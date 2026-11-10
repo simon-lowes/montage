@@ -17,6 +17,7 @@
 #include <QFile>
 
 #include "render/St2110Receive.h"
+#include "JpegXs.h"
 
 #ifdef MONTAGE_WITH_OMT
 #include "Omt.h"
@@ -26,6 +27,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/timecode.h>
@@ -58,7 +60,11 @@ const Codec kCodecs[] = {
     {"dnxhr_sq", "DNxHR SQ", "dnxhd", "dnxhr_sq", AV_PIX_FMT_YUV422P},
     {"dnxhr_hq", "DNxHR HQ", "dnxhd", "dnxhr_hq", AV_PIX_FMT_YUV422P},
     {"dnxhr_hqx", "DNxHR HQX (10-bit)", "dnxhd", "dnxhr_hqx", AV_PIX_FMT_YUV422P10LE},
+    // (FFmpeg's raw "encoder" hands each picture to SVT-JPEG-XS, which media/JpegXs.h's writer codes into MXF)
+    {"jpeg_xs", "JPEG XS (10-bit 4:2:2, MXF)", "rawvideo", "", AV_PIX_FMT_YUV422P10LE},
 };
+
+bool isJpegXs(const std::string& id) { return id == "jpeg_xs"; }
 
 const Codec* findCodec(const std::string& id) {
     for (const Codec& c : kCodecs)
@@ -573,7 +579,7 @@ AVRational standardRate(AVRational r, bool* standard) {
 std::vector<std::pair<std::string, std::string>> captureCodecs() {
     std::vector<std::pair<std::string, std::string>> out;
     for (const Codec& c : kCodecs)
-        if (avcodec_find_encoder_by_name(c.encoder)) out.push_back({c.id, c.name});
+        if (avcodec_find_encoder_by_name(c.encoder) && (!isJpegXs(c.id) || jpegXsAvailable())) out.push_back({c.id, c.name});
     return out;
 }
 
@@ -709,6 +715,20 @@ bool Recorder::start(const CaptureSettings& settings, std::string* error) {
         if (error) *error = "Record to a .mov or .mxf file";
         return false;
     }
+    if (isJpegXs(settings.codec)) {
+        if (!jpegXsAvailable()) {
+            if (error) *error = "This build of Montage records no JPEG XS (SVT-JPEG-XS)";
+            return false;
+        }
+        if (!settings.path.empty() && !endsWith(settings.path, ".mxf")) {
+            if (error) *error = "JPEG XS records to MXF (ST 2124): name a .mxf file";
+            return false;
+        }
+        if (!(settings.jpegXsBpp >= 0.5 && settings.jpegXsBpp <= 24)) {
+            if (error) *error = "A JPEG XS rate is 0.5 to 24 bits a pixel";
+            return false;
+        }
+    }
     if (settings.video.url.empty()) {
         if (error) *error = "Name the feed to record";
         return false;
@@ -780,6 +800,11 @@ void Recorder::run() {
     int64_t audioBaseSample = 0;
     const bool mov = endsWith(cs.path, ".mov");
     const bool watchOnly = cs.path.empty();
+    // JPEG XS: FFmpeg's raw pictures and PCM packets handed to its writer (the muxer FFmpeg's null one).
+    const bool jxsRecord = isJpegXs(cs.codec) && !watchOnly;
+    std::unique_ptr<JxsWriter> jxs;
+    AVFrame* jxsPicture = av_frame_alloc();
+    std::vector<float> jxsSound;
     int64_t frameLimit = 0;
     const bool ranged = cs.fromFrame >= 0;
     int64_t firstLabel = -1;  // a range's first picture's label
@@ -823,6 +848,32 @@ void Recorder::run() {
             return false;
         }
         while ((err = avcodec_receive_packet(enc, out)) >= 0) {
+            if (jxs) {
+                std::string why;
+                bool done = true;
+                if (enc == venc) {
+                    jxsPicture->format = venc->pix_fmt;
+                    jxsPicture->width = venc->width;
+                    jxsPicture->height = venc->height;
+                    done = av_image_fill_arrays(jxsPicture->data, jxsPicture->linesize, out->data, venc->pix_fmt, venc->width, venc->height, 1) >= 0 &&
+                           jxs->write(jxsPicture, &why);
+                } else {
+                    // (24-bit PCM, interleaved, to the writer's samples: exact in a float)
+                    const size_t n = size_t(out->size) / 3;
+                    jxsSound.resize(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        const uint8_t* d = out->data + i * 3;
+                        jxsSound[i] = float(double(int32_t(uint32_t(d[0]) << 8 | uint32_t(d[1]) << 16 | uint32_t(d[2]) << 24) >> 8) / 8388608.0);
+                    }
+                    done = jxs->audio(jxsSound.data(), int(n / size_t(std::max(1, enc->ch_layout.nb_channels))), &why);
+                }
+                av_packet_unref(out);
+                if (!done) {
+                    fatal = "Cannot write " + cs.path + ": " + why;
+                    return false;
+                }
+                continue;
+            }
             av_packet_rescale_ts(out, enc->time_base, st->time_base);
             out->stream_index = st->index;
             if ((err = av_interleaved_write_frame(oc, out)) < 0) {
@@ -945,7 +996,7 @@ void Recorder::run() {
             fatal = "The timecode " + tc + " does not fit the feed's " + b + " fps";
             return false;
         }
-        int err = watchOnly ? 0 : avformat_alloc_output_context2(&oc, nullptr, nullptr, cs.path.c_str());
+        int err = watchOnly ? 0 : avformat_alloc_output_context2(&oc, nullptr, jxsRecord ? "null" : nullptr, cs.path.c_str());
         if (!watchOnly && (err < 0 || !oc)) {
             fatal = "Cannot write " + cs.path + ": " + avError(err);
             return false;
@@ -958,6 +1009,10 @@ void Recorder::run() {
         interlaced = f->interlaced_frame != 0;
         topFirst = f->top_field_first != 0;
 #endif
+        if (jxsRecord && (interlaced || width % 2)) {
+            fatal = "JPEG XS records progressive pictures an even number of pixels wide: record this feed to ProRes or DNxHR";
+            return false;
+        }
         const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(AVPixelFormat(f->format));
         const bool rgb = desc && (desc->flags & AV_PIX_FMT_FLAG_RGB);
         colorSpace = !rgb && f->colorspace != AVCOL_SPC_UNSPECIFIED && f->colorspace != AVCOL_SPC_RGB ? f->colorspace
@@ -983,7 +1038,7 @@ void Recorder::run() {
                 venc->field_order = topFirst ? AV_FIELD_TT : AV_FIELD_BB;
                 venc->flags |= AV_CODEC_FLAG_INTERLACED_DCT;
             }
-            av_opt_set(venc->priv_data, "profile", codec->profile, 0);
+            if (*codec->profile) av_opt_set(venc->priv_data, "profile", codec->profile, 0);
             if (oc->oformat->flags & AVFMT_GLOBALHEADER) venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
             if ((err = avcodec_open2(venc, enc, nullptr)) < 0) {
                 fatal = std::string("Cannot encode ") + codec->name + " at " + std::to_string(width) + "x" + std::to_string(height) + ": " + avError(err);
@@ -1073,6 +1128,34 @@ void Recorder::run() {
         if (err < 0) {
             fatal = "Cannot write " + cs.path + ": " + avError(err);
             return false;
+        }
+        if (jxsRecord) {
+            // SVT-JPEG-XS at the rate asked, the feed's colour and timecode stated, its sound beside it in MXF (a mono
+            // PCM track a channel).
+            JxsWriteSettings xs;
+            xs.container = JxsContainer::Mxf;
+            xs.encode.width = width;
+            xs.encode.height = height;
+            xs.encode.depth = 10;
+            xs.encode.sampling = JxsSampling::Ycc422;
+            xs.encode.bppNum = int(std::lround(cs.jpegXsBpp * 1000));
+            xs.encode.bppDen = 1000;
+            xs.fpsNum = fps.num;
+            xs.fpsDen = fps.den;
+            xs.primaries = int(venc->color_primaries != AVCOL_PRI_UNSPECIFIED ? venc->color_primaries : AVCOL_PRI_BT709);
+            xs.transfer = int(venc->color_trc != AVCOL_TRC_UNSPECIFIED ? venc->color_trc : AVCOL_TRC_BT709);
+            xs.matrix = int(venc->colorspace);
+            xs.timecode = tc;
+            xs.dropFrame = tc.find(';') != std::string::npos;
+            xs.clipName = cs.reel;
+            if (aenc) xs.channels = aenc->ch_layout.nb_channels, xs.sampleRate = 48000, xs.bits = 24;
+            jxs = std::make_unique<JxsWriter>();
+            std::string why;
+            if (!jxs->open(cs.path, xs, &why)) {
+                fatal = "Cannot write " + cs.path + ": " + why;
+                jxs.reset();
+                return false;
+            }
         }
         headerWritten = true;
         if (cs.live) cs.live->begin(tc, fps.num, fps.den);
@@ -1799,6 +1882,8 @@ void Recorder::run() {
         if (aenc) write(aenc, ast, nullptr);
         const int err = av_write_trailer(oc);
         if (err < 0 && fatal.empty()) fatal = "Cannot finish " + cs.path + ": " + avError(err);
+        // (JPEG XS: its MXF finished with what was recorded, as a QuickTime file keeps its fragments)
+        if (std::string why; jxs && jxs->framesWritten() > 0 && !jxs->finish(&why) && fatal.empty()) fatal = "Cannot finish " + cs.path + ": " + why;
     } else if (!headerWritten && fatal.empty()) {
         fatal = warning.empty() ? "No picture came from the feed" : warning;
     }
@@ -1818,6 +1903,8 @@ void Recorder::run() {
         av_channel_layout_uninit(&x.in);
         av_channel_layout_uninit(&x.out);
     }
+    jxs.reset();
+    av_frame_free(&jxsPicture);
     av_frame_free(&last);
     av_frame_free(&decoded);
     av_frame_free(&sound);

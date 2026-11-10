@@ -83,6 +83,7 @@
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
 #include "media/Av2.h"
+#include "media/JpegXs.h"
 #include "media/Offload.h"
 #include "media/Recover.h"
 #include "media/Proxy.h"
@@ -13280,7 +13281,10 @@ void McpServer::Impl::addTools() {
             "jxl_depth":{"type":"string","enum":["8","16","half","float"],"description":"JPEG XL preset: the frames' samples (default 16-bit, half floats in linear light)"},
             "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL preset: 0 lossless, else libjxl's distance (1 visually lossless)"},
             "jxl_premultiplied":{"type":"boolean","default":false,"description":"JPEG XL preset with alpha: written premultiplied rather than straight (libjxl 0.9 or later)"},
-            "video_codec":{"type":"string","enum":["av2"],"description":"av2: AV2 instead of the preset's video, coded by AVM (builds made with AV2 only), in the container the output's extension names: .ivf, .obu (a bare OBU stream) or else MP4 by AV2's ISO BMFF binding, a working draft. MP4 keeps the preset's sound as AAC; IVF and OBU have none"},
+            "video_codec":{"type":"string","enum":["av2","jpeg_xs"],"description":"av2: AV2 instead of the preset's video, coded by AVM (builds made with AV2 only), in the container the output's extension names: .ivf, .obu (a bare OBU stream) or else MP4 by AV2's ISO BMFF binding, a working draft. MP4 keeps the preset's sound as AAC; IVF and OBU have none. jpeg_xs: JPEG XS through SVT-JPEG-XS, in MXF (ST 2124) with 24-bit PCM sound when the output ends .mxf, else a raw codestream file without sound"},
+            "jpeg_xs_bpp":{"type":"number","minimum":0.5,"maximum":24,"default":5,"description":"JPEG XS: bits a pixel, a constant number of bytes each picture (3 to 8 for most mezzanine work)"},
+            "jpeg_xs_sampling":{"type":"string","enum":["422","444","rgb"],"default":"422","description":"JPEG XS: 4:2:2 or 4:4:4 Y'CbCr, or R'G'B' (the preset's when it is a JPEG XS preset)"},
+            "jpeg_xs_depth":{"type":"integer","enum":[8,10,12],"default":10,"description":"JPEG XS: bits a sample"},
             "av2_speed":{"type":"integer","minimum":0,"maximum":6,"default":6,"description":"AV2: AVM's speed preset, 0 slowest (smallest) to 6 fastest"},
             "av2_quality":{"type":"integer","minimum":0,"maximum":63,"default":32,"description":"AV2 without a bitrate: the quantiser, 0 (best) to 63"},
             "av2_10bit":{"type":"boolean","default":false,"description":"AV2: 10 bits (always for HDR)"},
@@ -13424,8 +13428,36 @@ void McpServer::Impl::addTools() {
                 st.jxlDistance = std::clamp(a.value("jxl_distance").toDouble(0), 0.0, 25.0);
                 st.jxlPremultiplied = a.value("jxl_premultiplied").toBool();
             }
-            if (a.contains("video_codec")) {
-                if (str(a, "video_codec") != "av2") throw ArgError{"\"video_codec\" is av2"};
+            if (a.contains("video_codec") && str(a, "video_codec") == "jpeg_xs") {
+                if (!jpegXsAvailable()) throw ArgError{"This build of Montage writes no JPEG XS (SVT-JPEG-XS)"};
+                const bool wasXs = st.videoCodec == "jpegxs";
+                st.videoCodec = "jpegxs";
+                if (!wasXs) st.pixFmt = "yuv422p10le";
+                st.profile.clear();
+                st.alpha = false;
+                st.chapters = false;
+                st.monoAudioTracks = 0;
+                if (st.audioCodec != "none") st.audioCodec = "pcm_s24le";
+                st.format.clear();
+            }
+            if (a.contains("jpeg_xs_bpp") || a.contains("jpeg_xs_sampling") || a.contains("jpeg_xs_depth")) {
+                if (st.videoCodec != "jpegxs") throw ArgError{"\"jpeg_xs_bpp\", \"jpeg_xs_sampling\" and \"jpeg_xs_depth\" are for JPEG XS (\"video_codec\": \"jpeg_xs\")"};
+                if (a.contains("jpeg_xs_bpp")) {
+                    st.jpegXsBpp = a.value("jpeg_xs_bpp").toDouble();
+                    if (!(st.jpegXsBpp >= 0.5 && st.jpegXsBpp <= 24)) throw ArgError{"\"jpeg_xs_bpp\" is 0.5 to 24 bits a pixel"};
+                }
+                const QString cur = QString::fromStdString(st.pixFmt);
+                QString sampling = cur.startsWith("gbrp") ? "rgb" : cur.startsWith("yuv444") ? "444" : "422";
+                int depth = cur.endsWith("12le") ? 12 : cur.endsWith("10le") ? 10 : cur.isEmpty() ? 10 : 8;
+                if (a.contains("jpeg_xs_sampling")) sampling = str(a, "jpeg_xs_sampling");
+                if (a.contains("jpeg_xs_depth")) depth = a.value("jpeg_xs_depth").toInt();
+                if (sampling != "422" && sampling != "444" && sampling != "rgb") throw ArgError{"\"jpeg_xs_sampling\" is 422, 444 or rgb"};
+                if (depth != 8 && depth != 10 && depth != 12) throw ArgError{"\"jpeg_xs_depth\" is 8, 10 or 12"};
+                st.pixFmt = (sampling == "rgb" ? "gbrp" : sampling == "444" ? "yuv444p" : "yuv422p") + (depth == 8 ? std::string() : std::to_string(depth) + "le");
+            }
+            if (st.videoCodec == "jpegxs" && jxsContainerForPath(st.path) != JxsContainer::Mxf) st.audioCodec = "none";
+            if (a.contains("video_codec") && str(a, "video_codec") != "jpeg_xs") {
+                if (str(a, "video_codec") != "av2") throw ArgError{"\"video_codec\" is av2 or jpeg_xs"};
                 if (!av2EncoderAvailable()) throw ArgError{"This build of Montage writes no AV2 (AVM)"};
                 st.videoCodec = "av2";
                 st.preset = std::to_string(std::clamp(a.value("av2_speed").toInt(6), 0, 6));

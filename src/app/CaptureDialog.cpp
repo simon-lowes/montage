@@ -178,6 +178,14 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     if (const int i = wrapper_->findData(settings.value(QStringLiteral("capture/wrapper"), QStringLiteral("mov")).toString()); i >= 0)
         wrapper_->setCurrentIndex(i);
     form->addRow(tr("File:"), wrapper_);
+    // (JPEG XS records to MXF only)
+    auto codecChosen = [this] {
+        const bool xs = codec_->currentData().toString() == QLatin1String("jpeg_xs");
+        if (xs) wrapper_->setCurrentIndex(wrapper_->findData(QStringLiteral("mxf")));
+        wrapper_->setEnabled(!xs);
+    };
+    connect(codec_, qOverload<int>(&QComboBox::currentIndexChanged), this, codecChosen);
+    codecChosen();
 
     auto* folderRow = new QHBoxLayout;
     folder_ = new QLineEdit(settings.value(QStringLiteral("capture/folder"), QStandardPaths::writableLocation(QStandardPaths::MoviesLocation)).toString(), this);
@@ -601,7 +609,7 @@ bool CaptureDialog::record() {
     QString name = name_->text().trimmed();
     if (name.isEmpty()) name = tr("Capture 001");
     name.replace(QRegularExpression(QStringLiteral("[/\\\\:*?\"<>|]")), QStringLiteral("_"));
-    const QString ext = wrapper_->currentData().toString();
+    const QString ext = codec_->currentData().toString() == QLatin1String("jpeg_xs") ? QStringLiteral("mxf") : wrapper_->currentData().toString();
     while (QFileInfo::exists(QDir(dir).filePath(name + '.' + ext))) {
         const QRegularExpressionMatch m = QRegularExpression(QStringLiteral("^(.*?)(\\d+)$")).match(name);
         name = m.hasMatch() ? m.captured(1) + QStringLiteral("%1").arg(m.captured(2).toInt() + 1, m.captured(2).size(), 10, QLatin1Char('0'))
@@ -624,6 +632,7 @@ bool CaptureDialog::record() {
     }
     if (!kind.isEmpty() && kind != QLatin1String("omt") && kind != QLatin1String("st2110") && !sound_->text().trimmed().isEmpty()) cs.audio = CaptureSource{sound_->text().trimmed().toStdString(), kind.toStdString(), {}};
     cs.codec = codec_->currentData().toString().toStdString();
+    cs.jpegXsBpp = jpegXsBpp_;
     cs.path = path_.toStdString();
     cs.timecode = tc.toStdString();
     cs.seconds = seconds_->value();
@@ -726,7 +735,7 @@ QString CaptureDialog::statusText() const { return status_->text(); }
 
 QByteArray CaptureDialog::toolJson() {
     return QByteArrayLiteral(R"json({"name":"montage_capture","title":"Capture (record a live feed)",
-"description":"Records a live feed to ProRes or DNxHR with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths, and audio_interface=, data_interface= and their 2s for a sound or data stream joined elsewhere), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped), sound_latency_ms (how late the sound arrives, taken off; default Monitoring's audio device's input latency). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url. \"live\" with record: a live package of the feed as it records (HLS and DASH with a sliding window of window segments of 2 s, into folder; low_latency: in parts sent as they are made; segments ts: HLS in MPEG-TS; sound aac, libopus, ac3, eac3 or none; serve: from here over HTTP on port, network for other computers too; languages: every sound stream of the feed, each a rendition in its language; captions auto, always or none: the feed's CEA-608/708 captions as WebVTT and IMSC 1; the feed's SCTE 35 cues placed on keyframes as EXT-X-DATERANGE and DASH events); watch (default true): the recording watched live on the Source monitor. \"live\": the Source monitor watching a feed live (watch true: the recording File > Capture is making; input: a multiviewer input's index; watch false: back to the media), mark_in or mark_out (one a call) at the picture shown now, as frames of its recording (cut in at once from the growing file), and edit (insert, overwrite, append or place_on_top) the marked range into the sequence at its playhead; answers its label, timecode, frame, media, in and out. \"cue\" while a live package is made: an ad break from the next picture recorded, on a keyframe made there (duration: its length in seconds, 0 not known); \"chapter\": a chapter from there (title) in the package's chapters.vtt. \"multiview\": up to 16 inputs watched side by side (inputs: [{label, kind, url, options, record}] added, as \"record\" takes a feed; remove: an index; clear), the chosen ones (choose: indices, or each input's record) recorded while record is true, each into folder (codec as \"record\") and the Captures bin; source: an input's index shown on the Source monitor (-1 none); answers each input's label, running, recording, on_source, timecode, pictures, peaks_dbfs, path and media.",
+"description":"Records a live feed to ProRes, DNxHR or JPEG XS (codec jpeg_xs: 10-bit 4:2:2 in MXF, ST 2124, at jpeg_xs_bpp bits a pixel, default 5) with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths, and audio_interface=, data_interface= and their 2s for a sound or data stream joined elsewhere), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped), sound_latency_ms (how late the sound arrives, taken off; default Monitoring's audio device's input latency). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url. \"live\" with record: a live package of the feed as it records (HLS and DASH with a sliding window of window segments of 2 s, into folder; low_latency: in parts sent as they are made; segments ts: HLS in MPEG-TS; sound aac, libopus, ac3, eac3 or none; serve: from here over HTTP on port, network for other computers too; languages: every sound stream of the feed, each a rendition in its language; captions auto, always or none: the feed's CEA-608/708 captions as WebVTT and IMSC 1; the feed's SCTE 35 cues placed on keyframes as EXT-X-DATERANGE and DASH events); watch (default true): the recording watched live on the Source monitor. \"live\": the Source monitor watching a feed live (watch true: the recording File > Capture is making; input: a multiviewer input's index; watch false: back to the media), mark_in or mark_out (one a call) at the picture shown now, as frames of its recording (cut in at once from the growing file), and edit (insert, overwrite, append or place_on_top) the marked range into the sequence at its playhead; answers its label, timecode, frame, media, in and out. \"cue\" while a live package is made: an ad break from the next picture recorded, on a keyframe made there (duration: its length in seconds, 0 not known); \"chapter\": a chapter from there (title) in the package's chapters.vtt. \"multiview\": up to 16 inputs watched side by side (inputs: [{label, kind, url, options, record}] added, as \"record\" takes a feed; remove: an index; clear), the chosen ones (choose: indices, or each input's record) recorded while record is true, each into folder (codec as \"record\") and the Captures bin; source: an input's index shown on the Source monitor (-1 none); answers each input's label, running, recording, on_source, timecode, pictures, peaks_dbfs, path and media.",
 "inputSchema":{"type":"object","properties":{
 "action":{"type":"string","enum":["kinds","record","stop","status","nmos","live","multiview","cue","chapter"]},"offer":{"type":"boolean"},
 "duration":{"type":"number","minimum":0,"maximum":3600},"title":{"type":"string"},
@@ -736,7 +745,7 @@ QByteArray CaptureDialog::toolJson() {
 "remove":{"type":"integer","minimum":0},"clear":{"type":"boolean"},"choose":{"type":"array","items":{"type":"integer"}},
 "record":{"type":"boolean"},"source":{"type":"integer","minimum":-1,"maximum":15},
 "kind":{"type":"string"},"url":{"type":"string"},"options":{"type":"string"},"sound":{"type":"string"},
-"codec":{"type":"string"},"wrapper":{"type":"string","enum":["mov","mxf"]},"folder":{"type":"string"},"name":{"type":"string"},
+"codec":{"type":"string"},"jpeg_xs_bpp":{"type":"number","minimum":0.5,"maximum":24},"wrapper":{"type":"string","enum":["mov","mxf"]},"folder":{"type":"string"},"name":{"type":"string"},
 "timecode":{"type":"string"},"seconds":{"type":"number","minimum":0},"sound_latency_ms":{"type":"number","minimum":0,"maximum":2000},
 "live":{"type":"object","properties":{"folder":{"type":"string"},"hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
 "low_latency":{"type":"boolean","default":false},"window":{"type":"integer","minimum":3,"maximum":100,"default":6},
@@ -771,7 +780,21 @@ QString CaptureDialog::runTool(const QJsonObject& args, QJsonObject& structured,
         setSource(kind, same ? url_->text() : args.value("url").toString());
         setSoundDevice(args.value("sound").toString());
         if (!same || args.contains("options")) setOptions(args.value("options").toString());
-        if (args.contains("codec")) setCodec(args.value("codec").toString());
+        if (args.contains("codec")) {
+            if (codec_->findData(args.value("codec").toString()) < 0) {
+                isError = true;
+                return tr("This build does not record \"%1\" (see \"kinds\")").arg(args.value("codec").toString());
+            }
+            setCodec(args.value("codec").toString());
+        }
+        if (args.contains("jpeg_xs_bpp")) {
+            const double bpp = args.value("jpeg_xs_bpp").toDouble();
+            if (!(bpp >= 0.5 && bpp <= 24)) {
+                isError = true;
+                return tr("jpeg_xs_bpp is 0.5 to 24 bits a pixel");
+            }
+            jpegXsBpp_ = bpp;
+        }
         if (args.contains("wrapper")) setWrapper(args.value("wrapper").toString());
         if (args.contains("folder")) setFolder(args.value("folder").toString());
         if (args.contains("name")) setClipName(args.value("name").toString());

@@ -19078,6 +19078,69 @@ colorspaces:
 #endif
     }
 
+    // A sequence exported as JPEG XS (its MXF with sound, a raw codestream file) and read back as media: its frames,
+    // their constant size, its sound and colour; what JPEG XS cannot hold refused.
+    void jpegXsExport() {
+        using montage::JxsSampling;
+        if (!montage::jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        QTemporaryDir dir;
+        const int w = 320, h = 180;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = w, s.height = h, s.fps = {25, 1};
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.2f, 0.1f, 0, 12));
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.1f, 0.3f, 0.9f, 12, 12));
+        const ExportPreset* preset = nullptr;
+        for (const ExportPreset& e : exportPresets())
+            if (e.name == "JPEG XS 4:2:2 10-bit (MXF)") preset = &e;
+        QVERIFY(preset);
+        ExportSettings st = preset->settings;
+        st.path = (dir.path() + "/out.mxf").toStdString();
+        std::string err, used;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err, &used), err.c_str());
+        QCOMPARE(used, std::string("SVT-JPEG-XS (JPEG XS)"));
+        montage::JxsReader r;
+        QVERIFY2(r.open(st.path, &err), err.c_str());
+        QCOMPARE(r.info().frames, int64_t(24));
+        QVERIFY(r.info().sampling == JxsSampling::Ycc422 && r.info().header.depth == 10 && r.info().soundTracks == 2);
+        std::vector<uint8_t> cs;
+        QVERIFY(r.codestream(5, cs));
+        QCOMPARE(cs.size(), size_t(w * h * 5 / 8));
+        MediaItem m;
+        QVERIFY2(probeMedia(st.path, m, &err), err.c_str());
+        QCOMPARE(m.videoCodec, std::string("jpegxs"));
+        QVERIFY(m.width == w && m.height == h && m.hasAudio && m.sampleRate == 48000);
+        QVERIFY2(std::fabs(m.duration - 24 / 25.0) < 1e-6, qPrintable(QString::number(m.duration)));
+        VideoDecoder d;
+        QVERIFY2(d.open(st.path, &err), err.c_str());
+        auto colour = [&](double t) {
+            Frame16Ptr fr = d.frameAt(t, w, h, true);
+            if (!fr) return std::array<float, 3>{-1, -1, -1};
+            const Image img = toImage(*fr);
+            const float* q = img.at(w / 2, h / 2);
+            return std::array<float, 3>{q[0], q[1], q[2]};
+        };
+        for (const auto& [t, want] : {std::pair<double, std::array<float, 3>>{0.2, {0.8f, 0.2f, 0.1f}}, {0.7, {0.1f, 0.3f, 0.9f}}}) {
+            const std::array<float, 3> got = colour(t);
+            for (int c = 0; c < 3; ++c) QVERIFY2(std::fabs(got[size_t(c)] - want[size_t(c)]) < 0.02f, qPrintable(QString("%1: %2").arg(t).arg(got[size_t(c)])));
+        }
+        // A raw codestream file at 4:4:4 12-bit and 3 bits a pixel (no sound), read as a still when it is one picture.
+        st.path = (dir.path() + "/out.jxs").toStdString();
+        st.audioCodec = "none";
+        st.pixFmt = "yuv444p12le";
+        st.jpegXsBpp = 3;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err, &used), err.c_str());
+        QCOMPARE(QFileInfo(QString::fromStdString(st.path)).size(), qint64(24) * w * h * 3 / 8);
+        QVERIFY(probeMedia(st.path, m, &err) && m.videoCodec == "jpegxs" && !m.hasAudio);
+        // Refused: sound in a raw codestream, alpha, an unknown format.
+        st.audioCodec = "pcm_s24le";
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err) && QString::fromStdString(err).contains("no sound"));
+        st.audioCodec = "none", st.alpha = true;
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+        st.alpha = false, st.pixFmt = "yuv420p";
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err) && QString::fromStdString(err).contains("4:2:2 or 4:4:4"));
+    }
+
     // NMOS receivers: a controller hands each one a sender's SDP (two paths, ST 2022-7) through IS-05, the parameters
     // follow it, and the streams those parameters describe are received; IS-04's target connects and disconnects.
     void nmosReceivers() {

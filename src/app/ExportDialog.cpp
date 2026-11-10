@@ -37,6 +37,7 @@
 #include "media/Exr.h"
 #include "media/Av2.h"
 #include "media/Jxl.h"
+#include "media/JpegXs.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
@@ -423,6 +424,14 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         jxlDepth_->hide();
         jxlPremultiplied_->hide();
     }
+    jpegXsRate_ = new QComboBox(form_);
+    jpegXsRate_->setObjectName(QStringLiteral("exportJpegXsRate"));
+    jpegXsRate_->addItem(tr("The preset's"), 0.0);
+    for (double bpp : {2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0}) jpegXsRate_->addItem(tr("%1 bits a pixel").arg(bpp), bpp);
+    jpegXsRate_->setCurrentIndex(std::max(0, jpegXsRate_->findData(appSettings().value("export/jpegXsBpp", 0.0).toDouble())));
+    jpegXsRate_->setToolTip(tr("JPEG XS's rate: each picture the same number of bytes, its width times its height times this, over 8"));
+    if (jpegXsAvailable()) form->addRow(tr("JPEG XS:"), jpegXsRate_);
+    else jpegXsRate_->hide();
     // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
     stereo_ = new QComboBox(form_);
     stereo_->setObjectName(QStringLiteral("exportStereo"));
@@ -873,6 +882,7 @@ void ExportDialog::updateControls() {
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
         jxlQuality_->setEnabled(video && vc == "jxl" && jxlAvailable());
         jxlDepth_->setEnabled(jxlQuality_->isEnabled());
+        jpegXsRate_->setEnabled(video && vc == "jpegxs" && jpegXsAvailable());
         jxlPremultiplied_->setEnabled(jxlQuality_->isEnabled() && p->settings.alpha && jxlWritesPremultiplied());
     }
     loudness_->setEnabled(p && hasAudio(p->settings));
@@ -1142,6 +1152,10 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         settings.setValue("export/jxlDistance", s.jxlDistance);
         s.jxlDepth = jxlDepth_->currentData().toString().toStdString();
         settings.setValue("export/jxlDepth", jxlDepth_->currentData());
+    }
+    if (jpegXsRate_->isEnabled()) {
+        if (const double bpp = jpegXsRate_->currentData().toDouble(); bpp > 0) s.jpegXsBpp = bpp;
+        settings.setValue("export/jpegXsBpp", jpegXsRate_->currentData());
     }
     if (jxlPremultiplied_->isEnabled()) {
         s.jxlPremultiplied = jxlPremultiplied_->isChecked();

@@ -125,6 +125,7 @@ private:
     QString nmosFeed_;  // the feed (SDP text) an NMOS controller last set ("" none)
     QComboBox* codec_;
     QComboBox* wrapper_;
+    double jpegXsBpp_ = 5;  // JPEG XS recordings' bits a pixel (montage_capture's jpeg_xs_bpp)
     QLineEdit* folder_;
     QLineEdit* name_;
     QLineEdit* timecode_;

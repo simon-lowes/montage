@@ -8,6 +8,7 @@
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
 #include "media/Av2.h"
+#include "media/JpegXs.h"
 #include "media/ProResEncoder.h"
 #include "render/ProRes.h"
 #include "render/SegmentedExport.h"
@@ -238,6 +239,13 @@ struct Output {
     std::unique_ptr<Av2Writer> av2;
     AVFrame* av2Picture = nullptr;  // (a raw packet's planes, as AVM is handed them)
     std::string av2Error;
+    // JPEG XS (media/JpegXs.h): the video "encoder" gives raw pictures, which SVT-JPEG-XS codes; it writes the file (the
+    // muxer is FFmpeg's null one), the PCM sound's packets too.
+    std::unique_ptr<JxsWriter> jxs;
+    AVFrame* jxsPicture = nullptr;
+    int jxsSoundBits = 24;
+    std::vector<float> jxsSound;
+    std::string jxsError;
     // ProRes 4444 and 4444 XQ at 12 bits: the video "encoder" gives raw pictures (16 bits a sample), which Montage's
     // own encoder codes (media/ProResEncoder.h).
     std::unique_ptr<prores::OwnEncoder> prores;
@@ -251,6 +259,7 @@ struct Output {
         av_frame_free(&vframe);
         av_frame_free(&aframe);
         av_frame_free(&av2Picture);
+        av_frame_free(&jxsPicture);
         av_packet_free(&pkt);
         avcodec_free_context(&vctx);
         avcodec_free_context(&actx);
@@ -286,7 +295,11 @@ int writeSpatial(Output& o, std::vector<SpatialVideoEncoder::Packet>& coded) {
 
 // Why writing video failed: x265's own words for spatial video, Montage's ProRes encoder's for its pictures.
 std::string videoError(const Output& o, int rc) {
-    return !o.proresError.empty() ? o.proresError : !o.av2Error.empty() ? o.av2Error : o.spatialError.empty() ? averr(rc) : o.spatialError;
+    return !o.proresError.empty() ? o.proresError
+           : !o.av2Error.empty()  ? o.av2Error
+           : !o.jxsError.empty()  ? o.jxsError
+           : o.spatialError.empty() ? averr(rc)
+                                    : o.spatialError;
 }
 
 // A raw picture (Y'CbCr 4:4:4 at 16 bits a sample, alpha too when it has it) coded as ProRes by Montage's encoder and
@@ -374,6 +387,34 @@ int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
             if (!ok) return AVERROR_EXTERNAL;
             continue;
         }
+        if (o.jxs && st == o.vst) {
+            // (A picture, raw: coded by SVT-JPEG-XS.)
+            AVFrame* f = o.jxsPicture;
+            f->format = ctx->pix_fmt;
+            f->width = ctx->width;
+            f->height = ctx->height;
+            const bool ok = av_image_fill_arrays(f->data, f->linesize, o.pkt->data, ctx->pix_fmt, ctx->width, ctx->height, 1) >= 0 &&
+                            o.jxs->write(f, &o.jxsError);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
+            continue;
+        }
+        if (o.jxs && st == o.ast) {
+            // (Interleaved PCM, 16 or 24 bits little-endian, to the writer's samples: exact, a float holding 24 bits.)
+            const int bytes = o.jxsSoundBits / 8;
+            const size_t n = size_t(o.pkt->size) / size_t(bytes);
+            o.jxsSound.resize(n);
+            const uint8_t* d = o.pkt->data;
+            for (size_t i = 0; i < n; ++i, d += bytes) {
+                int32_t v = bytes == 3 ? int32_t(uint32_t(d[0]) << 8 | uint32_t(d[1]) << 16 | uint32_t(d[2]) << 24) >> 8 : int16_t(d[0] | d[1] << 8);
+                o.jxsSound[i] = float(double(v) / double(1 << (o.jxsSoundBits - 1)));
+            }
+            const int ch = ctx->ch_layout.nb_channels > 0 ? ctx->ch_layout.nb_channels : 1;
+            const bool ok = o.jxs->audio(o.jxsSound.data(), int(n / size_t(ch)), &o.jxsError);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
+            continue;
+        }
         if (o.prores && st == o.vst) {
             rc = writeOwnProRes(o, ctx, o.pkt);
             av_packet_unref(o.pkt);
@@ -450,6 +491,18 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
                                     "pcm_s24le", 16, "", "4444");
             a.settings.alpha = true;
             v.push_back(a);
+        }
+        if (everyBuild || jpegXsAvailable()) {
+            // JPEG XS (SVT-JPEG-XS, media/JpegXs.h): a light intra codec at a constant number of bytes a picture, in MXF
+            // (ST 2124) with 24-bit sound; the rate is its bits a pixel.
+            ExportPreset x = preset("JPEG XS 4:2:2 10-bit (MXF)", "mxf", "Light intra-frame mezzanine at 5 bits a pixel, for live production and contribution",
+                                    "jpegxs", "pcm_s24le", 0, "", "", "yuv422p10le");
+            x.settings.jpegXsBpp = 5;
+            v.push_back(x);
+            x = preset("JPEG XS 4:4:4 12-bit (MXF)", "mxf", "JPEG XS at 8 bits a pixel, 12-bit 4:4:4, for finishing and graphics", "jpegxs", "pcm_s24le", 0,
+                       "", "", "yuv444p12le");
+            x.settings.jpegXsBpp = 8;
+            v.push_back(x);
         }
         v.push_back(preset("Uncompressed 10-bit (v210)", "mov", "Uncompressed 10-bit 4:2:2, for broadcast ingest", "v210", "pcm_s24le", 0, ""));
         {
@@ -1031,6 +1084,37 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (wantAudio && s.audioCodec != "aac") return fail("AV2 in MP4 takes AAC sound");
         if (s.monoAudioTracks > 0 || !s.extraAudio.empty()) return fail("AV2 in MP4 holds one sound stream");
     }
+    // JPEG XS coded by SVT-JPEG-XS (media/JpegXs.h): MXF (ST 2124) with its PCM sound when the file name ends .mxf, else
+    // a raw codestream file.
+    const bool jxsOut = s.videoCodec == "jpegxs" && wantVideo;
+    const JxsContainer jxsHolder = jxsContainerForPath(s.path);
+    AVPixelFormat jxsFormat = AV_PIX_FMT_YUV422P10LE;
+    if (jxsOut) {
+        if (!jpegXsAvailable()) return fail("This build of Montage writes no JPEG XS (SVT-JPEG-XS)");
+        if (!s.pixFmt.empty()) {
+            jxsFormat = av_get_pix_fmt(s.pixFmt.c_str());
+            const AVPixelFormat ok[] = {AV_PIX_FMT_YUV422P,    AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV422P12LE, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV444P10LE,
+                                        AV_PIX_FMT_YUV444P12LE, AV_PIX_FMT_GBRP,       AV_PIX_FMT_GBRP10LE,    AV_PIX_FMT_GBRP12LE};
+            if (std::find(std::begin(ok), std::end(ok), jxsFormat) == std::end(ok))
+                return fail("JPEG XS is written as 4:2:2 or 4:4:4 Y'CbCr, or R'G'B', at 8, 10 or 12 bits (yuv422p10le, yuv444p12le, gbrp12le...)");
+        }
+        if (s.jpegXsBpp < 0 || s.jpegXsBpp > 24) return fail("A JPEG XS rate is up to 24 bits a pixel");
+        if (s.alpha || interlacedOut) return fail("JPEG XS is written without alpha or fields");
+        if (s.cea608 || s.embedCaptions) return fail("JPEG XS is written without embedded captions: burn them in, or deliver them beside the file");
+        if (s.adaptiveHdr) return fail("JPEG XS is written without adaptive HDR metadata");
+        if (s.twoPass || s.pass != 0) return fail("JPEG XS is written in one pass");
+        if (seq.stereo3d && s.stereo == "mv") return fail("Spatial video is MV-HEVC: choose H.265 (HEVC)");
+        if (seq.spherical) return fail("JPEG XS is written without 360° metadata");
+        StereoView eyes = StereoView::Left;
+        if (seq.stereo3d && stereoViewFromName(s.stereo.empty() ? "sbs" : s.stereo, eyes) && eyes != StereoView::Left &&
+            eyes != StereoView::Right && eyes != StereoView::Anaglyph)
+            return fail("JPEG XS is written without stereoscopic 3D metadata: export one eye or an anaglyph");
+        if (s.chapters && std::any_of(seq.markers.begin(), seq.markers.end(), [](const Marker& m) { return m.chapter; }))
+            return fail("JPEG XS is written without chapters: turn chapters off");
+        if (wantAudio && jxsHolder != JxsContainer::Mxf) return fail("A JPEG XS codestream file holds no sound: export it as .mxf for sound, or choose no audio codec");
+        if (wantAudio && s.audioCodec != "pcm_s24le" && s.audioCodec != "pcm_s16le") return fail("JPEG XS in MXF takes PCM sound (pcm_s24le or pcm_s16le)");
+        if (s.monoAudioTracks > 0 || !s.extraAudio.empty()) return fail("JPEG XS in MXF writes one sound stream, a mono track for each of its channels");
+    }
     // (through the OpenEXR library whenever it is there, so the file says its colour space: the colorInteropID attribute)
     const bool exrLibrary = floatFrames && (exrAvailable() || !s.exrCompression.empty() || s.exrLayers);
     if ((!s.exrCompression.empty() || s.exrLayers) && wantVideo) {
@@ -1050,7 +1134,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     }
     Output o;
-    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : av2Out ? "null" : s.format.empty() ? nullptr : s.format.c_str(),
+    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : av2Out || jxsOut ? "null" : s.format.empty() ? nullptr : s.format.c_str(),
                                             outPath.c_str());
     if (rc < 0 || !o.oc) return fail("Unknown output format for " + s.path);
     if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
@@ -1118,6 +1202,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             c = "png";
         }
         if (av2Out) c = "rawvideo";  // (FFmpeg's raw "encoder" hands each picture to AVM)
+        if (jxsOut) c = "rawvideo";  // (and to SVT-JPEG-XS)
         // ProRes 4444 and 4444 XQ at 12 bits (a 12-bit pixel format asked for): Montage's own encoder, handed each
         // picture by FFmpeg's raw "encoder" at 16 bits a sample, so alpha keeps its 16.
         const AVPixelFormat askedFormat = s.pixFmt.empty() ? AV_PIX_FMT_NONE : av_get_pix_fmt(s.pixFmt.c_str());
@@ -1135,6 +1220,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             *encoderUsed = spatial    ? std::string("x265 (MV-HEVC)")
                            : jxlFrames ? std::string("libjxl")
                            : av2Out    ? std::string("AVM (AV2)")
+                           : jxsOut    ? std::string("SVT-JPEG-XS (JPEG XS)")
                            : ownProRes ? std::string("Montage ProRes (12-bit)")
                                        : c;
         // FFmpeg's CineForm encoder reads memory it never wrote below a picture whose height is not a multiple of 8
@@ -1155,6 +1241,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         // (AV2 in 4:2:0, 10 bits for HDR or when asked)
         if (av2Out) o.vctx->pix_fmt = outSpace.hdr() || s.pixFmt.find("10") != std::string::npos ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
         if (ownProRes) o.vctx->pix_fmt = ownAlpha ? AV_PIX_FMT_YUVA444P16LE : AV_PIX_FMT_YUV444P16LE;
+        if (jxsOut) o.vctx->pix_fmt = jxsFormat;
         o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(dseq.fpsValue() * 2)));
         if (s.gop == 1) o.vctx->max_b_frames = 0;
         const ColorTags tags = colorTags(outSpace);
@@ -1835,6 +1922,39 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!o.av2->open(s.path, as, &o.av2Error)) return fail(o.av2Error);
         opened = true;  // (removed if the export fails after AVM's writer has finished it)
         if (o.actx && !o.av2->addAudio(o.ast->codecpar, o.actx->time_base.num, o.actx->time_base.den, &o.av2Error)) return fail(o.av2Error);
+    }
+    if (jxsOut && o.vctx) {
+        // SVT-JPEG-XS at the bits a pixel asked (5 when none), in the sampling and depth of the picture's format, colour
+        // stated as the delivery's; MXF with the sound beside it, a mono track for each channel.
+        JxsWriteSettings xs;
+        xs.container = jxsHolder;
+        const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(o.vctx->pix_fmt);
+        xs.encode.width = W;
+        xs.encode.height = H;
+        xs.encode.depth = d->comp[0].depth;
+        xs.encode.sampling = (d->flags & AV_PIX_FMT_FLAG_RGB) ? JxsSampling::Rgb : d->log2_chroma_w ? JxsSampling::Ycc422 : JxsSampling::Ycc444;
+        const double bpp = s.jpegXsBpp > 0 ? s.jpegXsBpp : 5.0;
+        xs.encode.bppNum = int(std::lround(bpp * 1000));
+        xs.encode.bppDen = 1000;
+        xs.fpsNum = fps.num;
+        xs.fpsDen = fps.den;
+        xs.primaries = int(o.vctx->color_primaries);
+        xs.transfer = int(o.vctx->color_trc);
+        xs.matrix = xs.encode.sampling == JxsSampling::Rgb ? 0 : int(o.vctx->colorspace);
+        xs.fullRange = xs.encode.sampling == JxsSampling::Rgb;
+        xs.timecode = s.startTimecode.empty() ? std::string("00:00:00:00") : s.startTimecode;
+        xs.dropFrame = xs.timecode.find(';') != std::string::npos;
+        if (o.actx) {
+            xs.channels = o.actx->ch_layout.nb_channels;
+            xs.sampleRate = o.actx->sample_rate;
+            xs.bits = o.actx->codec_id == AV_CODEC_ID_PCM_S16LE ? 16 : 24;
+            o.jxsSoundBits = xs.bits;
+        }
+        o.jxs = std::make_unique<JxsWriter>();
+        o.jxsPicture = av_frame_alloc();
+        if (!o.jxsPicture) return fail("Out of memory");
+        if (!o.jxs->open(s.path, xs, &o.jxsError)) return fail(o.jxsError);
+        opened = true;  // (removed if the export fails after the writer has finished it)
     }
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
@@ -2675,6 +2795,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
         if (!o.av2->finish(&o.av2Error)) return fail(o.av2Error);
     }
+    if (o.jxs && !o.jxs->finish(&o.jxsError)) return fail(o.jxsError);
     if (o.spatial) {
         // The second view's configuration and Apple's stereo boxes, which FFmpeg does not write.
         if ((rc = avio_closep(&o.oc->pb)) < 0) return fail("Writing the file failed: " + averr(rc));

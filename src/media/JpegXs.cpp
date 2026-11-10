@@ -745,7 +745,36 @@ struct JxsWriter::State {
     std::unique_ptr<bmx::ClipWriter> clip;
     bmx::ClipWriterTrack* pictureTrack = nullptr;
     std::vector<uint32_t> sequence;  // samples a frame, in turn
+    int64_t soundFrames = 0;         // frames whose sound is written (never more than the pictures)
     bool descriptorFixed = false;
+    // The sound of each frame whose picture is written, as far as it has come (bmx makes each content package when it
+    // has its picture and its sound, whichever comes first); `pad`: the rest of the last pictures' in silence.
+    void writeSound(bool pad) {
+        const int ch = s.channels;
+        if (ch <= 0) return;
+        const int bytes = (s.bits + 7) / 8;
+        const double scale = double(int64_t(1) << (s.bits - 1));
+        size_t used = 0;
+        std::vector<uint8_t> mono;
+        while (soundFrames < frames) {
+            const uint32_t n = sequence[size_t(soundFrames % int64_t(sequence.size()))];
+            const size_t want = size_t(n) * size_t(ch);
+            if (sound.size() - used < want && !pad) break;
+            mono.assign(size_t(n) * size_t(bytes), 0);
+            for (int c = 0; c < ch; ++c) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    const size_t at = used + size_t(i) * size_t(ch) + size_t(c);
+                    const float v = at < sound.size() ? sound[at] : 0.f;
+                    const int32_t q = int32_t(std::clamp(std::lround(double(v) * scale), long(-scale), long(scale - 1)));
+                    for (int b = 0; b < bytes; ++b) mono[size_t(i) * size_t(bytes) + size_t(b)] = uint8_t(uint32_t(q) >> (8 * b));
+                }
+                clip->WriteSamples(uint32_t(1 + c), mono.data(), uint32_t(mono.size()), n);
+            }
+            used = std::min(sound.size(), used + want);
+            ++soundFrames;
+        }
+        sound.erase(sound.begin(), sound.begin() + ptrdiff_t(used));
+    }
 #endif
     void discard() {
 #ifdef MONTAGE_WITH_BMX
@@ -780,6 +809,12 @@ bool JxsWriter::open(const std::string& path, const JxsWriteSettings& settings, 
     st.path = path;
     st.frames = 0;
     st.finished = false;
+    st.sound.clear();
+#ifdef MONTAGE_WITH_BMX
+    st.soundFrames = 0;
+    st.descriptorFixed = false;
+    st.sequence.clear();
+#endif
     if (!jpegXsAvailable()) return fail(error, "This build of Montage has no JPEG XS (SVT-JPEG-XS)");
     if (!st.encoder.open(settings.encode, error)) return false;
     if (settings.container == JxsContainer::Codestream) {
@@ -882,7 +917,21 @@ bool JxsWriter::write(const AVFrame* frame, std::string* error) {
 bool JxsWriter::audio(const float* samples, int frames, std::string* error) {
     State& st = *s_;
     if (st.s.channels <= 0) return frames <= 0 || fail(error, "This JPEG XS file holds no sound");
+    if (!st.open) return fail(error, "The JPEG XS file is not open");
     st.sound.insert(st.sound.end(), samples, samples + size_t(std::max(frames, 0)) * size_t(st.s.channels));
+#ifdef MONTAGE_WITH_BMX
+    if (st.clip && st.soundFrames < st.frames) {
+        BmxUse use;
+        try {
+            st.writeSound(false);
+        } catch (const std::exception& e) {
+            const std::string why = std::string("JPEG XS MXF: ") + e.what() + (use.log().empty() ? "" : " (" + use.log() + ")");
+            st.clip.reset();
+            st.discard();
+            return fail(error, why);
+        }
+    }
+#endif
     return true;
 }
 
@@ -926,24 +975,8 @@ bool JxsWriter::writeCodestream(const uint8_t* data, size_t size, std::string* e
                     if (auto* x = dynamic_cast<mxfpp::JPEGXSSubDescriptor*>(sd))
                         x->setJPEGXSMaximumBitRate(uint32_t(std::ceil(double(size) * 8 * st.s.fpsNum / st.s.fpsDen / 1e6)));
         }
-        if (st.s.channels > 0) {
-            const uint32_t n = st.sequence[size_t(st.frames % int64_t(st.sequence.size()))];
-            const int ch = st.s.channels;
-            const int bytes = (st.s.bits + 7) / 8;
-            std::vector<uint8_t> mono(size_t(n) * size_t(bytes));
-            for (int c = 0; c < ch; ++c) {
-                for (uint32_t i = 0; i < n; ++i) {
-                    const size_t at = size_t(i) * size_t(ch) + size_t(c);
-                    const float v = at < st.sound.size() ? st.sound[at] : 0.f;
-                    const double scale = double(int64_t(1) << (st.s.bits - 1));
-                    const int32_t q = int32_t(std::clamp(std::lround(double(v) * scale), long(-scale), long(scale - 1)));
-                    for (int b = 0; b < bytes; ++b) mono[size_t(i) * size_t(bytes) + size_t(b)] = uint8_t(uint32_t(q) >> (8 * b));
-                }
-                st.clip->WriteSamples(uint32_t(1 + c), mono.data(), uint32_t(mono.size()), n);
-            }
-            st.sound.erase(st.sound.begin(), st.sound.begin() + ptrdiff_t(std::min(st.sound.size(), size_t(n) * size_t(ch))));
-        }
         ++st.frames;
+        st.writeSound(false);
         return true;
     } catch (const std::exception& e) {
         const std::string why = std::string("JPEG XS MXF: ") + e.what() + (use.log().empty() ? "" : " (" + use.log() + ")");
@@ -975,6 +1008,7 @@ bool JxsWriter::finish(std::string* error) {
     {
         BmxUse use;
         try {
+            st.writeSound(true);
             st.clip->CompleteWrite();
             st.clip.reset();
         } catch (const std::exception& e) {

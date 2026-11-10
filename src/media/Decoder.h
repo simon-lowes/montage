@@ -50,6 +50,7 @@ struct PulldownMap;
 class MlvReader;
 class JxlAnimationReader;
 class Av2Reader;
+class JxsReader;
 namespace dcp {
 class ImfTrackReader;
 }
@@ -68,7 +69,7 @@ public:
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
     bool isOpen() const {
-        return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr || exr_ != nullptr || imf_ != nullptr || av2_ != nullptr ||
+        return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr || exr_ != nullptr || imf_ != nullptr || av2_ != nullptr || jxs_ != nullptr ||
                jxl_ != nullptr || jxlAnimation_ != nullptr || !jxlFile_.empty();
     }
 
@@ -159,6 +160,7 @@ private:
     std::unique_ptr<MlvReader> mlv_;          // Magic Lantern Video: each frame's mosaic developed (media/Mlv.h)
     std::shared_ptr<const dcp::ImfTrackReader> imf_;  // an IMF picture track file: each frame decoded with OpenJPEG, its codes kept
     std::unique_ptr<Av2Reader> av2_;          // AV2 decoded with dav2d (media/Av2.h)
+    std::unique_ptr<JxsReader> jxs_;          // JPEG XS decoded with SVT-JPEG-XS (media/JpegXs.h)
     std::unique_ptr<ImageSequence> exr_;      // OpenEXR read with OpenEXR (a layer, or a compression FFmpeg lacks): its frames
     std::string exrFile_;                     // (a single file: first = last = 0)
     std::vector<float> exrRgba_;              // its frame rawFrame_, straight float RGBA (JPEG XL's too)

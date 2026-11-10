@@ -285,8 +285,10 @@ QString Multiviewer::nextPath(const QString& label) const {
     std::set<QString> taken;
     for (const auto& s : inputs_)
         if (!s->path.isEmpty()) taken.insert(s->path);
+    // (JPEG XS records to MXF, the rest to QuickTime)
+    const QString ext = codec_->currentData().toString() == QLatin1String("jpeg_xs") ? QStringLiteral("mxf") : QStringLiteral("mov");
     for (int n = 1;; ++n) {
-        const QString path = QDir(folder()).filePath(QStringLiteral("%1 %2.mov").arg(name).arg(n, 3, 10, QLatin1Char('0')));
+        const QString path = QDir(folder()).filePath(QStringLiteral("%1 %2.%3").arg(name).arg(n, 3, 10, QLatin1Char('0')).arg(ext));
         if (!QFileInfo::exists(path) && !taken.count(path)) return path;
     }
 }

@@ -116,6 +116,10 @@ struct ExportSettings {
     double jxlDistance = 0;
     int jxlEffort = 3;
     bool jxlPremultiplied = false;
+    // JPEG XS (videoCodec "jpegxs", coded by SVT-JPEG-XS, media/JpegXs.h): bits a pixel, a constant number of bytes each
+    // picture (0 = 5). Its sampling and depth are pixFmt's (yuv422p10le when empty; yuv444p…, gbrp…; 8, 10 or 12 bits);
+    // a .mxf path is MXF (ST 2124) with PCM sound, any other a raw codestream file without.
+    double jpegXsBpp = 0;
     // More layers in each OpenEXR frame (a VFX pull's source layers and mattes, render/VfxPull.h), written with the
     // OpenEXR library: called with the frame's sequence time and the picture's size, adding to `layers` (the picture is
     // the first, "") and header `attributes`. False stops the export with `error`.

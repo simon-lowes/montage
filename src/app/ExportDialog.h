@@ -92,6 +92,7 @@ private:
     QCheckBox* adaptiveHdr_ = nullptr;  // adaptive HDR metadata (PQ and HLG)
     QComboBox* exrCompression_ = nullptr;  // OpenEXR frames' compression
     QComboBox* jxlQuality_ = nullptr;      // JPEG XL frames: lossless or a distance
+    QComboBox* jpegXsRate_ = nullptr;      // JPEG XS: bits a pixel (0: the preset's)
     QComboBox* jxlDepth_ = nullptr;        // and their depth (the preset's, 8 or 16-bit, half or float)
     QCheckBox* jxlPremultiplied_ = nullptr;  // and alpha written premultiplied
     QCheckBox* smart_ = nullptr;

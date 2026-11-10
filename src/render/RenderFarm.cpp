@@ -197,6 +197,7 @@ void visitSettings(S& s, V& v) {
     v("jxlDistance", s.jxlDistance);
     v("jxlEffort", s.jxlEffort);
     v("jxlPremultiplied", s.jxlPremultiplied);
+    v("jpegXsBpp", s.jpegXsBpp);
     v("colorSpace", s.colorSpace);
     v("toneMapping", s.toneMapping);
     v("trimTarget", s.trimTarget);

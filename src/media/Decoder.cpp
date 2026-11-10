@@ -6,6 +6,7 @@
 #include "Exr.h"
 #include "Jxl.h"
 #include "Av2.h"
+#include "JpegXs.h"
 #include "render/DcpMxf.h"
 #include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
@@ -700,6 +701,33 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         out = m;
         return true;
     }
+    // JPEG XS (media/JpegXs.h), its pictures read with SVT-JPEG-XS: raw codestreams, or an MXF (ST 2124) whose sound is
+    // read as any other MXF's (FFmpeg has no JPEG XS, so its picture's facts come from the codestream and descriptor).
+    static thread_local bool jxsProbing = false;
+    if (const JxsContainer jc = jpegXsAvailable() && !jxsProbing ? jxsContainer(file) : JxsContainer::None; jc != JxsContainer::None) {
+        JxsFileInfo ji;
+        if (!readJxsFileInfo(file, ji, error)) return false;
+        MediaItem m = out;
+        if (jc == JxsContainer::Mxf) {
+            jxsProbing = true;
+            MediaItem viaContainer = out;
+            if (probeMedia(path, viaContainer, nullptr)) m = viaContainer;
+            jxsProbing = false;
+        }
+        m.path = path;
+        if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
+        m.kind = MediaKind::Video;
+        m.hasVideo = true;
+        if (jc != JxsContainer::Mxf || ji.soundTracks == 0) m.hasAudio = false;
+        m.width = std::max(1, int(std::lround(ji.header.width * (in.par > 0 ? in.par : 1.0))));
+        m.height = ji.header.height;
+        m.fps = Rational{ji.fpsNum, ji.fpsDen};
+        m.duration = ji.seconds() / in.timeScale();
+        m.videoCodec = "jpegxs";
+        m.colorSpace = ji.colorSpace;
+        out = m;
+        return true;
+    }
     // An IMF archival master's pictures (Application #5: ACES image containers, which FFmpeg does not read), in ACES 2065-1.
     if (file.size() >= 4 && exrAvailable() && QString::fromStdString(file.substr(file.size() - 4)).compare(".mxf", Qt::CaseInsensitive) == 0) {
         int w = 0, h = 0;
@@ -1070,6 +1098,7 @@ void VideoDecoder::close() {
     jxlFile_.clear();
     imf_.reset();
     av2_.reset();
+    jxs_.reset();
     pulldown_.reset();
     av_frame_free(&woven_);
     wovenIndex_ = -1;
@@ -1335,6 +1364,23 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         fps_ = double(ai.fpsNum) / ai.fpsDen;
         duration_ = ai.seconds();
         still_ = false;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
+    }
+    // JPEG XS (media/JpegXs.h): decoded with SVT-JPEG-XS, each frame planar Y′CbCr or GBR as FFmpeg's would be.
+    if (jpegXsAvailable() && jxsContainer(file) != JxsContainer::None) {
+        auto reader = std::make_unique<JxsReader>();
+        if (!reader->open(file, error)) return false;
+        const JxsFileInfo& ji = reader->info();
+        jxs_ = std::move(reader);
+        rawFrame_ = -1;
+        dispW_ = std::max(1, int(std::lround(ji.header.width * (par_ > 0 ? par_ : 1.0))));
+        dispH_ = ji.header.height;
+        fps_ = ji.fpsNum > 0 && ji.fpsDen > 0 ? double(ji.fpsNum) / ji.fpsDen : 25.0;
+        duration_ = ji.seconds();
+        still_ = ji.frames == 1 && ji.container == JxsContainer::Codestream;
         rotation_ = 0;
         origin_ = 0;
         curPts_ = nextPts_ = -1;
@@ -2213,6 +2259,27 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         }
         if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_)) {
             stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality);
+            stillHq_ = highQuality;
+        }
+        curPts_ = double(n) / fps_;
+        return stillFrame_;
+    }
+    if (jxs_) {
+        // The frame shown at `t`, decoded once and kept while it is asked for again.
+        const int64_t n = std::clamp(int64_t(std::floor(std::min(std::max(0.0, t) * timeScale_ * fps_ + 1e-6, 1e15))), int64_t(0),
+                                     std::max<int64_t>(0, jxs_->info().frames - 1));
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        if (n != rawFrame_ || !raw_) {
+            if (!raw_ && !(raw_ = av_frame_alloc())) return nullptr;
+            rawFrame_ = -1;
+            if (!jxs_->frame(n, raw_)) return nullptr;
+            rawFrame_ = n;
+            stillFrame_.reset();
+        }
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_) ||
+            (stillFrame_->planes && !planes)) {
+            stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality, planes);
             stillHq_ = highQuality;
         }
         curPts_ = double(n) / fps_;
