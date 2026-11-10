@@ -37860,7 +37860,7 @@ if ui["pressed"] == "add":
             c.generator.params["shape"] = double(kind);
             c.generator.params["size"] = size;
             c.generator.params["pos_z"] = z;
-            c.generator.params["ground"] = 0.0;
+            c.generator.params["ground"] = 0.0, c.generator.params["rot_y"] = 0.0;  // (square on)
             c.generator.params["light_angle"] = 50.0, c.generator.params["light_height"] = 15.0;
             return c;
         };
@@ -37985,7 +37985,7 @@ if ui["pressed"] == "add":
             point.duration = 10;
             point.generator = makeEffect(p, "color");
             point.generator.params["color.r"] = 1.0, point.generator.params["color.g"] = 1.0, point.generator.params["color.b"] = 1.0;
-            point.motion.params["scale"] = 1.0;
+            point.motion.params["scale"] = 1.0;  // (under two pixels where it is)
             point.effects.push_back(makeEffect(p, "layer_3d"));  // (through the scene's camera)
             Clip camera;
             camera.id = p.newId();
@@ -38001,29 +38001,61 @@ if ui["pressed"] == "add":
             g.params["dof"] = 1.0, g.params["focus_distance"] = F, g.params["fstop"] = 1.4, g.params["blades"] = 6.0;
             const double r = -layer3dCoc(cam, W, 2 * F, F, 1.4, 1000);
             QVERIFY(r > 8 && r < 0.05 * W);
+            double cornerToCorner = 0;
             for (const double squeeze : {1.0, 2.0}) {
                 s.videoTracks[1].clips[0].generator.params["squeeze"] = squeeze;
                 const Image img = renderSequenceFrame(p, s, 3, o);
-                double peak = 0;
+                double peak = 0, cx = 0, cy = 0, sum = 0;
                 for (int y = 0; y < H; ++y)
-                    for (int x = 0; x < W; ++x) peak = std::max(peak, double(img.at(x, y)[3]));
+                    for (int x = 0; x < W; ++x) {
+                        const double a = img.at(x, y)[3];
+                        peak = std::max(peak, a), cx += (x + 0.5) * a, cy += (y + 0.5) * a, sum += a;
+                    }
                 QVERIFY(peak > 0);
-                // (its extent each way: the columns' and rows' most alpha against the whole's, summed)
-                double across = 0, down = 0;
-                for (int x = 0; x < W; ++x) {
-                    double m = 0;
-                    for (int y = 0; y < H; ++y) m = std::max(m, double(img.at(x, y)[3]));
-                    across += m / peak;
+                cx /= sum, cy /= sum;
+                // (its width along a direction `deg` from across: the pixels' most alpha by where they lie along it, in
+                // quarter pixels, between where that crosses half the whole's)
+                auto width = [&](double deg) {
+                    const double c = std::cos(deg * M_PI / 180), sn = std::sin(deg * M_PI / 180);
+                    const int bins = 4 * (W + H);
+                    std::vector<double> most(size_t(bins), -1.0);
+                    for (int y = 0; y < H; ++y)
+                        for (int x = 0; x < W; ++x) {
+                            const int b = int(std::lround(((x + 0.5 - cx) * c + (y + 0.5 - cy) * sn) * 4)) + bins / 2;
+                            if (b >= 0 && b < bins) most[size_t(b)] = std::max(most[size_t(b)], double(img.at(x, y)[3]) / peak);
+                        }
+                    // (bins with pixels in them only: along the axes the pixels fall in every fourth)
+                    std::vector<int> held;
+                    for (int b = 0; b < bins; ++b)
+                        if (most[size_t(b)] >= 0) held.push_back(b);
+                    int first = -1, last = -1;
+                    for (size_t k = 0; k < held.size(); ++k)
+                        if (most[size_t(held[k])] >= 0.5) last = int(k), first = first < 0 ? int(k) : first;
+                    if (first <= 0 || last + 1 >= int(held.size())) return 0.0;
+                    auto cross = [&](int from, int to) {  // (where the profile crosses a half between two bins' middles)
+                        const double u = most[size_t(from)], v = most[size_t(to)];
+                        return from + (to - from) * (0.5 - u) / (v - u);
+                    };
+                    return (cross(held[size_t(last)], held[size_t(last + 1)]) - cross(held[size_t(first - 1)], held[size_t(first)])) / 4;
+                };
+                const double flats = 2 * r * std::cos(M_PI / 6);  // (a hexagon in the circle, a corner across)
+                if (squeeze == 1) {
+                    // Flat to flat the same three ways, as wide as the thin lens makes it; corner to corner wider.
+                    for (const double deg : {30.0, 90.0, 150.0}) {
+                        const double got = width(deg);
+                        qInfo("bokeh: %.2f px flat to flat at %g° (the thin lens's hexagon: %.2f)", got, deg, flats);
+                        QVERIFY(std::fabs(got - flats) <= 1);
+                    }
+                    cornerToCorner = width(0);
+                    qInfo("bokeh: %.2f px corner to corner across (%.2f)", cornerToCorner, 2 * r);
+                    QVERIFY(cornerToCorner > flats + 1 && cornerToCorner <= 2 * r + 0.5);
+                } else {
+                    // Squeezed: twice as tall flat to flat, as wide corner to corner.
+                    const double down = width(90), across = width(0);
+                    qInfo("bokeh, squeeze 2: %.2f px down (%.2f), %.2f across (%.2f unsqueezed)", down, flats * 2, across, cornerToCorner);
+                    QVERIFY(std::fabs(down - flats * 2) <= 1);
+                    QVERIFY(std::fabs(across - cornerToCorner) <= 1);
                 }
-                for (int y = 0; y < H; ++y) {
-                    double m = 0;
-                    for (int x = 0; x < W; ++x) m = std::max(m, double(img.at(x, y)[3]));
-                    down += m / peak;
-                }
-                const double wantAcross = 2 * r, wantDown = 2 * r * std::cos(M_PI / 6) * squeeze;
-                qInfo("bokeh, squeeze %g: %.2f px across (a hexagon's %.2f), %.2f down (%.2f)", squeeze, across, wantAcross, down, wantDown);
-                QVERIFY(std::fabs(across - wantAcross) <= 1);
-                QVERIFY(std::fabs(down - wantDown) <= 1);
             }
             // Its own depth of field on a card seen through the camera is read into the camera when opened.
             Project q = p;
