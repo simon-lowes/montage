@@ -546,6 +546,8 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
             if (!w.empty()) w[0] = char(std::toupper(static_cast<unsigned char>(w[0])));
             issues.push_back({QcKind::EncodeQuality, in, std::min(out, in + 1), w});
         }
+        // (VMAF left unmeasured is a problem only where a VMAF limit was set)
+        if (!c.vmafNote.empty() && q.qualityLimits.minVmaf > 0) issues.push_back({QcKind::EncodeQuality, in, std::min(out, in + 1), c.vmafNote});
         for (const QualitySpan& sp : qualityOverLimits(c, q.qualityLimits)) issues.push_back({QcKind::EncodeQuality, sp.first, sp.end, sp.text});
         if (comparison) *comparison = c;
     }

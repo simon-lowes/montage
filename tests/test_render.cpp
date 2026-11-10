@@ -1023,7 +1023,9 @@ private slots:
             o.vmafModelDir = dir.path().toStdString();  // (nothing there)
             const EncodeComparison c = compareEncodeFiles(ref.toStdString(), dist.toStdString(), o);
             QVERIFY2(c.ok && !c.vmafScored && std::isnan(c.mean.vmaf) && c.mean.psnrY > 20, c.error.c_str());
-            QVERIFY(std::any_of(c.warnings.begin(), c.warnings.end(), [](const std::string& w) { return w.find("no HDR model") != std::string::npos; }));
+            // (said in its own note, not among the warnings Quality Check reports as problems)
+            QVERIFY(c.vmafNote.find("no HDR model") != std::string::npos);
+            QVERIFY(std::none_of(c.warnings.begin(), c.warnings.end(), [](const std::string& w) { return w.find("VMAF") != std::string::npos; }));
         }
     }
 
@@ -1041,10 +1043,13 @@ private slots:
         bars.effects.push_back(nz);
         s.videoTracks[0].clips.push_back(bars);
         s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.3f, 0.1f, 6, 4));
-        for (const bool ffv1 : {false, true}) {
+        // (and FFV1 4:2:2 in MOV, which keeps no chroma siting: read untagged, and sited as the export sites 4:2:2)
+        for (const int kind : {0, 1, 2}) {
+            const bool ffv1 = kind > 0;
             ExportSettings st;
-            st.path = (dir.path() + (ffv1 ? "/ffv1.mkv" : "/x264.mkv")).toStdString();
+            st.path = (dir.path() + (kind == 2 ? "/ffv1-422.mov" : ffv1 ? "/ffv1.mkv" : "/x264.mkv")).toStdString();
             st.videoCodec = ffv1 ? "ffv1" : "libx264";
+            if (kind == 2) st.pixFmt = "yuv422p";
             st.crf = 0;  // (lossless, QP 0)
             st.audioCodec = "none";
             std::string err;
@@ -23441,6 +23446,12 @@ colorspaces:
         // (its channels in the scheme ETSI TS 102 366 defines, stereo's mask, not MPEG's CICP)
         QVERIFY2(mpd.contains("schemeIdUri=\"tag:dolby.com,2014:dash:audio_channel_configuration:2011\" value=\"A000\"") && !mpd.contains("mpegB:cicp"),
                  qPrintable(mpd));
+        // (and from a stream's own channels: 5.1 with side or back surrounds, 7.1, LCR, quad and 5.0; the count without)
+        auto scheme = [](uint64_t mask, int n) { return QString::fromStdString(ac3DashChannelConfiguration(mask, n)); };
+        QVERIFY(scheme(AV_CH_LAYOUT_5POINT1, 6).contains("value=\"F801\"") && scheme(AV_CH_LAYOUT_5POINT1_BACK, 6).contains("value=\"F801\""));
+        QVERIFY(scheme(AV_CH_LAYOUT_7POINT1, 8).contains("value=\"FA01\"") && scheme(AV_CH_LAYOUT_SURROUND, 3).contains("value=\"E000\""));
+        QVERIFY(scheme(AV_CH_LAYOUT_QUAD, 4).contains("value=\"B800\"") && scheme(AV_CH_LAYOUT_5POINT0, 5).contains("value=\"F800\""));
+        QVERIFY(scheme(0, 2).contains("value=\"A000\"") && scheme(AV_CH_LAYOUT_MONO, 1).contains("value=\"4000\""));
         QFile init(pkg.filePath("a1_en/init.mp4"));
         QVERIFY(init.open(QIODevice::ReadOnly) && init.readAll().contains("dac3"));
         QVERIFY(pkg.exists("v1_180p_h264/seg00001.m4s"));

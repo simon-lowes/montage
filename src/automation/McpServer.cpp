@@ -6512,6 +6512,7 @@ void McpServer::Impl::addTools() {
                                  num(comparison.worst.ssim, 5), num(comparison.mean.msSsim, 5), num(comparison.mean.deltaItp, 3),
                                  num(comparison.worst.deltaItp, 3));
                 if (comparison.vmafScored) text += QStringLiteral(", VMAF %1 (worst %2)").arg(num(comparison.mean.vmaf, 2), num(comparison.worst.vmaf, 2));
+                else if (!comparison.vmafNote.empty()) text += QStringLiteral(" (%1)").arg(QString::fromStdString(comparison.vmafNote));
                 text += '\n';
                 if (!comparison.worstFrames.empty()) {
                     QStringList worst;

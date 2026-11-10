@@ -154,6 +154,7 @@ struct EncodeComparison {
     std::vector<FrameTime> worstFrames;  // the worst first
     bool vmafScored = false;
     std::string vmafModel;       // the model used
+    std::string vmafNote;        // why VMAF was asked for and not measured (HDR with no HDR model), else ""
     // How many frames each has after the alignment's offset is taken off (-1: not known), frames the decoder reported
     // damaged in the encode, and what is wrong but did not stop the comparison (frames missing or extra, damage).
     int64_t referenceFrames = -1, encodeFrames = -1;

@@ -1094,7 +1094,8 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
     if ((o.metrics & MetricVmaf) && vmafAvailable() && vmafMeasures(shape)) {
         res.vmafModel = vmafModelFor(shape, o);
         if (res.vmafModel.empty()) {
-            res.warnings.push_back("VMAF was not measured: libvmaf " + vmafVersion() + " has no HDR model, and none is in the VMAF models folder");
+            // (said apart from the warnings: VMAF is asked for by default, and an HDR encode is not wrong for it)
+            res.vmafNote = "VMAF was not measured: libvmaf " + vmafVersion() + " has no HDR model, and none is in the VMAF models folder";
         } else {
             vmaf = std::make_unique<VmafMeter>();
             std::string e;
@@ -1409,7 +1410,10 @@ struct ExportedPictures {
         av_frame_free(&frame);
     }
     bool convert(const Image& img, const QualityPicture& like, QualityPicture& out) {
-        const AVPixelFormat fmt = like.rgb ? AV_PIX_FMT_NONE : planarFormat(false, like.log2ChromaW, like.log2ChromaH, like.bits);
+        // (the export's scaler codes BT.709 and BT.2020 only: another matrix, BT.601's, from another tool's encode, as
+        // signalToPicture codes it)
+        const bool bt2020 = std::abs(like.kr - 0.2627) < 1e-3, bt709 = std::abs(like.kr - 0.2126) < 1e-3;
+        const AVPixelFormat fmt = like.rgb || !(bt709 || bt2020) ? AV_PIX_FMT_NONE : planarFormat(false, like.log2ChromaW, like.log2ChromaH, like.bits);
         if (fmt == AV_PIX_FMT_NONE) {
             if (img.width == like.width && img.height == like.height) {
                 signalToPicture(img, like, out);
@@ -1421,9 +1425,12 @@ struct ExportedPictures {
             }
             return true;
         }
-        // (sited as the encode is tagged, as the export sited it: untagged chroma is centred there too)
-        sws = exportPictureScaler(sws, img.width, img.height, like.width, like.height, fmt, AVChromaLocation(like.chromaLoc),
-                                  std::abs(like.kr - 0.2627) < 1e-3 ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709,
+        // (sited as the encode is tagged, as the export sited it: untagged 4:2:2 with the first luma sample of each
+        // pair, as the export makes it and Rec. 601 and 709 have it, where a container such as MOV drops the tag;
+        // other untagged chroma centred, as there)
+        AVChromaLocation loc = AVChromaLocation(like.chromaLoc);
+        if (loc == AVCHROMA_LOC_UNSPECIFIED && like.log2ChromaW == 1 && like.log2ChromaH == 0) loc = AVCHROMA_LOC_LEFT;
+        sws = exportPictureScaler(sws, img.width, img.height, like.width, like.height, fmt, loc, bt2020 ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709,
                                   like.fullRange ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG);
         if (!sws) return false;
         if (!frame || frame->format != fmt || frame->width != like.width || frame->height != like.height) {

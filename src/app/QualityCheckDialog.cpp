@@ -373,6 +373,7 @@ bool QualityCheckDialog::runCheck() {
                           .arg(QString::fromStdString(comparison_.format), num(comparison_.mean.psnrY, 2), num(comparison_.worst.psnrY, 2),
                                num(comparison_.mean.ssim, 4), num(comparison_.mean.msSsim, 4), num(comparison_.mean.deltaItp, 2));
         if (comparison_.vmafScored) text += tr("; VMAF %1").arg(num(comparison_.mean.vmaf, 1));
+        else if (!comparison_.vmafNote.empty()) text += tr("; VMAF not measured: no HDR VMAF model");
         if (comparison_.offset) text += ' ' + tr("(the encode is %n frame(s) off the sequence)", nullptr, std::abs(comparison_.offset));
         emit compared(sequence.id, revision);
     }

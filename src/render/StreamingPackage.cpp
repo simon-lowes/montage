@@ -497,6 +497,7 @@ struct AudioOut {
     std::string name, label, language;
     bool main = false, described = false;
     int channels = 2, sampleRate = 48000;
+    uint64_t channelMask = 0;  // (FFmpeg's AV_CH_* bits, 0 where not known)
     int stream = -1;
     AVRational tb{1, 1};
     std::unique_ptr<CmafTrack> track;
@@ -896,6 +897,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                 ao.label = (!given.empty() ? given : title ? std::string(title->value) : "Audio " + std::to_string(k + 1)) + " " + std::to_string(n);
             ao.described = (st->disposition & AV_DISPOSITION_DESCRIPTIONS) != 0;
             ao.channels = st->codecpar->ch_layout.nb_channels;
+            ao.channelMask = st->codecpar->ch_layout.order == AV_CHANNEL_ORDER_NATIVE ? st->codecpar->ch_layout.u.mask : 0;
             ao.sampleRate = st->codecpar->sample_rate;
             ao.name = "a" + std::to_string(k + 1) + "_" + pathName(ao.language);
             audio.push_back(std::move(ao));
@@ -1713,7 +1715,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                  "\" audioSamplingRate=\"" + std::to_string(ao.sampleRate) + "\">\n" +
                  // (AC-3 and E-AC-3 in the scheme ETSI TS 102 366 defines, as DASH-IF and DVB-DASH ask; the rest in MPEG's CICP)
                  (ao.codecs == "ac-3" || ao.codecs == "ec-3"
-                      ? ac3DashChannelConfiguration(ao.channels)
+                      ? ac3DashChannelConfiguration(ao.channelMask, ao.channels)
                       : "<AudioChannelConfiguration schemeIdUri=\"urn:mpeg:mpegB:cicp:ChannelConfiguration\" value=\"" +
                             std::to_string(ao.channels == 8 ? 12 : ao.channels) + "\"/>") +
                  "\n" + timeline(*ao.track, ao.name) + "</Representation>\n</AdaptationSet>\n";
