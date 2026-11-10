@@ -97,6 +97,7 @@ add_library(montage_engine STATIC
   media/CameraRaw.h media/CameraRaw.cpp
   media/DngOpcodes.h media/DngOpcodes.cpp
   media/ProResRaw.h media/ProResRaw.cpp
+  media/ProResEncoder.h media/ProResEncoder.cpp
   media/Mlv.h media/Mlv.cpp
   media/SuperScale.h media/SuperScale.cpp
   media/MotionDeblur.h media/MotionDeblur.cpp
