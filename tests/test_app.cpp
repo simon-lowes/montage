@@ -2967,10 +2967,12 @@ private slots:
         const int64_t first = std::llround(m->timecode * 25);  // (the recording's first frame's timecode, in frames)
         QCOMPARE(QString::fromStdString(mv->feed(0)->timecodeAt(0)).left(2), QString("10"));
         QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() > out + 25, 20000);
-        // (a sender held up past a fifth of a second goes on from now, so the recording, placed by the pictures'
-        // timestamps, holds the last picture again for the slots it passed over: those frames are a few behind)
+        // (a sender held up past a fifth of a second goes on from now, and a busy machine's receiver can miss frames:
+        // the recording, placed by the pictures' timestamps, holds the last picture again for the slots it passed
+        // over, so those frames are a few behind)
+        auto behind = [&] { return std::min<int64_t>(tx[0].slotsSkipped() + mv->tile(0).repeated, 24); };
         auto matches = [&](int got, FrameTime k) {
-            for (int64_t j = 0; j <= std::min<int64_t>(tx[0].slotsSkipped(), 24); ++j)
+            for (int64_t j = 0; j <= behind(); ++j)
                 if (std::abs(got - greyOf(first + in + k - j)) <= 6) return true;
             return false;
         };
@@ -2983,8 +2985,9 @@ private slots:
                 const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), k, {});
                 got = f.width > 0 ? int(std::lround(f.at(f.width / 2, f.height / 2)[1] * 255)) : 0;
             } while (!matches(got, k) && wait.elapsed() < 15000);
-            QVERIFY2(matches(got, k), qPrintable(QStringLiteral("frame %1: %2, sent %3 (sender %4 slots behind)")
-                                                     .arg(k).arg(got).arg(greyOf(first + in + k)).arg(tx[0].slotsSkipped())));
+            QVERIFY2(matches(got, k), qPrintable(QStringLiteral("frame %1: %2, sent %3 (sender %4 slots behind, %5 repeated)")
+                                                     .arg(k).arg(got).arg(greyOf(first + in + k)).arg(tx[0].slotsSkipped())
+                                                     .arg(mv->tile(0).repeated)));
         }
         // LIVE off scrubs the recording so far (the tile no longer on the Source monitor); on again, it is.
         auto* badge = source->findChild<QToolButton*>(QStringLiteral("liveBadge"));

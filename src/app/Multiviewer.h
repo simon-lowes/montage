@@ -52,6 +52,7 @@ public:
         int width = 0, height = 0;
         std::vector<float> peaks;
         QString path;            // being or last recorded
+        int64_t repeated = 0;    // pictures the recording holds again for frames that did not come
         Id media = 0;            // its media item, once imported
         QString error;           // why it is not showing
     };

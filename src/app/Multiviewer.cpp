@@ -266,6 +266,7 @@ Multiviewer::Tile Multiviewer::tile(int i) const {
     t.width = now.width, t.height = now.height;
     t.peaks = now.peaks;
     t.path = s.path;
+    if (s.recorder) t.repeated = s.recorder->status().repeated;
     t.media = s.media;
     t.error = s.error;
     return t;
