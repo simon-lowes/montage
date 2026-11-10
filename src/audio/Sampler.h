@@ -11,9 +11,15 @@
 // recorded pass keeps its notes (at the sample the picture showed when each key went down, so the output latency is
 // taken off) and is rendered to a file that goes onto a take lane as an ordinary clip; voicing it again renders the
 // same notes, with the same timing and variation, through the slots as they are now.
+//
+// Long sounds (ambiences, room tones, long cloth passes) are not held in memory whole: their first second is, and the
+// rest is read from disk as they play (a thread fills each voice's window ahead of it). A slot's velocity curve
+// shapes how the force a key is played with comes out; a slot can send its part of a pass to another track (its own
+// lane and strip); and a pass can be placed as one clip a hit.
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -28,12 +34,24 @@
 
 namespace montage::sampler {
 
+// Velocity in, through the slot's curve, to velocity out (1-127): what sets its level and the layer that answers.
+int curveVelocity(const SamplerSlot& slot, int velocity);
+
+// A long sound's frames on disk: 32-bit float stereo at the kit's rate, decoded once into a cache file.
+struct DiskSound {
+    std::string file;
+    int64_t frames = 0;
+};
+
 // A track's slots with their sounds decoded at the rate they are played at.
 struct Kit {
     struct Sound {
-        AudioBufferPtr buffer;  // stereo at the kit's rate
-        int64_t start = 0, end = 0;
+        AudioBufferPtr buffer;  // stereo at the kit's rate: the whole file, or for a streamed sound its first frames
+        int64_t start = 0, end = 0;  // frames of the file
         int velLow = 1, velHigh = 127;
+        // Streamed: `buffer` holds frames start .. start + head, and the rest comes from `disk`.
+        std::shared_ptr<const DiskSound> disk;
+        int64_t head = 0;
     };
     struct Slot {
         SamplerSlot settings;
@@ -47,9 +65,25 @@ struct Kit {
 using KitPtr = std::shared_ptr<const Kit>;
 using Loader = std::function<AudioBufferPtr(const std::string& path, int sampleRate, std::string* error)>;
 
-// Decodes a sampler's sounds (through `load`, by default the media pool's decoder); files that cannot be read are
-// listed in `missing` and left out.
-KitPtr loadKit(const SamplerSettings& settings, int sampleRate, std::vector<std::string>* missing = nullptr, const Loader& load = {});
+// Which sounds are streamed from disk: those longer than `longerThan` seconds (never when 0), their first
+// `headSeconds` kept in memory, the rest decoded into a cache file under `cacheDir` ("" the system's temporary folder).
+struct StreamOptions {
+    double longerThan = 20;
+    double headSeconds = 1;
+    std::string cacheDir;
+};
+
+// Decodes a sampler's sounds (through `load`, by default the media pool's decoder; long ones, by default, in blocks
+// straight into their cache file); files that cannot be read are listed in `missing` and left out.
+KitPtr loadKit(const SamplerSettings& settings, int sampleRate, std::vector<std::string>* missing = nullptr, const Loader& load = {},
+               const StreamOptions& stream = {});
+// A kit of only the slots sent to `output` (SamplerSlot::output; 0 the sampler's own track), sharing their sounds.
+KitPtr kitFor(const KitPtr& kit, Id output);
+
+// Streaming from disk: every read takes at least this long a megabyte (tests: a slow disk), and the frames played as
+// silence because the disk had not caught up, since Montage started.
+void setDiskThrottle(double secondsPerMegabyte);
+int64_t streamUnderruns();
 
 // The seed of the n-th note of a pass (its pitch and level variation).
 uint32_t noteSeed(uint32_t passSeed, size_t index);
@@ -57,7 +91,11 @@ uint32_t noteSeed(uint32_t passSeed, size_t index);
 class Engine {
 public:
     explicit Engine(int sampleRate = 48000);
+    ~Engine();
     int sampleRate() const { return rate_; }
+    // Offline renders (passes) wait for the disk where a streamed sound has not been read yet, rather than play
+    // silence there as the audio thread does.
+    void setBlocking(bool on) { blocking_ = on; }
     // The sounds (any thread); voices already sounding keep theirs.
     void setKit(KitPtr kit);
     KitPtr kit() const;
@@ -81,9 +119,12 @@ private:
         uint64_t order = 0;
         uint64_t id = 0;
     };
+    struct Window;
+    struct Disk;
     struct Voice {
         KitPtr kit;
         const Kit::Sound* sound = nullptr;
+        Window* window = nullptr;  // a streamed sound's frames past its head, read ahead from disk
         int key = 0, choke = 0;
         uint64_t id = 0;
         bool oneShot = true;
@@ -99,6 +140,7 @@ private:
     void startVoice(const Event& e, const KitPtr& kit);
     void release(int key, uint64_t id);
     void renderVoices(float* out, int frames);
+    void letGo(Voice& v);  // its window back to the disk thread
 
     int rate_;
     int64_t chokeLen_;
@@ -112,6 +154,8 @@ private:
     std::vector<std::pair<int, int>> robinKeys_;  // (key, first sound index) -> turn, as a small list
     std::vector<uint32_t> robinTurns_;
     bool resetPending_ = false;
+    bool blocking_ = false;
+    std::shared_ptr<Disk> disk_;  // (made by setKit for a kit with streamed sounds)
 };
 
 // A pass's notes rendered (stereo, interleaved) from timeline sample `start`, in the order given (the order they were
@@ -136,6 +180,9 @@ edit::Result addSlices(Sequence& s, TrackRef track, const std::string& path, con
 // A recorded pass: its notes rendered through `kit` to `file` (from the frame of its first note, or `from` when that
 // is earlier, by at most two seconds), the file added to the project and put on a new take lane, the lane given to the comp over the pass,
 // and the notes kept. created: the lane, then the comp clip.
+// Slots sent to other tracks have their part rendered on its own onto a lane of that track (its file named after
+// `file` with the track's id), kept as a pass of this track's that names it. With clip-per-hit on, each comp is cut at
+// every later note.
 edit::Result addPass(Project& p, Sequence& s, TrackRef track, const KitPtr& kit, std::vector<SamplerNote> notes, uint32_t seed,
                      const std::string& file, FrameTime from = -1, const std::string& name = {});
 // A pass voiced again through `kit` (the track's slots as they are now) into `file`, with the same notes and timing:

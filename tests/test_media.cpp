@@ -10858,6 +10858,146 @@ private slots:
         QVERIFY(v.active()->audioTracks[0].sampler.passes.empty());
     }
 
+    void samplerCurvesOutputsAndLongSounds() {
+        // Over MCP: a slot's velocity curve, a slot recorded onto another track, a pass placed as one clip a hit, and that
+        // part voiced again where it went; then a long file streamed from disk by default, the same sound sample for
+        // sample as when it is read whole.
+        const int rate = 48000;
+        std::mt19937 rng(11);
+        std::uniform_real_distribution<float> noise(-1.0f, 1.0f);
+        auto burst = [&](double seconds, double decay, float level) {
+            std::vector<float> x(size_t(seconds * rate));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = level * noise(rng) * float(std::exp(-double(i) / (decay * rate)));
+            return x;
+        };
+        const std::string kick = path("curve-kick.wav"), hat = path("curve-hat.wav");
+        QVERIFY(writeMonoWav(kick, burst(0.2, 0.03, 0.6f), rate));
+        QVERIFY(writeMonoWav(hat, burst(0.1, 0.01, 0.3f), rate));
+        Project p = makeDefaultProject();
+        while (p.active()->audioTracks.size() < 2) edit::addTrack(p, *p.active(), TrackKind::Audio);
+        const QString project = QString::fromStdString(path("sampler-outputs.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_sampler"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"action", "load"}, {"key", 60}, {"file", QString::fromStdString(kick)}, {"velocity_curve", "hard"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "load"}, {"key", 62}, {"file", QString::fromStdString(hat)}, {"output", "A2"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(call({{"action", "load"}, {"key", 60}, {"velocity_curve", "steep"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "load"}, {"key", 62}, {"output", "V1"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "load"}, {"key", 64}, {"gain", -3}}).value("isError").toBool());  // (no sounds there yet)
+        // Drawn: soft below the middle, full above it; the slot's sound kept.
+        r = call({{"action", "load"}, {"key", 60}, {"velocity_points", QJsonArray{QJsonArray{1, 1}, QJsonArray{64, 32}, QJsonArray{96, 127}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "show"}});
+        const QJsonArray pads = r.value("structuredContent").toObject().value("slots").toArray();
+        QCOMPARE(pads.size(), qsizetype(2));
+        QCOMPARE(pads[0].toObject().value("velocity_curve").toString(), QString("drawn"));
+        QCOMPARE(pads[0].toObject().value("velocity_points").toArray().size(), qsizetype(3));
+        QCOMPARE(pads[0].toObject().value("sounds").toArray().size(), qsizetype(1));
+        QCOMPARE(pads[1].toObject().value("output").toString(), QString("A2"));
+        QCOMPARE(pads[0].toObject().value("output").toString(), QString());
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            const SamplerSlot& sl = q.active()->audioTracks[0].sampler.pads[0];
+            QCOMPARE(sl.velocityCurve, 3);
+            QCOMPARE(sampler::curveVelocity(sl, 64), 32);
+            QCOMPARE(sampler::curveVelocity(sl, 80), 80);  // (half way from 32 to 127)
+            QCOMPARE(sampler::curveVelocity(sl, 110), 127);
+            QCOMPARE(q.active()->audioTracks[0].sampler.pads[1].output, q.active()->audioTracks[1].id);
+        }
+        // A pass, one clip a hit: the kicks on A1, the hats on A2 (each on a lane of its own track).
+        const QJsonArray notes{QJsonObject{{"key", 60}, {"velocity", 64}, {"at", 1.0}}, QJsonObject{{"key", 62}, {"at", 1.2}},
+                               QJsonObject{{"key", 60}, {"velocity", 120}, {"at", 1.6}}, QJsonObject{{"key", 62}, {"at", 2.0}},
+                               QJsonObject{{"key", 62}, {"at", 2.4}}};
+        r = call({{"action", "play"}, {"notes", notes}, {"clip_per_hit", true}, {"seed", 4}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        const Track& a1 = q.active()->audioTracks[0];
+        const Track& a2 = q.active()->audioTracks[1];
+        QVERIFY(a1.sampler.clipPerHit);
+        QCOMPARE(a1.sampler.passes.size(), size_t(2));
+        QCOMPARE(a1.lanes.size(), size_t(1));
+        QCOMPARE(a2.lanes.size(), size_t(1));
+        QCOMPARE(a1.sampler.passes[0].lane, a1.lanes[0].id);
+        QCOMPARE(a1.sampler.passes[1].lane, a2.lanes[0].id);
+        QCOMPARE(a1.sampler.passes[1].track, a2.id);
+        QCOMPARE(a1.lanes[0].start, a2.lanes[0].start);  // (the parts of one pass, at the same samples)
+        // A clip a hit: A1's two kicks at 1.0 and 1.6 s, A2's three hats from 1.2 s (frames at 30 fps).
+        QCOMPARE(a1.clips.size(), size_t(2));
+        QCOMPARE(a1.clips[0].start, FrameTime(30));
+        QCOMPARE(a1.clips[1].start, FrameTime(48));
+        QCOMPARE(a2.clips.size(), size_t(3));
+        QCOMPARE(a2.clips[0].start, FrameTime(36));
+        QCOMPARE(a2.clips[1].start, FrameTime(60));
+        QCOMPARE(a2.clips[2].start, FrameTime(72));
+        for (const Clip& c : a2.clips) QCOMPARE(c.mediaId, a2.lanes[0].mediaId);
+        // Each part heard on its own track: the kicks' render on A1's lane, the hats' on A2's, nothing of the other.
+        const sampler::KitPtr kit = sampler::loadKit(a1.sampler, rate);
+        const SamplerPass& hats = a1.sampler.passes[1];
+        const int64_t from = std::llround(double(a1.lanes[0].start) * rate / q.active()->fpsValue());
+        const std::vector<float> wantHats = sampler::renderNotes(sampler::kitFor(kit, a2.id), hats.notes, hats.seed, from, 2 * rate);
+        const std::vector<float> wantKicks = sampler::renderNotes(sampler::kitFor(kit, 0), hats.notes, hats.seed, from, 2 * rate);
+        auto peakAt = [](const std::vector<float>& v, double s0, double s1, int64_t base) {
+            double m = 0;
+            for (int64_t i = std::llround(s0 * 48000) - base; i < std::llround(s1 * 48000) - base; ++i) m = std::max(m, double(std::fabs(v[size_t(i) * 2])));
+            return m;
+        };
+        QVERIFY(peakAt(wantHats, 1.2, 1.3, from) > 0.05 && peakAt(wantHats, 1.0, 1.15, from) == 0);
+        QVERIFY(peakAt(wantKicks, 1.0, 1.15, from) > 0.05 && peakAt(wantKicks, 1.2, 1.55, from) < 0.05);
+        // The hats voiced again on A2 (by the lane over there): A2's lane takes the new sound, A1's keeps its own.
+        r = call({{"action", "load"}, {"key", 62}, {"file", QString::fromStdString(kick)}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "revoice"}, {"lane", double(a2.lanes[0].id)}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project v;
+        QVERIFY(loadProject(project.toStdString(), v));
+        QVERIFY(v.active()->audioTracks[1].lanes[0].mediaId != a2.lanes[0].mediaId);
+        QCOMPARE(v.active()->audioTracks[0].lanes[0].mediaId, a1.lanes[0].mediaId);
+        for (const Clip& c : v.active()->audioTracks[1].clips) QCOMPARE(c.mediaId, v.active()->audioTracks[1].lanes[0].mediaId);
+        QCOMPARE(v.active()->audioTracks[1].clips.size(), size_t(3));
+
+        // A long file (25 seconds) streamed by default: decoded in blocks to a cache file, played from it, the same
+        // sound sample for sample as the media pool's whole decode of it.
+        std::vector<float> longSound(size_t(25) * rate);
+        for (size_t i = 0; i < longSound.size(); ++i) longSound[i] = float(0.3 * std::sin(double(i) * 0.021)) + 0.05f * noise(rng);
+        const std::string longFile = path("sampler-long.wav");
+        QVERIFY(writeMonoWav(longFile, longSound, rate));
+        SamplerSettings st;
+        SamplerSlot sl;
+        sl.key = 40;
+        sl.sounds = {{longFile, 0.5, 0, 1, 127}};
+        st.pads = {sl};
+        QTemporaryDir cache;
+        sampler::StreamOptions streamed;
+        streamed.cacheDir = cache.path().toStdString();
+        sampler::StreamOptions whole;
+        whole.longerThan = 0;
+        const sampler::KitPtr disk = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        const sampler::KitPtr memory = sampler::loadKit(st, rate, nullptr, {}, whole);
+        QVERIFY(disk->pads[0].sounds[0].disk && !memory->pads[0].sounds[0].disk);
+        QCOMPARE(disk->pads[0].sounds[0].end - disk->pads[0].sounds[0].start, memory->pads[0].sounds[0].end - memory->pads[0].sounds[0].start);
+        const std::vector<SamplerNote> held{{40, 100, rate / 10, int64_t(26) * rate}};
+        const std::vector<float> a = sampler::renderNotes(disk, held, 1, 0, int64_t(26) * rate);
+        const std::vector<float> b = sampler::renderNotes(memory, held, 1, 0, int64_t(26) * rate);
+        QCOMPARE(a.size(), b.size());
+        QVERIFY(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+        double energy = 0;
+        for (float x : a) energy += double(x) * x;
+        QVERIFY(energy > 1000);
+    }
+
     void mcpMidiMap() {
         // MIDI Learn's maps edited over MCP: a mapping added, shown, replaced and removed, in the file the app reads.
         QTemporaryDir dir;

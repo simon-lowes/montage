@@ -6040,7 +6040,11 @@ void McpServer::Impl::addTools() {
         "in one recording (Split by Onsets) and puts them on successive keys from `key`. remove clears a key. play "
         "records a pass from a list of notes (key, velocity, at, length in seconds or timecode): rendered to a WAV file "
         "beside the project, put on a new take lane and given to the comp, its notes kept. revoice renders a pass's notes "
-        "again through the slots as they are now, with the same timing.",
+        "again through the slots as they are now, with the same timing. A slot's velocity_curve (linear, soft, hard, or "
+        "drawn through velocity_points, [in, out] pairs 1-127) shapes how the force played comes out; its output (a track, "
+        "\"\" this one) records its part of each pass onto that track's own lane; clip_per_hit (play) places a pass as "
+        "one clip a note. load without files changes a slot's settings. Sounds longer than 20 seconds are streamed from "
+        "disk as they play, their first second in memory.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
             "action":{"type":"string","enum":["show","load","slice","remove","play","revoice"]},
             "key":{"type":"integer","description":"A MIDI key 0-127 (load, remove; slice: the first key)"},
@@ -6050,6 +6054,10 @@ void McpServer::Impl::addTools() {
             "name":{"type":"string"},"gain":{"type":"number","description":"dB"},"attack":{"type":"number"},"release":{"type":"number"},
             "one_shot":{"type":"boolean"},"choke":{"type":"integer","description":"0 none, 1-16"},
             "pitch_variation":{"type":"number","description":"± semitones"},"level_variation":{"type":"number","description":"± dB"},
+            "velocity_curve":{"type":"string","enum":["linear","soft","hard","drawn"]},
+            "velocity_points":{"type":"array","items":{"type":"array","items":{"type":"integer"}},"description":"drawn: [velocity in, velocity out] pairs"},
+            "output":{"type":"string","description":"The track this slot's part of a pass is recorded onto (A2...; \"\" this one)"},
+            "clip_per_hit":{"type":"boolean","description":"play: one clip a note (kept for the track's later passes)"},
             "sensitivity":{"type":"number","default":50},"min_gap":{"type":"number","default":0.05},
             "notes":{"type":"array","items":{"type":"object","properties":{"key":{"type":"integer"},"velocity":{"type":"integer","default":100},
                 "at":{"type":["number","string"]},"length":{"type":"number","default":0.1}},"required":["key","at"]}},
@@ -6066,11 +6074,11 @@ void McpServer::Impl::addTools() {
                 if (!v.isDouble() || v.toInt() < 0 || v.toInt() > 127) throw ArgError{QStringLiteral("\"key\" must be a MIDI key, 0 to 127")};
                 return v.toInt();
             };
-            auto files = [&]() {
+            auto files = [&](bool optional = false) {
                 QStringList out;
                 if (a.contains("file")) out << absolute(need(a, "file"));
                 for (const QJsonValue& v : a.value("files").toArray()) out << absolute(v.toString());
-                if (out.isEmpty()) throw ArgError{QStringLiteral("\"file\" or \"files\" is required")};
+                if (out.isEmpty() && !optional) throw ArgError{QStringLiteral("\"file\" or \"files\" is required")};
                 for (const QString& f : out)
                     if (!QFileInfo::exists(f)) throw ArgError{QStringLiteral("No file %1").arg(f)};
                 return out;
@@ -6091,6 +6099,17 @@ void McpServer::Impl::addTools() {
             };
             const Track& t0 = *trackAt(s, track);
             const QString trackName = t0.name.empty() ? QStringLiteral("A%1").arg(track.index + 1) : QString::fromStdString(t0.name);
+            static const char* const curveNames[] = {"linear", "soft", "hard", "drawn"};
+            auto points = [](const SamplerSlot& sl) {
+                QJsonArray out;
+                for (const auto& [in, o] : sl.velocityPoints) out.append(QJsonArray{in, o});
+                return out;
+            };
+            auto outputName = [&](Id id) {
+                for (size_t i = 0; i < s.audioTracks.size(); ++i)
+                    if (id && s.audioTracks[i].id == id) return QStringLiteral("A%1").arg(i + 1);
+                return QString();
+            };
             if (action == "show") {
                 QJsonArray pads, passes;
                 QString text;
@@ -6100,7 +6119,9 @@ void McpServer::Impl::addTools() {
                         sounds.append(QJsonObject{{"file", QString::fromStdString(sd.path)}, {"start", sd.start}, {"end", sd.end}, {"vel_low", sd.velLow}, {"vel_high", sd.velHigh}});
                     pads.append(QJsonObject{{"key", sl.key}, {"name", QString::fromStdString(sl.name)}, {"sounds", sounds}, {"gain", sl.gainDb},
                                              {"attack", sl.attack}, {"release", sl.release}, {"one_shot", sl.oneShot}, {"choke", sl.choke},
-                                             {"pitch_variation", sl.pitchVariation}, {"level_variation", sl.levelVariation}});
+                                             {"pitch_variation", sl.pitchVariation}, {"level_variation", sl.levelVariation},
+                                             {"velocity_curve", QString::fromLatin1(curveNames[std::clamp(sl.velocityCurve, 0, 3)])},
+                                             {"velocity_points", points(sl)}, {"output", outputName(sl.output)}});
                     text += QStringLiteral("Key %1 %2: %3 sound(s)%4\n").arg(sl.key).arg(QString::fromStdString(sl.name)).arg(sl.sounds.size())
                                 .arg(sl.choke ? QStringLiteral(", choke group %1").arg(sl.choke) : QString());
                 }
@@ -6121,10 +6142,38 @@ void McpServer::Impl::addTools() {
                 sl.key = key;
                 for (const SamplerSlot& e : t0.sampler.pads)
                     if (e.key == key) sl = e;
-                if (!a.value("add").toBool(false)) sl.sounds.clear();
+                // (no files: the slot's settings changed, its sounds kept)
+                const QStringList given = files(!sl.sounds.empty());
+                if (!given.isEmpty() && !a.value("add").toBool(false)) sl.sounds.clear();
                 const int lo = std::clamp(a.value("vel_low").toInt(1), 1, 127), hi = std::clamp(a.value("vel_high").toInt(127), lo, 127);
-                for (const QString& f : files())
+                for (const QString& f : given)
                     sl.sounds.push_back({f.toStdString(), std::max(0.0, a.value("start").toDouble(0)), std::max(0.0, a.value("end").toDouble(0)), lo, hi});
+                if (a.contains("velocity_curve")) {
+                    const QString c = str(a, "velocity_curve");
+                    int k = -1;
+                    for (int i = 0; i < 4; ++i)
+                        if (c == QLatin1String(curveNames[i])) k = i;
+                    if (k < 0) throw ArgError{QStringLiteral("\"velocity_curve\" is linear, soft, hard or drawn")};
+                    sl.velocityCurve = k;
+                }
+                if (a.contains("velocity_points")) {
+                    sl.velocityPoints.clear();
+                    for (const QJsonValue& v : a.value("velocity_points").toArray()) {
+                        const QJsonArray pt = v.toArray();
+                        if (pt.size() != 2) throw ArgError{QStringLiteral("Each of \"velocity_points\" is [velocity in, velocity out]")};
+                        sl.velocityPoints.push_back({std::clamp(pt[0].toInt(), 1, 127), std::clamp(pt[1].toInt(), 1, 127)});
+                    }
+                    if (!a.contains("velocity_curve")) sl.velocityCurve = 3;
+                }
+                if (a.contains("output")) {
+                    const QString o = str(a, "output");
+                    if (o.isEmpty()) sl.output = 0;
+                    else {
+                        const TrackRef to = trackArg(o, s, false);
+                        if (to.kind != TrackKind::Audio) throw ArgError{QStringLiteral("A slot's output is an audio track")};
+                        sl.output = to == track ? 0 : trackAt(s, to)->id;
+                    }
+                }
                 if (a.contains("name")) sl.name = str(a, "name").toStdString();
                 else if (sl.name.empty()) sl.name = QFileInfo(QString::fromStdString(sl.sounds.front().path)).completeBaseName().toStdString();
                 if (a.contains("gain")) sl.gainDb = std::clamp(a.value("gain").toDouble(), -96.0, 24.0);
@@ -6177,20 +6226,28 @@ void McpServer::Impl::addTools() {
                 }
                 if (notes.empty()) throw ArgError{QStringLiteral("\"notes\" is required")};
                 const uint32_t seed = uint32_t(a.value("seed").toInt(1));
+                if (a.contains("clip_per_hit")) trackAt(s, track)->sampler.clipPerHit = a.value("clip_per_hit").toBool();
                 const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
                 edit::Result r = sampler::addPass(l.project, s, track, kit(), notes, seed, file.toStdString());
                 check(r);
                 save(l);
-                const TakeLane* ln = edit::findTakeLane(*trackAt(s, track), r.created.front());
+                // (the first lane made: this track's, or the first track a slot sends to)
+                const TakeLane* ln = nullptr;
+                for (const Track& t : s.audioTracks)
+                    if (!ln) ln = edit::findTakeLane(t, r.created.front());
                 return ok(QStringLiteral("%1 note(s) recorded to lane %2 (%3)").arg(notes.size()).arg(QString::fromStdString(ln->name), file),
                           {{"lane", double(ln->id)}, {"lane_name", QString::fromStdString(ln->name)}, {"file", file}, {"start", secs(ln->start, s)}});
             }
             if (action == "revoice") {
                 const QJsonValue v = a.value("lane");
                 Id lane = 0;
-                for (const TakeLane& ln : t0.lanes)
-                    if ((v.isDouble() && ln.id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(ln.name).compare(v.toString(), Qt::CaseInsensitive) == 0))
-                        lane = ln.id;
+                // (this track's passes: their lanes here, or on the tracks its slots send to)
+                for (const SamplerPass& ps : t0.sampler.passes)
+                    for (const Track& t : s.audioTracks)
+                        if (const TakeLane* ln = edit::findTakeLane(t, ps.lane))
+                            if ((v.isDouble() && ln->id == Id(v.toDouble())) ||
+                                (v.isString() && QString::fromStdString(ln->name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                                lane = ln->id;
                 if (!lane) throw ArgError{QStringLiteral("No such lane on that track (see action show)")};
                 const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
                 check(sampler::revoicePass(l.project, s, track, lane, kit(), file.toStdString()));

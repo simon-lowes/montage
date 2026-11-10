@@ -1,6 +1,8 @@
 // Engine tests: keyframes, timecode, edit operations, undo, project I/O.
 #include <QtTest>
 #include <QElapsedTimer>
+#include <QThread>
+#include <QFileInfo>
 #include <QTemporaryDir>
 #include <QImage>
 #include <cmath>
@@ -1704,6 +1706,176 @@ private slots:
                 QVERIFY(near(slices[size_t(i)].second, i < 19 ? slices[size_t(i) + 1].first : 10.0));
             }
         }
+    }
+
+    void samplerVelocityCurves() {
+        using namespace sampler;
+        // Every velocity 1-127 as the curve says: as played, soft (light playing louder), hard, and drawn.
+        SamplerSlot sl;
+        for (int v = 1; v <= 127; ++v) QCOMPARE(curveVelocity(sl, v), v);
+        QCOMPARE(curveVelocity(sl, 0), 1);
+        QCOMPARE(curveVelocity(sl, 200), 127);
+        sl.velocityCurve = 1;
+        for (int v = 1; v <= 127; ++v) {
+            QCOMPARE(curveVelocity(sl, v), int(std::lround(127 * std::sqrt(v / 127.0))));
+            QVERIFY(curveVelocity(sl, v) >= v);
+            if (v > 1) QVERIFY(curveVelocity(sl, v) >= curveVelocity(sl, v - 1));
+        }
+        QCOMPARE(curveVelocity(sl, 64), 90);
+        sl.velocityCurve = 2;
+        for (int v = 1; v <= 127; ++v) {
+            QCOMPARE(curveVelocity(sl, v), std::max(1, int(std::lround(127 * std::pow(v / 127.0, 2.0)))));
+            QVERIFY(curveVelocity(sl, v) <= v);
+        }
+        QCOMPARE(curveVelocity(sl, 64), 32);
+        sl.velocityCurve = 3;
+        sl.velocityPoints = {{127, 100}, {1, 20}, {64, 64}};  // (in any order)
+        QCOMPARE(curveVelocity(sl, 1), 20);
+        QCOMPARE(curveVelocity(sl, 32), 42);
+        QCOMPARE(curveVelocity(sl, 64), 64);
+        QCOMPARE(curveVelocity(sl, 96), 82);
+        QCOMPARE(curveVelocity(sl, 127), 100);
+        sl.velocityPoints = {{40, 10}, {80, 120}};  // (level outside the points)
+        QCOMPARE(curveVelocity(sl, 5), 10);
+        QCOMPARE(curveVelocity(sl, 60), 65);
+        QCOMPARE(curveVelocity(sl, 110), 120);
+        sl.velocityPoints.clear();
+        QCOMPARE(curveVelocity(sl, 77), 77);  // (drawn with no points: as played)
+
+        // Through the engine: the curved velocity picks the layer and sets the level.
+        const int rate = 48000;
+        auto level = [&](float v) {
+            auto b = std::make_shared<AudioBuffer>();
+            b->sampleRate = rate, b->channels = 2;
+            b->samples.assign(size_t(400) * 2, v);
+            return AudioBufferPtr(b);
+        };
+        std::map<std::string, AudioBufferPtr> files{{"soft", level(0.5f)}, {"loud", level(1.0f)}};
+        const Loader load = [&](const std::string& path, int, std::string*) { return files.at(path); };
+        SamplerSettings st;
+        SamplerSlot layered;
+        layered.key = 40;
+        layered.sounds = {{"soft", 0, 0, 1, 63}, {"loud", 0, 0, 64, 127}};
+        layered.velocityCurve = 1;
+        st.pads.push_back(layered);
+        Engine e(rate);
+        e.setKit(loadKit(st, rate, nullptr, load));
+        auto hit = [&](int velocity) {
+            std::vector<float> out(64 * 2, 0.0f);
+            e.reset();
+            e.noteOn(40, velocity, 0);
+            e.render(0, 64, out.data());
+            return out[10];
+        };
+        QVERIFY(std::fabs(hit(40) - 71 / 127.0) < 1e-6);        // (40 comes out 71: the loud layer)
+        QVERIFY(std::fabs(hit(10) - 0.5 * 36 / 127.0) < 1e-6);  // (10 comes out 36: the soft one)
+        st.pads[0].velocityCurve = 2;
+        e.setKit(loadKit(st, rate, nullptr, load));
+        QVERIFY(std::fabs(hit(100) - 79 / 127.0) < 1e-6);       // (hard: 100 comes out 79)
+        QVERIFY(std::fabs(hit(80) - 0.5 * 50 / 127.0) < 1e-6);  // (80 comes out 50: the soft layer)
+    }
+
+    void samplerStreamsLongSounds() {
+        using namespace sampler;
+        // A ten-minute sound (thirty seconds under valgrind: MONTAGE_TEST_SHORT) streamed from a slow disk, its first second
+        // in memory: played offline (as a pass is rendered) it is the same sound sample for sample as when it is held in
+        // memory whole, and played block by block at the device's pace no frame comes late.
+        const int rate = 48000;
+        const int64_t frames = int64_t(rate) * (qEnvironmentVariableIsSet("MONTAGE_TEST_SHORT") ? 30 : 600);
+        auto whole = std::make_shared<AudioBuffer>();
+        whole->sampleRate = rate, whole->channels = 2;
+        whole->samples.resize(size_t(frames) * 2);
+        uint32_t x = 12345;
+        for (int64_t i = 0; i < frames; ++i) {
+            x = x * 1664525u + 1013904223u;  // (no two stretches alike)
+            whole->samples[size_t(i) * 2] = float(0.4 * std::sin(double(i) * 0.0131)) + float(x >> 8) / float(1 << 24) * 0.1f;
+            whole->samples[size_t(i) * 2 + 1] = float((i % 9973) - 4986) / 9973.0f;
+        }
+        const Loader load = [&](const std::string&, int, std::string*) { return AudioBufferPtr(whole); };
+        SamplerSettings st;
+        SamplerSlot all, stretch;
+        all.key = 60;
+        all.sounds = {{"long", 0, 0, 1, 127}};
+        stretch.key = 61;
+        stretch.sounds = {{"long", 12.5, 0, 1, 127}};  // (from 12.5 s into the file)
+        st.pads = {all, stretch};
+        QTemporaryDir cache;
+        StreamOptions never;
+        never.longerThan = 0;
+        StreamOptions streamed;
+        streamed.longerThan = 10;  // (the stretch from 12.5 s is streamed too in the thirty-second run)
+        streamed.cacheDir = cache.path().toStdString();
+        KitPtr memory = loadKit(st, rate, nullptr, load, never);
+        KitPtr disk = loadKit(st, rate, nullptr, load, streamed);
+        QVERIFY(!memory->pads[0].sounds[0].disk);
+        const Kit::Sound& sd = disk->pads[0].sounds[0];
+        QVERIFY(sd.disk && sd.head == rate && sd.buffer->frames() == rate && sd.end == frames);
+        QVERIFY(disk->pads[1].sounds[0].disk && disk->pads[1].sounds[0].start == std::llround(12.5 * rate));
+        const std::string cacheFile = sd.disk->file;
+        QVERIFY(QFileInfo::exists(QString::fromStdString(cacheFile)));
+        {
+            // Offline, the disk at 100 MB/s: both keys, the second a little later.
+            setDiskThrottle(0.01);
+            Engine a(rate), b(rate);
+            a.setBlocking(true);
+            b.setBlocking(true);
+            a.setKit(memory);
+            b.setKit(disk);
+            for (Engine* e : {&a, &b}) {
+                e->noteOn(60, 127, 0);
+                e->noteOn(61, 90, 4801);
+            }
+            const int chunk = 48000;
+            std::vector<float> ma(size_t(chunk) * 2), mb(size_t(chunk) * 2);
+            for (int64_t at = 0; at < frames + rate; at += chunk) {
+                std::fill(ma.begin(), ma.end(), 0.0f);
+                std::fill(mb.begin(), mb.end(), 0.0f);
+                a.render(at, chunk, ma.data());
+                b.render(at, chunk, mb.data());
+                if (std::memcmp(ma.data(), mb.data(), ma.size() * sizeof(float)) != 0) {
+                    size_t k = 0;
+                    while (ma[k] == mb[k]) ++k;
+                    QFAIL(qPrintable(QStringLiteral("differs at frame %1").arg(at + int64_t(k / 2))));
+                }
+            }
+            QCOMPARE(b.activeVoices(), 0);
+        }
+        {
+            // At the device's pace (blocks of 256), the disk at 2 MB/s (five times what a voice needs): nothing late.
+            setDiskThrottle(0.5);
+            Engine a(rate), b(rate);
+            a.setKit(memory);
+            b.setKit(disk);
+            a.noteOn(61, 100, 0);
+            b.noteOn(61, 100, 0);
+            const int64_t before = streamUnderruns();
+            std::vector<float> ma(512), mb(512);
+            QElapsedTimer clock;
+            clock.start();
+            for (int64_t at = 0; at < 3 * rate; at += 256) {
+                std::fill(ma.begin(), ma.end(), 0.0f);
+                std::fill(mb.begin(), mb.end(), 0.0f);
+                a.render(at, 256, ma.data());
+                b.render(at, 256, mb.data());
+                QVERIFY2(ma == mb, qPrintable(QStringLiteral("differs in the block at %1").arg(at)));
+                const qint64 due = (at + 256) * 1000000 / rate;  // (microseconds)
+                const qint64 now = clock.nsecsElapsed() / 1000;
+                if (due > now) QThread::usleep(unsigned(due - now));
+            }
+            QCOMPARE(streamUnderruns(), before);
+            // Asked for far faster than the disk gives it (and not waiting, as the audio thread never does): silence
+            // where it has not caught up, counted.
+            Engine c(rate);
+            c.setKit(disk);
+            c.noteOn(60, 100, 0);
+            std::vector<float> mc(size_t(rate) * 2);
+            for (int64_t at = 0; at < 3 * rate; at += rate) c.render(at, rate, mc.data());
+            QVERIFY(streamUnderruns() > before);
+            setDiskThrottle(0);
+        }
+        memory.reset();
+        disk.reset();
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(cacheFile)));  // (a loader's sound: its cache goes with the kit)
     }
 
     void midiLearnMapping() {

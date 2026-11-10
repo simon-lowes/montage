@@ -637,14 +637,24 @@ QJsonObject trackToJson(const Track& t) {
             if (sl.choke) so["choke"] = sl.choke;
             if (sl.pitchVariation != 0) so["pitchVariation"] = sl.pitchVariation;
             if (sl.levelVariation != 0) so["levelVariation"] = sl.levelVariation;
+            if (sl.velocityCurve != 0) so["velocityCurve"] = sl.velocityCurve;
+            if (!sl.velocityPoints.empty()) {
+                QJsonArray points;
+                for (const auto& [in, out] : sl.velocityPoints) points.append(QJsonArray{in, out});
+                so["velocityPoints"] = points;
+            }
+            if (sl.output) so["output"] = double(sl.output);
             pads.append(so);
         }
         for (const SamplerPass& ps : t.sampler.passes) {
             QJsonArray notes;
             for (const SamplerNote& n : ps.notes) notes.append(QJsonArray{n.key, n.velocity, double(n.at), double(n.length)});
-            passes.append(QJsonObject{{"lane", double(ps.lane)}, {"seed", double(ps.seed)}, {"notes", notes}});
+            QJsonObject po{{"lane", double(ps.lane)}, {"seed", double(ps.seed)}, {"notes", notes}};
+            if (ps.track) po["track"] = double(ps.track);
+            passes.append(po);
         }
         QJsonObject so;
+        if (t.sampler.clipPerHit) so["clipPerHit"] = true;
         if (!pads.isEmpty()) so["slots"] = pads;
         if (!passes.isEmpty()) so["passes"] = passes;
         o["sampler"] = so;
@@ -721,6 +731,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     t.colorClips = o.value("colorClips").toBool(false);
     {
         const QJsonObject so = o.value("sampler").toObject();
+        t.sampler.clipPerHit = so.value("clipPerHit").toBool(false);
         for (const auto& v : so.value("slots").toArray()) {
             const QJsonObject x = v.toObject();
             SamplerSlot sl;
@@ -747,6 +758,12 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
             sl.choke = std::clamp(x.value("choke").toInt(0), 0, 16);
             sl.pitchVariation = std::clamp(x.value("pitchVariation").toDouble(0), 0.0, 12.0);
             sl.levelVariation = std::clamp(x.value("levelVariation").toDouble(0), 0.0, 24.0);
+            sl.velocityCurve = std::clamp(x.value("velocityCurve").toInt(0), 0, 3);
+            for (const auto& pt : x.value("velocityPoints").toArray()) {
+                const QJsonArray a = pt.toArray();
+                if (a.size() >= 2) sl.velocityPoints.push_back({std::clamp(a[0].toInt(), 1, 127), std::clamp(a[1].toInt(), 1, 127)});
+            }
+            sl.output = Id(i64(x.value("output")));
             if (std::none_of(t.sampler.pads.begin(), t.sampler.pads.end(), [&](const SamplerSlot& e) { return e.key == sl.key; }))
                 t.sampler.pads.push_back(std::move(sl));
         }
@@ -755,6 +772,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
             SamplerPass ps;
             ps.lane = Id(i64(x.value("lane")));
             ps.seed = uint32_t(i64(x.value("seed")));
+            ps.track = Id(i64(x.value("track")));
             for (const auto& n : x.value("notes").toArray()) {
                 const QJsonArray a = n.toArray();
                 if (a.size() < 4) continue;
