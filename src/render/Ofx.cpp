@@ -2967,6 +2967,8 @@ Interact::~Interact() = default;
 bool Interact::failed() const { return failed_ || (remote_ && remote_->failed()); }
 bool Interact::unresponsive() const { return remote_ && !remote_->failed() && remote_->unresponsive(); }
 std::string Interact::failure() const { return remote_ ? remote_->failure() : std::string(); }
+bool Interact::waiting() const { return remote_ && remote_->waiting(); }
+bool Interact::lateEdits(Effect& changes) { return remote_ && remote_->lateEdits(changes); }
 
 void setLoadWatcher(std::function<void(const std::string&, bool)> watch) {
     std::lock_guard<std::mutex> lock(gLoadMutex);

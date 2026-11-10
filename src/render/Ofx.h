@@ -268,6 +268,11 @@ public:
     bool failed() const;
     // (in a host) Its last reply missed the deadline: its last picture stays up, events are not sent until it answers.
     bool unresponsive() const;
+    // (in a host) A message is still out: its answer is taken at a later call (a poll repaints for it).
+    bool waiting() const;
+    // (in a host) What the control set in a reply that came after its deadline and that no pen or key event has handed
+    // on: only those parameters and strings. False when there is none.
+    bool lateEdits(Effect& changes);
     // In a plug-in host (not this process).
     bool remote() const { return remote_ != nullptr; }
     // Why it failed, when it failed in a host ("crashed (signal 11)"...); "" otherwise.

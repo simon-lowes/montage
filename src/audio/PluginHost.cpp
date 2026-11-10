@@ -187,6 +187,13 @@ std::string Host::loading() const {
     return std::string(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
 }
 
+bool Host::wasLoading(const std::string& id) const {
+    const std::string noted = loading();
+    if (noted.empty() || id.empty()) return false;
+    if (noted.size() == sizeof control.h->loading - 1) return id.compare(0, noted.size(), noted) == 0;
+    return noted == id;
+}
+
 bool Host::alive() {
     if (dead_.load(std::memory_order_acquire)) return false;
     if (proc && proc->alive() && !crashCode()) return true;
@@ -344,8 +351,9 @@ Attached attach(Host& host, Channel& chan, const std::string& kind, const std::s
     if (r == Result::Dead) {
         // (the host says which plug-in it was loading; one that says none and held nothing else had only this one)
         const std::string blamed = host.loading();
-        a.hostDied = blamed == id || (blamed.empty() && alone);
-        a.error = "its host " + host.howItEnded() + " while loading " + (blamed.empty() || blamed == id ? std::string("it") : blamed);
+        const bool self = host.wasLoading(id);
+        a.hostDied = self || (blamed.empty() && alone);
+        a.error = "its host " + host.howItEnded() + " while loading " + (blamed.empty() || self ? std::string("it") : blamed);
         return a;
     }
     if (r == Result::Timeout) {
@@ -709,7 +717,7 @@ void reportFailure(Core& core, bool same) {
     }
     // (a host Montage stopped for another instance's failure, recorded by that one, or one that crashed while loading
     // another plug-in, which is blocked for it: this one was only in it)
-    if (core.failure == Crashed && host && (host->stoppedByMontage() || (!host->loading().empty() && host->loading() != core.d.id))) {
+    if (core.failure == Crashed && host && (host->stoppedByMontage() || (!host->loading().empty() && !host->wasLoading(core.d.id)))) {
         core.innocent = true;
         return;
     }

@@ -176,6 +176,19 @@ void OfxOverlay::paint(QPainter& p, const QRectF&) {
         const QString name = QString::fromStdString(e->s("ofx_name"));
         // (controls in a host that did not answer in time keep their last picture up, marked)
         if (drew || !o.gl.isNull()) ofx::paintOverlay(p, o, v);
+        // What a late reply set once the pen was up: written as its own step, after this paint.
+        Effect late;
+        if (!(down_ && pressed_.clip == t.clip && pressed_.effect == t.effect) && in->lateEdits(late)) {
+            QTimer::singleShot(0, this, [this, t, late] {
+                const Effect* now = effectOf(t);
+                if (!now) return;
+                Effect edited = *now;
+                for (const auto& [key, param] : late.params) edited.params[key] = param;
+                for (const auto& [key, value] : late.strings) edited.strings[key] = value;
+                apply(t, edited, false);
+            });
+        }
+        if (in->waiting() && !poll_->isActive()) poll_->start();
         if (!drew) {
             const std::string why = in->failure();
             state_->message(why.empty() ? tr("%1's on-screen controls stopped working").arg(name)
@@ -191,7 +204,6 @@ void OfxOverlay::paint(QPainter& p, const QRectF&) {
             p.drawText(box, Qt::AlignCenter, note);
             p.restore();
             ++notes;
-            if (!poll_->isActive()) poll_->start();
         }
     }
 }

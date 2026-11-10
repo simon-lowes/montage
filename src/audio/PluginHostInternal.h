@@ -50,6 +50,8 @@ public:
     std::atomic<bool> failureTaken{false};
     // The plug-in it was loading when it ended ("" when it was loading none): that one alone is to blame.
     std::string loading() const;
+    // Whether the plug-in it notes is `id` (a long id is noted cut short, and matched as far as it goes).
+    bool wasLoading(const std::string& id) const;
 
 private:
     std::atomic<bool> dead_{false}, killed_{false};

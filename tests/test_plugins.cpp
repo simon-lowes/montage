@@ -2696,6 +2696,80 @@ private slots:
         QCOMPARE(f->count, 2);
     }
 
+    // Controls that answer after the deadline but do answer: a slow draw's picture is taken at a later call (draws are
+    // then not waited for, each showing the picture the one before asked for), what a late pen reply set is handed on
+    // rather than lost, and controls closed with a reply still out let their channel go once it comes.
+    void lateOpenFxControlRepliesAreKept() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-controls-late-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc probe;
+        QVERIFY(reg.find("org.montage.test.probe/1", probe));
+        Project p = makeDefaultProject();
+        Hosting hostingMode(Isolation::PerInstance);
+        // (as isolatedOpenFxControlsDrawTheSame: Centre (0.3, 0.6) is at view (120, 80))
+        ofx::View v;
+        v.width = 400, v.height = 200, v.frameW = 400, v.frameH = 200;
+        v.m[0] = 1, v.m[1] = 0, v.m[2] = 0, v.m[3] = 0, v.m[4] = -1, v.m[5] = 200;
+        std::string err;
+        Effect slow = ofx::makeEffect(p, probe);
+        slow.params["param.centre.x"] = Param(0.3);
+        slow.params["param.centre.y"] = Param(0.6);
+        std::unique_ptr<ofx::Interact> c;
+        {
+            Fault f("slow:draw");
+            c = ofx::Interact::open(slow, &err);
+        }
+        QVERIFY2(c && c->remote(), err.c_str());
+        ofx::Overlay o;
+        QVERIFY(c->draw(slow, 0, v, o));
+        QVERIFY(o.gl.isNull() && c->waiting() && c->unresponsive());  // (nothing to show yet)
+        QVERIFY(eventually([&] {
+            c->draw(slow, 0, v, o);
+            return !o.gl.isNull();
+        }, 10000));
+        QVERIFY(qAlpha(o.gl.pixel(120, 80)) > 0);
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY(c->draw(slow, 0, v, o) && !o.gl.isNull());
+        QVERIFY2(clock.elapsed() < 100, qPrintable(QString::number(clock.elapsed())));  // (not waited for)
+        QVERIFY(!c->failed() && c->waiting());
+        c.reset();
+        // A release answered late: the Centre it set comes as a late edit.
+        Effect late = slow;
+        late.id = p.newId();
+        {
+            Fault f("slow:pen:1");
+            c = ofx::Interact::open(late, &err);
+        }
+        QVERIFY2(c && c->remote(), err.c_str());
+        Effect edited;
+        bool changed = false;
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, late, 0, v, 120, 80, 1, edited, changed));
+        QVERIFY(c->pen(ofx::Interact::Pen::Move, late, 0, v, 150, 60, 1, edited, changed) && changed);
+        late = edited;
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, late, 0, v, 160, 50, 1, edited, changed));  // (0.4 s: past the deadline)
+        QVERIFY(!changed && c->waiting());
+        Effect set;
+        QVERIFY(eventually([&] { return c->lateEdits(set); }, 10000));
+        QVERIFY(set.params.count("param.centre.x") && std::fabs(set.params.at("param.centre.x").at(0) - 0.4) < 1e-9);
+        QVERIFY(!c->lateEdits(set));  // (handed on once)
+        QVERIFY(!c->failed() && !failureOf(probe.id).has_value());
+        // Closed with the release still out: its host ends once the reply has come and the channel is let go.
+        changed = false;
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, late, 0, v, 150, 60, 1, edited, changed));  // (where the move left it)
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, late, 0, v, 170, 40, 1, edited, changed));
+        QVERIFY(c->waiting());
+        c.reset();
+        QVERIFY(eventually([] {
+            ofx::remote::releaseIdle();
+            return runningHosts().empty();
+        }, 20000));
+        QVERIFY(!failureOf(probe.id).has_value());
+    }
+
     // In a host shared by a maker's plug-ins, the second of two crashes it while loading: that one alone is blocked
     // (the host said which plug-in it was loading), and the first is started again as if nothing of its own failed.
     void sharedHostBlamesThePlugInLoading() {

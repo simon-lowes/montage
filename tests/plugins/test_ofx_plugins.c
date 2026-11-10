@@ -332,6 +332,7 @@ static OfxStatus probeOverlay(const char* action, const void* handle, OfxPropert
         return gProbeGrabbed ? kOfxStatOK : kOfxStatReplyDefault;
     }
     if (!gProbeGrabbed) return kOfxStatReplyDefault;
+    montage_test_fault("pen", NULL, 0);  /* (a drag of the handle: its moves and its release) */
     gParam->paramSetValueAtTime(centre, time, pen[0], pen[1]);
     if (up) gProbeGrabbed = 0;
     return kOfxStatOK;

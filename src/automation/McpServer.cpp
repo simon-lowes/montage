@@ -897,21 +897,23 @@ struct McpServer::Impl {
         int readers = 0, writers = 0;
     };
     std::map<QString, PathUse> pathsInUse;
-    // The paths a call's arguments name: what it writes (output, report, any *_output or *_report) and what it reads
-    // (path, file, folder, files, paths, dir, any *_path, *_file, *_folder or *_dir; lists of them too). A path it both
-    // reads and writes counts as written.
+    // The paths a call's arguments name: what it writes (output, report, any *_output or *_report, and of a tool that
+    // is not read-only the folders too: folder, dir, any *_folder or *_dir, where exports write) and what it reads (path,
+    // file, files, paths, any *_path or *_file, and a read-only tool's folders; lists of them too). A path it both reads
+    // and writes counts as written.
     struct CallPaths {
         QStringList writes, reads;
     };
-    static CallPaths pathsOf(const QJsonObject& a) {
+    static CallPaths pathsOf(const QJsonObject& a, bool readOnly) {
         CallPaths out;
-        const auto kind = [](const QString& k) {
-            static const char* const writes[] = {"output", "report"};
-            static const char* const reads[] = {"path", "file", "folder", "files", "paths", "dir"};
-            for (const char* w : writes)
-                if (k == QLatin1String(w) || k.endsWith(QLatin1Char('_') + QLatin1String(w))) return 2;
-            for (const char* r : reads)
-                if (k == QLatin1String(r) || k.endsWith(QLatin1Char('_') + QLatin1String(r))) return 1;
+        const auto kind = [readOnly](const QString& k) {
+            const auto named = [&k](const char* n) { return k == QLatin1String(n) || k.endsWith(QLatin1Char('_') + QLatin1String(n)); };
+            for (const char* w : {"output", "report"})
+                if (named(w)) return 2;
+            for (const char* f : {"folder", "dir"})
+                if (named(f)) return readOnly ? 1 : 2;
+            for (const char* r : {"path", "file", "files", "paths"})
+                if (named(r)) return 1;
             return 0;
         };
         for (auto it = a.begin(); it != a.end(); ++it) {
@@ -1166,7 +1168,7 @@ struct McpServer::Impl {
             else alone.lock();
             OutputClaim outputs;
             const bool claimed = !job->sideBySide || tool == tools.end() ||
-                                 claimOutputs(outputs, pathsOf(job->args), job->cancel);
+                                 claimOutputs(outputs, pathsOf(job->args, tool->readOnly), job->cancel);
             {
                 std::lock_guard jl(job->m);
                 if (!claimed || job->cancel || tool == tools.end()) {

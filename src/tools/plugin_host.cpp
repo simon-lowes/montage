@@ -87,8 +87,11 @@ void unwatchForCrash(wire::Header* h) {
         }
 }
 
+void forgetLoadingUnlessHere();
+
 // (async-signal-safe: atomics, and a futex wake, sem_post or SetEvent)
 void tellMontageOfCrash(uint32_t code) {
+    forgetLoadingUnlessHere();
     for (CrashSlot& s : gCrashSlots) {
         wire::Header* h = s.h.load();
         if (!h) continue;
@@ -153,18 +156,36 @@ void catchCrashes() {
 #endif
 }
 
-// The control channel's header, where the plug-in being loaded is noted (Montage reads it if the host ends then).
+// The control channel's header, where the plug-in being loaded is noted (Montage reads it if the host ends then), and
+// the thread loading it.
 std::atomic<wire::Header*> gControl{nullptr};
+std::atomic<int> gLoader{0};
+std::atomic<int> gThreads{0};
+thread_local int tThread = 0;
+int thisThread() {
+    if (!tThread) tThread = ++gThreads;
+    return tThread;
+}
+
+// A crash on another thread than the one loading (a render of a plug-in already loaded) is not the loading one's:
+// its name is taken back. (In the crash handler, on the crashing thread: atomics and its own thread-local only.)
+void forgetLoadingUnlessHere() {
+    wire::Header* h = gControl.load(std::memory_order_acquire);
+    if (h && (tThread == 0 || gLoader.load(std::memory_order_acquire) != tThread)) h->loading[0] = '\0';
+}
 
 void noteLoading(const std::string& id, bool loading) {
     wire::Header* h = gControl.load(std::memory_order_acquire);
     if (!h) return;
     if (!loading) {
-        h->loading[0] = '\0';
+        int me = thisThread();
+        // (only the thread that noted it takes it back: another may have begun loading meanwhile)
+        if (gLoader.compare_exchange_strong(me, 0, std::memory_order_acq_rel)) h->loading[0] = '\0';
         return;
     }
     const size_t n = std::min(id.size(), sizeof h->loading - 1);
     if (n == 0) return;
+    gLoader.store(thisThread(), std::memory_order_release);
     // (the first byte last: Montage, reading after the host ended, never sees half a name)
     h->loading[0] = '\0';
     std::memcpy(h->loading + 1, id.data() + 1, n - 1);
