@@ -2950,6 +2950,13 @@ private slots:
         st::Sender tx[2];
         std::atomic<int> sent[2] = {-1, -1};
         std::thread sending[2];
+        // (a check that fails before the test's end still has to stop and join the senders: leaving with a thread
+        // running ends the whole run)
+        auto joinSenders = qScopeGuard([&] {
+            stop = true;
+            for (std::thread& t : sending)
+                if (t.joinable()) t.join();
+        });
         std::string err;
         for (int k = 0; k < 2; ++k) {
             st::SenderOptions o;
@@ -2974,6 +2981,10 @@ private slots:
         omt::Sender omtTx;
         std::atomic<int> omtSent{-1};
         std::thread omtSending;
+        auto joinOmt = qScopeGuard([&] {
+            stop = true;
+            if (omtSending.joinable()) omtSending.join();
+        });
         if (omtOk) {
             omt::Sender::Options so;
             so.name = "Multiviewer test";
@@ -3054,7 +3065,10 @@ private slots:
                               "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
                               "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
                               "-c:a", "mp2", "-f", "mpegts", to});
-            QVERIFY(p->waitForStarted(10000));
+            // (a busy Mac runner once took more than ten seconds to start the command: wait longer, and say what the
+            // process reports when it does not start)
+            QVERIFY2(p->waitForStarted(60000),
+                     qPrintable(QString("state %1, error %2: %3").arg(int(p->state())).arg(int(p->error())).arg(p->errorString())));
             streams.push_back(std::move(p));
         }
         auto finish = qScopeGuard([&] {
