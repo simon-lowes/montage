@@ -6428,6 +6428,22 @@
         <source>Scene Units a Metre</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>JPEG XS 4:2:2 10-bit (MXF)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS 4:4:4 12-bit (MXF)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS at 8 bits a pixel, 12-bit 4:4:4, for finishing and graphics</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Light intra-frame mezzanine at 5 bits a pixel, for live production and contribution</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -27873,6 +27889,14 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <source>st2110.%1 is an IPv4 address and port, such as 239.100.0.1:5004</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>st2110.jpeg_xs_bpp is 0.5 to 24 bits a pixel, or 0 for uncompressed video</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This build of Montage has no JPEG XS (SVT-JPEG-XS)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::ReferenceOutputPanel</name>
@@ -28109,10 +28133,6 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>The second path&apos;s video, sound and data addresses and ports, apart by spaces</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Second path:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -28126,6 +28146,58 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     </message>
     <message>
         <source>Second path from:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Uncompressed (ST 2110-20)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS (ST 2110-22)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS sends each frame in a constant number of bytes, a fraction of the uncompressed picture&apos;s, with a few lines&apos; delay</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Video coding:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> bits a pixel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS&apos;s rate: 3 to 6 bits a pixel keep 4:2:2 10-bit pictures visually lossless</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS rate:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Packets a slice at a time (RFC 9134&apos;s slice mode)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each slice of 16 lines in packets of its own, so a receiver can decode as the slices come and a lost packet damages only its slice</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Send each frame&apos;s number and time code as fast metadata (ST 2110-41)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The fast metadata stream&apos;s address and port</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Metadata stream:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The second path&apos;s video, sound, data and fast metadata addresses and ports, apart by spaces</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
