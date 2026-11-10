@@ -15,6 +15,7 @@
 
 #include "core/Captions.h"
 #include "core/Chapters.h"
+#include "render/Ac3.h"
 #include "render/ColorSpace.h"
 #include "render/Scte35.h"
 #include "render/TsSegments.h"
@@ -1254,9 +1255,13 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                  "\" segmentAlignment=\"true\">\n<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"" +
                  (ao.described ? "description" : ao.main ? "main" : "alternate") + "\"/>\n<Label>" + xmlEscape(ao.label) + "</Label>\n";
             x += "<Representation id=\"" + ao.name + "\" bandwidth=\"" + std::to_string(ao.track->peakBitrate()) + "\" codecs=\"" + ao.codecs +
-                 "\" audioSamplingRate=\"" + std::to_string(ao.sampleRate) + "\">\n<AudioChannelConfiguration "
-                 "schemeIdUri=\"urn:mpeg:mpegB:cicp:ChannelConfiguration\" value=\"" + std::to_string(ao.channels == 6 ? 6 : ao.channels == 8 ? 12 : ao.channels) +
-                 "\"/>\n" + timeline(*ao.track, ao.name) + "</Representation>\n</AdaptationSet>\n";
+                 "\" audioSamplingRate=\"" + std::to_string(ao.sampleRate) + "\">\n" +
+                 // (AC-3 and E-AC-3 in the scheme ETSI TS 102 366 defines, as DASH-IF and DVB-DASH ask; the rest in MPEG's CICP)
+                 (ao.codecs == "ac-3" || ao.codecs == "ec-3"
+                      ? ac3DashChannelConfiguration(ao.channels)
+                      : "<AudioChannelConfiguration schemeIdUri=\"urn:mpeg:mpegB:cicp:ChannelConfiguration\" value=\"" +
+                            std::to_string(ao.channels == 8 ? 12 : ao.channels) + "\"/>") +
+                 "\n" + timeline(*ao.track, ao.name) + "</Representation>\n</AdaptationSet>\n";
         }
         for (const TextOut& t : texts) {
             for (const char* kind : {"vtt", "ttml"}) {

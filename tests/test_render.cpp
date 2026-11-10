@@ -23438,6 +23438,9 @@ colorspaces:
         // (and DASH's CMAF: the AC-3 configuration in the sample entry)
         const QString mpd = text("manifest.mpd");
         QVERIFY2(mpd.contains("codecs=\"ac-3\""), qPrintable(mpd));
+        // (its channels in the scheme ETSI TS 102 366 defines, stereo's mask, not MPEG's CICP)
+        QVERIFY2(mpd.contains("schemeIdUri=\"tag:dolby.com,2014:dash:audio_channel_configuration:2011\" value=\"A000\"") && !mpd.contains("mpegB:cicp"),
+                 qPrintable(mpd));
         QFile init(pkg.filePath("a1_en/init.mp4"));
         QVERIFY(init.open(QIODevice::ReadOnly) && init.readAll().contains("dac3"));
         QVERIFY(pkg.exists("v1_180p_h264/seg00001.m4s"));
