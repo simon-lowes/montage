@@ -7,6 +7,7 @@
 
 #include <QDateTime>
 #include <QFileInfo>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -81,6 +82,13 @@ OCIO::ConstCPUProcessorRcPtr processorFor(const Effect& e, FrameTime t, std::str
     }
 }
 
+// A value written so that two that differ are told apart.
+std::string exact(double v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%.17g", v);
+    return b;
+}
+
 // The effect's transform, one processor a transform (kept for the last 64). With its exposure, contrast and gamma
 // (once any is set: liveControls), an ExposureContrastTransform on the input first: at the values at `t`, or (`dynamic`,
 // for OCIO's GPU shader) as dynamic properties, set while the shader runs without building it again.
@@ -96,24 +104,18 @@ OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool 
     const std::string key = configName + '\x1f' + std::to_string(reinterpret_cast<uintptr_t>(cfg.get())) + '\x1f' +
                             (display ? "d" : "c") + (inverse ? "i" : "f") + '\x1f' + src + '\x1f' + dst + '\x1f' +
                             disp + '\x1f' + view + '\x1f' + look + '\x1f' +
-                            (!live ? std::string("-") : dynamic ? std::string("dynamic")
-                                                                : std::to_string(exposure) + ' ' + std::to_string(contrast) + ' ' + std::to_string(gamma));
-    static std::map<std::string, OCIO::ConstProcessorRcPtr> cache;
+                            (!live ? std::string("-") : dynamic ? std::string("dynamic") : exact(exposure) + ' ' + exact(contrast) + ' ' + exact(gamma));
+    // (a processor at each value of a keyed control, kept apart so playing one through does not push the rest out)
+    static std::map<std::string, OCIO::ConstProcessorRcPtr> fixed, valued;
+    std::map<std::string, OCIO::ConstProcessorRcPtr>& cache = live && !dynamic ? valued : fixed;
     {
         std::lock_guard lock(ocioMutex());
         if (auto it = cache.find(key); it != cache.end()) return it->second;
     }
     try {
         const char* source = src.empty() ? OCIO::ROLE_SCENE_LINEAR : src.c_str();
+        // (the transform itself, inverted on its own, so the exposure, contrast and gamma still come first, on the input)
         OCIO::GroupTransformRcPtr group = OCIO::GroupTransform::Create();
-        if (live) {
-            OCIO::ExposureContrastTransformRcPtr ec = OCIO::ExposureContrastTransform::Create();
-            ec->setStyle(OCIO::EXPOSURE_CONTRAST_LINEAR);
-            ec->setPivot(0.18);
-            ec->setExposure(exposure), ec->setContrast(contrast), ec->setGamma(gamma);
-            if (dynamic) ec->makeExposureDynamic(), ec->makeContrastDynamic(), ec->makeGammaDynamic();
-            group->appendTransform(ec);
-        }
         if (!look.empty()) {
             OCIO::LookTransformRcPtr lt = OCIO::LookTransform::Create();
             lt->setSrc(source);
@@ -134,10 +136,20 @@ OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool 
             cst->setDst(dst.empty() ? source : dst.c_str());
             group->appendTransform(cst);
         }
-        OCIO::ConstProcessorRcPtr proc =
-            cfg->getProcessor(group, inverse ? OCIO::TRANSFORM_DIR_INVERSE : OCIO::TRANSFORM_DIR_FORWARD);
+        group->setDirection(inverse ? OCIO::TRANSFORM_DIR_INVERSE : OCIO::TRANSFORM_DIR_FORWARD);
+        OCIO::GroupTransformRcPtr whole = OCIO::GroupTransform::Create();
+        if (live) {
+            OCIO::ExposureContrastTransformRcPtr ec = OCIO::ExposureContrastTransform::Create();
+            ec->setStyle(OCIO::EXPOSURE_CONTRAST_LINEAR);
+            ec->setPivot(0.18);
+            ec->setExposure(exposure), ec->setContrast(contrast), ec->setGamma(gamma);
+            if (dynamic) ec->makeExposureDynamic(), ec->makeContrastDynamic(), ec->makeGammaDynamic();
+            whole->appendTransform(ec);
+        }
+        whole->appendTransform(group);
+        OCIO::ConstProcessorRcPtr proc = cfg->getProcessor(whole, OCIO::TRANSFORM_DIR_FORWARD);
         std::lock_guard lock(ocioMutex());
-        if (cache.size() > 64) cache.clear();
+        if (cache.size() > (&cache == &valued ? 16u : 64u)) cache.clear();
         cache[key] = proc;
         return proc;
     } catch (const OCIO::Exception& ex) {

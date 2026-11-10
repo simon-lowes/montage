@@ -886,7 +886,9 @@ std::shared_ptr<const GlareKernel> glareKernel(const ApertureShape& shape, int r
     // (kept to about 256 MB)
     size_t bytes = 0;
     for (size_t i = 0; i < kept.size(); ++i) {
-        bytes += 3 * size_t(kept[i]->fftSize) * size_t(kept[i]->fftSize) * sizeof(Cf);
+        // (and the copy the GPU reads, as if it were made: eight floats a texel)
+        const size_t texels = size_t(kept[i]->fftSize) * size_t(kept[i]->fftSize);
+        bytes += 3 * texels * sizeof(Cf) + texels * 8 * sizeof(float);
         if (i > 0 && bytes > (size_t(256) << 20)) {
             kept.resize(i);
             break;

@@ -3001,17 +3001,16 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             }
     }
     std::string adjustmentOnCpu;  // (an adjustment layer the GPU turned down after all: the frame is the CPU's)
-    auto layerOf = [&](const Clip& c, gpu::Layer& l, FrameTime at = -1) {
-        if (at < 0) at = t;
+    auto layerOf = [&](const Clip& c, gpu::Layer& l, std::optional<FrameTime> at = std::nullopt) {
         std::string how;
-        const GpuLayerResult r = gpuClipLayer(p, seq, c, at, o, l, &how);
+        const GpuLayerResult r = gpuClipLayer(p, seq, c, at.value_or(t), o, l, &how);
         if (r == GpuLayerResult::Unsupported && c.isGenerator() && c.generator.type == "adjustment") {
             adjustmentOnCpu = how;
             return false;
         }
         if (r == GpuLayerResult::Unsupported) {
             l = {};
-            Image img = clipLayer(p, seq, c, at, o, nullptr);
+            Image img = clipLayer(p, seq, c, at.value_or(t), o, nullptr);
             if (img.empty()) return false;
             l = cpuLayer(std::move(img));
         }

@@ -4203,7 +4203,10 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             // columns (43, Stockham radix 2, a pass a stage), through the kernel (44), back again (43, inverse) and added
             // into the glare kept in slot 0 (46); then the glare drawn back up and added to the picture (47)
             sfx::GlareSetup g;
-            if (sfx::apertureGlareSetup(e, t, width, height, pixelScale, g)) {
+            const bool glare = sfx::apertureGlareSetup(e, t, width, height, pixelScale, g);
+            // (a glare whose transforms would be 4096 square or more, 256 MB a pass, is left to the CPU)
+            if (glare && g.M > 2048) return false;
+            if (glare) {
                 const int M = g.M;
                 auto sized = [&](int w, int h) {
                     f.passes.back().width = w, f.passes.back().height = h;
@@ -4220,16 +4223,16 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                         }
                 };
                 bool first = true;
-                for (int ty = 0; ty < g.GH; ty += g.T)
+                for (int row = 0; row < g.GH; row += g.T)
                     for (int tx = 0; tx < g.GW; tx += g.T) {
-                        const int tw = std::min(g.T, g.GW - tx), th = std::min(g.T, g.GH - ty);
-                        add(42, {float(g.threshold), float(g.f), float(tx), float(ty), float(tw), float(th)});
+                        const int tw = std::min(g.T, g.GW - tx), th = std::min(g.T, g.GH - row);
+                        add(42, {float(g.threshold), float(g.f), float(tx), float(row), float(tw), float(th)});
                         sized(M, M);
                         transform(false);
                         add(44, {float(M)});
                         sized(M, M)->tableSlot = 1;
                         transform(true);
-                        add(46, {float(tx), float(ty), float(tw), float(th), float(g.radius), float(M), 1.0f / (float(M) * float(M)), first ? 0.0f : 1.0f});
+                        add(46, {float(tx), float(row), float(tw), float(th), float(g.radius), float(M), 1.0f / (float(M) * float(M)), first ? 0.0f : 1.0f});
                         gpu::ColorOp::FilterPass* acc = sized(g.GW, g.GH);
                         acc->save = 0, acc->extra = first ? -1 : 0;
                         first = false;

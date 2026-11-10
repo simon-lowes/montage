@@ -24123,6 +24123,25 @@ colorspaces:
             }
         }
         QVERIFY(builds > 0);
+        // Inverted, the transform runs backwards but the exposure still comes first, on the input: one stop up is the
+        // inverse of the input doubled (on the CPU and the GPU alike).
+        {
+            Effect inv = e;
+            inv.params.erase("contrast"), inv.params.erase("gamma");
+            inv.params["exposure"] = 1.0;
+            inv.params["inverse"] = 1.0;
+            Effect plain = inv;
+            plain.params.erase("exposure");
+            Image lit = in, doubled = in;
+            for (size_t i = 0; i < doubled.px.size(); ++i)
+                if (i % 4 != 3) doubled.px[i] *= 2;
+            QVERIFY(applyOcio(inv, lit));
+            QVERIFY(applyOcio(plain, doubled));
+            double worst = 0;
+            for (size_t i = 0; i < lit.px.size(); ++i)
+                worst = std::max(worst, std::fabs(double(lit.px[i]) - doubled.px[i]) / std::max(1.0, std::fabs(double(doubled.px[i]))));
+            QVERIFY2(worst <= 1e-5, qPrintable(QStringLiteral("inverted exposure differs by %1").arg(worst)));
+        }
     }
     // Aperture Glare's FFTs on the GPU at UHD, in tiles as the CPU makes them, against the CPU's: within 1/1023, at its
     // own size and on a layer with more pixels than the sequence (shrunk and drawn back up).
