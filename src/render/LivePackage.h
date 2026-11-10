@@ -64,7 +64,10 @@ struct LiveCue {
     double at = -1;          // seconds into the recording (its first picture at 0); -1: the next picture recorded
     double duration = 0;     // the break's length (seconds; 0 not known)
     bool returning = false, other = false;
+    bool autoReturn = true;  // a break with a length ends by itself (else at its return)
+    bool cancel = false;     // the feed's cancel of event `eventId`: a break of it not yet begun is taken off
     uint32_t eventId = 0;    // the feed's splice_event_id (or segmentation_event_id), matching a return to its out
+                             // and a repeat of a message to the cue it repeats
     std::vector<uint8_t> scte35;  // the feed's splice_info_section, as it came ("" for a cue placed here: made)
 };
 
@@ -113,13 +116,15 @@ public:
     void soundTracks(const std::vector<LiveSoundTrack>& tracks);
     void sound(const AVFrame* frame, int track = 0);
     // An ad cue, from any thread: placed on its picture, made a keyframe (a cue for a picture already encoded goes on
-    // the next), listed as an EXT-X-DATERANGE (SCTE35-OUT, then SCTE35-IN once the break is over) and sent to DASH
-    // players as an event in the segments (emsg, urn:scte:scte35:2013:bin). A cue placed here is made a splice_insert
+    // the next, one for a picture dropped on the first after it), listed as an EXT-X-DATERANGE (SCTE35-OUT, then
+    // SCTE35-IN once the break is over) and sent to DASH players as an event in the segments (emsg,
+    // urn:scte:scte35:2013:bin; again at each segment's start until its splice, for players that join after). A cue placed here is made a splice_insert
     // (or time_signal) at the presentation's 90 kHz time.
     void cue(const LiveCue& cue);
     // A SCTE 35 message from the feed (CaptureSettings::onCue): splice_insert and time_signal become cues at their
-    // splice time on the feed's clock (immediate ones when they came); splice_null and those it cannot read are passed
-    // over.
+    // splice time on the feed's clock (immediate ones when they came); a message repeated (as encoders send each a few
+    // times before its splice) is the cue it repeats, a cancel takes off a break not yet begun; splice_null and those
+    // it cannot read are passed over.
     void cueFromFeed(const std::vector<uint8_t>& section, double feedZero, double at);
     // A chapter from here (at < 0: the next picture recorded; else seconds into the recording) to the next: the
     // package's chapters.vtt (named in the multivariant playlist).

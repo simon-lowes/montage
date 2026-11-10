@@ -489,7 +489,7 @@ bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wan
     if (wantAudio) in.audioStream = av_find_best_stream(in.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     // (with every sound stream wanted, the first is track 0, or the first marked default: the programme's own sound,
     // as a broadcast lists it, the other languages after)
-    if (wantAudio && in.audioStream >= 0 && s->settings.allSound) {
+    if (index == 0 && wantAudio && in.audioStream >= 0 && s->settings.allSound) {
         int first = -1, marked = -1;
         for (unsigned i = 0; i < in.fmt->nb_streams; ++i) {
             const AVStream* st = in.fmt->streams[i];
@@ -518,7 +518,7 @@ bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wan
         AVStream* st = in.fmt->streams[i];
         if (int(i) == in.videoStream || int(i) == in.audioStream) continue;
         // (the other sound streams, when all are wanted, and the cue messages, when they are)
-        if (wantAudio && in.audioStream >= 0 && s->settings.allSound && st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && in.extras.size() < 15)
+        if (index == 0 && wantAudio && in.audioStream >= 0 && s->settings.allSound && st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && in.extras.size() < 15)
             if (AVCodecContext* dec = openDecoder(st, nullptr)) {
                 Input::Extra e;
                 e.stream = int(i), e.dec = dec, e.tb = st->time_base;

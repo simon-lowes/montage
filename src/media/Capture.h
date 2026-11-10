@@ -72,7 +72,8 @@ struct CaptureSettings {
     // Every sound stream of the feed, not only the one recorded (a network stream's or file's: each language of a
     // broadcast, its commentary, its descriptions): the others given apart, track 1 on, placed against the pictures as
     // the recorded one is, at 48 kHz in planar float with their own channels (at most 8). `onSoundTracks` names them
-    // all (track 0 the recorded one) before the first picture is given. The file records track 0 only.
+    // all (track 0 the recorded one) before the first picture is given. The file records track 0 only. (The feed's
+    // own sound streams: not with a sound device of its own.)
     bool allSound = false;
     std::function<void(int track, const AVFrame* sound)> onTrackSound;
     struct SoundTrack {

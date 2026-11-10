@@ -210,11 +210,9 @@ std::vector<uint8_t> stppInit(const std::string& language) {
     put32(tkhd, 0), put32(tkhd, 0);
     // (the language packed as ISO 639-2/T, three letters of five bits)
     std::string lang = "und";
-    static const std::pair<const char*, const char*> threes[] = {{"en", "eng"}, {"es", "spa"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"},
-                                                                 {"pt", "por"}, {"nl", "nld"}, {"ja", "jpn"}, {"zh", "zho"}, {"ko", "kor"}};
-    for (const auto& [two, three] : threes)
-        if (language == two || language.rfind(std::string(two) + "-", 0) == 0) lang = three;
-    if (language.size() == 3 && std::all_of(language.begin(), language.end(), [](char c) { return c >= 'a' && c <= 'z'; })) lang = language;
+    const std::string primary = language.substr(0, language.find('-'));
+    if (const char* three = iso639_2(primary)) lang = three;
+    if (lang.size() != 3 || !std::all_of(lang.begin(), lang.end(), [](char c) { return c >= 'a' && c <= 'z'; })) lang = "und";
     std::vector<uint8_t> mdhd;
     put32(mdhd, 0), put32(mdhd, 0), put32(mdhd, 1000), put32(mdhd, 0);
     put16(mdhd, uint16_t(((lang[0] - 0x60) & 31) << 10 | ((lang[1] - 0x60) & 31) << 5 | ((lang[2] - 0x60) & 31)));
@@ -500,9 +498,12 @@ struct LivePackager::State {
         int64_t frame = 0, back = -1;  // the splice's picture and the return's (-1 not known), from the presentation's first
         std::vector<uint8_t> out, in;  // the SCTE 35 messages (the return's once known)
         bool fromFeed = false, late = false, keyframe = false, returned = false, signalled = false, inSignalled = false;
+        bool returnSeen = false;  // the feed's return message came (its repeats passed over)
+        int64_t placedAt = -1;    // the picture it was placed at
     };
     std::vector<Placed> placed;
     int nextCue = 1;
+    int64_t encodedIndex = -1;  // the last picture encoded
 
     // Chapters: asked for (under m) and placed (seconds of the presentation).
     struct ChapterAsked {
@@ -1257,18 +1258,23 @@ struct LivePackager::State {
         return scte35::encode(c);
     }
 
-    // A cue's event messages (its out point, and its return once known), in each rung's next chunk.
-    void signal(Placed& p) {
+    // A cue's event messages (its out point, and its return once known), in each rung's next chunk: those not sent
+    // yet, or (`again`) those still ahead of picture `index` (each segment's start repeats them for players that
+    // join between the message and its splice; the same id, so a player raises each once).
+    void signal(Placed& p, bool again = false, int64_t index = 0) {
+        const bool out = again ? p.signalled && p.frame > index : !p.signalled;
+        const bool in = p.back >= 0 && !p.in.empty() && (again ? p.inSignalled && p.back > index : !p.inSignalled);
+        if (!out && !in) return;
         for (auto& v : video) {
             if (!v->cmaf) continue;
             const uint32_t scale = uint32_t(v->cmaf->timescale.den / std::max(1, v->cmaf->timescale.num));
             const auto at = [&](int64_t frame) { return uint64_t(std::llround(seconds(frame) * scale)); };
-            if (!p.signalled) {
+            if (out) {
                 const uint32_t dur = p.back >= 0 ? uint32_t(std::llround(seconds(p.back - p.frame) * scale)) : 0xffffffffu;
                 const std::vector<uint8_t> e = emsgBox(scale, at(p.frame), dur, uint32_t(p.id * 2), kScte35Scheme, "1", p.out);
                 v->emsg.insert(v->emsg.end(), e.begin(), e.end());
             }
-            if (!p.inSignalled && p.back >= 0 && !p.in.empty()) {
+            if (in) {
                 const std::vector<uint8_t> e = emsgBox(scale, at(p.back), 0, uint32_t(p.id * 2 + 1), kScte35Scheme, "1", p.in);
                 v->emsg.insert(v->emsg.end(), e.begin(), e.end());
             }
@@ -1310,10 +1316,31 @@ struct LivePackager::State {
             return std::max(f, index);
         };
         bool changed = false;
+        std::vector<Asked> later;
         for (Asked& a : got) {
             bool late = false;
             const int64_t frame = frameOf(a.cue.at, a.picture, &late);
-            if (frame > index + int64_t(3600 * rate)) continue;  // (an hour ahead: not a time this feed means)
+            if (frame > index + int64_t(3600 * rate)) {
+                // (the feed's an hour ahead: not a time it means; one placed here waits for its time to come near)
+                if (!a.fromFeed) later.push_back(a);
+                continue;
+            }
+            if (a.fromFeed && a.cue.cancel) {
+                // A cancel: the feed's break of that event not yet begun taken off (its message, if sent, stays sent).
+                const size_t was = placed.size();
+                placed.erase(std::remove_if(placed.begin(), placed.end(),
+                                            [&](const Placed& p) { return p.fromFeed && p.cue.eventId == a.cue.eventId && p.frame > index && !p.keyframe; }),
+                             placed.end());
+                changed = changed || placed.size() != was;
+                continue;
+            }
+            // (a message the feed repeats ahead of its splice: the cue placed already)
+            if (a.fromFeed && !a.cue.other &&
+                std::any_of(placed.begin(), placed.end(), [&](const Placed& p) {
+                    return p.fromFeed && !p.cue.other && !p.cue.returning && p.cue.eventId == a.cue.eventId &&
+                           (a.cue.returning ? p.returnSeen : !p.returned);
+                }))
+                continue;
             if (a.cue.returning) {
                 // The return of a break: the feed's by its event id, one placed here the latest still out.
                 Placed* out = nullptr;
@@ -1325,6 +1352,7 @@ struct LivePackager::State {
                     out->back = std::max(frame, out->frame + 1);
                     out->in = a.fromFeed && !a.cue.scte35.empty() ? a.cue.scte35 : makeCue(out->id, out->back, 0, true);
                     out->inSignalled = false;
+                    out->returnSeen = a.fromFeed;
                     signal(*out);
                     changed = true;
                     continue;
@@ -1335,14 +1363,20 @@ struct LivePackager::State {
             p.cue = a.cue;
             p.fromFeed = a.fromFeed;
             p.frame = frame;
+            p.placedAt = index;
             p.late = late;
-            if (!a.cue.other && !a.cue.returning && a.cue.duration > 0) p.back = frame + std::max<int64_t>(1, std::llround(a.cue.duration * rate));
+            if (!a.cue.other && !a.cue.returning && a.cue.duration > 0 && a.cue.autoReturn)
+                p.back = frame + std::max<int64_t>(1, std::llround(a.cue.duration * rate));
             p.out = a.fromFeed && !a.cue.scte35.empty() ? a.cue.scte35 : makeCue(p.id, frame, a.cue.duration, a.cue.returning);
             // (a break of the feed's that returns by itself: its end listed with its length, no message of its own)
             if (p.back >= 0 && !a.fromFeed) p.in = makeCue(p.id, p.back, 0, true);
             placed.push_back(std::move(p));
             signal(placed.back());
             changed = true;
+        }
+        if (!later.empty()) {
+            std::lock_guard lock(m);
+            asked.insert(asked.end(), later.begin(), later.end());
         }
         // (what has left the window and its files is forgotten)
         const double gone = seconds(index) - segSeconds * (2 * set.window + 4);
@@ -1425,6 +1459,18 @@ struct LivePackager::State {
         // (the first picture of a segment, or the first that came of it when the segment's first was dropped, and
         // a cue's splice or return: a keyframe)
         const int64_t segment = index / segFrames, before = encodedSegment;
+        // (a cue on a picture that was dropped goes on the first after it)
+        bool moved = false;
+        for (Placed& p : placed) {
+            if (p.frame > encodedIndex && p.frame < index) p.frame = index, moved = true;
+            if (p.back > encodedIndex && p.back < index) p.back = std::max(index, p.frame + 1), moved = true;
+        }
+        if (moved) publishCues();
+        encodedIndex = index;
+        // (each segment's start: the event messages of cues still ahead, again)
+        if (segment != before)
+            for (Placed& p : placed)
+                if (p.placedAt != index) signal(p, true, index);
         const bool cueHere = std::any_of(placed.begin(), placed.end(), [&](const Placed& p) { return p.frame == index || p.back == index; });
         const bool start = segment != before || cueHere;
         encodedSegment = segment;
@@ -1735,16 +1781,20 @@ void LivePackager::cueFromFeed(const std::vector<uint8_t>& section, double feedZ
         return std::max(0.0, double(d) / 90000);
     };
     if (c.command == scte35::Cue::Insert) {
-        if (c.eventCancel) return;
         lc.eventId = c.eventId;
-        lc.at = when(c.immediate ? -1 : c.ptsTime);
+        lc.cancel = c.eventCancel;
+        lc.at = when(c.immediate || c.eventCancel ? -1 : c.ptsTime);
         lc.returning = !c.outOfNetwork;
+        lc.autoReturn = c.autoReturn;
         lc.duration = !lc.returning && c.breakDuration > 0 ? double(c.breakDuration) / 90000 : 0;
     } else if (c.command == scte35::Cue::TimeSignal) {
         lc.at = when(c.ptsTime);
         lc.other = true;
         for (const scte35::Segmentation& g : c.segmentations)
-            if (!g.cancel && g.typeId >= 0x30 && g.typeId <= 0x3f) {
+            if (g.cancel) {
+                lc.other = false, lc.cancel = true, lc.eventId = g.eventId, lc.at = when(-1);
+                break;
+            } else if (g.typeId >= 0x30 && g.typeId <= 0x3f) {
                 // (an advertisement's or placement opportunity's start, even; its end, odd)
                 lc.other = false;
                 lc.eventId = g.eventId;
@@ -1793,7 +1843,8 @@ bool LivePackager::growing(const std::string& rel) const {
 std::string playlistDeltaUpdate(const std::string& playlist, int* skipped) {
     if (skipped) *skipped = 0;
     const QString text = QString::fromStdString(playlist);
-    const QRegularExpressionMatch until = QRegularExpression("CAN-SKIP-UNTIL=([0-9.]+)").match(text);
+    static const QRegularExpression canSkip("CAN-SKIP-UNTIL=([0-9.]+)"), partDuration("DURATION=([0-9.]+)");
+    const QRegularExpressionMatch until = canSkip.match(text);
     if (!until.hasMatch() || text.contains("#EXT-X-ENDLIST")) return playlist;
     const double boundary = until.captured(1).toDouble();
     QStringList lines = text.split('\n');
@@ -1820,7 +1871,7 @@ std::string playlistDeltaUpdate(const std::string& playlist, int* skipped) {
             from = i + 1;
             trailing = 0;
         } else if (l.startsWith("#EXT-X-PART:")) {
-            const QRegularExpressionMatch d = QRegularExpression("DURATION=([0-9.]+)").match(l);
+            const QRegularExpressionMatch d = partDuration.match(l);
             if (d.hasMatch()) trailing += d.captured(1).toDouble();
         }
     }

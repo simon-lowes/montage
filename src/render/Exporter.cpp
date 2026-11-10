@@ -198,18 +198,6 @@ AVPixelFormat tenBitFormat(AVPixelFormat f, const AVCodecContext* ctx, const AVC
     return f;
 }
 
-// ISO 639-2 code for a caption track's ISO 639-1 language (MP4 and MKV store three letters).
-const char* iso639_2(const std::string& code) {
-    static const std::pair<const char*, const char*> table[] = {
-        {"en", "eng"}, {"es", "spa"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"pt", "por"}, {"nl", "nld"},
-        {"pl", "pol"}, {"sv", "swe"}, {"da", "dan"}, {"no", "nor"}, {"fi", "fin"}, {"cs", "ces"}, {"el", "ell"},
-        {"tr", "tur"}, {"ru", "rus"}, {"uk", "ukr"}, {"ar", "ara"}, {"he", "heb"}, {"hi", "hin"}, {"id", "ind"},
-        {"vi", "vie"}, {"th", "tha"}, {"ja", "jpn"}, {"ko", "kor"}, {"zh", "zho"}, {"cy", "cym"}, {"ga", "gle"}};
-    for (const auto& [two, three] : table)
-        if (code == two) return three;
-    return code.size() == 3 ? code.c_str() : nullptr;
-}
-
 // Text subtitle encoders take ASS events and need an ASS header with a Default style.
 const char* kAssHeader =
     "[Script Info]\r\nScriptType: v4.00+\r\nPlayResX: 384\r\nPlayResY: 288\r\nScaledBorderAndShadow: yes\r\n\r\n"

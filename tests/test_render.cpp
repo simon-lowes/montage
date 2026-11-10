@@ -915,7 +915,7 @@ private:
         const std::vector<std::vector<CcTriplet>> cc = captionCcData(captions, Rational{25, 1}, frames, true, false);
         const auto t0 = std::chrono::steady_clock::now();
         int64_t samples[2] = {0, 0};
-        bool cueSent = false;
+        int cueCopies = 0;
         auto send = [&](AVCodecContext* e, AVStream* st, AVFrame* f) {
             if (avcodec_send_frame(e, f) < 0) return;
             while (avcodec_receive_packet(e, pkt) >= 0) {
@@ -927,12 +927,18 @@ private:
         };
         for (int64_t i = 0; i < frames && !stopping_; ++i) {
             std::this_thread::sleep_until(t0 + std::chrono::microseconds(i * 40000));
-            // (the cue, a few seconds ahead of its splice)
-            if (!cueSent && double(i) / 25 >= spliceSeconds - cueAhead) {
+            // (the cue, a few seconds ahead of its splice and again each second until it, as encoders repeat it; with
+            // the first, a later break announced, cancelled with the second)
+            if (cueCopies < int(cueAhead) && double(i) / 25 >= spliceSeconds - cueAhead + cueCopies) {
                 scte35::Cue c;
                 c.eventId = eventId, c.outOfNetwork = true, c.ptsTime = splicePts(), c.breakDuration = int64_t(breakSeconds * 90000);
                 queueCue(scte35::encode(c));
-                cueSent = true;
+                scte35::Cue other;
+                other.eventId = eventId + 1;
+                if (cueCopies == 0) other.ptsTime = splicePts() + 6 * 90000, other.breakDuration = 90000;
+                else other.eventCancel = true;
+                if (cueCopies < 2) queueCue(scte35::encode(other));
+                ++cueCopies;
             }
             av_frame_unref(pic);
             pic->format = AV_PIX_FMT_YUV420P, pic->width = 320, pic->height = 180;
@@ -25107,7 +25113,8 @@ colorspaces:
         // SRT on loopback, recorded by Capture (every sound stream, the captions and the cues) and packaged as it comes
         // with low latency, two rungs, served by the origin. hls.js and dash.js in headless Chromium list both
         // languages and the captions, show the captions, and raise the cue within a frame of its splice, on a
-        // keyframe; a cue placed by hand lands on a keyframe too. Delta updates skip what is past their boundary, each
+        // keyframe (the feed's repeats of it the same cue, a break it cancels gone); a cue placed by hand lands on a
+        // keyframe too. Delta updates skip what is past their boundary, each
         // rendition report names the other rung's last part, and a blocking reload for the next part returns with it.
 #ifndef MONTAGE_TEST_STREAMING_PLAYERS
         QSKIP("hls.js and dash.js were not fetched when the build was configured");
@@ -25309,6 +25316,12 @@ colorspaces:
         QTRY_VERIFY_WITH_TIMEOUT(packager.status().cues.size() >= 2 && packager.status().cues.back().keyframe, 20000);
         const LiveCueStatus manual = packager.status().cues.back();
         QVERIFY(!manual.fromFeed && manual.frame > fed.frame);
+        // (the feed's repeats of its cue the one cue; its cancelled break gone)
+        {
+            const std::vector<LiveCueStatus> all = packager.status().cues;
+            QCOMPARE(int(std::count_if(all.begin(), all.end(), [](const LiveCueStatus& c) { return c.fromFeed; })), 1);
+            QCOMPARE(int(all.size()), 2);
+        }
 
         // The rungs' segments: a keyframe at each splice (decoded from the segment that holds it).
         QTRY_VERIFY_WITH_TIMEOUT(packager.status().segments > manual.frame / 25 + 1, 20000);
