@@ -9853,6 +9853,14 @@ Download it now?</source>
         <source>(and at this computer&apos;s address on the network)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>This build does not record &quot;%1&quot; (see &quot;kinds&quot;)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>jpeg_xs_bpp is 0.5 to 24 bits a pixel</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::ChartMatchDialog</name>
@@ -12805,6 +12813,22 @@ Do you want to replace it?</source>
         <source>Exported %1, but it does not keep its buffer model (%2). A strict ingest check may refuse it; Quality Check&apos;s Buffer model lists the frames.</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>The preset&apos;s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 bits a pixel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS&apos;s rate: each picture the same number of bytes, its width times its height times this, over 8</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS:</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::FootageNotesDialog</name>
@@ -13348,10 +13372,6 @@ Projects it was inserted into play its pictures from there, so they would need r
         <translation type="unfinished">La visualización HDR necesita una pantalla de escritorio (este es « %1 »)</translation>
     </message>
     <message>
-        <source>HDR viewing is available on macOS (EDR displays) and Windows (with HDR switched on)</source>
-        <translation type="unfinished">La visualización HDR está disponible en macOS (mostraciones EDR) y Windows (con HDR activado)</translation>
-    </message>
-    <message>
         <source>No graphics device for HDR viewing</source>
         <translation type="unfinished">No hay dispositivo gráfico para ver HDR</translation>
     </message>
@@ -13370,6 +13390,46 @@ Projects it was inserted into play its pictures from there, so they would need r
     <message>
         <source>The graphics device was reset</source>
         <translation type="unfinished">El dispositivo gráfico se ha restablecido</translation>
+    </message>
+    <message>
+        <source>HDR viewing on Linux needs a Wayland session (this one is X11)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR viewing on Linux needs a Wayland session (this display is &quot;%1&quot;)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This compositor does not take HDR pictures (it has no Wayland colour management)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This compositor&apos;s colour management cannot describe HDR pictures (%1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This build cannot describe HDR pictures to Wayland (it needs wayland-protocols 1.41 or later, or Qt 6.10.2)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR viewing is available on macOS (EDR displays), Windows (with HDR switched on) and Wayland on Linux</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The graphics device cannot draw into half-float textures</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The graphics device could not make the HDR viewer&apos;s shaders</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The connection to the Wayland compositor failed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The compositor did not take the HDR picture&apos;s description (%1)</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
