@@ -24425,21 +24425,29 @@ colorspaces:
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
         Project p = makeDefaultProject();
         const int W = 3840, H = 2160;
-        Image in(W, H, Image::Uninitialized{});
+        Image full(W, H, Image::Uninitialized{});
         uint32_t seed = 7;
         for (int y = 0; y < H; ++y)
             for (int x = 0; x < W; ++x) {
-                float* px = in.at(x, y);
+                float* px = full.at(x, y);
                 seed = seed * 1664525u + 1013904223u;
                 const bool spot = (seed >> 20) % 4096 == 0;  // (about 2000 bright points, and soft light between)
                 for (int c = 0; c < 3; ++c) px[c] = spot ? 4.0f + float(c) : 0.4f + 0.5f * float(std::sin(x * 0.01 + y * 0.013 + c));
                 px[3] = 1;
             }
+        // (and with light only in a corner: the tiles with none passed over, as on the CPU)
+        Image corner = full;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (x >= 400 || y >= 400)
+                    for (int c = 0; c < 3; ++c) corner.at(x, y)[c] = std::min(corner.at(x, y)[c], 0.9f);
         const struct {
             double size, threshold, scale;
             int blades;
-        } cases[] = {{100, 1.0, 1, 6}, {40, 0.8, 3, 7}};
+            bool corner;
+        } cases[] = {{100, 1.0, 1, 6, false}, {40, 0.8, 3, 7, false}, {100, 1.0, 1, 6, true}};
         for (const auto& k : cases) {
+            const Image& in = k.corner ? corner : full;
             Effect e = makeEffect(p, "aperture_glare");
             e.params["size"] = k.size, e.params["threshold"] = k.threshold, e.params["blades"] = double(k.blades);
             Image cpu = in;
@@ -24453,9 +24461,12 @@ colorspaces:
             QVERIFY(gpuColorOps(e, 0, item.a.ops, W, H, k.scale));
             QCOMPARE(item.a.ops.size(), size_t(1));
             QVERIFY(item.a.ops[0].kind == gpu::ColorOp::Filter && item.a.ops[0].passes.size() > 40);
+            const size_t passes = item.a.ops[0].passes.size();
             frame.items.push_back(std::move(item));
             Image onGpu;
+            const long before = gpu::stats().filterPasses;
             QVERIFY(gpu::execute(frame, &onGpu));
+            if (k.corner) QVERIFY2(size_t(gpu::stats().filterPasses - before) < passes / 3, "tiles with no light drawn");
             double worst = 0, added = 0;
             for (size_t i = 0; i < cpu.px.size(); ++i) {
                 worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]));

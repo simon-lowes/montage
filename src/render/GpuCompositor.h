@@ -76,6 +76,10 @@ struct ColorOp {
         int width = 0, height = 0;  // what it makes (0: the layer's size)
         int save = -1;              // the filter's slot it keeps what it makes in, for a later pass
         int extra = -1, tableSlot = -1;  // slots read as gpufilter.frag's `extra`, and as its `table` instead of `table` above
+        // What it makes read back as flags (each texel's red, 0 or not), and a pass left out where flag `when` is 0
+        // (Aperture Glare's tiles with no light). (A sharedTable stays on the GPU while it lives, for later frames.)
+        bool flags = false;
+        int when = -1;
     };
     std::vector<FilterPass> passes;  // Filter
     std::shared_ptr<const ShaderStep> shader;  // Shader

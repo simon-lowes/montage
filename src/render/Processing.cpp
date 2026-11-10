@@ -4306,47 +4306,54 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                 }
             }
         } else if (ty == "aperture_glare") {
-            // apertureGlare's convolution by FFTs in tiles (overlap-add), tiled as the CPU tiles it: the kernel's spectra
-            // kept in slot 1 (45); each tile's light above the threshold, shrunk (42), transformed along rows then
-            // columns (43, Stockham radix 2, a pass a stage), through the kernel (44), back again (43, inverse) and added
-            // into the glare kept in slot 0 (46); then the glare drawn back up and added to the picture (47)
+            // apertureGlare's convolution by FFTs in tiles (overlap-add), tiled as the CPU tiles it: which tiles have any
+            // light (70 and 71, read back: those with none passed over, as the CPU passes over them); the glare cleared
+            // into slot 0 (45); each lit tile's light above the threshold, shrunk (42), transformed along rows then
+            // columns (43, Stockham radix 2, a pass a stage), through the kernel (44, its spectra kept on the GPU while
+            // the kernel lives), back again (43, inverse) and added into the glare (46); then the glare drawn back up and
+            // added to the picture (47)
             sfx::GlareSetup g;
             const bool glare = sfx::apertureGlareSetup(e, t, width, height, pixelScale, g);
             // (a glare whose transforms would be 4096 square or more, 256 MB a pass, is left to the CPU)
             if (glare && g.M > 2048) return false;
             if (glare) {
-                const int M = g.M;
+                const int M = g.M, across = (g.GW + g.T - 1) / g.T, down = (g.GH + g.T - 1) / g.T;
                 auto sized = [&](int w, int h) {
                     f.passes.back().width = w, f.passes.back().height = h;
                     return &f.passes.back();
                 };
-                gpu::ColorOp::FilterPass* kp = (add(45, {}), sized(M, 2 * M));
-                kp->sharedTable = g.spectra, kp->tableWidth = M, kp->save = 1;
+                const float lit[7] = {float(g.threshold), float(g.f), 0, 0, float(g.T), float(g.GW), float(g.GH)};
+                add(70, {lit[0], lit[1], lit[2], lit[3], lit[4], lit[5], lit[6]});
+                sized(across, g.GH);
+                add(71, {lit[0], lit[1], lit[2], lit[3], lit[4], lit[5], lit[6]});
+                sized(across, down)->flags = true;
+                add(45, {});
+                sized(g.GW, g.GH)->save = 0;
+                int tile = 0;
                 auto transform = [&](bool inverse) {
                     for (int dir = 0; dir < 2; ++dir)
                         for (int ns = 1; ns < M; ns *= 2) {
                             add(43, {float(M), float(ns), float(dir), inverse ? 1.0f : 0.0f});
                             gpu::ColorOp::FilterPass* fp = sized(M, M);
-                            fp->sharedTable = g.twiddles, fp->tableWidth = M / 2;
+                            fp->sharedTable = g.twiddles, fp->tableWidth = M / 2, fp->when = tile;
                         }
                 };
-                bool first = true;
                 for (int row = 0; row < g.GH; row += g.T)
-                    for (int tx = 0; tx < g.GW; tx += g.T) {
+                    for (int tx = 0; tx < g.GW; tx += g.T, ++tile) {
                         const int tw = std::min(g.T, g.GW - tx), th = std::min(g.T, g.GH - row);
                         add(42, {float(g.threshold), float(g.f), float(tx), float(row), float(tw), float(th)});
-                        sized(M, M);
+                        sized(M, M)->when = tile;
                         transform(false);
                         add(44, {float(M)});
-                        sized(M, M)->tableSlot = 1;
+                        gpu::ColorOp::FilterPass* kp = sized(M, M);
+                        kp->sharedTable = g.spectra, kp->tableWidth = M, kp->when = tile;
                         transform(true);
-                        add(46, {float(tx), float(row), float(tw), float(th), float(g.radius), float(M), 1.0f / (float(M) * float(M)), first ? 0.0f : 1.0f});
+                        add(46, {float(tx), float(row), float(tw), float(th), float(g.radius), float(M), 1.0f / (float(M) * float(M)), 1.0f});
                         gpu::ColorOp::FilterPass* acc = sized(g.GW, g.GH);
-                        acc->save = 0, acc->extra = first ? -1 : 0;
-                        first = false;
+                        acc->save = 0, acc->extra = 0, acc->when = tile;
                     }
                 add(47, {float(g.f), float(g.intensity)});
-                sized(width, height);
+                sized(width, height)->extra = 0;
             }
         } else if (ty == "lens_flare") {
             // lensFlare's light, star, ring and ghosts at each pixel (gpufilter.frag's mode 38), the ghosts in the table

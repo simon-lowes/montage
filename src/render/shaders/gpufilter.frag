@@ -47,9 +47,10 @@
 // Block Rays, 40 the small copy of what blocks them and 41 the light let through) and 38 Lens Flare;
 // 39 Radial Blur (render/StyleFx's radialBlur: p[1] the centre, the zoom's share of the way there, the spin in radians);
 // and Aperture Glare (render/StyleFx's apertureGlare, its convolution by FFTs in tiles; each texel of a transform holds
-// red + i green in xy and blue in zw): 45 the kernel's spectra from the table (M rows of red and green, then M of
-// blue), 42 a tile's light above the threshold, shrunk, 43 a stage of a transform, 44 through the kernel, 46 a tile's
-// glare added to what the tiles before made, 47 the glare added to the picture.
+// red + i green in xy and blue in zw): 70 which tiles have any light (along each row of each, then 71 down them, read
+// back so the others are passed over), 45 the glare cleared, 42 a tile's light above the threshold, shrunk, 43 a stage
+// of a transform, 44 through the kernel (the table its spectra, M rows of red and green, then M of blue), 46 a tile's
+// glare added to what the tiles before made (extra), 47 the glare (extra) added to the picture.
 // Painterly (render/PaintFx): 49 the structure tensor, smoothed by 1's boxes or 48's kernel, 50 its flow; then 52 the
 // anisotropic Kuwahara filter (a wide brush on 55 the picture and 51 its squares, each through 1's boxes) or 53 the
 // smear along the flow.
@@ -422,6 +423,23 @@ vec4 shapePaint(int at, float x, float y) {
         }
     }
     return tableTexel(s0 + 2 * (n - 1) + 1);
+}
+
+// Aperture Glare's light above the threshold at a pixel of the glare (gx, gy): the mean of the f x f of the picture's
+// (orig) it shrinks.
+vec3 glareLight(int gx, int gy, int f, float threshold) {
+    const ivec2 full = textureSize(orig, 0);
+    vec3 sum = vec3(0.0);
+    int n = 0;
+    for (int y = gy * f; y < min(full.y, (gy + 1) * f); ++y)
+        for (int x = gx * f; x < min(full.x, (gx + 1) * f); ++x) {
+            const vec4 q = texelFetch(orig, ivec2(x, y), 0);
+            const float l = q.a > 0.0 ? lumaOf(q) / q.a : 0.0;
+            if (!isinf(l) && !isnan(l) && l > threshold) sum += q.rgb * ((l - threshold) / l);
+            ++n;
+        }
+    if (f > 1) sum /= float(n);
+    return sum;
 }
 
 // Lens Blur's weight of a pixel's layers (bin0 in x, the nearer one's share in y) for layer k.
@@ -923,7 +941,7 @@ void main() {
         return;
     }
     if (mode == 45) {
-        fragColor = texelFetch(table, xy, 0);
+        fragColor = vec4(0.0);
         return;
     }
     if (mode == 42) {
@@ -934,19 +952,26 @@ void main() {
             fragColor = vec4(0.0);
             return;
         }
-        const ivec2 full = textureSize(orig, 0);
-        const int gx = tx + xy.x, gy = ty + xy.y;
-        vec3 sum = vec3(0.0);
-        int n = 0;
-        for (int y = gy * f; y < min(full.y, (gy + 1) * f); ++y)
-            for (int x = gx * f; x < min(full.x, (gx + 1) * f); ++x) {
-                const vec4 q = texelFetch(orig, ivec2(x, y), 0);
-                const float l = q.a > 0.0 ? lumaOf(q) / q.a : 0.0;
-                if (!isinf(l) && !isnan(l) && l > p[1].x) sum += q.rgb * ((l - p[1].x) / l);
-                ++n;
-            }
-        if (f > 1) sum /= float(n);
-        fragColor = vec4(sum.r, sum.g, sum.b, 0.0);
+        fragColor = vec4(glareLight(tx + xy.x, ty + xy.y, f, p[1].x), 0.0);
+        return;
+    }
+    if (mode == 70) {
+        // Whether any of a row's light (as 42 has it) in tile p[2].x wide is more than nothing: 1 or 0
+        const int f = int(p[1].y), T = int(p[2].x), GW = int(p[2].y);
+        float lit = 0.0;
+        for (int gx = xy.x * T; gx < min(GW, (xy.x + 1) * T) && lit == 0.0; ++gx) {
+            const vec3 l = glareLight(gx, xy.y, f, p[1].x);
+            if (l.r > 0.0 || l.g > 0.0 || l.b > 0.0) lit = 1.0;
+        }
+        fragColor = vec4(lit, 0.0, 0.0, 0.0);
+        return;
+    }
+    if (mode == 71) {
+        // Whether any row of the tile (70's, srcTex) is
+        const int T = int(p[2].x), GH = int(p[2].z);
+        float lit = 0.0;
+        for (int gy = xy.y * T; gy < min(GH, (xy.y + 1) * T); ++gy) lit = max(lit, texelFetch(srcTex, ivec2(xy.x, gy), 0).r);
+        fragColor = vec4(lit, 0.0, 0.0, 0.0);
         return;
     }
     if (mode == 43) {
@@ -992,20 +1017,20 @@ void main() {
         return;
     }
     if (mode == 47) {
-        // The glare (srcTex, shrunk p[1].x times: drawn back up between its pixels) added to the picture by p[1].y
+        // The glare (extra, shrunk p[1].x times: drawn back up between its pixels) added to the picture by p[1].y
         const vec4 o = texelFetch(orig, xy, 0);
         const int f = int(p[1].x);
         vec3 g;
         if (f == 1) {
-            g = texelFetch(srcTex, xy, 0).rgb;
+            g = texelFetch(extra, xy, 0).rgb;
         } else {
-            const ivec2 n = size;
+            const ivec2 n = textureSize(extra, 0);
             const float sx = clamp((float(xy.x) + 0.5) / float(f) - 0.5, 0.0, float(n.x - 1));
             const float sy = clamp((float(xy.y) + 0.5) / float(f) - 0.5, 0.0, float(n.y - 1));
             const int x0 = int(sx), y0 = int(sy), x1 = min(n.x - 1, x0 + 1), y1 = min(n.y - 1, y0 + 1);
             const float fx = sx - float(x0), fy = sy - float(y0);
-            g = (texelFetch(srcTex, ivec2(x0, y0), 0).rgb * (1.0 - fx) + texelFetch(srcTex, ivec2(x1, y0), 0).rgb * fx) * (1.0 - fy) +
-                (texelFetch(srcTex, ivec2(x0, y1), 0).rgb * (1.0 - fx) + texelFetch(srcTex, ivec2(x1, y1), 0).rgb * fx) * fy;
+            g = (texelFetch(extra, ivec2(x0, y0), 0).rgb * (1.0 - fx) + texelFetch(extra, ivec2(x1, y0), 0).rgb * fx) * (1.0 - fy) +
+                (texelFetch(extra, ivec2(x0, y1), 0).rgb * (1.0 - fx) + texelFetch(extra, ivec2(x1, y1), 0).rgb * fx) * fy;
         }
         const vec3 add = max(vec3(0.0), g) * p[1].y;
         fragColor = vec4(o.rgb + add, min(1.0, o.a + max(add.r, max(add.g, add.b))));

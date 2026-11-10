@@ -184,6 +184,7 @@ private:
     void release(QRhiTexture* tex);  // back to the pool, for later passes of the frame
     Target* target(QRhiTexture* tex);  // (null, and the frame failed, when the device cannot draw into it)
     QRhiTexture* lutTexture(const std::shared_ptr<const Lut3D>& lut, QRhiResourceUpdateBatch* u, QRhiTexture** table1d);
+    QRhiTexture* sharedTable(const std::shared_ptr<const std::vector<float>>& rows, int width, QRhiResourceUpdateBatch* u);
     QRhiBuffer* uniforms(QRhiResourceUpdateBatch* u, const float (&p)[64]);
     void pass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdateBatch* u,
               const std::vector<std::pair<int, QRhiTexture*>>& textures, QRhiBuffer* ubuf, QRhiResourceUpdateBatch* after = nullptr);
@@ -271,6 +272,14 @@ private:
     std::map<const Lut3D*, LutTex> luts_;
     // Those first uploaded in this frame: forgotten if it fails, as their uploads may not have been submitted.
     std::vector<const Lut3D*> lutsNew_;
+    // Filters' shared tables uploaded (Aperture Glare's spectra and twiddles), by the table, kept while it lives; and
+    // those uploaded in this frame.
+    struct SharedTex {
+        std::weak_ptr<const std::vector<float>> rows;
+        QRhiTexture* tex;
+    };
+    std::map<const std::vector<float>*, SharedTex> sharedTables_;
+    std::vector<const std::vector<float>*> sharedTablesNew_;
 };
 
 bool Device::start(std::string* why) {
@@ -578,6 +587,9 @@ void Device::destroy() {
     for (auto& [lut, t] : luts_) delete t.tex;
     luts_.clear();
     lutsNew_.clear();
+    for (auto& [rows, t] : sharedTables_) delete t.tex;
+    sharedTables_.clear();
+    sharedTablesNew_.clear();
     for (auto& [tex, t] : targets_) delete t.rt, delete t.rp;
     targets_.clear();
     for (Pooled& p : pool_) delete p.tex;
@@ -683,6 +695,29 @@ QRhiTexture* Device::lutTexture(const std::shared_ptr<const Lut3D>& lut, QRhiRes
         return dummy3d_;
     }
     return it->second.tex;
+}
+
+QRhiTexture* Device::sharedTable(const std::shared_ptr<const std::vector<float>>& rows, int width, QRhiResourceUpdateBatch* u) {
+    for (auto it = sharedTables_.begin(); it != sharedTables_.end();)
+        if (it->second.rows.expired()) {
+            delete it->second.tex;
+            it = sharedTables_.erase(it);
+        } else {
+            ++it;
+        }
+    if (auto it = sharedTables_.find(rows.get()); it != sharedTables_.end() && it->second.tex->pixelSize().width() == width) return it->second.tex;
+    const int h = std::max(1, int(rows->size() / (size_t(width) * 4)));
+    QRhiTexture* t = rhi_->newTexture(QRhiTexture::RGBA32F, QSize(width, h));
+    if (!t->create()) {
+        delete t;
+        return nullptr;
+    }
+    QRhiTextureSubresourceUploadDescription d(rows->data(), quint32(size_t(width) * size_t(h) * 16));
+    u->uploadTexture(t, QRhiTextureUploadEntry(0, 0, d));
+    if (auto it = sharedTables_.find(rows.get()); it != sharedTables_.end()) delete it->second.tex, sharedTables_.erase(it);
+    sharedTables_.emplace(rows.get(), SharedTex{rows, t});
+    sharedTablesNew_.push_back(rows.get());
+    return t;
 }
 
 QRhiBuffer* Device::uniforms(QRhiResourceUpdateBatch* u, const float (&p)[64]) {
@@ -1096,7 +1131,9 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             };
             auto slotAt = [&](int i) { return i >= 0 && size_t(i) < saved.size() ? saved[size_t(i)] : nullptr; };
             bool failed = false;
+            std::vector<float> flags;  // (read back from a pass that makes them)
             for (const ColorOp::FilterPass& fp : op.passes) {
+                if (fp.when >= 0 && size_t(fp.when) < flags.size() && flags[size_t(fp.when)] == 0) continue;
                 QRhiTexture* made = texture(T::RGBA32F, fp.width > 0 ? fp.width : size.width(), fp.height > 0 ? fp.height : size.height(), true);
                 if (!made) {
                     failed = true;
@@ -1106,8 +1143,16 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 p[0] = float(fp.mode);
                 std::copy(fp.params, fp.params + 60, p + 4);
                 QRhiTexture* table = nullptr;
+                QRhiTexture* kept = nullptr;  // (a shared table, held on the GPU)
                 const std::vector<float>& rowsOf = fp.sharedTable ? *fp.sharedTable : fp.table;
-                if (fp.tableWidth > 0 && !rowsOf.empty()) {
+                if (fp.sharedTable && fp.tableWidth > 0 && !rowsOf.empty()) {
+                    kept = sharedTable(fp.sharedTable, fp.tableWidth, u);
+                    if (!kept) {
+                        release(made);
+                        failed = true;
+                        break;
+                    }
+                } else if (fp.tableWidth > 0 && !rowsOf.empty()) {
                     const int rows = int(rowsOf.size() / (size_t(fp.tableWidth) * 4));
                     table = texture(T::RGBA32F, fp.tableWidth, std::max(1, rows), false);
                     if (!table) {
@@ -1120,11 +1165,25 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 }
                 std::vector<std::pair<int, QRhiTexture*>> bound = {{1, at}, {4, cur}};
                 if (QRhiTexture* t = slotAt(fp.extra)) bound.push_back({2, t});
-                if (QRhiTexture* t = table ? table : slotAt(fp.tableSlot)) bound.push_back({5, t});
+                if (QRhiTexture* t = table ? table : kept ? kept : slotAt(fp.tableSlot)) bound.push_back({5, t});
                 pass(filterPs_, made, u, bound, uniforms(u, p));
                 u = rhi_->nextResourceUpdateBatch();
                 if (table) release(table);
                 ++filterPasses;
+                if (fp.flags) {
+                    // (read back now, the work so far waited for: a small texture)
+                    QRhiReadbackResult read;
+                    QRhiResourceUpdateBatch* rb = rhi_->nextResourceUpdateBatch();
+                    rb->readBackTexture({made}, &read);
+                    cb_->resourceUpdate(rb);
+                    rhi_->finish();
+                    const size_t n = size_t(made->pixelSize().width()) * size_t(made->pixelSize().height());
+                    flags.clear();
+                    if (size_t(read.data.size()) >= n * 16) {
+                        flags.resize(n);
+                        for (size_t i = 0; i < n; ++i) std::memcpy(&flags[i], read.data.constData() + i * 16, sizeof(float));
+                    }
+                }
                 if (fp.save >= 0) {
                     if (saved.size() <= size_t(fp.save)) saved.resize(size_t(fp.save) + 1, nullptr);
                     QRhiTexture* old = saved[size_t(fp.save)];
@@ -1507,6 +1566,13 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
                 luts_.erase(it);
             }
     lutsNew_.clear();
+    if (!ok)
+        for (const std::vector<float>* rows : sharedTablesNew_)
+            if (auto it = sharedTables_.find(rows); it != sharedTables_.end()) {
+                delete it->second.tex;
+                sharedTables_.erase(it);
+            }
+    sharedTablesNew_.clear();
     if (!ok)
         for (const std::string& key : programsNew_)
             if (auto it = programs_.find(key); it != programs_.end()) {
