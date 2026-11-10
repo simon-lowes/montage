@@ -4056,6 +4056,10 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             // nearest face's depth needs the faces, found on the CPU.)
             if (std::lround(e.p("follow", t, 0)) == 2) return false;
             const DepthMap* depth = currentDepth();
+            // (its state twice the layer's width, and a table a row more than its height: a layer too big for them
+            // stays on the CPU)
+            if (const int most = gpu::maxTextureSize(); most > 0 && (2 * width > most || height + 1 > most || TransferTables::kDecode + 1 > most))
+                return false;
             if (width > 0 && height > 0 && depth && !depth->empty()) {
                 const std::vector<float> d = depth->resized(width, height);
                 const LensBlurSettings ls = depthBlurSettings(e, t, d, width, height, pixelScale);

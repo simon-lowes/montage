@@ -36,8 +36,9 @@ ShapeRaster shapeRaster(const std::vector<ShapePaint>& paints, const QTransform&
 // What it draws, premultiplied (gpufilter.frag's 56 does the same per pixel).
 Image drawShapeRaster(const ShapeRaster& r);
 
-// A Shape layer's contents (render/ShapeLayers' renderShapeContents), and the layer whatever it holds (render/Shapes'
-// renderShape: its contents, or its one shape), made so.
+// A Shape layer's contents on a w x h frame (`scale` output pixels a sequence pixel), through the layer's own position,
+// rotation and opacity, and the layer whatever it holds (render/Shapes' renderShape: its contents, or its one shape),
+// made so.
 ShapeRaster shapeContentsRaster(const Effect& g, FrameTime t, int w, int h, double scale, double fps);
 ShapeRaster shapeLayerRaster(const Effect& g, FrameTime t, int w, int h, double scale, double fps = 25);
 

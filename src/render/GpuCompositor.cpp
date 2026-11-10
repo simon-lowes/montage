@@ -1425,7 +1425,11 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     auto mixed = [&](QRhiTexture* a, QRhiTexture* b, const float* params, int n, const std::vector<float>* rows = nullptr,
                      int rowWidth = 0) -> QRhiTexture* {
         QRhiTexture* to = a && b ? texture(T::RGBA32F, W, H, true) : nullptr;
-        if (!to) return nullptr;
+        if (!to) {
+            if (a) release(a);
+            if (b) release(b);
+            return nullptr;
+        }
         float q[64] = {};
         std::copy(params, params + n, q);
         QRhiTexture* table = nullptr;  // (Smooth Cut's flow)
@@ -1492,8 +1496,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
                     if (blurred != map) release(map);
                     map = blurred;
                 }
-                if (!map) release(m);
-                m = map ? mixed(m, map, it.displaceParams, 24) : nullptr;
+                m = mixed(m, map, it.displaceParams, 24);  // (both let go, whatever comes of it)
             } else if (self) {
                 release(self);
             }

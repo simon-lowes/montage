@@ -3057,6 +3057,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
         if (r != GpuLayerResult::Nothing) gpu::countLayer(r != GpuLayerResult::Unsupported, "\"" + c.name + "\": " + how);
         return r != GpuLayerResult::Nothing;
     };
+    bool drawn = false;  // (anything on the canvas yet, as the CPU's canvasEmpty has it)
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;
@@ -3085,8 +3086,8 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             }
             if (flow) {
                 item.b.emplace();
-                layerOf(*A, item.a, from);
-                layerOf(*B, *item.b, to - 1);
+                drawn |= layerOf(*A, item.a, from);
+                drawn |= layerOf(*B, *item.b, to - 1);
                 std::fill(std::begin(item.transitionParams), std::end(item.transitionParams), 0.0f);
                 item.transitionParams[0] = 18, item.transitionParams[1] = float(std::clamp(u, 0.0, 1.0));
                 item.transitionParams[4] = float(flowScale), item.transitionParams[5] = float(flow->step);
@@ -3098,8 +3099,8 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 item.transition = 18;
             } else if (!smooth && gpuMixesTransition(seq, track, *active)) {
                 item.b.emplace();
-                if (A && A->enabled) layerOf(*A, item.a);
-                if (B && B->enabled) layerOf(*B, *item.b);
+                if (A && A->enabled) drawn |= layerOf(*A, item.a);
+                if (B && B->enabled) drawn |= layerOf(*B, *item.b);
                 item.dissolve = float(std::clamp(u, 0.0, 1.0));
                 if (active->type != "cross_dissolve") item.transition = kind;
             } else {
@@ -3108,7 +3109,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 Image below;
                 bool over = false;
                 for (const Clip* k : {A, B}) over |= k && k->enabled && k->isGenerator() && k->generator.type == "adjustment";
-                if (over && !frame.items.empty()) {
+                if (over && drawn) {
                     if (!adjustmentOnCpu.empty()) return fallback("an adjustment layer: " + adjustmentOnCpu);
                     gpu::Frame part;
                     part.width = W, part.height = H, part.flatten = false, part.part = true;
@@ -3120,6 +3121,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                     frame.items.push_back(std::move(canvasItem));
                 }
                 item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, below.empty() ? nullptr : &below, W, H));
+                drawn |= !item.a.image.empty();
                 gpu::countLayer(false, "a " + active->type + " transition");
             }
             frame.items.push_back(std::move(item));
@@ -3129,6 +3131,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             gpu::Item item;
             item.blendMode = blendModeIndex(c->blendMode);
             if (!layerOf(*c, item.a)) continue;
+            drawn = true;
             if (const Effect* e = enabledEffect(seq, *c, "displace_by_layer")) {
                 // Moved by a map (displaceLayer's): another track's picture now (none there, or no track: nothing
                 // moves), or its own; the edges its picture's, the map blurred first.

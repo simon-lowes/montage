@@ -32,10 +32,6 @@ struct ShapePaint {
 };
 std::vector<ShapePaint> shapePaints(const Effect& g, FrameTime t, double fps);
 
-// The contents drawn on a w x h frame (`scale` output pixels a sequence pixel), through the layer's own position,
-// rotation and opacity; premultiplied.
-Image renderShapeContents(const Effect& g, FrameTime t, int w, int h, double scale, double fps);
-
 // A path item's points (core/ShapeContents.h shapePathPoints) to the layer's frame at t: through the groups it is in
 // and the layer's own position and rotation, to pixels of a frameW x frameH frame (sequence pixels at its size). False
 // when the contents hold no path item `id`.

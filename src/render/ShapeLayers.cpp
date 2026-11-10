@@ -656,6 +656,8 @@ std::vector<ShapePaint> shapePaints(const Effect& g, FrameTime t, double fps) {
     return drawItems(g, shapeContents(g), t, fps, 0, budget).ops;
 }
 
+namespace {
+// The layer's own position and rotation, in a w x h frame's pixels.
 QTransform shapeLayerTransform(const Effect& g, FrameTime t, int w, int h, double scale) {
     QTransform layer;
     layer.translate(w / 2.0 + g.p("pos_x", t) * scale, h / 2.0 + g.p("pos_y", t) * scale);
@@ -663,14 +665,11 @@ QTransform shapeLayerTransform(const Effect& g, FrameTime t, int w, int h, doubl
     layer.scale(scale, scale);
     return layer;
 }
+}  // namespace
 
 ShapeRaster shapeContentsRaster(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
     const double opacity = std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0);
     return shapeRaster(shapePaints(g, t, fps), shapeLayerTransform(g, t, w, h, scale), opacity, w, h);
-}
-
-Image renderShapeContents(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
-    return drawShapeRaster(shapeContentsRaster(g, t, w, h, scale, fps));
 }
 
 namespace {

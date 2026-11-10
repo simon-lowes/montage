@@ -291,7 +291,7 @@ ShapeRaster shapeRaster(const std::vector<ShapePaint>& paints, const QTransform&
             const double ylo = std::min(s.y0, s.y1), yhi = std::max(s.y0, s.y1);
             if (yhi <= 0 || ylo >= bottom) continue;
             const double sign = s.y1 > s.y0 ? 1 : -1, k = (s.x1 - s.x0) / (s.y1 - s.y0);
-            const int b0 = std::max(0, int(std::floor(ylo / T))), b1 = std::min(r.tilesY - 1, int(std::floor(yhi / T)));
+            const int b0 = int(std::clamp(std::floor(ylo / T), 0.0, double(r.tilesY))), b1 = int(std::clamp(std::floor(yhi / T), -1.0, double(r.tilesY - 1)));
             for (int band = b0; band <= b1; ++band) {
                 const double t0 = std::max(ylo, double(band) * T), t1 = std::min(yhi, double(band + 1) * T);
                 if (!(t1 > t0)) continue;
