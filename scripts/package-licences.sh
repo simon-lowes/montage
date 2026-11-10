@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Starts a package's licences folder with what every package carries, whatever it bundles: Montage's own licence,
 # exception and third-party notices, the licences of the headers vendored in third_party/, of the libraries compiled
-# into Montage (from the build's _deps), of the C2PA library's Rust crates, and of the FFmpeg build.
+# into Montage (from the build's _deps), of the C2PA library's Rust crates, of SVT-JPEG-XS and of the FFmpeg build.
 #
-#   scripts/package-licences.sh <licenses-dir> <build-dir> [c2pa-prefix] [ffmpeg-share-dir]
+#   scripts/package-licences.sh <licenses-dir> <build-dir> [c2pa-prefix] [ffmpeg-share-dir] [svt-jpegxs-prefix]
 #
 # scripts/package-macos.sh and package-windows.sh then add the bundled shared libraries' licences and write
 # BUNDLED.txt, the index Help › Licences… shows.
@@ -13,6 +13,7 @@ OUT=${1:?licenses dir}
 BUILD=${2:?build dir}
 C2PA=${3:-}
 FFSHARE=${4:-}
+SVTJPEGXS=${5:-}
 
 rm -rf "$OUT"
 mkdir -p "$OUT/montage/third_party" "$OUT/compiled"
@@ -52,6 +53,12 @@ if [ -f "$BUILD/montage_x265_build-prefix/src/montage_x265_build/COPYING" ]; the
 fi
 
 if [ -n "$C2PA" ] && [ -d "$C2PA/licenses" ]; then cp -R "$C2PA/licenses" "$OUT/c2pa"; fi
+
+# SVT-JPEG-XS (static, as scripts/build-svt-jpegxs.sh builds it), with the cpuinfo it carries.
+if [ -n "$SVTJPEGXS" ] && [ -d "$SVTJPEGXS/licenses" ]; then
+  mkdir -p "$OUT/compiled"
+  cp -R "$SVTJPEGXS/licenses" "$OUT/compiled/svt-jpegxs"
+fi
 
 if [ -n "$FFSHARE" ] && [ -d "$FFSHARE" ]; then
   mkdir -p "$OUT/ffmpeg"

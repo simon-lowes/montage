@@ -93,6 +93,7 @@ add_library(montage_engine STATIC
   media/Exr.h media/Exr.cpp
   media/Jxl.h media/Jxl.cpp
   media/Av2.h media/Av2.cpp
+  media/JpegXs.h media/JpegXs.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
   media/DngOpcodes.h media/DngOpcodes.cpp
@@ -488,6 +489,29 @@ if(MONTAGE_WITH_AV2)
     target_link_libraries(montage_engine PRIVATE ${AV2_LINK_LIBRARIES} m)
   else()
     message(FATAL_ERROR "MONTAGE_WITH_AV2 is on but AVM and dav2d are not found: build them with scripts/build-av2.sh <prefix> and set AV2_ROOT=<prefix>")
+  endif()
+endif()
+if(MONTAGE_WITH_JPEGXS)
+  # Found from SVTJPEGXS_ROOT (scripts/build-svt-jpegxs.sh) or pkg-config, never fetched. Only media/JpegXs.cpp sees its
+  # headers and the definition; everything else asks jpegXsAvailable().
+  if(SVTJPEGXS_ROOT)
+    list(PREPEND CMAKE_PREFIX_PATH "${SVTJPEGXS_ROOT}")
+  endif()
+  pkg_check_modules(SVTJPEGXS SvtJpegxs>=0.10)
+  if(SVTJPEGXS_FOUND)
+    message(STATUS "SVT-JPEG-XS ${SVTJPEGXS_VERSION}: JPEG XS read and written")
+    set_property(SOURCE media/JpegXs.cpp APPEND PROPERTY INCLUDE_DIRECTORIES ${SVTJPEGXS_INCLUDE_DIRS})
+    set_property(SOURCE media/JpegXs.cpp APPEND PROPERTY COMPILE_DEFINITIONS MONTAGE_WITH_JPEGXS)
+    # (the static library as the script installs it, with its threads and libm)
+    target_link_libraries(montage_engine PRIVATE ${SVTJPEGXS_LINK_LIBRARIES} ${SVTJPEGXS_STATIC_LDFLAGS_OTHER} m)
+    # (its NASM objects carry no stack note, which would leave every program's stack executable on ELF systems)
+    if(NOT APPLE AND NOT WIN32)
+      target_link_options(montage_engine INTERFACE "LINKER:-z,noexecstack")
+    endif()
+  elseif(MONTAGE_REQUIRE_JPEGXS)
+    message(FATAL_ERROR "MONTAGE_REQUIRE_JPEGXS is on but SVT-JPEG-XS is not found: build it with scripts/build-svt-jpegxs.sh <prefix> and set SVTJPEGXS_ROOT=<prefix>")
+  else()
+    message(STATUS "SVT-JPEG-XS not found: JPEG XS is not read or written (scripts/build-svt-jpegxs.sh <prefix>, then SVTJPEGXS_ROOT=<prefix>)")
   endif()
 endif()
 if(MONTAGE_WITH_VMAF)

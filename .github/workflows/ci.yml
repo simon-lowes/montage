@@ -41,8 +41,19 @@ jobs:
           command -v meson > /dev/null || sudo apt-get install -y --no-install-recommends meson
           scripts/build-av2.sh ~/av2
           echo "MONTAGE_TEST_AV2_TOOLS=$HOME/av2/bin" >> "$GITHUB_ENV"
+      # SVT-JPEG-XS (JPEG XS in files, MXF and ST 2110-22), from a pinned tag checked against its commit, with its own
+      # encoder and decoder, which the JPEG XS tests compare Montage's frames with.
+      - name: Cache SVT-JPEG-XS
+        uses: actions/cache@v4
+        with:
+          path: ~/svt-jpegxs
+          key: svt-jpegxs-${{ runner.os }}-${{ hashFiles('scripts/build-svt-jpegxs.sh') }}
+      - name: SVT-JPEG-XS
+        run: |
+          scripts/build-svt-jpegxs.sh ~/svt-jpegxs
+          echo "MONTAGE_TEST_SVTJPEGXS=$HOME/svt-jpegxs/bin" >> "$GITHUB_ENV"
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DMONTAGE_WITH_AV2=ON -DAV2_ROOT="$HOME/av2"
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DMONTAGE_WITH_AV2=ON -DAV2_ROOT="$HOME/av2" -DSVTJPEGXS_ROOT="$HOME/svt-jpegxs" -DMONTAGE_REQUIRE_JPEGXS=ON
       - name: Build
         run: cmake --build build
       - name: Cache the speech model

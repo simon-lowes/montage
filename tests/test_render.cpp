@@ -185,6 +185,7 @@
 #include "render/Nmos.h"
 #include "render/St2110.h"
 #include "render/St2110Receive.h"
+#include "media/JpegXs.h"
 #ifdef MONTAGE_WITH_OMT
 #include "media/Omt.h"
 #include "media/OmtNet.h"
@@ -194,6 +195,7 @@
 #include "render/FaceShape.h"
 #include "media/CameraSolve.h"
 #include "audio/DynLib.h"
+#include <numeric>
 #include <random>
 #include "render/Restoration.h"
 #include "render/FilmScan.h"
@@ -1003,6 +1005,90 @@ private:
         av_write_trailer(oc);
     }
 };
+
+
+// ---- JPEG XS (media/JpegXs.h) ----
+
+// SVT-JPEG-XS's own encoder or decoder (SvtJpegxsEncApp, SvtJpegxsDecApp) in MONTAGE_TEST_SVTJPEGXS, as
+// scripts/build-svt-jpegxs.sh installs them in <prefix>/bin; empty when it is not there.
+QString jxsTool(const char* name) {
+    const QString dir = qEnvironmentVariable("MONTAGE_TEST_SVTJPEGXS");
+    if (dir.isEmpty()) return {};
+    const QString f = QDir(dir).filePath(QString::fromLatin1(name));
+    return QFileInfo(f).isExecutable() ? f : QString();
+}
+
+bool runJxsTool(const QString& exe, const QStringList& args, QString* said = nullptr) {
+    QProcess p;
+    p.setProcessChannelMode(QProcess::MergedChannels);
+    p.start(exe, args);
+    const bool done = p.waitForFinished(900000);
+    if (!done) p.kill();
+    if (said) *said = QString::fromLocal8Bit(p.readAll());
+    return done && p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0;
+}
+
+// A picture with what coders find hard and easy: smooth ramps, fine texture, hard-edged shapes and a little grain,
+// moving with `frame`.
+montage::JxsPicture jxsTestPicture(int w, int h, int depth, montage::JxsSampling s, int frame = 0) {
+    montage::JxsPicture p(w, h, depth, s);
+    const double top = double((1 << depth) - 1);
+    uint32_t seed = 2112u + uint32_t(frame) * 7919u;
+    for (int c = 0; c < 3; ++c) {
+        const int pw = p.planeWidth(c);
+        const double sx = double(w) / pw;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < pw; ++x) {
+                const double X = x * sx + frame * 3, Y = y;
+                double v = 0.45 + 0.25 * std::sin(X * 0.011 + c) * std::cos(Y * 0.007);                // ramps
+                v += 0.08 * std::sin(X * 0.35 + Y * 0.21) * (c == 0 ? 1.0 : 0.5);                     // texture
+                if (int(X / 97) % 3 == 0 && int(Y / 61) % 2 == 0) v += c == 0 ? 0.2 : (c == 1 ? -0.1 : 0.12);  // shapes
+                seed = seed * 1664525u + 1013904223u;
+                v += (double(seed >> 24) / 255.0 - 0.5) * 0.02;                                       // grain
+                p.planes[c][size_t(y) * size_t(pw) + size_t(x)] = uint16_t(std::clamp(v, 0.0, 1.0) * top + 0.5);
+            }
+    }
+    return p;
+}
+
+double jxsPsnr(const montage::JxsPicture& a, const montage::JxsPicture& b) {
+    double sum = 0;
+    size_t n = 0;
+    for (int c = 0; c < 3; ++c) {
+        if (a.planes[c].size() != b.planes[c].size()) return 0;
+        for (size_t i = 0; i < a.planes[c].size(); ++i) {
+            const double d = double(a.planes[c][i]) - double(b.planes[c][i]);
+            sum += d * d;
+        }
+        n += a.planes[c].size();
+    }
+    const double top = double((1 << a.depth) - 1);
+    return sum == 0 ? 999 : 10 * std::log10(top * top * double(n) / sum);
+}
+
+// Planar samples as SVT's tools read and write them: each plane in turn, 16-bit little-endian words above 8 bits.
+QByteArray jxsPlanarBytes(const montage::JxsPicture& p) {
+    QByteArray out;
+    for (int c = 0; c < 3; ++c)
+        for (uint16_t v : p.planes[c]) {
+            out.append(char(v & 0xFF));
+            if (p.depth > 8) out.append(char(v >> 8));
+        }
+    return out;
+}
+montage::JxsPicture jxsFromPlanarBytes(const QByteArray& b, int w, int h, int depth, montage::JxsSampling s, size_t* used = nullptr) {
+    montage::JxsPicture p(w, h, depth, s);
+    size_t at = 0;
+    const auto* d = reinterpret_cast<const uint8_t*>(b.constData());
+    for (int c = 0; c < 3; ++c)
+        for (uint16_t& v : p.planes[c]) {
+            if (at + (depth > 8 ? 2 : 1) > size_t(b.size())) return {};
+            v = depth > 8 ? uint16_t(d[at] | d[at + 1] << 8) : d[at];
+            at += depth > 8 ? 2 : 1;
+        }
+    if (used) *used = at;
+    return p;
+}
 
 }  // namespace
 
@@ -18702,6 +18788,294 @@ colorspaces:
         std::array<uint8_t, 24> cs{};
         QVERIFY(st::aes3ReadChannelStatus(received.data(), received.size() / 2, 2, 1, cs));
         QVERIFY(cs == status);
+    }
+
+    // JPEG XS coded and decoded through SVT-JPEG-XS: the header read without it, a constant number of bytes a picture
+    // (and of slices, each's bytes known), the quality each rate keeps, and frames identical to SVT's own tools'.
+    void jpegXsCodestreams() {
+        using montage::JxsSampling;
+        if (!montage::jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        QVERIFY(QString::fromStdString(montage::jpegXsVersion()).startsWith("SVT-JPEG-XS "));
+        QVERIFY(montage::jxsSamplingName(JxsSampling::Ycc422) == "YCbCr-4:2:2" && montage::jxsSamplingName(JxsSampling::Rgb) == "RGB");
+        QCOMPARE(QString::fromStdString(montage::jxsProfileName(0x3540)), QStringLiteral("Main 422.10"));
+        QCOMPARE(QString::fromStdString(montage::jxsLevelName(0x1004) + " " + montage::jxsSublevelName(0x1004)), QStringLiteral("2k-1 Sublev3bpp"));
+        QVERIFY(montage::jxsProfileName(0x1234).empty());
+
+        // 1080p 4:2:2 at 10 bits and 3 bits a pixel: 777,600 bytes each picture, its header as RFC 9134 and ST 2124 read it.
+        montage::JxsEncodeSettings es;
+        es.width = 1920, es.height = 1080, es.depth = 10, es.sampling = JxsSampling::Ycc422, es.bppNum = 3, es.slices = true;
+        montage::JxsEncoder enc;
+        std::string why;
+        QVERIFY2(enc.open(es, &why), why.c_str());
+        QCOMPARE(enc.bytesPerPicture(), 777600u);
+        montage::JxsDecoder dec;
+        std::vector<uint8_t> cs;
+        std::vector<uint32_t> units;
+        std::vector<uint32_t> firstUnits;
+        for (int f = 0; f < 3; ++f) {
+            const montage::JxsPicture in = jxsTestPicture(1920, 1080, 10, JxsSampling::Ycc422, f);
+            QVERIFY2(enc.encode(in, cs, &units, &why), why.c_str());
+            QCOMPARE(cs.size(), size_t(777600));
+            QCOMPARE(montage::jxsCodestreamSize(cs.data(), cs.size()), size_t(777600));
+            QCOMPARE(size_t(std::accumulate(units.begin(), units.end(), uint64_t(0))), cs.size());
+            if (f == 0) firstUnits = units;
+            QVERIFY(units == firstUnits);  // (as many slices, each as long, every picture)
+            montage::JxsPicture out;
+            QVERIFY2(dec.decode(cs.data(), cs.size(), out, &why), why.c_str());
+            QVERIFY2(jxsPsnr(in, out) > 40, qPrintable(QString::number(jxsPsnr(in, out))));
+        }
+        montage::JxsHeader h;
+        QVERIFY(montage::readJxsHeader(cs.data(), cs.size(), h));
+        QCOMPARE(h.lcod, 777600u);
+        QCOMPARE(QString::fromStdString(montage::jxsProfileName(h.ppih)), QStringLiteral("Main 422.10"));
+        QCOMPARE(QString::fromStdString(montage::jxsLevelName(h.plev)), QStringLiteral("2k-1"));
+        QCOMPARE(QString::fromStdString(montage::jxsSublevelName(h.plev)), QStringLiteral("Sublev3bpp"));
+        QVERIFY(h.width == 1920 && h.height == 1080 && h.components == 3 && h.depth == 10 && h.cpih == 0);
+        QVERIFY(h.sx[0] == 1 && h.sx[1] == 2 && h.sx[2] == 2 && h.sy[1] == 1);
+        QCOMPARE(h.sliceLines(), 16);
+        QCOMPARE(int(firstUnits.size()), 1 + (1080 + 15) / 16);  // the header, then each slice
+        QCOMPARE(size_t(firstUnits[0]), h.headerBytes);
+        QCOMPARE(int(h.componentTable.size()), 2 + 2 + 3 * 2);  // (CDT: marker, length, Bc and Sx/Sy each component)
+        QVERIFY(!montage::readJxsHeader(cs.data() + 1, cs.size() - 1, h) && montage::jxsCodestreamSize(cs.data(), 1000) == 0);
+
+        // The quality each rate keeps (PSNR over every sample, in dB): 4:2:2 at 10 bits and 4:4:4 at 12, 3 to 8 bits a
+        // pixel, and R′G′B′ through the colour transform.
+        struct Rate {
+            JxsSampling s;
+            int depth, bpp;
+            double least;
+        };
+        const Rate rates[] = {{JxsSampling::Ycc422, 10, 3, 42}, {JxsSampling::Ycc422, 10, 5, 46}, {JxsSampling::Ycc422, 10, 8, 52},
+                              {JxsSampling::Ycc444, 12, 3, 42}, {JxsSampling::Ycc444, 12, 5, 44}, {JxsSampling::Ycc444, 12, 8, 47},
+                              {JxsSampling::Rgb, 10, 5, 42}};
+        const int w = 1280, hh = 720;
+        for (const Rate& r : rates) {
+            montage::JxsEncodeSettings rs;
+            rs.width = w, rs.height = hh, rs.depth = r.depth, rs.sampling = r.s, rs.bppNum = r.bpp;
+            montage::JxsEncoder e;
+            QVERIFY2(e.open(rs, &why), why.c_str());
+            const montage::JxsPicture in = jxsTestPicture(w, hh, r.depth, r.s);
+            QVERIFY2(e.encode(in, cs, nullptr, &why), why.c_str());
+            QCOMPARE(cs.size(), size_t(w) * hh * r.bpp / 8);
+            montage::JxsPicture out;
+            QVERIFY2(dec.decode(cs.data(), cs.size(), out, &why, r.s), why.c_str());
+            QVERIFY(out.sampling == r.s && out.depth == r.depth && out.width == w);
+            const double psnr = jxsPsnr(in, out);
+            qInfo("JPEG XS %s %d-bit at %d bpp: %.2f dB", montage::jxsSamplingName(r.s).c_str(), r.depth, r.bpp, psnr);
+            QVERIFY2(psnr > r.least, qPrintable(QString("%1 bpp %2-bit: %3 dB").arg(r.bpp).arg(r.depth).arg(psnr)));
+            if (r.s == JxsSampling::Rgb) {
+                QVERIFY(montage::readJxsHeader(cs.data(), cs.size(), h) && h.cpih == 1);
+                QVERIFY2(dec.decode(cs.data(), cs.size(), out, &why), why.c_str());  // (R′G′B′ whatever is asked of 4:4:4)
+                QVERIFY(out.sampling == JxsSampling::Rgb);
+            }
+        }
+        // Settings it refuses, saying why.
+        montage::JxsEncoder bad;
+        es.depth = 16;
+        QVERIFY(!bad.open(es, &why) && !why.empty());
+        es.depth = 10, es.width = 1921;
+        QVERIFY(!bad.open(es, &why));
+        QVERIFY(!dec.decode(cs.data() + 4, cs.size() - 4, *std::make_unique<montage::JxsPicture>(), &why));
+
+        // Frames identical to SVT-JPEG-XS's own decoder's, from Montage's codestreams and from its own encoder's.
+        const QString encApp = jxsTool("SvtJpegxsEncApp"), decApp = jxsTool("SvtJpegxsDecApp");
+        if (encApp.isEmpty() || decApp.isEmpty()) QSKIP("No SVT-JPEG-XS tools (MONTAGE_TEST_SVTJPEGXS)");
+        QTemporaryDir dir;
+        struct Case {
+            JxsSampling s;
+            int depth, bpp;
+            const char* format;
+        };
+        for (const Case& c : {Case{JxsSampling::Ycc422, 10, 3, "yuv422"}, Case{JxsSampling::Ycc444, 12, 5, "yuv444"}, Case{JxsSampling::Ycc422, 8, 4, "yuv422"}}) {
+            const montage::JxsPicture in = jxsTestPicture(w, hh, c.depth, c.s, 1);
+            montage::JxsEncodeSettings cs1;
+            cs1.width = w, cs1.height = hh, cs1.depth = c.depth, cs1.sampling = c.s, cs1.bppNum = c.bpp;
+            montage::JxsEncoder e;
+            QVERIFY2(e.open(cs1, &why), why.c_str());
+            QVERIFY2(e.encode(in, cs, nullptr, &why), why.c_str());
+            const QString mine = dir.filePath("montage.jxs"), theirs = dir.filePath("svt.jxs"), yuv = dir.filePath("in.yuv"), out = dir.filePath("out.yuv");
+            {
+                QFile f(mine);
+                QVERIFY(f.open(QIODevice::WriteOnly));
+                f.write(reinterpret_cast<const char*>(cs.data()), qint64(cs.size()));
+            }
+            QString said;
+            QVERIFY2(runJxsTool(decApp, {"-i", mine, "-o", out, "-v", "0"}, &said), qPrintable(said));
+            {
+                QFile f(out);
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                const montage::JxsPicture theirsOut = jxsFromPlanarBytes(f.readAll(), w, hh, c.depth, c.s);
+                montage::JxsPicture mineOut;
+                QVERIFY2(dec.decode(cs.data(), cs.size(), mineOut, &why, c.s), why.c_str());
+                QVERIFY2(theirsOut == mineOut, c.format);
+            }
+            // (and the other way: SVT's encoder, Montage's decoder)
+            {
+                QFile f(yuv);
+                QVERIFY(f.open(QIODevice::WriteOnly));
+                f.write(jxsPlanarBytes(in));
+            }
+            QVERIFY2(runJxsTool(encApp, {"-i", yuv, "-b", theirs, "-w", QString::number(w), "-h", QString::number(hh), "--colour-format", c.format,
+                                         "--input-depth", QString::number(c.depth), "--bpp", QString::number(c.bpp), "-v", "0", "--no-progress", "1"},
+                                &said),
+                     qPrintable(said));
+            QVERIFY2(runJxsTool(decApp, {"-i", theirs, "-o", out, "-v", "0"}, &said), qPrintable(said));
+            QFile t(theirs), o(out);
+            QVERIFY(t.open(QIODevice::ReadOnly) && o.open(QIODevice::ReadOnly));
+            const QByteArray tb = t.readAll();
+            const montage::JxsPicture reference = jxsFromPlanarBytes(o.readAll(), w, hh, c.depth, c.s);
+            montage::JxsPicture mineOut;
+            QVERIFY2(dec.decode(reinterpret_cast<const uint8_t*>(tb.constData()), size_t(tb.size()), mineOut, &why, c.s), why.c_str());
+            QVERIFY2(reference == mineOut, c.format);
+            QVERIFY(jxsPsnr(in, mineOut) > 35);
+        }
+    }
+
+    // JPEG XS files: raw codestreams (one after another) and MXF (ST 2124, with sound, its timecode, colour and the
+    // JPEG XS Picture SubDescriptor), written and read back to the same codestreams and pictures.
+    void jpegXsFiles() {
+        using montage::JxsSampling;
+        if (!montage::jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        QTemporaryDir dir;
+        std::string why;
+        const int w = 640, h = 360, frames = 5;
+        // Raw codestreams: frames one after another, read back byte for byte.
+        montage::JxsWriteSettings ws;
+        ws.container = montage::JxsContainer::Codestream;
+        ws.encode.width = w, ws.encode.height = h, ws.encode.depth = 10, ws.encode.sampling = JxsSampling::Ycc422, ws.encode.bppNum = 4;
+        const std::string raw = dir.filePath("clip.jxs").toStdString();
+        QVERIFY(montage::jxsContainerForPath(raw) == montage::JxsContainer::Codestream && montage::jxsContainerForPath("a.MXF") == montage::JxsContainer::Mxf);
+        std::vector<std::vector<uint8_t>> coded;
+        {
+            montage::JxsWriter wr;
+            QVERIFY2(wr.open(raw, ws, &why), why.c_str());
+            montage::JxsEncoder e;
+            QVERIFY(e.open(ws.encode));
+            for (int f = 0; f < frames; ++f) {
+                const montage::JxsPicture p = jxsTestPicture(w, h, 10, JxsSampling::Ycc422, f);
+                QVERIFY2(wr.write(p, &why), why.c_str());
+                coded.emplace_back();
+                QVERIFY(e.encode(p, coded.back()));
+            }
+            QVERIFY(!wr.audio(nullptr, 10, &why));
+            QVERIFY2(wr.finish(&why), why.c_str());
+            QCOMPARE(wr.framesWritten(), int64_t(frames));
+        }
+        QCOMPARE(QFileInfo(QString::fromStdString(raw)).size(), qint64(frames) * w * h * 4 / 8);
+        QVERIFY(montage::jxsContainer(raw) == montage::JxsContainer::Codestream);
+        montage::JxsReader rd;
+        QVERIFY2(rd.open(raw, &why), why.c_str());
+        QCOMPARE(rd.info().frames, int64_t(frames));
+        QVERIFY(rd.info().sampling == JxsSampling::Ycc422 && rd.info().header.width == w && rd.info().header.depth == 10);
+        montage::JxsDecoder dec;
+        AVFrame* av = av_frame_alloc();
+        auto freeFrame = qScopeGuard([&] { av_frame_free(&av); });
+        for (int f = 0; f < frames; ++f) {
+            std::vector<uint8_t> got;
+            QVERIFY(rd.codestream(f, got));
+            QVERIFY(got == coded[size_t(f)]);
+            montage::JxsPicture a, b;
+            QVERIFY(rd.picture(f, a) && dec.decode(got.data(), got.size(), b));
+            QVERIFY(a == b);
+            QVERIFY2(rd.frame(f, av, &why), why.c_str());
+            QVERIFY(av->format == AV_PIX_FMT_YUV422P10LE && av->width == w && av->color_range == AVCOL_RANGE_MPEG);
+            QCOMPARE(reinterpret_cast<const uint16_t*>(av->data[1])[3], a.planes[1][3]);
+            QCOMPARE(reinterpret_cast<const uint16_t*>(av->data[0] + av->linesize[0] * 7)[5], a.planes[0][size_t(7) * w + 5]);
+        }
+        QVERIFY(!rd.codestream(frames, *std::make_unique<std::vector<uint8_t>>(), &why));
+        // A file cut short keeps its whole pictures; one that is no JPEG XS is refused.
+        QFile::copy(QString::fromStdString(raw), dir.filePath("cut.jxs"));
+        QFile(dir.filePath("cut.jxs")).resize(QFileInfo(QString::fromStdString(raw)).size() - 100);
+        montage::JxsFileInfo info;
+        QVERIFY(montage::readJxsFileInfo(dir.filePath("cut.jxs").toStdString(), info) && info.frames == frames - 1);
+        {
+            QFile f(dir.filePath("not.jxs"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray(4096, 'x'));
+        }
+        QVERIFY(!montage::readJxsFileInfo(dir.filePath("not.jxs").toStdString(), info, &why) && !why.empty());
+        QVERIFY(montage::jxsContainer(dir.filePath("not.jxs").toStdString()) == montage::JxsContainer::None);
+#ifdef MONTAGE_WITH_BMX
+        // MXF (OP1a, frame-wrapped): 4:2:2 10-bit in PQ and BT.2020, two sound channels and a start timecode.
+        ws.container = montage::JxsContainer::Mxf;
+        ws.fpsNum = 25, ws.channels = 2, ws.timecode = "10:00:00:00", ws.primaries = 9, ws.transfer = 16, ws.matrix = 9, ws.clipName = "jxs";
+        const std::string mxf = dir.filePath("clip.mxf").toStdString();
+        {
+            montage::JxsWriter wr;
+            QVERIFY2(wr.open(mxf, ws, &why), why.c_str());
+            std::vector<float> tone(size_t(1920) * 2);
+            for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.25 * std::sin(double(i / 2) * 2 * M_PI * 1000 / 48000) * (i % 2 ? -1 : 1));
+            for (int f = 0; f < frames; ++f) {
+                QVERIFY(wr.audio(tone.data(), 1920, &why));
+                QVERIFY2(wr.writeCodestream(coded[size_t(f)].data(), coded[size_t(f)].size(), &why), why.c_str());
+            }
+            QVERIFY2(wr.finish(&why), why.c_str());
+        }
+        QVERIFY(montage::jxsContainer(mxf) == montage::JxsContainer::Mxf);
+        montage::JxsReader mr;
+        QVERIFY2(mr.open(mxf, &why), why.c_str());
+        const montage::JxsFileInfo& mi = mr.info();
+        QCOMPARE(mi.frames, int64_t(frames));
+        QVERIFY(mi.fpsNum == 25 && mi.fpsDen == 1 && mi.sampling == JxsSampling::Ycc422);
+        QCOMPARE(QString::fromStdString(mi.timecode), QStringLiteral("10:00:00:00"));
+        QCOMPARE(mi.soundTracks, 2);
+        QVERIFY(mi.primaries == 9 && mi.transfer == 16 && mi.matrix == 9 && !mi.fullRange);
+        QVERIFY(!mi.colorSpace.empty());
+        QCOMPARE(QString::fromStdString(mi.essenceContainer), QStringLiteral("urn:smpte:ul:060e2b34.0401010d.0d010301.02210100"));
+        QCOMPARE(QString::fromStdString(mi.pictureCoding).left(44), QStringLiteral("urn:smpte:ul:060e2b34.0401010d.04010202.0308"));
+        QVERIFY(mi.horizontalSubsampling == 2 && mi.verticalSubsampling == 1 && mi.componentDepth == 10);
+        QVERIFY(mi.subDescriptor && mi.subPpih == mi.header.ppih && mi.subPlev == mi.header.plev && mi.subWf == w && mi.subHf == h && mi.subNc == 3);
+        QVERIFY(mi.subComponentTable == mi.header.componentTable || mi.subComponentTable.size() + 4 == mi.header.componentTable.size());
+        QVERIFY(mi.subMaxBitRate >= uint32_t(w * h * 4 * 25 / 1000000));
+        for (int f = 0; f < frames; ++f) {
+            std::vector<uint8_t> got;
+            QVERIFY2(mr.codestream(f, got, &why), why.c_str());
+            QVERIFY(got == coded[size_t(f)]);
+        }
+        QVERIFY2(mr.frame(2, av, &why), why.c_str());
+        QVERIFY(av->color_trc == AVCOL_TRC_SMPTE2084 && av->color_primaries == AVCOL_PRI_BT2020 && av->format == AV_PIX_FMT_YUV422P10LE);
+        // (its sound as FFmpeg reads any MXF's: two PCM streams, a frame's worth a picture)
+        AVFormatContext* fc = nullptr;
+        QVERIFY(avformat_open_input(&fc, mxf.c_str(), nullptr, nullptr) == 0);
+        auto closeInput = qScopeGuard([&] { avformat_close_input(&fc); });
+        QVERIFY(avformat_find_stream_info(fc, nullptr) >= 0);
+        int pcm = 0;
+        for (unsigned i = 0; i < fc->nb_streams; ++i)
+            if (fc->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                ++pcm;
+                QCOMPARE(fc->streams[i]->codecpar->sample_rate, 48000);
+            }
+        QCOMPARE(pcm, 2);
+
+        // R′G′B′ 4:4:4 at 12 bits (the RGBA descriptor), coded and written as it comes, full range.
+        ws.encode.sampling = JxsSampling::Rgb, ws.encode.depth = 12, ws.encode.bppNum = 6, ws.channels = 0, ws.primaries = 1, ws.transfer = 1,
+        ws.fullRange = true;
+        const std::string rgb = dir.filePath("rgb.mxf").toStdString();
+        {
+            montage::JxsWriter wr;
+            QVERIFY2(wr.open(rgb, ws, &why), why.c_str());
+            for (int f = 0; f < 2; ++f) QVERIFY2(wr.write(jxsTestPicture(w, h, 12, JxsSampling::Rgb, f), &why), why.c_str());
+            QVERIFY2(wr.finish(&why), why.c_str());
+        }
+        montage::JxsReader gr;
+        QVERIFY2(gr.open(rgb, &why), why.c_str());
+        QVERIFY(gr.info().sampling == JxsSampling::Rgb && gr.info().frames == 2 && gr.info().fullRange && gr.info().header.depth == 12);
+        montage::JxsPicture back;
+        QVERIFY2(gr.picture(1, back, &why), why.c_str());
+        QVERIFY(jxsPsnr(back, jxsTestPicture(w, h, 12, JxsSampling::Rgb, 1)) > 40);
+        QVERIFY2(gr.frame(1, av, &why), why.c_str());
+        QVERIFY(av->format == AV_PIX_FMT_GBRP12LE && av->colorspace == AVCOL_SPC_RGB && av->color_range == AVCOL_RANGE_JPEG);
+        // (FFmpeg's planes G, B, R)
+        QCOMPARE(reinterpret_cast<const uint16_t*>(av->data[2])[9], back.planes[0][9]);
+        QCOMPARE(reinterpret_cast<const uint16_t*>(av->data[0])[9], back.planes[1][9]);
+        // An unfinished MXF is removed.
+        {
+            montage::JxsWriter wr;
+            QVERIFY(wr.open(dir.filePath("gone.mxf").toStdString(), ws));
+            QVERIFY(wr.write(jxsTestPicture(w, h, 12, JxsSampling::Rgb)));
+        }
+        QVERIFY(!QFileInfo::exists(dir.filePath("gone.mxf")));
+#endif
     }
 
     // NMOS receivers: a controller hands each one a sender's SDP (two paths, ST 2022-7) through IS-05, the parameters

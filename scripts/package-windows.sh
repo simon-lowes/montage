@@ -69,7 +69,9 @@ FFSHARE=/ucrt64/share/montage-ffmpeg
 [ -d "$FFSHARE" ] || FFSHARE=""
 C2PA=$(sed -n 's/^C2PA_ROOT:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -1)
 [ -z "$C2PA" ] || C2PA=$(cygpath -u "$C2PA")
-scripts/package-licences.sh "$LIC" "$BUILD" "$C2PA" "$FFSHARE"
+SVTJPEGXS=$(sed -n 's/^SVTJPEGXS_ROOT:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -1)
+[ -z "$SVTJPEGXS" ] || SVTJPEGXS=$(cygpath -u "$SVTJPEGXS")
+scripts/package-licences.sh "$LIC" "$BUILD" "$C2PA" "$FFSHARE" "$SVTJPEGXS"
 SOURCES=${MONTAGE_SOURCES_DIR:-}
 [ -z "$SOURCES" ] || mkdir -p "$SOURCES"
 owners="$(mktemp)"
