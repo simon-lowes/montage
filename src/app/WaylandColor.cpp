@@ -67,9 +67,8 @@ struct WaylandColor::State {
         return p.ready;
     }
 
-    // Reads what the compositor prefers for the surface; what was known is kept if it cannot say just now (an
-    // output going or coming).
-    void readPreferred();
+    // Reads what the compositor prefers for a surface through its feedback object; false if it did not say.
+    bool read(wp_color_management_surface_feedback_v1* from, Preferred& out);
 };
 
 namespace {
@@ -121,10 +120,9 @@ const wp_image_description_info_v1_listener kInfoListener = [] {
     l.primaries = [](void*, wp_image_description_info_v1*, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t) {};
     l.primaries_named = [](void*, wp_image_description_info_v1*, uint32_t) {};
     l.tf_power = [](void*, wp_image_description_info_v1*, uint32_t) {};
-    l.tf_named = [](void* data, wp_image_description_info_v1*, uint32_t tf) { static_cast<Pending*>(data)->info.tf = tf; };
-    l.luminances = [](void* data, wp_image_description_info_v1*, uint32_t minLum, uint32_t maxLum, uint32_t referenceLum) {
+    l.tf_named = [](void*, wp_image_description_info_v1*, uint32_t) {};
+    l.luminances = [](void* data, wp_image_description_info_v1*, uint32_t, uint32_t maxLum, uint32_t referenceLum) {
         Preferred& p = static_cast<Pending*>(data)->info;
-        p.minNits = minLum / 10000.0;
         p.maxNits = maxLum;
         p.referenceNits = referenceLum;
     };
@@ -132,7 +130,7 @@ const wp_image_description_info_v1_listener kInfoListener = [] {
     l.target_luminance = [](void* data, wp_image_description_info_v1*, uint32_t, uint32_t maxLum) {
         static_cast<Pending*>(data)->info.targetMaxNits = maxLum;
     };
-    l.target_max_cll = [](void* data, wp_image_description_info_v1*, uint32_t v) { static_cast<Pending*>(data)->info.targetMaxCll = v; };
+    l.target_max_cll = [](void*, wp_image_description_info_v1*, uint32_t) {};
     l.target_max_fall = [](void*, wp_image_description_info_v1*, uint32_t) {};
     return l;
 }();
@@ -147,11 +145,20 @@ const wp_color_management_surface_feedback_v1_listener kFeedbackListener = [] {
 
 }  // namespace
 
-void WaylandColor::State::readPreferred() {
-    if (!feedback) return;
+bool WaylandColor::State::read(wp_color_management_surface_feedback_v1* from, Preferred& out) {
+    if (!from) return false;
     Pending p;
-    wp_image_description_v1* d = wp_color_management_surface_feedback_v1_get_preferred(feedback);
+    // As parameters (its luminances are what is read), not as an ICC profile, which an output may be described with.
+    // (where the generated header has the request)
+#ifdef WP_COLOR_MANAGEMENT_SURFACE_FEEDBACK_V1_GET_PREFERRED_PARAMETRIC
+    wp_image_description_v1* d = has(features, WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC)
+                                     ? wp_color_management_surface_feedback_v1_get_preferred_parametric(from)
+                                     : wp_color_management_surface_feedback_v1_get_preferred(from);
+#else
+    wp_image_description_v1* d = wp_color_management_surface_feedback_v1_get_preferred(from);
+#endif
     wp_image_description_v1_add_listener(d, &kDescriptionListener, &p);
+    bool known = false;
     if (waitFor(p)) {
         wp_image_description_info_v1* info = wp_image_description_v1_get_information(d);
         wp_image_description_info_v1_add_listener(info, &kInfoListener, &p);
@@ -159,11 +166,12 @@ void WaylandColor::State::readPreferred() {
             if (!roundtrip()) break;
         wp_image_description_info_v1_destroy(info);  // (the compositor's side went with `done`)
         if (p.infoDone && p.info.referenceNits > 0) {
-            preferred = p.info;
-            preferred.known = true;
+            out = p.info;
+            out.known = known = true;
         }
     }
     wp_image_description_v1_destroy(d);
+    return known;
 }
 
 WaylandColor::WaylandColor(wl_display* display) : s_(std::make_unique<State>()) {
@@ -217,7 +225,7 @@ bool WaylandColor::attach(wl_surface* surface) {
     s.feedback = wp_color_manager_v1_get_surface_feedback(s.manager, surface);
     wp_color_management_surface_feedback_v1_add_listener(s.feedback, &kFeedbackListener, &s);
     s.preferredChanged = false;
-    s.readPreferred();
+    s.read(s.feedback, s.preferred);
     return wl_display_get_error(s.display) == 0;
 }
 
@@ -283,17 +291,26 @@ const WaylandColor::Description* WaylandColor::described() const { return s_->ha
 
 const WaylandColor::Preferred& WaylandColor::preferred() const { return s_->preferred; }
 
-bool WaylandColor::dispatch() {
+void WaylandColor::dispatch() {
     State& s = *s_;
-    if (!s.display || !s.queue) return false;
+    if (!s.display || !s.queue) return;
     wl_display_dispatch_queue_pending(s.display, s.queue);
-    if (!s.preferredChanged || !s.feedback) return false;
+    if (!s.preferredChanged || !s.feedback) return;
     s.preferredChanged = false;
-    const Preferred before = s.preferred;
-    s.readPreferred();
-    const Preferred& now = s.preferred;
-    return now.known != before.known || now.tf != before.tf || now.referenceNits != before.referenceNits || now.maxNits != before.maxNits ||
-           now.targetMaxNits != before.targetMaxNits;
+    // (what was known is kept if the compositor cannot say just now: an output going or coming)
+    s.read(s.feedback, s.preferred);
+}
+
+WaylandColor::Preferred WaylandColor::preferredFor(wl_surface* surface) {
+    State& s = *s_;
+    Preferred out;
+    if (!surface || !available()) return out;
+    // (a feedback object of its own: a surface may have several, beside the toolkit's)
+    wp_color_management_surface_feedback_v1* feedback = wp_color_manager_v1_get_surface_feedback(s.manager, surface);
+    s.read(feedback, out);
+    wp_color_management_surface_feedback_v1_destroy(feedback);
+    wl_display_flush(s.display);
+    return out;
 }
 
 }  // namespace montage

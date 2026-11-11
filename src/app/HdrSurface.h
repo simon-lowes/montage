@@ -81,6 +81,9 @@ private:
     bool displayShowsHdr();  // the display the viewer is on takes the extended-range swap chain (sets problem_ if not)
     void stopHdr(const QString& why);
     void describeSurface();  // Wayland: the surface's image description, for the picture shown (before each frame)
+    // Wayland: the headroom and reference white the compositor prefers where the viewer is. False if it did not say;
+    // `asked` then tells whether there was a surface to ask about.
+    bool waylandDisplay(double* headroom, double* whiteNits, bool* asked = nullptr);
 
     QPointer<QWidget> target_;
     std::unique_ptr<HdrSurfaceGpu> gpu_;

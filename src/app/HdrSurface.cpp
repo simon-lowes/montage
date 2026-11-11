@@ -497,12 +497,12 @@ bool HdrSurface::probe(QString* why) {
 bool HdrSurface::displayShowsHdr() {
     if (!gpu_ || !gpu_->sc) return false;
     if (encoded_) {
-        // Wayland: what the compositor prefers for the surface, once it is attached (until then, that the compositor
-        // takes the description).
+        // Wayland: what the compositor prefers where the viewer is (with no surface to ask about yet, that the
+        // compositor takes the description).
 #if defined(MONTAGE_WAYLAND_COLOR)
-        if (!wayland_ || !wayland_->surface()) return true;
-        const WaylandColor::Preferred& p = wayland_->preferred();
-        if (!p.known || hdrHeadroomFromDescription(p.referenceNits, p.maxNits, p.targetMaxNits) <= 1.0) {
+        double h = 1, white = 0;
+        bool asked = false;
+        if (waylandDisplay(&h, &white, &asked) ? h <= 1.0 : asked) {
             problem_ = tr("This display does not show HDR");
             return false;
         }
@@ -534,6 +534,48 @@ bool HdrSurface::displayShowsHdr() {
 #endif
 }
 
+bool HdrSurface::waylandDisplay(double* headroom, double* whiteNits, bool* asked) {
+    if (asked) *asked = false;
+#if defined(MONTAGE_WAYLAND_COLOR)
+    if (!wayland_) return false;
+    auto read = [&](const WaylandColor::Preferred& p) {
+        if (!p.known) return false;
+        *headroom = hdrHeadroomFromDescription(p.referenceNits, p.maxNits, p.targetMaxNits);
+        *whiteNits = p.referenceNits;
+        return true;
+    };
+    // The surface's own, once it is attached and on an HDR output.
+    const bool attached = wayland_->surface() != nullptr;
+    if (asked && attached) *asked = true;
+    const bool own = attached && read(wayland_->preferred());
+    if (own && *headroom > 1.0) return true;
+    // Else the viewer's top-level window's, which is on its output already: before its first frame the surface is on
+    // none, and a compositor answers for it with a default (its first output's, or sRGB) until it is.
+    QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
+    QWindow* top = target_ ? target_->window()->windowHandle() : nullptr;
+    auto* surface = native && top && top != this && top->handle() ? static_cast<wl_surface*>(native->nativeResourceForWindow("surface", top))
+                                                                   : nullptr;
+    if (!surface) return own;
+    if (asked) *asked = true;
+    double h = 1, white = 0;
+    const WaylandColor::Preferred window = wayland_->preferredFor(surface);
+    if (window.known) {
+        h = hdrHeadroomFromDescription(window.referenceNits, window.maxNits, window.targetMaxNits);
+        white = window.referenceNits;
+    }
+    if (window.known && (h > 1.0 || !own)) {
+        *headroom = h;
+        *whiteNits = white;
+        return true;
+    }
+    return own;
+#else
+    Q_UNUSED(headroom);
+    Q_UNUSED(whiteNits);
+    return false;
+#endif
+}
+
 void HdrSurface::stopHdr(const QString& why) {
     if (!hdrActive_) return;
     hdrActive_ = false;
@@ -553,20 +595,18 @@ void HdrSurface::readDisplay() {
         h = gTestHeadroom;
     } else if (encoded_) {
 #if defined(MONTAGE_WAYLAND_COLOR)
-        // What the compositor prefers for the surface: its reference white (where the picture's 203 nits go) and peak.
-        // Read again when it says it changed (another output, its brightness), asked here every second.
-        if (!wayland_ || !wayland_->surface()) return;
+        // What the compositor prefers where the viewer is: its reference white (where the picture's 203 nits go) and
+        // peak. The surface's own is read again when the compositor says it changed (another output, its brightness),
+        // asked here every second.
+        if (!wayland_) return;
         if (QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
-            isVisible() && native && native->nativeResourceForWindow("surface", this) == wayland_->surface())
+            wayland_->surface() && isVisible() && native && native->nativeResourceForWindow("surface", this) == wayland_->surface())
             wayland_->dispatch();
-        const WaylandColor::Preferred& p = wayland_->preferred();
-        if (!p.known) return;
-        h = hdrHeadroomFromDescription(p.referenceNits, p.maxNits, p.targetMaxNits);
-        white = p.referenceNits;
+        if (!waylandDisplay(&h, &white)) return;
 #else
         // Qt describes the surface and the compositor fits it to the display, which it does not say: nothing is rolled
-        // off here.
-        h = picture_ ? std::max(1.0, picture_->contentPeak) : headroom_;
+        // off here, whatever the picture (PQ's whole range over its reference white).
+        h = 10000.0 / 203;
 #endif
     } else if (gpu_ && gpu_->sc && gpu_->hasSwapChain) {
 #if defined(Q_OS_WIN)

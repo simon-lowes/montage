@@ -21220,12 +21220,25 @@ print("added " + ui["name"])
         QVERIFY2(viewer.hdrStatus().isEmpty(), qPrintable(viewer.hdrStatus()));
         HdrSurface* surface = viewer.hdrSurface();
         QVERIFY(surface);
-        // The output's reference white and peak, as Weston prefers them for the surface.
+        // The output's reference white and peak, as Weston prefers them where the viewer is: known as soon as the
+        // surface is made, from the viewer's window, which is on the output already.
         QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
         QCOMPARE(viewer.hdrSdrWhiteNits(), 203.0);
         QCOMPARE(surface->bufferBits(), 10);
-        QCOMPARE(surface->describedTransfer(), Transfer::Pq);
-        QTRY_VERIFY(surface->framesDrawn() >= 3);
+        // Described with its first frame (the surface's own wl_surface is there once it is exposed), and a frame for
+        // each picture after that. (asked of the viewer each time: a surface that stopped is deleted)
+        auto described = [&] { return viewer.hdrSurface() ? viewer.hdrSurface()->describedTransfer() : Transfer::Linear; };
+        auto drawn = [&] { return viewer.hdrSurface() ? viewer.hdrSurface()->framesDrawn() : -1; };
+        QTRY_VERIFY2_WITH_TIMEOUT(described() == Transfer::Pq, qPrintable(viewer.hdrStatus()), 10000);
+        for (int i = 0; i < 3; ++i) {
+            const int before = drawn();
+            viewer.setHdrPicture(ramp);
+            QTRY_VERIFY2_WITH_TIMEOUT(drawn() > before, qPrintable(viewer.hdrStatus()), 10000);
+        }
+        // Still showing, on the surface's own answer now (the same output).
+        QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));
+        QCOMPARE(viewer.hdrSurface(), surface);
+        QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
         QTest::qWait(500);  // (Weston repaints)
         // Weston's protocol log: the surface described as BT.2100 PQ (named transfer 11, primaries 6) with the master's
         // light (800 nits from 0.005; MaxCLL 800, MaxFALL 200), and 10-bit buffers (AR30 or XR30).

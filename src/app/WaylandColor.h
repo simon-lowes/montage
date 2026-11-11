@@ -23,11 +23,10 @@ namespace montage {
 
 class WaylandColor {
 public:
-    // What the compositor prefers for the surface (wp_image_description_info_v1), in nits; 0 where it did not say.
+    // What the compositor prefers for a surface (wp_image_description_info_v1), in nits; 0 where it did not say.
     struct Preferred {
         bool known = false;
-        uint32_t tf = 0;  // wp_color_manager_v1.transfer_function, 0 if given otherwise
-        double minNits = 0, maxNits = 0, referenceNits = 0, targetMaxNits = 0, targetMaxCll = 0;
+        double maxNits = 0, referenceNits = 0, targetMaxNits = 0;
     };
     // The surface's image description: BT.2100 PQ or HLG, BT.2020 primaries, and its light.
     struct Description {
@@ -60,8 +59,12 @@ public:
     const Description* described() const;
 
     const Preferred& preferred() const;
-    // Handles what arrived on the queue; true if the preferred description changed (it is read again then).
-    bool dispatch();
+    // Handles what arrived on the queue: the preferred description is read again if the compositor said it changed.
+    void dispatch();
+    // What the compositor prefers for another surface, asked once (nothing is kept on it): the viewer's top-level
+    // window, which is on its output already. A surface with no buffer yet is on none, and a compositor answers for
+    // it with a default (the first output's, or sRGB) until it is.
+    Preferred preferredFor(wl_surface* surface);
 
     struct State;  // (the protocol's objects, in WaylandColor.cpp)
 
