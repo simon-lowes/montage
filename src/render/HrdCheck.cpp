@@ -17,7 +17,7 @@ namespace montage {
 
 namespace {
 
-constexpr int kH264 = AV_CODEC_ID_H264, kHevc = AV_CODEC_ID_HEVC, kMpeg2 = AV_CODEC_ID_MPEG2VIDEO;
+constexpr int kH264 = AV_CODEC_ID_H264, kHevc = AV_CODEC_ID_HEVC, kMpeg2 = AV_CODEC_ID_MPEG2VIDEO, kAv1 = AV_CODEC_ID_AV1;
 constexpr size_t kKeptIssues = 100;
 
 std::string format(const char* f, double a = 0, double b = 0, double c = 0) {
@@ -890,9 +890,16 @@ std::string HrdReport::summary() const {
     if (!error.empty()) return "Not checked: " + error;
     if (!checked) return "Not checked: " + (note.empty() ? std::string("no buffer model") : note);
     std::string s = codec + " " + model + ", " + (cbr ? "CBR " : "VBR ") + format("%.3g Mb/s, %.2f s buffer", bitRate / 1e6, bitRate > 0 ? bufferBits / bitRate : 0);
+    if (schedules.size() > 1) s += format(" (the first of %g schedules)", double(schedules.size()));
     if (conforms()) return s + format(": conforms (%g frames)", double(frames));
     s += format(": %g problem", double(issueCount)) + (issueCount == 1 ? "" : "s");
-    if (!issues.empty()) s += format(", the first at frame %g", double(issues.front().frame)) + " (" + issues.front().kind + ")";
+    if (!issues.empty()) {
+        const HrdIssue& i = issues.front();
+        s += format(", the first at frame %g", double(i.frame)) + " (" + i.kind;
+        if (i.schedule > 0 && size_t(i.schedule) < schedules.size())
+            s += ", " + schedules[size_t(i.schedule)].model + " schedule " + std::to_string(schedules[size_t(i.schedule)].index);
+        s += ")";
+    }
     return s;
 }
 
@@ -1080,13 +1087,7 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
     }
     r.signalled = true;
     r.model = p == &model.nal ? "NAL HRD" : "VCL HRD";
-    const hrd::Cpb& c = p->cpbs.front();
-    r.bitRate = c.bitRate;
-    r.bufferBits = c.size;
-    r.cbr = c.cbr;
     if (p->subPic) r.note = "sub-picture parameters are not modelled: checked by access unit";
-    if (p == &model.vcl)
-        for (size_t k = 0; k < units.size(); ++k) bits[k] = units[k].au.vclBits;  // (Type I: the VCL and filler data units)
     // Start at the first buffering period.
     size_t start = 0;
     while (start < units.size() && !units[start].au.bp.present) ++start;
@@ -1102,60 +1103,98 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
     }
     const bool usePt = havePt && model.tick() > 0;
     if (!usePt && r.note.empty()) r.note = "no picture timing on every picture: removals at the container's times";
-    auto delaysOf = [&](const hrd::BufferingPeriod& bp, double& delay, double& sum) {
-        const bool nalSet = p == &model.nal;
-        const auto& d = nalSet ? bp.nalDelay : bp.vclDelay;
-        const auto& o = nalSet ? bp.nalOffset : bp.vclOffset;
-        if (d.empty()) return false;
-        delay = double(d[0]) / 90000.0;
-        sum = double(d[0] + (o.empty() ? 0 : o[0])) / 90000.0;
-        return true;
-    };
-    double curDelay = c.size / c.bitRate, curSum = curDelay;
-    double bpRemoval = 0, prevNonDiscardable = 0;
     const int64_t d0 = units[0].dts != AV_NOPTS_VALUE ? units[0].dts : 0;
-    for (size_t k = 0; k < units.size(); ++k) {
-        const Unit& u = units[k];
-        const hrd::Sps* s = &model;
-        if (auto it = sps.find(u.au.spsId); it != sps.end()) s = &it->second;
-        const double tc = s->tick() > 0 ? s->tick() : model.tick();
-        const bool bp = u.au.bp.present || (k == 0);
-        double delay = curDelay, sum = curSum;
-        if (u.au.bp.present) delaysOf(u.au.bp, delay, sum);
-        if (k == 0) {
-            removal[0] = delay;
-            r.initialDelay = delay;
-        } else if (usePt) {
-            const double base = bp && codec == kHevc && u.au.bp.concatenation ? 0 : bpRemoval;
-            int64_t ticks = u.au.pt.cpbRemovalDelay;
-            const hrd::Params* sp = s->active() ? s->active() : p;
-            const double wrap = std::ldexp(1.0, sp->cpbDelayLength);
-            double t = base + tc * double(ticks);
-            if (bp && codec == kHevc && u.au.bp.concatenation) {
-                // (C-10 with concatenation_flag: from the last picture that is not discardable, or as the buffer allows)
-                const double t1 = prevNonDiscardable + tc * double(u.au.bp.auCpbRemovalDelayDeltaMinus1 + 1);
-                t = t1;
-                (void)wrap;
-            } else {
-                // (cpb_removal_delay counts modulo 2^length: the next time after the access unit before)
-                while (t <= removal[k - 1] + 1e-9 && wrap * tc < 1e6) t += tc * wrap;
+    // Every schedule the stream states: each SchedSelIdx of the NAL HRD (Type II: all the stream's bits), then of the
+    // VCL HRD (Type I: the VCL and filler data units) when the stream states both.
+    for (const hrd::Params* set : {&model.nal, &model.vcl}) {
+        if (!set->present) continue;
+        const bool nalSet = set == &model.nal;
+        std::vector<int64_t> setBits = bits;
+        if (!nalSet)
+            for (size_t k = 0; k < units.size(); ++k) setBits[k] = units[k].au.vclBits;
+        for (size_t idx = 0; idx < set->cpbs.size(); ++idx) {
+            const hrd::Cpb& c = set->cpbs[idx];
+            if (c.bitRate <= 0 || c.size <= 0) continue;
+            auto delaysOf = [&](const hrd::BufferingPeriod& bp, double& delay, double& sum) {
+                const auto& d = nalSet ? bp.nalDelay : bp.vclDelay;
+                const auto& o = nalSet ? bp.nalOffset : bp.vclOffset;
+                if (idx >= d.size()) return false;
+                delay = double(d[idx]) / 90000.0;
+                sum = double(d[idx] + (idx < o.size() ? o[idx] : 0)) / 90000.0;
+                return true;
+            };
+            double curDelay = c.size / c.bitRate, curSum = curDelay;
+            double bpRemoval = 0, prevNonDiscardable = 0;
+            HrdSchedule sched;
+            sched.model = nalSet ? "NAL HRD" : "VCL HRD";
+            sched.index = int(idx);
+            sched.cbr = c.cbr, sched.bitRate = c.bitRate, sched.bufferBits = c.size;
+            for (size_t k = 0; k < units.size(); ++k) {
+                const Unit& u = units[k];
+                const hrd::Sps* s = &model;
+                if (auto it = sps.find(u.au.spsId); it != sps.end()) s = &it->second;
+                const double tc = s->tick() > 0 ? s->tick() : model.tick();
+                const bool bp = u.au.bp.present || (k == 0);
+                double delay = curDelay, sum = curSum;
+                if (u.au.bp.present) delaysOf(u.au.bp, delay, sum);
+                if (k == 0) {
+                    removal[0] = delay;
+                    sched.initialDelay = delay;
+                } else if (usePt) {
+                    const double base = bp && codec == kHevc && u.au.bp.concatenation ? 0 : bpRemoval;
+                    const int64_t ticks = u.au.pt.cpbRemovalDelay;
+                    const hrd::Params* sp = s->active() ? s->active() : p;
+                    const double wrap = std::ldexp(1.0, sp->cpbDelayLength);
+                    double t = base + tc * double(ticks);
+                    if (bp && codec == kHevc && u.au.bp.concatenation) {
+                        // (C-10 with concatenation_flag: from the last picture that is not discardable, or as the buffer allows)
+                        t = prevNonDiscardable + tc * double(u.au.bp.auCpbRemovalDelayDeltaMinus1 + 1);
+                    } else {
+                        // (cpb_removal_delay counts modulo 2^length: the next time after the access unit before)
+                        while (t <= removal[k - 1] + 1e-9 && wrap * tc < 1e6) t += tc * wrap;
+                    }
+                    removal[k] = t;
+                } else {
+                    const int64_t d = u.dts != AV_NOPTS_VALUE ? u.dts : d0;
+                    removal[k] = removal[0] + double(d - d0) * tb;
+                }
+                if (bp) {
+                    bpRemoval = removal[k];
+                    curDelay = delay, curSum = sum;
+                }
+                bpStart[k] = bp;
+                initDelay[k] = delay;
+                initSum[k] = curSum;
+                if (codec == kHevc && u.temporalId == 0 && !(u.type >= 6 && u.type <= 9) && !(u.type <= 14 && u.type % 2 == 0)) prevNonDiscardable = removal[k];
+                if (codec == kH264) prevNonDiscardable = removal[k];
             }
-            removal[k] = t;
-        } else {
-            const int64_t d = u.dts != AV_NOPTS_VALUE ? u.dts : d0;
-            removal[k] = removal[0] + double(d - d0) * tb;
+            // Run on its own, then its findings joined to the others': each problem says which schedule it is on.
+            HrdReport one;
+            runCpb(one, removal, setBits, shown, bpStart, initDelay, initSum, c.bitRate, c.size, c.cbr, set->lowDelay);
+            sched.lowest = one.lowest, sched.highest = one.highest, sched.issueCount = one.issueCount;
+            const int at = int(r.schedules.size());
+            if (at == 0) {
+                r.bitRate = c.bitRate, r.bufferBits = c.size, r.cbr = c.cbr;
+                r.initialDelay = sched.initialDelay, r.lowest = one.lowest, r.highest = one.highest;
+            }
+            const std::string where = at == 0 ? std::string() : sched.model + " schedule " + std::to_string(idx) + format(" (%.4g Mb/s): ", c.bitRate / 1e6);
+            for (HrdIssue& i : one.issues) {
+                i.schedule = at;
+                i.text = where + i.text;
+                if (r.issues.size() < kKeptIssues) r.issues.push_back(std::move(i));
+            }
+            r.issueCount += one.issueCount;
+            if (!one.note.empty()) {
+                if (!r.note.empty()) r.note += "; ";
+                r.note += where + one.note;
+            }
+            r.schedules.push_back(sched);
         }
-        if (bp) {
-            bpRemoval = removal[k];
-            curDelay = delay, curSum = sum;
-        }
-        bpStart[k] = bp;
-        initDelay[k] = delay;
-        initSum[k] = curSum;
-        if (codec == kHevc && u.temporalId == 0 && !(u.type >= 6 && u.type <= 9) && !(u.type <= 14 && u.type % 2 == 0)) prevNonDiscardable = removal[k];
-        if (codec == kH264) prevNonDiscardable = removal[k];
     }
-    runCpb(r, removal, bits, shown, bpStart, initDelay, initSum, c.bitRate, c.size, c.cbr, p->lowDelay);
+    if (r.schedules.empty()) {
+        r.note = "the HRD states no schedule with a bit rate and a buffer";
+        return;
+    }
     r.frames = int64_t(units.size());
     r.checked = true;
 }
@@ -1277,6 +1316,389 @@ void checkMpeg2(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<boo
     r.checked = true;
 }
 
+// ---- AV1 (the AV1 specification's Annex E: the decoder model's smoothing buffer) ----
+
+// What the decoder model needs of a sequence header OBU.
+struct Av1Op {
+    int idc = 0, level = 0;
+    bool tier = false, model = false, lowDelay = false;
+    int64_t decoderDelay = 0, encoderDelay = 0;  // 90 kHz
+};
+struct Av1Seq {
+    bool valid = false;
+    int profile = 0;
+    bool reduced = false, timing = false, equalInterval = false, modelInfo = false;
+    uint32_t displayTick = 0, timeScale = 0, decodingTick = 0;
+    int delayLength = 0, removalLength = 0, presentationLength = 0;
+    std::vector<Av1Op> ops;
+    bool frameIds = false;
+    int idLength = 0;
+    int forceScreenContent = 2, forceIntegerMv = 2;  // 2: chosen by frame
+    int orderHintBits = 0;
+};
+
+uint64_t leb128(const uint8_t* d, size_t n, size_t& pos, bool& ok) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (pos >= n) {
+            ok = false;
+            return 0;
+        }
+        const uint8_t b = d[pos++];
+        v |= uint64_t(b & 0x7f) << (i * 7);
+        if (!(b & 0x80)) return v;
+    }
+    ok = false;
+    return 0;
+}
+
+Av1Seq parseAv1Sequence(const uint8_t* d, size_t n) {
+    Av1Seq q;
+    nal::Reader r(d, n);
+    q.profile = int(r.u(3));
+    r.bit();  // still_picture
+    q.reduced = r.flag();
+    if (q.reduced) {
+        Av1Op op;
+        op.level = int(r.u(5));
+        q.ops.push_back(op);
+    } else {
+        q.timing = r.flag();
+        if (q.timing) {
+            q.displayTick = uint32_t(r.u(32));
+            q.timeScale = uint32_t(r.u(32));
+            q.equalInterval = r.flag();
+            if (q.equalInterval) {
+                // num_ticks_per_picture_minus_1, uvlc()
+                int zeros = 0;
+                while (r.ok && !r.flag() && zeros < 32) ++zeros;
+                if (zeros < 32) r.u(zeros);
+            }
+            q.modelInfo = r.flag();
+            if (q.modelInfo) {
+                q.delayLength = int(r.u(5)) + 1;
+                q.decodingTick = uint32_t(r.u(32));
+                q.removalLength = int(r.u(5)) + 1;
+                q.presentationLength = int(r.u(5)) + 1;
+            }
+        }
+        const bool displayDelay = r.flag();
+        const int count = int(r.u(5)) + 1;
+        for (int i = 0; i < count && r.ok; ++i) {
+            Av1Op op;
+            op.idc = int(r.u(12));
+            op.level = int(r.u(5));
+            if (op.level > 7) op.tier = r.flag();
+            if (q.modelInfo) {
+                op.model = r.flag();
+                if (op.model) {
+                    op.decoderDelay = int64_t(r.u(q.delayLength));
+                    op.encoderDelay = int64_t(r.u(q.delayLength));
+                    op.lowDelay = r.flag();
+                }
+            }
+            if (displayDelay && r.flag()) r.u(4);
+            q.ops.push_back(op);
+        }
+    }
+    const int wBits = int(r.u(4)) + 1, hBits = int(r.u(4)) + 1;
+    r.u(wBits), r.u(hBits);
+    if (!q.reduced) q.frameIds = r.flag();
+    if (q.frameIds) {
+        const int delta = int(r.u(4)) + 2, additional = int(r.u(3)) + 1;
+        q.idLength = delta + additional;
+    }
+    r.skip(3);  // use_128x128_superblock, enable_filter_intra, enable_intra_edge_filter
+    if (!q.reduced) {
+        r.skip(4);  // enable_interintra_compound, enable_masked_compound, enable_warped_motion, enable_dual_filter
+        const bool orderHint = r.flag();
+        if (orderHint) r.skip(2);
+        if (r.flag()) {
+            q.forceScreenContent = 2;
+        } else {
+            q.forceScreenContent = r.bit();
+        }
+        if (q.forceScreenContent > 0) {
+            if (r.flag()) q.forceIntegerMv = 2;
+            else q.forceIntegerMv = r.bit();
+        } else {
+            q.forceIntegerMv = 2;
+        }
+        if (orderHint) q.orderHintBits = int(r.u(3)) + 1;
+    }
+    q.valid = r.ok && !q.ops.empty();
+    return q;
+}
+
+// A frame header's start: whether it is a frame to decode, a key frame, and each operating point's removal time.
+struct Av1Frame {
+    bool ok = false, showExisting = false, key = false;
+    std::vector<int64_t> removal;  // by operating point; -1 where none is stated
+};
+
+Av1Frame parseAv1Frame(const uint8_t* d, size_t n, const Av1Seq& q, int temporalId, int spatialId) {
+    Av1Frame f;
+    f.removal.assign(q.ops.size(), -1);
+    nal::Reader r(d, n);
+    int type = 0;
+    bool show = true, errorResilient = true;
+    if (!q.reduced) {
+        f.showExisting = r.flag();
+        if (f.showExisting) {
+            f.ok = r.ok;
+            return f;
+        }
+        type = int(r.u(2));
+        show = r.flag();
+        if (show && q.modelInfo && !q.equalInterval) r.u(q.presentationLength);
+        if (!show) r.bit();  // showable_frame
+        if (type == 3 || (type == 0 && show)) errorResilient = true;
+        else errorResilient = r.flag();
+    }
+    f.key = type == 0;
+    const bool intra = type == 0 || type == 2;
+    r.bit();  // disable_cdf_update
+    const int screenContent = q.forceScreenContent == 2 ? r.bit() : q.forceScreenContent;
+    if (screenContent && q.forceIntegerMv == 2) r.bit();
+    if (q.frameIds) r.u(q.idLength);
+    if (type != 3 && !q.reduced) r.bit();  // frame_size_override_flag
+    r.u(q.orderHintBits);
+    if (!intra && !errorResilient) r.u(3);  // primary_ref_frame
+    if (q.modelInfo && r.flag()) {
+        for (size_t op = 0; op < q.ops.size(); ++op) {
+            if (!q.ops[op].model) continue;
+            const int idc = q.ops[op].idc;
+            if (idc == 0 || (((idc >> temporalId) & 1) && ((idc >> (spatialId + 8)) & 1))) f.removal[op] = int64_t(r.u(q.removalLength));
+        }
+    }
+    f.ok = r.ok;
+    return f;
+}
+
+// The level's highest bit rate (bits/s, before the profile's factor) for seq_level_idx, by tier: 0 where the level
+// is not one that is defined (or its high tier is not).
+double av1LevelBitRate(int level, bool high) {
+    static const struct {
+        int idx;
+        double mainMbps, highMbps;
+    } table[] = {{0, 1.5, 0}, {1, 3, 0}, {4, 6, 0}, {5, 10, 0}, {8, 12, 30}, {9, 20, 50}, {12, 30, 100},
+                 {13, 40, 160}, {14, 60, 240}, {15, 60, 240}, {16, 60, 240}, {17, 100, 480}, {18, 160, 800}, {19, 160, 800}};
+    for (const auto& t : table)
+        if (t.idx == level) return (high ? t.highMbps : t.mainMbps) * 1e6;
+    return 0;
+}
+
+// One decodable frame group: the OBUs up to the end of a frame that is decoded.
+struct Av1Group {
+    int64_t bits = 0;
+    bool key = false;
+    int64_t removal = -1;
+    int64_t unit = 0, shown = 0;  // its temporal unit in decoding order, and the frame that shows
+};
+
+void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>* cancel) {
+    const AVCodecParameters* par = fmt->streams[v]->codecpar;
+    // The OBUs of `d`: fn(type, temporal id, spatial id, payload, payload size, whole size).
+    auto obus = [](const uint8_t* d, size_t n, const auto& fn) {
+        size_t pos = 0;
+        while (pos < n) {
+            const size_t at = pos;
+            const uint8_t h = d[pos++];
+            const int type = (h >> 3) & 15;
+            int tid = 0, sid = 0;
+            if (h & 4) {
+                if (pos >= n) return;
+                tid = (d[pos] >> 5) & 7, sid = (d[pos] >> 3) & 3;
+                ++pos;
+            }
+            size_t size = n - pos;
+            if (h & 2) {
+                bool ok = true;
+                const uint64_t s = leb128(d, n, pos, ok);
+                if (!ok || s > n - pos) return;
+                size = size_t(s);
+            }
+            fn(type, tid, sid, d + pos, size, pos + size - at);
+            pos += size;
+        }
+    };
+    Av1Seq seq;
+    if (par->extradata && par->extradata_size > 4 && (par->extradata[0] & 0x80))  // av1C: its configOBUs after four bytes
+        obus(par->extradata + 4, size_t(par->extradata_size - 4), [&](int type, int, int, const uint8_t* p, size_t n, size_t) {
+            if (type == 1 && !seq.valid) seq = parseAv1Sequence(p, n);
+        });
+    else if (par->extradata && par->extradata_size > 0)
+        obus(par->extradata, size_t(par->extradata_size), [&](int type, int, int, const uint8_t* p, size_t n, size_t) {
+            if (type == 1 && !seq.valid) seq = parseAv1Sequence(p, n);
+        });
+    struct Packet {
+        std::vector<uint8_t> data;
+        int64_t pts = AV_NOPTS_VALUE;
+        int64_t shown = 0;
+    };
+    std::vector<Packet> packets;
+    AVPacket* pkt = av_packet_alloc();
+    while (pkt && av_read_frame(fmt, pkt) >= 0) {
+        if (cancel && cancel->load()) break;
+        if (pkt->stream_index == v) packets.push_back({std::vector<uint8_t>(pkt->data, pkt->data + pkt->size), pkt->pts, 0});
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    if (cancel && cancel->load()) {
+        r.note = "cancelled";
+        return;
+    }
+    if (packets.empty()) {
+        r.note = "no pictures";
+        return;
+    }
+    {
+        std::vector<std::pair<int64_t, size_t>> order;
+        for (size_t k = 0; k < packets.size(); ++k) order.push_back({packets[k].pts == AV_NOPTS_VALUE ? int64_t(k) : packets[k].pts, k});
+        std::stable_sort(order.begin(), order.end());
+        for (size_t i = 0; i < order.size(); ++i) packets[order[i].second].shown = int64_t(i);
+    }
+    // The sequence header the stream starts with (its first packet's, else the container's).
+    obus(packets[0].data.data(), packets[0].data.size(), [&](int type, int, int, const uint8_t* p, size_t n, size_t) {
+        if (type == 1) {
+            const Av1Seq q = parseAv1Sequence(p, n);
+            if (q.valid) seq = q;
+        }
+    });
+    if (!seq.valid) {
+        r.note = "no sequence header";
+        return;
+    }
+    r.model = "decoder model";
+    bool any = false;
+    for (const Av1Op& op : seq.ops) any = any || op.model;
+    if (!seq.timing || !seq.modelInfo || !any || seq.timeScale == 0 || seq.decodingTick == 0) {
+        r.note = "the stream states no decoder model (AV1's is optional): nothing to check it against";
+        return;
+    }
+    const double tick = double(seq.decodingTick) / double(seq.timeScale);
+    for (size_t opIndex = 0; opIndex < seq.ops.size(); ++opIndex) {
+        const Av1Op op = seq.ops[opIndex];
+        if (!op.model) continue;
+        const std::string name = "operating point " + std::to_string(opIndex);
+        const double factor = seq.profile == 0 ? 1 : seq.profile == 1 ? 2 : 3;
+        const double rate = av1LevelBitRate(op.level, op.tier) * factor, size = rate;  // (the buffer: a second at that rate)
+        if (rate <= 0) {
+            if (!r.note.empty()) r.note += "; ";
+            r.note += name + ": level index " + std::to_string(op.level) + " has no bit rate the model can be run at";
+            continue;
+        }
+        // The decodable frame groups of this operating point, in decoding order.
+        std::vector<Av1Group> groups;
+        Av1Group cur;
+        bool inFrame = false, missing = false;
+        Av1Seq q = seq;
+        for (size_t k = 0; k < packets.size(); ++k) {
+            obus(packets[k].data.data(), packets[k].data.size(), [&](int type, int tid, int sid, const uint8_t* p, size_t n, size_t whole) {
+                if (op.idc != 0 && type != 1 && type != 2 && !(((op.idc >> tid) & 1) && ((op.idc >> (sid + 8)) & 1))) return;  // (not of this operating point)
+                // A frame ends with its last tile group (a repeated header among them is its own).
+                if (inFrame && type != 4 && type != 7) {
+                    groups.push_back(cur);
+                    cur = Av1Group{};
+                    inFrame = false;
+                }
+                cur.bits += int64_t(whole) * 8;
+                if (type == 1) {
+                    const Av1Seq s2 = parseAv1Sequence(p, n);
+                    if (s2.valid) q = s2;
+                } else if ((type == 3 || type == 6) && !inFrame) {
+                    const Av1Frame f = parseAv1Frame(p, n, q, tid, sid);
+                    if (f.ok && !f.showExisting) {
+                        inFrame = true;
+                        cur.key = f.key;
+                        cur.removal = opIndex < f.removal.size() ? f.removal[opIndex] : -1;
+                        cur.unit = int64_t(k), cur.shown = packets[k].shown;
+                        if (cur.removal < 0) missing = true;
+                    }
+                }
+            });
+        }
+        if (inFrame) groups.push_back(cur);
+        if (groups.empty()) continue;
+        if (missing) {
+            if (!r.note.empty()) r.note += "; ";
+            r.note += name + ": a frame states no removal time, so its schedule cannot be run";
+            continue;
+        }
+        HrdSchedule sched;
+        sched.model = "decoder model";
+        sched.index = int(opIndex);
+        sched.cbr = false, sched.bitRate = rate, sched.bufferBits = size;
+        sched.initialDelay = double(op.decoderDelay) / 90000;
+        const int at = int(r.schedules.size());
+        const std::string where = at == 0 ? std::string() : name + ": ";
+        int64_t found = 0;
+        auto issue = [&](size_t g, const char* kind, const std::string& text) {
+            ++found;
+            if (r.issues.size() < kKeptIssues) r.issues.push_back({groups[g].unit, groups[g].shown, kind, where + text, at});
+        };
+        // E.6.5: the delay is not 0 and no longer than the buffer takes to fill.
+        if (op.decoderDelay == 0 || double(op.decoderDelay) > 90000.0 * size / rate)
+            issue(0, "timing", format("decoder_buffer_delay is %.0f (90 kHz): it must be above 0 and no more than %.0f", double(op.decoderDelay), 90000.0 * size / rate));
+        const size_t n = groups.size();
+        const double window = double(op.encoderDelay + op.decoderDelay) / 90000;
+        const double wrap = std::ldexp(1.0, seq.removalLength) * tick;
+        std::vector<double> scheduled(n), removal(n), first(n), last(n);
+        size_t rap = 0;  // the random access point removal times count from
+        for (size_t i = 0; i < n; ++i) {
+            if (i == 0) {
+                scheduled[i] = double(op.decoderDelay) / 90000;
+                first[i] = 0;
+            } else {
+                // (buffer_removal_time counts modulo 2^length from the last random access point: the next such time)
+                double t = scheduled[rap] + double(groups[i].removal) * tick;
+                while (t <= scheduled[i - 1] + 1e-9 && wrap < 1e6) t += wrap;
+                scheduled[i] = t;
+                first[i] = std::max(last[i - 1], scheduled[i] - window);
+            }
+            last[i] = first[i] + double(groups[i].bits) / rate;
+            removal[i] = scheduled[i];
+            if (scheduled[i] < last[i] - 1e-7) {
+                // E.6.4: a group not all there at its removal. In low-delay mode it is taken at the next tick instead.
+                if (op.lowDelay) removal[i] = std::ceil(last[i] / tick - 1e-9) * tick;
+                else
+                    issue(i, "underflow",
+                          format("the frame's last bits arrive %.2f ms after it is to be decoded (%.0f bits)", (last[i] - scheduled[i]) * 1000, double(groups[i].bits)));
+            }
+            // E.6.2: where a random access point states the delay, it is no more than the buffer gives there.
+            if (i > 0 && groups[i].key) {
+                const double delta = (scheduled[i] - last[i - 1]) * 90000;
+                if (double(op.decoderDelay) > std::ceil(delta - 1e-6))
+                    issue(i, "initial delay",
+                          format("decoder_buffer_delay says %.0f (90 kHz) where the buffer gives %.1f: a decoder starting here runs dry", double(op.decoderDelay), delta));
+            }
+            if (groups[i].key) rap = i;
+        }
+        // E.6.3: the bits in the buffer just before each removal.
+        for (size_t i = 0; i < n; ++i) {
+            double full = 0;
+            for (size_t m = i; m < n && first[m] < removal[i]; ++m) full += std::min(double(groups[m].bits), (removal[i] - first[m]) * rate);
+            if (full > size * (1 + 1e-9) + 8) issue(i, "overflow", format("the buffer would hold %.0f bits of its %.0f", full, size));
+            sched.highest = std::max(sched.highest, full / size);
+            if (i + 1 < n) sched.lowest = std::min(sched.lowest, std::max(0.0, full - double(groups[i].bits)) / size);
+        }
+        sched.issueCount = found;
+        r.issueCount += found;
+        if (at == 0) {
+            r.bitRate = rate, r.bufferBits = size, r.cbr = false;
+            r.initialDelay = sched.initialDelay, r.lowest = sched.lowest, r.highest = sched.highest;
+            r.frames = int64_t(n);
+        }
+        r.schedules.push_back(sched);
+    }
+    if (r.schedules.empty()) {
+        if (r.note.empty()) r.note = "no operating point with a decoder model";
+        return;
+    }
+    r.signalled = true;
+    r.checked = true;
+}
+
 }  // namespace
 
 HrdReport checkHrd(const std::string& path, const std::atomic<bool>* cancel) {
@@ -1306,11 +1728,21 @@ HrdReport checkHrd(const std::string& path, const std::atomic<bool>* cancel) {
     } else if (codec == kMpeg2) {
         r.codec = "MPEG-2";
         checkMpeg2(fmt, v, r, cancel);
+    } else if (codec == kAv1) {
+        r.codec = "AV1";
+        checkAv1(fmt, v, r, cancel);
     } else {
         r.codec = avcodec_get_name(AVCodecID(codec));
-        r.note = r.codec + " has no buffer model to check here (H.264, HEVC and MPEG-2 do)";
+        r.note = r.codec + " has no buffer model to check here (H.264, HEVC, MPEG-2 and AV1 do)";
     }
     avformat_close_input(&fmt);
+    if (r.checked && r.schedules.empty()) {
+        // (one schedule: the level's limits, MPEG-2's VBV)
+        HrdSchedule one;
+        one.model = r.model, one.cbr = r.cbr, one.bitRate = r.bitRate, one.bufferBits = r.bufferBits, one.initialDelay = r.initialDelay;
+        one.lowest = r.lowest, one.highest = r.highest, one.issueCount = r.issueCount;
+        r.schedules.push_back(one);
+    }
     std::stable_sort(r.issues.begin(), r.issues.end(), [](const HrdIssue& a, const HrdIssue& b) { return a.frame < b.frame; });
     return r;
 }
@@ -1318,7 +1750,7 @@ HrdReport checkHrd(const std::string& path, const std::atomic<bool>* cancel) {
 // ---- Joining ----
 
 bool HrdSplicer::start(int codec, const std::vector<std::vector<uint8_t>>& sets, int lengthSize, double fps, int depth, double mpeg2Rate,
-                       double mpeg2Buffer) {
+                       double mpeg2Buffer, bool mpeg2Cbr) {
     codec_ = codec;
     lengthSize_ = lengthSize;
     fps_ = fps > 0 ? fps : 25;
@@ -1327,7 +1759,8 @@ bool HrdSplicer::start(int codec, const std::vector<std::vector<uint8_t>>& sets,
     active_ = false;
     if (codec == kMpeg2) {
         if (mpeg2Rate <= 0 || mpeg2Buffer <= 0) return false;
-        rate_ = mpeg2Rate, size_ = mpeg2Buffer, cbr_ = true;
+        rate_ = mpeg2Rate, size_ = mpeg2Buffer, cbr_ = mpeg2Cbr;
+        vbrLevel_ = size_;  // (at a variable rate the buffer is full before the first picture)
         active_ = true;
         return true;
     }
@@ -1401,6 +1834,12 @@ double mpeg2Lead(const std::vector<uint8_t>& au) {
 }  // namespace
 
 double HrdSplicer::nextDelay() const {
+    if (codec_ == kMpeg2 && !cbr_) {
+        // At a variable rate: the bits the buffer holds when the next picture is decoded, as seconds at the rate.
+        double level = vbrLevel_;
+        if (havePending_) level = std::min(size_, level - double(bitsOf(pending_.au)) + rate_ * frame_);
+        return std::max(0.0, level) / rate_;
+    }
     if (!havePending_) return firstDelay();
     const double nextRemoval = t0_ + double(count_ + 1) * frame_;
     const double end = pending_.arrival + double(bitsOf(pending_.au)) / rate_;
@@ -1466,6 +1905,8 @@ void HrdSplicer::finalize(Held& h, double nextRemoval, double nextAsked) {
     // stream's check, checkHrd, reports it)
     lastFinal_ = h.arrival + bits / rate_;
     if (codec_ == kMpeg2) mpegBits_ += bits;
+    // (MPEG-2 at a variable rate: its bits taken, and a frame's worth come in at the stated maximum, up to full)
+    if (codec_ == kMpeg2 && !cbr_) vbrLevel_ = std::min(size_, vbrLevel_ - bits + rate_ * frame_);
     ++count_;
 }
 
@@ -1528,33 +1969,40 @@ bool HrdSplicer::rewrite(Held& h, int64_t k) {
             t0_ = psc + d;
             h.removal = t0_;
         }
-        const int64_t want = std::clamp<int64_t>(int64_t(std::llround((h.removal - psc) * 90000)), 0, 0xfffe);
-        if (h.ours || pics[0].vbvDelay < 0 || pics[0].vbvDelay != want) {
-            uint8_t* p = h.au.data() + pics[0].psc;  // (the temporal reference's 10 bits, the type's 3, then the delay's 16)
+        // (at a variable rate every picture says 0xFFFF: a copied one that stated a delay, and ours, as the rest do)
+        const int64_t want = cbr_ ? std::clamp<int64_t>(int64_t(std::llround((h.removal - psc) * 90000)), 0, 0xfffe) : 0xffff;
+        for (size_t n = 0; n < pics.size(); ++n) {
+            if (n > 0 && cbr_) break;  // (at a constant rate the access unit's first picture carries the delay set here)
+            const int64_t has = pics[n].vbvDelay < 0 ? 0xffff : pics[n].vbvDelay;
+            if (!(h.ours && cbr_) && has == want) continue;
+            uint8_t* p = h.au.data() + pics[n].psc;  // (the temporal reference's 10 bits, the type's 3, then the delay's 16)
             uint32_t v = uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
             v = (v & ~(uint32_t(0xffff) << 3)) | (uint32_t(want) << 3);
             p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
         }
         if (h.ours) {
-            // (sequence header: vbv_buffer_size_value's 10 bits after 12+12+4+4+18+1; its extension's 8 after 4+8+1+2+2+2+12+1)
+            // Ours' sequence headers state the stream's buffer, and at a variable rate its maximum rate too. (The sequence
+            // header: bit_rate_value's 18 bits after 12+12+4+4, a marker, vbv_buffer_size_value's 10; its extension:
+            // bit_rate_extension's 12 after 4+8+1+2+2+2, a marker, vbv_buffer_size_extension's 8.)
             const uint32_t units = uint32_t(std::llround(size_ / 16384));
+            const uint32_t rate400 = uint32_t(std::ceil(rate_ / 400 - 1e-9));
+            auto put = [](uint8_t* q, size_t from, int count, uint32_t value) {
+                for (int b = 0; b < count; ++b) {
+                    const size_t bit = from + size_t(b);
+                    const int val = (value >> (count - 1 - b)) & 1;
+                    q[bit / 8] = uint8_t((q[bit / 8] & ~(0x80 >> (bit % 8))) | (val ? 0x80 >> (bit % 8) : 0));
+                }
+            };
             for (size_t i = 0; i + 12 <= h.au.size(); ++i) {
                 if (h.au[i] || h.au[i + 1] || h.au[i + 2] != 1) continue;
                 if (h.au[i + 3] == 0xb3) {
                     uint8_t* q = h.au.data() + i + 4;
-                    // bits 51..60 from q
-                    for (int b = 0; b < 10; ++b) {
-                        const size_t bit = 51 + size_t(b);
-                        const int val = (units >> (9 - b)) & 1;
-                        q[bit / 8] = uint8_t((q[bit / 8] & ~(0x80 >> (bit % 8))) | (val ? 0x80 >> (bit % 8) : 0));
-                    }
+                    if (!cbr_) put(q, 32, 18, rate400 & 0x3ffff);
+                    put(q, 51, 10, units & 0x3ff);
                 } else if (h.au[i + 3] == 0xb5 && (h.au[i + 4] >> 4) == 1) {
                     uint8_t* q = h.au.data() + i + 4;
-                    for (int b = 0; b < 8; ++b) {
-                        const size_t bit = 32 + size_t(b);
-                        const int val = (units >> (17 - b)) & 1;
-                        q[bit / 8] = uint8_t((q[bit / 8] & ~(0x80 >> (bit % 8))) | (val ? 0x80 >> (bit % 8) : 0));
-                    }
+                    if (!cbr_) put(q, 19, 12, (rate400 >> 18) & 0xfff);
+                    put(q, 32, 8, (units >> 10) & 0xff);
                 }
             }
         }

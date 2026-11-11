@@ -1,4 +1,4 @@
-// Montage — smart rendering of long-GOP exports (H.264, HEVC, MPEG-2 as XDCAM HD422 has it): where the export is coded
+// Montage — smart rendering of long-GOP exports (H.264, HEVC, MPEG-2 as XDCAM HD422 has it, AV1, VP9): where the export is coded
 // as its footage is (codec, size, sampling, bit depth, rate, field order), untouched pictures are copied from the source
 // a GOP at a time, and only the GOPs around edits, effects, transitions and titles are encoded again, closed, by x264,
 // x265 or FFmpeg's MPEG-2 encoder set to the source's profile and level (and, for H.264 and HEVC, a bit rate taken from
@@ -14,6 +14,9 @@
 //    B-pictures refer to the picture before it, so it is copied only where that frame is shown just before it, encoded
 //    (an encoded part always ends on an anchor picture): those B-pictures then decode from the encoded picture, near the
 //    source's but not exactly it.
+//  - AV1 and VP9: from one shown key frame to the next (AV1's with its sequence header). VP9's key frames set every
+//    reference and every probability context anew and carry their own profile, depth and size, so its GOPs need
+//    nothing in the file's description; libvpx's hidden frames ride inside the packet of the frame shown after them.
 // Footage shown turned (a display matrix), with other pixels or another range is not copied; nor is footage coded at
 // well over what the export's own settings would spend on it, or at a profile, tier or level above the one the export's
 // encoder states (or one its decoders need not decode). Every picture is shown
@@ -57,7 +60,7 @@ struct LongGopEncoder {
     // single IDR picture, an action camera's GOPs of several seconds) is encoded rather than held to be copied.
     int64_t maxGopBytes = int64_t(64) << 20;
     // The export's encoder, opened: the size, pixel format, rate, colour tags, field order and (MPEG-2) rate control the
-    // encoded parts are made with. Its codec is libx264, libx265 or mpeg2video.
+    // encoded parts are made with. Its codec is libx264, libx265, mpeg2video, libsvtav1, libaom-av1 or libvpx-vp9.
     const AVCodecContext* main = nullptr;
 };
 

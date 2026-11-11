@@ -1323,6 +1323,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 if (hrdCbr && pass != 1) o.vctx->bit_rate = o.vctx->rc_min_rate = hrdRate;
                 if (s.vbvInit > 0) o.vctx->rc_initial_buffer_occupancy = int(std::clamp(s.vbvInit, 0.05, 1.0) * double(o.vctx->rc_buffer_size));
             }
+            // (x265 states a constant rate, cbr_flag, whenever its bit rate is not below the buffer's, and then leaves the
+            // bits it does not spend unfilled, which no decoder's buffer holds: at a variable rate its target is kept a
+            // kilobit a second under the HRD's rate)
+            if (hrdVbr && c == "libx265" && o.vctx->bit_rate > 0 && o.vctx->bit_rate / 1000 >= hrdRate / 1000)
+                o.vctx->bit_rate = std::max<int64_t>(1000, (hrdRate / 1000 - 1) * 1000);
             if ((s.videoBitrate <= 0 && !hrdCbr) || pass == 1) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
             if (pass && c == "libx264") av_dict_set(&opts, "stats", s.passStats.c_str(), 0);

@@ -286,6 +286,8 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
+#include "render/HrdCheck.h"
+#include "render/NalBits.h"
 #include "render/LoudnessReport.h"
 #include "render/Dcp.h"
 #include "render/SdhDraft.h"
@@ -23842,6 +23844,699 @@ if ui["pressed"] == "add":
                 QVERIFY(same >= copied);
             }
         }
+    }
+
+    void hrdEverySchedule() {
+        // An HEVC file with its HRD stated: one schedule, VBR at 600 kb/s into a second's buffer.
+        Project gen = makeDefaultProject();
+        {
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+            Clip grad = makeGeneratorClip(gen, "gradient", 60);
+            grad.generator.params["angle"].addKey(0, 0.0);
+            grad.generator.params["angle"].addKey(59, 140.0);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = 0.05;
+            grad.effects.push_back(grain);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, grad);
+        }
+        ExportSettings st;
+        st.videoCodec = "libx265";
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.gop = 12;
+        st.hrd = "vbr";
+        st.videoBitrate = 600000;
+        st.path = path("two-schedules-src.mp4");
+        std::string err;
+        QVERIFY2(exportSequence(gen, *gen.active(), st, nullptr, nullptr, &err), err.c_str());
+        const HrdReport one = checkHrd(st.path);
+        QVERIFY2(one.checked && one.signalled && one.conforms(), one.summary().c_str());
+        QCOMPARE(one.schedules.size(), size_t(1));
+        QCOMPARE(one.schedules[0].bitRate, one.bitRate);
+
+        // The same pictures as a raw stream that states two schedules: the SPS's HRD written anew with the first as it
+        // was and a second of `rate` bits/s and `buffer` bits, and each buffering period given the second's initial delay.
+        auto restate = [&](const std::string& out, double rate, double buffer, int64_t delay90) {
+            AVFormatContext* in = nullptr;
+            if (avformat_open_input(&in, st.path.c_str(), nullptr, nullptr) < 0) return false;
+            avformat_find_stream_info(in, nullptr);
+            const AVCodecParameters* par = in->streams[0]->codecpar;
+            int lengthSize = 0;
+            const auto sets = hrd::parameterSets(AV_CODEC_ID_HEVC, par->extradata, size_t(par->extradata_size), lengthSize);
+            hrd::Sps sps;
+            QByteArray head;
+            auto put = [](QByteArray& to, const std::vector<uint8_t>& nalUnit) {
+                to.append("\0\0\0\1", 4);
+                to.append(reinterpret_cast<const char*>(nalUnit.data()), qsizetype(nalUnit.size()));
+            };
+            for (const std::vector<uint8_t>& u : sets) {
+                if (((u[0] >> 1) & 0x3f) != 33) {
+                    put(head, u);
+                    continue;
+                }
+                sps = hrd::parseHevcSps(u.data(), u.size());
+                if (!sps.valid || !sps.hrdTo || !sps.nal.present || sps.nal.cpbs.size() != 1) return false;
+                const std::vector<uint8_t> rbsp = nal::unescape(u.data(), u.size());
+                nal::Writer w;
+                w.copy(rbsp, 16, sps.hrdFrom);
+                w.flag(true);   // vui_hrd_parameters_present_flag
+                w.flag(true);   // nal_hrd_parameters_present_flag
+                w.flag(false);  // vcl_hrd_parameters_present_flag
+                w.flag(false);  // sub_pic_hrd_params_present_flag
+                w.u(0, 4);      // bit_rate_scale: 64 bits/s
+                w.u(0, 4);      // cpb_size_scale: 16 bits
+                w.u(uint64_t(sps.nal.initialDelayLength - 1), 5);
+                w.u(uint64_t(sps.nal.cpbDelayLength - 1), 5);
+                w.u(uint64_t(sps.nal.dpbDelayLength - 1), 5);
+                for (int layer = 0; layer <= sps.maxSubLayersMinus1; ++layer) {
+                    w.flag(true);  // fixed_pic_rate_general_flag
+                    w.ue(0);       // elemental_duration_in_tc_minus1
+                    w.ue(1);       // cpb_cnt_minus1: two schedules
+                    w.ue(uint64_t(sps.nal.cpbs[0].bitRate / 64) - 1);
+                    w.ue(uint64_t(sps.nal.cpbs[0].size / 16) - 1);
+                    w.flag(sps.nal.cpbs[0].cbr);
+                    w.ue(uint64_t(rate / 64) - 1);
+                    w.ue(uint64_t(buffer / 16) - 1);
+                    w.flag(false);
+                }
+                w.copy(rbsp, sps.hrdTo, nal::stopBit(rbsp));
+                w.trailing();
+                put(head, nal::escape(u.data(), 2, w.out));
+            }
+            if (!sps.valid) return false;
+            QFile f(QString::fromStdString(out));
+            if (!f.open(QIODevice::WriteOnly)) return false;
+            f.write(head);
+            AVPacket* pkt = av_packet_alloc();
+            bool ok = true;
+            int periods = 0;
+            while (av_read_frame(in, pkt) >= 0) {
+                QByteArray au;
+                for (int at = 0; at + 4 <= pkt->size;) {
+                    const int n = int(qFromBigEndian<quint32>(pkt->data + at));
+                    at += 4;
+                    if (n <= 0 || at + n > pkt->size) {
+                        ok = false;
+                        break;
+                    }
+                    std::vector<uint8_t> u(pkt->data + at, pkt->data + at + n);
+                    at += n;
+                    if (((u[0] >> 1) & 0x3f) == 39) {
+                        // A prefix SEI: its buffering period message gets the second schedule's delay and offset.
+                        const std::vector<uint8_t> rbsp = nal::unescape(u.data(), u.size(), 2);
+                        std::vector<uint8_t> made;
+                        size_t pos = 0;
+                        while (pos + 2 <= rbsp.size()) {
+                            int type = 0, size = 0;
+                            while (pos < rbsp.size() && rbsp[pos] == 0xff) type += 255, ++pos;
+                            type += rbsp[pos++];
+                            while (pos < rbsp.size() && rbsp[pos] == 0xff) size += 255, ++pos;
+                            size += rbsp[pos++];
+                            if (pos + size_t(size) > rbsp.size()) {
+                                ok = false;
+                                break;
+                            }
+                            std::vector<uint8_t> payload(rbsp.begin() + qsizetype(pos), rbsp.begin() + qsizetype(pos) + size);
+                            pos += size_t(size);
+                            if (type == 0) {
+                                nal::Reader r(payload);
+                                r.ue();  // bp_seq_parameter_set_id
+                                const bool irap = r.flag();
+                                if (irap) r.u(sps.nal.cpbDelayLength), r.u(sps.nal.dpbDelayLength);
+                                r.flag();                     // concatenation_flag
+                                r.u(sps.nal.cpbDelayLength);  // au_cpb_removal_delay_delta_minus1
+                                r.u(sps.nal.initialDelayLength), r.u(sps.nal.initialDelayLength);
+                                if (irap) r.u(sps.nal.initialDelayLength), r.u(sps.nal.initialDelayLength);
+                                nal::Writer w;
+                                w.copy(payload, 0, r.pos);
+                                for (int k = 0; k < (irap ? 2 : 1); ++k) {
+                                    w.u(uint64_t(delay90), sps.nal.initialDelayLength);
+                                    w.u(0, sps.nal.initialDelayLength);
+                                }
+                                w.payloadAlign();
+                                payload = w.out;
+                                ok = ok && r.ok;
+                                ++periods;
+                            }
+                            for (int v = type; ; v -= 255) {
+                                made.push_back(uint8_t(std::min(v, 255)));
+                                if (v < 255) break;
+                            }
+                            for (int v = int(payload.size()); ; v -= 255) {
+                                made.push_back(uint8_t(std::min(v, 255)));
+                                if (v < 255) break;
+                            }
+                            made.insert(made.end(), payload.begin(), payload.end());
+                        }
+                        made.push_back(0x80);
+                        u = nal::escape(u.data(), 2, made);
+                    }
+                    put(au, u);
+                }
+                f.write(au);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&in);
+            return ok && periods >= 5;
+        };
+
+        // A second schedule the pictures keep (twice the rate into the same buffer, half a second's wait): both are run
+        // and the stream conforms.
+        const std::string kept = path("two-schedules-kept.hevc");
+        QVERIFY(restate(kept, 1200000, 600000, 45000));
+        const HrdReport both = checkHrd(kept);
+        QVERIFY2(both.checked && both.signalled, both.summary().c_str());
+        QCOMPARE(both.schedules.size(), size_t(2));
+        QCOMPARE(both.schedules[0].bitRate, 600000.0);
+        QCOMPARE(both.schedules[1].bitRate, 1200000.0);
+        QCOMPARE(both.schedules[1].bufferBits, 600000.0);
+        QCOMPARE(both.schedules[1].index, 1);
+        QVERIFY(std::fabs(both.schedules[1].initialDelay - 0.5) < 1e-9);
+        QVERIFY2(both.conforms(), (both.summary() + " " + (both.issues.empty() ? std::string() : both.issues.front().text)).c_str());
+        QCOMPARE(both.frames, int64_t(60));
+        QVERIFY2(both.summary().find("the first of 2 schedules") != std::string::npos, both.summary().c_str());
+
+        // A second schedule they do not keep (a buffer of 24,000 bits, less than its larger pictures): the first
+        // schedule still passes, and the stream is reported for its second alone.
+        const std::string broken = path("two-schedules-broken.hevc");
+        QVERIFY(restate(broken, 1200000, 24000, 1800));
+        const HrdReport bad = checkHrd(broken);
+        QVERIFY2(bad.checked && !bad.conforms(), bad.summary().c_str());
+        QCOMPARE(bad.schedules.size(), size_t(2));
+        QCOMPARE(bad.schedules[0].issueCount, int64_t(0));
+        QVERIFY(bad.schedules[1].issueCount > 0);
+        QCOMPARE(bad.issueCount, bad.schedules[1].issueCount);
+        QVERIFY(!bad.issues.empty());
+        for (const HrdIssue& i : bad.issues) {
+            QCOMPARE(i.schedule, 1);
+            QVERIFY2(i.text.find("NAL HRD schedule 1 (1.2 Mb/s)") == 0, i.text.c_str());
+        }
+        // (the first picture larger than that buffer cannot all be there in time)
+        QVERIFY(bad.issues.front().frame >= 0 && bad.issues.front().frame < 60);
+        QCOMPARE(bad.issues.front().kind, std::string("underflow"));
+        QVERIFY2(bad.summary().find("NAL HRD schedule 1") != std::string::npos, bad.summary().c_str());
+        // Quality Check lists it as a buffer model problem that names the schedule.
+        QcSettings q;
+        q.flashing = q.levels = q.clipping = q.spelling = q.sync = q.phase = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+        q.loudnessTarget = 0;
+        q.intelligibility = 0;
+        q.dcOffsetDb = 0;
+        q.hrdFile = broken;
+        const std::vector<QcIssue> issues = qualityCheck(gen, *gen.active(), 0, -1, q, {}, nullptr, nullptr, nullptr);
+        QVERIFY(!issues.empty());
+        QCOMPARE(int(issues.front().kind), int(QcKind::Hrd));
+        QVERIFY2(issues.front().text.find("schedule 1") != std::string::npos, issues.front().text.c_str());
+    }
+
+    void av1DecoderModel() {
+        // AV1 that states its decoder model: libaom writes one when asked (timing-info=model). 40 frames of a moving
+        // gradient at 320x180, 300 kb/s, a key frame every 12.
+        const AVCodec* codec = avcodec_find_encoder_by_name("libaom-av1");
+        if (!codec) QSKIP("This build of FFmpeg has no libaom, the encoder that writes AV1's decoder model");
+        const std::string good = path("av1-model.mp4");
+        {
+            AVCodecContext* ctx = avcodec_alloc_context3(codec);
+            ctx->width = 320, ctx->height = 180;
+            ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+            ctx->time_base = AVRational{1, 25};
+            ctx->framerate = AVRational{25, 1};
+            ctx->bit_rate = 300000;
+            ctx->gop_size = 12;
+            ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            AVDictionary* opts = nullptr;
+            av_dict_set(&opts, "cpu-used", "8", 0);
+            av_dict_set(&opts, "aom-params", "timing-info=model", 0);
+            const int opened = avcodec_open2(ctx, codec, &opts);
+            const bool taken = av_dict_count(opts) == 0;
+            av_dict_free(&opts);
+            if (opened < 0 || !taken) {
+                avcodec_free_context(&ctx);
+                QSKIP("This libaom does not take timing-info=model");
+            }
+            AVFormatContext* out = nullptr;
+            QVERIFY(avformat_alloc_output_context2(&out, nullptr, nullptr, good.c_str()) >= 0);
+            AVStream* os = avformat_new_stream(out, nullptr);
+            avcodec_parameters_from_context(os->codecpar, ctx);
+            os->time_base = ctx->time_base;
+            QVERIFY(avio_open(&out->pb, good.c_str(), AVIO_FLAG_WRITE) >= 0);
+            QVERIFY(avformat_write_header(out, nullptr) >= 0);
+            AVFrame* fr = av_frame_alloc();
+            fr->format = ctx->pix_fmt, fr->width = ctx->width, fr->height = ctx->height;
+            QVERIFY(av_frame_get_buffer(fr, 0) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            auto drain = [&] {
+                while (avcodec_receive_packet(ctx, pkt) >= 0) {
+                    av_packet_rescale_ts(pkt, ctx->time_base, os->time_base);
+                    pkt->stream_index = 0;
+                    av_interleaved_write_frame(out, pkt);
+                }
+            };
+            for (int n = 0; n < 40; ++n) {
+                QVERIFY(av_frame_make_writable(fr) >= 0);
+                for (int y = 0; y < 180; ++y)
+                    for (int x = 0; x < 320; ++x) fr->data[0][y * fr->linesize[0] + x] = uint8_t(16 + (x + y + 4 * n) % 200);
+                for (int y = 0; y < 90; ++y)
+                    for (int x = 0; x < 160; ++x) {
+                        fr->data[1][y * fr->linesize[1] + x] = uint8_t(96 + (x + n) % 64);
+                        fr->data[2][y * fr->linesize[2] + x] = uint8_t(96 + (y + 2 * n) % 64);
+                    }
+                fr->pts = n;
+                QVERIFY(avcodec_send_frame(ctx, fr) >= 0);
+                drain();
+            }
+            avcodec_send_frame(ctx, nullptr);
+            drain();
+            av_write_trailer(out);
+            avio_closep(&out->pb);
+            avformat_free_context(out);
+            av_packet_free(&pkt);
+            av_frame_free(&fr);
+            avcodec_free_context(&ctx);
+        }
+        // It is run through its model (level 2.0: 1.5 Mb/s into a second's buffer) and conforms.
+        const HrdReport r = checkHrd(good);
+        QVERIFY2(r.checked && r.signalled && !r.cbr, r.summary().c_str());
+        QCOMPARE(r.codec, std::string("AV1"));
+        QCOMPARE(r.model, std::string("decoder model"));
+        QCOMPARE(r.bitRate, 1500000.0);
+        QCOMPARE(r.bufferBits, 1500000.0);
+        QVERIFY(r.initialDelay > 0 && r.initialDelay <= 1.0);
+        QVERIFY(r.frames >= 40);  // (every frame decoded, the hidden ones too)
+        QVERIFY2(r.conforms(), (r.summary() + " " + (r.issues.empty() ? std::string() : r.issues.front().text)).c_str());
+        QCOMPARE(r.schedules.size(), size_t(1));
+        QVERIFY(r.highest > 0 && r.highest < 1);
+
+        // One frame made too large (a metadata OBU of 1.6 megabits before it, more than the buffer holds): the model
+        // fails at that temporal unit, as the frame cannot all be there when it is to be decoded.
+        const std::string bad = path("av1-model-too-large.mp4");
+        int big = -1;
+        {
+            AVFormatContext* in = nullptr;
+            QVERIFY(avformat_open_input(&in, good.c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(in, nullptr);
+            AVFormatContext* out = nullptr;
+            QVERIFY(avformat_alloc_output_context2(&out, nullptr, nullptr, bad.c_str()) >= 0);
+            AVStream* os = avformat_new_stream(out, nullptr);
+            avcodec_parameters_copy(os->codecpar, in->streams[0]->codecpar);
+            os->codecpar->codec_tag = 0;
+            os->time_base = in->streams[0]->time_base;
+            QVERIFY(avio_open(&out->pb, bad.c_str(), AVIO_FLAG_WRITE) >= 0);
+            QVERIFY(avformat_write_header(out, nullptr) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            int n = 0;
+            while (av_read_frame(in, pkt) >= 0) {
+                // (the first temporal unit from the 20th on that starts with a frame to decode: an OBU_FRAME)
+                if (big < 0 && n >= 20 && pkt->size > 0 && ((pkt->data[0] >> 3) & 15) == 6) {
+                    big = n;
+                    const int extra = 200000;
+                    QByteArray obu;
+                    obu.append(char(5 << 3 | 2));  // a metadata OBU with its size stated
+                    for (int v = extra; ; v >>= 7) {
+                        obu.append(char((v & 0x7f) | (v >= 0x80 ? 0x80 : 0)));
+                        if (v < 0x80) break;
+                    }
+                    obu.append(char(6));  // metadata_type: private use
+                    obu.append(QByteArray(extra - 2, char(0x55)));
+                    obu.append(char(0x80));  // trailing bits
+                    const QByteArray whole = obu + QByteArray(reinterpret_cast<const char*>(pkt->data), pkt->size);
+                    AVPacket* grown = av_packet_alloc();
+                    QVERIFY(av_new_packet(grown, int(whole.size())) >= 0);
+                    std::memcpy(grown->data, whole.constData(), size_t(whole.size()));
+                    av_packet_copy_props(grown, pkt);
+                    av_packet_unref(pkt);
+                    av_packet_move_ref(pkt, grown);
+                    av_packet_free(&grown);
+                }
+                ++n;
+                pkt->stream_index = 0;
+                av_packet_rescale_ts(pkt, in->streams[0]->time_base, os->time_base);
+                av_interleaved_write_frame(out, pkt);
+            }
+            av_packet_free(&pkt);
+            av_write_trailer(out);
+            avio_closep(&out->pb);
+            avformat_free_context(out);
+            avformat_close_input(&in);
+        }
+        QVERIFY(big >= 20);
+        const HrdReport f = checkHrd(bad);
+        QVERIFY2(f.checked && !f.conforms() && !f.issues.empty(), f.summary().c_str());
+        QCOMPARE(f.issues.front().frame, int64_t(big));
+        QCOMPARE(f.issues.front().kind, std::string("underflow"));
+        for (const HrdIssue& i : f.issues) QVERIFY2(i.frame >= big, i.text.c_str());
+        // A stream with no decoder model (as most AV1 is) is said not to state one.
+        if (avcodec_find_encoder_by_name("libsvtav1")) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "gradient", 12));
+            ExportSettings st;
+            st.videoCodec = "libsvtav1";
+            st.audioCodec = "none";
+            st.preset = "10";
+            st.crf = 40;
+            st.path = path("av1-no-model.mp4");
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+            const HrdReport none = checkHrd(st.path);
+            QVERIFY(!none.checked && none.error.empty());
+            QVERIFY2(none.note.find("no decoder model") != std::string::npos, none.note.c_str());
+        }
+    }
+
+private:
+    // A file's video packets in decode order: their bytes, the frame each shows, and whether it is a key frame.
+    struct CodedPacket {
+        QByteArray data;
+        int64_t frame = 0;
+        bool key = false;
+    };
+    static std::vector<CodedPacket> codedPackets(const std::string& file) {
+        std::vector<CodedPacket> out;
+        AVFormatContext* fmt = nullptr;
+        if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+        avformat_find_stream_info(fmt, nullptr);
+        const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (v >= 0) {
+            const AVStream* st = fmt->streams[v];
+            const AVRational rate = st->avg_frame_rate.num > 0 ? st->avg_frame_rate : st->r_frame_rate;
+            const int64_t start = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == v)
+                    out.push_back({QByteArray(reinterpret_cast<const char*>(pkt->data), pkt->size),
+                                   av_rescale_q(pkt->pts - start, st->time_base, av_inv_q(rate)), (pkt->flags & AV_PKT_FLAG_KEY) != 0});
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+        }
+        avformat_close_input(&fmt);
+        return out;
+    }
+    // Every picture of a file decoded with FFmpeg's error checks on: how many, and how many errors it found or logged.
+    static int decodedPictures(const std::string& file, int& errors) {
+        static std::atomic<int> logged{0};
+        logged = 0;
+        av_log_set_callback([](void* avcl, int level, const char* fmt, va_list vl) {
+            if (level <= AV_LOG_ERROR) ++logged;
+            av_log_default_callback(avcl, level, fmt, vl);
+        });
+        int frames = 0;
+        errors = 0;
+        AVFormatContext* fmt = nullptr;
+        if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) >= 0) {
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVCodec* codec = v >= 0 ? avcodec_find_decoder(fmt->streams[v]->codecpar->codec_id) : nullptr;
+            AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+            if (ctx) {
+                avcodec_parameters_to_context(ctx, fmt->streams[v]->codecpar);
+                ctx->err_recognition = AV_EF_CRCCHECK | AV_EF_EXPLODE;
+                ctx->thread_count = 1;
+            }
+            if (ctx && avcodec_open2(ctx, codec, nullptr) >= 0) {
+                AVPacket* pkt = av_packet_alloc();
+                AVFrame* fr = av_frame_alloc();
+                auto take = [&] {
+                    while (avcodec_receive_frame(ctx, fr) >= 0) {
+                        if (fr->decode_error_flags || (fr->flags & AV_FRAME_FLAG_CORRUPT)) ++errors;
+                        ++frames;
+                        av_frame_unref(fr);
+                    }
+                };
+                while (av_read_frame(fmt, pkt) >= 0) {
+                    if (pkt->stream_index == v && avcodec_send_packet(ctx, pkt) < 0) ++errors;
+                    av_packet_unref(pkt);
+                    take();
+                }
+                avcodec_send_packet(ctx, nullptr);
+                take();
+                av_frame_free(&fr);
+                av_packet_free(&pkt);
+            }
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+        }
+        av_log_set_callback(av_log_default_callback);
+        errors += logged;
+        return frames;
+    }
+
+private slots:
+    void vp9SmartRenderCopiesGops() {
+        if (!avcodec_find_encoder_by_name("libvpx-vp9")) QSKIP("This build of FFmpeg has no libvpx VP9 encoder");
+        // VP9 footage in WebM: 100 frames of a turning gradient with grain, a key frame every 24.
+        Project gen = makeDefaultProject();
+        {
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+            Clip grad = makeGeneratorClip(gen, "gradient", 100);
+            grad.generator.params["angle"].addKey(0, 0.0);
+            grad.generator.params["angle"].addKey(99, 140.0);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = 0.05;
+            grad.effects.push_back(grain);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, grad);
+        }
+        ExportSettings st;
+        st.videoCodec = "libvpx-vp9";
+        st.audioCodec = "none";
+        st.preset = "good";
+        st.crf = 35;
+        st.gop = 24;
+        st.path = path("vp9-src.webm");
+        std::string err;
+        QVERIFY2(exportSequence(gen, *gen.active(), st, nullptr, nullptr, &err), err.c_str());
+        const std::vector<CodedPacket> source = codedPackets(st.path);
+        QCOMPARE(int(source.size()), 100);
+        std::vector<int64_t> keys;
+        for (const CodedPacket& c : source)
+            if (c.key) keys.push_back(c.frame);
+        QVERIFY(keys.size() >= 3 && keys.front() == 0);
+
+        // Source frames 5 to 94 on the timeline, an effect over export frames 30-35: the GOPs the cut and the effect
+        // leave whole are copied, the frames around them encoded.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 5, 95, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 30).ok);
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 36).ok);
+        for (Clip& c : s.videoTracks[0].clips)
+            if (c.start == 30) c.effects.push_back(makeEffect(p, "invert"));
+        // (the whole GOPs inside source frames 5-34 and 41-94: from a key frame to the frame before the next)
+        std::vector<std::pair<int64_t, int64_t>> whole;
+        for (size_t k = 0; k + 1 < keys.size(); ++k) {
+            const int64_t lo = keys[k], hi = keys[k + 1] - 1;
+            if ((lo >= 5 && hi <= 34) || (lo >= 41 && hi <= 94)) whole.push_back({lo, hi});
+        }
+        QVERIFY(!whole.empty());
+        int expected = 0;
+        for (const auto& [lo, hi] : whole) expected += int(hi - lo + 1);
+        for (const char* ext : {"webm", "mp4"}) {
+            ExportSettings ex = st;
+            ex.path = path((std::string("vp9-out.") + ext).c_str());
+            int copied = -1;
+            QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+            QCOMPARE(copied, expected);
+            int errors = -1;
+            QCOMPARE(decodedPictures(ex.path, errors), 90);
+            QCOMPARE(errors, 0);
+            // Those GOPs' packets are the footage's, byte for byte, each a key frame where the footage's was.
+            std::map<int64_t, const CodedPacket*> byFrame;
+            for (const CodedPacket& c : source) byFrame[c.frame] = &c;
+            const std::vector<CodedPacket> out = codedPackets(ex.path);
+            QCOMPARE(int(out.size()), 90);
+            int same = 0;
+            for (const CodedPacket& c : out) {
+                const int64_t from = c.frame + 5;
+                bool inWhole = false;
+                for (const auto& [lo, hi] : whole) inWhole = inWhole || (from >= lo && from <= hi);
+                if (!inWhole) continue;
+                QVERIFY2(byFrame[from]->data == c.data, qPrintable(QStringLiteral("%1: frame %2 is not the footage's").arg(ext).arg(c.frame)));
+                QCOMPARE(c.key, byFrame[from]->key);
+                ++same;
+            }
+            QCOMPARE(same, expected);
+            // The effect's frames were encoded: they are not the footage's.
+            for (const CodedPacket& c : out)
+                if (c.frame >= 30 && c.frame <= 35) QVERIFY(byFrame[c.frame + 5]->data != c.data);
+        }
+        // With smart rendering off nothing is copied.
+        ExportSettings off = st;
+        off.smartRender = false;
+        off.path = path("vp9-encoded.webm");
+        int copied = -1;
+        QVERIFY2(exportSequence(p, s, off, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+        QCOMPARE(copied, 0);
+    }
+
+    void mpeg2VariableRateJoin() {
+        // MPEG-2 footage at a variable rate, as FFmpeg's encoder writes it with a maximum above its bit rate: 6 Mb/s,
+        // no more than 12 Mb/s into a buffer of 9,781,248 bits, every vbv_delay 0xFFFF. 100 frames at 1280x720, a GOP
+        // of 12 with two B-pictures.
+        const double maxRate = 12000000, buffer = 9781248;
+        const std::string footage = path("mpeg2-vbr.mov");
+        {
+            const AVCodec* codec = avcodec_find_encoder_by_name("mpeg2video");
+            QVERIFY(codec);
+            AVCodecContext* ctx = avcodec_alloc_context3(codec);
+            ctx->width = 1280, ctx->height = 720;
+            ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+            ctx->time_base = AVRational{1, 25};
+            ctx->framerate = AVRational{25, 1};
+            ctx->bit_rate = 6000000;
+            ctx->rc_max_rate = int64_t(maxRate);
+            ctx->rc_buffer_size = int(buffer);
+            ctx->gop_size = 12;
+            ctx->max_b_frames = 2;
+            ctx->field_order = AV_FIELD_PROGRESSIVE;  // (stated in the file, as MPEG-2 footage states its scan)
+            ctx->color_primaries = AVCOL_PRI_BT709, ctx->color_trc = AVCOL_TRC_BT709, ctx->colorspace = AVCOL_SPC_BT709;
+            ctx->color_range = AVCOL_RANGE_MPEG;
+            QVERIFY(avcodec_open2(ctx, codec, nullptr) >= 0);
+            AVFormatContext* out = nullptr;
+            QVERIFY(avformat_alloc_output_context2(&out, nullptr, nullptr, footage.c_str()) >= 0);
+            AVStream* os = avformat_new_stream(out, nullptr);
+            avcodec_parameters_from_context(os->codecpar, ctx);
+            os->time_base = ctx->time_base;
+            os->avg_frame_rate = ctx->framerate;
+            QVERIFY(avio_open(&out->pb, footage.c_str(), AVIO_FLAG_WRITE) >= 0);
+            QVERIFY(avformat_write_header(out, nullptr) >= 0);
+            AVFrame* fr = av_frame_alloc();
+            fr->format = ctx->pix_fmt, fr->width = ctx->width, fr->height = ctx->height;
+            QVERIFY(av_frame_get_buffer(fr, 0) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            auto drain = [&] {
+                while (avcodec_receive_packet(ctx, pkt) >= 0) {
+                    av_packet_rescale_ts(pkt, ctx->time_base, os->time_base);
+                    pkt->stream_index = 0;
+                    av_interleaved_write_frame(out, pkt);
+                }
+            };
+            uint32_t seed = 12345;
+            for (int n = 0; n < 100; ++n) {
+                QVERIFY(av_frame_make_writable(fr) >= 0);
+                // (a gradient that drifts, a bar that crosses it, and grain)
+                for (int y = 0; y < 720; ++y)
+                    for (int x = 0; x < 1280; ++x) {
+                        seed = seed * 1664525u + 1013904223u;
+                        const int bar = std::abs(x - (n * 12) % 1280) < 40 ? 60 : 0;
+                        fr->data[0][y * fr->linesize[0] + x] = uint8_t(40 + (x + 2 * y + 3 * n) % 120 + bar + int(seed >> 29));
+                    }
+                for (int y = 0; y < 360; ++y)
+                    for (int x = 0; x < 640; ++x) {
+                        fr->data[1][y * fr->linesize[1] + x] = uint8_t(110 + (x + n) % 40);
+                        fr->data[2][y * fr->linesize[2] + x] = uint8_t(110 + (y + 2 * n) % 40);
+                    }
+                fr->pts = n;
+                QVERIFY(avcodec_send_frame(ctx, fr) >= 0);
+                drain();
+            }
+            avcodec_send_frame(ctx, nullptr);
+            drain();
+            av_write_trailer(out);
+            avio_closep(&out->pb);
+            avformat_free_context(out);
+            av_packet_free(&pkt);
+            av_frame_free(&fr);
+            avcodec_free_context(&ctx);
+        }
+        // What every picture and sequence header of a file says: vbv_delay, and the stated rate and buffer.
+        struct Stated {
+            int pictures = 0, delays = 0, headers = 0, otherHeaders = 0;
+        };
+        auto stated = [&](const std::string& file) {
+            Stated st;
+            for (const CodedPacket& c : codedPackets(file)) {
+                const uint8_t* d = reinterpret_cast<const uint8_t*>(c.data.constData());
+                const size_t n = size_t(c.data.size());
+                for (size_t i = 0; i + 8 <= n; ++i) {
+                    if (d[i] || d[i + 1] || d[i + 2] != 1) continue;
+                    if (d[i + 3] == 0x00) {
+                        const uint32_t v = uint32_t(d[i + 4]) << 24 | uint32_t(d[i + 5]) << 16 | uint32_t(d[i + 6]) << 8 | d[i + 7];
+                        ++st.pictures;
+                        if (((v >> 3) & 0xffff) != 0xffff) ++st.delays;
+                    } else if (d[i + 3] == 0xb3) {
+                        double rate = 0, size = 0;
+                        hrd::mpeg2Rate(d + i, n - i, rate, size);
+                        ++st.headers;
+                        if (rate != maxRate || size != buffer) ++st.otherHeaders;
+                    }
+                }
+            }
+            return st;
+        };
+        const Stated src = stated(footage);
+        QCOMPARE(src.pictures, 100);
+        QCOMPARE(src.delays, 0);
+        QVERIFY(src.headers >= 8);
+        QCOMPARE(src.otherHeaders, 0);
+        const HrdReport before = checkHrd(footage);
+        QVERIFY2(before.checked && !before.cbr && before.conforms(), before.summary().c_str());
+        QCOMPARE(before.bitRate, maxRate);
+        QCOMPARE(before.bufferBits, buffer);
+
+        // Source frames 5 to 94, an effect over export frames 30-35, exported as MPEG-2 at a constant 20 Mb/s: the
+        // footage's GOPs are copied, and the parts encoded beside them are made at a variable rate too.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1280, s.height = 720, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, footage);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 5, 95, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 30).ok);
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 36).ok);
+        for (Clip& c : s.videoTracks[0].clips)
+            if (c.start == 30) c.effects.push_back(makeEffect(p, "invert"));
+        ExportSettings ex;
+        ex.videoCodec = "mpeg2video";
+        ex.audioCodec = "none";
+        ex.pixFmt = "yuv420p";
+        ex.gop = 12;
+        ex.videoBitrate = 20000000;
+        ex.path = path("mpeg2-vbr-out.mov");
+        std::string err;
+        int copied = -1;
+        HrdReport after;
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied, nullptr, nullptr, &after), err.c_str());
+        QVERIFY2(copied >= 24 && copied < 90, qPrintable(QString::number(copied)));
+        // It decodes whole, with no errors.
+        int errors = -1;
+        QCOMPARE(decodedPictures(ex.path, errors), 90);
+        QCOMPARE(errors, 0);
+        // Every picture still says 0xFFFF, and every sequence header (the copied GOPs' and the encoded parts') states
+        // the footage's maximum and buffer, not the export's 20 Mb/s.
+        const Stated out = stated(ex.path);
+        QCOMPARE(out.pictures, 90);
+        QCOMPARE(out.delays, 0);
+        QVERIFY(out.headers >= 6);
+        QCOMPARE(out.otherHeaders, 0);
+        // The buffer model, run at that maximum, holds across the joins; the export checked it itself.
+        const HrdReport r = checkHrd(ex.path);
+        QVERIFY2(r.checked && r.signalled && !r.cbr, r.summary().c_str());
+        QCOMPARE(r.model, std::string("VBV"));
+        QCOMPARE(r.bitRate, maxRate);
+        QCOMPARE(r.bufferBits, buffer);
+        QVERIFY2(r.conforms(), (r.summary() + " " + (r.issues.empty() ? std::string() : r.issues.front().text)).c_str());
+        QCOMPARE(r.frames, int64_t(90));
+        QVERIFY2(after.checked && after.conforms() && !after.cbr, after.summary().c_str());
+        // The copied GOPs' pictures are the footage's bytes (a GOP's time code apart).
+        std::map<int64_t, QByteArray> byFrame;
+        for (const CodedPacket& c : codedPackets(footage)) byFrame[c.frame] = c.data;
+        int same = 0;
+        for (const CodedPacket& c : codedPackets(ex.path)) {
+            const QByteArray& from = byFrame[c.frame + 5];
+            if (from.size() != c.data.size()) continue;
+            int differing = 0;
+            for (qsizetype i = 0; i < from.size(); ++i) differing += from[i] != c.data[i];
+            if (differing <= 4) ++same;
+        }
+        QVERIFY2(same >= copied, qPrintable(QStringLiteral("%1 of %2").arg(same).arg(copied)));
     }
 
     void smartRenderingLimits() {
