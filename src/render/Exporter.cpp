@@ -3898,6 +3898,8 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
     } else {
         std::vector<uint8_t> rgba = toRgba8(img);
         QImage qi(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888);
+        // (Adobe RGB, which no tag names: said by its ICC profile, which PNG, JPEG and WebP carry)
+        if (space->primaries == Primaries::AdobeRgb) qi.setColorSpace(QColorSpace(QColorSpace::AdobeRgb));
         const bool lossy = ext == ".jpg" || ext == ".jpeg" || ext == ".webp";
         if (!qi.save(QString::fromStdString(path), nullptr, lossy ? std::clamp(options.quality, 0, 100) : -1))
             return fail("Cannot write " + path);

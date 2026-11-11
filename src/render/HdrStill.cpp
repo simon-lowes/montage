@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QBuffer>
+#include <QColorSpace>
 #include <QFile>
 #include <QImage>
 #include <QImageWriter>
@@ -154,10 +155,10 @@ bool avifProperties(const QByteArray& b, const Box& meta, std::vector<Box>& prop
     return ipco && boxes(b, ipco->body, ipco->end(), props);
 }
 
-// Adds mastering display (mdcv) and light level (clli) properties to an AVIF written by FFmpeg, which writes neither,
-// for its primary item: the boxes grow and the image data moves, so its locations (iloc) move with it. False (the file
-// as it was) for a layout this does not know.
-bool addAvifLightLevels(QByteArray& b, double peakNits, double maxCll, double maxFall) {
+// Adds properties (whole boxes, `count` of them in `added`) to the primary item of an AVIF written by FFmpeg: the boxes
+// grow and the image data moves, so its locations (iloc) move with it. False (the file as it was) for a layout this
+// does not know, and where `has` says of a property there already that the file has what would be added.
+bool addAvifProperties(QByteArray& b, const QByteArray& added, int count, bool (*has)(const QByteArray& b, const Box& property)) {
     std::vector<Box> top, kids, iprp, props;
     if (!boxes(b, 0, b.size(), top) || find(top, "moov")) return false;
     const Box* meta = find(top, "meta");
@@ -169,7 +170,7 @@ bool addAvifLightLevels(QByteArray& b, double peakNits, double maxCll, double ma
     // (Not for an FFmpeg that writes them itself, nor where transformative properties, which must come after descriptive
     // ones, are associated.)
     for (const Box& x : props)
-        if (x.type == "clli" || x.type == "mdcv" || x.type == "irot" || x.type == "imir" || x.type == "clap") return false;
+        if (has(b, x) || x.type == "irot" || x.type == "imir" || x.type == "clap") return false;
     for (const Box* x : {meta, iprpBox, ipco, ipma})
         if (x->body - x->at != 8) return false;  // (32-bit sizes, which grow in place)
     // The primary item.
@@ -177,16 +178,14 @@ bool addAvifLightLevels(QByteArray& b, double peakNits, double maxCll, double ma
     const int pitmVersion = uint8_t(b[pitm->body]);
     const uint64_t primary = pitmVersion == 0 ? get16(b, pitm->body + 4) : getN(b, pitm->body + 4, 4);
 
-    // The new properties: mdcv and clli.
-    const QByteArray added = mdcvBox(peakNits) + clliBox(maxCll, maxFall);
-    const int first = int(props.size()) + 1;  // their indices (1-based)
+    const int first = int(props.size()) + 1;  // the new properties' indices (1-based)
 
-    // The associations, with the primary item's two more.
+    // The associations, with the primary item's `count` more.
     qsizetype at = ipma->body;
     if (at + 8 > ipma->end()) return false;
     const int ipmaVersion = uint8_t(b[at]);
     const bool wideIndex = uint8_t(b[at + 3]) & 1;
-    if (!wideIndex && first + 1 > 127) return false;
+    if (!wideIndex && first + count - 1 > 127) return false;
     const uint32_t entries = get32(b, at + 4);
     QByteArray assoc = b.mid(at, 8);
     at += 8;
@@ -195,14 +194,14 @@ bool addAvifLightLevels(QByteArray& b, double peakNits, double maxCll, double ma
         const int idBytes = ipmaVersion < 1 ? 2 : 4;
         if (at + idBytes + 1 > ipma->end()) return false;
         const uint64_t item = getN(b, at, idBytes);
-        const int count = uint8_t(b[at + idBytes]);
-        const qsizetype len = idBytes + 1 + qsizetype(count) * (wideIndex ? 2 : 1);
+        const int had = uint8_t(b[at + idBytes]);
+        const qsizetype len = idBytes + 1 + qsizetype(had) * (wideIndex ? 2 : 1);
         if (at + len > ipma->end()) return false;
         QByteArray entry = b.mid(at, len);
         if (item == primary) {
-            if (count > 253) return false;
-            entry[idBytes] = char(count + 2);
-            for (int k = 0; k < 2; ++k) {
+            if (had > 255 - count) return false;
+            entry[idBytes] = char(had + count);
+            for (int k = 0; k < count; ++k) {
                 if (wideIndex) put16(entry, unsigned(first + k));
                 else entry.append(char(first + k));
             }
@@ -268,6 +267,20 @@ bool addAvifLightLevels(QByteArray& b, double peakNits, double maxCll, double ma
     setN(out, ipma->at, 4, uint64_t(8 + assoc.size()));
     b = out.left(insertAt) + added + out.mid(insertAt, ipma->body - insertAt) + assoc + out.mid(ipma->end());
     return true;
+}
+
+// Mastering display (mdcv) and light level (clli) properties for an AVIF written by FFmpeg, which writes neither.
+bool addAvifLightLevels(QByteArray& b, double peakNits, double maxCll, double maxFall) {
+    return addAvifProperties(b, mdcvBox(peakNits) + clliBox(maxCll, maxFall), 2,
+                             [](const QByteArray&, const Box& x) { return x.type == "clli" || x.type == "mdcv"; });
+}
+
+// An ICC profile as a second colour property (colr of type prof) beside the code points, for primaries they cannot
+// name: FFmpeg's AVIF muxer writes the code points alone.
+bool addAvifProfile(QByteArray& b, const QByteArray& icc) {
+    return addAvifProperties(b, box("colr", QByteArray("prof", 4) + icc), 1, [](const QByteArray& file, const Box& x) {
+        return x.type == "colr" && (file.mid(x.body, 4) == "prof" || file.mid(x.body, 4) == "rICC");
+    });
 }
 
 }  // namespace
@@ -469,6 +482,7 @@ struct Av1Picture {
     int width = 0, height = 0, bits = 8;
     Av1Layout layout = Av1Layout::Yuv420;
     std::vector<uint16_t> planes[3];
+    QByteArray icc;  // an ICC profile for primaries no code point names (Adobe RGB), written beside the code points
     AVColorPrimaries primaries = AVCOL_PRI_BT709;
     AVColorTransferCharacteristic transfer = AVCOL_TRC_BT709;
     AVColorSpace matrix = AVCOL_SPC_BT709;
@@ -520,6 +534,7 @@ Av1Picture ycbcr420(const Image& img, const ColorSpace& space, int bits, AVColor
             V[size_t(y) * CW + x] = uint16_t(std::clamp(std::lround(sr / n * maxCode + mid), 0L, long(maxCode)));
         }
     pic.primaries = avPrimaries(space.primaries);
+    if (space.primaries == Primaries::AdobeRgb) pic.icc = QColorSpace(QColorSpace::AdobeRgb).iccProfile();
     pic.transfer = transfer != AVCOL_TRC_UNSPECIFIED ? transfer
                    : space.transfer == Transfer::Pq    ? AVCOL_TRC_SMPTE2084
                    : space.transfer == Transfer::Hlg   ? AVCOL_TRC_ARIB_STD_B67
@@ -743,13 +758,15 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
     QTemporaryDir dir;
     if (!dir.isValid()) return fail("Cannot make a temporary folder");
     const std::string encoded = dir.filePath("still.avif").toStdString();
-    if (!encodeStill(ycbcr420(img, space, hdr ? 10 : 8), quality, {"libsvtav1", "libaom-av1", "librav1e"}, "avif", encoded, why,
-                     hdr ? peakNits : 0, maxCll, maxFall))
+    const Av1Picture picture = ycbcr420(img, space, hdr ? 10 : 8);
+    if (!encodeStill(picture, quality, {"libsvtav1", "libaom-av1", "librav1e"}, "avif", encoded, why, hdr ? peakNits : 0, maxCll, maxFall))
         return fail(why);
     QFile in(QString::fromStdString(encoded));
     if (!in.open(QIODevice::ReadOnly)) return fail("Cannot read back " + encoded);
     QByteArray bytes = in.readAll();
     in.close();
+    // (Adobe RGB, which no code point names: its profile beside the code points; a layout not known keeps them alone)
+    if (!picture.icc.isEmpty()) addAvifProfile(bytes, picture.icc);
     const bool added = hdr && addAvifLightLevels(bytes, peakNits, maxCll, maxFall);
     if (!writeStillFile(path, bytes, why)) return fail(why);
     if (stated) *stated = added;
@@ -965,6 +982,8 @@ bool hevcItem(const Av1Picture& source, int quality, const QTemporaryDir& dir, c
     if (!readMp4Hevc(mp4, item)) return why = "Cannot read back the HEVC picture", false;
     for (QByteArray& p : pictureProperties(pic.width, pic.height, pic.bits, int(pic.primaries), int(pic.transfer), int(pic.matrix)))
         item.properties.push_back(p);
+    // (primaries no code point names: the profile as a second colour property, of type prof)
+    if (!pic.icc.isEmpty()) item.properties.push_back(box("colr", QByteArray("prof", 4) + pic.icc));
     if (pic.width != source.width || pic.height != source.height) item.properties.push_back(clapBox(source.width, source.height, pic.width, pic.height));
     return true;
 }
@@ -1001,6 +1020,7 @@ bool hevcPicture(const Av1Picture& pic, int quality, int tile, const QTemporaryD
             Av1Picture part;  // (its planes cut from the picture's below)
             part.width = part.height = tile, part.bits = pic.bits, part.layout = pic.layout;
             part.primaries = pic.primaries, part.transfer = pic.transfer, part.matrix = pic.matrix;
+            part.icc = pic.icc;
             part.planes[0].assign(size_t(tile) * tile, 0);
             for (int y = 0; y < tile; ++y)
                 for (int x = 0; x < tile; ++x)

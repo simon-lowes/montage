@@ -2978,6 +2978,77 @@ private slots:
             QVERIFY2(probeMedia((dir.path() + "/" + written.first()).toStdString(), m, &err), err.c_str());
             QCOMPARE(m.colorSpace, std::string("adobergb"));
         }
+        // Delivered as Adobe RGB video: MOV and MP4 state the ICC profile for the stream, where FFmpeg's probe reads
+        // it, and Montage reads the file back as Adobe RGB.
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+        for (const char* name : {"adobe.mov", "adobe.mp4"}) {
+            if (!avcodec_find_encoder_by_name("libx264")) break;
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 64, s.height = 64;
+            s.videoTracks[0].clips.push_back(colorClip(p, 0.2f, 0.6f, 0.3f, 0, 5));
+            QTemporaryDir dir;
+            ExportSettings st;
+            st.path = dir.path().toStdString() + "/" + name;
+            st.videoCodec = "libx264";
+            st.audioCodec = "none";
+            st.colorSpace = "adobergb";
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            AVFormatContext* fc = nullptr;
+            QVERIFY(avformat_open_input(&fc, st.path.c_str(), nullptr, nullptr) == 0);
+            QVERIFY(avformat_find_stream_info(fc, nullptr) >= 0);
+            const int v = av_find_best_stream(fc, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            QVERIFY(v >= 0);
+            const AVCodecParameters* par = fc->streams[v]->codecpar;
+            const AVPacketSideData* sd = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_ICC_PROFILE);
+            const QByteArray profile = sd ? QByteArray(reinterpret_cast<const char*>(sd->data), int(sd->size)) : QByteArray();
+            avformat_close_input(&fc);
+            QVERIFY2(!profile.isEmpty(), name);
+            QCOMPARE(QColorSpace::fromIccProfile(profile).primaries(), QColorSpace::Primaries::AdobeRgb);
+            MediaItem m;
+            QVERIFY2(probeMedia(st.path, m, &err), err.c_str());
+            QCOMPARE(m.colorSpace, std::string("adobergb"));
+        }
+#endif
+        // Stills of an Adobe RGB sequence: a PNG, an AVIF and a HEIF each carry the profile and read back as Adobe RGB.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 128, s.height = 64;
+            s.colorSpace = "adobergb";
+            s.videoTracks[0].clips.push_back(colorClip(p, 0.2f, 0.6f, 0.3f, 0, 5));
+            QTemporaryDir dir;
+            const QByteArray adobe = QColorSpace(QColorSpace::AdobeRgb).iccProfile();
+            QVERIFY(!adobe.isEmpty());
+            for (const char* name : {"still.png", "still.avif", "still.heic"}) {
+                const std::string file = dir.path().toStdString() + "/" + name;
+                std::string err;
+                StillResult res;
+                if (!exportStill(p, s, 0, file, &err, {}, &res)) {
+                    // (a build of FFmpeg without the AV1 or HEVC encoder writes neither)
+                    QVERIFY2(std::string(name) != "still.png", err.c_str());
+                    qInfo("%s not written: %s", name, err.c_str());
+                    continue;
+                }
+                QCOMPARE(res.colorSpace, std::string("adobergb"));
+                QFile f(QString::fromStdString(file));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                const QByteArray bytes = f.readAll();
+                f.close();
+                if (std::string(name) == "still.png") {
+                    QCOMPARE(QImage(QString::fromStdString(file)).colorSpace().primaries(), QColorSpace::Primaries::AdobeRgb);
+                } else {
+                    // (a colour property of type prof holding the profile)
+                    const qsizetype at = bytes.indexOf(QByteArray("colrprof", 8));
+                    QVERIFY2(at >= 4, name);
+                    QCOMPARE(QColorSpace::fromIccProfile(bytes.mid(at + 8, adobe.size())).primaries(), QColorSpace::Primaries::AdobeRgb);
+                }
+                MediaItem m;
+                QVERIFY2(probeMedia(file, m, &err), err.c_str());
+                QVERIFY2(m.colorSpace == "adobergb", (std::string(name) + " read as " + m.colorSpace).c_str());
+            }
+        }
     }
 
     void ocioTransformEffect() {

@@ -385,6 +385,28 @@ int openMediaInput(AVFormatContext** fmt, const std::string& decorated) {
 
 namespace {
 
+// The colour space an ICC profile names ("" for one of no space Montage reads differently: an sRGB profile reads as
+// the Rec.709 default).
+std::string iccProfileSpace(const uint8_t* data, size_t size) {
+    const QColorSpace cs = QColorSpace::fromIccProfile(QByteArray(reinterpret_cast<const char*>(data), int(size)));
+    if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::AdobeRgb) return "adobergb";
+    if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::DciP3D65) return "p3d65";
+    return {};
+}
+
+// The colour space the ICC profile a file states for a stream names: MOV and MP4's colr box of type prof, an AVIF's
+// colour property, as FFmpeg's probe reads them ("" without one).
+std::string streamIccColorSpace(const AVStream* st) {
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+    if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data, AV_PKT_DATA_ICC_PROFILE))
+        return iccProfileSpace(sd->data, sd->size);
+#else
+    size_t size = 0;
+    if (const uint8_t* d = av_stream_get_side_data(st, AV_PKT_DATA_ICC_PROFILE, &size)) return iccProfileSpace(d, size);
+#endif
+    return {};
+}
+
 // The colour space a still image's embedded ICC profile names, for images whose tags name none ("" when it has no
 // profile, or one of no space Montage reads differently: an sRGB profile reads as the Rec.709 default).
 std::string iccColorSpace(const std::string& path) {
@@ -405,11 +427,7 @@ std::string iccColorSpace(const std::string& path) {
         }
         if (!got && avcodec_send_packet(dec, nullptr) >= 0) got = avcodec_receive_frame(dec, frame) == 0;
         if (got)
-            if (const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_ICC_PROFILE)) {
-                const QColorSpace cs = QColorSpace::fromIccProfile(QByteArray(reinterpret_cast<const char*>(sd->data), int(sd->size)));
-                if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::AdobeRgb) out = "adobergb";
-                else if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::DciP3D65) out = "p3d65";
-            }
+            if (const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_ICC_PROFILE)) out = iccProfileSpace(sd->data, sd->size);
     }
     av_frame_free(&frame);
     av_packet_free(&pkt);
@@ -804,6 +822,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         const char* trc = av_color_transfer_name(AVColorTransferCharacteristic(hi.transfer));
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (m.colorSpace == "rec709") m.colorSpace.clear();
+        if (hi.adobeRgb) m.colorSpace = "adobergb";  // (its profile says: no code point names Adobe RGB)
         m.maxCll = hi.maxCll;
         m.maxFall = hi.maxFall;
         if (hi.gainMap) {
@@ -867,7 +886,15 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         const char* trc = av_color_transfer_name(st->codecpar->color_trc);
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
-        // A still whose primaries are not tagged: an embedded ICC profile may say (Adobe RGB has no tag of its own).
+        // Primaries that are not tagged: the ICC profile the file states for the stream may say (Adobe RGB has no tag
+        // of its own; video in MOV and MP4 carries the profile in the stream's colr box).
+        if (st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED)
+            if (const std::string icc = streamIccColorSpace(st); !icc.empty()) m.colorSpace = icc;
+        // (an AVIF's, where this FFmpeg's probe does not hand on the picture's colour property: read from its meta box)
+        if (HeifStillInfo hi; st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED && lowerExtension(file) == ".avif" && readHeifStill(file, hi) &&
+                              hi.adobeRgb)
+            m.colorSpace = "adobergb";
+        // A still whose primaries are not tagged: an embedded ICC profile may say.
         if (st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED &&
             (st->codecpar->codec_id == AV_CODEC_ID_PNG || st->codecpar->codec_id == AV_CODEC_ID_MJPEG || st->codecpar->codec_id == AV_CODEC_ID_TIFF ||
              st->codecpar->codec_id == AV_CODEC_ID_WEBP) &&

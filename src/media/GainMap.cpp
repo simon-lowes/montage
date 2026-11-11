@@ -877,24 +877,33 @@ struct ItemColour {
     int primaries = 0, transfer = 0, matrix = 0;
     bool full = true;
     bool nclx = false;  // (an ICC profile states no matrix or range)
+    bool adobeRgb = false;  // (its profile's primaries: Adobe RGB's, which no code point names)
 };
 bool itemColour(const AvifFile& a, const AvifItem& item, ItemColour& out) {
     const QByteArray* icc = nullptr;
     for (int i : item.properties) {
         const QByteArray& c = a.properties[size_t(i)];
         if (c.mid(4, 4) != "colr" || c.size() < 12) continue;
-        if (c.mid(8, 4) == "nclx" && c.size() >= 8 + 4 + 7) {
+        if (c.mid(8, 4) == "nclx" && c.size() >= 8 + 4 + 7 && !out.nclx) {
             out.primaries = int(beN(c, 12, 2)), out.transfer = int(beN(c, 14, 2)), out.matrix = int(beN(c, 16, 2));
             out.full = uint8_t(c[18]) & 0x80;
             out.nclx = true;
-            return true;
         }
         if ((c.mid(8, 4) == "prof" || c.mid(8, 4) == "rICC") && !icc) icc = &c;
+    }
+    if (out.nclx) {
+        // (code points that name no primaries, beside a profile that does: Adobe RGB's)
+        if (out.primaries == 2 && icc) {
+            const QColorSpace named = QColorSpace::fromIccProfile(icc->mid(12));
+            out.adobeRgb = named.isValid() && named.primaries() == QColorSpace::Primaries::AdobeRgb;
+        }
+        return true;
     }
     if (!icc) return false;
     const QColorSpace cs = QColorSpace::fromIccProfile(icc->mid(12));
     if (!cs.isValid()) return false;
     out = ItemColour();
+    out.adobeRgb = cs.primaries() == QColorSpace::Primaries::AdobeRgb;
     out.primaries = cs.primaries() == QColorSpace::Primaries::SRgb        ? 1
                     : cs.primaries() == QColorSpace::Primaries::DciP3D65 ? 12
                                                                           : 0;
@@ -1169,7 +1178,7 @@ bool readHeifStill(const std::string& path, HeifStillInfo& out) {
     out.codec = coded->type == "hvc1" ? "hevc" : "av1";
     if (!shownSize(f, a, *item, out.width, out.height)) return false;
     ItemColour c;
-    if (itemColour(a, *item, c) || itemColour(a, *coded, c)) out.primaries = c.primaries, out.transfer = c.transfer;
+    if (itemColour(a, *item, c) || itemColour(a, *coded, c)) out.primaries = c.primaries, out.transfer = c.transfer, out.adobeRgb = c.adobeRgb;
     const QByteArray* clli = a.property(*item, "clli");
     if (!clli) clli = a.property(*coded, "clli");
     if (clli && clli->size() >= 12) out.maxCll = double(beN(*clli, 8, 2)), out.maxFall = double(beN(*clli, 10, 2));
