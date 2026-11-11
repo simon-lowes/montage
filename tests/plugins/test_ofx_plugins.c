@@ -1,5 +1,6 @@
 /* Montage's test OpenFX plugins, built as an .ofx.bundle:
- *  - Test Invert: inverts the (premultiplied) picture by Amount, then multiplies by Tint; Mode "Pass" leaves it alone.
+ *  - Test Invert: inverts the (premultiplied) picture by Amount, then multiplies by Tint; Mode "Pass" leaves it alone,
+ *    Mode "Upper half" leaves its lower half alone (which tells a picture given upside down).
  *  - Test Temporal Average: the average of the frames before, at and after the one rendered (temporal clip access).
  *  - Test Probe: shows what the host gave it. Mode "Centre" writes its Centre parameter (defined in normalised
  *    coordinates, read in canonical pixels) as red = x / 1000, green = y / 1000; mode "Changes" writes red = the
@@ -14,7 +15,7 @@
  * Test Probe also has on-screen controls (drawn with the Draw Suite): a red square of 20 screen pixels round Centre
  * with a yellow cross through it; a press within the square and a drag move Centre. With MONTAGE_TEST_OFX_GL defined,
  * Test Invert also renders with OpenGL (the same formula in a shader) and has OpenGL on-screen controls: a green
- * square from canonical (100, 100) to (200, 200).
+ * square from canonical (100, 100) to (200, 200); Test Dissolve renders with OpenGL too.
  * With MONTAGE_TEST_OFX_CRASH defined it instead crashes while describing itself, for the scanner's blocklist.
  * Test Invert misbehaves on request when rendering (test_fault.h, call "render"), Test Probe's controls when drawing
  * (call "draw"). */
@@ -118,6 +119,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, int invert) {
     gProp->propSetString(p, kOfxPropLabel, 0, "Mode");
     gProp->propSetString(p, kOfxParamPropChoiceOption, 0, "Invert");
     gProp->propSetString(p, kOfxParamPropChoiceOption, 1, "Pass");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 2, "Upper half");
     gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
     gParam->paramDefine(params, kOfxParamTypeRGB, "tint", &p);
     gProp->propSetString(p, kOfxPropLabel, 0, "Tint");
@@ -201,7 +203,7 @@ static OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle in, in
         gEffect->clipReleaseImage(outImg);
         return kOfxStatFailed;
     }
-    View o, s, b, a;
+    View o = {0}, s = {0}, b = {0}, a = {0};  /* (the two beside it are used by the temporal average only) */
     viewOf(outImg, &o);
     viewOf(srcImg, &s);
     double amount = 1, tint[3] = {1, 1, 1};
@@ -232,10 +234,12 @@ static OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle in, in
                 for (int c = 0; c < 4; ++c) op[c] = (bp[c] + sp[c] + ap[c]) / 3.0f;
                 continue;
             }
+            /* (rows count from the bottom: the lower half is the rows below the middle of the output) */
+            const int pass = mode == 1 || (mode == 2 && 2 * (y - o.y1) < o.y2 - o.y1);
             for (int c = 0; c < 3; ++c) {
                 const float inv = sp[3] - sp[c];
-                float v = mode == 1 ? sp[c] : (float)(sp[c] + (inv - sp[c]) * amount);
-                op[c] = mode == 1 ? v : (float)(v * tint[c]);
+                float v = pass ? sp[c] : (float)(sp[c] + (inv - sp[c]) * amount);
+                op[c] = pass ? v : (float)(v * tint[c]);
             }
             op[3] = sp[3];
         }
@@ -587,10 +591,30 @@ static OfxStatus renderDissolve(OfxImageEffectHandle effect, OfxPropertySetHandl
     return st;
 }
 
+#ifdef MONTAGE_TEST_OFX_GL
+static OfxStatus renderDissolveGl(OfxImageEffectHandle effect, OfxPropertySetHandle in);
+#endif
+
 static OfxStatus mainDissolve(const char* action, const void* handle, OfxPropertySetHandle in, OfxPropertySetHandle out) {
     (void)out;
     OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;
     if (!strcmp(action, kOfxActionLoad)) return load();
+#ifdef MONTAGE_TEST_OFX_GL
+    if (!strcmp(action, kOfxActionDescribe)) {
+        OfxPropertySetHandle props;
+        const OfxStatus st = describeAs(effect, "Test Dissolve", 0, kOfxImageEffectContextTransition);
+        gEffect->getPropertySet(effect, &props);
+        gProp->propSetString(props, kOfxImageEffectPropOpenGLRenderSupported, 0, "true");
+        return st;
+    }
+    if (!strcmp(action, kOfxActionOpenGLContextAttached)) return glAttached();
+    if (!strcmp(action, kOfxActionOpenGLContextDetached)) return glDetached();
+    if (!strcmp(action, kOfxImageEffectActionRender)) {
+        int enabled = 0;
+        gProp->propGetInt(in, kOfxImageEffectPropOpenGLEnabled, 0, &enabled);
+        if (enabled) return renderDissolveGl(effect, in);
+    }
+#endif
     if (!strcmp(action, kOfxActionDescribe)) return describeAs(effect, "Test Dissolve", 0, kOfxImageEffectContextTransition);
     if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) {
         defineClip(effect, kOfxImageEffectTransitionSourceFromClipName, 0, 0);
@@ -702,7 +726,7 @@ static OfxStatus mainMatte(const char* action, const void* handle, OfxPropertySe
     return kOfxStatReplyDefault;
 }
 
-/* ---- Test Invert's OpenGL render and OpenGL on-screen controls ---- */
+/* ---- Test Invert's and Test Dissolve's OpenGL renders, and Test Invert's OpenGL on-screen controls ---- */
 #ifdef MONTAGE_TEST_OFX_GL
 typedef char GLchar_;
 typedef unsigned (*CreateShader)(unsigned);
@@ -719,6 +743,7 @@ typedef void (*Uniform3f)(int, float, float, float);
 typedef void (*DeleteProgram)(unsigned);
 typedef void (*DeleteShader)(unsigned);
 typedef void (*GetProgramiv)(unsigned, unsigned, int*);
+typedef void (*ActiveTexture)(unsigned);
 
 static struct {
     CreateShader createShader;
@@ -735,7 +760,10 @@ static struct {
     DeleteProgram deleteProgram;
     DeleteShader deleteShader;
     GetProgramiv getProgramiv;
-    unsigned program;
+    ActiveTexture activeTexture;
+    unsigned program;  /* Test Invert's */
+    unsigned mix;      /* Test Dissolve's */
+    int attached;      /* the instances told of the context: the programs go with the last of them */
 } gGl;
 
 static void* glProc(const char* name) {
@@ -753,8 +781,35 @@ static const char* kFragment =
     "void main() {\n"
     "  vec4 s = texture2D(src, gl_TexCoord[0].st);\n"
     "  vec3 v = s.rgb + (vec3(s.a) - s.rgb - s.rgb) * amount;\n"
-    "  gl_FragColor = vec4(mode == 1 ? s.rgb : v * tint, s.a);\n"
+    "  bool pass = mode == 1 || (mode == 2 && gl_TexCoord[0].t < 0.5);\n"
+    "  gl_FragColor = vec4(pass ? s.rgb : v * tint, s.a);\n"
     "}\n";
+static const char* kMixFragment =
+    "uniform sampler2D from; uniform sampler2D to; uniform float k;\n"
+    "void main() {\n"
+    "  gl_FragColor = texture2D(from, gl_TexCoord[0].st) * (1.0 - k) + texture2D(to, gl_TexCoord[0].st) * k;\n"
+    "}\n";
+
+static unsigned glProgram(const char* fragment) {
+    const unsigned vs = gGl.createShader(0x8B31 /* GL_VERTEX_SHADER */), fs = gGl.createShader(0x8B30 /* GL_FRAGMENT_SHADER */);
+    gGl.shaderSource(vs, 1, &kVertex, NULL);
+    gGl.shaderSource(fs, 1, &fragment, NULL);
+    gGl.compileShader(vs);
+    gGl.compileShader(fs);
+    unsigned program = gGl.createProgram();
+    gGl.attachShader(program, vs);
+    gGl.attachShader(program, fs);
+    gGl.linkProgram(program);
+    gGl.deleteShader(vs);
+    gGl.deleteShader(fs);
+    int linked = 0;
+    gGl.getProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &linked);
+    if (!linked) {
+        gGl.deleteProgram(program);
+        program = 0;
+    }
+    return program;
+}
 
 static OfxStatus glAttached(void) {
 #define PROC(field, type, name) if (!(gGl.field = (type)glProc(name))) return kOfxStatFailed
@@ -772,32 +827,75 @@ static OfxStatus glAttached(void) {
     PROC(deleteProgram, DeleteProgram, "glDeleteProgram");
     PROC(deleteShader, DeleteShader, "glDeleteShader");
     PROC(getProgramiv, GetProgramiv, "glGetProgramiv");
+    PROC(activeTexture, ActiveTexture, "glActiveTexture");
 #undef PROC
-    if (gGl.program) return kOfxStatOK;
-    const unsigned vs = gGl.createShader(0x8B31 /* GL_VERTEX_SHADER */), fs = gGl.createShader(0x8B30 /* GL_FRAGMENT_SHADER */);
-    gGl.shaderSource(vs, 1, &kVertex, NULL);
-    gGl.shaderSource(fs, 1, &kFragment, NULL);
-    gGl.compileShader(vs);
-    gGl.compileShader(fs);
-    gGl.program = gGl.createProgram();
-    gGl.attachShader(gGl.program, vs);
-    gGl.attachShader(gGl.program, fs);
-    gGl.linkProgram(gGl.program);
-    gGl.deleteShader(vs);
-    gGl.deleteShader(fs);
-    int linked = 0;
-    gGl.getProgramiv(gGl.program, 0x8B82 /* GL_LINK_STATUS */, &linked);
-    if (!linked) {
-        gGl.deleteProgram(gGl.program);
-        gGl.program = 0;
-        return kOfxStatFailed;
-    }
+    if (!gGl.program) gGl.program = glProgram(kFragment);
+    if (!gGl.mix) gGl.mix = glProgram(kMixFragment);
+    if (!gGl.program || !gGl.mix) return kOfxStatFailed;
+    ++gGl.attached;
     return kOfxStatOK;
 }
 
 static OfxStatus glDetached(void) {
+    if (gGl.attached > 0 && --gGl.attached > 0) return kOfxStatOK;
     if (gGl.program && gGl.deleteProgram) gGl.deleteProgram(gGl.program);
-    gGl.program = 0;
+    if (gGl.mix && gGl.deleteProgram) gGl.deleteProgram(gGl.mix);
+    gGl.program = gGl.mix = 0;
+    return kOfxStatOK;
+}
+
+static void glWholeTarget(void) {
+    glDisable(GL_BLEND);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0), glVertex2f(-1, -1);
+    glTexCoord2f(1, 0), glVertex2f(1, -1);
+    glTexCoord2f(1, 1), glVertex2f(1, 1);
+    glTexCoord2f(0, 1), glVertex2f(-1, 1);
+    glEnd();
+}
+
+static OfxStatus renderDissolveGl(OfxImageEffectHandle effect, OfxPropertySetHandle in) {
+    OfxImageEffectOpenGLRenderSuiteV1* suite =
+        (OfxImageEffectOpenGLRenderSuiteV1*)gHost->fetchSuite(gHost->host, kOfxOpenGLRenderSuite, 1);
+    if (!suite || !gGl.mix) return kOfxStatFailed;
+    RenderArgs a;
+    renderArgs(in, &a);
+    OfxImageClipHandle from, to, output;
+    gEffect->clipGetHandle(effect, kOfxImageEffectTransitionSourceFromClipName, &from, NULL);
+    gEffect->clipGetHandle(effect, kOfxImageEffectTransitionSourceToClipName, &to, NULL);
+    gEffect->clipGetHandle(effect, kOfxImageEffectOutputClipName, &output, NULL);
+    OfxPropertySetHandle outTex = NULL, fromTex = NULL, toTex = NULL;
+    if (suite->clipLoadTexture(output, a.time, NULL, NULL, &outTex) != kOfxStatOK) return kOfxStatFailed;
+    if (suite->clipLoadTexture(from, a.time, NULL, NULL, &fromTex) != kOfxStatOK ||
+        suite->clipLoadTexture(to, a.time, NULL, NULL, &toTex) != kOfxStatOK) {
+        if (fromTex) suite->clipFreeTexture(fromTex);
+        suite->clipFreeTexture(outTex);
+        return kOfxStatFailed;
+    }
+    int fromIndex = 0, toIndex = 0, bounds[4];
+    gProp->propGetInt(fromTex, kOfxImageEffectPropOpenGLTextureIndex, 0, &fromIndex);
+    gProp->propGetInt(toTex, kOfxImageEffectPropOpenGLTextureIndex, 0, &toIndex);
+    gProp->propGetIntN(outTex, kOfxImagePropBounds, 4, bounds);
+    const double k = doubleParam(effect, kOfxImageEffectTransitionParamName, a.time);
+    glViewport(0, 0, bounds[2] - bounds[0], bounds[3] - bounds[1]);
+    gGl.useProgram(gGl.mix);
+    gGl.uniform1i(gGl.uniformLocation(gGl.mix, "from"), 0);
+    gGl.uniform1i(gGl.uniformLocation(gGl.mix, "to"), 1);
+    gGl.uniform1f(gGl.uniformLocation(gGl.mix, "k"), (float)k);
+    gGl.activeTexture(0x84C1 /* GL_TEXTURE1 */);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)toIndex);
+    gGl.activeTexture(0x84C0 /* GL_TEXTURE0 */);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)fromIndex);
+    glWholeTarget();
+    gGl.useProgram(0);
+    gGl.activeTexture(0x84C1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    gGl.activeTexture(0x84C0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glFinish();
+    suite->clipFreeTexture(fromTex);
+    suite->clipFreeTexture(toTex);
+    suite->clipFreeTexture(outTex);
     return kOfxStatOK;
 }
 
@@ -838,13 +936,7 @@ static OfxStatus renderInvertGl(OfxImageEffectHandle effect, OfxPropertySetHandl
     gGl.uniform3f(gGl.uniformLocation(gGl.program, "tint"), (float)tint[0], (float)tint[1], (float)tint[2]);
     gGl.uniform1i(gGl.uniformLocation(gGl.program, "mode"), mode);
     glBindTexture(GL_TEXTURE_2D, (GLuint)srcIndex);
-    glDisable(GL_BLEND);
-    glBegin(GL_QUADS);
-    glTexCoord2f(0, 0), glVertex2f(-1, -1);
-    glTexCoord2f(1, 0), glVertex2f(1, -1);
-    glTexCoord2f(1, 1), glVertex2f(1, 1);
-    glTexCoord2f(0, 1), glVertex2f(-1, 1);
-    glEnd();
+    glWholeTarget();
     gGl.useProgram(0);
     glBindTexture(GL_TEXTURE_2D, 0);
     glFinish();

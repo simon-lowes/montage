@@ -675,7 +675,7 @@ private slots:
         QCOMPARE(invert.params.size(), size_t(4));
         QCOMPARE(invert.params[0].name, std::string("amount"));
         QCOMPARE(invert.params[0].def.at(0), 1.0);
-        QCOMPARE(invert.params[1].choices, (std::vector<std::string>{"Invert", "Pass"}));
+        QCOMPARE(invert.params[1].choices, (std::vector<std::string>{"Invert", "Pass", "Upper half"}));
         QCOMPARE(invert.params[2].dimensions(), 3);
         QCOMPARE(invert.params[3].stringDefault, std::string("hello"));
         // As a clip effect: a slider, a choice and a colour in the Inspector; the text kept as a string.
@@ -695,7 +695,7 @@ private slots:
         };
         QCOMPARE(row("param.amount").label, std::string("Amount"));
         QCOMPARE(int(row("param.mode").kind), int(ParamKind::Choice));
-        QCOMPARE(row("param.mode").choices.size(), size_t(2));
+        QCOMPARE(row("param.mode").choices.size(), size_t(3));
         QCOMPARE(int(row("param.tint").kind), int(ParamKind::Color));
         QCOMPARE(row("param.tint").defG, 1.0);
         // On a colour matte: inverted, by an amount that is keyframed, through a tint; Pass leaves it.

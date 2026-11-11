@@ -11,6 +11,8 @@
 
 #include "media/Image.h"
 
+class QOpenGLContext;
+
 namespace montage::ofx::gl {
 
 // The offscreen surface, made on the GUI thread (once; false, with why, where OpenGL cannot start).
@@ -29,10 +31,30 @@ bool servingOpenGl();
 // the working space, expressions, cancelling), and waits. Elsewhere it runs `fn` here.
 void callBack(const std::function<void()>& fn);
 
+// Textures shared with the GPU compositor (render/GpuCompositor, where it draws with OpenGL): the two contexts share
+// their textures when the later of them is made sharing with the earlier. The plug-ins' context, once initialize() has
+// made it (null before, and where there is no OpenGL), for the compositor's to be made sharing with; and the
+// compositor's, told here when it is made and (null) before it goes, for the plug-ins' to be made sharing with.
+QOpenGLContext* context();
+void shareWith(QOpenGLContext* compositor);
+// Whether `other`'s textures are the plug-ins' context's too, and it can copy between them (flip()).
+bool sharesWith(QOpenGLContext* other);
+
 // (The rest only inside run().)
 // A premultiplied picture as an RGBA float texture, bottom row first (as OpenFX counts rows); 0 when it failed.
 unsigned upload(const Image& img);
+// An RGBA float texture of that size with nothing in it yet; 0 when it failed.
+unsigned makeTexture(int width, int height);
 void destroyTexture(unsigned texture);
+// Copies RGBA float texture `from` into `to` (both `width` x `height`) with its rows in the other order, on the GPU:
+// the compositor's textures have the picture's top row first, OpenFX's its bottom row. False when it could not.
+bool flip(unsigned from, unsigned to, int width, int height);
+// Texture `texture`'s pixels read back (top row first when `topFirst` says its rows are stored so, else flipped to it).
+void readTexture(unsigned texture, int width, int height, bool topFirst, Image& out);
+// `img` written into texture `texture` (the same size), top row first.
+void writeTexture(unsigned texture, const Image& img);
+// Everything drawn so far finished, so that another context sharing these textures reads what was drawn.
+void finish();
 // A float texture with a framebuffer to draw into.
 struct Target {
     unsigned fbo = 0, texture = 0;

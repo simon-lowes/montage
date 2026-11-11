@@ -159,6 +159,10 @@
 #include "render/Ocio.h"
 #include "media/Tracking.h"
 #include "render/Ofx.h"
+#include "render/OfxGl.h"
+#include <QOffscreenSurface>
+#include <QOpenGLContext>
+#include <QOpenGLExtraFunctions>
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
@@ -24351,6 +24355,149 @@ colorspaces:
         }
         QCOMPARE(qGreen(view.pixel(150, 50)), 255);
         QCOMPARE(qAlpha(view.pixel(150, 150)), 0);
+    }
+
+    // A plug-in that renders with OpenGL takes its picture from a texture of a context that shares its textures with
+    // the plug-ins' (as the GPU compositor's OpenGL context does) and draws into another, with nothing read back. The
+    // pictures match the CPU's within 1/1023, for an effect that tells the top of the picture from the bottom and for
+    // a transition. A plug-in without OpenGL has the texture read back and its picture written in.
+    void ofxSharedTextures() {
+        QTemporaryDir dir;
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath((dir.path() + "/ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve, temporal;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.dissolve/1", dissolve) &&
+                reg.find("org.montage.test.temporal/1", temporal));
+        std::string why, err;
+        if (!ofx::initializeGpu(&why)) QSKIP(why.c_str());
+        if (invert.openGL != "true" || dissolve.openGL != "true") QSKIP("The test plug-ins were built without OpenGL");
+        // The compositor's stand-in: an OpenGL 3.3 core context made sharing with the plug-ins' (current on this thread).
+        QSurfaceFormat format;
+        format.setVersion(3, 3);
+        format.setProfile(QSurfaceFormat::CoreProfile);
+        QOffscreenSurface surface;
+        surface.setFormat(format);
+        surface.create();
+        QOpenGLContext other;
+        other.setFormat(format);
+        other.setShareContext(ofx::gl::context());
+        QVERIFY2(surface.isValid() && other.create() && other.makeCurrent(&surface), "no second OpenGL context");
+        QVERIFY2(ofx::gl::sharesWith(&other), "the two OpenGL contexts do not share their textures");
+        QOpenGLExtraFunctions* f = other.extraFunctions();
+        const int W = 96, H = 54;
+        std::vector<GLuint> textures;
+        // A float texture with a picture's rows as the compositor stores them, top row first.
+        auto texture = [&](const Image* img) {
+            GLuint t = 0;
+            f->glGenTextures(1, &t);
+            f->glBindTexture(GL_TEXTURE_2D, t);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            f->glTexImage2D(GL_TEXTURE_2D, 0, 0x8814 /* GL_RGBA32F */, W, H, 0, GL_RGBA, GL_FLOAT, img ? img->px.data() : nullptr);
+            f->glBindTexture(GL_TEXTURE_2D, 0);
+            f->glFinish();  // (the other context sees what was uploaded)
+            textures.push_back(t);
+            return ofx::GlPicture{t, W, H};
+        };
+        auto pixels = [&](const ofx::GlPicture& t) {
+            Image out(W, H);
+            GLuint fbo = 0;
+            f->glGenFramebuffers(1, &fbo);
+            f->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            f->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.texture, 0);
+            f->glReadPixels(0, 0, W, H, GL_RGBA, GL_FLOAT, out.px.data());
+            f->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            f->glDeleteFramebuffers(1, &fbo);
+            return out;
+        };
+        auto worst = [](const Image& a, const Image& b) {
+            float d = a.px.size() == b.px.size() ? 0.0f : 1e9f;
+            for (size_t k = 0; k < a.px.size() && k < b.px.size(); ++k) d = std::max(d, std::fabs(a.px[k] - b.px[k]));
+            return d;
+        };
+        Project p = makeDefaultProject();
+        Image picture(W, H), second(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float a = 0.25f + 0.75f * float(x) / W;
+                float* px = picture.at(x, y);
+                px[0] = a * float(y) / H, px[1] = a * 0.5f, px[2] = a * (1 - float(x) / W), px[3] = a;
+                px = second.at(x, y);
+                px[0] = 0.9f - 0.8f * float(y) / H, px[1] = float(x) / W, px[2] = 0.3f, px[3] = 1.0f;
+            }
+        // The effect leaves the lower half of the picture alone, so a picture handed over upside down would show.
+        Effect e = ofx::makeEffect(p, invert);
+        e.params["param.amount"] = Param(0.7);
+        e.params["param.tint.g"] = Param(0.5);
+        e.params["param.mode"] = Param(2.0);
+        Image cpu = picture;
+        ofx::setGpuRendering(false);
+        QVERIFY2(ofx::applyEffect(e, 0, cpu, 1.0, {}, &err), err.c_str());
+        ofx::setGpuRendering(true);
+        QCOMPARE(cpu.at(48, H - 1)[1], picture.at(48, H - 1)[1]);
+        QVERIFY(std::fabs(cpu.at(48, 0)[1] - picture.at(48, 0)[1]) > 0.05f);
+        const ofx::GlPicture in = texture(&picture), out = texture(nullptr);
+        QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
+        int readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+        QVERIFY2(ofx::applyEffectTexture(e, 0, in, out, 1.0, {}, &err), err.c_str());
+        QCOMPARE(ofx::gpuReadBacks(), readBacks);
+        QCOMPARE(ofx::gpuTextureRenders(), direct + 1);
+        float d = worst(pixels(out), cpu);
+        QVERIFY2(d <= 1.0f / 1023, qPrintable(QString("effect: %1").arg(d)));
+        // Through the picture in memory instead (as before), one read-back is counted.
+        Image through = picture;
+        QVERIFY(ofx::applyEffect(e, 0, through, 1.0, {}, &err));
+        QCOMPARE(ofx::gpuReadBacks(), readBacks + 1);
+        QVERIFY(worst(through, cpu) <= 1.0f / 1023);
+
+        // A transition, its two sides and its picture all textures.
+        Effect tr = ofx::makeEffect(p, dissolve);
+        Image mixed;
+        ofx::setGpuRendering(false);
+        QVERIFY2(ofx::applyTransition(tr, 3, 0.25, picture, second, mixed, 1.0, &err), err.c_str());
+        ofx::setGpuRendering(true);
+        QVERIFY(std::fabs(mixed.at(10, 40)[0] - (0.75f * picture.at(10, 40)[0] + 0.25f * second.at(10, 40)[0])) < 1e-5f);
+        const ofx::GlPicture to = texture(&second), mix = texture(nullptr);
+        QVERIFY2(ofx::rendersTextures(tr, &why), why.c_str());
+        readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+        QVERIFY2(ofx::applyTransitionTexture(tr, 3, 0.25, in, to, mix, 1.0, &err), err.c_str());
+        QCOMPARE(ofx::gpuReadBacks(), readBacks);
+        QCOMPARE(ofx::gpuTextureRenders(), direct + 1);
+        d = worst(pixels(mix), mixed);
+        QVERIFY2(d <= 1.0f / 1023, qPrintable(QString("transition: %1").arg(d)));
+
+        // A plug-in without OpenGL is not given textures; asked all the same, its source is read back (counted) and its
+        // picture written into the texture.
+        Effect avg = ofx::makeEffect(p, temporal);
+        QVERIFY(!ofx::rendersTextures(avg, &why));
+        QVERIFY2(why.find("does not render with OpenGL") != std::string::npos, why.c_str());
+        Image averaged = picture;
+        QVERIFY2(ofx::applyEffect(avg, 0, averaged, 1.0, {}, &err), err.c_str());
+        const ofx::GlPicture plain = texture(nullptr);
+        readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+        QVERIFY2(ofx::applyEffectTexture(avg, 0, in, plain, 1.0, {}, &err), err.c_str());
+        QCOMPARE(ofx::gpuReadBacks(), readBacks + 1);
+        QCOMPARE(ofx::gpuTextureRenders(), direct);
+        d = worst(pixels(plain), averaged);
+        QVERIFY2(d <= 1e-6f, qPrintable(QString("in memory: %1").arg(d)));
+        // With OpenGL for plug-ins switched off the same holds for the effect that would render with it, and it is
+        // given textures again once OpenGL is back on.
+        ofx::setGpuRendering(false);
+        QVERIFY(!ofx::rendersTextures(e));
+        readBacks = ofx::gpuReadBacks();
+        QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
+        ofx::setGpuRendering(true);
+        QCOMPARE(ofx::gpuReadBacks(), readBacks + 1);
+        d = worst(pixels(plain), cpu);
+        QVERIFY2(d <= 1e-6f, qPrintable(QString("switched off: %1").arg(d)));
+        QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
+        // Textures of two sizes are refused.
+        QVERIFY(!ofx::applyEffectTexture(e, 0, in, ofx::GlPicture{out.texture, W, H - 2}, 1.0, {}, &err));
+        f->glDeleteTextures(GLsizei(textures.size()), textures.data());
+        other.doneCurrent();
     }
 
     void gpuFallback() {

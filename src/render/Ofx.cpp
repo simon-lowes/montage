@@ -353,6 +353,10 @@ struct Instance {
     bool glRefused = false;     // it failed kOfxActionOpenGLContextAttached: rendered on the CPU
     gl::Target target;          // the OpenGL render's output
     std::vector<unsigned> textures;  // input textures it has not freed yet
+    // Inputs given as the GPU compositor's textures, by clip name (a filter's Source, a transition's two sides), and
+    // those read back for a plug-in that asked for the picture itself.
+    std::map<std::string, GlPicture> given;
+    std::map<std::string, Image> givenRead;
     const InputResolver* inputs = nullptr;      // the compositor's, for a General plugin's further inputs
     std::map<std::string, Image> prefetched;     // ...those connected, made at the render's own frame beforehand
     const std::vector<float>* ownMask = nullptr;  // the effect's own mask, for an input connected to it
@@ -899,6 +903,25 @@ OfxImageEffectSuiteV1 gImageEffectSuite = {getPropertySet, getParamSet, clipDefi
 
 constexpr int kGlTexture2D = 0x0DE1;
 std::atomic<int> gGpuRenders{0};
+// OpenGL renders read back into memory, and those that went into the compositor's texture on the GPU instead.
+std::atomic<int> gGpuReadBacks{0}, gGpuTextureRenders{0};
+
+// Plug-ins that turned out not to render from the compositor's textures (by id, with why): rendered from pictures in
+// memory from then on, as before.
+std::mutex gNoTexturesMutex;
+std::map<std::string, std::string> gNoTextures;
+void noteNoTextures(const PluginDesc& d, const std::string& why) {
+    std::lock_guard<std::mutex> lock(gNoTexturesMutex);
+    gNoTextures.emplace(d.id, why);
+}
+
+// Whether the plug-in is to be given the compositor's texture for input `name` at `time`: the picture now (another
+// frame of a filter's source comes from the fetch, where there is one).
+bool givenNow(const Instance& inst, const std::string& name, double time) {
+    if (!inst.given.count(name)) return false;
+    if (name != kOfxImageEffectSimpleSourceClipName) return true;
+    return std::fabs(time - inst.time) <= 1e-6 || !(inst.fetch && *inst.fetch);
+}
 
 struct TextureObj {
     PropertySet props;
@@ -921,6 +944,14 @@ OfxStatus clipLoadTextureUnguarded(OfxImageClipHandle h, OfxTime time, OfxProper
         t->output = true;
         gl::bind(inst->target);
         id = "out:" + std::to_string(++gImageSerial);
+    } else if (givenNow(*inst, c->name, time)) {
+        // The compositor's own texture, copied on the GPU into one of this context's with OpenFX's row order (the
+        // plug-in never holds the compositor's texture itself).
+        t->texture = gl::makeTexture(inst->width, inst->height);
+        if (!t->texture) return kOfxStatErrMemory;
+        inst->textures.push_back(t->texture);
+        if (!gl::flip(inst->given[c->name].texture, t->texture, inst->width, inst->height)) return kOfxStatFailed;
+        id = "texture:" + std::to_string(++gImageSerial);
     } else {
         Image scratch;
         const Image* pic = inputPicture(*inst, c->name, time, scratch);
@@ -1345,7 +1376,23 @@ const Image* inputPicture(Instance& inst, const std::string& name, double time, 
         if (img.width != w || img.height != h) img = resizeImage(img, w, h);
     };
     if (auto it = inst.images.find(name); it != inst.images.end()) return it->second;
-    if (name == kOfxImageEffectSimpleSourceClipName && inst.source) {
+    // A picture given as the compositor's texture, for a plug-in that asks for the picture itself: read back (once a
+    // render, and counted).
+    auto given = [&]() -> const Image* {
+        auto g = inst.given.find(name);
+        if (g == inst.given.end()) return nullptr;
+        auto read = inst.givenRead.find(name);
+        if (read == inst.givenRead.end()) {
+            Image pic;
+            const GlPicture tex = g->second;
+            if (!gl::run([&] { gl::readTexture(tex.texture, tex.width, tex.height, true, pic); }) || pic.empty()) return nullptr;
+            ++gGpuReadBacks;
+            read = inst.givenRead.emplace(name, std::move(pic)).first;
+        }
+        return &read->second;
+    };
+    if (name != kOfxImageEffectSimpleSourceClipName && inst.given.count(name)) return given();
+    if (name == kOfxImageEffectSimpleSourceClipName && (inst.source || inst.given.count(name))) {
         // Another frame, sized like this one (else this one stands in).
         const FrameFetch* fetch = inst.fetch;
         if (std::fabs(time - inst.time) > 1e-6 && fetch && *fetch && onRenderThread([&] { return (*fetch)(time, scratch); }) &&
@@ -1353,7 +1400,7 @@ const Image* inputPicture(Instance& inst, const std::string& name, double time, 
             fit(scratch);
             return &scratch;
         }
-        return inst.source;
+        return inst.source ? inst.source : given();
     }
     // A General plugin's further input: what its effect connects it to.
     if (!inst.effect) return nullptr;
@@ -2284,6 +2331,10 @@ struct Job {
     const FrameFetch* fetch = nullptr;
     std::map<std::string, const Image*> images;  // a transition's
     double progress = -1;
+    // From and into the GPU compositor's textures (render/Ofx.h's applyEffectTexture): the inputs by clip name in
+    // place of `source` and `images`, and where the picture goes in place of the Image.
+    std::map<std::string, GlPicture> given;
+    const GlPicture* outTexture = nullptr;
 };
 
 // A General plugin's further inputs connected (or not) as the effect says, telling an instance that has rendered before
@@ -2450,7 +2501,8 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
             w.owner.erase(l);
         }
     } release{held, l->unsafe ? l : nullptr};
-    Image out(job.width, job.height);
+    // (Into the compositor's texture, the picture is in memory only when the plug-in could not draw it there.)
+    Image out = job.outTexture ? Image() : Image(job.width, job.height);
     inst->effect = job.effect;
     inst->time = job.t;
     inst->scale = std::max(1e-3, job.scale);
@@ -2459,6 +2511,8 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
     inst->fetch = job.fetch;
     inst->source = job.source;
     inst->images = job.images;
+    inst->given = job.given;
+    inst->givenRead.clear();
     inst->output = &out;
     inst->error.clear();
     inst->wrote = false;
@@ -2475,18 +2529,63 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
     // Colour management: the pictures in the colourspace the plugin asked for, its output back into the working space.
     const ColorSpace& space = working ? *working : rec709Space();
     inst->space = &space;
+    auto clear = [&] {
+        inst->effect = nullptr;
+        inst->source = nullptr;
+        inst->images.clear();
+        inst->fetch = nullptr;
+        inst->output = nullptr;
+        inst->convert = nullptr;
+        inst->inputs = nullptr;
+        inst->prefetched.clear();
+        inst->ownMask = nullptr;
+        inst->given.clear();
+        inst->givenRead.clear();
+    };
     const ColourPlan plan = inst->colourStyle.empty() ? ColourPlan{} : planColour(*inst, space);
+    // OpenGL, where the plug-in renders with it.
+    const bool gpu = d.openGL != "false" && gUseGpu && !inst->glRefused && !tNoGl && gl::available();
+    // The compositor's textures are read back first where the plug-in cannot take them as they are: it does not render
+    // with OpenGL here, or its pictures are converted into another colourspace (which is done in memory). It then
+    // renders as from pictures in memory, and its picture is written into the compositor's texture afterwards.
+    const Image* source = job.source;
+    std::map<std::string, const Image*> images = job.images;
+    std::map<std::string, Image> taken;
+    const bool inMemory = job.outTexture && (!gpu || plan.source || plan.output);
+    if (inMemory) {
+        bool read = true;
+        for (const auto& [name, tex] : job.given) {
+            Image& pic = taken[name];
+            const GlPicture from = tex;
+            read = read && gl::run([&] { gl::readTexture(from.texture, from.width, from.height, true, pic); }) && !pic.empty();
+            ++gGpuReadBacks;
+        }
+        if (!read) {
+            clear();
+            return fail(d.label + ": the compositor's picture could not be read back for it");
+        }
+        for (const auto& [name, pic] : taken) {
+            if (name == kOfxImageEffectSimpleSourceClipName) source = &pic;
+            else images[name] = &pic;
+        }
+        inst->given.clear();
+        inst->source = source;
+        inst->images = images;
+        // (Remembered where it is the plug-in's own doing, not where OpenGL is off for this render.)
+        if (gpu) noteNoTextures(d, "its pictures are converted to another colourspace in memory");
+        else if (inst->glRefused) noteNoTextures(d, "it could not set itself up for OpenGL here");
+    }
     Image convertedSource;
     std::map<std::string, Image> convertedImages;
     FrameFetch convertedFetch;
     if (const NativeSpace* to = plan.source) {
         inst->convert = to;
-        if (job.source) {
-            convertedSource = *job.source;
+        if (source) {
+            convertedSource = *source;
             reencode(convertedSource, space.primaries, space.transfer, to->primaries, to->transfer);
             inst->source = &convertedSource;
         }
-        for (const auto& [name, img] : job.images)
+        for (const auto& [name, img] : images)
             if (img) {
                 Image& c = convertedImages[name] = *img;
                 reencode(c, space.primaries, space.transfer, to->primaries, to->transfer);
@@ -2502,25 +2601,13 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
             inst->fetch = &convertedFetch;
         }
     }
-    auto clear = [&] {
-        inst->effect = nullptr;
-        inst->source = nullptr;
-        inst->images.clear();
-        inst->fetch = nullptr;
-        inst->output = nullptr;
-        inst->convert = nullptr;
-        inst->inputs = nullptr;
-        inst->prefetched.clear();
-        inst->ownMask = nullptr;
-    };
-    // OpenGL, where the plug-in renders with it.
-    const bool gpu = d.openGL != "false" && gUseGpu && !inst->glRefused && !tNoGl && gl::available();
     if (d.openGL == "needed" && !gpu) {
         clear();
         return fail(d.label + " needs OpenGL, which is not available here");
     }
     OfxStatus st = kOfxStatFailed;
     bool rendered = false;
+    bool direct = false;  // the picture went into the compositor's texture on the GPU
     if (gpu) {
         auto entry = l->plugin->mainEntry;
         const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst->obj);
@@ -2551,12 +2638,25 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
                 gl::bind(inst->target);
                 gl::clear();
                 st = sendRender(*inst, job.t, true);
-                if (ok(st)) gl::read(inst->target, out);
+                if (ok(st) && job.outTexture && !inMemory) {
+                    // Into the compositor's texture, on the GPU (rows turned back to its order), and finished there
+                    // before the compositor's context reads it.
+                    if (gl::flip(inst->target.texture, job.outTexture->texture, job.width, job.height)) {
+                        gl::finish();
+                        direct = true;
+                    } else {
+                        st = kOfxStatFailed;
+                    }
+                } else if (ok(st)) {
+                    gl::read(inst->target, out);
+                    ++gGpuReadBacks;
+                }
             }
         });
-        if (!ran) st = kOfxStatFailed;
+        if (!ran) st = kOfxStatFailed, direct = false;
         rendered = ok(st);
         if (rendered) ++gGpuRenders;
+        if (direct) ++gGpuTextureRenders;
         else if (d.openGL == "needed") {
             clear();
             return fail(inst->error.empty() ? d.label + " failed to render with OpenGL" : d.label + ": " + inst->error);
@@ -2564,6 +2664,8 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
         // (else on the CPU, as kOfxStatGLRenderFailed asks)
     }
     if (!rendered) {
+        // (From the compositor's textures: they are read back as the plug-in asks for them, and it is not given them again.)
+        if (job.outTexture && !inMemory) noteNoTextures(d, "it did not render them with OpenGL");
         inst->error.clear();
         inst->wrote = false;
         st = sendRender(*inst, job.t, false);
@@ -2574,7 +2676,18 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
     }
     clear();
     if (!ok(st)) return fail(inst->error.empty() ? d.label + " failed to render" : d.label + ": " + inst->error);
+    if (direct) return true;
     if (const NativeSpace* from = plan.output) reencode(out, from->primaries, from->transfer, space.primaries, space.transfer);
+    if (job.outTexture) {
+        // Rendered in memory after all: written into the compositor's texture.
+        const GlPicture to = *job.outTexture;
+        if (out.width != to.width || out.height != to.height || !gl::run([&] {
+                gl::writeTexture(to.texture, out);
+                gl::finish();
+            }))
+            return fail(d.label + ": its picture could not be written into the compositor's texture");
+        return true;
+    }
     result = std::move(out);
     return true;
 }
@@ -2744,6 +2857,78 @@ bool renderGenerator(const Effect& e, double t, int w, int h, double scale, Imag
     return runRender(d, l, inst.inst, job, out, error, working);
 }
 
+bool rendersTextures(const Effect& e, std::string* why) {
+    auto no = [&](const std::string& reason) {
+        if (why) *why = reason;
+        return false;
+    };
+    if (remote::isolated()) return no("its plug-in renders in a host process");
+    if (!gUseGpu || !gl::available()) return no("plug-ins have no OpenGL here");
+    if (tNoGl || gl::servingOpenGl()) return no("OpenGL is busy with the render that asked for this picture");
+    PluginDesc d;
+    if (!Registry::instance().lookUp(e, d, why)) return false;
+    if (d.openGL == "false") return no(d.label + " does not render with OpenGL");
+    std::lock_guard<std::mutex> lock(gNoTexturesMutex);
+    if (auto it = gNoTextures.find(d.id); it != gNoTextures.end()) return no(d.label + ": " + it->second);
+    return true;
+}
+
+namespace {
+bool sameSize(const GlPicture& a, const GlPicture& b) { return a.texture && b.texture && a.width > 0 && a.height > 0 && a.width == b.width && a.height == b.height; }
+}  // namespace
+
+bool applyEffectTexture(const Effect& e, double t, const GlPicture& from, const GlPicture& to, double scale, const FrameFetch& fetch,
+                        std::string* error, const ColorSpace* working) {
+    if (!sameSize(from, to) || remote::isolated() || !gl::available() || gl::servingOpenGl()) {
+        if (error) *error = "no textures to render from and into";
+        return false;
+    }
+    PluginDesc d;
+    Loaded* l = nullptr;
+    GiveBack inst{acquire(e, d, l, error)};
+    if (!inst.inst) return false;
+    if (d.transition() || d.generator()) {
+        if (error) *error = d.label + (d.transition() ? " is a transition" : " is a generator") + ", not a clip effect";
+        return false;
+    }
+    Job job;
+    job.effect = &e;
+    job.t = t;
+    job.scale = scale;
+    job.width = from.width, job.height = from.height;
+    job.given[kOfxImageEffectSimpleSourceClipName] = from;
+    job.fetch = &fetch;
+    job.outTexture = &to;
+    Image none;
+    return runRender(d, l, inst.inst, job, none, error, working);
+}
+
+bool applyTransitionTexture(const Effect& e, double t, double progress, const GlPicture& from, const GlPicture& to, const GlPicture& out,
+                            double scale, std::string* error, const ColorSpace* working) {
+    if (!sameSize(from, out) || !sameSize(to, out) || remote::isolated() || !gl::available() || gl::servingOpenGl()) {
+        if (error) *error = "no textures to render from and into";
+        return false;
+    }
+    PluginDesc d;
+    Loaded* l = nullptr;
+    GiveBack inst{acquire(e, d, l, error)};
+    if (!inst.inst) return false;
+    if (!d.transition()) {
+        if (error) *error = d.label + " is not a transition";
+        return false;
+    }
+    Job job;
+    job.effect = &e;
+    job.t = t;
+    job.scale = scale;
+    job.width = out.width, job.height = out.height;
+    job.given = {{kOfxImageEffectTransitionSourceFromClipName, from}, {kOfxImageEffectTransitionSourceToClipName, to}};
+    job.progress = std::clamp(progress, 0.0, 1.0);
+    job.outTexture = &out;
+    Image none;
+    return runRender(d, l, inst.inst, job, none, error, working);
+}
+
 bool PluginDesc::transition() const { return context == kOfxImageEffectContextTransition; }
 bool PluginDesc::generator() const { return context == kOfxImageEffectContextGenerator; }
 
@@ -2772,6 +2957,8 @@ bool gpuAvailable(std::string* why) { return gl::available(why); }
 void setGpuRendering(bool on) { gUseGpu = on; }
 bool gpuRendering() { return gUseGpu && gl::available(); }
 int gpuRenders() { return gGpuRenders.load(); }
+int gpuReadBacks() { return gGpuReadBacks.load(); }
+int gpuTextureRenders() { return gGpuTextureRenders.load(); }
 
 // ---- On-screen controls ---------------------------------------------------------------------------------------------
 

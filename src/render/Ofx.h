@@ -211,6 +211,31 @@ void setGpuRendering(bool on);  // use OpenGL for plugins that take it (on by de
 bool gpuRendering();
 int gpuRenders();  // renders made with OpenGL in this process (for tests)
 
+// ---- The GPU compositor's textures ----
+// Where the GPU compositor draws with OpenGL in a context sharing its textures with the plug-ins' (render/OfxGl.h), a
+// plug-in that renders with OpenGL takes the compositor's picture as a texture and draws into another of its
+// textures: nothing is read back into memory.
+// One of the compositor's textures: RGBA 32-bit float, premultiplied, the picture's top row first.
+struct GlPicture {
+    unsigned texture = 0;
+    int width = 0, height = 0;
+};
+// Whether `e`'s plug-in is given textures (it renders with OpenGL, in this process); `why` says why not.
+bool rendersTextures(const Effect& e, std::string* why = nullptr);
+// applyEffect from `from` into `to` (two textures of one size, in a context sharing with the plug-ins'; what was drawn
+// into `from` finished first). Called from the thread that renders the frame, with its scopes, not the compositor's
+// own. A plug-in that after all does not render them with OpenGL has `from` read back and its picture written into
+// `to` (counted in gpuReadBacks, and it is not given textures again). False (with `error`) as applyEffect: `to` is
+// then not to be used.
+bool applyEffectTexture(const Effect& e, double t, const GlPicture& from, const GlPicture& to, double scale, const FrameFetch& fetch = {},
+                        std::string* error = nullptr, const ColorSpace* working = nullptr);
+// applyTransition likewise, from the two sides `from` and `to` into `out` (three textures of one size).
+bool applyTransitionTexture(const Effect& e, double t, double progress, const GlPicture& from, const GlPicture& to, const GlPicture& out,
+                            double scale, std::string* error = nullptr, const ColorSpace* working = nullptr);
+// OpenGL renders read back into memory in this process, and those that went into a texture of the compositor's.
+int gpuReadBacks();
+int gpuTextureRenders();
+
 // ---- On-screen controls (overlay interacts) ----
 // What a control drew: Draw Suite primitives, in canonical coordinates (the effect's full-size frame, y up), and what
 // it drew with OpenGL, as a premultiplied picture the size of the view.

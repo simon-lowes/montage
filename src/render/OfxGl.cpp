@@ -40,6 +40,18 @@
 #ifndef GL_TEXTURE0
 #define GL_TEXTURE0 0x84C0
 #endif
+#ifndef GL_READ_FRAMEBUFFER
+#define GL_READ_FRAMEBUFFER 0x8CA8
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER
+#define GL_DRAW_FRAMEBUFFER 0x8CA9
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER_BINDING
+#define GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
+#endif
+#ifndef GL_READ_FRAMEBUFFER_BINDING
+#define GL_READ_FRAMEBUFFER_BINDING 0x8CAA
+#endif
 
 namespace montage::ofx::gl {
 
@@ -66,6 +78,13 @@ struct Worker {
     LoadMatrixd loadMatrix = nullptr;
     std::atomic<bool> ok{false};
     std::string why = "OpenGL for plugins was not started";  // (set before ok, read after it)
+    // Textures shared with the GPU compositor's context: the compositor's context while it lives (shareMutex; this one
+    // is made sharing with it when it is made later), whether this context copies between framebuffers (flip()), and
+    // the two framebuffers it copies with.
+    std::mutex shareMutex;
+    QOpenGLContext* compositor = nullptr;
+    std::atomic<bool> blits{false};
+    unsigned copyFbo[2] = {0, 0};
 };
 
 // The thread waiting in run() for the job on the OpenGL thread, and what that job asks it to do meanwhile.
@@ -106,11 +125,23 @@ void start(Worker* w) {
     }
     w->context = new QOpenGLContext;
     w->context->setFormat(w->surface->format());
-    if (!w->context->create() || !w->context->makeCurrent(w->surface)) {
+    bool created = false;
+    {
+        // (The compositor's context, where it was made first, stays while this one is made from it.)
+        std::lock_guard<std::mutex> lock(w->shareMutex);
+        if (w->compositor) w->context->setShareContext(w->compositor);
+        created = w->context->create();
+        if (!created && w->compositor) {  // (a context of its own, as before, where the two cannot share)
+            w->context->setShareContext(nullptr);
+            created = w->context->create();
+        }
+    }
+    if (!created || !w->context->makeCurrent(w->surface)) {
         w->why = "No OpenGL context could be made for plugins";
         return;
     }
     w->f = w->context->extraFunctions();
+    w->blits = w->context->format().majorVersion() >= 3;  // (glBlitFramebuffer)
     auto proc = [w](const char* name) { return w->context->getProcAddress(name); };
     w->matrixMode = reinterpret_cast<MatrixMode>(proc("glMatrixMode"));
     w->loadIdentity = reinterpret_cast<LoadIdentity>(proc("glLoadIdentity"));
@@ -177,6 +208,22 @@ bool available(std::string* why) {
 bool onThread() {
     Worker& w = worker();
     return w.ok && std::this_thread::get_id() == w.id;
+}
+
+QOpenGLContext* context() {
+    Worker& w = worker();
+    return w.ok ? w.context : nullptr;
+}
+
+void shareWith(QOpenGLContext* compositor) {
+    Worker& w = worker();
+    std::lock_guard<std::mutex> lock(w.shareMutex);
+    w.compositor = compositor;
+}
+
+bool sharesWith(QOpenGLContext* other) {
+    Worker& w = worker();
+    return w.ok && w.blits && other && QOpenGLContext::areSharing(w.context, other);
 }
 
 namespace {
@@ -274,6 +321,103 @@ unsigned upload(const Image& img) {
     f->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, img.width, img.height, 0, GL_RGBA, GL_FLOAT, rows.data());
     f->glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
+}
+
+unsigned makeTexture(int width, int height) {
+    QOpenGLExtraFunctions* f = worker().f;
+    if (!f || width <= 0 || height <= 0) return 0;
+    GLuint tex = 0;
+    f->glGenTextures(1, &tex);
+    f->glBindTexture(GL_TEXTURE_2D, tex);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    f->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+    f->glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
+namespace {
+
+// `texture` as framebuffer `which`'s (0: read from, 1: drawn into) only colour attachment (0: none); whether it is
+// complete then.
+bool attach(Worker& w, int which, unsigned texture) {
+    QOpenGLExtraFunctions* f = w.f;
+    if (!w.copyFbo[0]) f->glGenFramebuffers(2, w.copyFbo);
+    const GLenum target = which ? GL_DRAW_FRAMEBUFFER : GL_READ_FRAMEBUFFER;
+    f->glBindFramebuffer(target, w.copyFbo[which]);
+    f->glFramebufferTexture2D(target, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    return texture && f->glCheckFramebufferStatus(target) == GL_FRAMEBUFFER_COMPLETE;
+}
+
+// The framebuffers bound before a copy, bound again after it (a plug-in may ask for its input's texture with its
+// output's framebuffer bound); neither texture stays held by the copy's framebuffers (the compositor's are its own to
+// delete).
+struct Bound {
+    Worker& w;
+    GLint read = 0, draw = 0;
+    explicit Bound(Worker& worker) : w(worker) {
+        w.f->glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+        w.f->glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    }
+    ~Bound() {
+        attach(w, 0, 0);
+        attach(w, 1, 0);
+        w.f->glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(read));
+        w.f->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(draw));
+    }
+};
+
+}  // namespace
+
+bool flip(unsigned from, unsigned to, int width, int height) {
+    Worker& w = worker();
+    QOpenGLExtraFunctions* f = w.f;
+    if (!f || !w.blits || !from || !to || width <= 0 || height <= 0) return false;
+    while (f->glGetError() != GL_NO_ERROR) {
+    }
+    bool complete = false;
+    {
+        Bound bound(w);
+        complete = attach(w, 0, from) && attach(w, 1, to);
+        if (complete) {
+            const bool scissor = f->glIsEnabled(GL_SCISSOR_TEST);
+            f->glDisable(GL_SCISSOR_TEST);
+            f->glBlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            if (scissor) f->glEnable(GL_SCISSOR_TEST);
+        }
+    }
+    return complete && f->glGetError() == GL_NO_ERROR;
+}
+
+void readTexture(unsigned texture, int width, int height, bool topFirst, Image& out) {
+    Worker& w = worker();
+    QOpenGLExtraFunctions* f = w.f;
+    out = Image();
+    if (!f || !w.blits || !texture || width <= 0 || height <= 0) return;
+    Bound bound(w);
+    if (!attach(w, 0, texture)) return;
+    out = Image(width, height);
+    const size_t row = size_t(width) * 4;
+    std::vector<float> rows(topFirst ? 0 : out.px.size());
+    f->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    f->glReadPixels(0, 0, width, height, GL_RGBA, GL_FLOAT, topFirst ? out.px.data() : rows.data());
+    if (!topFirst)
+        for (int y = 0; y < height; ++y) std::memcpy(out.row(height - 1 - y), rows.data() + size_t(y) * row, row * sizeof(float));
+}
+
+void writeTexture(unsigned texture, const Image& img) {
+    QOpenGLExtraFunctions* f = worker().f;
+    if (!f || !texture || img.empty()) return;
+    f->glBindTexture(GL_TEXTURE_2D, texture);
+    f->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    f->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.width, img.height, GL_RGBA, GL_FLOAT, img.px.data());
+    f->glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void finish() {
+    if (QOpenGLExtraFunctions* f = worker().f) f->glFinish();
 }
 
 void destroyTexture(unsigned texture) {
