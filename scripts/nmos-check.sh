@@ -44,17 +44,25 @@ failed=0
 run() {
     local suite=$1
     shift
-    local attempt
-    for attempt in 1 2; do
+    local attempt pause=15 d
+    for attempt in 1 2 3 4 5; do
         rm -f "$work/$suite.xml"
         (cd "$work/nmos-testing" && timeout 900 "$work/venv/bin/python" nmos-test.py suite "$suite" "$@" --output "$work/$suite.xml" \
             > "$work/$suite.log" 2>&1) || true
-        # (the tool fetches AMWA's specification repositories from GitHub as it starts: a runner that briefly cannot reach
-        # GitHub stops it before any test, so that alone is tried once more)
+        # (the tool fetches AMWA's specification repositories from GitHub as it starts, a dozen of them one after another:
+        # a runner that cannot reach GitHub for a while stops it before any test, so that alone is tried again, waiting
+        # longer each time; runners have lost GitHub's name for more than the quarter minute one more try used to allow)
         [ -s "$work/$suite.xml" ] && break
         grep -q "Could not resolve host\|unable to access 'https://github.com" "$work/$suite.log" || break
-        # (a clone cut off part way may be left in the tool's cache: it starts again from none)
-        [ "$attempt" = 1 ] && { echo "$suite: GitHub could not be reached for the specifications; trying again"; rm -rf "$work/nmos-testing/cache"; sleep 15; }
+        [ "$attempt" = 5 ] && break
+        echo "$suite: GitHub could not be reached for the specifications; trying again in $pause seconds"
+        # (the repositories already fetched stay; one cut off part way, with no commit checked out, starts again)
+        for d in "$work/nmos-testing/cache"/*/; do
+            [ -d "$d" ] || continue
+            { [ -d "$d/.git" ] && git --git-dir="$d/.git" rev-parse -q --verify HEAD > /dev/null 2>&1; } || rm -rf "$d"
+        done
+        sleep "$pause"
+        pause=$((pause * 2))
     done
     if [ ! -s "$work/$suite.xml" ]; then
         # (the tool stopped before writing its report: its own output says why)
