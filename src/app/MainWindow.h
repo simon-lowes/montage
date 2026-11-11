@@ -70,6 +70,7 @@ class PlaybackController;
 class MonitorPanel;
 class MediaBinWidget;
 class RenderQueue;
+class DialogJobs;
 class EffectsBrowser;
 class InspectorWidget;
 class CompositeNodePanel;
@@ -122,6 +123,8 @@ public:
     // Shows each encode a Quality Check dialog compares as the timeline's quality lane.
     void watchQualityCheck(QualityCheckDialog* dlg);
     RenderQueue* renderQueue() const { return queue_; }
+    // The jobs this window's dialogs run, as the job store keeps them (DialogJobs.h).
+    DialogJobs* dialogJobs() const { return dialogJobs_; }
     bool openProject(const QString& path);
     // Opening a shared project (core/ProjectLock.h): Ask asks whether to open it read-only when someone else is
     // editing it (or to take it over when they left it locked); Edit and ReadOnly say up front.
@@ -807,6 +810,7 @@ private:
     TrimPanel* trims_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     RenderQueue* queue_ = nullptr;
+    DialogJobs* dialogJobs_ = nullptr;
     Image colourRef_;       // the look Match Colour aims for
     QString colourRefName_;
     QImage colourRefView_;  // the reference at display size, for the compare

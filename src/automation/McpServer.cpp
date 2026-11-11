@@ -1274,7 +1274,9 @@ struct McpServer::Impl {
     ToolResult storedAction(montage::jobs::Record r, const QString& action) {
         const bool queue = r.owner == QLatin1String("render-queue");
         if (action == "cancel" && !r.finished() && r.status != QLatin1String("resumed")) {
-            if (queue || montage::jobs::runningElsewhere(r)) {
+            // (a dialog's job in Montage hears it too, also when this server is Montage's own live link)
+            const bool dialog = r.owner == QLatin1String("app") && r.status == QLatin1String("running");
+            if (queue || dialog || montage::jobs::runningElsewhere(r)) {
                 // (whoever runs it hears it: the render queue within a fifth of a second, a server at its next progress)
                 QFile f(montage::jobs::jobFolder(r.id) + QStringLiteral("/cancel"));
                 if (!f.open(QIODevice::WriteOnly)) return fail(QStringLiteral("Cannot ask %1 to stop").arg(r.id));
@@ -1293,6 +1295,8 @@ struct McpServer::Impl {
         }
         if (action == "resume") {
             if (queue) return fail(QStringLiteral("%1 is the render queue's: Montage renders it again when it starts").arg(r.id));
+            if (r.owner == QLatin1String("app"))
+                return fail(QStringLiteral("%1 was started from a dialog in Montage: a consolidation is taken up again when Montage next starts, other jobs are not").arg(r.id));
             if (r.status != QLatin1String("interrupted") && r.status != QLatin1String("waiting"))
                 return fail(QStringLiteral("%1 is %2: only a call cut short is taken up again").arg(r.id, r.status));
             if (montage::jobs::runningElsewhere(r)) return fail(QStringLiteral("%1 is held by a server still running").arg(r.id));

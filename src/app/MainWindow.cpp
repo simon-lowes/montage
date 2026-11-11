@@ -179,6 +179,7 @@ extern "C" {
 #include "render/TrimPasses.h"
 #include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
+#include "DialogJobs.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
 #include "render/BackgroundJobs.h"
@@ -812,6 +813,14 @@ void MainWindow::buildPanels() {
         if (!folder.isEmpty()) queueTrimPasses(folder);
     });
     queue_ = new RenderQueue(this, jobs::storeFolder());  // (kept on disk: after a restart or a crash its jobs go on)
+    // The dialogs' jobs are kept there too: a consolidation cut short by a crash is taken up again now, in the
+    // background, and says so when it is done.
+    dialogJobs_ = new DialogJobs(this, jobs::storeFolder());
+    connect(dialogJobs_, &DialogJobs::resumed, this, [this](const QString& title) {
+        statusBar()->showMessage(tr("Taking up again what Montage was doing when it stopped: %1").arg(title), 8000);
+    });
+    connect(dialogJobs_, &DialogJobs::finished, this, [this](const QString&, bool, const QString& text) { statusBar()->showMessage(text, 10000); });
+    dialogJobs_->resume();
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     production_ = new ProductionPanel(state_, this);
     productionDock_ = makeDock(tr("Production"), "production", production_);
@@ -6072,18 +6081,35 @@ int MainWindow::matchColourChart() {
 
 namespace {
 
+// The window's job store for its dialogs (DialogJobs.h), found from any widget under it.
+DialogJobs* dialogJobsOf(QWidget* w) {
+    for (; w; w = w->parentWidget())
+        if (auto* win = qobject_cast<MainWindow*>(w)) return win->dialogJobs();
+    return nullptr;
+}
+
 // Runs `work` off the UI thread behind a progress dialog with Cancel; false if
-// it fails (the error shown in the status bar) or is cancelled.
+// it fails (the error shown in the status bar) or is cancelled. The job is kept in the job store while it runs and
+// after (`job`: one already begun there, as the Project Manager's is; else it is begun here), so montage_job lists
+// it and can ask it to stop.
 bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
-                     const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work) {
+                     const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work,
+                     const QString& job = {}) {
     QProgressDialog progress(title, QObject::tr("Cancel"), 0, 1000, parent);
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(400);
     auto done = std::make_shared<std::atomic<double>>(0.0);
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     QObject::connect(&progress, &QProgressDialog::canceled, parent, [cancel] { *cancel = true; });
+    DialogJobs* const jobs = dialogJobsOf(parent);
+    const QString id = !job.isEmpty() ? job : jobs ? jobs->begin(QStringLiteral("dialog"), title) : QString();
     QTimer tick;
-    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done, cancel, jobs, id] {
+        progress.setValue(int(*done * 1000));
+        if (!jobs) return;
+        jobs->setProgress(id, *done);
+        if (jobs->cancelAsked(id)) *cancel = true;
+    });
     tick.start(100);
     using Out = std::pair<bool, std::string>;
     QFutureWatcher<Out> watcher;
@@ -6099,6 +6125,7 @@ bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
     progress.disconnect(parent);
     progress.close();
     const Out r = watcher.result();
+    if (jobs) jobs->end(id, r.first, *cancel, QString::fromStdString(r.second));
     if (!r.first && !*cancel && !r.second.empty()) state->message(QString::fromStdString(r.second), 6000);
     return r.first && !*cancel;
 }
@@ -6436,10 +6463,15 @@ bool MainWindow::runProjectManager(const ConsolidateOptions& o) {
     }
     const Project project = state_->project();
     ConsolidateResult res;
-    const bool ok = runWithProgress(this, state_, o.trim ? tr("Consolidating the project…") : tr("Collecting the project's media…"),
+    // Kept in the job store with the project as it is now: cut short by a crash, it is taken up again when Montage
+    // next starts (DialogJobs.h).
+    const QString title = o.trim ? tr("Consolidating the project…") : tr("Collecting the project's media…");
+    const QString job = dialogJobs_->beginConsolidate(project, o, title);
+    const ConsolidateOptions run = dialogJobs_->tracked(job, o);
+    const bool ok = runWithProgress(this, state_, title,
                                     [&](const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string* error) {
-                                        return consolidateProject(project, o, &res, progress, cancel, error);
-                                    });
+                                        return consolidateProject(project, run, &res, progress, cancel, error);
+                                    }, job);
     if (!ok) return false;
     QString text = tr("Copied the project to %1: %n file(s) copied", nullptr, res.copied).arg(QString::fromStdString(res.projectPath));
     if (res.trimmed) text += tr(", %n consolidated", nullptr, res.trimmed);

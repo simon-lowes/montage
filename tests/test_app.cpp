@@ -285,7 +285,10 @@
 #include "RenderQueuePanel.h"
 #include "render/BackgroundJobs.h"
 #include "render/RenderFarm.h"
+#include "DialogJobs.h"
 #include "render/HrdCheck.h"
+#include <QProgressDialog>
+#include <QSaveFile>
 #include "TimelineWidget.h"
 #include "PitchCurves.h"
 #include "TranscribeDialog.h"
@@ -5372,6 +5375,162 @@ private slots:
         report = checkHrd(vbr.path);
         QVERIFY2(report.conforms() && report.signalled && !report.cbr, report.summary().c_str());
         QVERIFY2(std::fabs(report.bitRate - 1200000) < 12000 && std::fabs(report.bufferBits - 1200000) < 12000, report.summary().c_str());
+    }
+
+    void dialogJobsKeptAndResumed() {
+        // What the app's dialogs run is kept in the job store. A consolidation started from the Project Manager and
+        // cut short, as a kill leaves it, is taken up again and writes the same file under the same name.
+        const QString film = dir_.path() + "/resume-film.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 640, gs.height = 360, gs.fps = {25, 1};
+            Clip c = makeGeneratorClip(gen, "color", 250);
+            c.generator.params["color.r"] = Param(0.45);
+            c.generator.params["color.g"] = Param(0.5);
+            c.generator.params["color.b"] = Param(0.4);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = Param(0.6);
+            grain.params["color"] = Param(1.0);
+            c.effects.push_back(grain);
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, c).ok);
+            ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+            st.path = film.toStdString();
+            st.preset = "ultrafast";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({film});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 640, s.height = 360, s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 25, 225, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const auto bytes = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+        const auto latest = [](const QString& kind) {
+            jobs::Record found;
+            for (const jobs::Record& r : jobs::all("app"))
+                if (r.kind == kind && r.order >= found.order) found = r;
+            return found;
+        };
+        DialogJobs* dialogs = win_->dialogJobs();
+        QVERIFY(dialogs);
+        // Anything run behind the window's progress dialog leaves its record: here a cue sheet written.
+        {
+            const int before = latest("dialog").order;
+            win_->exportPaperwork("cue_sheet", dir_.path() + "/jobs-cues.xlsx");
+            const jobs::Record r = latest("dialog");
+            QVERIFY(r.order > before);
+            QCOMPARE(r.owner, QStringLiteral("app"));
+            QVERIFY2(r.finished() && !r.title.isEmpty(), qPrintable(r.status));
+        }
+        ConsolidateOptions o;
+        o.name = "Copy";
+        o.trim = true;
+        o.codec = "libx264";
+        o.handles = 0.2;
+        // Run whole from the window: the file to compare with, and its record in the store.
+        o.folder = (dir_.path() + "/consolidated-whole").toStdString();
+        QVERIFY(win_->runProjectManager(o));
+        const QString whole = dir_.path() + "/consolidated-whole/Media/resume-film_trim.mp4";
+        const QByteArray reference = bytes(whole);
+        QVERIFY(reference.size() > 1000);
+        {
+            const jobs::Record r = latest("consolidate");
+            QCOMPARE(r.status, QStringLiteral("done"));
+            QCOMPARE(r.progress, 1.0);
+            QCOMPARE(r.data.value("files").toArray().size(), 1);
+            QCOMPARE(QFileInfo(r.data.value("files").toArray().at(0).toString()).fileName(), QStringLiteral("resume-film_trim.mp4"));
+            QVERIFY(!QFileInfo::exists(jobs::jobFolder(r.id) + "/project.json"));  // (kept only while it may be taken up)
+        }
+        // Started again from the window and stopped once its transcode is under way.
+        o.folder = (dir_.path() + "/consolidated-cut").toStdString();
+        const QString cut = dir_.path() + "/consolidated-cut/Media/resume-film_trim.mp4";
+        const int orderBefore = latest("consolidate").order;
+        bool stopped = false;
+        QTimer watch;
+        connect(&watch, &QTimer::timeout, this, [&] {
+            const jobs::Record r = latest("consolidate");
+            if (stopped || r.order == orderBefore || r.data.value("files").toArray().isEmpty()) return;
+            for (QWidget* w : QApplication::topLevelWidgets())
+                if (auto* progress = qobject_cast<QProgressDialog*>(w)) {
+                    emit progress->canceled();  // (as its Cancel button does)
+                    stopped = true;
+                }
+        });
+        watch.start(20);
+        QVERIFY(!win_->runProjectManager(o));
+        watch.stop();
+        QVERIFY(stopped);
+        jobs::Record r = latest("consolidate");
+        QVERIFY(r.order > orderBefore);
+        QCOMPARE(r.status, QStringLiteral("cancelled"));
+        // As a kill of Montage during it leaves things: the record still says it runs, in a process that is gone, the
+        // project kept with it, and the file half-written.
+        {
+            QSaveFile kept(jobs::jobFolder(r.id) + "/project.json");
+            QVERIFY(kept.open(QIODevice::WriteOnly));
+            kept.write(QByteArray::fromStdString(projectToJson(state()->project())));
+            QVERIFY(kept.commit());
+            QFile half(cut);
+            QVERIFY(half.open(QIODevice::WriteOnly));
+            half.write(reference.left(reference.size() / 2));
+        }
+        r.status = "running";
+        r.pid = 0x7ffffff0;
+        r.process = "gone";
+        QVERIFY(jobs::save(r));
+        QVERIFY(jobs::load(r.id, r));
+        QCOMPARE(r.status, QStringLiteral("interrupted"));
+        // The project open now is another one: what is taken up is the job's own copy.
+        state()->newProject();
+        // The next Montage (here, the window asked as at its start) takes it up by itself and writes the file again.
+        QString said;
+        connect(dialogs, &DialogJobs::finished, this, [&](const QString&, bool, const QString& text) { said = text; });
+        QCOMPARE(dialogs->resume(), 1);
+        QVERIFY(dialogs->running());
+        QTRY_VERIFY_WITH_TIMEOUT(!dialogs->running(), 300000);
+        disconnect(dialogs, &DialogJobs::finished, this, nullptr);
+        QVERIFY2(said.contains("consolidated-cut"), qPrintable(said));
+        QVERIFY(bytes(cut) == reference);
+        QVERIFY(!QFileInfo::exists(dir_.path() + "/consolidated-cut/Media/resume-film_trim-2.mp4"));
+        QVERIFY(jobs::load(r.id, r));
+        QCOMPARE(r.status, QStringLiteral("done"));
+        QCOMPARE(r.data.value("tries").toInt(), 1);
+        Project copy;
+        QVERIFY(loadProject((dir_.path() + "/consolidated-cut/Copy.montage").toStdString(), copy));
+        QCOMPARE(copy.media.size(), size_t(1));
+        QVERIFY(QString::fromStdString(copy.media[0].path).endsWith("consolidated-cut/Media/resume-film_trim.mp4"));
+        QCOMPARE(dialogs->resume(), 0);  // (nothing is taken up twice)
+        // One that Montage stopped in twice already is given up, and so is a dialog's job that cannot be run again.
+        jobs::Record twice = r;
+        twice.id = "app-test-twice";
+        twice.status = "running";
+        twice.pid = 0x7ffffff0;
+        twice.process = "gone";
+        twice.data["tries"] = 2;
+        QVERIFY(jobs::save(twice));
+        jobs::Record plain;
+        plain.id = "app-test-plain";
+        plain.owner = "app";
+        plain.kind = "dialog";
+        plain.title = "Measuring";
+        plain.status = "running";
+        plain.pid = 0x7ffffff0;
+        plain.process = "gone";
+        QVERIFY(jobs::save(plain));
+        QCOMPARE(dialogs->resume(), 0);
+        QVERIFY(jobs::load(twice.id, twice) && jobs::load(plain.id, plain));
+        QCOMPARE(twice.status, QStringLiteral("failed"));
+        QCOMPARE(plain.status, QStringLiteral("failed"));
+        QVERIFY(!twice.error.isEmpty() && !plain.error.isEmpty());
+        jobs::remove(twice.id);
+        jobs::remove(plain.id);
     }
 
     void trimMode() {
