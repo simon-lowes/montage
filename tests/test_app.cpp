@@ -3299,7 +3299,26 @@ private slots:
         ViewerWidget* viewer = source->viewer();
         Multiviewer* mv = win_->multiviewer();
         const bool hdrWas = playback->hdrOutput(), viewerWas = viewer->hdrViewer();
+        // (the window and its panels are put back as they were: the test makes room for the feed's every pixel)
         const QSize windowWas = win_->size(), leastWas = viewer->minimumSize();
+        const QByteArray panelsWere = win_->saveState();
+        auto panelSizes = [&] {
+            QStringList sizes;
+            for (QDockWidget* d : win_->findChildren<QDockWidget*>())
+                if (d->isVisible()) sizes << QStringLiteral("%1 %2x%3").arg(d->objectName()).arg(d->width()).arg(d->height());
+            sizes.sort();
+            return sizes.join(QStringLiteral(", "));
+        };
+        const QString sizesWere = panelSizes();
+        auto sizesBack = [&] {
+            viewer->setMinimumSize(leastWas);
+            for (int i = 0; i < 100 && (win_->size() != windowWas || panelSizes() != sizesWere); ++i) {
+                QApplication::processEvents();  // (the smaller least size reaches the window with its layouts' requests)
+                win_->resize(windowWas);
+                win_->restoreState(panelsWere);
+                QApplication::processEvents();
+            }
+        };
         auto finish = qScopeGuard([&] {
             stop = true;
             sending.join();
@@ -3312,10 +3331,9 @@ private slots:
             viewer->setHdrViewer(false);
             source->setHdrViewer(viewerWas);
             playback->setHdrOutput(hdrWas);
-            viewer->setMinimumSize(leastWas);
-            win_->resize(windowWas);
             for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
                 if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
+            sizesBack();
         });
         viewer->setHdrViewer(false);
         playback->setHdrOutput(false);
@@ -3344,6 +3362,9 @@ private slots:
             const int got = qGreen(img.pixel(img.width() / 4 + side * img.width() / 2, img.height() / 2));
             QVERIFY2(std::abs(got - want) <= 4, qPrintable(QStringLiteral("%1, not %2").arg(got).arg(want)));
         }
+        // (going live moved no panel and left the window its size)
+        QCOMPARE(win_->size(), windowWas);
+        QCOMPARE(panelSizes(), sizesWere);
         // With room for it, the feed's every pixel.
         win_->resize(std::max(windowWas.width(), W + 1600), std::max(windowWas.height(), H + 1000));
         viewer->setMinimumSize(W, H);
@@ -3392,6 +3413,10 @@ private slots:
         QVERIFY(!source->liveFeed() && !viewer->hdrPicture());
         QTest::qWait(200);
         QVERIFY(!viewer->hdrPicture());
+        // The window and every panel back at the sizes they had, for the tests after.
+        sizesBack();
+        QCOMPARE(win_->size(), windowWas);
+        QCOMPARE(panelSizes(), sizesWere);
     }
 
     // Tangent panels through a stand-in Tangent Hub: introduced, the controls file written, turns, resets and value

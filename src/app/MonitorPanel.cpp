@@ -825,6 +825,12 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         badge->setStyleSheet(QStringLiteral("QToolButton { color: #888; font-weight: 600; padding: 0 4px; border-radius: 3px; }"
                                             "QToolButton:checked { color: white; background: #c62828; }"));
         badge->hide();
+        {
+            // (its place kept while hidden: going live must not widen a narrow monitor, and with it the window)
+            QSizePolicy keep = badge->sizePolicy();
+            keep.setRetainSizeWhenHidden(true);
+            badge->setSizePolicy(keep);
+        }
         bar->addWidget(badge);
         liveBadge_ = badge;
         connect(badge, &QToolButton::toggled, this, [this](bool on) {
