@@ -21445,16 +21445,20 @@ print("added " + ui["name"])
             QFile::rename(shots.filePath(pngs.first()), shots.filePath(name));
             return shot;
         };
-        if (cm) {
-            // First the SDR viewer as Weston shows it on its PQ output: the picture's grey, so the screenshot further
-            // down is of what Weston shows.
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        {
+            // First the SDR viewer as Weston shows it, so the screenshot further down is of what Weston shows: the
+            // picture's grey as it is without colour management, and on the PQ output at the output's reference white
+            // (sRGB white at 203 nits; Weston reads sRGB as gamma 2.2).
             QTest::qWait(500);  // (the viewer painted, Weston repainted)
             const QImage sdrShot = screenshot(QStringLiteral("sdr.png"));
             QVERIFY2(!sdrShot.isNull(), "no screenshot from Weston");
             const QRgb px = sdrShot.pixel(sdrShot.width() / 2, sdrShot.height() / 2);
-            const QString said = QStringLiteral("Weston shows the SDR viewer's grey (sRGB 90) as %1 %2 %3").arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px));
+            const int expect = cm ? int(std::lround(nitsToCode(pq, 203 * std::pow(90 / 255.0, 2.2)) * 255)) : 90;
+            const QString said = QStringLiteral("Weston shows the SDR viewer's grey (sRGB 90) as %1 %2 %3, expected %4")
+                                     .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect);
             qInfo().noquote() << said;
-            QVERIFY2(qGreen(px) > 8 && std::abs(qRed(px) - qGreen(px)) <= 3 && std::abs(qBlue(px) - qGreen(px)) <= 3, qPrintable(said));
+            QVERIFY2(std::abs(qRed(px) - expect) <= 3 && std::abs(qGreen(px) - expect) <= 3 && std::abs(qBlue(px) - expect) <= 3, qPrintable(said));
         }
         viewer.setHdrViewer(true);
         viewer.setHdrPicture(ramp);
@@ -21492,7 +21496,6 @@ print("added " + ui["name"])
         QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
         // The surface's own pixels, as they go to Weston: in each bar's middle the linear light (relative to SDR white)
         // within 1% and the ramp's PQ code (read 8 bits a channel) within 2.
-        const ColorSpace& pq = *findColorSpace("rec2100pq");
         surface->keepNextFrame();
         QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() == surface && !surface->keptSignal().isNull() && !surface->keptLight().isNull(),
                                   qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame kept") : viewer.hdrStatus()), 10000);

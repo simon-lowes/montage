@@ -2,8 +2,9 @@
 # Runs the HDR viewer under Weston (scripts/build-weston.sh): headless, its GL renderer, one 1280x720 output, the kiosk
 # shell. Twice: with colour management on and the output driven as BT.2100 PQ (BT.2020, reference white 203 nits, a
 # 1000-nit target), where test_app's hdrViewerOnWayland checks the surface's description in Weston's protocol log,
-# its 10-bit buffers and the PQ codes in Weston's screenshot; then with colour management off, where the viewer stays
-# SDR and says why. A skipped test fails the check, and so does a Weston that died or did not stop cleanly.
+# its 10-bit buffers, the surface's own pixels and the PQ codes in Weston's screenshot; then with colour management
+# off, where the viewer stays SDR and says why. Both runs first check Weston's screenshot of the SDR viewer. A skipped
+# test fails the check, and so does a Weston that died or did not stop cleanly.
 #
 #   scripts/wayland-hdr-check.sh <weston prefix> <test_app> <work directory>
 set -euo pipefail
@@ -60,7 +61,11 @@ EOF
   # is hidden. Desktops always have a seat.
   # The log also has what Weston's renderer draws each surface with (its buffer's format, its colour transformation and
   # the shaders made for it), for when its screenshot is not what the test expects.
-  LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$weston_prefix/bin/weston" \
+  # Weston 16 blends in its fragment shaders where the GL driver can read the framebuffer back in a shader, and under
+  # Mesa's llvmpipe that showed every window black on the PQ output, SDR ones too. Without that one extension Weston
+  # blends in a half-float buffer of its own, as its earlier releases always did.
+  LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    MESA_EXTENSION_OVERRIDE="-GL_EXT_shader_framebuffer_fetch_non_coherent" "$weston_prefix/bin/weston" \
     --backend=headless --fake-seat --renderer=gl --width=1280 --height=720 --shell=kiosk --socket="$socket" \
     --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto,gl-renderer-paint-nodes,color-lcms-transformations,gl-shader-generator &
   weston=$!
