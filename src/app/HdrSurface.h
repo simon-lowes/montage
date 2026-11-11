@@ -62,6 +62,12 @@ public:
     void setOverlay(const QImage& overlay);                      // the viewer's drawing, the window's size
     const QImage& overlay() const { return overlay_; }
     int framesDrawn() const { return frames_; }
+    // Tests, on Wayland: the next frame's pixels kept as it is drawn, top row first: the frame as it goes to the
+    // compositor (the signal the surface is described with, read 8 bits a channel) and the linear light it is written
+    // from (half floats: relative to SDR white, Rec. 709 primaries). Null until that frame is drawn.
+    void keepNextFrame();
+    const QImage& keptSignal() const { return keptSignal_; }
+    const QImage& keptLight() const { return keptLight_; }
 
     // Tests: a GPU-less device (Qt's Null RHI) that claims an HDR display with this headroom (0 = off).
     static void setTestDisplay(double headroom);
@@ -105,6 +111,8 @@ private:
     QPointer<QObject> waylandWindow_;  // (Qt's Wayland window, whose surfaceDestroyed lets the description go)
     QElapsedTimer ownFrame_;           // Wayland: since the surface's wl_surface first had a frame (not valid before)
     int frames_ = 0;
+    bool keepFrame_ = false;
+    QImage keptSignal_, keptLight_;
     QString problem_;
     QElapsedTimer displayRead_;  // since the display's HDR range was last asked
     QTimer displayTimer_;        // asks again while shown, paused too (brightness, the HDR switch)

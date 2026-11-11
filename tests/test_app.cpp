@@ -21396,6 +21396,29 @@ print("added " + ui["name"])
             }
         ramp->rgba.resize(texels.size());
         qFloatToFloat16(reinterpret_cast<qfloat16*>(ramp->rgba.data()), texels.data(), qsizetype(texels.size()));
+        // Weston's screenshot of its output (kept under `name` beside its log; null if none could be taken).
+        const QString shooter = qEnvironmentVariable("MONTAGE_TEST_WESTON_SCREENSHOOTER");
+        const QDir shots(qEnvironmentVariable("XDG_PICTURES_DIR"));
+        auto screenshot = [&](const QString& name) {
+            if (shooter.isEmpty() || !shots.exists() || QProcess::execute(shooter, {}) != 0) return QImage();
+            const QStringList pngs = shots.entryList({QStringLiteral("wayland-screenshot-*.png")}, QDir::Files, QDir::Time);
+            if (pngs.isEmpty()) return QImage();
+            const QImage shot = QImage(shots.filePath(pngs.first())).convertToFormat(QImage::Format_RGB32);
+            QFile::remove(shots.filePath(name));
+            QFile::rename(shots.filePath(pngs.first()), shots.filePath(name));
+            return shot;
+        };
+        if (cm) {
+            // First the SDR viewer as Weston shows it on its PQ output: the picture's grey, so the screenshot further
+            // down is of what Weston shows.
+            QTest::qWait(500);  // (the viewer painted, Weston repainted)
+            const QImage sdrShot = screenshot(QStringLiteral("sdr.png"));
+            QVERIFY2(!sdrShot.isNull(), "no screenshot from Weston");
+            const QRgb px = sdrShot.pixel(sdrShot.width() / 2, sdrShot.height() / 2);
+            const QString said = QStringLiteral("Weston shows the SDR viewer's grey (sRGB 90) as %1 %2 %3").arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px));
+            qInfo().noquote() << said;
+            QVERIFY2(qGreen(px) > 8 && std::abs(qRed(px) - qGreen(px)) <= 3 && std::abs(qBlue(px) - qGreen(px)) <= 3, qPrintable(said));
+        }
         viewer.setHdrViewer(true);
         viewer.setHdrPicture(ramp);
         if (!cm) {
@@ -21430,6 +21453,38 @@ print("added " + ui["name"])
         QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));
         QCOMPARE(viewer.hdrSurface(), surface);
         QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
+        // The surface's own pixels, as they go to Weston: in each bar's middle the linear light (relative to SDR white)
+        // within 1% and the ramp's PQ code (read 8 bits a channel) within 2.
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        surface->keepNextFrame();
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() == surface && !surface->keptSignal().isNull() && !surface->keptLight().isNull(),
+                                  qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame kept") : viewer.hdrStatus()), 10000);
+        {
+            const QImage ownSignal = surface->keptSignal(), ownLight = surface->keptLight();
+            QCOMPARE(ownSignal.size(), ownLight.size());
+            const QRectF own = viewer.imageRect();
+            const double sx = double(ownSignal.width()) / std::max(1, surface->width());
+            const double sy = double(ownSignal.height()) / std::max(1, surface->height());
+            QStringList said;
+            bool right = true;
+            for (int i = 0; i < 8; ++i) {
+                const QPoint at(int((own.left() + (i + 0.5) * own.width() / 8) * sx), int(own.center().y() * sy));
+                QVERIFY(ownSignal.rect().contains(at));
+                const int expect = int(std::lround(nitsToCode(pq, nits[i]) * 255));
+                const double want = nits[i] / 203;
+                const QRgb px = ownSignal.pixel(at);
+                const auto* l = reinterpret_cast<const qfloat16*>(ownLight.constScanLine(at.y())) + at.x() * 4;
+                const double light[3] = {double(float(l[0])), double(float(l[1])), double(float(l[2]))};
+                const int code[3] = {qRed(px), qGreen(px), qBlue(px)};
+                for (int c = 0; c < 3; ++c)
+                    if (std::fabs(light[c] - want) > 0.01 * want + 0.002 || std::abs(code[c] - expect) > 2) right = false;
+                said << QStringLiteral("%1 nits at %2,%3: light %4 %5 %6 (expected %7), code %8 %9 %10 alpha %11 (expected %12)")
+                            .arg(nits[i]).arg(at.x()).arg(at.y()).arg(light[0]).arg(light[1]).arg(light[2]).arg(want)
+                            .arg(code[0]).arg(code[1]).arg(code[2]).arg(qAlpha(px)).arg(expect);
+            }
+            qInfo().noquote() << "The surface's own pixels:" << said.join(QStringLiteral("; "));
+            QVERIFY2(right, qPrintable(said.join(QStringLiteral("; "))));
+        }
         QTest::qWait(500);  // (Weston repaints)
         // Weston's protocol log: the surface described as BT.2100 PQ (named transfer 11, primaries 6) with the master's
         // light (800 nits from 0.005; MaxCLL 800, MaxFALL 200), and 10-bit buffers (AR30 or XR30).
@@ -21450,27 +21505,25 @@ print("added " + ui["name"])
                 tenBit = true;
         QVERIFY2(tenBit, "no 10-bit buffer in Weston's protocol log");
         // Weston's screenshot of its PQ output: each bar's middle is the ramp's PQ code (8 bits) within 2.
-        const QString shooter = qEnvironmentVariable("MONTAGE_TEST_WESTON_SCREENSHOOTER");
-        const QDir shots(qEnvironmentVariable("XDG_PICTURES_DIR"));
-        QVERIFY(!shooter.isEmpty() && shots.exists());
-        QCOMPARE(QProcess::execute(shooter, {}), 0);
-        const QStringList pngs = shots.entryList({QStringLiteral("wayland-screenshot-*.png")}, QDir::Files, QDir::Time);
-        QVERIFY(!pngs.isEmpty());
-        const QImage shot = QImage(shots.filePath(pngs.first())).convertToFormat(QImage::Format_RGB32);
-        QVERIFY(!shot.isNull());
+        const QImage shot = screenshot(QStringLiteral("hdr.png"));
+        QVERIFY2(!shot.isNull(), "no screenshot from Weston");
         const QRectF r = viewer.imageRect().translated(QPointF(viewer.mapTo(viewer.window(), QPoint(0, 0))));
-        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        QStringList said;
+        bool right = true;
         for (int i = 0; i < 8; ++i) {
             const QPoint at(int(r.left() + (i + 0.5) * r.width() / 8), int(r.center().y()));
+            QVERIFY(shot.rect().contains(at));
             float signal[3] = {float(nits[i] / 203), float(nits[i] / 203), float(nits[i] / 203)};
             hdrSurfaceSignal(signal, Transfer::Pq);
             QVERIFY(std::fabs(signal[1] - nitsToCode(pq, nits[i])) < 1e-4);
             const int expect = int(std::lround(signal[1] * 255));
             const QRgb px = shot.pixel(at);
-            QVERIFY2(std::abs(qRed(px) - expect) <= 2 && std::abs(qGreen(px) - expect) <= 2 && std::abs(qBlue(px) - expect) <= 2,
-                     qPrintable(QString("bar %1 (%2 nits) at %3,%4: %5 %6 %7, expected %8").arg(i).arg(nits[i]).arg(at.x()).arg(at.y())
-                                    .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect)));
+            if (std::abs(qRed(px) - expect) > 2 || std::abs(qGreen(px) - expect) > 2 || std::abs(qBlue(px) - expect) > 2) right = false;
+            said << QStringLiteral("bar %1 (%2 nits) at %3,%4: %5 %6 %7, expected %8").arg(i).arg(nits[i]).arg(at.x()).arg(at.y())
+                        .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect);
         }
+        qInfo().noquote() << "Weston's screenshot:" << said.join(QStringLiteral("; "));
+        QVERIFY2(right, qPrintable(said.join(QStringLiteral("; "))));
 #endif
     }
 

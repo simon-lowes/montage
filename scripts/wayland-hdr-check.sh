@@ -58,9 +58,11 @@ EOF
   # only through its seat's focus: with none, the output keeps pointing at the freed window (desktop_surface_removed
   # in kiosk-shell.c) and Weston crashes when the next window is mapped, as the test's viewer is after the main window
   # is hidden. Desktops always have a seat.
+  # The log also has what Weston's renderer draws each surface with (its buffer's format, its colour transformation and
+  # the shaders made for it), for when its screenshot is not what the test expects.
   LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$weston_prefix/bin/weston" \
     --backend=headless --fake-seat --renderer=gl --width=1280 --height=720 --shell=kiosk --socket="$socket" \
-    --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto &
+    --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto,gl-renderer-paint-nodes,color-lcms-transformations,gl-shader-generator &
   weston=$!
   local i
   for i in $(seq 100); do
@@ -81,7 +83,7 @@ EOF
   local status=0
   WAYLAND_DISPLAY="$socket" QT_QPA_PLATFORM=wayland QT_WAYLAND_DISABLE_WINDOWDECORATION=1 QTEST_FUNCTION_TIMEOUT=900000 \
     MONTAGE_TEST_WESTON_LOG="$dir/weston.log" MONTAGE_TEST_WESTON_CM="$cm" XDG_PICTURES_DIR="$dir/shots" \
-    MONTAGE_TEST_WESTON_SCREENSHOOTER="$work/screenshooter" \
+    MONTAGE_TEST_WESTON_SCREENSHOOTER="$work/screenshooter" QT_LOGGING_RULES="qt.rhi.general=true" \
     "$test_app" hdrViewerOnWayland -o "$dir/result.txt,txt" -o -,txt || status=1
   echo "::endgroup::"
   if grep -q '^SKIP' "$dir/result.txt" 2> /dev/null; then
@@ -107,7 +109,7 @@ EOF
   weston=""
   if [ "$status" != 0 ]; then
     echo "hdrViewerOnWayland failed with colour management $cm; Weston's log:" >&2
-    grep -v ' -> \| client ' "$dir/weston.log" | tail -80 >&2 || true
+    grep -v ' -> \| client ' "$dir/weston.log" | tail -200 >&2 || true
     grep -E 'color|image_description|create_buffer|create_immed|\.create\(' "$dir/weston.log" | tail -60 >&2 || true
     echo "The last of Weston's protocol log:" >&2
     grep -v 'wl_registry@.*global(\|wl_shm@.*format(' "$dir/weston.log" | tail -40 >&2 || true

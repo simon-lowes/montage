@@ -147,6 +147,19 @@ QShader encodeShader() {
         if (key.source() == QShader::GlslShader) s.setShader(key, QShaderCode(encodeGlsl(key.sourceVersion(), block)));
     return s;
 }
+
+// What was read back from the GPU as an image, top row first (OpenGL gives the bottom row first); null if it is not
+// in the format expected.
+QImage readBack(const QRhiReadbackResult& r, QRhiTexture::Format rhiFormat, QImage::Format format, int bytesPerPixel, bool bottomFirst) {
+    const int w = r.pixelSize.width(), h = r.pixelSize.height();
+    if (r.format != rhiFormat || w <= 0 || h <= 0 || r.data.size() < qsizetype(w) * h * bytesPerPixel) return QImage();
+    QImage img(w, h, format);
+    if (img.isNull() || img.bytesPerLine() != qsizetype(w) * bytesPerPixel) return QImage();
+    for (int y = 0; y < h; ++y)
+        std::memcpy(img.scanLine(y), r.data.constData() + qsizetype(bottomFirst ? h - 1 - y : y) * w * bytesPerPixel,
+                    size_t(w) * size_t(bytesPerPixel));
+    return img;
+}
 #endif
 
 #if defined(Q_OS_WIN)
@@ -239,6 +252,7 @@ public:
     std::unique_ptr<QRhiGraphicsPipeline> psPicture, psOverlay, psEncode;
     bool hasSwapChain = false, vbufUploaded = false, notExposed = false, newlyExposed = false;
     QSize pictureSize{1, 1}, overlaySize{1, 1}, linearSize{1, 1};
+    QRhiReadbackResult readSignal, readLight;  // (tests: HdrSurface::keepNextFrame)
 
     ~HdrSurfaceGpu() {
         // Resources before the RHI that made them.
@@ -299,7 +313,7 @@ public:
     // The linear target at the swap chain's size (Linux), the encode pass pointed at it.
     bool resizeLinear(QSize size) {
         if (linear && linearRt && size == linearSize) return true;
-        QRhiTexture* t = rhi->newTexture(QRhiTexture::RGBA16F, size, 1, QRhiTexture::RenderTarget);
+        QRhiTexture* t = rhi->newTexture(QRhiTexture::RGBA16F, size, 1, QRhiTexture::RenderTarget | QRhiTexture::UsedAsTransferSource);
         if (!t->create()) {
             delete t;
             return false;
@@ -331,6 +345,13 @@ public:
 };
 
 void HdrSurface::setTestDisplay(double headroom) { gTestHeadroom = headroom; }
+
+void HdrSurface::keepNextFrame() {
+    keepFrame_ = true;
+    keptSignal_ = QImage();
+    keptLight_ = QImage();
+    requestUpdate();
+}
 
 HdrSurface::HdrSurface(QWidget* target) : target_(target) {
     setFlag(Qt::WindowDoesNotAcceptFocus);  // the editor's shortcuts keep working: focus stays in the widgets
@@ -939,6 +960,17 @@ void HdrSurface::render() {
         u->updateDynamicBuffer(g.ubufEncode.get(), 0, kUniformBytes, data);
     }
 
+    // (tests) This frame read back as its last pass ends: the swap chain's pixels, then the linear light under them.
+    // (OpenGL, where the encode pass is: read as the frame ends)
+    QRhiResourceUpdateBatch* kept = nullptr;
+    if (encode && keepFrame_) {
+        kept = g.rhi->nextResourceUpdateBatch();
+        g.readSignal = QRhiReadbackResult();
+        g.readLight = QRhiReadbackResult();
+        kept->readBackTexture(QRhiReadbackDescription(), &g.readSignal);
+        kept->readBackTexture(QRhiReadbackDescription(g.linear.get()), &g.readLight);
+    }
+
     QRhiCommandBuffer* cb = g.sc->currentFrameCommandBuffer();
     const QSize px = g.sc->currentPixelSize();
     QRhiRenderTarget* target = encode ? static_cast<QRhiRenderTarget*>(g.linearRt.get()) : g.sc->currentFrameRenderTarget();
@@ -966,12 +998,20 @@ void HdrSurface::render() {
         cb->setShaderResources(g.srbEncode.get());
         cb->setVertexInput(0, 1, &input);
         cb->draw(4);
-        cb->endPass();
+        cb->endPass(kept);
     }
     if (g.rhi->endFrame(g.sc.get()) == QRhi::FrameOpDeviceLost) {
         stopHdr(tr("The graphics device was reset"));
         return;
     }
+#if defined(MONTAGE_HDR_ENCODED)
+    if (kept) {
+        keepFrame_ = false;
+        const bool bottomFirst = g.rhi->isYUpInFramebuffer();
+        keptSignal_ = readBack(g.readSignal, QRhiTexture::RGBA8, QImage::Format_RGBA8888, 4, bottomFirst);
+        keptLight_ = readBack(g.readLight, QRhiTexture::RGBA16F, QImage::Format_RGBA16FPx4, 8, bottomFirst);
+    }
+#endif
     if (!ownFrame_.isValid()) ownFrame_.start();
     if (++frames_ == 1) {
         // macOS reports the headroom once a frame is up: asked again straight after the first.
