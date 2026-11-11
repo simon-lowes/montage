@@ -105,6 +105,40 @@ std::vector<FrameTime> captionShotChanges(const Sequence& seq) {
     return {out.begin(), out.end()};
 }
 
+bool markShotChange(Sequence& seq, FrameTime f) {
+    const std::vector<FrameTime> have = captionShotChanges(seq);
+    if (std::binary_search(have.begin(), have.end(), f)) return false;
+    auto byTime = [](const Marker& x, const Marker& y) { return x.t < y.t; };
+    Marker m;
+    m.name = "Shot change";
+    m.shotChange = true;
+    // The picture shown at `f`: the top track's clip there. A cut is marked inside a clip, not on its edges.
+    for (size_t ti = seq.videoTracks.size(); ti-- > 0;) {
+        Track& t = seq.videoTracks[ti];
+        if (t.muted) continue;
+        const auto shown = std::find_if(t.clips.begin(), t.clips.end(), [f](const Clip& c) {
+            return c.enabled && !c.isGenerator() && c.start <= f - 1 && f < c.end();
+        });
+        if (shown == t.clips.end()) continue;
+        Clip& c = *shown;
+        // (played backwards, the cut follows the marked frame: captionShotChanges)
+        const FrameTime frame = f - (c.reverse ? 1 : 0);
+        const double source = c.sourceFrameAt(frame);
+        for (const FrameTime at : {FrameTime(std::llround(source)), FrameTime(std::floor(source)), FrameTime(std::ceil(source))}) {
+            m.t = at;
+            if (c.markerFrame(m) != frame) continue;
+            c.markers.push_back(m);
+            std::stable_sort(c.markers.begin(), c.markers.end(), byTime);
+            return true;
+        }
+        break;  // (the picture on top is the one a viewer sees cut: none below it is marked instead)
+    }
+    m.t = f;
+    seq.markers.push_back(m);
+    std::stable_sort(seq.markers.begin(), seq.markers.end(), byTime);
+    return true;
+}
+
 double captionCps(const Caption& c, Rational fps) {
     const double seconds = double(c.end - c.start) / rate(fps);
     return seconds > 0 ? characters(c.text) / seconds : 0.0;

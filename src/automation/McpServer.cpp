@@ -9899,7 +9899,8 @@ void McpServer::Impl::addTools() {
         "right, e.g. \"top left\": where the captions sit, kept in every caption format) or raise_over_titles (captions "
         "shown over lower thirds and other low titles move to the top). `captions` (indices) limits shift, replace and place. Limits "
         "can be changed: max_cps, max_line_chars, max_lines, min_seconds, max_seconds, min_gap_frames. Shot changes (the "
-        "sequence's cuts and its shot-change markers; `shot_changes` adds markers at those times first, and action "
+        "sequence's cuts and its shot-change markers; `shot_changes` adds markers at those times first, each on the clip "
+        "shown there so that it moves with the clip, or on the sequence where there is none; action "
         "shot_changes lists them) are kept clear of by check and fix_timing under `profile` netflix (the default: no caption "
         "starts or ends within half a second of one, except starting on it or ending min_gap_frames before it; "
         "`shot_zone_seconds` changes the half second) or off.",
@@ -9931,19 +9932,11 @@ void McpServer::Impl::addTools() {
             if (profile != QLatin1String("netflix") && profile != QLatin1String("off")) throw ArgError{"profile is netflix or off"};
             if (profile == QLatin1String("off")) lim.shotZoneSeconds = 0;
             else if (a.contains("shot_zone_seconds")) lim.shotZoneSeconds = std::max(0.0, a.value("shot_zone_seconds").toDouble());
-            // Shot changes given: marked first (kept with the sequence).
+            // Shot changes given: marked first, each on the clip showing its picture there (so it follows the clip
+            // when that moves), or on the sequence where no clip does.
             bool marked = false;
-            for (const QJsonValue& v : a.value("shot_changes").toArray()) {
-                const FrameTime f = timeArg(v, s, "shot_changes");
-                if (std::any_of(s.markers.begin(), s.markers.end(), [f](const Marker& m) { return m.shotChange && m.t == f; })) continue;
-                Marker m;
-                m.t = f;
-                m.name = "Shot change";
-                m.shotChange = true;
-                s.markers.push_back(m);
-                marked = true;
-            }
-            if (marked) std::sort(s.markers.begin(), s.markers.end(), [](const Marker& x, const Marker& y) { return x.t < y.t; });
+            for (const QJsonValue& v : a.value("shot_changes").toArray())
+                if (markShotChange(s, timeArg(v, s, "shot_changes"))) marked = true;
             const std::vector<FrameTime> cuts = lim.shotZoneSeconds > 0 ? captionShotChanges(s) : std::vector<FrameTime>();
             std::vector<size_t> chosen;
             for (const QJsonValue& v : a.value("captions").toArray()) {

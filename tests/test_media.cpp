@@ -36036,6 +36036,97 @@ private slots:
         QVERIFY(r.value("isError").toBool());
     }
 
+    void shotChangeMarkersFollowClips() {
+        // Shot changes given over MCP are markers on the clips shown at those times, so moving a clip moves them;
+        // one given where no clip shows a picture stays a marker of the sequence.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem film;
+        film.id = p.newId();
+        film.name = "film";
+        film.path = path("film.mov");
+        film.duration = 20;
+        film.width = 1920;
+        film.height = 1080;
+        film.fps = s.fps;
+        film.hasVideo = true;
+        p.media.push_back(film);
+        Clip c = makeClip(p, film, TrackKind::Video, s);
+        c.start = 100;
+        c.sourceIn = 60;
+        c.duration = 200;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        Clip r = makeClip(p, film, TrackKind::Video, s);
+        r.start = 400;
+        r.sourceIn = 0;
+        r.duration = 100;
+        r.reverse = true;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, r).ok);
+        const Id id = s.videoTracks[0].clips[0].id, backwards = s.videoTracks[0].clips[1].id;
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.name = "English";
+        ct.captions = {{200, 260, "A caption"}};
+        s.captionTracks.push_back(ct);
+        const QString project = QString::fromStdString(path("shot-markers.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto listed = [](const QJsonObject& result) {
+            std::vector<FrameTime> frames;
+            for (const QJsonValue& v : result.value("structuredContent").toObject().value("shot_changes").toArray())
+                frames.push_back(FrameTime(v.toObject().value("frame").toDouble()));
+            return frames;
+        };
+        const double fps = 30;
+        // One inside the first clip, one inside the clip played backwards, one after the picture's end.
+        QJsonObject res = call("montage_edit_captions", {{"project", project}, {"action", "shot_changes"},
+                                                         {"shot_changes", QJsonArray{180 / fps, 450 / fps, 700 / fps}}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        // (with the cuts at the clips' edges: the first clip's start and end, and the second's start)
+        QCOMPARE(listed(res), (std::vector<FrameTime>{100, 180, 300, 400, 450, 700}));
+        {
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            const Sequence& bs = *back.active();
+            const Clip* first = edit::clipById(bs, id);
+            const Clip* second = edit::clipById(bs, backwards);
+            QVERIFY(first && second);
+            QCOMPARE(first->markers.size(), size_t(1));
+            QVERIFY(first->markers[0].shotChange);
+            QCOMPARE(first->markers[0].t, FrameTime(60 + 80));  // on the clip's source
+            QCOMPARE(second->markers.size(), size_t(1));
+            QVERIFY(second->markers[0].shotChange);
+            QCOMPARE(bs.markers.size(), size_t(1));
+            QCOMPARE(bs.markers[0].t, FrameTime(700));
+        }
+        // Given again, nothing is marked twice.
+        res = call("montage_edit_captions", {{"project", project}, {"action", "shot_changes"}, {"shot_changes", QJsonArray{180 / fps, 700 / fps}}});
+        QCOMPARE(listed(res), (std::vector<FrameTime>{100, 180, 300, 400, 450, 700}));
+        res = call("montage_edit_captions", {{"project", project}, {"action", "check"}});
+        QVERIFY2(!QJsonDocument(res).toJson().contains("shot change"), QJsonDocument(res).toJson().constData());
+        // The first clip moved 40 frames earlier: its shot change goes with it, and the others stay.
+        res = call("montage_move_clip", {{"project", project}, {"clip", double(id)}, {"start", 60 / fps}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_edit_captions", {{"project", project}, {"action", "shot_changes"}});
+        QCOMPARE(listed(res), (std::vector<FrameTime>{60, 140, 260, 400, 450, 700}));
+        // The caption, which was clear of every shot change, now ends on the clip's end.
+        res = call("montage_edit_captions", {{"project", project}, {"action", "check"}});
+        QVERIFY2(QJsonDocument(res).toJson().contains("shot change"), QJsonDocument(res).toJson().constData());
+        // The backwards clip moved too.
+        res = call("montage_move_clip", {{"project", project}, {"clip", double(backwards)}, {"start", 500 / fps}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_edit_captions", {{"project", project}, {"action", "shot_changes"}});
+        QCOMPARE(listed(res), (std::vector<FrameTime>{60, 140, 260, 500, 550, 700}));
+    }
+
     void interfaceTranslationDrafts() {
         // Machine drafts for Montage's own interface: untranslated texts get one, still unfinished for review; finished
         // translations, rich text and plural forms are left alone; placeholders must survive and the mnemonic comes back.
