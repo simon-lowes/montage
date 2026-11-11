@@ -83,6 +83,10 @@ private:
     QSpinBox* width_ = nullptr;
     QSpinBox* height_ = nullptr;
     QSpinBox* quality_ = nullptr;
+    // A stated HRD (H.264, H.265): none, a constant or a variable rate, with the buffer's rate and size (render/HrdCheck.h).
+    QComboBox* hrd_ = nullptr;
+    QSpinBox* hrdRate_ = nullptr;    // kbit/s
+    QSpinBox* hrdBuffer_ = nullptr;  // kbit; 0: a second at the rate
     QComboBox* captions_ = nullptr;
     QCheckBox* chapters_ = nullptr;
     QComboBox* streams_ = nullptr;      // more audio streams after the mix: none, per role, per track

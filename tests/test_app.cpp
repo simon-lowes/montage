@@ -285,6 +285,7 @@
 #include "RenderQueuePanel.h"
 #include "render/BackgroundJobs.h"
 #include "render/RenderFarm.h"
+#include "render/HrdCheck.h"
 #include "TimelineWidget.h"
 #include "PitchCurves.h"
 #include "TranscribeDialog.h"
@@ -5278,6 +5279,99 @@ private slots:
         QCOMPARE(copy.media.size(), size_t(1));
         QVERIFY(QString::fromStdString(copy.media[0].path).endsWith("handoff/Media/jfk.wav"));
         QVERIFY(!win_->runProjectManager(ConsolidateOptions{}));  // no folder
+    }
+
+    void exportDialogStatedHrd() {
+        // The Export dialog states a buffer model for H.264 and H.265: a constant or a variable rate with a buffer. The
+        // export it queues says so, and the file written keeps to the model it states.
+        loadDemo();
+        RenderQueue* queue = win_->renderQueue();
+        const size_t before = queue->jobs().size();
+        const QVariant remembered = appSettings().value("export/preset");
+        auto putBack = qScopeGuard([&] {
+            appSettings().remove("export/hrd");
+            appSettings().remove("export/hrdRate");
+            appSettings().remove("export/hrdBuffer");
+            if (remembered.isValid()) appSettings().setValue("export/preset", remembered);  // later tests export with the preset they had
+            else appSettings().remove("export/preset");
+        });
+        int h264 = -1, prores = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i) {
+            if (exportPresets()[i].name == "H.264 - High Quality") h264 = int(i);
+            if (exportPresets()[i].name == "ProRes 422 HQ") prores = int(i);
+        }
+        QVERIFY(h264 >= 0 && prores >= 0);
+        // What the dialog queues with the model, rate (kbit/s) and buffer (kbit) set.
+        auto queued = [&](const char* mode, int rateKbit, int bufferKbit, const QString& file, ExportSettings* out) {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* hrd = ed.findChild<QComboBox*>("exportHrd");
+            auto* rate = ed.findChild<QSpinBox*>("exportHrdRate");
+            auto* buffer = ed.findChild<QSpinBox*>("exportHrdBuffer");
+            auto* quality = ed.findChild<QSpinBox*>("exportQuality");
+            QVERIFY(hrd && rate && buffer && quality);
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(h264);
+            hrd->setCurrentIndex(hrd->findData(QString::fromLatin1(mode)));
+            QVERIFY(rate->isEnabled() && buffer->isEnabled());
+            // (at a constant rate the bits are the rate's: the quality setting does not apply)
+            QCOMPARE(quality->isEnabled(), QByteArray(mode) != "cbr");
+            rate->setValue(rateKbit);
+            buffer->setValue(bufferKbit);
+            const QString summary = ed.findChild<QLabel*>("exportSummary")->text();
+            QVERIFY2(summary.contains(QStringLiteral("%1 kbit/s").arg(rateKbit)), qPrintable(summary));
+            ed.findChild<QLineEdit*>("exportPath")->setText(file);
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(ed.result(), int(QDialog::Accepted));
+            QCOMPARE(queue->jobs().size(), before + 1);
+            *out = queue->jobs().back().settings;
+            queue->remove(queue->jobs().back().id);
+        };
+        {
+            // Only H.264 and H.265 state one, and nothing is stated until asked for.
+            ExportDialog ed(state(), win_.get());
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* hrd = ed.findChild<QComboBox*>("exportHrd");
+            QVERIFY(preset && hrd);
+            preset->setCurrentIndex(prores);
+            QVERIFY(!hrd->isEnabled() && !ed.findChild<QSpinBox*>("exportHrdRate")->isEnabled());
+            preset->setCurrentIndex(h264);
+            QVERIFY(hrd->isEnabled());
+            QCOMPARE(hrd->currentData().toString(), QString());
+            QVERIFY(!ed.findChild<QSpinBox*>("exportHrdRate")->isEnabled() && !ed.findChild<QSpinBox*>("exportHrdBuffer")->isEnabled());
+        }
+        // A constant 1500 kbit/s into a 3000 kbit buffer.
+        ExportSettings cbr;
+        queued("cbr", 1500, 3000, dir_.path() + "/stated-cbr.mp4", &cbr);
+        if (QTest::currentTestFailed()) return;
+        QCOMPARE(cbr.hrd, std::string("cbr"));
+        QCOMPARE(cbr.vbvMaxrate, int64_t(1500000));
+        QCOMPARE(cbr.vbvBuffer, int64_t(3000000));
+        // Rendered (small and fast): the stream states that rate and buffer, and every picture keeps to them.
+        cbr.width = 320, cbr.height = 180, cbr.preset = "veryfast";
+        std::string err;
+        QVERIFY2(renderExport(state()->project(), state()->sequence()->id, cbr, 0, {}, nullptr, &err), err.c_str());
+        HrdReport report = checkHrd(cbr.path);
+        QVERIFY2(report.conforms() && report.signalled && report.cbr, report.summary().c_str());
+        QVERIFY2(std::fabs(report.bitRate - 1500000) < 15000 && std::fabs(report.bufferBits - 3000000) < 30000, report.summary().c_str());
+        // The dialog remembers the model. Variable, with the buffer left at a second's: no more than the rate.
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(h264);
+            QCOMPARE(ed.findChild<QComboBox*>("exportHrd")->currentData().toString(), QStringLiteral("cbr"));
+            QCOMPARE(ed.findChild<QSpinBox*>("exportHrdRate")->value(), 1500);
+            QCOMPARE(ed.findChild<QSpinBox*>("exportHrdBuffer")->value(), 3000);
+        }
+        ExportSettings vbr;
+        queued("vbr", 1200, 0, dir_.path() + "/stated-vbr.mp4", &vbr);
+        if (QTest::currentTestFailed()) return;
+        QCOMPARE(vbr.hrd, std::string("vbr"));
+        QCOMPARE(vbr.vbvMaxrate, int64_t(1200000));
+        QCOMPARE(vbr.vbvBuffer, int64_t(0));
+        vbr.width = 320, vbr.height = 180, vbr.preset = "veryfast";
+        QVERIFY2(renderExport(state()->project(), state()->sequence()->id, vbr, 0, {}, nullptr, &err), err.c_str());
+        report = checkHrd(vbr.path);
+        QVERIFY2(report.conforms() && report.signalled && !report.cbr, report.summary().c_str());
+        QVERIFY2(std::fabs(report.bitRate - 1200000) < 12000 && std::fabs(report.bufferBits - 1200000) < 12000, report.summary().c_str());
     }
 
     void trimMode() {
