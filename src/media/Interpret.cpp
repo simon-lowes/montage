@@ -55,6 +55,7 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
     if (i.par != 0 && (i.par < 0.1 || i.par > 10)) return Result::fail("The pixel aspect must be 0.1 to 10");
     if (!validAlphaMode(i.alpha)) return Result::fail("Alpha is straight, premultiplied, ignore or invert");
     if (!validFieldOrder(i.fields)) return Result::fail("Fields are progressive, upper or lower");
+    if (!validChromaSiting(i.chroma)) return Result::fail("Chroma siting is left, center or topleft");
     if (i.alpha == "straight") i.alpha.clear();
     if (!validRawHighlights(i.rawHighlights)) return Result::fail("Highlights are clip, blend or rebuild");
     if (i.rawHighlights == "clip") i.rawHighlights.clear();

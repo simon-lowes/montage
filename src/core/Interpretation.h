@@ -13,6 +13,10 @@
 //  - Camera RAW (stills and CinemaDNG runs): exposure in stops, white balance as the light's temperature and tint
 //    (or as shot), highlight recovery and a half-size decode for speed, as Resolve's Camera RAW panel and Lightroom
 //    develop them.
+//  - Chroma siting: where a subsampled picture's colour samples sit, when the file does not say or says wrongly:
+//    "left" (beside the left luma sample of each pair, as Rec. 601 and 709 site 4:2:2 and MPEG-2 and H.264 site
+//    4:2:0 across), "center" (midway between, as JPEG and MPEG-1 do) or "topleft" (on the top left sample, as
+//    Rec. 2020 sites 4:2:0). Untagged 4:2:2 is otherwise read as "left" and untagged 4:2:0 as centred.
 // Like an image sequence's rate, the interpretation travels with the media path, after a separator no file name holds,
 // so everything that opens media by path (decoders, the frame and audio caches, thumbnails, waveforms, proxies and
 // analysis) reads it the same way: "clip.mov\x1d" "fps=24,1;file=120,1;par=2;alpha=ignore;fields=upper;pitch=1".
@@ -32,6 +36,7 @@ struct Interpretation {
     double par = 0;          // pixel aspect ratio; 0 = the file's
     std::string alpha;       // "" as the file says (straight), "premultiplied", "ignore", "invert"
     std::string fields;      // "" as the frames are flagged, "progressive", "upper" (top field first), "lower"
+    std::string chroma;      // chroma siting: "" as the file says, "left", "center", "topleft"
     // Pulldown removed (media/Pulldown.h): each stretch of the cadence as "frame:position:order" (the file frame it starts
     // at, that frame's place in the cadence, 0 A A, 1 B B, 2 B C, 3 C D, 4 D D or v for video with none, and t for the top
     // field first or b),
@@ -58,8 +63,8 @@ struct Interpretation {
     bool gainMap = false;
     bool hasRaw() const { return rawExposure != 0 || rawTemperature > 0 || rawTint != 0 || !rawHighlights.empty() || rawHalf || rawNoOpcodes; }
     bool empty() const {
-        return !conformed() && par <= 0 && (alpha.empty() || alpha == "straight") && fields.empty() && pulldown.empty() && !hasRaw() && stereo.empty() && !swapEyes &&
-               eye == 0 && layer.empty() && !gainMap;
+        return !conformed() && par <= 0 && (alpha.empty() || alpha == "straight") && fields.empty() && chroma.empty() && pulldown.empty() && !hasRaw() &&
+               stereo.empty() && !swapEyes && eye == 0 && layer.empty() && !gainMap;
     }
     bool conformed() const { return fps.valid() && fileFps.valid() && !(fps == fileFps); }
     // Seconds of the file per second of media time (the new rate over the file's); 1 when not conformed.
@@ -79,6 +84,7 @@ Interpretation interpretationOf(const MediaItem& m);
 // Names for the choices, as the dialog, the project file and MCP use them.
 bool validAlphaMode(const std::string& alpha);
 bool validFieldOrder(const std::string& fields);
+bool validChromaSiting(const std::string& chroma);  // "", "left", "center", "topleft"
 // One stretch of a 2:3 cadence (Interpretation::pulldown).
 struct PulldownStretch {
     int64_t start = 0;     // the file frame it starts at

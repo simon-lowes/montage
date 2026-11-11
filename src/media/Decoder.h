@@ -33,7 +33,9 @@ bool sameProbedFacts(const MediaItem& a, const MediaItem& b, bool length = true)
 // A project saved before Montage read stereo packing (or MV-HEVC spatial video): its stereo video files (side-by-side or
 // top-and-bottom metadata, or HEVC of two views) are found from their headers and read again, so their items say so and give one eye's size, as they would imported
 // now. Nothing happens once a project has been checked (Project::stereoChecked). ProRes RAW media saved by a build
-// that read them differently (with or without FFmpeg 9's colour) are probed again every time.
+// that read them differently (with or without FFmpeg 9's colour) are probed again every time. A project saved while
+// untagged 4:2:2 was read with its chroma centred (Project::chromaChecked) has such footage marked to be read so
+// still (Interpretation::chroma), once.
 void checkStereoMedia(Project& p);
 
 // Captions carried inside a video (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast and camera

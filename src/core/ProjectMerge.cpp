@@ -733,6 +733,7 @@ MergeResult mergeProjects(const MergeBase& from, const Project& mine, const Proj
         return r;
     }
     out.stereoChecked = mine.stereoChecked && theirs.stereoChecked;
+    out.chromaChecked = mine.chromaChecked && theirs.chromaChecked;
     keepUsedMedia(out, mine, their);
     settleMovedClips(out, mine, choices, r);
     settleOverlaps(out, mine, choices, r);

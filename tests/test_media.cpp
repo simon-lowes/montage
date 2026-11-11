@@ -24539,6 +24539,156 @@ private slots:
         QVERIFY2(same >= copied, qPrintable(QStringLiteral("%1 of %2").arg(same).arg(copied)));
     }
 
+    void chromaSitingOverride() {
+        // 4:2:2 footage that does not say where its chroma sits: luma flat, Cb a ramp of one code a chroma sample
+        // across, Cr flat. FFV1 in Matroska, written here with no chroma location.
+        const std::string footage = path("untagged422.mkv");
+        {
+            const AVCodec* codec = avcodec_find_encoder_by_name("ffv1");
+            QVERIFY(codec);
+            AVCodecContext* ctx = avcodec_alloc_context3(codec);
+            ctx->width = 256, ctx->height = 64;
+            ctx->pix_fmt = AV_PIX_FMT_YUV422P;
+            ctx->time_base = AVRational{1, 25};
+            ctx->framerate = AVRational{25, 1};
+            ctx->colorspace = AVCOL_SPC_BT709, ctx->color_primaries = AVCOL_PRI_BT709, ctx->color_trc = AVCOL_TRC_BT709;
+            ctx->color_range = AVCOL_RANGE_MPEG;
+            AVFormatContext* out = nullptr;
+            QVERIFY(avformat_alloc_output_context2(&out, nullptr, nullptr, footage.c_str()) >= 0);
+            if (out->oformat->flags & AVFMT_GLOBALHEADER) ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            QVERIFY(avcodec_open2(ctx, codec, nullptr) >= 0);
+            AVStream* os = avformat_new_stream(out, nullptr);
+            avcodec_parameters_from_context(os->codecpar, ctx);
+            os->codecpar->chroma_location = AVCHROMA_LOC_UNSPECIFIED;
+            os->time_base = ctx->time_base;
+            os->avg_frame_rate = ctx->framerate;
+            QVERIFY(avio_open(&out->pb, footage.c_str(), AVIO_FLAG_WRITE) >= 0);
+            QVERIFY(avformat_write_header(out, nullptr) >= 0);
+            AVFrame* fr = av_frame_alloc();
+            fr->format = ctx->pix_fmt, fr->width = ctx->width, fr->height = ctx->height;
+            QVERIFY(av_frame_get_buffer(fr, 0) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            auto drain = [&] {
+                while (avcodec_receive_packet(ctx, pkt) >= 0) {
+                    av_packet_rescale_ts(pkt, ctx->time_base, os->time_base);
+                    pkt->stream_index = 0;
+                    av_interleaved_write_frame(out, pkt);
+                }
+            };
+            for (int n = 0; n < 5; ++n) {
+                QVERIFY(av_frame_make_writable(fr) >= 0);
+                for (int y = 0; y < 64; ++y) {
+                    std::memset(fr->data[0] + y * fr->linesize[0], 128, 256);
+                    for (int x = 0; x < 128; ++x) {
+                        fr->data[1][y * fr->linesize[1] + x] = uint8_t(64 + x);
+                        fr->data[2][y * fr->linesize[2] + x] = 128;
+                    }
+                }
+                fr->pts = n;
+                QVERIFY(avcodec_send_frame(ctx, fr) >= 0);
+                drain();
+            }
+            avcodec_send_frame(ctx, nullptr);
+            drain();
+            av_write_trailer(out);
+            avio_closep(&out->pb);
+            avformat_free_context(out);
+            av_packet_free(&pkt);
+            av_frame_free(&fr);
+            avcodec_free_context(&ctx);
+        }
+        // The blue of row 32, read with each siting.
+        auto blue = [&](const std::string& file) {
+            std::vector<double> row;
+            VideoDecoder dec;
+            if (!dec.open(file)) return row;
+            const Frame16Ptr f = dec.frameAt(0.02);
+            if (!f) return row;
+            const Image img = toImage(*f);
+            for (int x = 0; x < img.width; ++x) row.push_back(double(img.at(x, 32)[2]));
+            return row;
+        };
+        auto read = [&](const std::string& chroma) {
+            Interpretation in;
+            in.chroma = chroma;
+            return blue(interpretedPath(footage, in));
+        };
+        const std::vector<double> asFile = read(""), left = read("left"), centre = read("center");
+        QCOMPARE(asFile.size(), size_t(256));
+        QCOMPARE(left.size(), size_t(256));
+        QCOMPARE(centre.size(), size_t(256));
+        // Untagged 4:2:2 is read as co-sited: set to left, nothing changes.
+        for (size_t x = 0; x < 256; ++x) QCOMPARE(asFile[x], left[x]);
+        // Centred, each chroma sample sits half a luma sample further right than co-sited: the ramp reads as it does
+        // half a pixel to the left, less by half of what it gains from one pixel to the next.
+        double step = 0, shift = 0;
+        for (size_t x = 40; x < 216; ++x) {
+            step += (left[x + 1] - left[x]) / 176;
+            shift += (left[x] - centre[x]) / 176;
+        }
+        QVERIFY2(step > 0.002, qPrintable(QString::number(step)));
+        QVERIFY2(std::fabs(shift / step - 0.5) < 0.05, qPrintable(QStringLiteral("%1 of a pixel").arg(shift / step)));
+
+        // A project saved before untagged 4:2:2 was read as co-sited (its file has neither marker): loaded, the
+        // footage is set to centred, and its frames come out as they did, which is not how a new project reads it.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 256, s.height = 64, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, footage);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 5, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        RenderOptions ro;
+        ro.highQuality = true;
+        auto blueOf = [&](const Project& q) {
+            const Image img = renderProgramFrame(q, *q.active(), 1, ro);
+            std::vector<double> row;
+            for (int x = 0; x < img.width; ++x) row.push_back(double(img.at(x, 32)[2]));
+            return row;
+        };
+        const std::vector<double> now = blueOf(p);
+        Project asCentred = p;
+        {
+            Interpretation in;
+            in.chroma = "center";
+            asCentred.media[0].path = interpretedPath(footage, in);
+        }
+        const std::vector<double> before = blueOf(asCentred);
+        QCOMPARE(now.size(), size_t(256));
+        QCOMPARE(before.size(), size_t(256));
+        QVERIFY(std::fabs(now[128] - before[128]) > 0.0005);
+        const std::string saved = projectToJson(p, "");
+        QJsonObject root = QJsonDocument::fromJson(QByteArray::fromStdString(saved)).object();
+        QCOMPARE(root.value("chromaSiting").toInt(), 1);
+        std::string err;
+        Project fresh;
+        QVERIFY2(projectFromJson(saved, fresh, &err), err.c_str());
+        QVERIFY(fresh.chromaChecked);
+        checkStereoMedia(fresh);
+        QCOMPARE(fresh.media[0].path, footage);
+        root.remove("chromaSiting");
+        root.remove("cameraLens");
+        Project old;
+        QVERIFY2(projectFromJson(QJsonDocument(root).toJson().toStdString(), old, &err), err.c_str());
+        QVERIFY(!old.chromaChecked);
+        checkStereoMedia(old);
+        QVERIFY(old.chromaChecked);
+        QCOMPARE(interpretationOf(old.media[0]).chroma, std::string("center"));
+        const std::vector<double> asOld = blueOf(old);
+        QCOMPARE(asOld.size(), size_t(256));
+        for (size_t x = 0; x < 256; ++x) QCOMPARE(asOld[x], before[x]);
+        // Saved again, it says so, and is not looked at twice; taken back to the file's own, it reads as a new one.
+        Project again;
+        QVERIFY2(projectFromJson(projectToJson(old, ""), again, &err), err.c_str());
+        QVERIFY(again.chromaChecked);
+        QCOMPARE(interpretationOf(again.media[0]).chroma, std::string("center"));
+        Interpretation back = interpretationOf(again.media[0]);
+        back.chroma.clear();
+        QVERIFY(edit::interpretFootage(again, again.media[0].id, back).ok);
+        QCOMPARE(interpretationOf(again.media[0]).chroma, std::string());
+        const std::vector<double> taken = blueOf(again);
+        for (size_t x = 0; x < 256; ++x) QCOMPARE(taken[x], now[x]);
+    }
+
     void smartRenderingLimits() {
         // Footage made here (a turning gradient with light grain, in GOPs of 12), each file's frames placed one after
         // another in a cut, and what an export of the cut copies.

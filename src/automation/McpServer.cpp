@@ -627,6 +627,7 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.par > 0) o["pixel_aspect"] = i.par;
     if (!i.alpha.empty()) o["alpha"] = QString::fromStdString(i.alpha);
     if (!i.fields.empty()) o["field_order"] = QString::fromStdString(i.fields);
+    if (!i.chroma.empty()) o["chroma_siting"] = QString::fromStdString(i.chroma);
     if (std::vector<PulldownStretch> st; parsePulldown(i.pulldown, st) && !st.empty()) {
         // Pulldown removed: the cadence's stretches (a break where an edit after the pulldown changed it).
         QJsonArray stretches;
@@ -11314,6 +11315,7 @@ void McpServer::Impl::addTools() {
             "pixel_aspect":{"type":["number","string"],"description":"Pixel aspect ratio, or \"file\""},
             "alpha":{"type":"string","enum":["file","straight","premultiplied","ignore","invert"]},
             "field_order":{"type":"string","enum":["file","progressive","upper","lower"]},
+            "chroma_siting":{"type":"string","enum":["file","left","center","topleft"],"description":"Where a subsampled picture's colour samples sit: file (as the file says: untagged 4:2:2 as left, untagged 4:2:0 as center), left, center or topleft"},
             "keep_pitch":{"type":"boolean","description":"A conformed sound keeps its pitch"},
             "remove_pulldown":{"type":"string","enum":["off","auto","A","B","C","D"],"description":"29.97 or 30 frame video carrying 23.976 or 24 frame pictures with 2:3 pulldown: woven back into those frames (it then plays at 23.976 or 24, with no combed or repeated frames). auto finds the cadence from the fields, stretch by stretch (an edit made after the pulldown breaks it); A to D say which frame of the cadence the file starts on (A A, B B, B C, C D), the fields in field_order (or as the file says)"},
             "raw_exposure":{"type":"number","description":"Camera RAW, CinemaDNG, ProRes RAW and Magic Lantern Video: exposure in stops (-5 to 5)"},
@@ -11358,6 +11360,7 @@ void McpServer::Impl::addTools() {
                 if (fileOr("pixel_aspect", par)) i.par = par;
                 if (a.contains("alpha")) i.alpha = str(a, "alpha") == "file" ? "" : str(a, "alpha").toStdString();
                 if (a.contains("field_order")) i.fields = str(a, "field_order") == "file" ? "" : str(a, "field_order").toStdString();
+                if (a.contains("chroma_siting")) i.chroma = str(a, "chroma_siting") == "file" ? "" : str(a, "chroma_siting").toStdString();
                 if (a.contains("keep_pitch")) i.keepPitch = a.value("keep_pitch").toBool();
                 if (a.contains("remove_pulldown")) {
                     const QString pd = str(a, "remove_pulldown");

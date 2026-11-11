@@ -853,6 +853,9 @@ struct Project {
     // Whether its media's stereo packing (MediaItem::stereo) has been read: false for a project saved before Montage
     // read it, until media/Decoder.h checkStereoMedia looks (not saved).
     bool stereoChecked = true;
+    // False for a project saved while untagged 4:2:2 footage was read with its chroma centred: checkStereoMedia then
+    // marks such footage to be read so still, once, so the project renders as it did.
+    bool chromaChecked = true;
 
     Id newId() { return nextId++; }
     MediaItem* findMedia(Id id);

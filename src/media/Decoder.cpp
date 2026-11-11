@@ -1642,6 +1642,19 @@ bool VideoDecoder::decodeNext(AVFrame* into) {
         }
         // (IMF ProRes in full range, QE.2: its descriptor says so, the frames cannot)
         if (rc == 0 && imfFullRange_) into->color_range = AVCOL_RANGE_JPEG;
+        // A picture that does not say how its colour is coded takes what the file says of its stream (a hardware
+        // decoder's pictures can come without): below 720 lines it would otherwise be read by BT.601's matrix
+        // whatever the file states.
+        if (rc == 0) {
+            const AVCodecParameters* par = fmt_->streams[stream_]->codecpar;
+            if (into->colorspace == AVCOL_SPC_UNSPECIFIED && par->color_space != AVCOL_SPC_RGB) into->colorspace = par->color_space;
+            if (into->color_primaries == AVCOL_PRI_UNSPECIFIED) into->color_primaries = par->color_primaries;
+            if (into->color_trc == AVCOL_TRC_UNSPECIFIED) into->color_trc = par->color_trc;
+            // (Interpret Colour's chroma siting: where the colour samples sit, whatever the file says)
+            if (interp_.chroma == "left") into->chroma_location = AVCHROMA_LOC_LEFT;
+            else if (interp_.chroma == "center") into->chroma_location = AVCHROMA_LOC_CENTER;
+            else if (interp_.chroma == "topleft") into->chroma_location = AVCHROMA_LOC_TOPLEFT;
+        }
         if (rc == 0) return true;
         if (rc == AVERROR_EOF) return false;
         if (rc != AVERROR(EAGAIN)) return false;
@@ -3080,6 +3093,36 @@ void checkStereoMedia(Project& p) {
         m.height = fresh.height;
         for (MediaItem& sub : p.media)
             if (sub.subclipOf == m.id) sub.colorSpace = m.colorSpace, sub.width = m.width, sub.height = m.height;
+    }
+    // A project saved while untagged 4:2:2 was read as centred: its footage of that kind keeps being read so, as an
+    // interpretation the bin's Interpret Colour menu shows and can take back, so the project renders as it did.
+    if (!p.chromaChecked) {
+        p.chromaChecked = true;
+        for (MediaItem& m : p.media) {
+            if (m.kind != MediaKind::Video || m.path.empty() || m.subclipOf) continue;
+            Interpretation in = interpretationOf(m);
+            if (!in.chroma.empty()) continue;
+            AVFormatContext* fmt = nullptr;
+            if (openMediaInput(&fmt, m.path) < 0) continue;
+            bool untagged422 = false;
+            if (avformat_find_stream_info(fmt, nullptr) >= 0)
+                if (const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0); v >= 0) {
+                    const AVCodecParameters* par = fmt->streams[v]->codecpar;
+                    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(par->format));
+                    untagged422 = d && !(d->flags & AV_PIX_FMT_FLAG_RGB) && d->nb_components >= 3 && d->log2_chroma_w == 1 && d->log2_chroma_h == 0 &&
+                                  par->chroma_location == AVCHROMA_LOC_UNSPECIFIED;
+                }
+            avformat_close_input(&fmt);
+            if (!untagged422) continue;
+            in.chroma = "center";
+            m.path = interpretedPath(m.path, in);
+            for (MediaItem& sub : p.media)
+                if (sub.subclipOf == m.id && !sub.path.empty()) {
+                    Interpretation si = interpretationOf(sub);
+                    si.chroma = "center";
+                    sub.path = interpretedPath(sub.path, si);
+                }
+        }
     }
     if (p.stereoChecked) return;
     p.stereoChecked = true;

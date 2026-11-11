@@ -534,6 +534,7 @@ bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interp
             if (m->kind == MediaKind::Image) i.fps = Rational{0, 1};
             if (!isRawMedia(*m)) i.rawExposure = 0, i.rawTemperature = 0, i.rawTint = 0, i.rawHighlights.clear(), i.rawHalf = false, i.rawNoOpcodes = false;
             else if (keepHighlights) i.rawHighlights = interpretationOf(*m).rawHighlights;
+            i.chroma = interpretationOf(*m).chroma;  // (Interpret Colour's, which the dialog does not show: kept)
             if (auto it = each.find(id); it != each.end()) i.pulldown = it->second;
             const edit::Result r = edit::interpretFootage(p, id, i);
             if (!r.ok && !r.error.empty()) return edit::Result::fail(m->name + ": " + r.error);
@@ -1544,6 +1545,43 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             a->setCheckable(true);
             a->setChecked(current == cs.id);
             a->setData(QString::fromStdString(cs.id));
+        }
+        // Chroma siting: where the colour samples of subsampled footage sit, for files that do not say or say wrongly
+        // (a project saved while untagged 4:2:2 was read as centred has its footage of that kind set to Centre).
+        {
+            interpret->addSeparator();
+            QMenu* siting = interpret->addMenu(tr("Chroma siting"));
+            siting->setObjectName(QStringLiteral("interpretChroma"));
+            std::string now = first ? interpretationOf(*first).chroma : std::string();
+            for (Id id : pictures)
+                if (const MediaItem* m = state_->project().findMedia(id); m && interpretationOf(*m).chroma != now) now = "?";
+            auto setSiting = [this, pictures](const std::string& value) {
+                state_->apply(tr("Interpret Colour"), [pictures, value](Project& p, Sequence&) {
+                    edit::Result out = edit::Result::fail("");
+                    for (Id id : pictures) {
+                        const MediaItem* m = p.findMedia(id);
+                        if (!m) continue;
+                        Interpretation i = interpretationOf(*m);
+                        if (i.chroma == value) continue;
+                        i.chroma = value;
+                        if (ImageSequence seq; parseImageSequencePath(m->path, seq)) i.fps = seq.fps;
+                        const edit::Result r = edit::interpretFootage(p, id, i);
+                        if (!r.ok && !r.error.empty()) return edit::Result::fail(m->name + ": " + r.error);
+                        if (r.ok) out = {};
+                    }
+                    return out;
+                });
+            };
+            const std::pair<const char*, QString> choices[] = {{"", tr("As the file says")},
+                                                               {"left", tr("Left (co-sited)")},
+                                                               {"center", tr("Centre")},
+                                                               {"topleft", tr("Top left")}};
+            for (const auto& [value, label] : choices) {
+                QAction* a = siting->addAction(label, this, [setSiting, v = std::string(value)] { setSiting(v); });
+                a->setCheckable(true);
+                a->setChecked(now == value);
+                a->setData(QString::fromLatin1(value));
+            }
         }
         // How they are read: frame rate, pixel aspect, alpha, fields.
         menu.addAction(tr("Interpret Footage…"), this, [this, pictures] { interpretFootageDialog(pictures); })

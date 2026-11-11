@@ -1377,7 +1377,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
                      {"activeSequence", double(p.activeSequence)},
                      {"nextId", double(p.nextId)},
                      {"mediaStereo", 2},  // the media's stereo packing is recorded (2: MV-HEVC's too)
-                     {"cameraLens", 1}};  // depth of field through the scene's camera is the Camera clip's
+                     {"cameraLens", 1},     // depth of field through the scene's camera is the Camera clip's
+                     {"chromaSiting", 1}};  // untagged 4:2:2 is read co-sited unless a media item says otherwise
     QJsonArray media;
     for (const auto& m : p.media) {
         QJsonObject o{{"id", double(m.id)},
@@ -1543,6 +1544,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     p.activeSequence = Id(i64(root.value("activeSequence")));
     p.nextId = Id(i64(root.value("nextId"), 1));
     p.stereoChecked = root.value("mediaStereo").toInt() >= 2;
+    // (saved before untagged 4:2:2 was read co-sited: before the camera-lens marker, which came after that)
+    p.chromaChecked = root.value("chromaSiting").toInt() >= 1 || root.value("cameraLens").toInt() >= 1;
     if (root.value("mergeBase").isObject())
         p.mergeBase = std::make_shared<const std::string>(QJsonDocument(root.value("mergeBase").toObject()).toJson(QJsonDocument::Compact).toStdString());
     const QJsonObject mergeIds = root.value("mergeIds").toObject();
