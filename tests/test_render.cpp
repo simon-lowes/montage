@@ -22575,6 +22575,67 @@ colorspaces:
 #endif
     }
 
+    // Guessers from 64 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
+    // from elsewhere is tried every time, when right and when wrong, while they guess.
+    void browserReviewGuessersFromManyNetworks() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+#ifndef Q_OS_LINUX
+        QSKIP("Needs every 127.x address to be this computer's (Linux)");
+#else
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        ReviewRig rig;
+        rig.picture = [](FrameTime) { return std::make_shared<const Image>(320, 180); };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        const QByteArray pass = QByteArray::fromStdString(rig.settings.passphrase);
+        const int port = rig.port();
+        std::atomic<bool> guessing{true};
+        std::atomic<int> first{0}, wrong{0}, refused{0}, dropped{0};
+        std::vector<std::thread> guessers;
+        for (int n = 0; n < 64; ++n)
+            guessers.emplace_back([&, n] {
+                const QString from = QStringLiteral("127.1.%1.9").arg(n);
+                for (bool begun = false; guessing; begun = true) {
+                    const int s = httpsStatus(from, port, "/config", "not the passphrase", 8000);
+                    ++(s == 429 ? refused : s == 401 ? wrong : dropped);
+                    if (!begun) ++first;
+                    QThread::msleep(200);
+                }
+            });
+        auto stopGuessing = qScopeGuard([&] {
+            guessing = false;
+            for (auto& t : guessers) t.join();
+        });
+        // While their first guesses are still being answered, with every connection held: one who has the passphrase,
+        // and one who mistypes it and then has it.
+        QThread::msleep(300);
+        QCOMPARE(httpsStatus("127.2.0.5", port, "/config", pass, 8000), 200);
+        QCOMPARE(httpsStatus("127.2.1.5", port, "/config", "mistyped", 8000), 401);
+        QCOMPARE(httpsStatus("127.2.1.5", port, "/config", pass, 8000), 200);
+        QTRY_COMPARE_WITH_TIMEOUT(first.load(), 64, 20000);
+        // After every network's first wrong guess, for some seconds of their guessing: newcomers from eight more
+        // networks, each wrong twice and then right, and none of their tries is refused untried.
+        QElapsedTimer storm;
+        storm.start();
+        const int wrongBefore = wrong;
+        for (int k = 0; k < 8; ++k) {
+            const QString from = QStringLiteral("127.3.%1.5").arg(k);
+            QCOMPARE(httpsStatus(from, port, "/config", "mistyped", 8000), 401);
+            QCOMPARE(httpsStatus(from, port, "/config", "mistyped again", 8000), 401);
+            QCOMPARE(httpsStatus(from, port, "/config", pass, 8000), 200);
+            QCOMPARE(httpsStatus(QStringLiteral("127.4.%1.5").arg(k), port, "/config", pass, 8000), 200);
+        }
+        const double seconds = double(storm.elapsed()) / 1000.0;
+        const int wrongMeanwhile = wrong - wrongBefore;
+        qInfo("Guessers from 64 networks: %d told wrong and %d refused untried in all, %d told wrong in the last %.1f s",
+              wrong.load(), refused.load(), wrongMeanwhile, seconds);
+        QVERIFY(refused > 0);
+        // The guessers together: what each network may try at once, and five a second between them after that.
+        QVERIFY2(wrongMeanwhile <= 64 * 3 + int(5 * seconds) + 16, std::to_string(wrongMeanwhile).c_str());
+#endif
+    }
+
     void ndiOutput() {
         using namespace montage::output;
         // A stand-in NDI Runtime where the SDK says to look.

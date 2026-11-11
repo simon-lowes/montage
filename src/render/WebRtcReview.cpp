@@ -162,7 +162,8 @@ using Clock = std::chrono::steady_clock;
 
 constexpr qsizetype kMaxHeader = 16 * 1024, kMaxBody = 256 * 1024;  // (an offer is a few kilobytes)
 constexpr int kMaxConnections = 64, kMaxConnectionsFrom = 8;  // (all, and from one address or IPv6 /64)
-constexpr double kGuessRate = 5, kGuessBurst = 20;            // passphrases tried a second, from anywhere
+constexpr double kGuessRate = 5;                               // passphrases tried a second by all who guessed wrong lately
+constexpr double kNetworkBurst = 3;                           // and at once from one network that has
 constexpr double kPeerRate = 1, kPeerBurst = 8;               // and from one address or IPv6 /64 not yet let in
 constexpr std::chrono::hours kTrustedMemory{1};               // how long a right passphrase lets its address past the rest
 constexpr int kHandshakeMs = 5000;                            // a TLS handshake not done by then is dropped
@@ -376,6 +377,14 @@ struct Failures {
 // A token bucket for one address's requests.
 struct PeerBucket {
     double tokens = kPeerBurst;
+    Clock::time_point at = Clock::now();
+};
+
+// A network that has guessed wrong lately, and the passphrases it may still try: a ration of its own, so that no
+// network's guessing uses up another's tries.
+struct NetworkRation {
+    Clock::time_point last;  // when one there last guessed wrong
+    double tokens = kNetworkBurst;
     Clock::time_point at = Clock::now();
 };
 
@@ -718,10 +727,8 @@ struct BrowserReviewBackend::Impl {
     std::map<QString, Failures> failures;  // (that thread's)
     std::map<QString, PeerBucket> peerBuckets;          // (that thread's) by guesser()
     std::map<QString, Clock::time_point> trusted;       // (that thread's) addresses that gave the right passphrase lately
-    std::map<QString, Clock::time_point> guessingNetworks;  // (that thread's) by network(): when one there last guessed wrong
-    // Passphrases that may be tried now: from addresses and networks that have guessed wrong lately, and from the rest.
-    double guesses = kGuessBurst, freshGuesses = kGuessBurst;
-    Clock::time_point guessesAt = Clock::now(), freshGuessesAt = Clock::now();
+    std::map<QString, NetworkRation> guessingNetworks;  // (that thread's) by network(): those that guessed wrong lately
+    NetworkRation elsewhere;  // (that thread's) every network not listed, once the list is full
 
     std::map<std::string, std::shared_ptr<Viewer>> viewers;
     // Viewers let go, kept a few seconds more: a callback of theirs still running is never the last to hold one (a
@@ -795,15 +802,20 @@ struct BrowserReviewBackend::Impl {
 #endif
             return;
         }
-        const QList<QSslSocket*> open = server.findChildren<QSslSocket*>();
+        const QList<QSslSocket*> all = server.findChildren<QSslSocket*>();
         // (counted by IPv6 /64, as one computer can have many addresses in one)
         const QString from = guesser(c->peerAddress());
-        const auto fromThere = std::count_if(open.begin(), open.end(), [&](QSslSocket* o) { return guesser(o->peerAddress()) == from; });
+        const auto fromThere = std::count_if(all.begin(), all.end(), [&](QSslSocket* o) { return guesser(o->peerAddress()) == from; });
         if (fromThere > kMaxConnectionsFrom) {
             c->abort();
             c->deleteLater();
             return;
         }
+        // (the places are for connections with something to wait for. One only waiting to be told its passphrase was
+        // wrong holds none: guessers from many addresses, each waiting, keep nobody out. authorised() bounds those.)
+        QList<QSslSocket*> open;
+        for (QSslSocket* o : all)
+            if (!o->property("refusing").toBool()) open.append(o);
         if (open.size() > kMaxConnections) {
             // Full. A reviewer who gave the passphrase lately still gets in, in the place of the oldest connection
             // still waiting to be answered from anyone else. Anyone else gets in by their share: in the place of the
@@ -898,12 +910,13 @@ struct BrowserReviewBackend::Impl {
     }
 
     // The passphrase as a bearer token. An address that has guessed wrong too often lately is refused at once; each
-    // address (IPv6 /64) may try only so many a second, and all of them together only so many more (the rest refused
-    // untried), except addresses that gave the right one lately, so that guessing elsewhere never shuts reviewers
-    // already in out. Addresses whose network (IPv4 /24, IPv6 /48) has guessed wrong lately share that budget; the
-    // rest share one of their own, so that guessing from a few networks never shuts a newcomer out either (one who
-    // would must bring a fresh network for each wrong guess). Wrong ones are told a second after the one before from
-    // the same address.
+    // address (IPv6 /64) may try only so many a second (the rest refused untried), except addresses that gave the
+    // right one lately, so that guessing elsewhere never shuts reviewers already in out. A network (IPv4 /24, IPv6
+    // /48) is rationed from its first wrong guess: it has a few tries at once and then its share of the few a second
+    // that all the networks which guessed wrong lately have between them, split evenly. A network's guessing
+    // therefore uses up nobody else's tries: a newcomer from elsewhere is tried at once however many networks are
+    // guessing, and one who mistypes has a ration of their own. Wrong ones are told a second after the one before
+    // from the same address.
     bool authorised(QSslSocket* c, const Request& r) {
         const QString peer = guesser(c->peerAddress());
         const auto now = Clock::now();
@@ -916,13 +929,13 @@ struct BrowserReviewBackend::Impl {
         while (failures.size() > 4096)
             failures.erase(std::min_element(failures.begin(), failures.end(), [](const auto& a, const auto& b) { return a.second.last < b.second.last; }));
         const bool known = trusted.count(peer) > 0;
-        // (an address, or a network around it, that has guessed wrong lately; newcomers from elsewhere have a
-        // budget of their own, so that guessing from a few networks never shuts them out)
+        // (the network around it, if one there has guessed wrong lately. With the list of networks full, every
+        // network not in it shares one ration: guessing from more networks than the list holds gains nothing)
         const QString around = network(c->peerAddress());
-        forget(guessingNetworks, [&](Clock::time_point t) { return now - t > kFailureMemory; });
-        // (with the list of networks full, every network not in it counts as one that guessed: guessing from more
-        // networks than it holds never empties the newcomers' budget)
-        const bool suspect = failures.count(peer) > 0 || guessingNetworks.count(around) > 0 || guessingNetworks.size() >= 4096;
+        forget(guessingNetworks, [&](const NetworkRation& n) { return now - n.last > kFailureMemory; });
+        const bool full = guessingNetworks.size() >= 4096;
+        auto listed = guessingNetworks.find(around);
+        NetworkRation* ration = listed != guessingNetworks.end() ? &listed->second : full ? &elsewhere : nullptr;
         // (an address a reviewer is in lately, as a shared network's, is blocked only after many more)
         auto blocked = failures.find(peer);
         if (blocked != failures.end() && blocked->second.count >= (known ? 100 : 10)) {
@@ -939,15 +952,18 @@ struct BrowserReviewBackend::Impl {
                 return false;
             }
             mine.tokens -= 1;
-            double& pool = suspect ? guesses : freshGuesses;
-            Clock::time_point& poolAt = suspect ? guessesAt : freshGuessesAt;
-            pool = std::min(kGuessBurst, pool + std::chrono::duration<double>(now - poolAt).count() * kGuessRate);
-            poolAt = now;
-            if (pool < 1) {
-                respond(c, "429 Too Many Requests", {{"Retry-After", "5"}}, "Too many passphrases tried: try again shortly");
-                return false;
+            if (ration) {
+                const double rate = kGuessRate / double(guessingNetworks.size() + (full ? 1 : 0));
+                ration->tokens = std::min(kNetworkBurst, ration->tokens + std::chrono::duration<double>(now - ration->at).count() * rate);
+                ration->at = now;
+                if (ration->tokens < 1) {
+                    const int wait = int(std::clamp(std::ceil((1 - ration->tokens) / rate), 1.0, 600.0));
+                    respond(c, "429 Too Many Requests", {{"Retry-After", QByteArray::number(wait)}},
+                            "Too many wrong passphrases from this network: try again shortly");
+                    return false;
+                }
+                ration->tokens -= 1;
             }
-            pool -= 1;
         }
         QByteArray given = r.header("authorization");
         if (given.toLower().startsWith("bearer ")) given = given.mid(7).trimmed();
@@ -959,14 +975,27 @@ struct BrowserReviewBackend::Impl {
         Failures& f = failures[peer];
         ++f.count;
         f.last = now;
-        if (guessingNetworks.size() < 4096 || guessingNetworks.count(around)) guessingNetworks[around] = now;
-        // (per address: wrong guesses from elsewhere never hold back anyone's answer, the shared bucket above bounds
-        // how fast all of them together may guess)
+        // (the network's first wrong guess lists it, with the tries it has at once still to use)
+        if (listed != guessingNetworks.end() || !full) guessingNetworks[around].last = now;
+        // (per address: wrong guesses from elsewhere never hold back anyone's answer, the rations above bound how
+        // fast all of them together may guess)
         f.nextRefusal = std::max(now, f.nextRefusal) + std::chrono::seconds(1);
         const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(f.nextRefusal - now).count());
-        QTimer::singleShot(ms, c, [this, c] {
-            respond(c, "401 Unauthorized", {{"WWW-Authenticate", "Bearer realm=\"Montage review\""}}, "Wrong passphrase");
-        });
+        // (only waiting to be told so, and holding no place meanwhile. No more than a set number wait at once: past
+        // that, the one that has waited longest is told now.)
+        c->setProperty("refusing", true);
+        auto tell = [this](QSslSocket* o) {
+            if (!o->property("refusing").toBool()) return;
+            o->setProperty("refusing", false);
+            respond(o, "401 Unauthorized", {{"WWW-Authenticate", "Bearer realm=\"Montage review\""}}, "Wrong passphrase");
+        };
+        QTimer::singleShot(ms, c, [tell, c] { tell(c); });
+        if (c->parent()) {
+            QList<QSslSocket*> waiting;
+            for (QSslSocket* o : c->parent()->findChildren<QSslSocket*>())
+                if (o->property("refusing").toBool()) waiting.append(o);
+            if (waiting.size() > kMaxConnections) tell(waiting.front());  // (children are listed oldest first)
+        }
         return false;
     }
 
