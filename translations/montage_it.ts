@@ -11225,6 +11225,43 @@ Download it now?</source>
     </message>
 </context>
 <context>
+    <name>montage::DialogJobs</name>
+    <message>
+        <source>Montage stopped while this ran</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Montage stopped %n time(s) while this ran: it was not taken up again</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>The project kept with it could not be read</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Taken up again after Montage stopped: the project was copied to %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>, %n file(s) missing</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Stopped: %1</source>
+        <translation type="unfinished">Fermato: %1</translation>
+    </message>
+    <message>
+        <source>Taken up again after Montage stopped, but it failed: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>montage::EditorState</name>
     <message>
         <source>This project is open read-only (File › Edit Project to make changes)</source>
@@ -12742,14 +12779,6 @@ Do you want to replace it?</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Untouched footage already coded as this export is (H.264, HEVC or XDCAM&apos;s MPEG-2 at this size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Lossless</source>
         <translation type="unfinished">Senza perdita</translation>
     </message>
@@ -12843,6 +12872,62 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>JPEG XS:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not stated</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Constant bit rate (CBR)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Variable bit rate (VBR)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>States a buffer model (HRD) in H.264 or H.265 video, as broadcast ingest checks it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set above. The export is checked against it when it is written.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> kbit/s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The rate the stream states: its bit rate when constant, its highest when variable</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> kbit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A second&apos;s buffer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The decoder buffer the stream states. The lowest setting is a second at the rate.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Buffer model (HRD):</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Untouched footage already coded as this export is (H.264, HEVC, AV1, VP9 or XDCAM&apos;s MPEG-2 at this size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC, AV1, VP9 and XDCAM HD422</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, a constant %1 kbit/s with its buffer model stated (%2 kbit)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, no more than %1 kbit/s with its buffer model stated (%2 kbit)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -23425,6 +23510,10 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
             <numerusform></numerusform>
         </translation>
     </message>
+    <message>
+        <source>Taking up again what Montage was doing when it stopped: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -24419,6 +24508,26 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
             <numerusform></numerusform>
             <numerusform></numerusform>
         </translation>
+    </message>
+    <message>
+        <source>Chroma siting</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>As the file says</source>
+        <translation type="unfinished">Come dice il file</translation>
+    </message>
+    <message>
+        <source>Left (co-sited)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Centre</source>
+        <translation type="unfinished">Centro</translation>
+    </message>
+    <message>
+        <source>Top left</source>
+        <translation type="unfinished">In alto a sinistra</translation>
     </message>
 </context>
 <context>
