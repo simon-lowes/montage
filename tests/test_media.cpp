@@ -3383,20 +3383,43 @@ private slots:
             AVFormatContext* fc = nullptr;
             QVERIFY(avformat_open_input(&fc, c.path.c_str(), nullptr, nullptr) == 0);
             bool reel = false;
+            int video = -1;
             for (unsigned s = 0; s < fc->nb_streams; ++s) {
                 if (const AVDictionaryEntry* t = av_dict_get(fc->streams[s]->metadata, "reel_name", nullptr, 0)) reel = reel || std::string(t->value) == "TAPE07";
-                // (how the file says its colour is coded: the feed's BT.709, which a decoder otherwise guesses as BT.601 at
-                // this size. Checked on Linux and Windows; on macOS, where such a capture was read by BT.601 though
-                // tagged BT.709, said rather than checked until a run there shows how it is tagged)
+                // (how the file says its colour is coded: the feed's BT.709 in full, matrix, primaries and transfer,
+                // which a decoder otherwise guesses as BT.601 at this size. Checked on every platform.)
                 const AVCodecParameters* cp = fc->streams[s]->codecpar;
                 if (cp->codec_type != AVMEDIA_TYPE_VIDEO) continue;
-#ifdef __APPLE__
-                if (cp->color_space != AVCOL_SPC_BT709)
-                    qInfo("%s is tagged %s, not bt709", c.entry.name.c_str(), av_color_space_name(cp->color_space));
-#else
+                video = int(s);
                 const char* tag = av_color_space_name(cp->color_space);
                 QVERIFY2(cp->color_space == AVCOL_SPC_BT709, (c.entry.name + " is tagged " + (tag ? tag : "?") + ", not bt709").c_str());
-#endif
+                QCOMPARE(int(cp->color_primaries), int(AVCOL_PRI_BT709));
+                QCOMPARE(int(cp->color_trc), int(AVCOL_TRC_BT709));
+            }
+            // Its first picture says the same of itself (decoded here without the file's tags, in software).
+            QVERIFY(video >= 0);
+            {
+                const AVCodecParameters* cp = fc->streams[video]->codecpar;
+                AVCodecContext* dctx = avcodec_alloc_context3(avcodec_find_decoder(cp->codec_id));
+                QVERIFY(dctx && avcodec_parameters_to_context(dctx, cp) >= 0);
+                dctx->colorspace = AVCOL_SPC_UNSPECIFIED, dctx->color_primaries = AVCOL_PRI_UNSPECIFIED, dctx->color_trc = AVCOL_TRC_UNSPECIFIED;
+                QVERIFY(avcodec_open2(dctx, nullptr, nullptr) >= 0);
+                AVPacket* pkt = av_packet_alloc();
+                AVFrame* own = av_frame_alloc();
+                bool got = false;
+                while (!got && av_read_frame(fc, pkt) >= 0) {
+                    if (pkt->stream_index == video && avcodec_send_packet(dctx, pkt) >= 0) got = avcodec_receive_frame(dctx, own) >= 0;
+                    av_packet_unref(pkt);
+                }
+                if (!got && avcodec_send_packet(dctx, nullptr) >= 0) got = avcodec_receive_frame(dctx, own) >= 0;
+                const int matrix = got ? int(own->colorspace) : -1, primaries = got ? int(own->color_primaries) : -1, transfer = got ? int(own->color_trc) : -1;
+                av_frame_free(&own);
+                av_packet_free(&pkt);
+                avcodec_free_context(&dctx);
+                QVERIFY(got);
+                QCOMPARE(matrix, int(AVCOL_SPC_BT709));
+                QCOMPARE(primaries, int(AVCOL_PRI_BT709));
+                QCOMPARE(transfer, int(AVCOL_TRC_BT709));
             }
             avformat_close_input(&fc);
             QVERIFY(reel);

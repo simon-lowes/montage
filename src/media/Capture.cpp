@@ -966,7 +966,10 @@ void Recorder::run() {
     std::deque<std::pair<double, double>> delays;  // (a range placed by the clock: recent pictures' arrival and delay)
     int64_t soundEnd = INT64_MAX;  // (once stopped: the pictures' end)
     int width = 0, height = 0;
-    int colorSpace = AVCOL_SPC_BT709;
+    // How the recording says its colour is coded: the feed's matrix, primaries and transfer, BT.709's where a feed in
+    // BT.709's matrix says nothing of the others. The encoder, every picture given to it and so the file all say the
+    // same (a ProRes or DNxHR picture carries its own, which some readers take before the file's).
+    int colorSpace = AVCOL_SPC_BT709, colorPrimaries = AVCOL_PRI_BT709, colorTransfer = AVCOL_TRC_BT709;
     bool interlaced = false, topFirst = true;
     std::vector<uint8_t> ccCarried;  // (a dropped picture's caption data, for the next one)
     // ST 2110-41 fast metadata kept beside the recording, a line a frame (a dropped picture's items go with the next).
@@ -1315,6 +1318,8 @@ void Recorder::run() {
         colorSpace = !rgb && f->colorspace != AVCOL_SPC_UNSPECIFIED && f->colorspace != AVCOL_SPC_RGB ? f->colorspace
                      : height >= 720                                                                    ? AVCOL_SPC_BT709
                                                                                                         : AVCOL_SPC_SMPTE170M;
+        colorPrimaries = f->color_primaries != AVCOL_PRI_UNSPECIFIED ? f->color_primaries : colorSpace == AVCOL_SPC_BT709 ? AVCOL_PRI_BT709 : AVCOL_PRI_UNSPECIFIED;
+        colorTransfer = f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : colorSpace == AVCOL_SPC_BT709 ? AVCOL_TRC_BT709 : AVCOL_TRC_UNSPECIFIED;
         const AVCodec* enc = avcodec_find_encoder_by_name(codec->encoder);
         // (watched only: the pictures converted to the codec's format as if recorded, not encoded)
         if (!watchOnly) {
@@ -1325,8 +1330,8 @@ void Recorder::run() {
             venc->time_base = av_inv_q(fps);
             venc->framerate = fps;
             venc->sample_aspect_ratio = f->sample_aspect_ratio.num > 0 ? f->sample_aspect_ratio : AVRational{1, 1};
-            venc->color_primaries = f->color_primaries != AVCOL_PRI_UNSPECIFIED ? f->color_primaries : colorSpace == AVCOL_SPC_BT709 ? AVCOL_PRI_BT709 : AVCOL_PRI_UNSPECIFIED;
-            venc->color_trc = f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : colorSpace == AVCOL_SPC_BT709 ? AVCOL_TRC_BT709 : AVCOL_TRC_UNSPECIFIED;
+            venc->color_primaries = AVColorPrimaries(colorPrimaries);
+            venc->color_trc = AVColorTransferCharacteristic(colorTransfer);
             venc->colorspace = AVColorSpace(colorSpace);
             venc->color_range = AVCOL_RANGE_MPEG;
             venc->thread_count = 0;
@@ -1561,8 +1566,10 @@ void Recorder::run() {
         // (as coded: narrow range in the recording's matrix, the feed's pixel shape; a live view reads them)
         pic->colorspace = AVColorSpace(colorSpace);
         pic->color_range = AVCOL_RANGE_MPEG;
-        pic->color_primaries = f->color_primaries;
-        pic->color_trc = f->color_trc;
+        // (the recording's, as the encoder was told: a feed whose pictures say less is not written as "unspecified"
+        // in each picture's own header beside a file that says BT.709)
+        pic->color_primaries = f->color_primaries != AVCOL_PRI_UNSPECIFIED ? f->color_primaries : AVColorPrimaries(colorPrimaries);
+        pic->color_trc = f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : AVColorTransferCharacteristic(colorTransfer);
         pic->sample_aspect_ratio = f->sample_aspect_ratio;
         if (av_frame_get_buffer(pic, 0) < 0) {
             av_frame_free(&pic);
