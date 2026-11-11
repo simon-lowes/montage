@@ -495,7 +495,8 @@ void Node::setStreams(const st2110::VideoFormat& video, const st2110::AudioForma
     const bool formatChanged = video.width != video_.width || video.height != video_.height || !(video.fps == video_.fps) ||
                                video.interlaced != video_.interlaced || video.depth != video_.depth || video.tcs != video_.tcs ||
                                video.colorimetry != video_.colorimetry || audio.channels != audio_.channels || video.codec != video_.codec ||
-                               video.bpp != video_.bpp || video.packetMode != video_.packetMode || video.sampling != video_.sampling;
+                               video.bpp != video_.bpp || video.packetMode != video_.packetMode || video.sampling != video_.sampling ||
+                               audio.aes3 != audio_.aes3;
     video_ = video;
     audio_ = audio;
     options_ = o;

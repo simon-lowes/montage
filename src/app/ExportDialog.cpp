@@ -84,6 +84,7 @@ QString videoCodecName(const ExportSettings& s) {
     if (c == "libsvtav1") return QStringLiteral("AV1");
     if (c == "av2") return s.pixFmt.find("10") != std::string::npos ? QStringLiteral("AV2 10-bit") : QStringLiteral("AV2");
     if (c == "mjpeg") return QStringLiteral("Motion JPEG");
+    if (c == "jpegxs") return QStringLiteral("JPEG XS");
     if (c == "cfhd") return s.alpha ? QStringLiteral("CineForm RGBA") : QStringLiteral("CineForm");
     if (c == "ffv1") return QStringLiteral("FFV1 (lossless)");
     if (c == "v210") return QStringLiteral("Uncompressed 10-bit");
@@ -1125,6 +1126,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     }
     if (usesCrf(s.videoCodec)) s.crf = quality_->value();
     if (s.videoCodec == "av2" && av2ContainerForPath(s.path) != Av2Container::Mp4) s.audioCodec = "none";  // (IVF and OBU hold no sound)
+    if (s.videoCodec == "jpegxs" && jxsContainerForPath(s.path) != JxsContainer::Mxf) s.audioCodec = "none";  // (nor do raw codestreams)
     if (captions_->isEnabled()) {
         const int mode = captions_->currentData().toInt();
         s.burnInCaptions = mode & 1;

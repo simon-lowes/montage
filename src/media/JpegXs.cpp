@@ -469,10 +469,16 @@ bool indexCodestreams(QFile& f, std::vector<std::pair<int64_t, uint32_t>>& out, 
     int64_t at = 0;
     std::vector<uint8_t> whole;  // (a variable-rate file: read whole to find each codestream's end)
     while (at < total) {
-        if (!f.seek(at)) return fail(error, "Could not read " + f.fileName().toStdString());
-        const QByteArray head = f.read(std::min<int64_t>(total - at, 65536));
+        // (a header is some hundred bytes: the little read first, the most one can be only when that was short)
         JxsHeader h;
-        if (!readJxsHeader(reinterpret_cast<const uint8_t*>(head.constData()), size_t(head.size()), h)) {
+        bool read = false;
+        for (const int64_t most : {int64_t(1024), int64_t(65536)}) {
+            if (!f.seek(at)) return fail(error, "Could not read " + f.fileName().toStdString());
+            const QByteArray head = f.read(std::min<int64_t>(total - at, most));
+            read = readJxsHeader(reinterpret_cast<const uint8_t*>(head.constData()), size_t(head.size()), h);
+            if (read || total - at <= most) break;
+        }
+        if (!read) {
             if (out.empty()) return fail(error, f.fileName().toStdString() + " is not a JPEG XS codestream");
             break;  // (anything after the last whole codestream is passed over)
         }
@@ -965,7 +971,7 @@ bool JxsWriter::writeCodestream(const uint8_t* data, size_t size, std::string* e
                 cd->setColorSiting(MXF_COLOR_SITING_COSITING);
                 cd->setBlackRefLevel(st.s.fullRange ? 0 : 16u << (d - 8));
                 cd->setWhiteReflevel(st.s.fullRange ? (1u << d) - 1 : 235u << (d - 8));
-                cd->setColorRange(st.s.fullRange ? (1u << d) : (225u << (d - 8)) + 1);
+                cd->setColorRange(st.s.fullRange ? (1u << d) : (224u << (d - 8)) + 1);
             } else if (auto* rd = dynamic_cast<mxfpp::RGBAEssenceDescriptor*>(fd)) {
                 rd->setComponentMinRef(st.s.fullRange ? 0 : 16u << (d - 8));
                 rd->setComponentMaxRef(st.s.fullRange ? (1u << d) - 1 : 235u << (d - 8));

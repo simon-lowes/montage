@@ -18767,7 +18767,8 @@ colorspaces:
             for (int k = 0; k < frames && !stop; ++k) {
                 const Timecode t = timecodeOf(FrameTime(36000 * 25 + k), v.fps);
                 a.queueAes3(words.data() + size_t(k) * perFrame * 2, perFrame);
-                a.setNextMetadata({{0x123, false, {uint32_t(k), 0xDEADBEEF}}, {0x3FFFFF, true, {1}}});
+                // (the item with no words is one the stream cannot carry: left out, the frame and the others sent)
+                a.setNextMetadata({{0x123, false, {uint32_t(k), 0xDEADBEEF}}, {0x55, false, {}}, {0x3FFFFF, true, {1}}});
                 if (!a.send(pic, nullptr, 0, &t, {}, &stop)) break;
             }
         });
@@ -19303,6 +19304,19 @@ colorspaces:
             QCOMPARE(reinterpret_cast<const uint16_t*>(av->data[0] + av->linesize[0] * 7)[5], a.planes[0][size_t(7) * w + 5]);
         }
         QVERIFY(!rd.codestream(frames, *std::make_unique<std::vector<uint8_t>>(), &why));
+        // In the library the run is a video of its pictures; one codestream alone, a still.
+        {
+            montage::MediaItem m;
+            QVERIFY2(montage::probeMedia(raw, m, &why), why.c_str());
+            QVERIFY(m.kind == montage::MediaKind::Video && m.videoCodec == "jpegxs" && m.width == w && m.height == h && !m.hasAudio && m.duration > 0);
+            QFile one(dir.filePath("one.jxs"));
+            QVERIFY(one.open(QIODevice::WriteOnly));
+            one.write(reinterpret_cast<const char*>(coded[0].data()), qint64(coded[0].size()));
+            one.close();
+            montage::MediaItem still;
+            QVERIFY2(montage::probeMedia(one.fileName().toStdString(), still, &why), why.c_str());
+            QVERIFY(still.kind == montage::MediaKind::Image && still.duration == 0 && still.width == w && still.height == h);
+        }
         // A file cut short keeps its whole pictures; one that is no JPEG XS is refused.
         QFile::copy(QString::fromStdString(raw), dir.filePath("cut.jxs"));
         QFile(dir.filePath("cut.jxs")).resize(QFileInfo(QString::fromStdString(raw)).size() - 100);
@@ -19344,6 +19358,12 @@ colorspaces:
         QCOMPARE(QString::fromStdString(mi.essenceContainer), QStringLiteral("urn:smpte:ul:060e2b34.0401010d.0d010301.02210100"));
         QCOMPARE(QString::fromStdString(mi.pictureCoding).left(44), QStringLiteral("urn:smpte:ul:060e2b34.0401010d.04010202.0308"));
         QVERIFY(mi.horizontalSubsampling == 2 && mi.verticalSubsampling == 1 && mi.componentDepth == 10);
+        {
+            // (narrow range at ten bits: the CDCI descriptor's ColorRange, local tag 3306, is 897)
+            QFile f(QString::fromStdString(mxf));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QVERIFY(f.read(1 << 20).contains(QByteArray::fromHex("3306000400000381")));
+        }
         QVERIFY(mi.subDescriptor && mi.subPpih == mi.header.ppih && mi.subPlev == mi.header.plev && mi.subWf == w && mi.subHf == h && mi.subNc == 3);
         QVERIFY(mi.subComponentTable == mi.header.componentTable || mi.subComponentTable.size() + 4 == mi.header.componentTable.size());
         QVERIFY(mi.subMaxBitRate >= uint32_t(w * h * 4 * 25 / 1000000));

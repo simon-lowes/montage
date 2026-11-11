@@ -2879,6 +2879,18 @@ private slots:
         stop = true;
         sending.join();
         tx.close();
+        if (jpegXsAvailable()) {
+            // A JPEG XS sender (ST 2110-22) the controller connects is the feed as well.
+            v.codec = "jxsv", v.bpp = 3;
+            QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+            const QJsonObject patch{{"master_enable", true},
+                                    {"transport_file", QJsonObject{{"data", QString::fromStdString(tx.sdpVideo())}, {"type", "application/sdp"}}},
+                                    {"activation", QJsonObject{{"mode", "activate_immediate"}}}};
+            QCOMPARE(dlg->nmosNode()->handle("PATCH", "/x-nmos/connection/v1.1/single/receivers/" + receivers[0].toString() + "/staged",
+                                             QJsonDocument(patch).toJson()).code, 200);
+            QVERIFY2(url->text().contains("jxsv/90000"), qPrintable(url->text()));
+            tx.close();
+        }
         call({{"action", "nmos"}, {"offer", false}});
         QVERIFY(!dlg->nmosNode()->running());
         dlg->hide();

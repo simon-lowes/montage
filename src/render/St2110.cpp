@@ -792,10 +792,17 @@ std::vector<uint32_t> unpackAm824(const uint8_t* payload, size_t size, int chann
 
 // ---- ST 2110-41.
 
+namespace {
+// Whether ST 2110-41 carries the item: some words, no more than an item holds, a type of 22 bits.
+bool metadataFits(const FastMetadata& m) {
+    return !m.words.empty() && m.words.size() <= kMaxMetadataWords && 4 + m.words.size() * 4 <= kMaxMetadataPayload && m.type <= 0x3FFFFF;
+}
+}  // namespace
+
 bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload) {
     const size_t room = std::clamp<size_t>(size_t(std::max(maxPayload, 8)), 8, kMaxMetadataPayload);
     for (const FastMetadata& m : items)
-        if (m.words.empty() || m.words.size() > kMaxMetadataWords || 4 + m.words.size() * 4 > kMaxMetadataPayload || m.type > 0x3FFFFF) return false;
+        if (!metadataFits(m)) return false;
     std::vector<uint8_t> packet;
     bool ok = true;
     size_t i = 0;
@@ -1521,6 +1528,9 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
             ok = packAnc(out, field, ts, rtpAnc_, [&](const uint8_t* p, size_t n) { return s_->to(2, p, n); });
         }
         if (ok && o_.sendMetadata && f == 0) {
+            // (an item the stream cannot carry is left out: the frame's picture and sound go all the same)
+            nextMetadata_.erase(std::remove_if(nextMetadata_.begin(), nextMetadata_.end(), [](const FastMetadata& m) { return !metadataFits(m); }),
+                                nextMetadata_.end());
             ok = packFastMetadata(nextMetadata_, ts, rtpMeta_, [&](const uint8_t* p, size_t n) { return s_->to(3, p, n); }, o_.maxPayload);
             nextMetadata_.clear();
         }

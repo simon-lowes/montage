@@ -192,7 +192,6 @@ private:
     std::vector<uint8_t> prev_;
     std::vector<size_t> prevSlices_;
     size_t prevBoxes_ = 0, unit_ = 0;
-    int64_t prevPackets_ = 0;
     std::vector<uint8_t> done_;
     bool finish();
 };

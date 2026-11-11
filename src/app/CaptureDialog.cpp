@@ -542,7 +542,7 @@ void CaptureDialog::nmosConnected() {
     const std::vector<st2110::SdpStream> streams = node_->receiverStreams(&why);
     std::string text;
     bool video = false;
-    for (const st2110::SdpStream& s : streams) text += st2110::sdpText(s), video = video || s.encoding == "raw";
+    for (const st2110::SdpStream& s : streams) text += st2110::sdpText(s), video = video || s.encoding == "raw" || s.encoding == "jxsv";
     if (video) {
         setSource(QStringLiteral("st2110"), QString::fromStdString(text));
         nmosFeed_ = url_->text();

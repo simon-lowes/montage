@@ -716,13 +716,15 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         }
         m.path = path;
         if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
-        m.kind = MediaKind::Video;
+        // (one codestream alone is a still, as the decoder plays it)
+        const bool still = jc == JxsContainer::Codestream && ji.frames == 1;
+        m.kind = still ? MediaKind::Image : MediaKind::Video;
         m.hasVideo = true;
         if (jc != JxsContainer::Mxf || ji.soundTracks == 0) m.hasAudio = false;
         m.width = std::max(1, int(std::lround(ji.header.width * (in.par > 0 ? in.par : 1.0))));
         m.height = ji.header.height;
-        m.fps = Rational{ji.fpsNum, ji.fpsDen};
-        m.duration = ji.seconds() / in.timeScale();
+        if (!still) m.fps = Rational{ji.fpsNum, ji.fpsDen};
+        m.duration = still ? 0 : ji.seconds() / in.timeScale();
         m.videoCodec = "jpegxs";
         m.colorSpace = ji.colorSpace;
         out = m;

@@ -286,7 +286,6 @@ bool JxsvAssembler::finish() {
     int64_t lost = frameLost_;
     frameLost_ = 0;
     if (parts.empty()) return false;
-    if (prevPackets_ > 0) lost = std::max<int64_t>(lost, prevPackets_ - int64_t(parts.size()));
     for (const Part& q : parts)
         if (!q.last) unit_ = std::max(unit_, q.data.size());
     const bool slices = mode_ == 1;
@@ -330,7 +329,6 @@ bool JxsvAssembler::finish() {
         prev_ = cs;
         prevSlices_ = starts;
         prevBoxes_ = boxes;
-        prevPackets_ = int64_t(parts.size());
         done_ = std::move(cs);
         doneTimestamp_ = timestamp_;
         doneLost_ = 0;

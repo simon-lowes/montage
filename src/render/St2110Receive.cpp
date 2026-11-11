@@ -585,7 +585,10 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         const JxsSampling s444 = s.sdp.video.sampling == Sampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444;
         const std::vector<uint8_t>& cs = s.jxsv->codestream();
         const JxsSampling want = video_.sampling == Sampling::Ycc422 ? JxsSampling::Ycc422 : s444;
-        const bool ok = s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && pic.width == video_.width && pic.height == video_.height &&
+        // (a codestream of another size or depth than the SDP's is not decoded at all)
+        JxsHeader h;
+        const bool ok = readJxsHeader(cs.data(), cs.size(), h) && h.width == video_.width && h.height == video_.height && h.depth == video_.depth &&
+                        s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && pic.width == video_.width && pic.height == video_.height &&
                         pic.depth == video_.depth && pic.sampling == want;
         std::lock_guard lock(m_);
         if (!ok) {
