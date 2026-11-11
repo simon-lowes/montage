@@ -48,6 +48,7 @@ struct Multiviewer::Slot {
     bool ended = false;      // (the recorder has finished: waited for again)
     qint64 retryAt = 0;
     int generation = 0;
+    int opened = 0;          // times its feed was opened
     QString path, importedPath, error;
     Id media = 0;
     int64_t notedFrames = -1;
@@ -267,6 +268,7 @@ Multiviewer::Tile Multiviewer::tile(int i) const {
     t.peaks = now.peaks;
     t.path = s.path;
     if (s.recorder) t.repeated = s.recorder->status().repeated;
+    t.opened = s.opened;
     t.media = s.media;
     t.error = s.error;
     return t;
@@ -294,12 +296,50 @@ QString Multiviewer::nextPath(const QString& label) const {
 }
 
 bool Multiviewer::startSlot(Slot& s, bool record, QString* error) {
+    QString refused;
+    if (record && (folder().isEmpty() || !QDir().mkpath(folder()))) {
+        // (watched on, unrecorded, saying why)
+        refused = tr("Not recorded: choose a folder to record into");
+        if (error) *error = refused;
+        record = false;
+    }
+    // A feed being received is recorded, or no longer, from the same reception: nothing is opened again (an SRT
+    // caller does not have to call again, and no picture is missed between watching and recording).
+    // (a feed still being opened takes the file once it runs: not waited for, as this thread draws the window)
+    if (s.recorder && s.recorder->recording() && !s.ended) {
+        const bool running = s.feed->look().running;
+        CaptureFile to;
+        to.codec = codec_->currentData().toString().toStdString();
+        const QString path = record ? nextPath(labelOf(s.input)) : QString();
+        to.path = path.toStdString();
+        std::string why;
+        if (s.recorder->recordTo(to, &why, running)) {
+            if (s.recording) importSlot(s);  // (a recording shorter than its first fragment, whole now)
+            s.recording = record;
+            s.error = refused;
+            if (record) {
+                s.path = path;
+                s.media = 0;
+                s.importedPath.clear();
+                s.notedFrames = -1;
+            }
+            announce(s);
+            return true;
+        }
+        if (s.recorder->recording()) {
+            // (a file it cannot record: said, the feed watched on as it was)
+            s.error = QString::fromStdString(why);
+            if (error) *error = s.error;
+            return false;
+        }
+        // (the feed ended meanwhile: opened again)
+    }
     if (s.recorder) s.recorder->stop();  // (its notices are an earlier generation's: passed over)
     if (s.recording) importSlot(s);       // (a recording shorter than its first fragment, whole now)
     s.recorder.reset();
     s.recording = false;
     s.ended = false;
-    s.error.clear();
+    s.error = refused;
     CaptureSettings cs;
     cs.video.device = s.input.kind.toStdString();
     cs.video.url = s.input.url.trimmed().toStdString();
@@ -311,12 +351,6 @@ bool Multiviewer::startSlot(Slot& s, bool record, QString* error) {
     cs.live = s.feed;
     cs.codec = codec_->currentData().toString().toStdString();
     cs.openTimeout = 10;
-    if (record && (folder().isEmpty() || !QDir().mkpath(folder()))) {
-        // (watched on, unrecorded, saying why)
-        s.error = tr("Not recorded: choose a folder to record into");
-        if (error) *error = s.error;
-        record = false;
-    }
     if (record) {
         s.path = nextPath(labelOf(s.input));
         s.media = 0;
@@ -328,10 +362,29 @@ bool Multiviewer::startSlot(Slot& s, bool record, QString* error) {
     const int generation = ++s.generation;
     const quint64 id = s.id;
     QPointer<Multiviewer> self(this);
-    r->onFirstFragment = [self, id, generation] {
-        QMetaObject::invokeMethod(self.data(), [self, id, generation] {
+    // (the file whose first second is written, as the recorder says on its own thread: an input's files follow one
+    // another on one recorder)
+    Recorder* recorder = r.get();
+    r->onFirstFragment = [self, id, generation, recorder] {
+        const QString path = QString::fromStdString(recorder->status().path);
+        QMetaObject::invokeMethod(self.data(), [self, id, generation, path] {
             if (!self) return;
-            if (Slot* s = self->find(id); s && s->generation == generation) self->importSlot(*s);
+            if (Slot* s = self->find(id); s && s->generation == generation && s->path == path) self->importSlot(*s);
+        }, Qt::QueuedConnection);
+    };
+    // A file named while the feed was received that could not be begun: said on its tile, the feed watched on.
+    r->onFileFinished = [self, id, generation](const std::string& file, bool ok, const std::string& message) {
+        const QString path = QString::fromStdString(file), m = QString::fromStdString(message);
+        QMetaObject::invokeMethod(self.data(), [self, id, generation, path, ok, m] {
+            if (!self) return;
+            Slot* s = self->find(id);
+            if (!s || s->generation != generation || s->path != path) return;
+            if (!m.isEmpty()) s->error = m;
+            if (!ok && s->recording) {
+                s->recording = false;
+                self->announce(*s);
+            }
+            emit self->changed();
         }, Qt::QueuedConnection);
     };
     r->onFinished = [self, id, generation](bool ok, const std::string& message) {
@@ -350,6 +403,7 @@ bool Multiviewer::startSlot(Slot& s, bool record, QString* error) {
     }
     s.recorder = std::move(r);
     s.recording = record;
+    ++s.opened;
     announce(s);
     return true;
 }
@@ -642,7 +696,7 @@ QString Multiviewer::runTool(const QJsonObject& args, QJsonObject& structured, b
         for (float p : t.peaks) peaks.append(p > 0 ? std::round(20 * std::log10(double(p)) * 10) / 10 : -100.0);
         QJsonObject o{{"label", t.input.label}, {"kind", t.input.kind}, {"url", t.input.url}, {"record", t.input.record}, {"running", t.running},
                       {"recording", t.recording}, {"on_source", t.onSource}, {"timecode", t.timecode}, {"pictures", double(t.pictures)},
-                      {"width", t.width}, {"height", t.height}, {"peaks_dbfs", peaks}};
+                      {"width", t.width}, {"height", t.height}, {"peaks_dbfs", peaks}, {"opened", t.opened}};
         if (!t.path.isEmpty()) o["path"] = t.path;
         if (t.media) o["media"] = double(t.media);
         if (!t.error.isEmpty()) o["error"] = t.error;

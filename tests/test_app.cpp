@@ -3202,6 +3202,196 @@ private slots:
         r = call({{"action", "live"}, {"watch", false}});
         QVERIFY(!source->liveShowing() && !source->liveFeed());
         QTRY_VERIFY(!mv->tileWidget(0)->tally().isValid());
+        // Its recording ended from the reception it was made by: the feed was opened once, and is watched on.
+        QCOMPARE(mv->tile(0).opened, 1);
+        const int64_t seen = mv->tile(0).pictures;
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).running && mv->tile(0).pictures > seen + 5, 20000);
+        // The stream, watched since its sender called in, chosen and recorded: from that same reception (its sender
+        // has not called again: its feed opened once), the file starting on a picture between the stream's groups
+        // with the feed's own timecode there, each picture the one its timecode names.
+        r = call({{"action", "multiview"}, {"choose", QJsonArray{2}}, {"record", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(mv->tile(2).recording && !mv->tile(0).recording);
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(2).media != 0, 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(mv->feed(2)->look().frame >= 40, 30000);
+        r = call({{"action", "multiview"}, {"record", false}});
+        QVERIFY(!mv->tile(2).recording && mv->tile(2).running);
+        QCOMPARE(mv->tile(2).opened, 1);
+        QCOMPARE(r.value("structuredContent").toObject().value("inputs").toArray()[2].toObject().value("opened").toInt(), 1);
+        QCOMPARE(streams[0]->state(), QProcess::Running);
+        {
+            const QString file = mv->tile(2).path;
+            QVERIFY2(QFileInfo(file).fileName() == QStringLiteral("Stream 001.mov"), qPrintable(file));
+            MediaItem recorded;
+            QVERIFY2(probeMedia(file.toStdString(), recorded, &err), err.c_str());
+            QVERIFY2(recorded.duration >= 1.6 && recorded.timecode >= 12 * 3600 && recorded.timecode < 13 * 3600,
+                     qPrintable(QStringLiteral("%1 s from %2").arg(recorded.duration).arg(recorded.timecode)));
+            const int64_t from = std::llround(recorded.timecode * 25);
+            VideoDecoder dec;
+            QVERIFY(dec.open(file.toStdString()));
+            for (int k : {0, 1, 13, 30}) {
+                const Frame16Ptr f = dec.frameAt((k + 0.5) / 25.0);
+                QVERIFY(f);
+                const Image img = toImage(*f);
+                const int got = int(std::lround(img.at(img.width / 2, img.height / 2)[1] * 255));
+                // (a picture the stream sent late is held over the frame it missed)
+                QVERIFY2(std::abs(got - greyOf(from + k)) <= 6 || (k > 0 && std::abs(got - greyOf(from + k - 1)) <= 6),
+                         qPrintable(QStringLiteral("frame %1: %2, sent %3").arg(k).arg(got).arg(greyOf(from + k))));
+            }
+        }
+    }
+
+    // An HDR feed live on the Source monitor (BT.2100 PQ over ST 2110: JPEG XS at 1920 by 1080 where this build has
+    // it, else uncompressed at 1280 by 720): shown at the feed's own size where the monitor has the pixels, as HDR
+    // light while the HDR viewer shows HDR (a grey at 203 nits SDR white, one at 1000 nits near five times it), its
+    // SDR view the light rolled off as an HDR sequence's is; LIVE off and the feed taken away leave no HDR picture.
+    void liveHdrOnTheSourceMonitor() {
+        namespace st = st2110;
+        state()->newProject();
+        int ports[3];
+        {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.ttl = 1;
+        const bool xs = jpegXsAvailable();
+        const int W = xs ? 1920 : 1280, H = xs ? 1080 : 720;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        v.colorimetry = "BT2100", v.tcs = "PQ";
+        if (xs) v.codec = "jxsv", v.bpp = 3;
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        const int codes[2] = {int(std::lround(64 + 876 * fromLinear(Transfer::Pq, 1.0))), int(std::lround(64 + 876 * fromLinear(Transfer::Pq, 1000.0 / 203)))};
+        const double light[2] = {toLinear(Transfer::Pq, double(codes[0] - 64) / 876), toLinear(Transfer::Pq, double(codes[1] - 64) / 876)};
+        st::Raster raster(W, H, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < H; ++y) {
+            uint16_t* d = raster.row(y);
+            for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = uint16_t(codes[x < W / 2 ? 0 : 1]);
+        }
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            const std::vector<float> sound(1920 * 2, 0.0f);
+            for (int t = 0; !stop && t < 25 * 300; ++t) {
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                if (!tx.send(raster, sound.data(), 1920, &tc, {}, &stop)) break;
+            }
+        });
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        MonitorPanel* source = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Source) source = m;
+        auto* playback = win_->findChild<PlaybackController*>("sourcePlayback");
+        QVERIFY(source && playback);
+        ViewerWidget* viewer = source->viewer();
+        Multiviewer* mv = win_->multiviewer();
+        const bool hdrWas = playback->hdrOutput(), viewerWas = viewer->hdrViewer();
+        const QSize windowWas = win_->size(), leastWas = viewer->minimumSize();
+        auto finish = qScopeGuard([&] {
+            stop = true;
+            sending.join();
+            tx.close();
+            mv->clear();
+            mv->hide();
+#ifdef MONTAGE_HDR_VIEWER
+            HdrSurface::setTestDisplay(0);
+#endif
+            viewer->setHdrViewer(false);
+            source->setHdrViewer(viewerWas);
+            playback->setHdrOutput(hdrWas);
+            viewer->setMinimumSize(leastWas);
+            win_->resize(windowWas);
+            for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+                if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
+        });
+        viewer->setHdrViewer(false);
+        playback->setHdrOutput(false);
+        QJsonObject r = call({{"action", "multiview"},
+                              {"inputs", QJsonArray{QJsonObject{{"label", "HDR cam"}, {"kind", "st2110"},
+                                                                {"url", QString::fromStdString(tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc())}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 5, 60000);
+        QCOMPARE(mv->feed(0)->look().hdr, std::string("pq"));
+        r = call({{"action", "live"}, {"input", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(source->liveShowing());
+        // Its SDR view, with the HDR viewer off: no HDR picture; each grey as convertColor shows that light in SDR, at
+        // the feed's size or the 1280 by 720 a small monitor is given (the tile's own picture is 640 by 360 at most).
+        auto shown = [&] { return viewer->shownImage(); };
+        QTRY_VERIFY_WITH_TIMEOUT(shown().width() >= 1280, 30000);
+        QVERIFY(!viewer->hdrPicture());
+        QVERIFY2(shown().width() <= W && shown().height() >= 720, qPrintable(QStringLiteral("%1 by %2").arg(shown().width()).arg(shown().height())));
+        for (int side = 0; side < 2; ++side) {
+            Image one(1, 1);
+            float* p = one.at(0, 0);
+            p[0] = p[1] = p[2] = float(codes[side] - 64) / 876, p[3] = 1;
+            convertColor(one, *findColorSpace("rec2100pq"), rec709Space());
+            const int want = int(std::lround(std::clamp(one.at(0, 0)[1], 0.0f, 1.0f) * 255));
+            const QImage img = shown();
+            const int got = qGreen(img.pixel(img.width() / 4 + side * img.width() / 2, img.height() / 2));
+            QVERIFY2(std::abs(got - want) <= 4, qPrintable(QStringLiteral("%1, not %2").arg(got).arg(want)));
+        }
+        // With room for it, the feed's every pixel.
+        win_->resize(std::max(windowWas.width(), W + 1600), std::max(windowWas.height(), H + 1000));
+        viewer->setMinimumSize(W, H);
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->width() >= W && viewer->height() >= H, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(shown().width() == W && shown().height() == H, 30000);
+        // As HDR light, once the monitor's controller says HDR is shown (as it does while the HDR viewer shows it).
+        auto centre = [](const HdrPicture& pic, int side) {
+            float px[4];
+            const size_t at = size_t(pic.height / 2) * size_t(pic.width) + size_t(pic.width / 4 + side * pic.width / 2);
+            qFloatFromFloat16(px, reinterpret_cast<const qfloat16*>(&pic.rgba[at * 4]), 4);
+            return std::array<float, 4>{px[0], px[1], px[2], px[3]};
+        };
+        playback->setHdrOutput(true);
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->hdrPicture() != nullptr, 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->hdrPicture() && viewer->hdrPicture()->width == W, 30000);
+        const HdrPicturePtr pic = viewer->hdrPicture();
+        QVERIFY(pic->height == H && pic->rgba.size() == size_t(W) * size_t(H) * 4);
+        QVERIFY(pic->transfer == Transfer::Pq && std::fabs(pic->contentPeak - 1000.0 / 203) < 1e-6);
+        for (int side = 0; side < 2; ++side) {
+            const auto c = centre(*pic, side);
+            for (int k = 0; k < 3; ++k)
+                QVERIFY2(std::fabs(c[size_t(k)] / light[side] - 1) < 0.04, qPrintable(QStringLiteral("%1, not %2").arg(c[size_t(k)]).arg(light[side])));
+            QCOMPARE(c[3], 1.0f);
+        }
+        QVERIFY(std::fabs(light[0] - 1) < 0.02 && std::fabs(light[1] - 1000.0 / 203) < 0.1);
+#ifdef MONTAGE_HDR_VIEWER
+        // On a stand-in HDR display the HDR surface shows it, the badge up.
+        HdrSurface::setTestDisplay(4);
+        viewer->setHdrViewer(true);
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->hdrShowing(), 30000);
+        auto* hdrBadge = source->findChild<QLabel*>("hdrBadge");
+        QVERIFY(hdrBadge);
+        QTRY_VERIFY(hdrBadge->isVisible());
+        QVERIFY(playback->hdrOutput() && viewer->hdrPicture());
+#endif
+        // LIVE off (the media, none here): no HDR picture left on the monitor; on again, the feed's.
+        auto* badge = source->findChild<QToolButton*>(QStringLiteral("liveBadge"));
+        QVERIFY(badge && badge->isChecked());
+        badge->click();
+        QVERIFY(!source->liveShowing() && !viewer->hdrPicture());
+        QTest::qWait(200);  // (a picture that was being made ready is not shown)
+        QVERIFY(!viewer->hdrPicture());
+        badge->click();
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->hdrPicture() != nullptr, 30000);
+        r = call({{"action", "live"}, {"watch", false}});
+        QVERIFY(!source->liveFeed() && !viewer->hdrPicture());
+        QTest::qWait(200);
+        QVERIFY(!viewer->hdrPicture());
     }
 
     // Tangent panels through a stand-in Tangent Hub: introduced, the controls file written, turns, resets and value
