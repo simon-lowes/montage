@@ -67,12 +67,16 @@ void DialogJobs::save(const QString& id, const std::function<void(jobs::Record&)
 
 QString DialogJobs::begin(const QString& kind, const QString& title) {
     if (folder_.isEmpty() || !QDir().mkpath(folder_)) return {};
-    // (an id no job in the store has, another Montage's included: the folder is made here, or the next one is tried)
+    // (an id after every one the store has, so that they are listed in the order they were begun, and one no other
+    // Montage takes at the same moment: the folder is made here, or the next one is tried)
+    int from = 1;
+    for (const QString& name : QDir(folder_).entryList({QStringLiteral("app-*")}, QDir::Dirs | QDir::NoDotAndDotDot))
+        from = std::max(from, name.mid(4).toInt() + 1);
     QString id;
     int order = 0;
-    for (int n = 1; n < 1000000; ++n) {
+    for (int n = from; n < from + 1000; ++n) {
         const QString tryId = QStringLiteral("app-%1").arg(n);
-        if (QFileInfo::exists(jobs::jobFolder(tryId, folder_)) || !QDir(folder_).mkdir(tryId)) continue;
+        if (!QDir(folder_).mkdir(tryId)) continue;
         id = tryId;
         order = n;
         break;
@@ -193,7 +197,8 @@ int DialogJobs::resume() {
         run->options = optionsFromJson(r.data.value("options").toObject());
         // (the files the run before had begun are this job's own: they are written again, not beside themselves)
         for (const QJsonValue& v : r.data.value("files").toArray()) run->options.replace.push_back(v.toString().toStdString());
-        // Held by this Montage from now on.
+        // Held by this Montage from now on (unless another one, started with this, took it meanwhile).
+        if (jobs::Record now; !jobs::load(r.id, now, folder_) || now.status != QLatin1String("interrupted")) continue;
         r.status = QStringLiteral("running");
         r.progress = 0;
         r.error.clear();

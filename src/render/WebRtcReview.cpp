@@ -164,6 +164,7 @@ constexpr qsizetype kMaxHeader = 16 * 1024, kMaxBody = 256 * 1024;  // (an offer
 constexpr int kMaxConnections = 64, kMaxConnectionsFrom = 8;  // (all, and from one address or IPv6 /64)
 constexpr double kGuessRate = 5;                               // passphrases tried a second by all who guessed wrong lately
 constexpr double kNetworkBurst = 3;                           // and at once from one network that has
+constexpr double kListedBurst = 256;                          // (fewer once the networks listed are more than a third of this)
 constexpr double kPeerRate = 1, kPeerBurst = 8;               // and from one address or IPv6 /64 not yet let in
 constexpr std::chrono::hours kTrustedMemory{1};               // how long a right passphrase lets its address past the rest
 constexpr int kHandshakeMs = 5000;                            // a TLS handshake not done by then is dropped
@@ -912,8 +913,9 @@ struct BrowserReviewBackend::Impl {
     // The passphrase as a bearer token. An address that has guessed wrong too often lately is refused at once; each
     // address (IPv6 /64) may try only so many a second (the rest refused untried), except addresses that gave the
     // right one lately, so that guessing elsewhere never shuts reviewers already in out. A network (IPv4 /24, IPv6
-    // /48) is rationed from its first wrong guess: it has a few tries at once and then its share of the few a second
-    // that all the networks which guessed wrong lately have between them, split evenly. A network's guessing
+    // /48) is rationed from its first wrong guess: it has a few tries at once (fewer when very many networks are
+    // guessing) and then its share of the few a second that all the networks which guessed wrong lately have
+    // between them, split evenly. A network's guessing
     // therefore uses up nobody else's tries: a newcomer from elsewhere is tried at once however many networks are
     // guessing, and one who mistypes has a ration of their own. Wrong ones are told a second after the one before
     // from the same address.
@@ -975,8 +977,16 @@ struct BrowserReviewBackend::Impl {
         Failures& f = failures[peer];
         ++f.count;
         f.last = now;
-        // (the network's first wrong guess lists it, with the tries it has at once still to use)
-        if (listed != guessingNetworks.end() || !full) guessingNetworks[around].last = now;
+        // (the network's first wrong guess lists it, with the tries it has at once still to use: three while few
+        // networks are guessing, fewer and then none as they become many, so that guessing from very many networks
+        // gains little more than each one's first try)
+        if (listed != guessingNetworks.end()) {
+            listed->second.last = now;
+        } else if (!full) {
+            NetworkRation& n = guessingNetworks[around];
+            n.last = now;
+            n.tokens = std::clamp(std::floor(kListedBurst / double(guessingNetworks.size())), 0.0, kNetworkBurst);
+        }
         // (per address: wrong guesses from elsewhere never hold back anyone's answer, the rations above bound how
         // fast all of them together may guess)
         f.nextRefusal = std::max(now, f.nextRefusal) + std::chrono::seconds(1);
