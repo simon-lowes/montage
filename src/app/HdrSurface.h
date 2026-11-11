@@ -81,9 +81,13 @@ private:
     bool displayShowsHdr();  // the display the viewer is on takes the extended-range swap chain (sets problem_ if not)
     void stopHdr(const QString& why);
     void describeSurface();  // Wayland: the surface's image description, for the picture shown (before each frame)
-    // Wayland: the headroom and reference white the compositor prefers where the viewer is. False if it did not say;
-    // `asked` then tells whether there was a surface to ask about.
-    bool waylandDisplay(double* headroom, double* whiteNits, bool* asked = nullptr);
+    // Wayland: the headroom and reference white the compositor prefers where the viewer is: whether there was a
+    // surface to ask about, and whether the compositor said.
+    struct WaylandDisplay {
+        bool asked = false, known = false;
+        double headroom = 1, whiteNits = 0;
+    };
+    WaylandDisplay waylandDisplay();
 
     QPointer<QWidget> target_;
     std::unique_ptr<HdrSurfaceGpu> gpu_;
@@ -99,6 +103,7 @@ private:
     bool encoded_ = false;  // Linux: drawn as linear light, then written as PQ or HLG into a 10-bit swap chain
     std::unique_ptr<WaylandColor> wayland_;
     QPointer<QObject> waylandWindow_;  // (Qt's Wayland window, whose surfaceDestroyed lets the description go)
+    QElapsedTimer ownFrame_;           // Wayland: since the surface's wl_surface first had a frame (not valid before)
     int frames_ = 0;
     QString problem_;
     QElapsedTimer displayRead_;  // since the display's HDR range was last asked

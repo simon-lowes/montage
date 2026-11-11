@@ -21423,7 +21423,8 @@ print("added " + ui["name"])
         for (int i = 0; i < 3; ++i) {
             const int before = drawn();
             viewer.setHdrPicture(ramp);
-            QTRY_VERIFY2_WITH_TIMEOUT(drawn() > before, qPrintable(viewer.hdrStatus()), 10000);
+            QTRY_VERIFY2_WITH_TIMEOUT(drawn() > before, qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame drawn") : viewer.hdrStatus()),
+                                      10000);
         }
         // Still showing, on the surface's own answer now (the same output).
         QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));

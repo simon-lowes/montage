@@ -52,6 +52,7 @@ struct WaylandColor::State {
     // An image description being made or read: ready or failed, and what get_information told.
     struct Pending {
         bool ready = false, failed = false;
+        uint32_t cause = 0;  // wp_image_description_v1.cause, when failed
         std::string why;
         bool infoDone = false;
         Preferred info;
@@ -67,8 +68,11 @@ struct WaylandColor::State {
         return p.ready;
     }
 
-    // Reads what the compositor prefers for a surface through its feedback object; false if it did not say.
-    bool read(wp_color_management_surface_feedback_v1* from, Preferred& out);
+    // Reads what the compositor prefers for a surface through its feedback object into `out`: Known; Unknown if it
+    // has none to read (not parametric, no luminances); Later if it cannot say just now (no output for the surface
+    // at the moment, or no answer). `out` is written only when Known.
+    enum class Answer { Known, Unknown, Later };
+    Answer read(wp_color_management_surface_feedback_v1* from, Preferred& out);
 };
 
 namespace {
@@ -106,6 +110,7 @@ const wp_image_description_v1_listener kDescriptionListener = [] {
     l.failed = [](void* data, wp_image_description_v1*, uint32_t cause, const char* msg) {
         auto* p = static_cast<WaylandColor::State::Pending*>(data);
         p->failed = true;
+        p->cause = cause;
         p->why = msg && *msg ? msg : "cause " + std::to_string(cause);
     };
     l.ready = [](void* data, wp_image_description_v1*, uint32_t) { static_cast<WaylandColor::State::Pending*>(data)->ready = true; };
@@ -145,8 +150,8 @@ const wp_color_management_surface_feedback_v1_listener kFeedbackListener = [] {
 
 }  // namespace
 
-bool WaylandColor::State::read(wp_color_management_surface_feedback_v1* from, Preferred& out) {
-    if (!from) return false;
+WaylandColor::State::Answer WaylandColor::State::read(wp_color_management_surface_feedback_v1* from, Preferred& out) {
+    if (!from) return Answer::Later;
     Pending p;
     // As parameters (its luminances are what is read), not as an ICC profile, which an output may be described with.
     // (where the generated header has the request)
@@ -158,7 +163,7 @@ bool WaylandColor::State::read(wp_color_management_surface_feedback_v1* from, Pr
     wp_image_description_v1* d = wp_color_management_surface_feedback_v1_get_preferred(from);
 #endif
     wp_image_description_v1_add_listener(d, &kDescriptionListener, &p);
-    bool known = false;
+    Answer answer = Answer::Later;
     if (waitFor(p)) {
         wp_image_description_info_v1* info = wp_image_description_v1_get_information(d);
         wp_image_description_info_v1_add_listener(info, &kInfoListener, &p);
@@ -167,11 +172,16 @@ bool WaylandColor::State::read(wp_color_management_surface_feedback_v1* from, Pr
         wp_image_description_info_v1_destroy(info);  // (the compositor's side went with `done`)
         if (p.infoDone && p.info.referenceNits > 0) {
             out = p.info;
-            out.known = known = true;
+            out.known = true;
+            answer = Answer::Known;
+        } else if (p.infoDone) {
+            answer = Answer::Unknown;  // (described, but not by luminances)
         }
+    } else if (p.failed && p.cause != WP_IMAGE_DESCRIPTION_V1_CAUSE_NO_OUTPUT) {
+        answer = Answer::Unknown;  // (it has no such description: an output described by an ICC profile, say)
     }
     wp_image_description_v1_destroy(d);
-    return known;
+    return answer;
 }
 
 WaylandColor::WaylandColor(wl_display* display) : s_(std::make_unique<State>()) {
@@ -297,8 +307,9 @@ void WaylandColor::dispatch() {
     wl_display_dispatch_queue_pending(s.display, s.queue);
     if (!s.preferredChanged || !s.feedback) return;
     s.preferredChanged = false;
-    // (what was known is kept if the compositor cannot say just now: an output going or coming)
-    s.read(s.feedback, s.preferred);
+    // (what was known is kept if the compositor cannot say just now, an output going or coming; not if it has
+    // nothing to say for where the surface is now)
+    if (s.read(s.feedback, s.preferred) == State::Answer::Unknown) s.preferred = Preferred();
 }
 
 WaylandColor::Preferred WaylandColor::preferredFor(wl_surface* surface) {
