@@ -59,15 +59,15 @@ EOF
   # only through its seat's focus: with none, the output keeps pointing at the freed window (desktop_surface_removed
   # in kiosk-shell.c) and Weston crashes when the next window is mapped, as the test's viewer is after the main window
   # is hidden. Desktops always have a seat.
-  # The log also has what Weston's renderer draws each surface with (its buffer's format, its colour transformation and
-  # the shaders made for it), for when its screenshot is not what the test expects.
+  # The log also has what Weston's renderer draws each surface with (its buffer's format and its colour
+  # transformation), for when its screenshot is not what the test expects.
   # Weston 16 blends in its fragment shaders where the GL driver can read the framebuffer back in a shader, and under
   # Mesa's llvmpipe that showed every window black on the PQ output, SDR ones too. Without that one extension Weston
   # blends in a half-float buffer of its own, as its earlier releases always did.
   LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     MESA_EXTENSION_OVERRIDE="-GL_EXT_shader_framebuffer_fetch_non_coherent" "$weston_prefix/bin/weston" \
     --backend=headless --fake-seat --renderer=gl --width=1280 --height=720 --shell=kiosk --socket="$socket" \
-    --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto,gl-renderer-paint-nodes,color-lcms-transformations,gl-shader-generator &
+    --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto,gl-renderer-paint-nodes,color-lcms-transformations &
   weston=$!
   local i
   for i in $(seq 100); do

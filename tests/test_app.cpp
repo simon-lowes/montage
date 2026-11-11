@@ -21686,14 +21686,27 @@ print("added " + ui["name"])
             }
         ramp->rgba.resize(texels.size());
         qFloatToFloat16(reinterpret_cast<qfloat16*>(ramp->rgba.data()), texels.data(), qsizetype(texels.size()));
-        // Weston's screenshot of its output (kept under `name` beside its log; null if none could be taken).
+        // Weston's screenshot of its output (kept under `name` beside its log; null, and why, if none could be taken).
         const QString shooter = qEnvironmentVariable("MONTAGE_TEST_WESTON_SCREENSHOOTER");
         const QDir shots(qEnvironmentVariable("XDG_PICTURES_DIR"));
+        QString noShot;
         auto screenshot = [&](const QString& name) {
-            if (shooter.isEmpty() || !shots.exists() || QProcess::execute(shooter, {}) != 0) return QImage();
+            noShot.clear();
+            if (shooter.isEmpty() || !shots.exists()) {
+                noShot = QStringLiteral("MONTAGE_TEST_WESTON_SCREENSHOOTER or XDG_PICTURES_DIR is not set");
+                return QImage();
+            }
+            if (const int status = QProcess::execute(shooter, {}); status != 0) {
+                noShot = QStringLiteral("Weston's screenshooter ended with status %1").arg(status);
+                return QImage();
+            }
             const QStringList pngs = shots.entryList({QStringLiteral("wayland-screenshot-*.png")}, QDir::Files, QDir::Time);
-            if (pngs.isEmpty()) return QImage();
+            if (pngs.isEmpty()) {
+                noShot = QStringLiteral("Weston's screenshooter wrote no picture");
+                return QImage();
+            }
             const QImage shot = QImage(shots.filePath(pngs.first())).convertToFormat(QImage::Format_RGB32);
+            if (shot.isNull()) noShot = QStringLiteral("Weston's screenshot cannot be read");
             QFile::remove(shots.filePath(name));
             QFile::rename(shots.filePath(pngs.first()), shots.filePath(name));
             return shot;
@@ -21703,15 +21716,20 @@ print("added " + ui["name"])
             // First the SDR viewer as Weston shows it, so the screenshot further down is of what Weston shows: the
             // picture's grey as it is without colour management, and on the PQ output at the output's reference white
             // (sRGB white at 203 nits; Weston reads sRGB as gamma 2.2).
-            QTest::qWait(500);  // (the viewer painted, Weston repainted)
-            const QImage sdrShot = screenshot(QStringLiteral("sdr.png"));
-            QVERIFY2(!sdrShot.isNull(), "no screenshot from Weston");
-            const QRgb px = sdrShot.pixel(sdrShot.width() / 2, sdrShot.height() / 2);
             const int expect = cm ? int(std::lround(nitsToCode(pq, 203 * std::pow(90 / 255.0, 2.2)) * 255)) : 90;
-            const QString said = QStringLiteral("Weston shows the SDR viewer's grey (sRGB 90) as %1 %2 %3, expected %4")
-                                     .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect);
+            QString said;
+            bool right = false;
+            for (int attempt = 0; attempt < 6 && !right; ++attempt) {  // (until the viewer has painted and Weston repainted)
+                QTest::qWait(500);
+                const QImage sdrShot = screenshot(QStringLiteral("sdr.png"));
+                QVERIFY2(!sdrShot.isNull(), qPrintable(noShot));
+                const QRgb px = sdrShot.pixel(sdrShot.width() / 2, sdrShot.height() / 2);
+                said = QStringLiteral("Weston shows the SDR viewer's grey (sRGB 90) as %1 %2 %3, expected %4")
+                           .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect);
+                right = std::abs(qRed(px) - expect) <= 3 && std::abs(qGreen(px) - expect) <= 3 && std::abs(qBlue(px) - expect) <= 3;
+            }
             qInfo().noquote() << said;
-            QVERIFY2(std::abs(qRed(px) - expect) <= 3 && std::abs(qGreen(px) - expect) <= 3 && std::abs(qBlue(px) - expect) <= 3, qPrintable(said));
+            QVERIFY2(right, qPrintable(said));
         }
         viewer.setHdrViewer(true);
         viewer.setHdrPicture(ramp);
@@ -21743,7 +21761,9 @@ print("added " + ui["name"])
             QTRY_VERIFY2_WITH_TIMEOUT(drawn() > before, qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame drawn") : viewer.hdrStatus()),
                                       10000);
         }
-        // Still showing, on the surface's own answer now (the same output).
+        // Still showing once the display has been asked again a few times (every second), by then on the surface's
+        // own answer (the same output).
+        QTest::qWait(2500);
         QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));
         QCOMPARE(viewer.hdrSurface(), surface);
         QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
@@ -21799,7 +21819,7 @@ print("added " + ui["name"])
         QVERIFY2(tenBit, "no 10-bit buffer in Weston's protocol log");
         // Weston's screenshot of its PQ output: each bar's middle is the ramp's PQ code (8 bits) within 2.
         const QImage shot = screenshot(QStringLiteral("hdr.png"));
-        QVERIFY2(!shot.isNull(), "no screenshot from Weston");
+        QVERIFY2(!shot.isNull(), qPrintable(noShot));
         const QRectF r = viewer.imageRect().translated(QPointF(viewer.mapTo(viewer.window(), QPoint(0, 0))));
         QStringList said;
         bool right = true;

@@ -570,14 +570,14 @@ HdrSurface::WaylandDisplay HdrSurface::waylandDisplay() {
     QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
     if (wayland_->surface()) {
         // The surface's own answer, read again first if the compositor said it changed (another output, its
-        // brightness). It stands when it is HDR, and whatever it is once the surface has had a frame up for a while.
+        // brightness). It stands when it is HDR, and when it is SDR once the surface has had a frame up for a while.
         if (isVisible() && native && native->nativeResourceForWindow("surface", this) == wayland_->surface()) wayland_->dispatch();
         out = answered(wayland_->preferred());
-        if ((out.known && out.headroom > 1.0) || (ownFrame_.isValid() && ownFrame_.elapsed() >= 2000)) return out;
+        if (out.known && (out.headroom > 1.0 || (ownFrame_.isValid() && ownFrame_.elapsed() >= 2000))) return out;
     }
-    // Until then the viewer's top-level window's, once that is shown: it is on its output already, while a surface
-    // with no frame yet is on none, and a compositor answers for such a surface with a default (its first output's,
-    // or sRGB) until it is on one.
+    // Else the viewer's top-level window's, once that is shown: it is on its output already, while a surface with no
+    // frame yet is on none, and a compositor answers for such a surface with a default (its first output's, or sRGB)
+    // until it is on one. (Also where the compositor never says what it prefers for the surface itself.)
     QWindow* top = target_ ? target_->window()->windowHandle() : nullptr;
     auto* surface = native && top && top->isExposed() ? static_cast<wl_surface*>(native->nativeResourceForWindow("surface", top)) : nullptr;
     if (surface) {
