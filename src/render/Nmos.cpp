@@ -670,8 +670,13 @@ QJsonArray Node::flowResources() const {
         } else if (i == 1) {
             f["format"] = "urn:x-nmos:format:audio";
             f["sample_rate"] = QJsonObject{{"numerator", audio_.rate}, {"denominator", 1}};
-            f["media_type"] = audio_.bits == 16 ? "audio/L16" : "audio/L24";
-            f["bit_depth"] = audio_.bits;
+            // (ST 2110-31's AES3 subframes: no linear PCM flow, so by its RTP payload's name and no bit depth)
+            if (audio_.aes3) {
+                f["media_type"] = "audio/AM824";
+            } else {
+                f["media_type"] = audio_.bits == 16 ? "audio/L16" : "audio/L24";
+                f["bit_depth"] = audio_.bits;
+            }
         } else {
             f["format"] = "urn:x-nmos:format:data";
             f["grain_rate"] = rational(video_.fps);

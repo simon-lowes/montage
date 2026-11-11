@@ -132,12 +132,14 @@ int usage() {
                  "                     [--label NAME] [--registry URL | --domain DOMAIN [--dns-server ADDR]]\n"
                  "                     [--video2 ADDR:PORT --audio2 ADDR:PORT --data2 ADDR:PORT [--send-interface2 ADDR]]\n"
                  "                     [--receivers [--interface2 ADDR]] [--jpeg-xs BITS [--slices]] [--metadata ADDR:PORT [--metadata2 ADDR:PORT]]\n"
+                 "                     [--aes3]\n"
                  "                     (colour bars and a tone sent as SMPTE ST 2110 video, sound and time code, their SDP files\n"
                  "                      printed; an NMOS node registers them and lets a controller route them; with --receivers\n"
                  "                      it offers receivers too, and says what a controller connects them to brings; the\n"
                  "                      second path's addresses send every packet twice, as ST 2022-7 does; --jpeg-xs: the\n"
                  "                      bars coded as JPEG XS at BITS a pixel (ST 2110-22, a slice a packet unit with --slices);\n"
-                 "                      --metadata: each frame's number and time code as ST 2110-41 fast metadata)\n"
+                 "                      --metadata: each frame's number and time code as ST 2110-41 fast metadata;\n"
+                 "                      --aes3: the tone as AES3 subframes, ST 2110-31)\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png|.jpg|.tif|.avif|.heic> [--rendition master|<trim target>] [--gain-map]\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
@@ -719,7 +721,7 @@ int cmdSt2110(const std::vector<std::string>& args) {
     std::string modeName = "1080p25";
     int depth = 10, channels = 2, seconds = 0;
     double jpegXsBpp = 0;
-    bool slices = false;
+    bool slices = false, aes3 = false;
     bool nmosOn = true;
     st2110::SenderOptions so = st2110::SenderOptions{};
     nmos::NodeOptions no;
@@ -758,6 +760,7 @@ int cmdSt2110(const std::vector<std::string>& args) {
         else if (a == "--interface2") no.interface2 = QString::fromStdString(next());
         else if (a == "--jpeg-xs") jpegXsBpp = std::atof(next().c_str());
         else if (a == "--slices") slices = true;
+        else if (a == "--aes3") aes3 = true;
         else if (a == "--metadata") { if (!endpoint(so.metadata)) return 2; so.sendMetadata = true; }
         else if (a == "--metadata2") { if (!endpoint(so.metadata2)) return 2; }
         else return usage();
@@ -784,6 +787,7 @@ int cmdSt2110(const std::vector<std::string>& args) {
     if (so.sendMetadata) so.metadataTypes = {st2110::kFrameItemType};
     st2110::AudioFormat af;
     af.channels = channels;
+    if (aes3) af.aes3 = true, af.packetUs = channels > 6 ? 125 : 1000;  // (ST 2110-31: 8 subframes fit 125 µs packets)
     // 75 % colour bars (BT.709): white, yellow, cyan, green, magenta, red, blue.
     const PixelFormat format = depth == 10 ? PixelFormat::V210 : PixelFormat::Uyvy8;
     video::Ycbcr422 bars(vf.width, vf.height);

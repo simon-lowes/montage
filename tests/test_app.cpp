@@ -23464,6 +23464,24 @@ print("added " + ui["name"])
             QVERIFY(r.value("structuredContent").toObject().value("sdp").toObject().value("video").toString().contains("raw/90000"));
             QVERIFY(call({{"action", "start"}, {"st2110", QJsonObject{{"jpeg_xs_bpp", 30}}}}).value("isError").toBool());
         }
+        // ST 2110-31: the sound as AES3 subframes, its SDP AM824 and its NMOS flow by that name; kept in the settings.
+        // Then PCM again.
+        r = call({{"action", "start"}, {"st2110", QJsonObject{{"redundant", false}, {"aes3", true}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "status"}});
+        QVERIFY2(r.value("structuredContent").toObject().value("sdp").toObject().value("audio").toString().contains("AM824/48000/"),
+                 QJsonDocument(r).toJson().constData());
+        QVERIFY(controller->nmosNode());
+        {
+            const QByteArray flows = controller->nmosNode()->handle("GET", "/x-nmos/node/v1.3/flows/", {}).body;
+            QVERIFY2(flows.contains("audio/AM824") && !flows.contains("audio/L24"), flows.constData());
+        }
+        QVERIFY(ReferenceOutputController::loadSt2110().aes3);
+        r = call({{"action", "start"}, {"st2110", QJsonObject{{"aes3", false}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "status"}});
+        QVERIFY(r.value("structuredContent").toObject().value("sdp").toObject().value("audio").toString().contains("L24/48000/"));
+        QVERIFY(!ReferenceOutputController::loadSt2110().aes3);
         r = call({{"action", "start"}, {"st2110", QJsonObject{{"video", "not an address"}}}});
         QVERIFY(r.value("isError").toBool());
         call({{"action", "stop"}});

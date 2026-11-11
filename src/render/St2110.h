@@ -352,6 +352,9 @@ struct SenderOptions {
     bool jpegXs = false;
     double jpegXsBpp = 5;
     int jpegXsPacketMode = 0;
+    // ST 2110-31 in place of ST 2110-30 (the reference output's: its sound as AES3 subframes, AudioFormat::aes3, in
+    // 125 µs packets above 6 channels).
+    bool aes3 = false;
     std::string refclk = "ptp=IEEE1588-2008:traceable";
     // ST 2022-7: every packet also sent to these (from `interfaceAddress2`), when `redundant`.
     bool redundant = false;

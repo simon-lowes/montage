@@ -18184,6 +18184,30 @@ colorspaces:
         for (const auto& a : ancNow(3)) QVERIFY(a.size() == 2 && a[0].did == 0x60 && a[1].did == 0x60);  // (parked: time code only)
         sched.stop();
         QVERIFY(backend->address().empty());
+        // Its sound as AES3 (ST 2110-31) when the options say so: the SDP's AM824, and every subframe that comes whole
+        // (its parity even), a block of 192 frames begun among them.
+        o.aes3 = true;
+        st::setOutputOptions(o);
+        QVERIFY2(sched.start(dev, *findMode(dev.modes, "720p50"), s, cfg, &why), why.c_str());
+        QVERIFY2(QString::fromStdString(backend->sdp().at("audio")).contains("AM824/48000/2"), backend->sdp().at("audio").c_str());
+        {
+            std::vector<uint8_t> d;
+            st::RtpPacket pk;
+            while (ra.receive(d, 0)) {}
+            int subframes = 0, starts = 0;
+            for (int i = 0; i < 400 && subframes < 2 * 48 * 200; ++i) {
+                if (!ra.receive(d, 100) || !st::parseRtp(d.data(), d.size(), pk)) continue;
+                const std::vector<uint32_t> words = st::unpackAm824(pk.payload, pk.size, 2);
+                QCOMPARE(int(words.size()), 2 * 48);  // (1 ms of two subframes a frame)
+                for (uint32_t w : words) {
+                    QVERIFY(st::am824ParityOk(w));
+                    if (st::am824BlockStart(w)) ++starts;
+                    ++subframes;
+                }
+            }
+            QVERIFY2(subframes >= 2 * 48 * 200 && starts >= 40, qPrintable(QStringLiteral("%1 subframes, %2 block starts").arg(subframes).arg(starts)));
+        }
+        sched.stop();
         st::setOutputOptions({});
     }
 

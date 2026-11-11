@@ -28630,6 +28630,14 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <source>The second path&apos;s video, sound, data and fast metadata addresses and ports, apart by spaces</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Send the sound as AES3 (ST 2110-31)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AES3 subframes with channel status, for equipment that takes AES3 over IP, in place of ST 2110-30&apos;s PCM</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::RemoteGradeController</name>

@@ -1736,6 +1736,11 @@ public:
         st2110::AudioFormat a;
         a.channels = std::max(1, audioChannels);
         a.rate = audioRate;
+        if (o.aes3) {
+            // (ST 2110-31: the same sound as AES3 subframes, PCM with professional channel status)
+            a.aes3 = true;
+            if (a.channels > 6) a.packetUs = 125;
+        }
         o.sendAudio = o.sendAudio && audioChannels > 0;
         // (ST 2110-41: each frame's number and time code, the item named in the SDP)
         if (o.sendMetadata && std::find(o.metadataTypes.begin(), o.metadataTypes.end(), st2110::kFrameItemType) == o.metadataTypes.end())

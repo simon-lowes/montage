@@ -121,6 +121,7 @@ private:
     QComboBox* st2110Codec_;     // (ST 2110-20, or -22's JPEG XS)
     QDoubleSpinBox* st2110Bpp_;
     QCheckBox* st2110Slices_;
+    QCheckBox* st2110Aes3_;
     QCheckBox* st2110Meta_;      // (ST 2110-41)
     QLineEdit* st2110MetaTo_;
     QCheckBox* nmos_;

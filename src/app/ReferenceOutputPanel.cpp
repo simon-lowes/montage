@@ -124,6 +124,7 @@ st2110::SenderOptions ReferenceOutputController::loadSt2110() {
     o.jpegXsBpp = std::clamp(s.value("output/st2110/jpegXsBpp", o.jpegXsBpp).toDouble(), 0.5, 24.0);
     o.jpegXsPacketMode = s.value("output/st2110/jpegXsSlices", false).toBool() ? 1 : 0;
     o.sendMetadata = s.value("output/st2110/sendMetadata", false).toBool();
+    o.aes3 = s.value("output/st2110/aes3", false).toBool();
     endpoint("output/st2110/metadata", o.metadata);
     endpoint("output/st2110/metadata2", o.metadata2);
     return o;
@@ -146,6 +147,7 @@ void ReferenceOutputController::saveSt2110(const st2110::SenderOptions& o) {
     s.setValue("output/st2110/jpegXsBpp", o.jpegXsBpp);
     s.setValue("output/st2110/jpegXsSlices", o.jpegXsPacketMode == 1);
     s.setValue("output/st2110/sendMetadata", o.sendMetadata);
+    s.setValue("output/st2110/aes3", o.aes3);
     s.setValue("output/st2110/metadata", qs(st2110::endpointText(o.metadata)));
     s.setValue("output/st2110/metadata2", qs(st2110::endpointText(o.metadata2)));
 }
@@ -395,7 +397,8 @@ QByteArray ReferenceOutputController::toolJson() {
 "jpeg_xs_bpp":{"type":"number","description":"ST 2110-22: the picture coded as JPEG XS at this many bits a pixel (0.5 to 24), a constant number of bytes a frame; 0 sends it uncompressed (ST 2110-20)"},
 "jpeg_xs_slices":{"type":"boolean","description":"JPEG XS sent a slice at a time (RFC 9134's slice packetization mode) instead of a codestream at a time"},
 "send_metadata":{"type":"boolean","description":"ST 2110-41: each frame's sequence frame number and time code as fast metadata"},
-"metadata":{"type":"string","description":"Where the fast metadata goes"},"metadata2":{"type":"string","description":"Its second path's address (ST 2022-7)"}}},
+"metadata":{"type":"string","description":"Where the fast metadata goes"},"metadata2":{"type":"string","description":"Its second path's address (ST 2022-7)"},
+"aes3":{"type":"boolean","description":"ST 2110-31: the sound sent as AES3 subframes (AM824) instead of ST 2110-30's PCM"}}},
 "nmos":{"type":"object","description":"ST 2110's streams offered to broadcast controllers as an AMWA NMOS Node (IS-04 and IS-05; settings left out are the last used)","properties":{
 "enabled":{"type":"boolean"},
 "registry":{"type":"string","description":"The registry's Registration API, \"http://host:port\" (empty: found by DNS-SD)"},
@@ -523,6 +526,7 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
             }
             if (x.contains("jpeg_xs_slices")) o.jpegXsPacketMode = x.value("jpeg_xs_slices").toBool() ? 1 : 0;
             if (x.contains("send_metadata")) o.sendMetadata = x.value("send_metadata").toBool();
+            if (x.contains("aes3")) o.aes3 = x.value("aes3").toBool();
             st2110::setOutputOptions(o);
         }
         if (has("nmos")) {
@@ -696,6 +700,12 @@ ReferenceOutputPanel::ReferenceOutputPanel(ReferenceOutputController* controller
     };
     connect(st2110Codec_, &QComboBox::currentIndexChanged, this, codecOn);
     codecOn();
+    // ST 2110-31: the sound as AES3 subframes.
+    st2110Aes3_ = new QCheckBox(tr("Send the sound as AES3 (ST 2110-31)"), this);
+    st2110Aes3_->setObjectName(QStringLiteral("outputSt2110Aes3"));
+    st2110Aes3_->setChecked(so.aes3);
+    st2110Aes3_->setToolTip(tr("AES3 subframes with channel status, for equipment that takes AES3 over IP, in place of ST 2110-30's PCM"));
+    form->addRow(QString(), st2110Aes3_);
     // ST 2110-41: each frame's number and time code.
     st2110Meta_ = new QCheckBox(tr("Send each frame's number and time code as fast metadata (ST 2110-41)"), this);
     st2110Meta_->setObjectName(QStringLiteral("outputSt2110Metadata"));
@@ -822,7 +832,7 @@ void ReferenceOutputPanel::fillDevices() {
     hdr_->setEnabled(!network);  // (NDI and OMT carry the colour, not HDR10's mastering metadata)
     device_->setToolTip(network ? tr("The %1 source's name (other computers see \"<this computer> (Montage)\")").arg(qs(b->name())) : QString());
     const bool ip = b && b->name() == "ST 2110";
-    for (QWidget* w : std::initializer_list<QWidget*>{st2110Video_, st2110Audio_, st2110Data_, st2110Codec_, st2110Bpp_, st2110Slices_, st2110Meta_,
+    for (QWidget* w : std::initializer_list<QWidget*>{st2110Video_, st2110Audio_, st2110Data_, st2110Codec_, st2110Bpp_, st2110Slices_, st2110Aes3_, st2110Meta_,
                                                       st2110MetaTo_, st2110Ttl_, st2110Clock_, st2110Redundant_, st2110Paths2_, st2110Interface2_, nmos_,
                                                       nmosRegistry_, saveSdp_})
         form_->setRowVisible(w, ip);
@@ -876,6 +886,7 @@ st2110::SenderOptions ReferenceOutputPanel::chosenSt2110() const {
     o.jpegXsBpp = st2110Bpp_->value();
     o.jpegXsPacketMode = st2110Slices_->isChecked() ? 1 : 0;
     o.sendMetadata = st2110Meta_->isChecked();
+    o.aes3 = st2110Aes3_->isChecked();
     if (!st2110::parseEndpoint(st2110MetaTo_->text().trimmed().toStdString(), o.metadata)) o.metadata = {st2110MetaTo_->text().trimmed().toStdString(), 0};
     return o;
 }

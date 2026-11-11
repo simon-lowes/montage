@@ -3,7 +3,8 @@
 # registration (IS-04-01), IS-05's Connection API (IS-05-01) and the two together (IS-05-02), with the registry found by
 # unicast DNS-SD from the test tool's own DNS server. The Node is `montage-cli st2110`, sending colour bars and tone
 # on both of ST 2022-7's paths (its senders offering both legs through IS-05) and offering receivers with two legs:
-# once with ST 2110-20's uncompressed video, then again with ST 2110-22's JPEG XS (AMWA BCP-006-01's flows and senders).
+# once with ST 2110-20's uncompressed video and ST 2110-30's PCM, then again with ST 2110-22's JPEG XS (AMWA BCP-006-01's
+# flows and senders) and ST 2110-31's AES3 sound.
 #
 #   sudo scripts/nmos-check.sh build/src/montage-cli <work directory>
 #
@@ -104,10 +105,10 @@ if [ "$failed" -ne 0 ]; then
     cat "$work/node.log"
 fi
 stop_node
-echo "Again with JPEG XS (ST 2110-22) senders:"
+echo "Again with JPEG XS (ST 2110-22) and AES3 (ST 2110-31) senders:"
 before=$failed
 failed=0
-start_node --jpeg-xs 4 --slices
+start_node --jpeg-xs 4 --slices --aes3
 suites
 if [ "$failed" -ne 0 ]; then
     echo "The Node's log:"
