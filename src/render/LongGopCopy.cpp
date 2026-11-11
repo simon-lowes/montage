@@ -874,6 +874,8 @@ struct LongGopCopier::Source {
     int stream = -1;
     AVRational tb{1, 1};
     int64_t start = 0, ticks = 1;
+    AVRational rate{0, 1};                    // its frame rate
+    bool exact = true;                        // a frame is a whole number of `tb`'s ticks (else: times are rounded)
     std::vector<uint8_t> config;              // the decoder configuration (avcC, hvcC)
     std::vector<uint8_t> sets;                // HEVC: its VPS, SPS and PPS, length-prefixed
     Avcc avcc;                                // H.264
@@ -1050,7 +1052,14 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         // (frames counted from the file's start, as the decoder counts them: the earliest of its streams)
         src.start = src.fmt->start_time != AV_NOPTS_VALUE ? av_rescale_q(src.fmt->start_time, AV_TIME_BASE_Q, src.tb) : 0;
         src.ticks = av_rescale_q(1, av_inv_q(rate), src.tb);
-        if (src.ticks <= 0 || av_cmp_q(av_mul_q(AVRational{int(src.ticks), 1}, src.tb), av_inv_q(rate)) != 0) continue;
+        src.rate = rate;
+        src.exact = src.ticks > 0 && av_cmp_q(av_mul_q(AVRational{int(src.ticks), 1}, src.tb), av_inv_q(rate)) == 0;
+        // A frame that is not a whole number of the file's ticks: Matroska and WebM count in milliseconds, so at 24,
+        // 30 or 60 frames a second each packet's time is its frame's, rounded. Its frame is then the nearest one (AV1
+        // and VP9 only, whose packets come in the order shown; frames under four ticks long are not told apart so).
+        const bool rounded = (codec == kAv1 || codec == kVp9) && src.ticks >= 4 && src.fmt->iformat && src.fmt->iformat->name &&
+                             std::string(src.fmt->iformat->name).find("matroska") != std::string::npos;
+        if (src.ticks <= 0 || (!src.exact && !rounded)) continue;
         src.profile = par->profile;
         src.level = par->level;
         src.config.assign(par->extradata, par->extradata + par->extradata_size);
@@ -1182,10 +1191,20 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
             k.size = pkt->size;
             k.key = pkt->flags & AV_PKT_FLAG_KEY;
             const int64_t rel = pkt->pts - src.start;
-            k.frame = rel >= 0 ? (rel + src.ticks / 2) / src.ticks : -1 - (-rel - 1 + src.ticks / 2) / src.ticks;
-            if (std::llabs(rel - k.frame * src.ticks) > src.ticks / 4) {  // (not on a frame)
-                bad = true;
-                break;
+            if (src.exact) {
+                k.frame = rel >= 0 ? (rel + src.ticks / 2) / src.ticks : -1 - (-rel - 1 + src.ticks / 2) / src.ticks;
+                if (std::llabs(rel - k.frame * src.ticks) > src.ticks / 4) {  // (not on a frame)
+                    bad = true;
+                    break;
+                }
+            } else {
+                // (rounded times: the nearest frame, whose own time, rounded, is this one give or take a tick)
+                const int64_t num = int64_t(src.tb.num) * src.rate.num, den = int64_t(src.tb.den) * src.rate.den;
+                k.frame = av_rescale_rnd(rel, num, den, AV_ROUND_NEAR_INF);
+                if (std::llabs(rel - av_rescale_rnd(k.frame, den, num, AV_ROUND_NEAR_INF)) > 1) {
+                    bad = true;
+                    break;
+                }
             }
             k.kind = packetKind(codec, pkt->data, size_t(pkt->size), lg->lengthSize_);
             if ((k.kind & kCopyPoint) && seenCopyPoint && k.frame >= s1) break;  // (the GOP after the run's)

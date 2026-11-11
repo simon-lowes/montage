@@ -24311,11 +24311,19 @@ private:
 private slots:
     void vp9SmartRenderCopiesGops() {
         if (!avcodec_find_encoder_by_name("libvpx-vp9")) QSKIP("This build of FFmpeg has no libvpx VP9 encoder");
+        // At 25 frames a second, and at 30, where WebM's millisecond times are each frame's rounded (33, 67, 100).
+        vp9SmartRender(25);
+        if (QTest::currentTestFailed()) return;
+        vp9SmartRender(30);
+    }
+
+private:
+    void vp9SmartRender(int fps) {
         // VP9 footage in WebM: 100 frames of a turning gradient with grain, a key frame every 24.
         Project gen = makeDefaultProject();
         {
             Sequence& gs = *gen.active();
-            gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+            gs.width = 320, gs.height = 180, gs.fps = Rational{fps, 1};
             Clip grad = makeGeneratorClip(gen, "gradient", 100);
             grad.generator.params["angle"].addKey(0, 0.0);
             grad.generator.params["angle"].addKey(99, 140.0);
@@ -24330,7 +24338,7 @@ private slots:
         st.preset = "good";
         st.crf = 35;
         st.gop = 24;
-        st.path = path("vp9-src.webm");
+        st.path = path(("vp9-src-" + std::to_string(fps) + ".webm").c_str());
         std::string err;
         QVERIFY2(exportSequence(gen, *gen.active(), st, nullptr, nullptr, &err), err.c_str());
         const std::vector<CodedPacket> source = codedPackets(st.path);
@@ -24344,7 +24352,7 @@ private slots:
         // leave whole are copied, the frames around them encoded.
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
-        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        s.width = 320, s.height = 180, s.fps = Rational{fps, 1};
         MediaItem m = probeOrFail(p, st.path);
         p.media.push_back(m);
         QVERIFY(edit::placeMedia(p, s, m.id, 0, 5, 95, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
@@ -24363,7 +24371,7 @@ private slots:
         for (const auto& [lo, hi] : whole) expected += int(hi - lo + 1);
         for (const char* ext : {"webm", "mp4"}) {
             ExportSettings ex = st;
-            ex.path = path((std::string("vp9-out.") + ext).c_str());
+            ex.path = path(("vp9-out-" + std::to_string(fps) + "." + ext).c_str());
             int copied = -1;
             QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
             QCOMPARE(copied, expected);
@@ -24393,12 +24401,13 @@ private slots:
         // With smart rendering off nothing is copied.
         ExportSettings off = st;
         off.smartRender = false;
-        off.path = path("vp9-encoded.webm");
+        off.path = path(("vp9-encoded-" + std::to_string(fps) + ".webm").c_str());
         int copied = -1;
         QVERIFY2(exportSequence(p, s, off, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
         QCOMPARE(copied, 0);
     }
 
+private slots:
     void mpeg2VariableRateJoin() {
         // MPEG-2 footage at a variable rate, as FFmpeg's encoder writes it with a maximum above its bit rate: 6 Mb/s,
         // no more than 12 Mb/s into a buffer of 9,781,248 bits, every vbv_delay 0xFFFF. 100 frames at 1280x720, a GOP
