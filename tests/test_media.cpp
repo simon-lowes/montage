@@ -2152,6 +2152,277 @@ private slots:
         QVERIFY(r.status().error.empty() && r.status().timecode.rfind("10:00:", 0) == 0);
     }
 
+    // A feed being watched recorded from the same reception (Recorder::recordTo): an MPEG transport stream called in
+    // over SRT once (UDP where FFmpeg has no SRT) is watched, recorded, recorded to a second file and watched on,
+    // without its caller calling again. Each file starts with the picture after the one before it ended on, its
+    // timecode the feed's own there (counted on from the last picture that carried one: files begin between a
+    // transport stream's groups), every picture the one its timecode names, and its sound the feed's from its first
+    // samples (the sound a decoder's held pictures let run ahead goes in at the start). A file that cannot be written
+    // is said and the feed watched on.
+    void captureFromTheSameReception() {
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
+        QProcess probe;
+        probe.start(ffmpeg, {"-hide_banner", "-protocols"});
+        probe.waitForFinished(20000);
+        const bool srt = QString::fromLocal8Bit(probe.readAllStandardOutput()).contains(QRegularExpression(QStringLiteral("\\n\\s*srt\\s*\\n")));
+        QUdpSocket free;
+        free.bind(QHostAddress::LocalHost, 0);
+        const int port = int(free.localPort());
+        free.close();
+        CaptureSettings cs;
+        cs.video.url = (srt ? QStringLiteral("srt://127.0.0.1:%1?mode=listener&latency=120000&transtype=live").arg(port)
+                            : QStringLiteral("udp://127.0.0.1:%1").arg(port))
+                           .toStdString();
+        cs.openTimeout = 15;
+        cs.live = std::make_shared<LiveFeed>(160, 90);
+        std::string err;
+        Recorder r;
+        // (what the recorder says of each file it ended, on its own thread)
+        std::mutex said;
+        std::vector<std::tuple<std::string, bool, std::string, int64_t>> ended;
+        r.onFileFinished = [&](const std::string& file, bool ok, const std::string& message) {
+            const int64_t frames = r.status().frames;  // (still that file's)
+            std::lock_guard lock(said);
+            ended.emplace_back(file, ok, message, frames);
+        };
+        QVERIFY2(!r.recordTo({path("same-early.mov")}, &err) && !err.empty(), err.c_str());  // (nothing is being received)
+        QVERIFY2(r.start(cs, &err), err.c_str());
+        QThread::msleep(300);
+        QProcess sender;
+        const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(port)
+                               : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(port);
+        sender.start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i",
+                              "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128", "-f", "lavfi", "-i",
+                              "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12", "-bf", "0",
+                              "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", "10:00:00:00", "-c:a", "mp2", "-f", "mpegts", to});
+        QVERIFY(sender.waitForStarted(10000));
+        auto finish = qScopeGuard([&] {
+            r.stop();
+            sender.kill();
+            sender.waitForFinished(5000);
+        });
+        // (waiting on pictures, not the clock: a busy machine is slow)
+        auto waitFor = [&](const std::function<bool()>& there) {
+            QElapsedTimer t;
+            t.start();
+            while (!there() && t.elapsed() < 60000 && r.recording()) QThread::msleep(20);
+            return there();
+        };
+        const bool watched = waitFor([&] { return cs.live->look().pictures >= 15; });
+        if (!watched && r.status().error.find("Protocol not found") != std::string::npos) QSKIP("This build's FFmpeg cannot receive the feed");
+        QVERIFY2(watched, r.status().error.c_str());
+        QVERIFY(r.status().path.empty() && r.status().frames >= 15);
+        // A file that is no recording's, refused as start refuses it; the feed goes on.
+        QVERIFY(!r.recordTo({path("same.avi"), "prores_proxy"}, &err));
+        QCOMPARE(err, std::string("Record to a .mov or .mxf file"));
+        QVERIFY(!r.recordTo({path("same.mov"), "no_such_codec"}, &err));
+        // Recorded: ProRes in QuickTime, then (from the picture after its last) JPEG XS in MXF where this build has it,
+        // then only watched, then a file in a folder that is not there, then recorded again until stopped.
+        struct File {
+            std::string path, codec;
+            std::string timecode;  // (as the recorder said while it recorded)
+            int64_t frames = 0;    // (its pictures, as the recorder said when it ended)
+        };
+        std::vector<File> files = {{path("same-1.mov"), "prores_proxy"},
+                                   jpegXsAvailable() ? File{path("same-2.mxf"), "jpeg_xs"} : File{path("same-2.mov"), "prores_lt"},
+                                   {path("same-3.mov"), "prores_lt"}};
+        int64_t pictures = cs.live->look().pictures;
+        auto record = [&](File& f) {
+            if (!r.recordTo({f.path, f.codec}, &err)) return false;
+            // (numbered from its first picture again, the feed's pictures counted on)
+            if (!waitFor([&] { return r.status().frames >= 45 && cs.live->look().frame >= 40; })) return false;
+            const LiveFeed::Now now = cs.live->look();
+            const bool on = now.running && now.pictures > pictures && now.frame < now.pictures;
+            pictures = now.pictures;
+            return on && r.status().path == f.path;
+        };
+        QVERIFY2(record(files[0]), err.c_str());
+        files[0].timecode = r.status().timecode;
+        QVERIFY2(record(files[1]), err.c_str());
+        // (the first is whole by now: said before recordTo came back)
+        {
+            std::lock_guard lock(said);
+            QCOMPARE(ended.size(), size_t(1));
+            QVERIFY2(std::get<0>(ended[0]) == files[0].path && std::get<1>(ended[0]), std::get<2>(ended[0]).c_str());
+        }
+        files[1].timecode = r.status().timecode;
+        QVERIFY2(r.recordTo({}, &err), err.c_str());  // (watched on)
+        // (its pictures counted on, numbered from the first watched again)
+        QVERIFY(waitFor([&] { return cs.live->look().pictures >= pictures + 10; }));
+        {
+            const LiveFeed::Now now = cs.live->look();
+            QVERIFY2(r.status().path.empty() && now.frame >= 5 && now.frame < now.pictures - pictures,
+                     qPrintable(QStringLiteral("frame %1, %2 pictures on").arg(now.frame).arg(now.pictures - pictures)));
+        }
+        QVERIFY2(r.recordTo({path("no-such-folder/same.mov"), "prores_proxy"}, &err), err.c_str());
+        QVERIFY(waitFor([&] {
+            std::lock_guard lock(said);
+            return ended.size() >= 3;
+        }));
+        {
+            std::lock_guard lock(said);
+            QVERIFY2(std::get<0>(ended[1]) == files[1].path && std::get<1>(ended[1]), std::get<2>(ended[1]).c_str());
+            QVERIFY(std::get<0>(ended[2]) == path("no-such-folder/same.mov") && !std::get<1>(ended[2]) && !std::get<2>(ended[2]).empty());
+        }
+        QVERIFY(waitFor([&] { return r.status().path.empty() && cs.live->look().frame >= 5; }));  // (watched on)
+        QVERIFY2(record(files[2]), err.c_str());
+        // The sender's one call still stands (its stream opened once), and stopping ends the last file as ever.
+        QCOMPARE(sender.state(), QProcess::Running);
+        r.stop();
+        files[2].timecode = r.status().timecode;
+        QVERIFY2(r.status().error.empty(), r.status().error.c_str());
+        QVERIFY(!r.recordTo({path("same-late.mov")}, &err));
+        QVERIFY(!cs.live->look().running);
+        {
+            std::lock_guard lock(said);
+            QCOMPARE(ended.size(), size_t(3));  // (the last is onFinished's)
+        }
+        // Each file: as long as the recorder said, its timecode the feed's at its first picture, every picture the one
+        // that names (its grey 8 codes a frame within the second), its sound there from the start.
+        int64_t firsts[3] = {0, 0, 0};
+        for (size_t i = 0; i < files.size(); ++i) {
+            File& f = files[i];
+            const QString what = QString::fromStdString(f.path);
+            MediaItem m;
+            QVERIFY2(probeMedia(f.path, m, &err), err.c_str());
+            QVERIFY2(m.hasVideo && m.width == 320 && m.hasAudio, qPrintable(what));
+            {
+                std::lock_guard lock(said);
+                f.frames = i < 2 ? std::get<3>(ended[i]) : r.status().frames;
+            }
+            // (a file ended while the feed goes on keeps the sound that had come ahead of its last picture: a moment's)
+            QVERIFY2(f.frames >= 45 && m.duration * 25 > double(f.frames) - 0.01 && m.duration < double(f.frames) / 25 + 0.25,
+                     qPrintable(QStringLiteral("%1: %2 s, %3 pictures").arg(what).arg(m.duration).arg(f.frames)));
+            VideoDecoder dec;
+            QVERIFY(dec.open(f.path));
+            QVERIFY2(f.timecode.rfind("10:0", 0) == 0, f.timecode.c_str());
+            firsts[i] = std::llround((m.timecode - 36000) * 25);
+            int hh = 0, mm = 0, ss = 0, ff = 0;
+            QVERIFY(std::sscanf(f.timecode.c_str(), "%d:%d:%d:%d", &hh, &mm, &ss, &ff) == 4);
+            QCOMPARE(firsts[i], int64_t((mm * 60 + ss) * 25 + ff));
+            // (a picture the feed sent late is held over the frame or two it missed: never another's)
+            int held = 0;
+            QString seen;
+            for (int64_t k : {int64_t(0), int64_t(1), int64_t(2), int64_t(11), int64_t(12), int64_t(13), int64_t(30), f.frames - 2, f.frames - 1}) {
+                const Frame16Ptr p = dec.frameAt((double(k) + 0.5) / 25.0);
+                QVERIFY2(p, qPrintable(what));
+                const Image img = toImage(*p);
+                const int grey = int(std::lround(img.at(img.width / 2, img.height / 2)[1] * 219 / 8));
+                seen += QStringLiteral(" %1=%2").arg(k).arg(grey);
+                const int behind = int(((firsts[i] + k) % 25 - grey + 25) % 25);
+                QVERIFY2(behind <= std::min<int64_t>(2, k), qPrintable(what + seen));
+                if (behind) ++held;
+            }
+            QVERIFY2(held <= 3, qPrintable(what + seen));
+            AudioBufferPtr heard = decodeAudio(f.path, 48000, &err);
+            QVERIFY2(heard, err.c_str());
+            QVERIFY2(heard->frames() >= f.frames * 1920 - 1920 && heard->frames() <= f.frames * 1920 + 12000,
+                     qPrintable(QStringLiteral("%1: %2 samples").arg(what).arg(heard->frames())));
+            // (the sine in every 5 ms of the first second, from its first samples: an eighth of full scale, in each of
+            // the stereo pair its one channel is read back as 3 dB under that)
+            for (int64_t at = 0; at + 240 <= std::min<int64_t>(heard->frames(), 48000); at += 240) {
+                float peak = 0;
+                for (int64_t k = at; k < at + 240; ++k) peak = std::max(peak, std::fabs(heard->samples[size_t(k) * size_t(heard->channels)]));
+                QVERIFY2(std::fabs(peak - 0.125f * float(M_SQRT1_2)) < 0.01f, qPrintable(QStringLiteral("%1: sound %2 at sample %3").arg(what).arg(peak).arg(at)));
+            }
+        }
+        // The second begins with the picture after the first's last: nothing was opened again between them.
+        QVERIFY2(firsts[1] >= firsts[0] + files[0].frames && firsts[1] <= firsts[0] + files[0].frames + 1,
+                 qPrintable(QStringLiteral("%1 + %2, then %3").arg(firsts[0]).arg(files[0].frames).arg(firsts[1])));
+        QVERIFY(firsts[2] > firsts[1] + files[1].frames + 15);
+    }
+
+    // An HDR feed watched live (BT.2100 PQ over ST 2110: JPEG XS at 1920 by 1080 where this build has it, else
+    // uncompressed at 1280 by 720): the feed says it is PQ, its picture is kept at its own size for a viewer that
+    // shows it whole (its R'G'B' code values, a grey at SDR white's 203 nits and one at 1000), scaled down only when
+    // asked smaller, and the small picture a tile shows is that light as an SDR display shows it (as convertColor
+    // rolls HDR off), not the code values read as SDR.
+    void captureWatchedHdrAtFullSize() {
+        namespace st = st2110;
+        int ports[3];
+        {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.ttl = 1;
+        const bool xs = jpegXsAvailable();
+        const int W = xs ? 1920 : 1280, H = xs ? 1080 : 720, spf = 1920;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        v.colorimetry = "BT2100", v.tcs = "PQ";
+        if (xs) v.codec = "jxsv", v.bpp = 3;
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        // The left half a grey at 203 nits, the right at 1000 (PQ's code values, narrow range, 10 bits).
+        const int codes[2] = {int(std::lround(64 + 876 * fromLinear(Transfer::Pq, 1.0))), int(std::lround(64 + 876 * fromLinear(Transfer::Pq, 1000.0 / 203)))};
+        const float sent[2] = {float(codes[0] - 64) / 876, float(codes[1] - 64) / 876};
+        QVERIFY2(std::abs(codes[0] - 573) <= 1 && std::abs(codes[1] - 723) <= 1, qPrintable(QStringLiteral("%1 %2").arg(codes[0]).arg(codes[1])));
+        st::Raster raster(W, H, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < H; ++y) {
+            uint16_t* d = raster.row(y);
+            for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = uint16_t(codes[x < W / 2 ? 0 : 1]);
+        }
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            const std::vector<float> sound(size_t(spf) * 2, 0.0f);
+            for (int t = 0; !stop && t < 25 * 60; ++t) {
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                if (!tx.send(raster, sound.data(), spf, &tc, {}, &stop)) break;
+            }
+        });
+        CaptureSettings cs;
+        cs.video.device = "st2110";
+        cs.video.url = tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc();
+        cs.live = std::make_shared<LiveFeed>(640, 360);
+        Recorder r;
+        QVERIFY2(r.start(cs, &err), err.c_str());
+        QElapsedTimer t;
+        t.start();
+        while (cs.live->look().pictures < 5 && t.elapsed() < 60000 && r.recording()) QThread::msleep(20);
+        const LiveFeed::Now now = cs.live->look();
+        const LiveFeed::Full whole = cs.live->full(4096, 4096);
+        const LiveFeed::Full fitted = cs.live->full(960, 960, whole.pictures - 1);
+        r.stop();
+        stop = true;
+        sending.join();
+        tx.close();
+        QVERIFY2(now.pictures >= 5, r.status().error.c_str());
+        QCOMPARE(now.hdr, std::string("pq"));
+        QVERIFY(now.width == W && now.height == H && now.picture.width() == 640 && now.picture.height() == 360);
+        // At its own size, its code values the ones sent (JPEG XS's loss on flat greys is small).
+        QVERIFY(whole.pictures >= 5 && whole.picture.isNull() && whole.width == W && whole.height == H);
+        QCOMPARE(whole.space, std::string("rec2100pq"));
+        QVERIFY(whole.light.width == W && whole.light.height == H);
+        for (int side = 0; side < 2; ++side) {
+            const float* p = whole.light.at(W / 4 + side * W / 2, H / 2);
+            QVERIFY2(std::fabs(p[0] - sent[side]) < 0.006f && std::fabs(p[1] - sent[side]) < 0.006f && std::fabs(p[2] - sent[side]) < 0.006f && p[3] == 1,
+                     qPrintable(QStringLiteral("%1 %2 %3, sent %4").arg(p[0]).arg(p[1]).arg(p[2]).arg(sent[side])));
+        }
+        // Asked smaller, scaled to fit; with no newer picture than the one a viewer has, nothing.
+        QVERIFY(fitted.light.width == 960 && fitted.light.height == 540 && fitted.width == W);
+        QCOMPARE(cs.live->full(4096, 4096, cs.live->look().pictures).pictures, int64_t(0));
+        // The tile's picture: each grey as convertColor shows that light in SDR.
+        for (int side = 0; side < 2; ++side) {
+            Image one(1, 1);
+            float* p = one.at(0, 0);
+            p[0] = p[1] = p[2] = sent[side], p[3] = 1;
+            convertColor(one, *findColorSpace("rec2100pq"), rec709Space());
+            const int want = int(std::lround(std::clamp(one.at(0, 0)[1], 0.0f, 1.0f) * 255));
+            const QRgb got = now.picture.pixel(160 + side * 320, 180);
+            QVERIFY2(std::abs(qGreen(got) - want) <= 4 && std::abs(qRed(got) - want) <= 4 && std::abs(qBlue(got) - want) <= 4,
+                     qPrintable(QStringLiteral("%1 %2 %3, not %4").arg(qRed(got)).arg(qGreen(got)).arg(qBlue(got)).arg(want)));
+            // (and not the code value itself, as an SDR conversion would show it)
+            if (side == 0) QVERIFY2(std::abs(want - int(std::lround(sent[0] * 255))) > 20, qPrintable(QString::number(want)));
+        }
+    }
+
     // ST 2110-31 recorded: AES3 subframes carrying a payload that is not PCM (an ST 337 burst's preambles and counted
     // words) are in the file bit for bit, as the 24-bit sound they were sent as, beside the picture.
     void captureAes3BitExact() {

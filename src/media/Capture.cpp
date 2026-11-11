@@ -16,6 +16,7 @@
 
 #include <QFile>
 
+#include "render/ColorSpace.h"
 #include "render/St2110Receive.h"
 #include "JpegXs.h"
 
@@ -244,6 +245,12 @@ struct Recorder::State {
     int64_t queuedBytes = 0;
     // When a blocked read gives up (each input's own).
     std::atomic<int64_t> deadline[2] = {0, 0};
+    // Whether a file is being recorded now (else the feed is only watched), and another asked for while it runs
+    // (recordTo: `next` and the requests made and taken under `m`).
+    std::atomic<bool> toFile{false}, switchAsked{false};
+    std::optional<CaptureFile> next;
+    uint64_t asked = 0, taken = 0;
+    std::condition_variable switched;
 };
 
 namespace {
@@ -255,7 +262,7 @@ namespace {
 constexpr int64_t kQueueBytes = int64_t(512) << 20;
 constexpr int64_t kWatchQueueBytes = int64_t(32) << 20;
 int64_t queueLimit(const Recorder::State* s, int64_t picture = 0) {
-    return s->settings.path.empty() ? std::max(kWatchQueueBytes, 4 * picture) : kQueueBytes;
+    return s->toFile ? kQueueBytes : std::max(kWatchQueueBytes, 4 * picture);
 }
 
 struct Interrupt {
@@ -601,7 +608,74 @@ std::vector<std::string> captureDeviceKinds() {
 
 LiveFeed::LiveFeed(int maxWidth, int maxHeight) : maxWidth_(std::max(16, maxWidth)), maxHeight_(std::max(16, maxHeight)) {}
 
-LiveFeed::~LiveFeed() { sws_freeContext(sws_); }
+LiveFeed::~LiveFeed() {
+    sws_freeContext(sws_);
+    sws_freeContext(fullSws_);
+    av_frame_free(&latest_);
+}
+
+namespace {
+
+// A picture's size scaled to fit, its shape kept (the pixels' aspect too); never made larger.
+void fitted(const AVFrame* f, int maxWidth, int maxHeight, int& w, int& h) {
+    const double sar = f->sample_aspect_ratio.num > 0 && f->sample_aspect_ratio.den > 0 ? av_q2d(f->sample_aspect_ratio) : 1.0;
+    const double shown = f->width * sar;
+    const double k = std::min({1.0, maxWidth / shown, double(maxHeight) / f->height});
+    w = std::max(2, int(std::lround(shown * k))), h = std::max(2, int(std::lround(f->height * k)));
+}
+
+// BT.2100 PQ or HLG, as the picture states it ("" otherwise).
+const char* hdrOf(const AVFrame* f) {
+    return f->color_trc == AVCOL_TRC_SMPTE2084 ? "pq" : f->color_trc == AVCOL_TRC_ARIB_STD_B67 ? "hlg" : "";
+}
+
+// The scaler from a picture to R'G'B' at w by h (8-bit BGRA, or 16-bit RGBA for an HDR picture's code values), kept
+// and made again when what it was made for changes.
+SwsContext* rgbScaler(SwsContext* sws, int* kept, const AVFrame* f, int w, int h, bool deep) {
+    const int key[7] = {f->width, f->height, f->format, w, h, int(f->colorspace) << 8 | int(f->color_range), deep ? 1 : 0};
+    if (sws && std::equal(key, key + 7, kept)) return sws;
+    sws = sws_getCachedContext(sws, f->width, f->height, AVPixelFormat(f->format), w, h, deep ? AV_PIX_FMT_RGBA64 : AV_PIX_FMT_BGRA, SWS_BILINEAR,
+                               nullptr, nullptr, nullptr);
+    std::copy(key, key + 7, kept);
+    if (sws) {
+        const int space = f->colorspace == AVCOL_SPC_BT2020_NCL                                         ? SWS_CS_BT2020
+                          : f->colorspace == AVCOL_SPC_SMPTE170M || f->colorspace == AVCOL_SPC_BT470BG ? SWS_CS_ITU601
+                                                                                                        : SWS_CS_ITU709;
+        const bool full = f->color_range == AVCOL_RANGE_JPEG;
+        sws_setColorspaceDetails(sws, sws_getCoefficients(space), full ? 1 : 0, sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1 << 16, 1 << 16);
+    }
+    return sws;
+}
+
+// An HDR picture's R'G'B' code values at w by h.
+bool lightOf(SwsContext* sws, const AVFrame* f, int w, int h, Image& out) {
+    std::vector<uint16_t> deep(size_t(w) * size_t(h) * 4);
+    uint8_t* dst[1] = {reinterpret_cast<uint8_t*>(deep.data())};
+    const int stride[1] = {w * 8};
+    if (sws_scale(sws, f->data, f->linesize, 0, f->height, dst, stride) <= 0) return false;
+    out = Image(w, h, Image::Uninitialized{});
+    for (int y = 0; y < h; ++y) {
+        const uint16_t* in = deep.data() + size_t(y) * size_t(w) * 4;
+        float* o = out.row(y);
+        for (int x = 0; x < w * 4; x += 4) {
+            o[x] = float(in[x]) / 65535.0f, o[x + 1] = float(in[x + 1]) / 65535.0f, o[x + 2] = float(in[x + 2]) / 65535.0f;
+            o[x + 3] = 1;
+        }
+    }
+    return true;
+}
+
+const ColorSpace& hdrSpace(const char* hdr) { return *findColorSpace(hdr[0] == 'h' ? "rec2100hlg" : "rec2100pq"); }
+
+// An HDR picture's light as an SDR display shows it (its highlights rolled off, as the viewer shows HDR sequences).
+QImage sdrView(Image light, const char* hdr) {
+    convertColor(light, hdrSpace(hdr), rec709Space());
+    QImage img(light.width, light.height, QImage::Format_RGBA8888);
+    toRgba8(light, img.bits(), size_t(img.bytesPerLine()));
+    return img;
+}
+
+}  // namespace
 
 LiveFeed::Now LiveFeed::look() const {
     std::lock_guard lock(m_);
@@ -631,7 +705,15 @@ void LiveFeed::begin(const std::string& timecode, int fpsNum, int fpsDen) {
     std::lock_guard lock(m_);
     first_ = timecode;
     fpsNum_ = std::max(1, fpsNum), fpsDen_ = std::max(1, fpsDen);
-    now_ = {};
+    // (begun again while it runs, a file begun or ended from the same reception: its picture and levels go on, its
+    // pictures numbered from the first again)
+    if (now_.running) {
+        now_.frame = -1;
+        now_.timecode.clear();
+    } else {
+        now_ = {};
+        av_frame_free(&latest_);
+    }
     now_.fps = double(fpsNum_) / fpsDen_;
     now_.running = true;
 }
@@ -643,34 +725,34 @@ void LiveFeed::end() {
 
 void LiveFeed::picture(const AVFrame* f) {
     if (!f || f->width <= 0 || f->height <= 0) return;
-    // Scaled to fit, its shape kept (the pixels' aspect too), as RGB.
-    const double sar = f->sample_aspect_ratio.num > 0 && f->sample_aspect_ratio.den > 0 ? av_q2d(f->sample_aspect_ratio) : 1.0;
-    const double shown = f->width * sar;
-    const double k = std::min({1.0, maxWidth_ / shown, double(maxHeight_) / f->height});
-    const int w = std::max(2, int(std::lround(shown * k))), h = std::max(2, int(std::lround(f->height * k)));
-    QImage img(w, h, QImage::Format_RGB32);
+    // Scaled to fit, its shape kept (the pixels' aspect too), as RGB; an HDR picture as an SDR display shows it.
+    const char* hdr = hdrOf(f);
+    int w = 0, h = 0;
+    // (an HDR picture no larger than a tile: rolling its light off is this thread's work, the recording's; a viewer
+    // that shows it larger asks full(), on its own thread)
+    fitted(f, *hdr ? std::min(maxWidth_, 640) : maxWidth_, *hdr ? std::min(maxHeight_, 360) : maxHeight_, w, h);
+    QImage img;
     {
         // (the scaler, kept for the next picture: this thread alone uses it)
-        // (keyed by everything the scaler is made for: the size made from the pixels' shape among them)
-        const int key[6] = {f->width, f->height, f->format, w, h, int(f->colorspace) << 8 | int(f->color_range)};
-        if (!sws_ || !std::equal(key, key + 6, swsKey_)) {
-            sws_ = sws_getCachedContext(sws_, f->width, f->height, AVPixelFormat(f->format), w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-            std::copy(key, key + 6, swsKey_);
-            if (sws_) {
-                const int space = f->colorspace == AVCOL_SPC_BT2020_NCL                                         ? SWS_CS_BT2020
-                                  : f->colorspace == AVCOL_SPC_SMPTE170M || f->colorspace == AVCOL_SPC_BT470BG ? SWS_CS_ITU601
-                                                                                                                : SWS_CS_ITU709;
-                const bool full = f->color_range == AVCOL_RANGE_JPEG;
-                sws_setColorspaceDetails(sws_, sws_getCoefficients(space), full ? 1 : 0, sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1 << 16, 1 << 16);
-            }
-        }
+        sws_ = rgbScaler(sws_, swsKey_, f, w, h, *hdr != 0);
         if (!sws_) return;
-        uint8_t* dst[1] = {img.bits()};
-        const int stride[1] = {int(img.bytesPerLine())};
-        sws_scale(sws_, f->data, f->linesize, 0, f->height, dst, stride);
+        if (*hdr) {
+            Image light;
+            if (!lightOf(sws_, f, w, h, light)) return;
+            img = sdrView(std::move(light), hdr);
+        } else {
+            img = QImage(w, h, QImage::Format_RGB32);
+            uint8_t* dst[1] = {img.bits()};
+            const int stride[1] = {int(img.bytesPerLine())};
+            sws_scale(sws_, f->data, f->linesize, 0, f->height, dst, stride);
+        }
     }
+    AVFrame* kept = av_frame_clone(f);  // (a reference to its planes: converted only when a viewer asks, full())
     std::lock_guard lock(m_);
+    av_frame_free(&latest_);
+    latest_ = kept;
     now_.picture = img;
+    now_.hdr = hdr;
     now_.frame = f->pts;
     now_.width = f->width, now_.height = f->height;
     ++now_.pictures;
@@ -680,6 +762,38 @@ void LiveFeed::picture(const AVFrame* f) {
         char b[AV_TIMECODE_STR_SIZE];
         now_.timecode = av_timecode_make_string(&tc, b, int(std::min<int64_t>(f->pts, INT32_MAX)));
     }
+}
+
+LiveFeed::Full LiveFeed::full(int maxWidth, int maxHeight, int64_t after) const {
+    Full out;
+    AVFrame* f = nullptr;
+    {
+        std::lock_guard lock(m_);
+        if (!latest_ || now_.pictures == after) return out;
+        f = av_frame_clone(latest_);
+        out.pictures = now_.pictures;
+    }
+    if (!f) return {};
+    out.width = f->width, out.height = f->height;
+    int w = 0, h = 0;
+    fitted(f, std::max(16, maxWidth), std::max(16, maxHeight), w, h);
+    const char* hdr = hdrOf(f);
+    bool ok = false;
+    {
+        std::lock_guard lock(fullM_);
+        fullSws_ = rgbScaler(fullSws_, fullKey_, f, w, h, *hdr != 0);
+        if (fullSws_ && *hdr) {
+            ok = lightOf(fullSws_, f, w, h, out.light);
+            out.space = hdrSpace(hdr).id;
+        } else if (fullSws_) {
+            out.picture = QImage(w, h, QImage::Format_RGB32);
+            uint8_t* dst[1] = {out.picture.bits()};
+            const int stride[1] = {int(out.picture.bytesPerLine())};
+            ok = sws_scale(fullSws_, f->data, f->linesize, 0, f->height, dst, stride) > 0;
+        }
+    }
+    av_frame_free(&f);
+    return ok ? out : Full{};
 }
 
 void LiveFeed::sound(const AVFrame* f) {
@@ -705,30 +819,40 @@ Recorder::Recorder() : s_(std::make_unique<State>()) {}
 
 Recorder::~Recorder() { stop(); }
 
-bool Recorder::start(const CaptureSettings& settings, std::string* error) {
-    stop();
-    if (!findCodec(settings.codec) || !avcodec_find_encoder_by_name(findCodec(settings.codec)->encoder)) {
-        if (error) *error = "Unknown codec " + settings.codec;
+namespace {
+
+// Whether a feed can be recorded to `file` (or, with no path, watched: `watched`), and why not.
+bool recordable(const CaptureFile& file, bool watched, std::string* error) {
+    if (!findCodec(file.codec) || !avcodec_find_encoder_by_name(findCodec(file.codec)->encoder)) {
+        if (error) *error = "Unknown codec " + file.codec;
         return false;
     }
-    if (!(settings.path.empty() && settings.live) && !endsWith(settings.path, ".mov") && !endsWith(settings.path, ".mxf")) {
+    if (!(file.path.empty() && watched) && !endsWith(file.path, ".mov") && !endsWith(file.path, ".mxf")) {
         if (error) *error = "Record to a .mov or .mxf file";
         return false;
     }
-    if (isJpegXs(settings.codec)) {
+    if (isJpegXs(file.codec)) {
         if (!jpegXsAvailable()) {
             if (error) *error = "This build of Montage records no JPEG XS (SVT-JPEG-XS)";
             return false;
         }
-        if (!settings.path.empty() && !endsWith(settings.path, ".mxf")) {
+        if (!file.path.empty() && !endsWith(file.path, ".mxf")) {
             if (error) *error = "JPEG XS records to MXF (ST 2124): name a .mxf file";
             return false;
         }
-        if (!(settings.jpegXsBpp >= 0.5 && settings.jpegXsBpp <= 24)) {
+        if (!(file.jpegXsBpp >= 0.5 && file.jpegXsBpp <= 24)) {
             if (error) *error = "A JPEG XS rate is 0.5 to 24 bits a pixel";
             return false;
         }
     }
+    return true;
+}
+
+}  // namespace
+
+bool Recorder::start(const CaptureSettings& settings, std::string* error) {
+    stop();
+    if (!recordable({settings.path, settings.codec, settings.jpegXsBpp, settings.timecode, settings.reel}, bool(settings.live), error)) return false;
     if (settings.video.url.empty()) {
         if (error) *error = "Name the feed to record";
         return false;
@@ -739,8 +863,31 @@ bool Recorder::start(const CaptureSettings& settings, std::string* error) {
     s_ = std::make_unique<State>();
     s_->settings = settings;
     s_->running = true;
+    s_->toFile = !settings.path.empty();
     s_->st.recording = true;
+    s_->st.path = settings.path;
     thread_ = std::thread([this] { run(); });
+    return true;
+}
+
+bool Recorder::recordTo(const CaptureFile& file, std::string* error, bool wait) {
+    if (!s_ || !s_->running) {
+        if (error) *error = "The feed has ended";
+        return false;
+    }
+    // (with no file named the reception is held, watched or not, for the file after)
+    if (!recordable(file, true, error)) return false;
+    std::unique_lock lock(s_->m);
+    s_->next = file;
+    const uint64_t mine = ++s_->asked;
+    s_->switchAsked = true;
+    s_->qc.notify_all();
+    if (!wait) return true;
+    s_->switched.wait(lock, [&] { return s_->taken >= mine || !s_->running; });
+    if (s_->taken < mine) {
+        if (error) *error = "The feed has ended";
+        return false;
+    }
     return true;
 }
 
@@ -770,7 +917,11 @@ CaptureStatus Recorder::status() const {
 void Recorder::run() {
     State* s = s_.get();
     const CaptureSettings& cs = s->settings;
-    const Codec* codec = findCodec(cs.codec);
+    // What it records to now: the settings' file, then any recordTo names (from the same reception).
+    CaptureFile file{cs.path, cs.codec, cs.jpegXsBpp, cs.timecode, cs.reel};
+    const Codec* codec = findCodec(file.codec);
+    double seconds = cs.seconds;  // (a set length: the first file's)
+    bool switched = false;        // a file (or watching) begun by recordTo
     std::string fatal, warning;
     std::vector<std::thread> readers;
     Input inputs[2];
@@ -798,15 +949,15 @@ void Recorder::run() {
     bool audioStarted = false;
     double audioBase = 0;        // a sound device's: its first timestamp and the sample it was placed at
     int64_t audioBaseSample = 0;
-    const bool mov = endsWith(cs.path, ".mov");
-    const bool watchOnly = cs.path.empty();
+    bool mov = endsWith(file.path, ".mov");
+    bool watchOnly = file.path.empty();
     // JPEG XS: FFmpeg's raw pictures and PCM packets handed to its writer (the muxer FFmpeg's null one).
-    const bool jxsRecord = isJpegXs(cs.codec) && !watchOnly;
+    bool jxsRecord = isJpegXs(file.codec) && !watchOnly;
     std::unique_ptr<JxsWriter> jxs;
     AVFrame* jxsPicture = av_frame_alloc();
     std::vector<float> jxsSound;
     int64_t frameLimit = 0;
-    const bool ranged = cs.fromFrame >= 0;
+    bool ranged = cs.fromFrame >= 0;
     int64_t firstLabel = -1;  // a range's first picture's label
     double arrival = 0;       // when the packet being decoded arrived
     // When the video packets arrived, by their timestamp: a decoder that holds pictures back (frame threads, reordering)
@@ -835,6 +986,27 @@ void Recorder::run() {
         double time = std::nan("");  // (its stream time, seconds)
     };
     std::vector<CueHeld> cuesHeld;  // (before the first picture)
+    // The feed's own time code as it runs: the last one given and the time of the picture it names (only some pictures
+    // come with one: a transport stream's once a group), so a file begun between them starts with the feed's.
+    std::string tcSeen;
+    double tcSeenAt = 0;
+    // The feed's own sound of the last two seconds, as it was placed (each stretch with the first picture's time
+    // then): a decoder holds pictures back, so sound runs ahead of them, and a file begun from the same reception
+    // takes what belongs from its first picture on.
+    struct Placed {
+        double zero = 0;  // (t0 when it was placed: its first sample's time is zero + pts / 48000)
+        AVFrame* sound = nullptr;
+    };
+    std::deque<Placed> recentSound;
+    int64_t recentSamples = 0;
+    // Sound that came between a file's end and the next one's first picture (recordTo): placed once that has begun.
+    struct Held {
+        AVFrame* sound = nullptr;
+        bool sameInput = true;
+        AVRational tb{1, 1};
+    };
+    std::deque<Held> heldSound;
+    std::function<bool(AVFrame*, bool, AVRational)> placeSound;  // (putSound, for putPicture)
 
     auto write = [&](AVCodecContext* enc, AVStream* st, AVFrame* f) -> bool {
         if (f && enc == venc) {
@@ -872,7 +1044,7 @@ void Recorder::run() {
                 }
                 av_packet_unref(out);
                 if (!done) {
-                    fatal = "Cannot write " + cs.path + ": " + why;
+                    fatal = "Cannot write " + file.path + ": " + why;
                     return false;
                 }
                 continue;
@@ -880,7 +1052,7 @@ void Recorder::run() {
             av_packet_rescale_ts(out, enc->time_base, st->time_base);
             out->stream_index = st->index;
             if ((err = av_interleaved_write_frame(oc, out)) < 0) {
-                fatal = "Cannot write " + cs.path + ": " + avError(err);
+                fatal = "Cannot write " + file.path + ": " + avError(err);
                 return false;
             }
         }
@@ -903,6 +1075,97 @@ void Recorder::run() {
             count -= quiet->nb_samples;
             const bool ok = write(aenc, ast, quiet);
             av_frame_free(&quiet);
+            if (!ok) return false;
+        }
+        return true;
+    };
+
+    // The file being recorded finished (its encoders emptied, its end written; `fatal` says what could not be), or one
+    // begun and never written to taken away again; what was made for it let go.
+    auto endFile = [&] {
+        if (headerWritten && !watchOnly) {
+            // (a QuickTime file already holds all but the last fragment)
+            if (venc) write(venc, vst, nullptr);
+            if (aenc) write(aenc, ast, nullptr);
+            const int err = av_write_trailer(oc);
+            if (err < 0 && fatal.empty()) fatal = "Cannot finish " + file.path + ": " + avError(err);
+            // (JPEG XS: its MXF finished with what was recorded, as a QuickTime file keeps its fragments)
+            if (std::string why; jxs && jxs->framesWritten() > 0 && !jxs->finish(&why) && fatal.empty()) fatal = "Cannot finish " + file.path + ": " + why;
+        }
+        if (oc) {
+            if (!(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
+            avformat_free_context(oc);
+            oc = nullptr;
+        }
+        // (nothing usable: the file begun is taken away again)
+        if (fileMade && !headerWritten) QFile::remove(QString::fromStdString(file.path));
+        if (metaFile) metaFile->close();
+        metaFile.reset();
+        vst = ast = nullptr;
+        avcodec_free_context(&venc);
+        avcodec_free_context(&aenc);
+        sws_freeContext(sws);
+        sws = nullptr;
+        swsKey[2] = -1;
+        swr_free(&swr);
+        av_channel_layout_uninit(&swrLayout);
+        swrFormat = -1, swrRate = 0;
+        jxs.reset();
+        av_frame_free(&last);
+    };
+    // What is recorded from the next picture on (begin opens it): `to`, or with no path the feed only watched.
+    auto setFile = [&](const CaptureFile& to) {
+        file = to;
+        codec = findCodec(file.codec);
+        mov = endsWith(file.path, ".mov");
+        watchOnly = file.path.empty();
+        jxsRecord = isJpegXs(file.codec) && !watchOnly;
+        switched = true;
+        seconds = 0, frameLimit = 0;
+        ranged = false, firstLabel = -1;
+        headerWritten = fileMade = told = false;
+        nextFrame = nextSample = skipSamples = 0;
+        audioStarted = false;
+        audioBase = 0, audioBaseSample = 0;
+        swrFailed = false;
+        ccCarried.clear();
+        metaCarried.clear();
+        for (ExtraPlace& x : extraPlaces) x.next = x.skip = 0, x.started = false;
+        warning.clear();
+        s->toFile = !watchOnly;
+        std::lock_guard lock(s->m);
+        const CaptureStatus was = s->st;
+        s->st = {};
+        s->st.recording = true;
+        s->st.path = file.path;
+        // (the feed's own, the same until the next picture says again)
+        s->st.width = was.width, s->st.height = was.height, s->st.fps = was.fps, s->st.channels = was.channels;
+    };
+    // A file begun from the same reception: the sound already placed that belongs from its first picture on (it ran
+    // ahead of the pictures) goes in at its start.
+    auto carrySound = [&]() -> bool {
+        if (!aenc) return true;
+        for (const Placed& r : recentSound) {
+            const int64_t at = r.sound->pts + int64_t(std::llround((r.zero - t0) * 48000));  // (its first sample's place here)
+            const int n = r.sound->nb_samples;
+            if (r.sound->ch_layout.nb_channels != aenc->ch_layout.nb_channels || r.sound->format != aenc->sample_fmt || at + n <= nextSample) continue;
+            // (a gap in what was kept, silence there before: silence here too)
+            if (at > nextSample && !silence(at - nextSample)) return false;
+            const int skip = int(nextSample - at);
+            AVFrame* part = av_frame_alloc();
+            part->format = r.sound->format;
+            part->sample_rate = 48000;
+            av_channel_layout_copy(&part->ch_layout, &r.sound->ch_layout);
+            part->nb_samples = n - skip;
+            bool ok = av_frame_get_buffer(part, 0) >= 0;
+            if (ok) {
+                av_samples_copy(part->data, r.sound->data, 0, skip, n - skip, part->ch_layout.nb_channels, AVSampleFormat(part->format));
+                part->pts = nextSample;
+                nextSample += part->nb_samples;
+                audioStarted = true;
+                ok = write(aenc, ast, part);
+            }
+            av_frame_free(&part);
             if (!ok) return false;
         }
         return true;
@@ -952,46 +1215,77 @@ void Recorder::run() {
         return cs.label(came);
     };
 
-    // Opens the file at the first picture (its size, rate and timecode known then).
-    auto begin = [&](const AVFrame* f, Input& in) -> bool {
-        bool standard = false;
-        fps = standardRate(in.rate, &standard);
-        if (fps.num <= 0 || fps.den <= 0 || av_q2d(fps) > 240 || av_q2d(fps) < 1) fps = {25, 1}, standard = true;
-        if (!mov && !standard) {
-            char b[32];
-            std::snprintf(b, sizeof b, "%.3g", av_q2d(fps));
-            fatal = std::string("MXF records at the broadcast rates (23.976 to 120 fps); this feed runs at ") + b + " fps: record it to QuickTime";
-            return false;
-        }
-        frameLimit = cs.seconds > 0 ? int64_t(std::llround(cs.seconds * av_q2d(fps))) : 0;
-        std::string tc = cs.timecode;
-        if (ranged) {
-            frameLimit = cs.frames > 0 ? cs.fromFrame + cs.frames - firstLabel : 0;
-            const int base = int(std::lround(av_q2d(fps)));
-            const LtcFrame l = ltcFrameAt(firstLabel, base, base == 30 && fps.den == 1001 && isDropFrameFeed);
-            tc = ltcLabel(l);
-        }
-        if (tc.empty())
-            if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_S12M_TIMECODE); sd && sd->size >= 8) {
-                const auto* v = reinterpret_cast<const uint32_t*>(sd->data);
-                if (v[0] >= 1) {
-                    char b[AV_TIMECODE_STR_SIZE];
-                    av_timecode_make_smpte_tc_string2(b, fps, v[1], 0, 0);
-                    tc = b;
-                    AVTimecode check;
-                    if (av_timecode_init_from_string(&check, fps, tc.c_str(), nullptr) < 0) tc.clear();  // (the feed's does not fit its rate)
-                }
+    // The rate a feed is recorded at: its own, a broadcast rate when it is within half a percent of one.
+    auto rateOf = [](const Input& in, bool* standard) {
+        AVRational r = standardRate(in.rate, standard);
+        if (r.num <= 0 || r.den <= 0 || av_q2d(r) > 240 || av_q2d(r) < 1) r = {25, 1}, *standard = true;
+        return r;
+    };
+    // The time code a picture carries ("" none, or one that does not fit the rate): SMPTE 12-M, or an MPEG-2 feed's GOP
+    // time code (an encoder's own over SRT, RIST, UDP). `next`: it is the following picture's. (FFmpeg's decoder gives a
+    // group's time code with the picture it gives out as it reads the group's header: the group's first picture when
+    // that is given out at once, as the feed's first is, else the picture before it.)
+    auto ownTimecode = [](const AVFrame* f, AVRational rate, bool* next) -> std::string {
+        *next = false;
+        std::string tc;
+        if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_S12M_TIMECODE); sd && sd->size >= 8) {
+            const auto* v = reinterpret_cast<const uint32_t*>(sd->data);
+            if (v[0] >= 1) {
+                char b[AV_TIMECODE_STR_SIZE];
+                av_timecode_make_smpte_tc_string2(b, rate, v[1], 0, 0);
+                tc = b;
             }
-        // (an MPEG-2 feed's GOP time code, on the picture beginning each group: an encoder's own over SRT, RIST, UDP)
+        }
         if (tc.empty())
             if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_GOP_TIMECODE); sd && sd->size >= int(sizeof(int64_t))) {
                 int64_t gop = 0;
                 std::memcpy(&gop, sd->data, sizeof gop);
                 char b[AV_TIMECODE_STR_SIZE];
                 tc = av_timecode_make_mpeg_tc_string(b, uint32_t(gop));
-                AVTimecode check;
-                if (av_timecode_init_from_string(&check, fps, tc.c_str(), nullptr) < 0) tc.clear();
+                *next = f->pict_type != AV_PICTURE_TYPE_I;
             }
+        AVTimecode check;
+        if (!tc.empty() && av_timecode_init_from_string(&check, rate, tc.c_str(), nullptr) < 0) tc.clear();
+        return tc;
+    };
+
+    // Opens the file at the first picture (its size, rate and timecode known then).
+    auto begin = [&](const AVFrame* f, Input& in) -> bool {
+        bool standard = false;
+        fps = rateOf(in, &standard);
+        if (!mov && !standard) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%.3g", av_q2d(fps));
+            fatal = std::string("MXF records at the broadcast rates (23.976 to 120 fps); this feed runs at ") + b + " fps: record it to QuickTime";
+            return false;
+        }
+        frameLimit = seconds > 0 ? int64_t(std::llround(seconds * av_q2d(fps))) : 0;
+        std::string tc = file.timecode;
+        if (ranged) {
+            frameLimit = cs.frames > 0 ? cs.fromFrame + cs.frames - firstLabel : 0;
+            const int base = int(std::lround(av_q2d(fps)));
+            const LtcFrame l = ltcFrameAt(firstLabel, base, base == 30 && fps.den == 1001 && isDropFrameFeed);
+            tc = ltcLabel(l);
+        }
+        if (bool next = false; tc.empty()) {
+            tc = ownTimecode(f, fps, &next);
+            if (next) tc.clear();  // (the picture after this one's: counted back from, below)
+        }
+        // (a picture between those that carry it: the last one's, counted on by the feed's clock; the picture before
+        // the one it names: a frame back)
+        if (const int64_t ts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts;
+            tc.empty() && !tcSeen.empty() && ts != AV_NOPTS_VALUE) {
+            const double on = (double(ts) * av_q2d(in.videoTb) - tcSeenAt) * av_q2d(fps);
+            AVTimecode from;
+            if (on > -1.5 && on < 86400 * av_q2d(fps) && av_timecode_init_from_string(&from, fps, tcSeen.c_str(), nullptr) >= 0) {
+                int64_t frames = std::llround(on);
+                // (a frame before midnight's: the day's last)
+                if (int64_t(from.start) + frames < 0)
+                    frames += int64_t(from.fps) * 86400 - ((from.flags & AV_TIMECODE_FLAG_DROPFRAME) ? int64_t(from.fps / 30) * 2592 : 0);
+                char b[AV_TIMECODE_STR_SIZE];
+                tc = av_timecode_make_string(&from, b, int(frames));
+            }
+        }
         if (tc.empty()) tc = timeOfDay(fps);
         if (AVTimecode check; av_timecode_init_from_string(&check, fps, tc.c_str(), nullptr) < 0) {
             char b[32];
@@ -999,9 +1293,9 @@ void Recorder::run() {
             fatal = "The timecode " + tc + " does not fit the feed's " + b + " fps";
             return false;
         }
-        int err = watchOnly ? 0 : avformat_alloc_output_context2(&oc, nullptr, jxsRecord ? "null" : nullptr, cs.path.c_str());
+        int err = watchOnly ? 0 : avformat_alloc_output_context2(&oc, nullptr, jxsRecord ? "null" : nullptr, file.path.c_str());
         if (!watchOnly && (err < 0 || !oc)) {
-            fatal = "Cannot write " + cs.path + ": " + avError(err);
+            fatal = "Cannot write " + file.path + ": " + avError(err);
             return false;
         }
         width = f->width, height = f->height;
@@ -1055,7 +1349,7 @@ void Recorder::run() {
             vst->time_base = venc->time_base;
             vst->avg_frame_rate = fps;
             av_dict_set(&vst->metadata, "timecode", tc.c_str(), 0);
-            if (!cs.reel.empty()) av_dict_set(&vst->metadata, "reel_name", cs.reel.c_str(), 0);
+            if (!file.reel.empty()) av_dict_set(&vst->metadata, "reel_name", file.reel.c_str(), 0);
         }
         // Its sound: the video source's, else a sound device of its own (its format known from the first sound).
         const Input& ain = inputs[1].live() ? inputs[1] : inputs[0];
@@ -1114,8 +1408,8 @@ void Recorder::run() {
         }
         av_dict_set(&oc->metadata, "timecode", tc.c_str(), 0);
         if (!(oc->oformat->flags & AVFMT_NOFILE)) {
-            if ((err = avio_open(&oc->pb, cs.path.c_str(), AVIO_FLAG_WRITE)) < 0) {
-                fatal = "Cannot write " + cs.path + ": " + avError(err);
+            if ((err = avio_open(&oc->pb, file.path.c_str(), AVIO_FLAG_WRITE)) < 0) {
+                fatal = "Cannot write " + file.path + ": " + avError(err);
                 return false;
             }
             fileMade = true;
@@ -1129,7 +1423,7 @@ void Recorder::run() {
         err = avformat_write_header(oc, &mopts);
         av_dict_free(&mopts);
         if (err < 0) {
-            fatal = "Cannot write " + cs.path + ": " + avError(err);
+            fatal = "Cannot write " + file.path + ": " + avError(err);
             return false;
         }
         if (jxsRecord) {
@@ -1141,7 +1435,7 @@ void Recorder::run() {
             xs.encode.height = height;
             xs.encode.depth = 10;
             xs.encode.sampling = JxsSampling::Ycc422;
-            xs.encode.bppNum = int(std::lround(cs.jpegXsBpp * 1000));
+            xs.encode.bppNum = int(std::lround(file.jpegXsBpp * 1000));
             xs.encode.bppDen = 1000;
             xs.fpsNum = fps.num;
             xs.fpsDen = fps.den;
@@ -1150,18 +1444,18 @@ void Recorder::run() {
             xs.matrix = int(venc->colorspace);
             xs.timecode = tc;
             xs.dropFrame = tc.find(';') != std::string::npos;
-            xs.clipName = cs.reel;
+            xs.clipName = file.reel;
             if (aenc) xs.channels = aenc->ch_layout.nb_channels, xs.sampleRate = 48000, xs.bits = 24;
             jxs = std::make_unique<JxsWriter>();
             std::string why;
-            if (!jxs->open(cs.path, xs, &why)) {
-                fatal = "Cannot write " + cs.path + ": " + why;
+            if (!jxs->open(file.path, xs, &why)) {
+                fatal = "Cannot write " + file.path + ": " + why;
                 jxs.reset();
                 return false;
             }
         }
         // (fast metadata an earlier recording here kept: not this one's)
-        if (!watchOnly) QFile::remove(QString::fromStdString(st2110::fastMetadataSidecar(cs.path)));
+        if (!watchOnly) QFile::remove(QString::fromStdString(st2110::fastMetadataSidecar(file.path)));
         headerWritten = true;
         if (cs.live) cs.live->begin(tc, fps.num, fps.den);
         std::lock_guard lock(s->m);
@@ -1175,6 +1469,12 @@ void Recorder::run() {
 
     auto putPicture = [&](AVFrame* f, Input& in) -> bool {
         const int64_t ts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts;
+        if (ts != AV_NOPTS_VALUE) {
+            bool standard = false, next = false;
+            const AVRational rate = rateOf(in, &standard);
+            if (std::string own = ownTimecode(f, rate, &next); !own.empty())
+                tcSeen = std::move(own), tcSeenAt = double(ts) * av_q2d(in.videoTb) + (next ? 1 / av_q2d(rate) : 0);
+        }
         // A range by timecode: the picture's label, and those before the range passed over. A label from the clock
         // only chooses the first picture (the rest placed by the feed's timestamps, steadier than when they arrived).
         int64_t label = -1;
@@ -1193,8 +1493,29 @@ void Recorder::run() {
         if (!headerWritten) {
             // (a feed joined between keyframes: its pictures start once they decode whole)
             if (f->decode_error_flags || (f->flags & AV_FRAME_FLAG_CORRUPT)) return true;
-            if (!begin(f, in)) return false;
+            if (!begin(f, in)) {
+                if (!switched || watchOnly) return false;
+                // A file named while the feed was received that cannot be begun: said, and the feed watched on.
+                const std::string path = file.path, why = fatal;
+                fatal.clear();
+                endFile();
+                fatal.clear();
+                if (onFileFinished) onFileFinished(path, false, why);
+                setFile({});
+                if (!begin(f, in)) return false;
+            }
             t0 = ts != AV_NOPTS_VALUE ? double(ts) * av_q2d(in.videoTb) : 0;
+            if (switched) {
+                // (the sound that belongs from this picture on: what was placed already, then what came since)
+                bool ok = carrySound();
+                std::deque<Held> held;
+                held.swap(heldSound);
+                for (Held& h : held) {
+                    if (ok) ok = placeSound(h.sound, h.sameInput, h.tb);
+                    av_frame_free(&h.sound);
+                }
+                if (!ok) return false;
+            }
             if (cs.onCue)
                 for (const CueHeld& c : cuesHeld) cs.onCue(c.section, t0, c.time - t0);
             cuesHeld.clear();
@@ -1240,6 +1561,8 @@ void Recorder::run() {
         // (as coded: narrow range in the recording's matrix, the feed's pixel shape; a live view reads them)
         pic->colorspace = AVColorSpace(colorSpace);
         pic->color_range = AVCOL_RANGE_MPEG;
+        pic->color_primaries = f->color_primaries;
+        pic->color_trc = f->color_trc;
         pic->sample_aspect_ratio = f->sample_aspect_ratio;
         if (av_frame_get_buffer(pic, 0) < 0) {
             av_frame_free(&pic);
@@ -1306,6 +1629,11 @@ void Recorder::run() {
     };
 
     auto putSound = [&](AVFrame* f, bool sameInput, AVRational tb) -> bool {
+        if (!headerWritten && switched) {
+            if (heldSound.size() < 256)
+                if (AVFrame* keep = av_frame_clone(f)) heldSound.push_back({keep, sameInput, tb});
+            return true;
+        }
         if (!headerWritten || !aenc) return true;
         const int64_t endSample = std::min(soundEnd, frameLimit > 0 ? int64_t(std::llround(double(frameLimit) / av_q2d(fps) * 48000)) : INT64_MAX);
         if (nextSample >= endSample) return true;
@@ -1394,11 +1722,23 @@ void Recorder::run() {
         use->nb_samples = int(std::min<int64_t>(use->nb_samples, endSample - nextSample));
         use->pts = nextSample;
         nextSample += use->nb_samples;
+        if (sameInput)
+            if (AVFrame* keep = av_frame_clone(use)) {
+                recentSound.push_back({t0, keep});
+                recentSamples += keep->nb_samples;
+                while (recentSamples - recentSound.front().sound->nb_samples >= 2 * 48000) {
+                    recentSamples -= recentSound.front().sound->nb_samples;
+                    av_frame_free(&recentSound.front().sound);
+                    recentSound.pop_front();
+                }
+            }
         const bool ok = write(aenc, ast, use);
         av_frame_free(&trimmed);
         av_frame_unref(sound);
         return ok;
     };
+
+    placeSound = putSound;
 
     // One of the feed's other sound streams (allSound): converted to 48 kHz planar float and placed by its time
     // against the pictures', as putSound places the recorded one (silence where it is missing, trimmed where it runs
@@ -1622,7 +1962,7 @@ void Recorder::run() {
             if (!headerWritten) metaCarried.clear();
             if (nextFrame > before && !metaCarried.empty()) {
                 if (!metaFile) {
-                    metaFile = std::make_unique<QFile>(QString::fromStdString(st2110::fastMetadataSidecar(cs.path)));
+                    metaFile = std::make_unique<QFile>(QString::fromStdString(st2110::fastMetadataSidecar(file.path)));
                     if (!metaFile->open(QIODevice::WriteOnly | QIODevice::Truncate)) metaFile->setFileName(QString());
                 }
                 if (metaFile->isOpen()) {
@@ -1838,10 +2178,39 @@ void Recorder::run() {
         int ended = 0;
         const int live = inputs[1].live() ? 2 : 1;
         while (ok && !timedOut) {
+            // Another file asked for (recordTo), or the feed only watched on: the one being recorded ends at the picture
+            // reached, its sound with it, and the next picture begins the new one.
+            if (s->switchAsked) {
+                CaptureFile to;
+                uint64_t request = 0;
+                {
+                    std::lock_guard lock(s->m);
+                    s->switchAsked = false;
+                    if (s->next) to = *s->next, request = s->asked;
+                    s->next.reset();
+                }
+                if (request) {
+                    const bool recorded = headerWritten && !watchOnly;
+                    const std::string path = file.path;
+                    if (recorded && aenc)
+                        if (const int64_t end = int64_t(std::llround(double(nextFrame) / av_q2d(fps) * 48000)); nextSample < end) silence(end - nextSample);
+                    endFile();
+                    const std::string problem = fatal, said = warning;
+                    fatal.clear();
+                    // (told while status() is still that file's)
+                    if (recorded && onFileFinished) onFileFinished(path, problem.empty(), problem.empty() ? said : problem);
+                    setFile(to);
+                    {
+                        std::lock_guard lock(s->m);
+                        s->taken = request;
+                    }
+                    s->switched.notify_all();
+                }
+            }
             Item item;
             {
                 std::unique_lock lock(s->qm);
-                s->qc.wait_for(lock, std::chrono::milliseconds(200), [&] { return !s->queue.empty() || s->stopping; });
+                s->qc.wait_for(lock, std::chrono::milliseconds(200), [&] { return !s->queue.empty() || s->stopping || s->switchAsked; });
                 if (s->stopping) break;
                 if (s->queue.empty()) continue;
                 item = s->queue.front();
@@ -1898,49 +2267,30 @@ void Recorder::run() {
         s->queuedBytes = 0;
     }
     if (cs.live) cs.live->end();
-    if (headerWritten && !watchOnly) {
-        // The encoders emptied and the file finished (a QuickTime file already holds all but the last fragment).
-        if (venc) write(venc, vst, nullptr);
-        if (aenc) write(aenc, ast, nullptr);
-        const int err = av_write_trailer(oc);
-        if (err < 0 && fatal.empty()) fatal = "Cannot finish " + cs.path + ": " + avError(err);
-        // (JPEG XS: its MXF finished with what was recorded, as a QuickTime file keeps its fragments)
-        if (std::string why; jxs && jxs->framesWritten() > 0 && !jxs->finish(&why) && fatal.empty()) fatal = "Cannot finish " + cs.path + ": " + why;
-    } else if (!headerWritten && fatal.empty()) {
-        fatal = warning.empty() ? "No picture came from the feed" : warning;
-    }
-    if (oc) {
-        if (!(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
-        avformat_free_context(oc);
-    }
-    // (nothing usable: the file begun is taken away again)
-    if (fileMade && !headerWritten) QFile::remove(QString::fromStdString(cs.path));
-    if (metaFile) metaFile->close();
-    avcodec_free_context(&venc);
-    avcodec_free_context(&aenc);
-    sws_freeContext(sws);
-    swr_free(&swr);
-    av_channel_layout_uninit(&swrLayout);
+    // (a feed that never sent a picture, or stopped before a file named since had one: only the first is a failure)
+    if (!headerWritten && fatal.empty() && !switched) fatal = warning.empty() ? "No picture came from the feed" : warning;
+    endFile();
+    for (Placed& r : recentSound) av_frame_free(&r.sound);
+    for (Held& h : heldSound) av_frame_free(&h.sound);
     for (ExtraPlace& x : extraPlaces) {
         swr_free(&x.swr);
         av_channel_layout_uninit(&x.in);
         av_channel_layout_uninit(&x.out);
     }
-    jxs.reset();
     av_frame_free(&jxsPicture);
-    av_frame_free(&last);
     av_frame_free(&decoded);
     av_frame_free(&sound);
     av_packet_free(&out);
-    const bool fine = headerWritten && (fatal.empty() || fatal == "Stopped");
+    const bool fine = (headerWritten || switched) && (fatal.empty() || fatal == "Stopped");
     {
         std::lock_guard lock(s->m);
         s->st.finished = true;
         s->st.recording = false;
         if (!fine && s->st.error.empty()) s->st.error = fatal;
         s->st.warning = warning;
+        s->running = false;  // (under the lock: a recordTo waiting sees it)
     }
-    s->running = false;
+    s->switched.notify_all();
     if (onFinished) onFinished(fine, fine ? warning : fatal);
 }
 
