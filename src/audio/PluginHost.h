@@ -83,6 +83,22 @@ private:
 };
 bool renderingRealtime();
 
+// An export marks its thread with this for as long as it renders. A plug-in that fails in its host, or is found
+// bypassed, by an offline render on a thread so marked stops that export (offlineFailureSerial() goes up). Met by any
+// other offline render, such as a background analysis with a mixer of its own, it is recorded for the main window's
+// bar and nothing more: an export running beside it carries on, as its own mixer has lost nothing.
+class ExportScope {
+public:
+    ExportScope();
+    ~ExportScope();
+    ExportScope(const ExportScope&) = delete;
+    ExportScope& operator=(const ExportScope&) = delete;
+
+private:
+    bool previous_;
+};
+bool renderingForExport();
+
 // An audio plug-in in a host process of the given grouping, whatever the setting (null with why when it cannot start).
 std::unique_ptr<Instance> instantiateIsolated(const Descriptor& d, Isolation grouping, std::string* error = nullptr);
 // The host process an instance runs in (0: Montage's own process).
@@ -105,7 +121,8 @@ struct HostFailure {
 std::vector<HostFailure> hostFailures();
 // Goes up with each failure, restart or change of the list (the main window's bar watches it).
 uint64_t hostFailureSerial();
-// Goes up with each failure during an offline render; lastOfflineFailure() says what it was.
+// Goes up with each failure during an export's render (ExportScope; an OpenFX plug-in's during any offline render);
+// lastOfflineFailure() says what it was.
 uint64_t offlineFailureSerial();
 std::string lastOfflineFailure();
 // Starts the plug-in's bypassed instances again, in fresh hosts, with their last saved states (false: none bypassed).

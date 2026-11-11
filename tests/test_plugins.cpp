@@ -22,6 +22,8 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <thread>
 
 #include "audio/AraHost.h"
 #include "audio/AudioDevice.h"
@@ -2127,6 +2129,9 @@ private slots:
         QVERIFY(firstHost > 0);
         const uint64_t offlineBefore = offlineFailureSerial();
         RenderModeScope mode(realtime);
+        // (the offline render is an export's: it is told of the failure)
+        std::optional<ExportScope> exporting;
+        if (!realtime) exporting.emplace();
         std::vector<float> l(128), r(128);
         float* ch[2] = {l.data(), r.data()};
         auto block = [&] {
@@ -2365,6 +2370,54 @@ private slots:
         QVERIFY(eventually([] { return runningHosts().empty(); }, 20000));
         err.clear();
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+    }
+
+    void backgroundRenderStopsNoExport() {
+        // A plug-in that fails in an offline render that is no export's (a background analysis, with a mixer and an
+        // instance of its own) is bypassed and recorded, and an export rendering meanwhile is told of nothing. The
+        // same failure met by the export's own instance stops it, by name.
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerInstance, [](HostingSettings& s) { s.autoRestarts = 0; });
+        std::string err;
+        std::unique_ptr<Instance> theirs, ours;
+        {
+            Fault f("crash:process:3");
+            theirs = instantiateIsolated(*d, Isolation::PerInstance, &err);
+            QVERIFY2(theirs, err.c_str());
+            ours = instantiateIsolated(*d, Isolation::PerInstance, &err);
+            QVERIFY2(ours, err.c_str());
+        }
+        QVERIFY(theirs->activate(48000, 128) && ours->activate(48000, 128));
+        QVERIFY(hostProcessOf(theirs.get()) != hostProcessOf(ours.get()));
+        auto renderUntilBypassed = [](Instance* inst) {
+            RenderModeScope offline(false);
+            std::vector<float> l(128), r(128);
+            float* ch[2] = {l.data(), r.data()};
+            for (int n = 0; n < 200 && !bypassed(inst); ++n) {
+                std::fill(l.begin(), l.end(), 0.5f);
+                std::fill(r.begin(), r.end(), 0.5f);
+                inst->process(ch, 2, 128);
+            }
+            // (and once more, finding it bypassed)
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            inst->process(ch, 2, 128);
+        };
+        // An export is rendering on this thread; the analysis runs on a thread of its own.
+        ExportScope exporting;
+        const uint64_t before = offlineFailureSerial();
+        std::thread analysis([&] { renderUntilBypassed(theirs.get()); });
+        analysis.join();
+        QVERIFY(bypassed(theirs.get()));
+        QVERIFY(!bypassed(ours.get()));
+        QVERIFY(eventually([&] { return failureOf(d->id).has_value(); }));
+        QCOMPARE(offlineFailureSerial(), before);
+        // The export's own instance fails the same way: the export is told at once.
+        renderUntilBypassed(ours.get());
+        QVERIFY(bypassed(ours.get()));
+        QVERIFY(offlineFailureSerial() != before);
+        QVERIFY2(QString::fromStdString(lastOfflineFailure()).startsWith(QString::fromStdString(d->name)), lastOfflineFailure().c_str());
     }
 
     void offlineRenderWaitsForARestart() {

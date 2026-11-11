@@ -95,7 +95,8 @@ Isolation currentIsolation();
 // (`offlineNoted`: noteOfflineFailure already told the export.)
 void recordFailure(const std::string& id, const std::string& name, const std::string& vendor, const std::string& kind,
                    const std::string& reason, bool offline, bool countsAsNew = true, bool offlineNoted = false);
-// Tells an export running now that a plug-in failed, at once (the thread rendering it, not the audio thread).
+// Tells the export rendering on this thread that a plug-in failed, at once (not the audio thread). An offline render
+// that is no export's (no ExportScope on its thread) tells nobody.
 void noteOfflineFailure(const std::string& name, const std::string& why);
 void noteRestart(const std::string& id);
 bool pluginHeldBypassed(const std::string& id);  // disabled after failing

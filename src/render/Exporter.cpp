@@ -1025,7 +1025,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (error) *error = msg;
         return false;
     };
-    // A plug-in that fails in its host while this renders stops the export, naming it (audio/PluginHost.h).
+    // A plug-in that fails in its host while this renders stops the export, naming it (audio/PluginHost.h). Only one
+    // this export's own mixers meet: this thread is marked as an export's while it renders.
+    const plugins::ExportScope exporting;
     const uint64_t pluginFailures = plugins::offlineFailureSerial();
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
@@ -3282,6 +3284,7 @@ bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSetti
                            containerCarriesStreams(s.path);
     // Smart rendering that cannot go on as planned (HEVC copied as hvc1 whose footage is not found where it was): made
     // again, encoded whole.
+    const plugins::ExportScope exporting;
     const uint64_t pluginFailures = plugins::offlineFailureSerial();
     auto exportOnce = [&](const Sequence& q, const ExportSettings& st) {
         bool again = false;

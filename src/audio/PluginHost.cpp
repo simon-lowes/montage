@@ -46,6 +46,7 @@ std::atomic<int> gMemoryLimitMb{4096};
 std::atomic<int> gAutoRestarts{2};
 std::atomic<bool> gInHost{false};
 thread_local bool tRealtime = false;
+thread_local bool tExport = false;
 }  // namespace
 
 const char* isolationName(Isolation i) {
@@ -139,6 +140,10 @@ bool isolating() {
 RenderModeScope::RenderModeScope(bool realtime) : previous_(tRealtime) { tRealtime = realtime; }
 RenderModeScope::~RenderModeScope() { tRealtime = previous_; }
 bool renderingRealtime() { return tRealtime; }
+
+ExportScope::ExportScope() : previous_(tExport) { tExport = true; }
+ExportScope::~ExportScope() { tExport = previous_; }
+bool renderingForExport() { return tExport; }
 
 namespace remote {
 
@@ -463,6 +468,7 @@ void recordFailure(const std::string& id, const std::string& name, const std::st
 }
 
 void noteOfflineFailure(const std::string& name, const std::string& why) {
+    if (!tExport) return;  // (a background analysis's mixer: no export has lost anything)
     Book& b = book();
     {
         std::lock_guard lock(b.m);
@@ -1072,7 +1078,8 @@ private:
         if (!core_->state.compare_exchange_strong(expected, 3)) return;
         core_->failure = f;
         core_->failedOffline = rendering && !tRealtime;
-        if (rendering && !tRealtime) {
+        // (an export's render alone: another offline render waits for the new host and carries on)
+        if (rendering && !tRealtime && tExport) {
             offlineNoted_ = true;
             // (an export checks for failures between frames: it hears of this one before it finishes)
             std::string how = f == Hung ? "did not answer within " + std::to_string(gExportTimeoutMs.load() / 1000) + " s and was stopped"
@@ -1148,9 +1155,10 @@ private:
     void processChunk(float* const* channels, int numChannels, int off, int frames) {
         core_->lastRenderOffline.store(!tRealtime, std::memory_order_relaxed);
         if (!usable()) {
-            if (!tRealtime && !offlineNoted_ && !pluginHeldBypassed(core_->d.id)) {
+            if (!tRealtime && tExport && !offlineNoted_ && !pluginHeldBypassed(core_->d.id)) {
                 // An export would leave it out: it stops instead, naming it (a plug-in the user disabled after it
-                // failed stays out, as asked).
+                // failed stays out, as asked). Only the export whose own mixer meets it here: an analysis in the
+                // background that finds it bypassed stops no export.
                 offlineNoted_ = true;
                 std::string how = core_->failure == Hung ? std::string("stopped responding") : link_ ? link_->host->howItEnded() : std::string();
                 noteOfflineFailure(core_->d.name.empty() ? core_->d.id : core_->d.name,
@@ -1315,9 +1323,10 @@ std::unique_ptr<Instance> instantiateIsolated(const Descriptor& d, Isolation gro
         if (a.hostDied) {
             // As a crash while scanning: blocked until the file changes or the user tries it again.
             Registry::instance().blockAfterCrash(d.format, d.path, "crashed while loading: " + a.error);
-            recordFailure(d.id, d.name, d.vendor, "load", a.error + "; blocked", !tRealtime);
+            // (told to the export making it; an offline render that is no export's has none to tell)
+            recordFailure(d.id, d.name, d.vendor, "load", a.error + "; blocked", !tRealtime, true, !tExport);
         } else if (a.timedOut) {
-            recordFailure(d.id, d.name, d.vendor, "hang", a.error, !tRealtime);
+            recordFailure(d.id, d.name, d.vendor, "hang", a.error, !tRealtime, true, !tExport);
         }
         if (error) *error = a.error;
         return nullptr;
