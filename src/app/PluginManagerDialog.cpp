@@ -82,12 +82,15 @@ void PluginManagerDialog::editHosting(QWidget* parent) {
     auto* isolation = new QComboBox(&dlg);
     isolation->setObjectName(QStringLiteral("hostingIsolation"));
     isolation->addItem(tr("Each plug-in in a host of its own (recommended)"), int(Isolation::PerPlugin));
+    isolation->addItem(tr("Each instance in a host of its own"), int(Isolation::PerInstance));
     isolation->addItem(tr("One host for each maker"), int(Isolation::PerVendor));
     isolation->addItem(tr("All plug-ins in one host"), int(Isolation::Shared));
     isolation->addItem(tr("In Montage's own process (off)"), int(Isolation::InProcess));
     isolation->setCurrentIndex(std::max(0, isolation->findData(int(h.isolation))));
-    isolation->setToolTip(tr("Instances of one plug-in share its host. Fewer hosts use less memory; a fault then reaches "
-                             "every plug-in in the same host."));
+    isolation->setToolTip(tr("With a host for each plug-in, its instances share it; with a host for each instance, a fault "
+                             "in one instance reaches no other, at the cost of more memory. Fewer hosts use less memory; a "
+                             "fault then reaches every plug-in in the same host, but one that crashes while loading is "
+                             "blocked alone."));
     form->addRow(tr("Run plug-ins:"), isolation);
     auto* missed = new QSpinBox(&dlg);
     missed->setObjectName(QStringLiteral("hostingMissedBlocks"));

@@ -93,10 +93,12 @@ add_library(montage_engine STATIC
   media/Exr.h media/Exr.cpp
   media/Jxl.h media/Jxl.cpp
   media/Av2.h media/Av2.cpp
+  media/JpegXs.h media/JpegXs.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
   media/DngOpcodes.h media/DngOpcodes.cpp
   media/ProResRaw.h media/ProResRaw.cpp
+  media/ProResEncoder.h media/ProResEncoder.cpp
   media/Mlv.h media/Mlv.cpp
   media/SuperScale.h media/SuperScale.cpp
   media/MotionDeblur.h media/MotionDeblur.cpp
@@ -172,6 +174,7 @@ add_library(montage_engine STATIC
   render/Jpeg2000.h render/Jpeg2000.cpp
   render/PackageFiles.h render/PackageFiles.cpp
   render/Imf.h render/Imf.cpp
+  render/ImfEvents.h render/ImfEvents.cpp
   render/ProRes.h render/ProRes.cpp
   render/BroadcastMxf.h render/BroadcastMxf.cpp
   render/Adm.h render/Adm.cpp
@@ -197,6 +200,7 @@ add_library(montage_engine STATIC
   render/ModelClip.h render/ModelClip.cpp
   render/Layer3D.h render/Layer3D.cpp
   render/ShapeLayers.h render/ShapeLayers.cpp
+  render/ShapeRaster.h render/ShapeRaster.cpp
   render/SplatRender.h render/SplatRender.cpp
   render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp
@@ -286,7 +290,7 @@ add_library(montage_engine STATIC
   render/SurfaceTrack.h render/SurfaceTrack.cpp
   render/TemporalFx.h render/TemporalFx.cpp
   render/Deconvolve.h render/Deconvolve.cpp
-  render/Exporter.h render/Exporter.cpp
+  render/Exporter.h render/Exporter.cpp render/ExportScaler.h render/ExportScaler.cpp
   render/RenderFarm.h render/RenderFarm.cpp
   render/BackgroundJobs.h render/BackgroundJobs.cpp
   render/SegmentedExport.h render/SegmentedExport.cpp
@@ -299,7 +303,7 @@ add_library(montage_engine STATIC
   render/CompositeRender.h render/CompositeRender.cpp
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
-  render/St2110.h render/St2110.cpp render/St2110Receive.h render/St2110Receive.cpp render/Nmos.h render/Nmos.cpp
+  render/St2110.h render/St2110.cpp render/St2110Jxs.cpp render/St2110Receive.h render/St2110Receive.cpp render/Nmos.h render/Nmos.cpp
   render/RemoteReview.h render/RemoteReview.cpp render/WebRtcReview.h render/WebRtcReview.cpp render/WebRtcReviewPage.cpp
   render/HeadlessBrowser.h
   render/RemoteGrade.h render/RemoteGrade.cpp
@@ -487,15 +491,33 @@ if(MONTAGE_WITH_AV2)
     message(FATAL_ERROR "MONTAGE_WITH_AV2 is on but AVM and dav2d are not found: build them with scripts/build-av2.sh <prefix> and set AV2_ROOT=<prefix>")
   endif()
 endif()
-if(MONTAGE_WITH_VMAF)
-  pkg_check_modules(LIBVMAF IMPORTED_TARGET GLOBAL libvmaf>=3.0)
-  if(LIBVMAF_FOUND)
-    message(STATUS "libvmaf ${LIBVMAF_VERSION}: VMAF in Compare Encode enabled")
-    target_link_libraries(montage_engine PRIVATE PkgConfig::LIBVMAF)
-    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_VMAF)
-  else()
-    message(STATUS "libvmaf not found: Compare Encode measures without VMAF")
+if(MONTAGE_WITH_JPEGXS)
+  # Found from SVTJPEGXS_ROOT (scripts/build-svt-jpegxs.sh) or pkg-config, never fetched. Only media/JpegXs.cpp sees its
+  # headers and the definition; everything else asks jpegXsAvailable().
+  if(SVTJPEGXS_ROOT)
+    list(PREPEND CMAKE_PREFIX_PATH "${SVTJPEGXS_ROOT}")
   endif()
+  pkg_check_modules(SVTJPEGXS SvtJpegxs>=0.10)
+  if(SVTJPEGXS_FOUND)
+    message(STATUS "SVT-JPEG-XS ${SVTJPEGXS_VERSION}: JPEG XS read and written")
+    set_property(SOURCE media/JpegXs.cpp APPEND PROPERTY INCLUDE_DIRECTORIES ${SVTJPEGXS_INCLUDE_DIRS})
+    set_property(SOURCE media/JpegXs.cpp APPEND PROPERTY COMPILE_DEFINITIONS MONTAGE_WITH_JPEGXS)
+    # (the static library as the script installs it, with its threads and libm)
+    target_link_libraries(montage_engine PRIVATE ${SVTJPEGXS_LINK_LIBRARIES} ${SVTJPEGXS_STATIC_LDFLAGS_OTHER} m)
+    # (its NASM objects carry no stack note, which would leave every program's stack executable on ELF systems)
+    if(NOT APPLE AND NOT WIN32)
+      target_link_options(montage_engine INTERFACE "LINKER:-z,noexecstack")
+    endif()
+  elseif(MONTAGE_REQUIRE_JPEGXS)
+    message(FATAL_ERROR "MONTAGE_REQUIRE_JPEGXS is on but SVT-JPEG-XS is not found: build it with scripts/build-svt-jpegxs.sh <prefix> and set SVTJPEGXS_ROOT=<prefix>")
+  else()
+    message(STATUS "SVT-JPEG-XS not found: JPEG XS is not read or written (scripts/build-svt-jpegxs.sh <prefix>, then SVTJPEGXS_ROOT=<prefix>)")
+  endif()
+endif()
+if(MONTAGE_WITH_VMAF)
+  # (libvmaf as CMakeLists.txt builds it, with its models compiled in; only Compare Encode calls it)
+  target_link_libraries(montage_engine PRIVATE montage_vmaf)
+  set_property(SOURCE render/EncodeCompare.cpp APPEND PROPERTY COMPILE_DEFINITIONS MONTAGE_WITH_VMAF)
 endif()
 if(MONTAGE_WITH_MYSOFA)
   # (Not as an imported target: MSYS2's libmysofa.pc names "/ucrt64/include", a path CMake cannot see.)

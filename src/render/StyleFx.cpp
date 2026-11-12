@@ -547,7 +547,62 @@ void lensFlare(const Effect& e, FrameTime t, Image& img) {
     });
 }
 
+// ---- Radial Blur ----------------------------------------------------------------------
+
+bool radialBlurSetup(const Effect& e, FrameTime t, int w, int h, RadialBlur& out) {
+    out.cx = float(e.p("center_x", t, 0.5) * w), out.cy = float(e.p("center_y", t, 0.5) * h);
+    out.zoom = float(std::clamp(e.p("zoom", t, 20) / 100, 0.0, 1.0));
+    out.spin = float(std::clamp(e.p("spin", t, 0), 0.0, 180.0) * kDeg);
+    if (!std::isfinite(out.cx) || !std::isfinite(out.cy)) out.cx = w * 0.5f, out.cy = h * 0.5f;
+    return w > 0 && h > 0 && (out.zoom > 0 || out.spin > 0);
+}
+
+void radialBlur(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    (void)pixelScale;  // (its reach is a share of each pixel's distance from the centre, the same at any size)
+    RadialBlur s;
+    if (!radialBlurSetup(e, t, img.width, img.height, s)) return;
+    const Image src = img;
+    parallelRows(img.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                // As Zoom Blur and Spin smear their pictures: samples one every 1.5 px of the way the pixel's smear
+                // reaches (towards the centre by `zoom` of the way, and turned through `spin` either side).
+                const float fx = float(x) + 0.5f - s.cx, fy = float(y) + 0.5f - s.cy;
+                const float d = std::sqrt(fx * fx + fy * fy);
+                const float zr = s.zoom * d, sr = s.spin * d;
+                const int taps = std::clamp(int(std::sqrt(zr * zr + sr * sr) / 1.5f) + 1, 1, 64);
+                float acc[4] = {0, 0, 0, 0};
+                for (int k = 0; k < taps; ++k) {
+                    const float f = taps > 1 ? float(k) / float(taps - 1) : 0.0f;
+                    const float sc = 1 - s.zoom * f, ang = taps > 1 ? s.spin * (f - 0.5f) : 0.0f;
+                    const float cs = std::cos(ang), sn = std::sin(ang);
+                    float q[4];
+                    sample(src, s.cx + (fx * cs - fy * sn) * sc, s.cy + (fx * sn + fy * cs) * sc, q, Edge::Transparent);
+                    for (int c = 0; c < 4; ++c) acc[c] += q[c];
+                }
+                for (int c = 0; c < 4; ++c) p[c] = acc[c] / float(taps);
+            }
+        }
+    });
+}
+
 // ---- Light Rays ----------------------------------------------------------------------
+
+RayShadowGrid rayShadowGrid(int W, int H) {
+    RayShadowGrid g;
+    g.shrink = std::min(1.0, 320.0 / std::max(1, std::max(W, H)));
+    g.tw = std::max(1, int(std::lround(W * g.shrink))), g.th = std::max(1, int(std::lround(H * g.shrink)));
+    for (int x = 0; x < g.tw; ++x) {
+        const int a = std::min(W - 1, int(x / g.shrink));
+        g.x0.push_back(a), g.x1.push_back(std::max(a + 1, std::min(W, int((x + 1) / g.shrink))));
+    }
+    for (int y = 0; y < g.th; ++y) {
+        const int a = std::min(H - 1, int(y / g.shrink));
+        g.y0.push_back(a), g.y1.push_back(std::max(a + 1, std::min(H, int((y + 1) / g.shrink))));
+    }
+    return g;
+}
 
 void lightRays(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     (void)pixelScale;  // (the rays' reach is a share of the way to the centre, the same at any size)
@@ -615,15 +670,15 @@ void lightRays(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     int tw = 0, th = 0;
     if (block > 0) {
         // (worked out on a small copy: it changes slowly)
-        const double shrink = std::min(1.0, 320.0 / std::max(W, H));
-        tw = std::max(1, int(std::lround(W * shrink))), th = std::max(1, int(std::lround(H * shrink)));
+        const RayShadowGrid grid = rayShadowGrid(W, H);
+        const double shrink = grid.shrink;
+        tw = grid.tw, th = grid.th;
         std::vector<float> pass(size_t(tw) * size_t(th));
         parallelRows(th, [&](int y0, int y1) {
             for (int y = y0; y < y1; ++y)
                 for (int x = 0; x < tw; ++x) {
                     // (the average of the pixels it covers, so a thin dark thing is not missed)
-                    const int ax = std::min(W - 1, int(x / shrink)), bx = std::max(ax + 1, std::min(W, int((x + 1) / shrink)));
-                    const int ay = std::min(H - 1, int(y / shrink)), by = std::max(ay + 1, std::min(H, int((y + 1) / shrink)));
+                    const int ax = grid.x0[size_t(x)], bx = grid.x1[size_t(x)], ay = grid.y0[size_t(y)], by = grid.y1[size_t(y)];
                     double sum = 0;
                     for (int sy = ay; sy < by; ++sy)
                         for (int sx = ax; sx < bx; ++sx) {
@@ -644,10 +699,16 @@ void lightRays(const Effect& e, FrameTime t, Image& img, double pixelScale) {
                     double logT = 0;
                     for (int j = 1; j <= steps; ++j) {  // (from beside the pixel: the near side of a dark thing is lit)
                         const double f = length * j / steps;
-                        const int sx = int(std::floor(px + (scx - px) * f)), sy = int(std::floor(py + (scy - py) * f));
-                        if (sx < 0 || sy < 0 || sx >= tw || sy >= th) break;
-                        // (each 1/160 of the frame's longer side taking its share, at any size)
-                        logT += std::log(std::max(1e-4f, pass[size_t(sy) * size_t(tw) + size_t(sx)])) * (reach / steps) / std::max(tw, th) * 160;
+                        const double qx = px + (scx - px) * f, qy = py + (scy - py) * f;
+                        if (!(qx >= 0 && qy >= 0 && qx < tw && qy < th)) break;
+                        // (bilinear between the small copy's pixels, so the march does not jump from one to the next; each
+                        // 1/160 of the frame's longer side taking its share, at any size)
+                        const double fx = std::clamp(qx - 0.5, 0.0, tw - 1.0), fy = std::clamp(qy - 0.5, 0.0, th - 1.0);
+                        const int x0 = int(fx), y0p = int(fy), x1 = std::min(tw - 1, x0 + 1), y1p = std::min(th - 1, y0p + 1);
+                        const double ax = fx - x0, ay = fy - y0p;
+                        auto at = [&](int xi, int yi) { return double(pass[size_t(yi) * size_t(tw) + size_t(xi)]); };
+                        const double v = (at(x0, y0p) * (1 - ax) + at(x1, y0p) * ax) * (1 - ay) + (at(x0, y1p) * (1 - ax) + at(x1, y1p) * ax) * ay;
+                        logT += std::log(std::max(1e-4, v)) * (reach / steps) / std::max(tw, th) * 160;
                     }
                     through[size_t(y) * size_t(tw) + size_t(x)] = float(std::exp(logT));
                 }
@@ -789,6 +850,9 @@ struct GlareKernel {
     ApertureShape shape;
     int radius = 0, fftSize = 0;
     std::vector<Cf> spectrum[3];  // each channel's kernel transformed, fftSize square
+    // The spectra as the GPU reads them (GlareSetup::spectra), made the first time it does.
+    mutable std::once_flag gpuOnce;
+    mutable std::shared_ptr<const std::vector<float>> gpu;
 };
 
 // The kernel transformed for convolving at `fftSize`, kept for the last few.
@@ -822,7 +886,9 @@ std::shared_ptr<const GlareKernel> glareKernel(const ApertureShape& shape, int r
     // (kept to about 256 MB)
     size_t bytes = 0;
     for (size_t i = 0; i < kept.size(); ++i) {
-        bytes += 3 * size_t(kept[i]->fftSize) * size_t(kept[i]->fftSize) * sizeof(Cf);
+        // (and the copy the GPU reads, as if it were made: eight floats a texel)
+        const size_t texels = size_t(kept[i]->fftSize) * size_t(kept[i]->fftSize);
+        bytes += 3 * texels * sizeof(Cf) + texels * 8 * sizeof(float);
         if (i > 0 && bytes > (size_t(256) << 20)) {
             kept.resize(i);
             break;
@@ -893,11 +959,12 @@ std::vector<float> apertureKernel(const ApertureShape& a, int radius) {
     return out;
 }
 
-void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) {
-    const int W = img.width, H = img.height;
-    if (W <= 0 || H <= 0) return;
-    const double threshold = std::max(0.0, e.p("threshold", t, 1.0)), intensity = std::max(0.0, e.p("intensity", t, 1.0));
-    ApertureShape shape;
+namespace {
+
+// The settings both draw from: the shape, the shrink f and the kernel's radius at that size.
+bool glareSettings(const Effect& e, FrameTime t, double pixelScale, double& threshold, double& intensity, ApertureShape& shape, int& f,
+                   int& radius) {
+    threshold = std::max(0.0, e.p("threshold", t, 1.0)), intensity = std::max(0.0, e.p("intensity", t, 1.0));
     shape.blades = std::clamp(int(std::lround(e.p("blades", t, 6))), 3, 16);
     shape.rounding = std::round(std::clamp(e.p("rounding", t, 0) / 100, 0.0, 1.0) * 100) / 100;
     // (the pattern repeats every 360 / blades degrees, so a turn by a whole step makes the same kernel)
@@ -905,9 +972,61 @@ void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) 
     shape.rotation = std::round(std::fmod(std::fmod(e.p("rotation", t, 0), step) + step, step) * 10) / 10;
     // On a picture with more pixels than the sequence (a large layer scaled down) the glare is worked out on a picture
     // f times smaller each way, so that its kernel stays as small as at twice the sequence's size, and drawn back up.
-    const int f = pixelScale > 2 ? int(std::ceil(pixelScale / 2 - 1e-9)) : 1;
-    const int radius = std::max(2, int(std::lround(std::clamp(e.p("size", t, 200), 10.0, 600.0) * pixelScale / f)));
-    if (intensity <= 0) return;
+    f = pixelScale > 2 ? int(std::ceil(pixelScale / 2 - 1e-9)) : 1;
+    radius = std::max(2, int(std::lround(std::clamp(e.p("size", t, 200), 10.0, 600.0) * pixelScale / f)));
+    return intensity > 0;
+}
+
+}  // namespace
+
+bool apertureGlareSetup(const Effect& e, FrameTime t, int W, int H, double pixelScale, GlareSetup& out) {
+    ApertureShape shape;
+    if (W <= 0 || H <= 0 || !glareSettings(e, t, pixelScale, out.threshold, out.intensity, shape, out.f, out.radius)) return false;
+    out.GW = (W + out.f - 1) / out.f, out.GH = (H + out.f - 1) / out.f;
+    const int K = 2 * out.radius + 1;
+    out.M = nextPow2(K + std::max(K / 2, 128)), out.T = out.M - K + 1;
+    const auto kernel = glareKernel(shape, out.radius, out.M);
+    std::call_once(kernel->gpuOnce, [&] {
+        const int M = out.M;
+        auto rows = std::make_shared<std::vector<float>>(size_t(M) * size_t(M) * 8);
+        for (size_t i = 0; i < size_t(M) * size_t(M); ++i) {
+            float* a = &(*rows)[i * 4];
+            float* b = &(*rows)[(size_t(M) * size_t(M) + i) * 4];
+            a[0] = kernel->spectrum[0][i].real(), a[1] = kernel->spectrum[0][i].imag();
+            a[2] = kernel->spectrum[1][i].real(), a[3] = kernel->spectrum[1][i].imag();
+            b[0] = kernel->spectrum[2][i].real(), b[1] = kernel->spectrum[2][i].imag();
+        }
+        kernel->gpu = std::move(rows);
+    });
+    out.spectra = kernel->gpu;
+    static std::mutex twiddleLock;
+    static std::vector<std::pair<int, std::shared_ptr<const std::vector<float>>>> twiddles;
+    {
+        const std::lock_guard<std::mutex> g(twiddleLock);
+        for (const auto& [n, tw] : twiddles)
+            if (n == out.M) out.twiddles = tw;
+        if (!out.twiddles) {
+            // (exp(-2 pi i k / M) for k < M / 2, as fftInPlace's table, in floats)
+            auto tw = std::make_shared<std::vector<float>>(size_t(out.M / 2) * 4, 0.0f);
+            for (int k = 0; k < out.M / 2; ++k) {
+                const Cf w = Cf(std::polar(1.0, -2 * M_PI * double(k) / double(out.M)));
+                (*tw)[size_t(k) * 4] = w.real(), (*tw)[size_t(k) * 4 + 1] = w.imag();
+            }
+            twiddles.insert(twiddles.begin(), {out.M, tw});
+            if (twiddles.size() > 4) twiddles.pop_back();
+            out.twiddles = tw;
+        }
+    }
+    return true;
+}
+
+void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const int W = img.width, H = img.height;
+    if (W <= 0 || H <= 0) return;
+    double threshold = 0, intensity = 0;
+    ApertureShape shape;
+    int f = 1, radius = 2;
+    if (!glareSettings(e, t, pixelScale, threshold, intensity, shape, f, radius)) return;
     // The highlights: the light above the threshold.
     std::vector<float> bright(size_t(W) * H * 3, 0.0f);
     bool any = false;

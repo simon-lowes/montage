@@ -142,6 +142,21 @@ std::unique_ptr<SharedMemory> SharedMemory::create(const std::string& name, size
         shm_unlink(name.c_str());
         return nullptr;
     }
+#ifdef __linux__
+    // (the pages reserved now: a /dev/shm too small for the block, as a container's 64 MB is for HD transitions, is
+    // said here, rather than ending Montage with SIGBUS when a page is first touched)
+    int reserved;
+    do reserved = posix_fallocate(fd, 0, off_t(size));
+    while (reserved == EINTR);
+    if (reserved != 0 && reserved != EOPNOTSUPP && reserved != EINVAL) {
+        if (error)
+            *error = "not enough shared memory for " + std::to_string(size >> 20) + " MB (" +
+                     (reserved == ENOSPC ? std::string("/dev/shm is full or too small") : std::string(std::strerror(reserved))) + ")";
+        close(fd);
+        shm_unlink(name.c_str());
+        return nullptr;
+    }
+#endif
     void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (p == MAP_FAILED) {
@@ -281,7 +296,11 @@ bool Bell::wait(std::atomic<uint32_t>* word, uint32_t old, int64_t timeoutUs) {
     int64_t step = 20;
     for (;;) {
         if (word->load(std::memory_order_acquire) != old) return true;
-        if (sem_trywait(static_cast<sem_t*>(sem_)) == 0) continue;  // rung: look again
+        if (sem_trywait(static_cast<sem_t*>(sem_)) == 0) {
+            // rung: look again (old rings left over cannot keep it past its deadline)
+            if (nowUs() >= end) return word->load(std::memory_order_acquire) != old;
+            continue;
+        }
         const int64_t left = end - nowUs();
         if (left <= 0) return false;
         std::this_thread::sleep_for(std::chrono::microseconds(std::min(step, left)));

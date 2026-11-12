@@ -17,7 +17,6 @@
 #include "render/RemoteReview.h"
 #include "render/WebRtcReview.h"
 
-class QAudioSink;
 class QPainter;
 class QRectF;
 class QCheckBox;
@@ -31,6 +30,8 @@ class QSpinBox;
 class QTimer;
 
 namespace montage {
+
+class SoundOut;
 
 // How the picture goes out, beyond the stream's own settings.
 struct RemoteReviewOptions {
@@ -166,6 +167,7 @@ public:
     bool watching() const { return watching_; }
     // The frame shown, as its stream tagged it (frame -1: none yet).
     output::StreamTag shownTag() const { return tag_; }
+    const SoundOut* soundOutput() const { return sound_; }  // (null until it first watched)
 
 private:
     void toggle();
@@ -187,8 +189,7 @@ private:
     QPushButton* mark_;
     QLabel* status_;
     QTimer* timer_;
-    QAudioSink* sink_ = nullptr;
-    QIODevice* sound_ = nullptr;
+    SoundOut* sound_ = nullptr;  // (through the audio device chosen, else Qt Multimedia's output)
     QString sent_;  // what the last marker sent came to
     int sending_ = 0;
 };

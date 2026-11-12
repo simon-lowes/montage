@@ -116,6 +116,10 @@ struct ExportSettings {
     double jxlDistance = 0;
     int jxlEffort = 3;
     bool jxlPremultiplied = false;
+    // JPEG XS (videoCodec "jpegxs", coded by SVT-JPEG-XS, media/JpegXs.h): bits a pixel, a constant number of bytes each
+    // picture (0 = 5). Its sampling and depth are pixFmt's (yuv422p10le when empty; yuv444p…, gbrp…; 8, 10 or 12 bits);
+    // a .mxf path is MXF (ST 2124) with PCM sound, any other a raw codestream file without.
+    double jpegXsBpp = 0;
     // More layers in each OpenEXR frame (a VFX pull's source layers and mattes, render/VfxPull.h), written with the
     // OpenEXR library: called with the frame's sequence time and the picture's size, adding to `layers` (the picture is
     // the first, "") and header `attributes`. False stops the export with `error`.
@@ -205,9 +209,11 @@ struct ExportSettings {
     Rational rate{0, 1};          // the rate delivered (pulldown: 0 = 29.97 or 30 interlaced)
     std::string cadence = "2:3";  // pulldown: "2:3" or "2:2:2:4"
     bool rateKeepPitch = true;    // a speed change's sound keeps its pitch
-    // Coded as interlaced fields, the top first (each picture's two halves: PsF), as 1080i deliveries ask: MPEG-2,
-    // H.264 (AVC-Intra), ProRes and DNxHD.
+    // Coded as interlaced fields, the top first, as 1080i deliveries ask: MPEG-2, H.264 (AVC-Intra), ProRes and FFV1.
+    // Each field is rendered at its own moment, the second half a frame after the first (render/RateConversion.h
+    // fieldRateSequence); with `segmentedFields`, both are the halves of one picture (PsF).
     bool interlaced = false;
+    bool segmentedFields = false;
     // Broadcast MXF by the book (render/BroadcastMxf.h), for an .mxf in XDCAM HD422 (MPEG-2) or AVC-Intra, rewrapped
     // after the render with the EBU's bmx: "" = FFmpeg's OP1a as it writes it; "rdd9" = RDD 9 (XDCAM HD422);
     // AS-11 "as11-dpp" (UK DPP HD: AVC-Intra 100, 1080i25, coded interlaced whatever `interlaced` says), "as11-x2"
@@ -326,15 +332,13 @@ struct BroadcastMxfOptions;
 // OP1a): its checks and the options to rewrap it with. False with `error` for what the delivery refuses.
 bool broadcastMxfJoinOptions(const Sequence& seq, const ExportSettings& s, BroadcastMxfOptions& o, std::string* error = nullptr);
 
-// Renders an audio clip's sound with its effects (not its volume, pan or
-// fades) to a 24-bit WAV, from its first frame to its last.
-// Render and Replace for video: the clip alone through its effects (and speed), at its media's size, to ProRes 4444
-// (or, with `apv`, APV 4:4:4:4 12-bit) with its transparency; its transform is not baked in.
+// Render and Replace for video: the clip alone through its effects (and speed), at its media's size, to ProRes 4444 at
+// 12 bits (Montage's own encoder; or, with `apv`, APV 4:4:4:4 12-bit) with its transparency; its transform is not baked in.
 bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error = nullptr,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, bool apv = false);
 // Interchange formats (EDL, OpenTimelineIO, FCP XML, AAF) get a compositing graph's clip as its rendered picture: each
 // clip of sequence `seq` in `p` with a graph (core/CompositeGraph.h) rendered, as the timeline shows its layer, to ProRes
-// 4444 with its transparency (the frame's size, its place in it baked in) in a folder beside `output` ("name
+// 4444 at 12 bits with its transparency (the frame's size, its place in it baked in) in a folder beside `output` ("name
 // Composites"), and replaced in `p` by that file, its blend mode kept. `p` is the export's own copy. `baked` gets how
 // many; false with `error` when one cannot be rendered.
 bool bakeCompositeClips(Project& p, Id seq, const std::string& output, std::string* error = nullptr, int* baked = nullptr,
@@ -342,8 +346,21 @@ bool bakeCompositeClips(Project& p, Id seq, const std::string& output, std::stri
 // Whether FFmpeg here has APV's encoder (OpenAPV's liboapv, FFmpeg 8 and later) and decoder.
 bool apvEncoderAvailable();
 bool apvDecoderAvailable();
+// Renders an audio clip's sound with its effects (not its volume, pan or fades) to a 24-bit WAV, from its first frame
+// to its last, stamped (Broadcast Wave's bext and iXML, media/FieldRecorder.h) with its source's timecode there (a file
+// that cannot be stamped, a RIFF past 4 GB, is kept without it).
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
+// Extract Sound to Files: the same without its effects (the sound as its source has it, at the clip's speed); failing
+// when it cannot be stamped.
+bool extractClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
+// What such a WAV is stamped with: the source's timecode at the clip's first frame (its media's start timecode, or
+// midnight without one, plus the clip's in-point; round again past midnight), the recording's timecode rate (its own,
+// else its frame rate, else the sequence's), the clip's name as its description and the media's project, scene, take
+// and tape.
+struct BroadcastStamp;
+BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip& c);
 
 // Export Frame's choices. `rendition`: "" the frame as SDR screens show it (an HDR sequence through its first SDR trim
 // target, else mapped to Rec.709 as the viewer maps it; other sequences as they are), "master" the sequence's own

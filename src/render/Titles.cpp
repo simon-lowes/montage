@@ -1,5 +1,6 @@
 #include "Titles.h"
 
+#include <QByteArray>
 #include <QFont>
 #include <QFontMetricsF>
 #include <QGlyphRun>
@@ -333,9 +334,11 @@ double selection(const Animator& a, double sec, double remaining, int i, int n) 
 // ---------------------------------------------------------------------------
 // Paths
 
-// SVG path data (M L H V C S Q T Z, absolute and relative; arcs as straight lines) as a QPainterPath.
-QPainterPath parseSvgPath(const std::string& d) {
-    QPainterPath path;
+}  // namespace
+
+TitlePathCurve svgPathCurve(const std::string& d) {
+    TitlePathCurve out;
+    using Seg = TitlePathCurve::Segment;
     size_t i = 0;
     auto skip = [&] {
         while (i < d.size() && (std::isspace(static_cast<unsigned char>(d[i])) || d[i] == ',')) ++i;
@@ -343,16 +346,81 @@ QPainterPath parseSvgPath(const std::string& d) {
     auto number = [&](double& v) {
         skip();
         if (i >= d.size()) return false;
-        const char* begin = d.c_str() + i;
-        char* end = nullptr;
-        v = std::strtod(begin, &end);
-        if (end == begin) return false;
-        i += size_t(end - begin);
+        // (an SVG number, its decimal point a point in every locale)
+        size_t j = i;
+        auto digits = [&] {
+            const size_t from = j;
+            while (j < d.size() && std::isdigit(static_cast<unsigned char>(d[j]))) ++j;
+            return j > from;
+        };
+        if (j < d.size() && (d[j] == '+' || d[j] == '-')) ++j;
+        bool any = digits();
+        if (j < d.size() && d[j] == '.') ++j, any = digits() || any;
+        if (!any) return false;
+        if (j < d.size() && (d[j] == 'e' || d[j] == 'E')) {
+            size_t e = j + 1;
+            if (e < d.size() && (d[e] == '+' || d[e] == '-')) ++e;
+            if (e < d.size() && std::isdigit(static_cast<unsigned char>(d[e]))) {
+                j = e;
+                digits();
+            }
+        }
+        bool ok = false;
+        v = QByteArray(d.data() + i, qsizetype(j - i)).toDouble(&ok);
+        if (!ok || !std::isfinite(v)) return false;
+        i = j;
         return true;
+    };
+    // (an arc's flags may be written without spaces: "a 10 10 0 01 20 0")
+    auto flag = [&](double& v) {
+        skip();
+        if (i >= d.size() || (d[i] != '0' && d[i] != '1')) return false;
+        v = d[i++] == '1' ? 1 : 0;
+        return true;
+    };
+    auto line = [&](QPointF a, QPointF b) {
+        if (a == b) return;
+        Seg g;
+        g.p[0] = a, g.p[1] = b;
+        out.segments.push_back(g);
+    };
+    auto cubic = [&](QPointF a, QPointF b, QPointF c, QPointF e) {
+        Seg g;
+        g.kind = 1;
+        g.p[0] = a, g.p[1] = b, g.p[2] = c, g.p[3] = e;
+        out.segments.push_back(g);
+    };
+    // An elliptic arc from a to b (SVG's endpoint form, as its implementation notes turn it into a centre and angles).
+    auto arc = [&](QPointF a, double rx, double ry, double phiDeg, bool large, bool sweep, QPointF b) {
+        rx = std::abs(rx), ry = std::abs(ry);
+        if (a == b) return;
+        if (rx < 1e-12 || ry < 1e-12) return line(a, b);
+        const double phi = phiDeg * M_PI / 180, c = std::cos(phi), s = std::sin(phi);
+        const double hx = (a.x() - b.x()) / 2, hy = (a.y() - b.y()) / 2;
+        const double x1 = c * hx + s * hy, y1 = -s * hx + c * hy;
+        const double lambda = x1 * x1 / (rx * rx) + y1 * y1 / (ry * ry);
+        if (lambda > 1) rx *= std::sqrt(lambda), ry *= std::sqrt(lambda);
+        const double num = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1, den = rx * rx * y1 * y1 + ry * ry * x1 * x1;
+        double k = den > 0 ? std::sqrt(std::max(0.0, num / den)) : 0;
+        if (large == sweep) k = -k;
+        const double cx1 = k * rx * y1 / ry, cy1 = -k * ry * x1 / rx;
+        const QPointF centre(c * cx1 - s * cy1 + (a.x() + b.x()) / 2, s * cx1 + c * cy1 + (a.y() + b.y()) / 2);
+        const double t1 = std::atan2((y1 - cy1) / ry, (x1 - cx1) / rx);
+        double dt = std::atan2((-y1 - cy1) / ry, (-x1 - cx1) / rx) - t1;
+        if (sweep && dt < 0) dt += 2 * M_PI;
+        if (!sweep && dt > 0) dt -= 2 * M_PI;
+        Seg g;
+        g.kind = 3;
+        g.p[0] = centre;
+        g.p[1] = QPointF(rx * c, rx * s);
+        g.p[2] = QPointF(-ry * s, ry * c);
+        g.from = t1, g.to = t1 + dt;
+        out.segments.push_back(g);
     };
     char cmd = 0;
     QPointF cur, start, ctrl;
     char lastCmd = 0;
+    bool begun = false;
     while (true) {
         skip();
         if (i >= d.size()) break;
@@ -366,67 +434,103 @@ QPainterPath parseSvgPath(const std::string& d) {
                 if (!number(a[k])) return false;
             return true;
         };
-        switch (std::toupper(static_cast<unsigned char>(cmd))) {
+        const char up = char(std::toupper(static_cast<unsigned char>(cmd)));
+        if (up == 'M' && begun) break;  // (the first subpath only)
+        switch (up) {
             case 'M':
-                if (!need(2)) return path;
+                if (!need(2)) return out;
                 cur = start = o + QPointF(a[0], a[1]);
-                path.moveTo(cur);
+                begun = true;
                 cmd = rel ? 'l' : 'L';  // further pairs are lines
                 break;
             case 'L':
-                if (!need(2)) return path;
+                if (!need(2)) return out;
+                line(cur, o + QPointF(a[0], a[1]));
                 cur = o + QPointF(a[0], a[1]);
-                path.lineTo(cur);
                 break;
-            case 'H':
-                if (!need(1)) return path;
-                cur.setX((rel ? cur.x() : 0) + a[0]);
-                path.lineTo(cur);
+            case 'H': {
+                if (!need(1)) return out;
+                const QPointF e((rel ? cur.x() : 0) + a[0], cur.y());
+                line(cur, e);
+                cur = e;
                 break;
-            case 'V':
-                if (!need(1)) return path;
-                cur.setY((rel ? cur.y() : 0) + a[0]);
-                path.lineTo(cur);
+            }
+            case 'V': {
+                if (!need(1)) return out;
+                const QPointF e(cur.x(), (rel ? cur.y() : 0) + a[0]);
+                line(cur, e);
+                cur = e;
                 break;
+            }
             case 'C':
-                if (!need(6)) return path;
+                if (!need(6)) return out;
                 ctrl = o + QPointF(a[2], a[3]);
-                path.cubicTo(o + QPointF(a[0], a[1]), ctrl, cur = o + QPointF(a[4], a[5]));
+                cubic(cur, o + QPointF(a[0], a[1]), ctrl, o + QPointF(a[4], a[5]));
+                cur = o + QPointF(a[4], a[5]);
                 break;
             case 'S': {
-                if (!need(4)) return path;
+                if (!need(4)) return out;
                 const QPointF c1 = (lastCmd == 'C' || lastCmd == 'S') ? 2 * cur - ctrl : cur;
                 ctrl = o + QPointF(a[0], a[1]);
-                path.cubicTo(c1, ctrl, cur = o + QPointF(a[2], a[3]));
+                cubic(cur, c1, ctrl, o + QPointF(a[2], a[3]));
+                cur = o + QPointF(a[2], a[3]);
                 break;
             }
             case 'Q':
-                if (!need(4)) return path;
-                ctrl = o + QPointF(a[0], a[1]);
-                path.quadTo(ctrl, cur = o + QPointF(a[2], a[3]));
+            case 'T': {
+                if (!need(up == 'Q' ? 4 : 2)) return out;
+                const QPointF q = up == 'Q' ? o + QPointF(a[0], a[1]) : (lastCmd == 'Q' || lastCmd == 'T') ? 2 * cur - ctrl : cur;
+                const QPointF e = up == 'Q' ? o + QPointF(a[2], a[3]) : o + QPointF(a[0], a[1]);
+                ctrl = q;
+                cubic(cur, cur + 2.0 / 3 * (q - cur), e + 2.0 / 3 * (q - e), e);  // (the quadratic raised to a cubic)
+                cur = e;
                 break;
-            case 'T':
-                if (!need(2)) return path;
-                ctrl = (lastCmd == 'Q' || lastCmd == 'T') ? 2 * cur - ctrl : cur;
-                path.quadTo(ctrl, cur = o + QPointF(a[0], a[1]));
-                break;
+            }
             case 'A':
-                if (!need(7)) return path;
+                if (!number(a[0]) || !number(a[1]) || !number(a[2]) || !flag(a[3]) || !flag(a[4]) || !number(a[5]) || !number(a[6])) return out;
+                arc(cur, a[0], a[1], a[2], a[3] > 0.5, a[4] > 0.5, o + QPointF(a[5], a[6]));
                 cur = o + QPointF(a[5], a[6]);
-                path.lineTo(cur);
                 break;
             case 'Z':
-                path.closeSubpath();
+                line(cur, start);
                 cur = start;
+                out.closed = !out.segments.empty();
                 lastCmd = 'Z';
                 cmd = 0;  // a number after Z starts nothing
+                if (out.closed) return out;
                 continue;
-            default: return path;
+            default: return out;
         }
-        lastCmd = char(std::toupper(static_cast<unsigned char>(cmd)));
+        lastCmd = up;
     }
-    return path;
+    // (an outline that ends where it began is closed)
+    if (!out.segments.empty() && QLineF(cur, start).length() < 1e-6) out.closed = true;
+    return out;
 }
+
+TitlePathCurve mappedCurve(TitlePathCurve c, const QTransform& m) {
+    const QTransform lin(m.m11(), m.m12(), m.m21(), m.m22(), 0, 0);
+    for (TitlePathCurve::Segment& g : c.segments) {
+        if (g.kind == 2) {
+            // (as an arc of conjugate axes, which any affine map keeps one)
+            const double cr = std::cos(g.rotation), sr = std::sin(g.rotation);
+            const QPointF r = g.p[1];
+            g.kind = 3;
+            g.p[1] = QPointF(r.x() * cr, r.x() * sr);
+            g.p[2] = QPointF(-r.y() * sr, r.y() * cr);
+        }
+        if (g.kind == 3) {
+            g.p[0] = m.map(g.p[0]);
+            g.p[1] = lin.map(g.p[1]);
+            g.p[2] = lin.map(g.p[2]);
+        } else {
+            for (int k = 0; k < (g.kind == 0 ? 2 : 4); ++k) g.p[k] = m.map(g.p[k]);
+        }
+    }
+    return c;
+}
+
+namespace {
 
 // A point of a curve's segment at u in [0, 1], and its direction there (not normalised).
 void segmentAt(const TitlePathCurve::Segment& g, double u, QPointF& p, QPointF& d) {
@@ -437,6 +541,12 @@ void segmentAt(const TitlePathCurve::Segment& g, double u, QPointF& p, QPointF& 
             d = 3 * v * v * (g.p[1] - g.p[0]) + 6 * v * u * (g.p[2] - g.p[1]) + 3 * u * u * (g.p[3] - g.p[2]);
             // (a handle on its anchor: the direction towards the next control point that is not)
             if (QPointF::dotProduct(d, d) < 1e-18) d = (u < 0.5 ? (g.p[2] == g.p[0] ? g.p[3] : g.p[2]) - g.p[0] : g.p[3] - (g.p[1] == g.p[3] ? g.p[0] : g.p[1]));
+            return;
+        }
+        case 3: {
+            const double th = g.from + (g.to - g.from) * u, c = std::cos(th), s = std::sin(th);
+            p = g.p[0] + c * g.p[1] + s * g.p[2];
+            d = (g.to - g.from) * (-s * g.p[1] + c * g.p[2]);
             return;
         }
         case 2: {
@@ -469,19 +579,47 @@ struct PathSampler {
         if (!curve.segments.empty()) return curveCum.empty() ? 0 : curveCum.back();
         return cum.empty() ? 0 : cum.back();
     }
+    // Set off along the normal (the curve's offset, outwards): +1 or -1 as the curve runs clockwise on screen or not.
+    double side = 1;
+    // The curve's point and direction at u of segment k, set off by its offset.
+    void curvePoint(size_t k, double u, QPointF& p, QPointF& d) const {
+        segmentAt(curve.segments[k], u, p, d);
+        if (curve.offset == 0) return;
+        const double l = std::hypot(d.x(), d.y());
+        if (l > 1e-12) p += curve.offset * side / l * QPointF(d.y(), -d.x());
+    }
     void fromCurve(TitlePathCurve c) {
         curve = std::move(c);
         closed = curve.closed;
+        side = 1;
+        auto steps = [](const TitlePathCurve::Segment& g) {
+            return g.kind == 0 ? 1 : g.kind == 1 ? 256 : std::max(256, int(std::ceil(std::abs(g.to - g.from) * 128)));
+        };
+        if (curve.offset != 0 && curve.closed) {
+            // Which way round it runs (y down: a positive area clockwise on screen, its outside to the left).
+            double area = 0;
+            QPointF first, prev, d;
+            bool any = false;
+            for (const TitlePathCurve::Segment& g : curve.segments)
+                for (int i = 0, n = steps(g); i <= n; ++i) {
+                    QPointF q;
+                    segmentAt(g, double(i) / n, q, d);
+                    if (any) area += prev.x() * q.y() - q.x() * prev.y();
+                    else first = q, any = true;
+                    prev = q;
+                }
+            if (any) area += prev.x() * first.y() - first.x() * prev.y();
+            side = area >= 0 ? 1 : -1;
+        }
         curveCum.assign(1, 0.0);
         curveAt.assign(1, 0.0);
         for (size_t k = 0; k < curve.segments.size(); ++k) {
-            const TitlePathCurve::Segment& g = curve.segments[k];
-            const int n = g.kind == 0 ? 1 : g.kind == 1 ? 256 : std::max(256, int(std::ceil(std::abs(g.to - g.from) * 128)));
+            const int n = steps(curve.segments[k]);
             QPointF prev, d;
-            segmentAt(g, 0, prev, d);
+            curvePoint(k, 0, prev, d);
             for (int i = 1; i <= n; ++i) {
                 QPointF q;
-                segmentAt(g, double(i) / n, q, d);
+                curvePoint(k, double(i) / n, q, d);
                 curveCum.push_back(curveCum.back() + QLineF(prev, q).length());
                 curveAt.push_back(double(k) + double(i) / n);
                 prev = q;
@@ -508,7 +646,7 @@ struct PathSampler {
             const size_t k = std::min(curve.segments.size() - 1, size_t(std::floor(at)));
             const double u = std::clamp(at - double(k), 0.0, 1.0);
             QPointF d;
-            segmentAt(curve.segments[k], u, p, d);
+            curvePoint(k, u, p, d);
             angle = std::atan2(d.y(), d.x());
             if (s != within) p += QPointF(std::cos(angle), std::sin(angle)) * (s - within);
             return;
@@ -583,18 +721,15 @@ bool titlePath(const Effect& g, double t, double scale, double cx, double cy, in
         return true;
     }
     if (shape == 3) {
-        QPainterPath p = parseSvgPath(g.s("path_data"));
-        if (p.isEmpty()) return false;
+        // Its lines, curves and arcs worked out exactly where the letters fall, as a mask's are.
+        TitlePathCurve c = svgPathCurve(g.s("path_data"));
+        if (c.segments.empty()) return false;
         QTransform tr;
         tr.translate(cx, cy);
         tr.scale(scale, scale);
-        const QList<QPolygonF> polys = tr.map(p).toSubpathPolygons();
-        if (polys.isEmpty() || polys[0].size() < 2) return false;
-        std::vector<QPointF> poly(polys[0].begin(), polys[0].end());
-        const bool isClosed = QLineF(poly.front(), poly.back()).length() < 1e-6;
-        if (reverse) std::reverse(poly.begin(), poly.end());
-        out.fromPolygon(std::move(poly), isClosed);
-        return out.pts.size() >= 2;
+        c = mappedCurve(std::move(c), tr);
+        out.fromCurve(reverse ? reversedCurve(std::move(c)) : std::move(c));
+        return out.length() > 1e-9;
     }
     return false;
 }
@@ -662,7 +797,8 @@ struct TitleScene {
 
 bool titleIsStyledAt(const Effect& g, double t);
 
-TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& pathFn) {
+TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& pathFn,
+                      const TitleLayerFn& layerFn) {
     TitleScene sc0;
     QFont f(QString::fromStdString(g.s("font", "Sans Serif")));
     f.setPixelSize(std::max(1, int(std::lround(g.pAt("size", t, 96) * scale))));
@@ -679,6 +815,17 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
     auto fontOfLine = [&](int i) -> const QFont& { return i > 0 && sub ? fs : f; };
     sc0.anyLines = !lines.isEmpty();
     const bool styled = titleIsStyledAt(g, t);
+    // An SVG's text: laid out as the SVG says, in the layer's place (render/Compositor.cpp titleLayerSource), its
+    // letters drawn at the layer's scale there.
+    const std::optional<SvgTextLayout> svg = parseSvgTextLayout(g.s("svg_text"));
+    QTransform layerTo;
+    if (svg) {
+        const std::optional<QTransform> at = layerFn ? layerFn(t) : std::nullopt;
+        layerTo = at ? *at : QTransform::fromScale(scale, scale) * QTransform::fromTranslate(w / 2.0, h / 2.0);
+        // (and moved as far as the title's Position has been from where it was laid out)
+        layerTo = layerTo * QTransform::fromTranslate((g.pAt("pos_x", t) - svg->atX) * scale, (g.pAt("pos_y", t) - svg->atY) * scale);
+    }
+    const double layoutPx = svg ? std::max(1e-6, std::sqrt(std::abs(layerTo.determinant()))) : scale;
 
     // Animation: how far in (from the start) and out (towards the end) at this frame.
     fps = fps > 0 ? fps : 30;
@@ -772,10 +919,10 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                         ln[at] = noise[int(hsh % uint32_t(noise.size()))];
                     }
         const std::vector<TextRun> runs = parseTextRuns(g.s("runs"));
-        rich = layoutText(shownLines, charStyles(g, t, scale, 96, shownLines.join('\n'), runs), g, t, scale, 96);
+        rich = layoutText(shownLines, charStyles(g, t, layoutPx, 96, shownLines.join('\n'), runs), g, t, layoutPx, 96);
         // Measured on the real letters, so the block does not move while they shuffle.
         if (shownLines != lines) {
-            const std::vector<LineLayout> real = layoutText(lines, charStyles(g, t, scale, 96, fullText, runs), g, t, scale, 96);
+            const std::vector<LineLayout> real = layoutText(lines, charStyles(g, t, layoutPx, 96, fullText, runs), g, t, layoutPx, 96);
             for (size_t i = 0; i < rich.size(); ++i) rich[i].width = real[i].width, rich[i].height = real[i].height, rich[i].ascent = real[i].ascent;
         }
     }
@@ -899,7 +1046,83 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
             return -1;
         };
         PathSampler path;
-        const bool onPath = titlePath(g, t, scale, cx, cy, w, h, pathFn, path);
+        const bool onPath = !svg && titlePath(g, t, scale, cx, cy, w, h, pathFn, path);
+        // An SVG's text: each letter where its x, y, dx and dy put it (or along its textPath), turned by its rotate,
+        // through the text's transform to the layer and the layer's to the frame.
+        std::vector<QTransform> svgPlace;
+        std::vector<char> svgShown;
+        std::vector<int> lineBase(rich.size() + 1, 0);
+        for (size_t i = 0; i < rich.size(); ++i) lineBase[i + 1] = lineBase[i] + int(rich[i].clusters.size());
+        if (svg) {
+            const QTransform textTo = svg->matrix * layerTo;
+            const double k = std::max(1e-9, std::sqrt(std::abs(textTo.determinant())));
+            const int n = lineBase.back();
+            std::vector<QPointF> pos(static_cast<size_t>(n));
+            std::vector<double> adv(static_cast<size_t>(n));
+            std::vector<int> chunk(size_t(n), 0);
+            PathSampler along;
+            const bool alongPath = !svg->path.empty() && [&] {
+                TitlePathCurve pc = mappedCurve(svgPathCurve(svg->path), svg->pathMatrix);
+                if (pc.segments.empty()) return false;
+                along.fromCurve(std::move(pc));
+                return along.length() > 1e-9;
+            }();
+            QPointF pen;
+            int chunks = 0;
+            for (size_t i = 0, gi = 0; i < rich.size(); ++i)
+                for (const Cluster& cl : rich[i].clusters) {
+                    const size_t q = gi++;
+                    adv[q] = (cl.x1 - cl.x0) / k;
+                    // (an absolute x or y starts a chunk of text, anchored on its own)
+                    const bool hasX = q < svg->x.size() && svg->x[q], hasY = !alongPath && q < svg->y.size() && svg->y[q];
+                    if (hasX) pen.setX(*svg->x[q]);
+                    if (hasY) pen.setY(*svg->y[q]);
+                    if (q > 0 && (hasX || hasY)) ++chunks;
+                    pen += QPointF(q < svg->dx.size() ? svg->dx[q] : 0.0, q < svg->dy.size() ? svg->dy[q] : 0.0);
+                    pos[q] = pen;
+                    chunk[q] = chunks;
+                    pen.rx() += adv[q];
+                }
+            if (svg->anchor != 0)
+                for (int ch = 0; ch <= chunks; ++ch) {
+                    double lo = 1e300, hi = -1e300;
+                    for (int q = 0; q < n; ++q)
+                        if (chunk[size_t(q)] == ch) lo = std::min(lo, pos[size_t(q)].x()), hi = std::max(hi, pos[size_t(q)].x() + adv[size_t(q)]);
+                    if (hi < lo) continue;
+                    const double by = -(hi - lo) * (svg->anchor == 1 ? 0.5 : 1.0);
+                    for (int q = 0; q < n; ++q)
+                        if (chunk[size_t(q)] == ch) pos[size_t(q)].rx() += by;
+                }
+            const double startAt = alongPath ? (svg->startPercent ? svg->start / 100 * along.length() : svg->start) : 0.0;
+            svgPlace.assign(size_t(n), QTransform());
+            svgShown.assign(size_t(n), 1);
+            for (size_t i = 0, gi = 0; i < rich.size(); ++i)
+                for (const Cluster& cl : rich[i].clusters) {
+                    const size_t q = gi++;
+                    const double r = q < svg->rotate.size() && svg->rotate[q] ? *svg->rotate[q] : 0.0;
+                    // The glyph at the text's size, turned about its origin (its baseline's start).
+                    QTransform turn;
+                    turn.rotate(r);
+                    const QTransform own = QTransform::fromTranslate(-cl.x0, 0) * QTransform::fromScale(1 / k, 1 / k) * turn;
+                    if (alongPath) {
+                        // Its middle at its distance along the path, turned to the path there, dy across it; off the
+                        // ends of an open path it is not drawn.
+                        const double mid = startAt + pos[q].x() + adv[q] / 2;
+                        if (!along.closed && (mid < 0 || mid > along.length())) {
+                            svgShown[q] = 0;
+                            continue;
+                        }
+                        QPointF pt;
+                        double ang = 0;
+                        along.at(mid, pt, ang);
+                        QTransform onIt;
+                        onIt.rotateRadians(ang);
+                        svgPlace[q] = own * QTransform::fromTranslate(-adv[q] / 2, pos[q].y()) * onIt * QTransform::fromTranslate(pt.x(), pt.y()) * textTo;
+                    } else {
+                        svgPlace[q] = own * QTransform::fromTranslate(pos[q].x(), pos[q].y()) * textTo;
+                    }
+                }
+        }
         const double pathLen = onPath ? path.length() : 0;
         const bool upright = g.pAt("path_upright", t) > 0.5;
         // Along the path: placed as the text is aligned, at its start, middle or end, or spread from end to end.
@@ -953,7 +1176,12 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                 const double mid = (cl.x0 + cl.x1) / 2 + shift[size_t(c)];
                 QTransform place;
                 double placedAngle = 0;
-                if (onPath) {
+                if (svg) {
+                    const size_t q = size_t(lineBase[i] + c);
+                    if (!svgShown[q]) continue;
+                    place = svgPlace[q];
+                    placedAngle = std::atan2(place.m12(), place.m11()) * 180 / M_PI;
+                } else if (onPath) {
                     QPointF pt;
                     double ang;
                     path.at(anchorAt + mid + spreadAdd[size_t(c)] - alignRef, pt, ang);
@@ -1026,7 +1254,7 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
             }
         }
         // Text on a path: its box, bar and wipe go round where the glyphs are.
-        if (onPath && !placedBounds.isNull()) {
+        if ((onPath || svg) && !placedBounds.isNull()) {
             left = placedBounds.left();
             top = placedBounds.top();
             blockW = placedBounds.width();
@@ -1317,6 +1545,7 @@ namespace {
 
 bool titleIsStyledAt(const Effect& g, double t) {
     if (std::lround(g.pAt("path_shape", t)) > 0) return true;
+    if (!g.s("svg_text").empty()) return true;
     if (!textAnimators(g).empty()) return true;
     if (!titleAxes(g).empty()) return true;
     const std::vector<TextRun> runs = parseTextRuns(g.s("runs"));
@@ -1343,6 +1572,79 @@ bool sameScene(const TitleScene& a, const TitleScene& b) {
 
 }  // namespace
 
+std::string svgTextLayoutJson(const SvgTextLayout& l) {
+    auto matrix = [](const QTransform& m) { return QJsonArray{m.m11(), m.m12(), m.m21(), m.m22(), m.dx(), m.dy()}; };
+    auto opt = [](const std::vector<std::optional<double>>& v) {
+        QJsonArray a;
+        for (const auto& x : v) a.append(x ? QJsonValue(*x) : QJsonValue());
+        return a;
+    };
+    auto list = [](const std::vector<double>& v) {
+        QJsonArray a;
+        for (double x : v) a.append(x);
+        return a;
+    };
+    QJsonObject o;
+    o["m"] = matrix(l.matrix);
+    if (!l.x.empty()) o["x"] = opt(l.x);
+    if (!l.y.empty()) o["y"] = opt(l.y);
+    if (!l.rotate.empty()) o["rotate"] = opt(l.rotate);
+    if (!l.dx.empty()) o["dx"] = list(l.dx);
+    if (!l.dy.empty()) o["dy"] = list(l.dy);
+    if (l.anchor) o["anchor"] = l.anchor;
+    if (!l.path.empty()) {
+        o["path"] = QString::fromStdString(l.path);
+        o["pm"] = matrix(l.pathMatrix);
+        o["start"] = l.start;
+        if (l.startPercent) o["start_pct"] = true;
+    }
+    if (l.atX != 0 || l.atY != 0) o["at"] = QJsonArray{l.atX, l.atY};
+    return QJsonDocument(o).toJson(QJsonDocument::Compact).toStdString();
+}
+
+std::optional<SvgTextLayout> parseSvgTextLayout(const std::string& json) {
+    if (json.empty()) return std::nullopt;
+    const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(json));
+    if (!doc.isObject()) return std::nullopt;
+    const QJsonObject o = doc.object();
+    constexpr int kMost = 1 << 16;  // characters
+    auto finite = [](double v) { return std::isfinite(v) && std::abs(v) < 1e9 ? v : 0.0; };
+    auto matrix = [&](const QJsonValue& v, QTransform& m) {
+        const QJsonArray a = v.toArray();
+        if (a.size() != 6) return;
+        m = QTransform(finite(a[0].toDouble()), finite(a[1].toDouble()), finite(a[2].toDouble()), finite(a[3].toDouble()), finite(a[4].toDouble()),
+                       finite(a[5].toDouble()));
+    };
+    auto opt = [&](const char* k) {
+        std::vector<std::optional<double>> out;
+        for (const QJsonValue& v : o.value(k).toArray()) {
+            if (out.size() >= size_t(kMost)) break;
+            out.push_back(v.isDouble() ? std::optional<double>(finite(v.toDouble())) : std::nullopt);
+        }
+        return out;
+    };
+    auto list = [&](const char* k) {
+        std::vector<double> out;
+        for (const QJsonValue& v : o.value(k).toArray()) {
+            if (out.size() >= size_t(kMost)) break;
+            out.push_back(finite(v.toDouble()));
+        }
+        return out;
+    };
+    SvgTextLayout l;
+    matrix(o.value("m"), l.matrix);
+    l.x = opt("x"), l.y = opt("y"), l.rotate = opt("rotate");
+    l.dx = list("dx"), l.dy = list("dy");
+    l.anchor = std::clamp(o.value("anchor").toInt(), 0, 2);
+    l.path = o.value("path").toString().toStdString();
+    matrix(o.value("pm"), l.pathMatrix);
+    l.start = finite(o.value("start").toDouble());
+    l.startPercent = o.value("start_pct").toBool();
+    const QJsonArray at = o.value("at").toArray();
+    if (at.size() == 2) l.atX = finite(at[0].toDouble()), l.atY = finite(at[1].toDouble());
+    return l;
+}
+
 std::vector<std::string> titleAxes(const Effect& g) {
     std::vector<std::string> out;
     for (auto it = g.params.lower_bound("axis."); it != g.params.end() && it->first.rfind("axis.", 0) == 0; ++it)
@@ -1353,39 +1655,43 @@ std::vector<std::string> titleAxes(const Effect& g) {
 bool titleIsStyled(const Effect& g, FrameTime t) { return titleIsStyledAt(g, double(t)); }
 
 std::vector<TitleGlyph> titleGlyphs(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps,
-                                    const TitlePathFn& path) {
+                                    const TitlePathFn& path, const TitleLayerFn& layer) {
     if (!titleIsStyled(g, t)) return {};
-    return buildTitle(g, double(t), w, h, scale, duration, fps, path).glyphs;
+    return buildTitle(g, double(t), w, h, scale, duration, fps, path, layer).glyphs;
 }
 
-Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path) {
-    const double shutter = std::clamp(g.p("letter_shutter", t, 180), 0.0, 720.0) / 360.0;
-    const int n = std::clamp(int(std::lround(g.p("letter_samples", t, 16))), 2, 64);
-    if (g.p("letter_blur", t) <= 0.5 || shutter <= 0) return renderTitleAt(g, double(t), w, h, scale, duration, fps, path);
-    // The times through the shutter, centred on the frame; a title that draws the same at the first, middle and last
-    // of them is drawn once.
-    std::vector<double> times;
-    for (int i = 0; i < n; ++i) times.push_back(double(t) + ((i + 0.5) / n - 0.5) * shutter);
-    const TitleScene first = buildTitle(g, times.front(), w, h, scale, duration, fps, path);
-    if (sameScene(first, buildTitle(g, times.back(), w, h, scale, duration, fps, path)) &&
-        sameScene(first, buildTitle(g, double(t), w, h, scale, duration, fps, path)))
-        return renderTitleAt(g, double(t), w, h, scale, duration, fps, path);
-    Image sum(w, h);
-    for (const double at : times) {
-        const Image one = renderTitleAt(g, at, w, h, scale, duration, fps, path);
-        for (size_t i = 0; i < sum.px.size(); ++i) sum.px[i] += one.px[i];
-    }
-    const float k = 1.0f / float(n);
-    for (float& v : sum.px) v *= k;
-    return sum;
+namespace {
+
+// The scene's transform about its middle (the title's own animation in and out).
+QTransform sceneTransform(const TitleScene& s) {
+    QTransform m;
+    m.translate(s.cx + s.dx, s.cy + s.dy);
+    m.scale(s.sc, s.sc);
+    m.translate(-s.cx, -s.cy);
+    return m;
 }
 
-Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path) {
-    QImage qi(w, h, QImage::Format_RGBA8888_Premultiplied);
+// Where a piece can draw on the frame (its fill, outline, shadow and blur, and a pixel or two for smoothing).
+QRect pieceFootprint(const Piece& pc, const QTransform& m, double sh, double ow) {
+    if (pc.path.isEmpty()) return {};
+    const double o = std::max(ow, pc.outline) + 1, sc = std::sqrt(std::abs(m.determinant()));
+    QRectF r = pc.path.boundingRect().adjusted(-o + std::min(0.0, sh), -o + std::min(0.0, sh), o + std::max(0.0, sh), o + std::max(0.0, sh));
+    const double b = pc.blur > 0.05 ? 3 * pc.blur * std::max(1e-3, sc) + 2 : 0.0;
+    return m.mapRect(r).adjusted(-b - 2, -b - 2, b + 2, b + 2).toAlignedRect();
+}
+
+bool samePiece(const Piece& p, const Piece& q) {
+    return p.opacity == q.opacity && p.fill == q.fill && p.outlineColor == q.outlineColor && p.outline == q.outline && p.blur == q.blur &&
+           p.sub == q.sub && p.styled == q.styled && p.path == q.path;
+}
+
+// A scene drawn within `area` of the w x h frame: its pieces, or those `keep` marks (then without its box or bar).
+Image drawScene(const Effect& g, double t, const TitleScene& s, int w, int h, double scale, const std::vector<char>* keep, QRect area) {
+    area = area.intersected(QRect(0, 0, w, h));
+    if (area.isEmpty() || s.hidden) return Image(std::max(0, area.width()), std::max(0, area.height()));
+    QImage qi(area.size(), QImage::Format_RGBA8888_Premultiplied);
     qi.fill(Qt::transparent);
     {
-        const TitleScene s = buildTitle(g, t, w, h, scale, duration, fps, path);
-        if (s.hidden) return Image(w, h);
         QPainter pa(&qi);
         pa.setRenderHint(QPainter::Antialiasing);
         pa.setRenderHint(QPainter::TextAntialiasing);
@@ -1399,6 +1705,7 @@ Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, Frame
             return c;
         };
         pa.setOpacity(std::clamp(g.pAt("opacity", t, 100) / 100.0 * s.op, 0.0, 1.0));
+        pa.translate(-area.left(), -area.top());
         pa.translate(s.cx + s.dx, s.cy + s.dy);
         pa.scale(s.sc, s.sc);
         pa.translate(-s.cx, -s.cy);
@@ -1407,22 +1714,26 @@ Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, Frame
             const double from = block.left() - s.barW - s.barGap;
             pa.setClipRect(QRectF(from, -h, (block.right() - from) * s.wipe, 3.0 * h));
         }
-        if (s.boxOp > 0 && s.anyLines) pa.fillRect(block, col("box_color", s.boxOp));
-        if (s.barKind == 1) pa.fillRect(QRectF(block.left() - s.barGap - s.barW, block.top(), s.barW, block.height()), col("bar_color", 1.0));
-        if (s.barKind == 2) pa.fillRect(QRectF(s.left, block.bottom() + s.barW, s.blockW, s.barW), col("bar_color", 1.0));
+        if (!keep) {
+            if (s.boxOp > 0 && s.anyLines) pa.fillRect(block, col("box_color", s.boxOp));
+            if (s.barKind == 1) pa.fillRect(QRectF(block.left() - s.barGap - s.barW, block.top(), s.barW, block.height()), col("bar_color", 1.0));
+            if (s.barKind == 2) pa.fillRect(QRectF(s.left, block.bottom() + s.barW, s.blockW, s.barW), col("bar_color", 1.0));
+        }
         const double sh = g.pAt("shadow", t, 4) * scale;
         const double shOp = g.pAt("shadow_opacity", t, 50) / 100.0;
         const double ow = g.pAt("outline", t) * scale;
         // A styled title's pieces: blurred ones on their own first; the rest merged where they look alike (so joined
         // scripts draw without seams), then drawn as a plain title's are.
         std::vector<Piece> merged;
-        for (const Piece& pc : s.pieces) {
+        for (size_t i = 0; i < s.pieces.size(); ++i) {
+            const Piece& pc = s.pieces[i];
+            if (keep && !(*keep)[i]) continue;
             if (!pc.styled) {
                 merged.push_back(pc);
                 continue;
             }
             if (pc.blur > 0.05) {
-                drawBlurred(pa, pc, sh, shOp, std::max(ow, pc.outline), w, h);
+                drawBlurred(pa, pc, sh, shOp, std::max(ow, pc.outline), area.width(), area.height());
                 continue;
             }
             if (!merged.empty() && merged.back().styled && merged.back().fill == pc.fill && merged.back().outline == pc.outline &&
@@ -1446,14 +1757,119 @@ Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, Frame
         for (const Piece& pc : merged)
             pa.fillPath(pc.path, pc.styled ? withAlpha(pc.fill, pc.opacity) : col(pc.sub ? "sub_color" : "color", pc.opacity));
     }
-    Image img(w, h);
+    Image img(area.width(), area.height());
     const float k = 1.0f / 255.0f;
-    for (int y = 0; y < h; ++y) {
-        const uchar* s = qi.constScanLine(y);
+    for (int y = 0; y < img.height; ++y) {
+        const uchar* src = qi.constScanLine(y);
         float* d = img.row(y);
-        for (int x = 0; x < w * 4; ++x) d[x] = s[x] * k;
+        for (int x = 0; x < img.width * 4; ++x) d[x] = src[x] * k;
     }
     return img;
+}
+
+}  // namespace
+
+Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path,
+                  const TitleLayerFn& layer) {
+    const double shutter = std::clamp(g.p("letter_shutter", t, 180), 0.0, 720.0) / 360.0;
+    const int n = std::clamp(int(std::lround(g.p("letter_samples", t, 16))), 2, 64);
+    if (g.p("letter_blur", t) <= 0.5 || shutter <= 0) return renderTitleAt(g, double(t), w, h, scale, duration, fps, path, layer);
+    // The times through the shutter, centred on the frame; a title that draws the same at the first, middle and last
+    // of them is drawn once.
+    std::vector<double> times;
+    for (int i = 0; i < n; ++i) times.push_back(double(t) + ((i + 0.5) / n - 0.5) * shutter);
+    std::vector<TitleScene> scenes(times.size());
+    scenes.front() = buildTitle(g, times.front(), w, h, scale, duration, fps, path, layer);
+    scenes.back() = buildTitle(g, times.back(), w, h, scale, duration, fps, path, layer);
+    {
+        const TitleScene now = buildTitle(g, double(t), w, h, scale, duration, fps, path, layer);
+        if (sameScene(scenes.front(), scenes.back()) && sameScene(scenes.front(), now)) return drawScene(g, double(t), now, w, h, scale, nullptr, QRect(0, 0, w, h));
+    }
+    for (size_t k = 1; k + 1 < times.size(); ++k) scenes[k] = buildTitle(g, times[k], w, h, scale, duration, fps, path, layer);
+    // The letters that draw the same at every time are drawn once, and the frame is drawn again at every time only
+    // over the part of it the moving ones reach, with whatever else reaches that part. (Outside it every time draws
+    // the same pixels, and inside it each time draws them as the whole title would, so the average is unchanged.)
+    // Not with a box or bar behind the text, when the title as a whole moves, fades or changes colour, or its
+    // letters come and go.
+    const TitleScene& s0 = scenes.front();
+    bool split = !s0.hidden && s0.boxOp <= 0 && s0.barKind == 0;
+    for (const TitleScene& sc : scenes)
+        split = split && !sc.hidden && sc.pieces.size() == s0.pieces.size() && sc.cx == s0.cx && sc.cy == s0.cy && sc.dx == s0.dx &&
+                sc.dy == s0.dy && sc.sc == s0.sc && sc.op == s0.op && sc.wipe == s0.wipe && sc.block == s0.block && sc.boxOp == s0.boxOp &&
+                sc.barKind == s0.barKind;
+    // (what drawScene reads from the title at each time)
+    static const char* const kDrawn[] = {"opacity", "shadow", "shadow_opacity", "outline", "color.r", "color.g", "color.b", "sub_color.r",
+                                         "sub_color.g", "sub_color.b", "outline_color.r", "outline_color.g", "outline_color.b"};
+    for (const char* key : kDrawn)
+        for (size_t k = 1; split && k < times.size(); ++k) split = g.pAt(key, times[k], -1) == g.pAt(key, times[0], -1);
+    std::vector<char> moving(s0.pieces.size(), 0);
+    std::vector<QRect> reach(s0.pieces.size());
+    QRect area;  // where the moving letters reach
+    if (split) {
+        const double sh = g.pAt("shadow", times[0], 4) * scale, ow = g.pAt("outline", times[0]) * scale;
+        const QTransform m = sceneTransform(s0);
+        for (size_t i = 0; i < s0.pieces.size(); ++i)
+            for (const TitleScene& sc : scenes) {
+                reach[i] |= pieceFootprint(sc.pieces[i], m, sh, ow);
+                if (!samePiece(sc.pieces[i], s0.pieces[i])) moving[i] = 1;
+            }
+        for (size_t i = 0; i < moving.size(); ++i)
+            if (moving[i]) area |= reach[i];
+        area = area.intersected(QRect(0, 0, w, h));
+        split = std::count(moving.begin(), moving.end(), 0) > 0;
+    }
+    if (!split) {
+        Image sum(w, h);
+        for (size_t k = 0; k < scenes.size(); ++k) {
+            const Image one = drawScene(g, times[k], scenes[k], w, h, scale, nullptr, QRect(0, 0, w, h));
+            for (size_t i = 0; i < sum.px.size(); ++i) sum.px[i] += one.px[i];
+        }
+        const float k = 1.0f / float(n);
+        for (float& v : sum.px) v *= k;
+        return sum;
+    }
+    // The still letters once, over only as much of the frame as they reach.
+    std::vector<char> still(moving.size()), near(moving.size());
+    QRect stillArea;
+    for (size_t i = 0; i < moving.size(); ++i) {
+        still[i] = !moving[i];
+        near[i] = moving[i] || reach[i].intersects(area);
+        if (still[i]) stillArea |= reach[i];
+    }
+    Image out(w, h);
+    auto lay = [&](const Image& part, QRect at, float k, bool add) {
+        for (int y = 0; y < at.height(); ++y) {
+            float* d = out.row(at.top() + y) + size_t(at.left()) * 4;
+            const float* src = part.px.data() + size_t(y) * size_t(at.width()) * 4;
+            for (int x = 0; x < at.width() * 4; ++x) d[x] = (add ? d[x] : 0.0f) + src[x] * k;
+        }
+    };
+    stillArea = stillArea.intersected(QRect(0, 0, w, h));
+    if (!stillArea.isEmpty()) lay(drawScene(g, times.front(), s0, w, h, scale, &still, stillArea), stillArea, 1.0f, false);
+    if (area.isEmpty()) return out;
+    // Drawn over all of any blurred letter reaching that part (its blur needs the whole of it), kept only there.
+    QRect drawn = area;
+    for (size_t i = 0; i < near.size(); ++i)
+        if (near[i] && s0.pieces[i].styled && s0.pieces[i].blur > 0.05) drawn |= reach[i];
+    drawn = drawn.intersected(QRect(0, 0, w, h));
+    Image sum(area.width(), area.height());
+    for (size_t k = 0; k < scenes.size(); ++k) {
+        const Image one = drawScene(g, times[k], scenes[k], w, h, scale, &near, drawn);
+        for (int y = 0; y < area.height(); ++y) {
+            const float* src = one.row(area.top() - drawn.top() + y) + size_t(area.left() - drawn.left()) * 4;
+            float* d = sum.row(y);
+            for (int x = 0; x < area.width() * 4; ++x) d[x] += src[x];
+        }
+    }
+    lay(sum, area, 1.0f / float(n), false);
+    return out;
+}
+
+Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path,
+                    const TitleLayerFn& layer) {
+    const TitleScene s = buildTitle(g, t, w, h, scale, duration, fps, path, layer);
+    if (s.hidden) return Image(w, h);
+    return drawScene(g, t, s, w, h, scale, nullptr, QRect(0, 0, w, h));
 }
 
 std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing,

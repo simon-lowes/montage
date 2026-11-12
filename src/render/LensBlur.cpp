@@ -104,12 +104,6 @@ void fillBehind(std::vector<float>& col, std::vector<float>& cov, int W, int rx0
     });
 }
 
-struct Tap {
-    int dx, dy;     // where the source pixel is, from the one gathered
-    double kx, ky;  // the aperture's position (source to output)
-    float w;
-};
-
 }  // namespace
 
 double signedCoc(const LensBlurSettings& s, double depth) {
@@ -173,9 +167,9 @@ void breathe(Image& img, double scale) {
     });
 }
 
-void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSettings& s, const TransferTables* tf) {
-    const int W = img.width, H = img.height;
-    if (img.empty() || depth.size() != size_t(W) * H || s.radius < 0.5) return;
+LensBlurPlan lensBlurPlan(const std::vector<float>& depth, int W, int H, const LensBlurSettings& s, const TransferTables* tf) {
+    LensBlurPlan plan;
+    if (W <= 0 || H <= 0 || depth.size() != size_t(W) * H || s.radius < 0.5) return plan;
     const size_t N = size_t(W) * H;
     // Each pixel's blur, signed (behind the focus negative), and the layers: blur radii from the farthest to the
     // nearest a step apart, each pixel shared between the two either side of its own.
@@ -185,15 +179,85 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
         coc[i] = float(signedCoc(s, depth[i]));
         lo = std::min(lo, double(coc[i])), hi = std::max(hi, double(coc[i]));
     }
-    if (hi - lo < 0.5) return;
+    if (hi - lo < 0.5) return plan;
+    plan.none = false;
     const double widest = std::max(-lo, hi);
     const int perSide = std::clamp(int(std::ceil(widest / 2)), 1, 10);
     const double step = widest / perSide;
     const int first = -int(std::ceil(-lo / step - 1e-9)), last = int(std::ceil(hi / step - 1e-9));
+    plan.liftThreshold = tf ? tf->decode(float(s.threshold)) : s.threshold;
+    plan.lift = 12 * std::clamp(s.highlights, 0.0, 1.0);
+    // Each pixel's two layers: the nearer-side share of the one past bin0.
+    plan.bin0.resize(N);
+    plan.share.resize(N);
+    const int bins = last - first + 1;
+    std::vector<int> bx0(size_t(bins), W), by0(size_t(bins), H), bx1(size_t(bins), -1), by1(size_t(bins), -1);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = size_t(y) * W + x;
+            const double pos = std::clamp(coc[i] / step, double(first), double(last));
+            const int k0 = std::min(last - 1, int(std::floor(pos)));
+            plan.bin0[i] = int16_t(k0);
+            plan.share[i] = float(pos - k0);
+            for (int k = k0; k <= k0 + 1; ++k) {
+                if ((k == k0 ? 1 - plan.share[i] : plan.share[i]) <= 0) continue;
+                const size_t b = size_t(k - first);
+                bx0[b] = std::min(bx0[b], x), bx1[b] = std::max(bx1[b], x), by0[b] = std::min(by0[b], y), by1[b] = std::max(by1[b], y);
+            }
+        }
+    const Aperture& ap = s.aperture;
+    const double sq = std::max(1.0, ap.squeeze);
+    bool any = false;
+    for (int k = first; k <= last; ++k) {
+        const size_t b = size_t(k - first);
+        if (bx1[b] < 0) continue;
+        LensBlurLayer L;
+        L.k = k;
+        L.r = std::fabs(k * step);
+        L.bx0 = bx0[b], L.by0 = by0[b], L.bx1 = bx1[b], L.by1 = by1[b];
+        if (L.r < 0.5) {
+            L.sharp = true;
+            plan.layers.push_back(std::move(L));
+            any = true;
+            continue;
+        }
+        // Worked on at a scale where the radius is at most 6 pixels, over the layer's box grown by the blur.
+        L.f = L.r > 6 ? int(std::ceil(L.r / 6)) : 1;
+        L.rr = L.r / L.f;
+        const int grow = int(std::ceil(L.r * sq)) + 2;
+        L.x0 = std::max(0, L.bx0 - grow), L.y0 = std::max(0, L.by0 - grow);
+        L.x1 = std::min(W - 1, L.bx1 + grow), L.y1 = std::min(H - 1, L.by1 + grow);
+        // What is behind carries on under this layer's blurred edge (filled from a margin round the box, so the
+        // colour comes from what surrounds the layer).
+        L.fill = any;
+        L.fx0 = std::max(0, L.x0 - grow), L.fy0 = std::max(0, L.y0 - grow), L.fx1 = std::min(W - 1, L.x1 + grow), L.fy1 = std::min(H - 1, L.y1 + grow);
+        L.lw = (L.x1 - L.x0 + L.f) / L.f, L.lh = (L.y1 - L.y0 + L.f) / L.f;
+        // The aperture as taps: gathering from the source at -k what a scattered disc would put at +k.
+        double total = 0;
+        const int R = int(std::ceil(L.rr * sq)) + 1;
+        for (int ky = -R; ky <= R; ++ky)
+            for (int kx = -R; kx <= R; ++kx) {
+                const float w = apertureWeight(ap, kx, ky, L.rr);
+                if (w <= 0) continue;
+                L.taps.push_back({-kx, -ky, double(kx), double(ky), w});
+                total += w;
+            }
+        if (total <= 0) L.taps.clear();
+        if (!L.taps.empty()) any = true;
+        plan.layers.push_back(std::move(L));
+    }
+    return plan;
+}
+
+void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSettings& s, const TransferTables* tf) {
+    const int W = img.width, H = img.height;
+    const LensBlurPlan plan = lensBlurPlan(depth, W, H, s, tf);
+    if (img.empty() || plan.none) return;
+    const size_t N = size_t(W) * H;
     // In light, highlights lifted.
     Lift lift;
-    lift.thr = tf ? tf->decode(float(s.threshold)) : s.threshold;
-    lift.a = 12 * std::clamp(s.highlights, 0.0, 1.0);
+    lift.thr = plan.liftThreshold;
+    lift.a = plan.lift;
     std::vector<float> lin(N * 4);
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y)
@@ -206,41 +270,21 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
                 lift.apply(q, true);
             }
     });
-    // Each pixel's two layers: the nearer-side share of the one past bin0.
-    std::vector<int16_t> bin0(N);
-    std::vector<float> share(N);
-    const int bins = last - first + 1;
-    std::vector<int> bx0(size_t(bins), W), by0(size_t(bins), H), bx1(size_t(bins), -1), by1(size_t(bins), -1);
-    for (int y = 0; y < H; ++y)
-        for (int x = 0; x < W; ++x) {
-            const size_t i = size_t(y) * W + x;
-            const double pos = std::clamp(coc[i] / step, double(first), double(last));
-            const int k0 = std::min(last - 1, int(std::floor(pos)));
-            bin0[i] = int16_t(k0);
-            share[i] = float(pos - k0);
-            for (int k = k0; k <= k0 + 1; ++k) {
-                if ((k == k0 ? 1 - share[i] : share[i]) <= 0) continue;
-                const size_t b = size_t(k - first);
-                bx0[b] = std::min(bx0[b], x), bx1[b] = std::max(bx1[b], x), by0[b] = std::min(by0[b], y), by1[b] = std::max(by1[b], y);
-            }
-        }
+    const std::vector<int16_t>& bin0 = plan.bin0;
+    const std::vector<float>& share = plan.share;
     std::vector<float> acc(N * 4, 0), accA(N, 0);
     // Pixels wholly in the sharp layer that nothing blurred covers keep their own value (no round trip to light).
     std::vector<uint8_t> keep(N, 0);
     const double cx = W / 2.0, cy = H / 2.0, corner = std::hypot(cx, cy);
     const Aperture& ap = s.aperture;
     const double sq = std::max(1.0, ap.squeeze);
-    bool any = false;
-    for (int k = first; k <= last; ++k) {
-        const double centre = k * step, r = std::fabs(centre);
+    for (const LensBlurLayer& L : plan.layers) {
+        const int k = L.k;
         auto weight = [&](size_t i) { return bin0[i] == k ? 1 - share[i] : bin0[i] + 1 == k ? share[i] : 0.0f; };
-        const size_t b = size_t(k - first);
-        if (bx1[b] < 0) continue;
-        const int bx0k = bx0[b], by0k = by0[b], bx1k = bx1[b], by1k = by1[b];
-        if (r < 0.5) {
+        if (L.sharp) {
             // Sharp: laid down as it is.
-            for (int y = by0k; y <= by1k; ++y)
-                for (int x = bx0k; x <= bx1k; ++x) {
+            for (int y = L.by0; y <= L.by1; ++y)
+                for (int x = L.bx0; x <= L.bx1; ++x) {
                     const size_t i = size_t(y) * W + x;
                     const float w = weight(i);
                     if (w <= 0) continue;
@@ -248,19 +292,12 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
                     for (int c = 0; c < 4; ++c) acc[i * 4 + c] = lin[i * 4 + c] * w + acc[i * 4 + c] * (1 - w);
                     accA[i] = w + accA[i] * (1 - w);
                 }
-            any = true;
             continue;
         }
-        // Worked on at a scale where the radius is at most 6 pixels, over the layer's box grown by the blur.
-        const int f = r > 6 ? int(std::ceil(r / 6)) : 1;
-        const double rr = r / f;
-        const int grow = int(std::ceil(r * sq)) + 2;
-        const int x0 = std::max(0, bx0k - grow), y0 = std::max(0, by0k - grow);
-        const int x1 = std::min(W - 1, bx1k + grow), y1 = std::min(H - 1, by1k + grow);
-        // What is behind carries on under this layer's blurred edge (filled from a margin round the box, so the
-        // colour comes from what surrounds the layer).
-        if (any) fillBehind(acc, accA, W, std::max(0, x0 - grow), std::max(0, y0 - grow), std::min(W - 1, x1 + grow), std::min(H - 1, y1 + grow));
-        const int lw = (x1 - x0 + f) / f, lh = (y1 - y0 + f) / f;
+        const int f = L.f, x0 = L.x0, y0 = L.y0, x1 = L.x1, y1 = L.y1, lw = L.lw, lh = L.lh;
+        const double rr = L.rr;
+        if (L.fill) fillBehind(acc, accA, W, L.fx0, L.fy0, L.fx1, L.fy1);
+        if (L.taps.empty()) continue;
         std::vector<float> lc(size_t(lw) * lh * 4, 0), la(size_t(lw) * lh, 0);
         const float cell = 1.0f / float(f * f);
         parallelRows(lh, [&](int ya, int yb) {
@@ -274,18 +311,7 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
                         for (int c = 0; c < 4; ++c) lc[j * 4 + c] += lin[i * 4 + c] * w;
                     }
         });
-        // The aperture as taps: gathering from the source at -k what a scattered disc would put at +k.
-        std::vector<Tap> taps;
-        double total = 0;
-        const int R = int(std::ceil(rr * sq)) + 1;
-        for (int ky = -R; ky <= R; ++ky)
-            for (int kx = -R; kx <= R; ++kx) {
-                const float w = apertureWeight(ap, kx, ky, rr);
-                if (w <= 0) continue;
-                taps.push_back({-kx, -ky, double(kx), double(ky), w});
-                total += w;
-            }
-        if (taps.empty() || total <= 0) continue;
+        const std::vector<LensBlurTap>& taps = L.taps;
         const bool catEye = ap.catEye > 0;
         std::vector<float> bc(lc.size(), 0), ba(la.size(), 0);
         parallelRows(lh, [&](int ya, int yb) {
@@ -298,7 +324,7 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
                         ox = ap.catEye * rr * (px - cx) / corner, oy = ap.catEye * rr * sq * (py - cy) / corner;
                     }
                     double sum[4] = {0, 0, 0, 0}, a = 0, norm = 0;
-                    for (const Tap& t : taps) {
+                    for (const LensBlurTap& t : taps) {
                         float w = t.w;
                         if (catEye) w = std::min(w, float(std::clamp(rr - std::hypot(t.kx - ox, (t.ky - oy) / sq) + 0.5, 0.0, 1.0)));
                         if (w <= 0) continue;
@@ -345,7 +371,6 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
                 }
             }
         });
-        any = true;
     }
     // Back from light, highlights brought down.
     parallelRows(H, [&](int ya, int yb) {

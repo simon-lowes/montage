@@ -53,9 +53,11 @@
 #include "FrameRepair.h"
 #include "Particles.h"
 #include "Retime.h"
+#include "media/Tracking.h"
 #include "Shapes.h"
 #include "Title3D.h"
 #include "ShapeLayers.h"
+#include "ShapeRaster.h"
 #include "Titles.h"
 #include "Layer3D.h"
 #include "ModelClip.h"
@@ -730,7 +732,9 @@ void sourceSize(const Geometry& g, double scale, int nativeW, int nativeH, int& 
 struct ClipSource {
     FrameTime t = 0, lt = 0;  // (Stop Motion holds frames)
     Image src;
-    // Or, when asked to leave it (`deferFrame`), the decoded frame and the space it is in: nothing ran on it yet.
+    // Or, when asked to leave it (`deferFrame`), a Shape layer's paints for the GPU to draw (render/ShapeRaster) ...
+    std::shared_ptr<const ShapeRaster> shapes;
+    // ... or the decoded frame and the space it is in: nothing ran on it yet.
     Frame16Ptr frame;
     const ColorSpace* frameSpace = nullptr;
     // The frame's adaptive HDR metadata (render/AdaptiveHdr.h) when it changes how the frame enters the sequence.
@@ -873,6 +877,27 @@ int ofxInputTrack(const Sequence& seq, const std::string& connection) {
 
 }  // namespace
 
+namespace {
+// The clip a title's Path From Clip names (its id, or its name: of several so named, the one playing at sequence frame
+// st, else the first in the sequence); null when it names none, or none is there.
+const Clip* namedPathClip(const Sequence& seq, const Clip& title, FrameTime st) {
+    const std::string name = title.generator.s("path_clip");
+    if (name.empty()) return nullptr;
+    const Clip* found = nullptr;
+    bool digits = !name.empty() && name.size() < 20 && std::all_of(name.begin(), name.end(), [](char ch) { return ch >= '0' && ch <= '9'; });
+    const Id id = digits ? Id(std::strtoull(name.c_str(), nullptr, 10)) : 0;
+    for (const Track& tr : seq.videoTracks)
+        for (const Clip& k : tr.clips) {
+            if (k.id == title.id) continue;
+            if (id != 0 && k.id == id) return &k;
+            if (k.name != name) continue;
+            if (k.contains(st)) return &k;
+            if (!found) found = &k;
+        }
+    return found;
+}
+}  // namespace
+
 TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h) {
     const int shape = int(std::lround(c.generator.p("path_shape", 0)));
     const auto ps = c.generator.params.find("path_shape");
@@ -881,6 +906,10 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
     auto atFrame = [&p, &seq, &c, w, h](FrameTime lt) -> std::optional<TitlePathCurve> {
         const double t = double(lt);
         const int kind = int(std::lround(c.generator.pAt("path_shape", t)));
+        const FrameTime st = c.start + lt;
+        // Another clip's (named by Path From Clip), else the title's own.
+        const Clip* named = namedPathClip(seq, c, st);
+        if (!named && !c.generator.s("path_clip").empty()) return std::nullopt;
         using Seg = TitlePathCurve::Segment;
         TitlePathCurve out;
         auto cubic = [&](QPointF a, QPointF b, QPointF cc, QPointF d) {
@@ -900,45 +929,79 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
             out.closed = closed;
         };
         if (kind == 4) {
-            // The clip's effects' masks drawn as shapes (ellipses, rectangles, Bézier paths), the Mask Number-th.
+            // The clip's effects' masks drawn as shapes (ellipses, rectangles, Bézier paths), the Mask Number-th; on
+            // another clip, at its own time and carried through its transform into the title's frame.
+            const Clip& src = named ? *named : c;
+            const FrameTime olt = named ? std::clamp<FrameTime>(st - src.start, 0, std::max<FrameTime>(0, src.duration - 1)) : lt;
+            const double ot = named ? double(olt) : t;
+            // Its frame (u, v as fractions) to the title's (pixels).
+            bool ok = true;
+            auto frameTo = [&](double u, double v) {
+                if (!named) return QPointF(u * w, v * h);
+                double sx = 0, sy = 0, tu = 0, tv = 0;
+                ok = ok && clipFrameToSequence(p, seq, src, st, u, v, sx, sy) && sequenceToClipFrame(p, seq, c, st, sx, sy, tu, tv);
+                return QPointF(tu * w, tv * h);
+            };
+            // (the frame's shape, for a turned mask's box)
+            double fw = w, fh = h;
+            if (named && !clipFrameSize(p, seq, src, fw, fh)) return std::nullopt;
             const int want = std::max(1, int(std::lround(c.generator.pAt("path_mask", t, 1))));
             int k = 0;
-            for (const Effect& e : c.effects) {
-                const int ms = int(std::lround(e.p("mask.shape", lt)));
+            for (const Effect& e : src.effects) {
+                const int ms = int(std::lround(e.p("mask.shape", olt)));
                 if (!e.enabled || (ms != 1 && ms != 2 && ms != 5) || ++k != want) continue;  // (as the monitor shows them)
-                const MaskBox b = maskBox(e, lt);
+                const MaskBox b = maskBox(e, olt);
+                auto to = [&](double bx, double by) {
+                    double u = 0, v = 0;
+                    boxToFrame(b, fw, fh, bx, by, u, v);
+                    return frameTo(u, v);
+                };
                 if (ms == 1) {
-                    // From the top, clockwise on screen (as the Circle path runs).
+                    // From the top, clockwise on screen (as the Circle path runs): its middle and the ends of its
+                    // axes carried over (an ellipse still, the clip's transform being affine).
                     Seg g;
-                    g.kind = 2;
-                    g.p[0] = QPointF(b.x * w, b.y * h);
-                    g.p[1] = QPointF(b.w * w / 2, b.h * h / 2);
-                    g.rotation = b.rotation * M_PI / 180;
+                    g.kind = 3;
+                    g.p[0] = to(0, 0);
+                    g.p[1] = to(0.5, 0) - g.p[0];
+                    g.p[2] = to(0, 0.5) - g.p[0];
                     g.from = -M_PI / 2, g.to = 1.5 * M_PI;
                     out.segments.push_back(g);
                     out.closed = true;
-                    return out;
+                } else if (ms == 2) {
+                    pathSegments({{-0.5, -0.5}, {0.5, -0.5}, {0.5, 0.5}, {-0.5, 0.5}}, true, to);
+                } else if (maskPathCount(e) >= 2) {
+                    pathSegments(maskPath(e, olt), e.p("mask.open", olt) <= 0.5, to);
                 }
-                auto to = [&](double bx, double by) {
-                    double u = 0, v = 0;
-                    boxToFrame(b, w, h, bx, by, u, v);
-                    return QPointF(u * w, v * h);
-                };
-                if (ms == 2) pathSegments({{-0.5, -0.5}, {0.5, -0.5}, {0.5, 0.5}, {-0.5, 0.5}}, true, to);
-                else if (maskPathCount(e) >= 2) pathSegments(maskPath(e, lt), e.p("mask.open", lt) <= 0.5, to);
-                if (out.segments.empty()) return std::nullopt;
-                return out;
+                if (out.segments.empty() || !ok) return std::nullopt;
+                // Set off by the mask's expansion, and across its feather (centred on the expanded edge) as far as On
+                // the Feather says: its pixels (as the clip's effects count them on its frame) as many of the title's
+                // as the clip's frame takes of them there.
+                const double feather = std::max(0.0, e.pAt("mask.feather", ot, 20)), expand = e.pAt("mask.expansion", ot);
+                const double across = std::clamp(c.generator.pAt("path_feather", t), -100.0, 100.0) / 100;
+                const double at = expand + across * feather / 2;
+                double ew = seq.width, eh = seq.height;  // (the clip's effects' pixels)
+                if (at != 0 && (!clipEffectFrameSize(p, seq, src, st, ew, eh) || ew <= 0 || eh <= 0)) ew = seq.width, eh = seq.height;
+                if (at != 0) {
+                    const QPointF o = frameTo(b.x, b.y), ux = frameTo(b.x + 1.0 / ew, b.y), uy = frameTo(b.x, b.y + 1.0 / eh);
+                    const QPointF a = ux - o, d = uy - o;
+                    out.offset = at * std::sqrt(std::abs(a.x() * d.y() - a.y() * d.x()));
+                }
+                return ok ? std::optional<TitlePathCurve>(out) : std::nullopt;
             }
             return std::nullopt;
         }
         if (kind != 5) return std::nullopt;
-        // A shape layer under the title (on Shape Track, or the nearest below it) at this time, and its path.
+        // A shape layer under the title (on Shape Track, or the nearest below it; or the clip named) at this time, and
+        // its path.
         const auto loc = edit::locate(seq, c.id);
         if (!loc || loc->track.kind != TrackKind::Video) return std::nullopt;
-        const FrameTime st = c.start + lt;
         const int track = int(std::lround(c.generator.pAt("path_track", t)));
         const Clip* layer = nullptr;
-        for (int i = track > 0 ? track - 1 : loc->track.index - 1; i >= 0 && i < int(seq.videoTracks.size()) && !layer; i = track > 0 ? -1 : i - 1)
+        if (named) {
+            if (!named->isGenerator() || named->generator.type != "shape") return std::nullopt;
+            layer = named;
+        }
+        for (int i = track > 0 ? track - 1 : loc->track.index - 1; !named && i >= 0 && i < int(seq.videoTracks.size()) && !layer; i = track > 0 ? -1 : i - 1)
             for (const Clip& k : seq.videoTracks[size_t(i)].clips)
                 if (k.isGenerator() && k.generator.type == "shape" && k.contains(st) && k.id != c.id) {
                     layer = &k;
@@ -946,7 +1009,7 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
                 }
         if (!layer) return std::nullopt;
         const std::string id = shapePathItem(layer->generator, c.generator.s("path_item"));
-        const FrameTime slt = st - layer->start;
+        const FrameTime slt = std::clamp<FrameTime>(st - layer->start, 0, std::max<FrameTime>(0, layer->duration - 1));
         QTransform toFrame;
         if (id.empty() || !shapePathToFrame(layer->generator, id, slt, seq.width, seq.height, toFrame)) return std::nullopt;
         const std::vector<PathPoint> pts = shapePathPoints(layer->generator, id, slt);
@@ -959,7 +1022,7 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
         pathSegments(pts, closed, [&](double x, double y) {
             const QPointF f = toFrame.map(QPointF(x, y));
             double sx = 0, sy = 0, u = 0, v = 0;
-            ok = ok && clipFrameToSequence(p, seq, *layer, st, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
+            ok = ok && clipFrameToSequence(p, seq, *layer, layer->start + slt, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
                  sequenceToClipFrame(p, seq, c, st, sx, sy, u, v);
             return QPointF(u * w, v * h);
         });
@@ -976,6 +1039,7 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
         if (!a || f < 1e-9 || lt >= last) return a;
         const std::optional<TitlePathCurve> b = atFrame(lt + 1);
         if (!b || b->segments.size() != a->segments.size() || b->closed != a->closed) return a;
+        a->offset += (b->offset - a->offset) * f;
         for (size_t i = 0; i < a->segments.size(); ++i) {
             TitlePathCurve::Segment& sa = a->segments[i];
             const TitlePathCurve::Segment& sb = b->segments[i];
@@ -986,6 +1050,46 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
             sa.to += (sb.to - sa.to) * f;
         }
         return a;
+    };
+}
+
+TitleLayerFn titleLayerSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h) {
+    const std::string id = c.generator.s("svg_layer");
+    if (id.empty() || c.generator.s("svg_text").empty()) return {};
+    const Id layerId = Id(std::strtoull(id.c_str(), nullptr, 10));
+    // The layer's pixels (from its middle) to the title's at a frame: through the layer's own position and turn, its
+    // clip's transform to the sequence, and back through the title's.
+    auto atFrame = [&p, &seq, &c, w, h, layerId](FrameTime lt) -> std::optional<QTransform> {
+        const Clip* layer = edit::clipById(seq, layerId);
+        if (!layer || !layer->isGenerator() || layer->generator.type != "shape") return std::nullopt;
+        const FrameTime st = c.start + lt, slt = std::clamp<FrameTime>(st - layer->start, 0, std::max<FrameTime>(0, layer->duration - 1));
+        QTransform own;
+        own.translate(seq.width / 2.0 + layer->generator.p("pos_x", slt), seq.height / 2.0 + layer->generator.p("pos_y", slt));
+        own.rotate(layer->generator.p("rotation", slt));
+        bool ok = true;
+        auto to = [&](double x, double y) {
+            const QPointF f = own.map(QPointF(x, y));
+            double sx = 0, sy = 0, u = 0, v = 0;
+            ok = ok && clipFrameToSequence(p, seq, *layer, layer->start + slt, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
+                 sequenceToClipFrame(p, seq, c, st, sx, sy, u, v);
+            return QPointF(u * w, v * h);
+        };
+        const QPointF o = to(0, 0), a = to(100, 0), b = to(0, 100);
+        if (!ok) return std::nullopt;
+        return QTransform((a.x() - o.x()) / 100, (a.y() - o.y()) / 100, (b.x() - o.x()) / 100, (b.y() - o.y()) / 100, o.x(), o.y());
+    };
+    // Between frames (motion blur's samples) the frames either side mixed.
+    return [atFrame, last = std::max<FrameTime>(0, c.duration - 1)](double t) -> std::optional<QTransform> {
+        const double ct = std::clamp(t, 0.0, double(last));
+        const FrameTime lt = FrameTime(std::floor(ct + 1e-9));
+        const std::optional<QTransform> a = atFrame(lt);
+        const double f = ct - double(lt);
+        if (!a || f < 1e-9 || lt >= last) return a;
+        const std::optional<QTransform> b = atFrame(lt + 1);
+        if (!b) return a;
+        auto mix = [f](double x, double y) { return x + (y - x) * f; };
+        return QTransform(mix(a->m11(), b->m11()), mix(a->m12(), b->m12()), mix(a->m21(), b->m21()), mix(a->m22(), b->m22()), mix(a->dx(), b->dx()),
+                          mix(a->dy(), b->dy()));
     };
 }
 
@@ -1042,12 +1146,26 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
         std::string modelError;
+        // A Shape layer the GPU draws itself (in Rec.709, the space graphics are made in, as the sequence is; within
+        // the groups its shader keeps, and a table it takes).
+        if (deferFrame && c.generator.type == "shape" && !currentSceneGrading() && sameColorSpace(rec709Space(), sequenceColorSpace(seq))) {
+            ShapeRaster raster = shapeLayerRaster(c.generator, lt, w, h, double(w) / SW, seq.fpsValue());
+            const int most = gpu::maxTextureSize();
+            if (raster.depth <= kShapeGpuGroups && raster.table.size() / (size_t(kShapeTableWidth) * 4) <= size_t(most) && w <= most && h <= most &&
+                kShapeTableWidth <= most) {
+                out.shapes = std::make_shared<const ShapeRaster>(std::move(raster));
+                return true;
+            }
+            src = drawShapeRaster(raster);
+            return true;
+        }
         src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError,
                                                                       modelLayerAt(p, seq, o))
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
-              : c.generator.type == "title" ? renderTitle(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), titlePathSource(p, seq, c, w, h))
+              : c.generator.type == "title" ? renderTitle(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), titlePathSource(p, seq, c, w, h),
+                                                          titleLayerSource(p, seq, c, w, h))
                                               : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         if (!modelError.empty() && o.issues) o.issues->note(modelError);
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white (graded scene-referred, back
@@ -1837,6 +1955,13 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
 
 namespace {
 
+// The name Smooth Cut's flow is kept under (render/Retime's frameFlow): the transition, its pair, the frame's size and
+// eye, and whether it is morphed as the display shows it.
+std::string smoothCutKey(const Transition& tr, FrameTime from, FrameTime to, int W, int H, const RenderOptions& o, bool shown) {
+    return "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' + std::to_string(W) + 'x' +
+           std::to_string(H) + (o.eye ? "#R" : "") + (shown ? "#shown" : "");
+}
+
 // A transition's picture at t (from to `to` on its track), on the CPU.
 // (`finish`, when given, does what compositing does to each clip's layer at the time it shows: Sky Replacement)
 // (`displayReferred`, when given, is told whether the picture is mixed as the display shows it: graded scene-referred,
@@ -1875,9 +2000,7 @@ Image transitionLayer(const Project& p, const Sequence& seq, const Track& track,
         if (sg)
             for (Image* l : {&la, &lb}) outputTransform(*l, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
         Image mix = la.width == W && la.height == H && lb.width == W && lb.height == H
-                        ? interpolateFrames(la, lb, u,
-                                            "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' +
-                                                std::to_string(W) + 'x' + std::to_string(H) + (o.eye ? "#R" : "") + (sg ? "#shown" : ""))
+                        ? interpolateFrames(la, lb, u, smoothCutKey(tr, from, to, W, H, o, sg != nullptr))
                         : transitionMix("cross_dissolve", tr.params, la, lb, u, W, H);
         if (sg) {
             inverseOutputTransform(mix, *sg->display, *sg->linear, sg->peakNits, sg->kind);
@@ -2046,6 +2169,48 @@ std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, con
     return mask;
 }
 
+// Displace by Layer's settings on clip `c` at t, with the edges of the clip's picture on a W x H canvas: false when
+// none of it is there to move.
+bool displaceGeometry(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, FrameTime t, const RenderOptions& o, int W, int H,
+                      DisplaceSettings& ds) {
+    ds = displaceSettings(e, t - c.start, o.scale);
+    // The edges are the clip's picture's (scaled, moved, letterboxed, cropped, turned): where it lies square on the
+    // canvas (at quarter turns), the pixels whose centres it covers; turned at any other angle, the parallelogram its
+    // corners make.
+    if (Geometry g; clipGeometry(p, seq, c, t, g) && g.sx != 0 && g.sy != 0) {
+        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+        const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
+        if (u1 <= u0 || v1 <= v0) return false;  // (cropped away)
+        // (a point of the picture, on the canvas in the layer's pixels)
+        auto canvas = [&](double u, double v, double& X, double& Y) {
+            const double rx = (u - g.mw / 2 - g.ax) * g.sx, ry = (v - g.mh / 2 - g.ay) * g.sy;
+            X = (seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale, Y = (seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale;
+        };
+        if (std::min(std::fabs(cr), std::fabs(sn)) < 1e-9) {
+            double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+            for (double u : {u0, u1})
+                for (double v : {v0, v1}) {
+                    double X, Y;
+                    canvas(u, v, X, Y);
+                    x0 = std::min(x0, X), x1 = std::max(x1, X), y0 = std::min(y0, Y), y1 = std::max(y1, Y);
+                }
+            auto edge = [](double at, int n) { return int(std::clamp(std::ceil(at - 0.5 - 1e-6), 0.0, double(n))); };
+            ds.left = edge(x0, W), ds.right = edge(x1, W);
+            ds.top = edge(y0, H), ds.bottom = edge(y1, H);
+            if (ds.right <= ds.left || ds.bottom <= ds.top) return false;  // (none of its picture on the canvas)
+        } else {
+            double X, Y;
+            ds.turned = true;
+            canvas(u0, v0, ds.origin[0], ds.origin[1]);
+            canvas(u1, v0, X, Y);
+            ds.across[0] = X - ds.origin[0], ds.across[1] = Y - ds.origin[1];
+            canvas(u0, v1, X, Y);
+            ds.down[0] = X - ds.origin[0], ds.down[1] = Y - ds.origin[1];
+        }
+    }
+    return true;
+}
+
 // Displace by Layer on clip `c` (on track `ti`) at t: its layer's pixels moved by a channel of another track's picture
 // or of the layer itself (render/PaintFx.h), the map's values as shown. Amounts are in the sequence's pixels.
 void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, Image& layer, int W,
@@ -2067,41 +2232,8 @@ void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip&
     // (a mask on the effect: moved within it, as it was outside)
     const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, layer, W, H);
     const Image before = mask.empty() ? Image() : layer;
-    DisplaceSettings ds = displaceSettings(*e, lt, o.scale);
-    // The edges are the clip's picture's (scaled, moved, letterboxed, cropped, turned): where it lies square on the
-    // canvas (at quarter turns), the pixels whose centres it covers; turned at any other angle, the parallelogram its
-    // corners make.
-    if (Geometry g; clipGeometry(p, seq, c, t, g) && g.sx != 0 && g.sy != 0) {
-        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
-        const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
-        if (u1 <= u0 || v1 <= v0) return;  // (cropped away)
-        // (a point of the picture, on the canvas in the layer's pixels)
-        auto canvas = [&](double u, double v, double& X, double& Y) {
-            const double rx = (u - g.mw / 2 - g.ax) * g.sx, ry = (v - g.mh / 2 - g.ay) * g.sy;
-            X = (seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale, Y = (seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale;
-        };
-        if (std::min(std::fabs(cr), std::fabs(sn)) < 1e-9) {
-            double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
-            for (double u : {u0, u1})
-                for (double v : {v0, v1}) {
-                    double X, Y;
-                    canvas(u, v, X, Y);
-                    x0 = std::min(x0, X), x1 = std::max(x1, X), y0 = std::min(y0, Y), y1 = std::max(y1, Y);
-                }
-            auto edge = [](double at, int n) { return int(std::clamp(std::ceil(at - 0.5 - 1e-6), 0.0, double(n))); };
-            ds.left = edge(x0, layer.width), ds.right = edge(x1, layer.width);
-            ds.top = edge(y0, layer.height), ds.bottom = edge(y1, layer.height);
-            if (ds.right <= ds.left || ds.bottom <= ds.top) return;  // (none of its picture on the canvas)
-        } else {
-            double X, Y;
-            ds.turned = true;
-            canvas(u0, v0, ds.origin[0], ds.origin[1]);
-            canvas(u1, v0, X, Y);
-            ds.across[0] = X - ds.origin[0], ds.across[1] = Y - ds.origin[1];
-            canvas(u0, v1, X, Y);
-            ds.down[0] = X - ds.origin[0], ds.down[1] = Y - ds.origin[1];
-        }
-    }
+    DisplaceSettings ds;
+    if (!displaceGeometry(p, seq, c, *e, t, o, layer.width, layer.height, ds)) return;
     displaceByMap(layer, map, ds);
     if (mask.size() == size_t(layer.width) * size_t(layer.height))
         for (size_t i = 0; i < mask.size(); ++i)
@@ -2346,6 +2478,49 @@ Image deepLayer(const DeepFrame& f) {
     return img;
 }
 
+// The Camera clip whose lens blurs track ti's deep frame at t (render/Layer3D.h lensCamera): a card's or a 3D model's
+// drawn at its depths (a model made deep from its flat picture was blurred as it was drawn).
+const Clip* deepLensCamera(const Sequence& seq, size_t ti, FrameTime t) {
+    const Clip* c = ti < seq.videoTracks.size() ? clipAt(seq.videoTracks[ti], t) : nullptr;
+    if (!c) return nullptr;
+    if (c->isGenerator() && c->generator.type == "model3d")
+        return enabledEffect(seq, *c, "make_deep") ? nullptr : lensCamera(seq, *c, c->generator, t);
+    const Effect* l3 = enabledEffect(seq, *c, "layer_3d");
+    return l3 ? lensCamera(seq, *c, *l3, t) : nullptr;
+}
+
+// `img`, flattened from deep frames (with the Camera clip each is seen through with its depth of field on, or null),
+// blurred by each of those cameras' lenses by the depth of each pixel's nearest sample: where that sample is from a
+// frame seen through it (the rest kept in focus).
+void deepLensBlur(const Project& p, const Sequence& seq, FrameTime t, const std::vector<std::pair<const DeepFrame*, const Clip*>>& frames,
+                  Image& img) {
+    std::vector<const Clip*> cameras;
+    for (const auto& [f, cam] : frames)
+        if (cam && std::find(cameras.begin(), cameras.end(), cam) == cameras.end()) cameras.push_back(cam);
+    const int W = img.width, H = img.height;
+    if (cameras.empty() || W <= 0 || H <= 0) return;
+    const size_t N = size_t(W) * size_t(H);
+    std::vector<float> nearest(N, 0.0f);
+    std::vector<int> from(N, -1);
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const DeepFrame& f = *frames[i].first;
+        if (f.width != W || f.height != H) continue;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t at = size_t(y) * size_t(W) + size_t(x);
+                const DeepSample* smp = f.at(x, y);
+                for (size_t k = 0; k < f.count(x, y); ++k)
+                    if (smp[k].a > 0 && smp[k].z > 0 && (nearest[at] <= 0 || smp[k].z < nearest[at])) nearest[at] = smp[k].z, from[at] = int(i);
+            }
+    }
+    for (const Clip* cam : cameras) {
+        std::vector<float> depth = nearest;
+        std::vector<char> sharp(N, 0);
+        for (size_t at = 0; at < N; ++at) sharp[at] = from[at] >= 0 && frames[size_t(from[at])].second != cam;
+        cameraDepthOfField(p, seq, *cam, t, double(W) / seq.width, img, depth, &sharp);
+    }
+}
+
 // The deep layers on screen at t: every deep clip's frame (held out where asked), the merge of those not flattened on
 // their own, and the lowest track among them.
 struct DeepLayers {
@@ -2404,7 +2579,15 @@ DeepLayers deepLayers(const Project& p, const Sequence& seq, FrameTime t, const 
             merge.push_back(&f);
             if (out.lowest < 0) out.lowest = int(ti);
         }
-    if (!merge.empty()) out.merged = deepLayer(mergeDeep(merge));
+    if (!merge.empty()) {
+        out.merged = deepLayer(mergeDeep(merge));
+        // Through the Camera clips the cards and models look through with their lenses' depth of field on: the merged
+        // scene blurred by them.
+        std::vector<std::pair<const DeepFrame*, const Clip*>> lensed;
+        for (const auto& [ti, f] : out.frames)
+            if (!out.flattened[ti]) lensed.push_back({&f, deepLensCamera(seq, ti, t)});
+        deepLensBlur(p, seq, t, lensed, out.merged);
+    }
     return out;
 }
 
@@ -2499,6 +2682,10 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
     int W = std::max(1, int(std::lround(seq.width * o.scale))), H = std::max(1, int(std::lround(seq.height * o.scale)));
     Image canvas(W, H);
     const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
+    // The cards' and models' scenes of shadows, made once for this frame (render/Layer3D.h).
+    const SceneShadowScope shadows(
+        p, seq, [&p, &seq, o](const Clip& k, FrameTime at) { return clipLayer(p, seq, k, at, o, nullptr); },
+        [&p, &seq, o](int track, FrameTime at) { return modelLayerAt(p, seq, o)(track, at); });
     bool canvasEmpty = true;  // nothing drawn yet: the first normal layer can be moved in
     auto composite = [&](Image&& layer, const std::string& mode, bool displayReferred = false) {
         if (layer.empty()) return;
@@ -2516,7 +2703,9 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         if (auto it = deep.frames.find(ti); it != deep.frames.end()) {
             if (deep.flattened[ti]) {
                 const Clip* c = clipAt(track, t);
-                composite(deepLayer(it->second), c ? c->blendMode : "normal");
+                Image flat = deepLayer(it->second);
+                deepLensBlur(p, seq, t, {{&it->second, deepLensCamera(seq, ti, t)}}, flat);  // (on its own, by its own camera's lens)
+                composite(std::move(flat), c ? c->blendMode : "normal");
             } else if (int(ti) == deep.lowest) {
                 composite(std::move(deep.merged), "normal");
             }
@@ -2869,6 +3058,9 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         out.input = cs.adaptive ? adaptiveConversionLut(*cs.frameSpace, *cs.adaptive, sequenceColorSpace(seq), seq.hdrPeakNits)
                                 : conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
         w = cs.frame->width, h = cs.frame->height;
+    } else if (cs.shapes) {
+        out.shapes = cs.shapes;
+        w = cs.shapes->width, h = cs.shapes->height;
     } else {
         out.image = std::move(cs.src);
         w = out.image.width, h = out.image.height;
@@ -2894,6 +3086,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
                    std::to_string(planes->bits) + "-bit" + (planes->hw ? std::string(" in ") + planes->hwType + "'s memory" : std::string()) +
                    ", converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
         else if (cs.frame) *why = "16-bit RGBA from the decoder";
+        else if (cs.shapes) *why = "a Shape layer, drawn there";
         else *why = "a picture made on the CPU before its effects";
     }
     // Placed as transformLayer places it (worked out here in double).
@@ -2909,6 +3102,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) {  // (a transparent layer)
         out.canvas = false;
         out.frame.reset();
+        out.shapes.reset();
         out.image = Image();
         out.ops.clear();
         return GpuLayerResult::Drawn;
@@ -2925,12 +3119,14 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     return GpuLayerResult::Drawn;
 }
 
-// Whether the GPU mixes a transition itself: not Smooth Cut's flow or an OpenFX one, nor one with a clip turned as a
-// 3D Layer as it mixes (those are the CPU's).
+// Whether the GPU mixes a transition itself: not an OpenFX one, nor one with a clip turned as a 3D Layer as it mixes,
+// nor a Smooth Cut from or to an adjustment layer (those are the CPU's).
 bool gpuMixesTransition(const Sequence& seq, const Track& track, const Transition& tr) {
-    if (tr.type == "smooth_cut" || tr.type == "ofx") return false;
-    for (const Clip* c : {findClip(track, tr.clipA), findClip(track, tr.clipB)})
+    if (tr.type == "ofx") return false;
+    for (const Clip* c : {findClip(track, tr.clipA), findClip(track, tr.clipB)}) {
         if (c && c->enabled && !(c->isGenerator() && c->generator.type == "model3d") && enabledEffect(seq, *c, "layer_3d")) return false;
+        if (c && tr.type == "smooth_cut" && c->isGenerator() && c->generator.type == "adjustment") return false;
+    }
     return true;
 }
 
@@ -2984,31 +3180,42 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                     std::vector<gpu::ColorOp> unused;
                     if (compositeShown(*c) || !gpuChainOps(seq, *c, t - c->start, runOnSource, unused, 0, 0, 1))
                         return fallback("an adjustment layer with " + cpuEffectReason(*c, t - c->start));
-                    if (tr && !gpuMixesTransition(seq, track, *tr)) return fallback("an adjustment layer in a " + tr->type + " transition");
+                    // (in a transition the GPU does not mix, a Smooth Cut or an OpenFX one, mixed on the CPU over the canvas
+                    // drawn so far, read back)
                 }
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
-                if (enabledEffect(seq, *c, "displace_by_layer")) return fallback("Displace by Layer");
+                if (const Effect* e = enabledEffect(seq, *c, "displace_by_layer")) {
+                    // (drawn there alone, with another track's picture as it is, or its own; not through a mask)
+                    if (tr) return fallback("Displace by Layer in a transition");
+                    if (c->isGenerator() && c->generator.type == "adjustment") return fallback("Displace by Layer on an adjustment layer");
+                    if (hasMask(*e, t - c->start)) return fallback("Displace by Layer through a mask");
+                    FrameTime mf = 0, mt = 0;
+                    if (const int m = std::lround(e->p("source", t - c->start, 0)) == 0 ? matteTrack(seq, ti, *c, *e, t) : -1;
+                        m >= 0 && activeTransition(seq.videoTracks[size_t(m)], t, mf, mt))
+                        return fallback("Displace by Layer's map in a transition");
+                }
                 if (isDeepClip(p, seq, *c, t)) return fallback("deep compositing");
             }
     }
     std::string adjustmentOnCpu;  // (an adjustment layer the GPU turned down after all: the frame is the CPU's)
-    auto layerOf = [&](const Clip& c, gpu::Layer& l) {
+    auto layerOf = [&](const Clip& c, gpu::Layer& l, std::optional<FrameTime> at = std::nullopt) {
         std::string how;
-        const GpuLayerResult r = gpuClipLayer(p, seq, c, t, o, l, &how);
+        const GpuLayerResult r = gpuClipLayer(p, seq, c, at.value_or(t), o, l, &how);
         if (r == GpuLayerResult::Unsupported && c.isGenerator() && c.generator.type == "adjustment") {
             adjustmentOnCpu = how;
             return false;
         }
         if (r == GpuLayerResult::Unsupported) {
             l = {};
-            Image img = clipLayer(p, seq, c, t, o, nullptr);
+            Image img = clipLayer(p, seq, c, at.value_or(t), o, nullptr);
             if (img.empty()) return false;
             l = cpuLayer(std::move(img));
         }
         if (r != GpuLayerResult::Nothing) gpu::countLayer(r != GpuLayerResult::Unsupported, "\"" + c.name + "\": " + how);
         return r != GpuLayerResult::Nothing;
     };
+    bool drawn = false;  // (anything on the canvas yet, as the CPU's canvasEmpty has it)
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;
@@ -3022,14 +3229,57 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             item.blendMode = blendModeIndex(top ? top->blendMode : "normal");
             const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
             const int kind = active->type == "cross_dissolve" ? 0 : gpuTransitionParams(active->type, active->params, u, W, H, item.transitionParams);
-            if (gpuMixesTransition(seq, track, *active)) {
+            // Smooth Cut: the transition's first frame of A and last of B, each drawn here, morphed along their flow (as
+            // transitionLayer does: measured once from the pair, on the CPU, and kept), gpumix.frag's 18.
+            std::shared_ptr<const FlowField> flow;
+            double flowScale = 1;
+            const bool smooth = active->type == "smooth_cut" && A && A->enabled && B && B->enabled;
+            if (smooth && W >= 16 && H >= 16 && gpuMixesTransition(seq, track, *active)) {
+                const std::string key = smoothCutKey(*active, from, to, W, H, o, false);
+                flow = frameFlow(nullptr, nullptr, key, W, flowScale);
+                if (!flow) {
+                    const Image fa = clipLayer(p, seq, *A, from, o, nullptr), fb = clipLayer(p, seq, *B, to - 1, o, nullptr);
+                    if (fa.width == W && fa.height == H && fb.width == W && fb.height == H) flow = frameFlow(&fa, &fb, key, W, flowScale);
+                }
+            }
+            if (flow) {
                 item.b.emplace();
-                if (A && A->enabled) layerOf(*A, item.a);
-                if (B && B->enabled) layerOf(*B, *item.b);
+                drawn |= layerOf(*A, item.a, from);
+                drawn |= layerOf(*B, *item.b, to - 1);
+                std::fill(std::begin(item.transitionParams), std::end(item.transitionParams), 0.0f);
+                item.transitionParams[0] = 18, item.transitionParams[1] = float(std::clamp(u, 0.0, 1.0));
+                item.transitionParams[4] = float(flowScale), item.transitionParams[5] = float(flow->step);
+                item.transitionParams[6] = float(flow->gw), item.transitionParams[7] = float(flow->gh);
+                item.transitionTableWidth = flow->gw;
+                item.transitionTable.resize(size_t(flow->gw) * size_t(flow->gh) * 4);
+                for (size_t i = 0; i < flow->v.size(); ++i) item.transitionTable[i * 4] = float(flow->v[i].x), item.transitionTable[i * 4 + 1] = float(flow->v[i].y);
+                item.dissolve = item.transitionParams[1];
+                item.transition = 18;
+            } else if (!smooth && gpuMixesTransition(seq, track, *active)) {
+                item.b.emplace();
+                if (A && A->enabled) drawn |= layerOf(*A, item.a);
+                if (B && B->enabled) drawn |= layerOf(*B, *item.b);
                 item.dissolve = float(std::clamp(u, 0.0, 1.0));
                 if (active->type != "cross_dissolve") item.transition = kind;
             } else {
-                item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, nullptr, W, H));
+                // Mixed on the CPU; from or to an adjustment layer, over the canvas beneath it, drawn here so far and read
+                // back, which then goes on from there.
+                Image below;
+                bool over = false;
+                for (const Clip* k : {A, B}) over |= k && k->enabled && k->isGenerator() && k->generator.type == "adjustment";
+                if (over && drawn) {
+                    if (!adjustmentOnCpu.empty()) return fallback("an adjustment layer: " + adjustmentOnCpu);
+                    gpu::Frame part;
+                    part.width = W, part.height = H, part.flatten = false, part.part = true;
+                    part.items = std::move(frame.items);
+                    if (!gpu::execute(part, &below)) return fallback("the GPU could not draw it");
+                    frame.items.clear();
+                    gpu::Item canvasItem;
+                    canvasItem.a = cpuLayer(Image(below));
+                    frame.items.push_back(std::move(canvasItem));
+                }
+                item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, below.empty() ? nullptr : &below, W, H));
+                drawn |= !item.a.image.empty();
                 gpu::countLayer(false, "a " + active->type + " transition");
             }
             frame.items.push_back(std::move(item));
@@ -3039,6 +3289,71 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             gpu::Item item;
             item.blendMode = blendModeIndex(c->blendMode);
             if (!layerOf(*c, item.a)) continue;
+            drawn = true;
+            if (const Effect* e = enabledEffect(seq, *c, "displace_by_layer")) {
+                // Moved by a map (displaceLayer's): another track's picture now (none there, or no track: nothing
+                // moves), or its own; the edges its picture's, the map blurred first.
+                DisplaceSettings ds;
+                const bool self = std::lround(e->p("source", t - c->start, 0)) != 0;
+                if (displaceGeometry(p, seq, *c, *e, t, o, W, H, ds)) {
+                    const bool across = ds.horizontal != DisplaceChannel::Off && ds.horizontalAmount != 0;
+                    const bool down = ds.vertical != DisplaceChannel::Off && ds.verticalAmount != 0;
+                    bool mapped = self;
+                    if (!self && (across || down))
+                        if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0)
+                            if (const Clip* mc = clipAt(seq.videoTracks[size_t(m)], t);
+                                mc && mc->enabled && !(mc->isGenerator() && mc->generator.type == "adjustment")) {
+                                item.displaceMap.emplace();
+                                mapped = layerOf(*mc, *item.displaceMap);
+                            }
+                    if (mapped && (across || down)) {
+                        item.displace = true;
+                        item.displaceSelf = self;
+                        float* q = item.displaceParams;
+                        q[0] = 31, q[1] = float(ds.horizontal), q[2] = float(ds.vertical), q[3] = float(ds.edge);
+                        q[4] = float(ds.horizontalAmount), q[5] = float(ds.verticalAmount), q[6] = ds.bicubic ? 1 : 0, q[7] = ds.turned ? 1 : 0;
+                        if (ds.right > ds.left && ds.bottom > ds.top)
+                            q[8] = float(std::clamp(ds.left, 0, W)), q[9] = float(std::clamp(ds.top, 0, H)), q[10] = float(std::clamp(ds.right, 0, W)),
+                            q[11] = float(std::clamp(ds.bottom, 0, H));
+                        else
+                            q[10] = float(W), q[11] = float(H);
+                        // (as displaceTurned works them out, in floats)
+                        const float a0 = float(ds.across[0]), a1 = float(ds.across[1]), d0 = float(ds.down[0]), d1 = float(ds.down[1]);
+                        const float det = a0 * d1 - a1 * d0;
+                        q[12] = float(ds.origin[0]), q[13] = float(ds.origin[1]), q[14] = a0, q[15] = a1;
+                        q[16] = d0, q[17] = d1, q[18] = det < 0 ? -1.0f : 1.0f, q[19] = std::fabs(det);
+                        const double reach = ds.bicubic ? 3.0 : 1.5;
+                        q[20] = float(std::min(0.5, reach / std::max(1e-9, std::hypot(ds.across[0], ds.across[1]))));
+                        q[21] = float(std::min(0.5, reach / std::max(1e-9, std::hypot(ds.down[0], ds.down[1]))));
+                        q[22] = across ? 1 : 0, q[23] = down ? 1 : 0;
+                        if (ds.turned && !(std::fabs(ds.across[0] * ds.down[1] - ds.across[1] * ds.down[0]) > 1e-9 && q[19] > 0)) item.displace = false;
+                        // (the map's blur: gaussian's passes, as Painterly's)
+                        if (const GaussianPlan plan = gaussianPlan(ds.mapBlur / 2); ds.mapBlur > 0 && (plan.byBoxes || !plan.kernel.empty())) {
+                            gpu::ColorOp f;
+                            f.kind = gpu::ColorOp::Filter;
+                            for (int dim = 0; dim < 2; ++dim) {
+                                if (plan.byBoxes) {
+                                    for (int r : plan.boxes) {
+                                        gpu::ColorOp::FilterPass fp;
+                                        fp.mode = 1;
+                                        fp.params[0] = float(r), fp.params[1] = float(dim);
+                                        fp.params[4] = fp.params[5] = fp.params[6] = fp.params[7] = 1;
+                                        f.passes.push_back(fp);
+                                    }
+                                } else {
+                                    gpu::ColorOp::FilterPass fp;
+                                    fp.mode = 48;
+                                    fp.params[0] = float(plan.kernel.size() - 1), fp.params[1] = float(dim);
+                                    std::copy(plan.kernel.begin(), plan.kernel.begin() + std::min<size_t>(plan.kernel.size(), 56), fp.params + 4);
+                                    f.passes.push_back(fp);
+                                }
+                            }
+                            item.displaceBlur.push_back(std::move(f));
+                        }
+                    }
+                    if (!item.displace) item.displaceMap.reset();
+                }
+            }
             if (const Effect* e = trackMatteOf(*c)) {
                 // Seen through the matte track's picture (none there now: an empty matte; no track: no matte).
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) {

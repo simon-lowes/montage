@@ -14,8 +14,35 @@
 #include <rhi/qrhi.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+
+#if defined(MONTAGE_WAYLAND_COLOR)
+#include "WaylandColor.h"  // (the class, whether or not it is used here)
+#define MONTAGE_WAYLAND_COLOR_CLASS
+#endif
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS) && QT_CONFIG(opengl)
+#define MONTAGE_HDR_ENCODED  // (Linux: OpenGL, the picture written as BT.2100 PQ or HLG)
+#include <QColorSpace>
+#include <QOffscreenSurface>
+#include <QOpenGLContext>
+#include <qpa/qplatformnativeinterface.h>
+// Wayland's colour management: Montage's binding where it was built, else Qt's own (6.10.2 and later; 6.10.1's is
+// the protocol's experimental forerunner).
+#if !defined(MONTAGE_WAYLAND_COLOR) && QT_VERSION >= QT_VERSION_CHECK(6, 10, 2)
+#define MONTAGE_QT_WAYLAND_COLOR
+#endif
+// Qt's word that it let a window's wl_surface go (made again when a window changes role, without a hide).
+#if defined(MONTAGE_WAYLAND_COLOR) && __has_include(<qpa/qplatformwindow_p.h>)
+#include <qpa/qplatformwindow_p.h>
+#if QT_CONFIG(wayland)  // (the header has Qt's Wayland window only then)
+#define MONTAGE_WAYLAND_SURFACE_SIGNALS
+#endif
+#endif
+#else
+#undef MONTAGE_WAYLAND_COLOR  // (no OpenGL: no surface to describe)
+#endif
 
 #if defined(Q_OS_WIN)
 #include <windows.h>
@@ -33,8 +60,20 @@ namespace {
 
 namespace montage {
 
+#if defined(MONTAGE_HDR_VIEWER) && !defined(MONTAGE_WAYLAND_COLOR_CLASS)
+class WaylandColor {};  // (not built: never made)
+#endif
+
 bool hdrViewerBuilt() {
 #ifdef MONTAGE_HDR_VIEWER
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool hdrViewerOnWaylandBuilt() {
+#if defined(MONTAGE_HDR_VIEWER) && (defined(MONTAGE_WAYLAND_COLOR) || defined(MONTAGE_QT_WAYLAND_COLOR))
     return true;
 #else
     return false;
@@ -53,6 +92,75 @@ QShader shader(const unsigned char* data, size_t size) {
 
 // The uniform block the shaders share: the clip-space correction, the rectangle drawn and the tone values.
 constexpr quint32 kUniformBytes = 96;
+
+#if defined(MONTAGE_HDR_ENCODED)
+// The last pass on Linux: the picture and overlay, drawn as linear light relative to SDR white in Rec. 709 primaries
+// into a half-float texture, written as the BT.2100 signal the surface is described with (render/HdrView.h
+// hdrSurfaceSignal, step for step): BT.2020 primaries, SDR white at 203 nits, PQ, or HLG on its 1000-nit reference
+// display (tone.w 2). OpenGL is the RHI's backend there, so this shader is GLSL only, in the versions the baked ones
+// carry, and takes the picture shader's interface (its uniform block, sampler and input), whose reflection it reuses:
+// no shader tools are needed to build it.
+QByteArray encodeGlsl(const QShaderVersion& v, const QByteArray& block) {
+    const bool es = v.flags().testFlag(QShaderVersion::GlslEs);
+    const bool modern = es ? v.version() >= 300 : v.version() >= 130;
+    QByteArray m;
+    {
+        double d[9];
+        primariesMatrix(Primaries::Bt709, Primaries::Bt2020, d);
+        for (int c = 0; c < 3; ++c)  // (GLSL's matrices are given column by column)
+            for (int r = 0; r < 3; ++r) m += (m.isEmpty() ? "" : ", ") + QByteArray::number(d[r * 3 + c], 'g', 9);
+    }
+    QByteArray src = "#version " + QByteArray::number(v.version()) + (es && v.version() >= 300 ? " es\n" : "\n");
+    if (es) src += "precision highp float;\nprecision highp int;\n";
+    src += "struct Params { mat4 clipCorrection; vec4 rect; vec4 tone; };\nuniform Params " + block + ";\n";
+    src += es ? "uniform highp sampler2D tex;\n" : "uniform sampler2D tex;\n";
+    src += modern ? "in vec2 v_uv;\nout vec4 fragColor;\n" : "varying vec2 v_uv;\n";
+    src += "const mat3 toBt2020 = mat3(" + m + ");\n";
+    src += "float pqCode(float nits) {\n"
+           "    float y = pow(clamp(nits / 10000.0, 0.0, 1.0), 0.1593017578125);\n"
+           "    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);\n"
+           "}\n"
+           "float hlgCode(float e) {\n"
+           "    e = max(e, 0.0);\n"
+           "    return e <= 1.0 / 12.0 ? sqrt(3.0 * e) : 0.17883277 * log(12.0 * e - 0.28466892) + 0.55991073;\n"
+           "}\n"
+           "void main() {\n";
+    src += QByteArray("    vec3 l = max(toBt2020 * ") + (modern ? "texture" : "texture2D") + "(tex, v_uv).rgb, vec3(0.0));\n";
+    src += "    vec3 e;\n"
+           "    if (" + block + ".tone.w > 1.5) {\n"
+           "        float yd = max(1e-12, dot(l, vec3(0.2627, 0.6780, 0.0593)) * 0.203);\n"
+           "        vec3 s = l * (pow(yd, -1.0 / 6.0) * 0.203);\n"
+           "        e = vec3(hlgCode(s.r), hlgCode(s.g), hlgCode(s.b));\n"
+           "    } else {\n"
+           "        vec3 n = l * 203.0;\n"
+           "        e = vec3(pqCode(n.r), pqCode(n.g), pqCode(n.b));\n"
+           "    }\n";
+    src += QByteArray("    ") + (modern ? "fragColor" : "gl_FragColor") + " = vec4(clamp(e, 0.0, 1.0), 1.0);\n}\n";
+    return src;
+}
+
+QShader encodeShader() {
+    QShader s = shader(kPictureFragQsb, sizeof kPictureFragQsb);
+    const QList<QShaderDescription::UniformBlock> blocks = s.description().uniformBlocks();
+    const QByteArray block = blocks.isEmpty() || blocks.first().structName.isEmpty() ? QByteArrayLiteral("_27") : blocks.first().structName;
+    for (const QShaderKey& key : s.availableShaders())
+        if (key.source() == QShader::GlslShader) s.setShader(key, QShaderCode(encodeGlsl(key.sourceVersion(), block)));
+    return s;
+}
+
+// What was read back from the GPU as an image, top row first (OpenGL gives the bottom row first); null if it is not
+// in the format expected.
+QImage readBack(const QRhiReadbackResult& r, QRhiTexture::Format rhiFormat, QImage::Format format, int bytesPerPixel, bool bottomFirst) {
+    const int w = r.pixelSize.width(), h = r.pixelSize.height();
+    if (r.format != rhiFormat || w <= 0 || h <= 0 || r.data.size() < qsizetype(w) * h * bytesPerPixel) return QImage();
+    QImage img(w, h, format);
+    if (img.isNull() || img.bytesPerLine() != qsizetype(w) * bytesPerPixel) return QImage();
+    for (int y = 0; y < h; ++y)
+        std::memcpy(img.scanLine(y), r.data.constData() + qsizetype(bottomFirst ? h - 1 - y : y) * w * bytesPerPixel,
+                    size_t(w) * size_t(bytesPerPixel));
+    return img;
+}
+#endif
 
 #if defined(Q_OS_WIN)
 // The display a window is on, as Windows reports it. (Qt asks about the display at the window's position, which for
@@ -126,25 +234,32 @@ WinDisplay windowsDisplay(HWND hwnd) {
 
 }  // namespace
 
-// The GPU side: the RHI, the swap chain and what is drawn with (the RHI is declared first so it goes last).
+// The GPU side: the RHI, the swap chain and what is drawn with (the RHI is declared first so it goes last). On Linux
+// the picture and overlay are drawn into `linear` (half floats), which the encode pass writes into the swap chain.
 class HdrSurfaceGpu {
 public:
+#if defined(MONTAGE_HDR_ENCODED)
+    std::unique_ptr<QOffscreenSurface> fallback;  // (OpenGL's, for when the window is not there; outlives the RHI)
+#endif
     std::unique_ptr<QRhi> rhi;
     std::unique_ptr<QRhiSwapChain> sc;
-    std::unique_ptr<QRhiRenderPassDescriptor> rp;
-    std::unique_ptr<QRhiBuffer> vbuf, ubufPicture, ubufOverlay;
+    std::unique_ptr<QRhiRenderPassDescriptor> rp, linearRp;
+    std::unique_ptr<QRhiBuffer> vbuf, ubufPicture, ubufOverlay, ubufEncode;
     std::unique_ptr<QRhiSampler> sampler;
-    std::unique_ptr<QRhiTexture> picture, overlay;
-    std::unique_ptr<QRhiShaderResourceBindings> srbPicture, srbOverlay;
-    std::unique_ptr<QRhiGraphicsPipeline> psPicture, psOverlay;
+    std::unique_ptr<QRhiTexture> picture, overlay, linear;
+    std::unique_ptr<QRhiTextureRenderTarget> linearRt;
+    std::unique_ptr<QRhiShaderResourceBindings> srbPicture, srbOverlay, srbEncode;
+    std::unique_ptr<QRhiGraphicsPipeline> psPicture, psOverlay, psEncode;
     bool hasSwapChain = false, vbufUploaded = false, notExposed = false, newlyExposed = false;
-    QSize pictureSize{1, 1}, overlaySize{1, 1};
+    QSize pictureSize{1, 1}, overlaySize{1, 1}, linearSize{1, 1};
+    QRhiReadbackResult readSignal, readLight;  // (tests: HdrSurface::keepNextFrame)
 
     ~HdrSurfaceGpu() {
         // Resources before the RHI that made them.
-        psPicture.reset(), psOverlay.reset(), srbPicture.reset(), srbOverlay.reset();
-        picture.reset(), overlay.reset(), sampler.reset(), vbuf.reset(), ubufPicture.reset(), ubufOverlay.reset();
-        rp.reset(), sc.reset();
+        psPicture.reset(), psOverlay.reset(), psEncode.reset(), srbPicture.reset(), srbOverlay.reset(), srbEncode.reset();
+        linearRt.reset(), linear.reset();
+        picture.reset(), overlay.reset(), sampler.reset(), vbuf.reset(), ubufPicture.reset(), ubufOverlay.reset(), ubufEncode.reset();
+        linearRp.reset(), rp.reset(), sc.reset();
         rhi.reset();
     }
 
@@ -156,7 +271,7 @@ public:
         return srb;
     }
 
-    QRhiGraphicsPipeline* pipeline(const QShader& fragment, QRhiShaderResourceBindings* srb, bool blend) {
+    QRhiGraphicsPipeline* pipeline(const QShader& fragment, QRhiShaderResourceBindings* srb, bool blend, QRhiRenderPassDescriptor* pass) {
         QRhiGraphicsPipeline* ps = rhi->newGraphicsPipeline();
         ps->setTopology(QRhiGraphicsPipeline::TriangleStrip);
         ps->setShaderStages({{QRhiShaderStage::Vertex, shader(kViewVertQsb, sizeof kViewVertQsb)}, {QRhiShaderStage::Fragment, fragment}});
@@ -165,7 +280,7 @@ public:
         layout.setAttributes({{0, 0, QRhiVertexInputAttribute::Float2, 0}});
         ps->setVertexInputLayout(layout);
         ps->setShaderResourceBindings(srb);
-        ps->setRenderPassDescriptor(rp.get());
+        ps->setRenderPassDescriptor(pass);
         if (blend) {
             // The overlay is premultiplied.
             QRhiGraphicsPipeline::TargetBlend b;
@@ -176,7 +291,10 @@ public:
             b.dstAlpha = QRhiGraphicsPipeline::OneMinusSrcAlpha;
             ps->setTargetBlends({b});
         }
-        ps->create();
+        if (!ps->create()) {
+            delete ps;
+            return nullptr;
+        }
         return ps;
     }
 
@@ -191,23 +309,69 @@ public:
         if (tex) tex.release()->deleteLater();
         tex.reset(t);
     }
+
+    // The linear target at the swap chain's size (Linux), the encode pass pointed at it.
+    bool resizeLinear(QSize size) {
+        if (linear && linearRt && size == linearSize) return true;
+        QRhiTexture* t = rhi->newTexture(QRhiTexture::RGBA16F, size, 1, QRhiTexture::RenderTarget | QRhiTexture::UsedAsTransferSource);
+        if (!t->create()) {
+            delete t;
+            return false;
+        }
+        if (!linearRt) {
+            linearRt.reset(rhi->newTextureRenderTarget({QRhiColorAttachment(t)}));
+            linearRp.reset(linearRt->newCompatibleRenderPassDescriptor());
+            linearRt->setRenderPassDescriptor(linearRp.get());
+        } else {
+            linearRt->setDescription(QRhiTextureRenderTargetDescription(QRhiColorAttachment(t)));
+        }
+        if (!linearRt->create()) {
+            // (the target keeps the texture it was described with; the caller stops HDR)
+            if (linear) linear.release()->deleteLater();
+            linear.reset(t);
+            linearSize = QSize();
+            return false;
+        }
+        if (srbEncode) {
+            srbEncode->setBindings({QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage, ubufEncode.get()),
+                                    QRhiShaderResourceBinding::sampledTexture(1, QRhiShaderResourceBinding::FragmentStage, t, sampler.get())});
+            srbEncode->create();
+        }
+        if (linear) linear.release()->deleteLater();
+        linear.reset(t);
+        linearSize = size;
+        return true;
+    }
 };
 
 void HdrSurface::setTestDisplay(double headroom) { gTestHeadroom = headroom; }
+
+void HdrSurface::keepNextFrame() {
+    keepFrame_ = true;
+    keptSignal_ = QImage();
+    keptLight_ = QImage();
+    requestUpdate();
+}
 
 HdrSurface::HdrSurface(QWidget* target) : target_(target) {
     setFlag(Qt::WindowDoesNotAcceptFocus);  // the editor's shortcuts keep working: focus stays in the widgets
     displayTimer_.setInterval(1000);
     connect(&displayTimer_, &QTimer::timeout, this, [this] {
         if (!hdrActive_) return;
+        if (encoded_) readDisplay();  // (Wayland: what the compositor said, first)
         if (gTestHeadroom <= 0 && !displayShowsHdr()) {
             stopHdr(problem_);
             return;
         }
-        readDisplay();
+        if (!encoded_) readDisplay();
     });
     connect(this, &QWindow::screenChanged, this, [this] {
         if (!gpu_ || !gpu_->sc || gTestHeadroom > 0) return;
+        if (encoded_) {
+            // (Wayland: the compositor tells the surface what it prefers on the new output, read every second)
+            requestUpdate();
+            return;
+        }
         // Another display: HDR may have come or gone, and the swap chain is made again for it (macOS resets the layer's
         // colour space when the window changes screens).
         if (!displayShowsHdr()) {
@@ -259,8 +423,49 @@ bool HdrSurface::probe(QString* why) {
         create();
         QRhiD3D11InitParams params;
         g.rhi.reset(QRhi::create(QRhi::D3D11, &params));
+#elif defined(MONTAGE_HDR_ENCODED)
+        // Linux and the BSDs: on Wayland, through its colour management (X11 has no way to say a window is HDR). The
+        // RHI draws with OpenGL there, into a 10-bit swap chain whose pixels are the BT.2100 signal the surface is
+        // described with.
+        const QString platform = QGuiApplication::platformName();
+        if (!platform.startsWith(QLatin1String("wayland"))) {
+            if (platform == QLatin1String("xcb")) return fail(tr("HDR viewing on Linux needs a Wayland session (this one is X11)"));
+            return fail(tr("HDR viewing on Linux needs a Wayland session (this display is \"%1\")").arg(platform));
+        }
+#if defined(MONTAGE_WAYLAND_COLOR)
+        QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
+        wayland_ = std::make_unique<WaylandColor>(native ? static_cast<wl_display*>(native->nativeResourceForIntegration("wl_display")) : nullptr);
+        if (!wayland_->available()) return fail(tr("This compositor does not take HDR pictures (it has no Wayland colour management)"));
+        if (const std::string why = wayland_->unsupported(); !why.empty())
+            return fail(tr("This compositor's colour management cannot describe HDR pictures (%1)").arg(QString::fromStdString(why)));
+#elif !defined(MONTAGE_QT_WAYLAND_COLOR)
+        return fail(tr("This build cannot describe HDR pictures to Wayland (it needs wayland-protocols 1.41 or later, or Qt 6.10.2)"));
+#endif
+        QSurfaceFormat format = QSurfaceFormat::defaultFormat();
+        format.setRedBufferSize(10);
+        format.setGreenBufferSize(10);
+        format.setBlueBufferSize(10);
+        format.setAlphaBufferSize(2);
+#if defined(MONTAGE_QT_WAYLAND_COLOR)
+        // Qt describes the window (BT.2100 PQ, the protocol's default luminances; no mastering light).
+        format.setColorSpace(QColorSpace(QColorSpace::Primaries::Bt2020, QColorSpace::TransferFunction::St2084));
 #else
-        return fail(tr("HDR viewing is available on macOS (EDR displays) and Windows (with HDR switched on)"));
+        // The window's format asks for no colour space, so Qt's own colour management (6.10.2 and later) leaves the
+        // surface to Montage's: the protocol allows one colour management surface for each wl_surface.
+        format.setColorSpace(QColorSpace());
+#endif
+        setSurfaceType(QSurface::OpenGLSurface);
+        setFormat(format);
+        create();
+        g.fallback.reset(QRhiGles2InitParams::newFallbackSurface(format));
+        QRhiGles2InitParams params;
+        params.format = format;
+        params.fallbackSurface = g.fallback.get();
+        params.window = this;
+        g.rhi.reset(QRhi::create(QRhi::OpenGLES2, &params));
+        encoded_ = true;
+#else
+        return fail(tr("HDR viewing is available on macOS (EDR displays), Windows (with HDR switched on) and Wayland on Linux"));
 #endif
     }
     if (!g.rhi) return fail(tr("No graphics device for HDR viewing"));
@@ -269,7 +474,7 @@ bool HdrSurface::probe(QString* why) {
     g.sc->setWindow(this);
     if (gTestHeadroom <= 0) {
         if (!displayShowsHdr()) return fail(problem_);
-        g.sc->setFormat(QRhiSwapChain::HDRExtendedSrgbLinear);
+        if (!encoded_) g.sc->setFormat(QRhiSwapChain::HDRExtendedSrgbLinear);
     }
     g.rp.reset(g.sc->newCompatibleRenderPassDescriptor());
     g.sc->setRenderPassDescriptor(g.rp.get());
@@ -289,8 +494,21 @@ bool HdrSurface::probe(QString* why) {
     g.overlay->create();
     g.srbPicture.reset(g.bindings(g.ubufPicture.get(), g.picture.get()));
     g.srbOverlay.reset(g.bindings(g.ubufOverlay.get(), g.overlay.get()));
-    g.psPicture.reset(g.pipeline(shader(kPictureFragQsb, sizeof kPictureFragQsb), g.srbPicture.get(), false));
-    g.psOverlay.reset(g.pipeline(shader(kOverlayFragQsb, sizeof kOverlayFragQsb), g.srbOverlay.get(), true));
+    QRhiRenderPassDescriptor* drawn = g.rp.get();
+#if defined(MONTAGE_HDR_ENCODED)
+    if (encoded_) {
+        if (!g.rhi->isTextureFormatSupported(QRhiTexture::RGBA16F, QRhiTexture::RenderTarget) || !g.resizeLinear(QSize(1, 1)))
+            return fail(tr("The graphics device cannot draw into half-float textures"));
+        g.ubufEncode.reset(g.rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kUniformBytes));
+        g.ubufEncode->create();
+        g.srbEncode.reset(g.bindings(g.ubufEncode.get(), g.linear.get()));
+        g.psEncode.reset(g.pipeline(encodeShader(), g.srbEncode.get(), false, g.rp.get()));
+        drawn = g.linearRp.get();
+    }
+#endif
+    g.psPicture.reset(g.pipeline(shader(kPictureFragQsb, sizeof kPictureFragQsb), g.srbPicture.get(), false, drawn));
+    g.psOverlay.reset(g.pipeline(shader(kOverlayFragQsb, sizeof kOverlayFragQsb), g.srbOverlay.get(), true, drawn));
+    if (!g.psPicture || !g.psOverlay || (encoded_ && !g.psEncode)) return fail(tr("The graphics device could not make the HDR viewer's shaders"));
     hdrActive_ = true;
     problem_.clear();
     readDisplay();
@@ -299,6 +517,22 @@ bool HdrSurface::probe(QString* why) {
 
 bool HdrSurface::displayShowsHdr() {
     if (!gpu_ || !gpu_->sc) return false;
+    if (encoded_) {
+        // Wayland: what the compositor prefers where the viewer is (with no surface to ask about yet, that the
+        // compositor takes the description).
+#if defined(MONTAGE_WAYLAND_COLOR)
+        if (const WaylandDisplay d = waylandDisplay(); d.known ? d.headroom <= 1.0 : d.asked) {
+            problem_ = tr("This display does not show HDR");
+            return false;
+        }
+#elif defined(MONTAGE_QT_WAYLAND_COLOR)
+        if (handle() && format().colorSpace() != requestedFormat().colorSpace()) {
+            problem_ = tr("This compositor does not take HDR pictures (it has no Wayland colour management)");
+            return false;
+        }
+#endif
+        return true;
+    }
     const bool qt = gpu_->sc->isFormatSupported(QRhiSwapChain::HDRExtendedSrgbLinear);
 #if defined(Q_OS_WIN)
     // Both must agree: Windows about the viewer's own display, and Qt (which makes the swap chain) about the main one.
@@ -319,6 +553,42 @@ bool HdrSurface::displayShowsHdr() {
 #endif
 }
 
+HdrSurface::WaylandDisplay HdrSurface::waylandDisplay() {
+    WaylandDisplay out;
+#if defined(MONTAGE_WAYLAND_COLOR)
+    if (!wayland_) return out;
+    auto answered = [](const WaylandColor::Preferred& p) {
+        WaylandDisplay d;
+        d.asked = true;
+        d.known = p.known;
+        if (p.known) {
+            d.headroom = hdrHeadroomFromDescription(p.referenceNits, p.maxNits, p.targetMaxNits);
+            d.whiteNits = p.referenceNits;
+        }
+        return d;
+    };
+    QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
+    if (wayland_->surface()) {
+        // The surface's own answer, read again first if the compositor said it changed (another output, its
+        // brightness). It stands when it is HDR, and when it is SDR once the surface has had a frame up for a while.
+        if (isVisible() && native && native->nativeResourceForWindow("surface", this) == wayland_->surface()) wayland_->dispatch();
+        out = answered(wayland_->preferred());
+        if (out.known && (out.headroom > 1.0 || (ownFrame_.isValid() && ownFrame_.elapsed() >= 2000))) return out;
+    }
+    // Else the viewer's top-level window's, once that is shown: it is on its output already, while a surface with no
+    // frame yet is on none, and a compositor answers for such a surface with a default (its first output's, or sRGB)
+    // until it is on one. (Also where the compositor never says what it prefers for the surface itself.)
+    QWindow* top = target_ ? target_->window()->windowHandle() : nullptr;
+    auto* surface = native && top && top->isExposed() ? static_cast<wl_surface*>(native->nativeResourceForWindow("surface", top)) : nullptr;
+    if (surface) {
+        const WaylandDisplay window = answered(wayland_->preferredFor(surface));
+        // (the surface's own answer stays if the window's is not HDR either)
+        if (!out.known || (window.known && window.headroom > 1.0)) out = window;
+    }
+#endif
+    return out;
+}
+
 void HdrSurface::stopHdr(const QString& why) {
     if (!hdrActive_) return;
     hdrActive_ = false;
@@ -332,53 +602,116 @@ void HdrSurface::readDisplay() {
     // frame has been shown).
     if (displayRead_.isValid() && displayRead_.elapsed() < 1000) return;
     displayRead_.start();
-    double h = 1;
+    double h = 1, white = 0;
     float sc = 1;
     if (gTestHeadroom > 0) {
         h = gTestHeadroom;
+    } else if (encoded_) {
+#if defined(MONTAGE_WAYLAND_COLOR)
+        // What the compositor prefers where the viewer is: its reference white (where the picture's 203 nits go) and
+        // peak, asked here every second.
+        const WaylandDisplay d = waylandDisplay();
+        if (!d.known) return;
+        h = d.headroom;
+        white = d.whiteNits;
+#else
+        // Qt describes the surface and the compositor fits it to the display, which it does not say: nothing is rolled
+        // off here, whatever the picture (PQ's whole range over its reference white).
+        h = 10000.0 / 203;
+#endif
     } else if (gpu_ && gpu_->sc && gpu_->hasSwapChain) {
 #if defined(Q_OS_WIN)
         // The viewer's own display (Qt's answer is about the main one).
         const WinDisplay d = windowsDisplay(reinterpret_cast<HWND>(winId()));
         if (d.known && d.maxNits > 0) {
             // SDR white from the display configuration, else as Qt reads it, else Windows' default.
-            double white = d.sdrWhiteNits;
+            white = d.sdrWhiteNits;
             if (!d.whiteKnown) {
                 const QRhiSwapChainHdrInfo info = gpu_->sc->hdrInfo();
                 white = info.sdrWhiteLevel > 0 ? info.sdrWhiteLevel : 80;
             }
             h = d.maxNits / white;
             sc = float(white / 80);
-            absoluteWhite_ = true;
-            h = std::max(1.0, std::isfinite(h) ? h : 1.0);
-            if (std::fabs(h - headroom_) > 0.01 || sc != scale_) {
-                headroom_ = h;
-                scale_ = sc;
-                emit displayChanged();
-            }
-            return;
-        }
+        } else
 #endif
-        const QRhiSwapChainHdrInfo info = gpu_->sc->hdrInfo();
-        if (info.limitsType == QRhiSwapChainHdrInfo::ColorComponentValue) {
-            h = info.limits.colorComponentValue.maxColorComponentValue;  // macOS EDR: 1.0 is SDR white
-            absoluteWhite_ = false;
-        } else {
-            // Windows scRGB: 1.0 is 80 nits; SDR white is the user's setting.
-            const double white = info.sdrWhiteLevel > 0 ? info.sdrWhiteLevel : 80;
-            h = info.limits.luminanceInNits.maxLuminance / white;
-            sc = float(white / 80);
-            absoluteWhite_ = true;
+        {
+            const QRhiSwapChainHdrInfo info = gpu_->sc->hdrInfo();
+            if (info.limitsType == QRhiSwapChainHdrInfo::ColorComponentValue) {
+                h = info.limits.colorComponentValue.maxColorComponentValue;  // macOS EDR: 1.0 is SDR white
+            } else {
+                // Windows scRGB: 1.0 is 80 nits; SDR white is the user's setting.
+                white = info.sdrWhiteLevel > 0 ? info.sdrWhiteLevel : 80;
+                h = info.limits.luminanceInNits.maxLuminance / white;
+                sc = float(white / 80);
+            }
         }
     } else {
         return;
     }
     h = std::max(1.0, std::isfinite(h) ? h : 1.0);
-    if (std::fabs(h - headroom_) > 0.01 || sc != scale_) {
+    if (std::fabs(h - headroom_) > 0.01 || sc != scale_ || white != whiteNits_) {
         headroom_ = h;
         scale_ = sc;
+        whiteNits_ = white;
         emit displayChanged();
     }
+}
+
+int HdrSurface::bufferBits() const {
+    if (!gpu_ || !gpu_->rhi) return 0;
+    if (!encoded_) return 16;
+#if defined(MONTAGE_HDR_ENCODED)
+    if (const auto* h = static_cast<const QRhiGles2NativeHandles*>(gpu_->rhi->nativeHandles()); h && h->context)
+        return h->context->format().redBufferSize();
+#endif
+    return 0;
+}
+
+Transfer HdrSurface::describedTransfer() const {
+#if defined(MONTAGE_WAYLAND_COLOR)
+    if (wayland_ && wayland_->described()) return wayland_->described()->transfer;
+#elif defined(MONTAGE_QT_WAYLAND_COLOR)
+    if (encoded_ && handle() && format().colorSpace() == requestedFormat().colorSpace()) return Transfer::Pq;
+#endif
+    return Transfer::Linear;
+}
+
+void HdrSurface::describeSurface() {
+#if defined(MONTAGE_WAYLAND_COLOR)
+    if (!wayland_ || !hdrActive_) return;
+    QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
+    auto* surface = native ? static_cast<wl_surface*>(native->nativeResourceForWindow("surface", this)) : nullptr;
+    if (!surface) return;
+    if (surface != wayland_->surface()) {
+        // A new wl_surface (the first, or made again when the window was shown again): its objects, and what the
+        // compositor prefers for it.
+#if defined(MONTAGE_WAYLAND_SURFACE_SIGNALS)
+        // (let go when Qt lets the wl_surface go, so one made again at the same address is attached afresh)
+        if (auto* w = nativeInterface<QNativeInterface::Private::QWaylandWindow>(); w && static_cast<QObject*>(w) != waylandWindow_.data()) {
+            waylandWindow_ = w;
+            connect(w, &QNativeInterface::Private::QWaylandWindow::surfaceDestroyed, this, [this] {
+                if (wayland_) wayland_->detach();
+            });
+        }
+#endif
+        if (!wayland_->attach(surface)) {
+            stopHdr(tr("The connection to the Wayland compositor failed"));
+            return;
+        }
+        ownFrame_.invalidate();  // (no frame on this wl_surface yet)
+        displayRead_.invalidate();
+        readDisplay();
+    }
+    // PQ, or HLG for HLG pictures where the compositor takes it; the picture's light as shown on this display.
+    WaylandColor::Description d;
+    d.transfer = picture_ && picture_->transfer == Transfer::Hlg && wayland_->supportsHlg() ? Transfer::Hlg : Transfer::Pq;
+    if (picture_) d.light = hdrSurfaceLight(*picture_, headroom_);
+    else if (const WaylandColor::Description* now = wayland_->described()) d = *now;  // (nothing to show yet: as it is)
+    if (const WaylandColor::Description* now = wayland_->described(); now && *now == d) return;
+    std::string why;
+    if (!wayland_->describe(d, &why))
+        stopHdr(tr("The compositor did not take the HDR picture's description (%1)").arg(QString::fromStdString(why)));
+#endif
 }
 
 void HdrSurface::setPicture(HdrPicturePtr picture, const QRectF& rect) {
@@ -403,6 +736,9 @@ void HdrSurface::exposeEvent(QExposeEvent*) {
             stopHdr(tr("The graphics device was reset"));
             return;
         }
+        // Wayland: the surface described, and what the compositor prefers for it read.
+        if (g.hasSwapChain && encoded_) describeSurface();
+        if (!hdrActive_) return;
         // Now inside the viewer: asked again (on Windows Qt makes an SDR swap chain where it sees an SDR display).
         if (g.hasSwapChain && gTestHeadroom <= 0 && !displayShowsHdr()) {
             stopHdr(problem_);
@@ -431,12 +767,22 @@ bool HdrSurface::event(QEvent* e) {
             render();
             return true;
         case QEvent::PlatformSurface:
-            if (static_cast<QPlatformSurfaceEvent*>(e)->surfaceEventType() == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed && gpu_ &&
-                gpu_->sc) {
-                gpu_->sc->destroy();
-                gpu_->hasSwapChain = false;
+            if (static_cast<QPlatformSurfaceEvent*>(e)->surfaceEventType() == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed) {
+#if defined(MONTAGE_WAYLAND_COLOR)
+                if (wayland_) wayland_->detach();
+#endif
+                if (gpu_ && gpu_->sc) {
+                    gpu_->sc->destroy();
+                    gpu_->hasSwapChain = false;
+                }
             }
             break;
+#if defined(MONTAGE_WAYLAND_COLOR)
+        case QEvent::Hide:
+            // (Qt lets the wl_surface go with the window hidden: shown again, the new one is described afresh)
+            if (wayland_) wayland_->detach();
+            break;
+#endif
         case QEvent::MouseButtonPress:
         case QEvent::MouseButtonRelease:
         case QEvent::MouseButtonDblClick:
@@ -531,6 +877,17 @@ void HdrSurface::render() {
         g.newlyExposed = false;
     }
     readDisplay();
+    // Linux: the surface described for this picture (applied with this frame's commit), and the linear target at the
+    // swap chain's size.
+    const bool encode = encoded_ && g.linearRt;
+    if (encode) {
+        describeSurface();
+        if (!hdrActive_) return;
+        if (!g.resizeLinear(g.sc->currentPixelSize())) {
+            stopHdr(tr("The graphics device cannot draw into half-float textures"));
+            return;
+        }
+    }
     QRhi::FrameOpResult r = g.rhi->beginFrame(g.sc.get());
     if (r == QRhi::FrameOpSwapChainOutOfDate) {
         if (!remade()) return;
@@ -591,10 +948,33 @@ void HdrSurface::render() {
     };
     uniforms(g.ubufPicture.get(), rect_);
     uniforms(g.ubufOverlay.get(), QRectF(0, 0, w, h));
+    if (encode) {
+        // The whole window, the linear texture's first row where the backend puts it (OpenGL: at the bottom), and the
+        // transfer the surface is described with.
+        float data[24];
+        std::memcpy(data, corr.constData(), 16 * sizeof(float));
+        const float top = g.rhi->isYUpInFramebuffer() ? -1 : 1;
+        data[16] = -1, data[17] = top, data[18] = 1, data[19] = -top;
+        data[20] = data[21] = data[22] = 0;
+        data[23] = describedTransfer() == Transfer::Hlg ? 2 : 1;
+        u->updateDynamicBuffer(g.ubufEncode.get(), 0, kUniformBytes, data);
+    }
+
+    // (tests) This frame read back as its last pass ends: the swap chain's pixels, then the linear light under them.
+    // (OpenGL, where the encode pass is: read as the frame ends)
+    QRhiResourceUpdateBatch* kept = nullptr;
+    if (encode && keepFrame_) {
+        kept = g.rhi->nextResourceUpdateBatch();
+        g.readSignal = QRhiReadbackResult();
+        g.readLight = QRhiReadbackResult();
+        kept->readBackTexture(QRhiReadbackDescription(), &g.readSignal);
+        kept->readBackTexture(QRhiReadbackDescription(g.linear.get()), &g.readLight);
+    }
 
     QRhiCommandBuffer* cb = g.sc->currentFrameCommandBuffer();
     const QSize px = g.sc->currentPixelSize();
-    cb->beginPass(g.sc->currentFrameRenderTarget(), Qt::black, {1.0f, 0}, u);
+    QRhiRenderTarget* target = encode ? static_cast<QRhiRenderTarget*>(g.linearRt.get()) : g.sc->currentFrameRenderTarget();
+    cb->beginPass(target, Qt::black, {1.0f, 0}, u);
     const QRhiCommandBuffer::VertexInput input(g.vbuf.get(), 0);
     if (picture_ && !rect_.isEmpty()) {
         cb->setGraphicsPipeline(g.psPicture.get());
@@ -611,10 +991,28 @@ void HdrSurface::render() {
         cb->draw(4);
     }
     cb->endPass();
+    if (encode) {
+        cb->beginPass(g.sc->currentFrameRenderTarget(), Qt::black, {1.0f, 0});
+        cb->setGraphicsPipeline(g.psEncode.get());
+        cb->setViewport({0, 0, float(px.width()), float(px.height())});
+        cb->setShaderResources(g.srbEncode.get());
+        cb->setVertexInput(0, 1, &input);
+        cb->draw(4);
+        cb->endPass(kept);
+    }
     if (g.rhi->endFrame(g.sc.get()) == QRhi::FrameOpDeviceLost) {
         stopHdr(tr("The graphics device was reset"));
         return;
     }
+#if defined(MONTAGE_HDR_ENCODED)
+    if (kept) {
+        keepFrame_ = false;
+        const bool bottomFirst = g.rhi->isYUpInFramebuffer();
+        keptSignal_ = readBack(g.readSignal, QRhiTexture::RGBA8, QImage::Format_RGBA8888, 4, bottomFirst);
+        keptLight_ = readBack(g.readLight, QRhiTexture::RGBA16F, QImage::Format_RGBA16FPx4, 8, bottomFirst);
+    }
+#endif
+    if (!ownFrame_.isValid()) ownFrame_.start();
     if (++frames_ == 1) {
         // macOS reports the headroom once a frame is up: asked again straight after the first.
         QTimer::singleShot(100, this, [this] {

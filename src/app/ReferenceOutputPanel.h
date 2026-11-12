@@ -17,6 +17,7 @@
 #include "render/St2110.h"
 
 class QCheckBox;
+class QDoubleSpinBox;
 class QComboBox;
 class QFormLayout;
 class QLabel;
@@ -117,6 +118,12 @@ private:
     QCheckBox* st2110Redundant_;
     QLineEdit* st2110Paths2_;
     QLineEdit* st2110Interface2_;
+    QComboBox* st2110Codec_;     // (ST 2110-20, or -22's JPEG XS)
+    QDoubleSpinBox* st2110Bpp_;
+    QCheckBox* st2110Slices_;
+    QCheckBox* st2110Aes3_;
+    QCheckBox* st2110Meta_;      // (ST 2110-41)
+    QLineEdit* st2110MetaTo_;
     QCheckBox* nmos_;
     QLineEdit* nmosRegistry_;
     QPushButton* saveSdp_;

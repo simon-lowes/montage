@@ -1,9 +1,11 @@
 #include "OfxOverlay.h"
 
+#include <QFocusEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QTabletEvent>
+#include <QTimer>
 
 #include "EditorState.h"
 #include "MonitorPanel.h"
@@ -46,6 +48,11 @@ int keysym(const QKeyEvent* k) {
 }  // namespace
 
 OfxOverlay::OfxOverlay(EditorState* state, ViewerWidget* viewer) : QObject(viewer), state_(state), viewer_(viewer) {
+    // (controls in a plug-in host that are not answering: looked at again until they do, or are closed)
+    poll_ = new QTimer(this);
+    poll_->setSingleShot(true);
+    poll_->setInterval(100);
+    connect(poll_, &QTimer::timeout, viewer_, qOverload<>(&QWidget::update));
     viewer_->installEventFilter(this);
     viewer_->setMouseTracking(true);
     viewer_->addOverlay([this](QPainter& p, const QRectF& r) { paint(p, r); });
@@ -100,6 +107,7 @@ bool OfxOverlay::view(Id clip, ofx::View& v) const {
     v.frameW = fw;
     v.frameH = fh;
     v.renderScale = 1;
+    v.pixelRatio = viewer_->devicePixelRatioF();
     v.m[0] = (pts[1][0] - pts[0][0]) / fw;
     v.m[1] = (pts[2][0] - pts[0][0]) / fh;
     v.m[2] = pts[0][0];
@@ -121,6 +129,7 @@ const Effect* OfxOverlay::effectOf(const Target& t) const {
 
 ofx::Interact* OfxOverlay::interactFor(const Target& t, const Effect& e) {
     Open& o = open_[{t.clip, t.effect}];
+    o.target = t;
     // (one that failed is left alone from then on, as OpenFX asks; one that will not open is not tried again either)
     if (o.interact && o.interact->failed()) {
         o.interact.reset();
@@ -137,15 +146,34 @@ ofx::Interact* OfxOverlay::interactFor(const Target& t, const Effect& e) {
     return o.interact.get();
 }
 
+bool OfxOverlay::unresponsive(Id clip, Id effect) const {
+    const auto it = open_.find({clip, effect});
+    return it != open_.end() && it->second.interact && it->second.interact->unresponsive();
+}
+
+bool OfxOverlay::inHost(Id clip, Id effect) const {
+    const auto it = open_.find({clip, effect});
+    return it != open_.end() && it->second.interact && it->second.interact->remote();
+}
+
 void OfxOverlay::paint(QPainter& p, const QRectF&) {
     const std::vector<Target> ts = targets();
     // Controls of effects no longer shown are closed.
     for (auto it = open_.begin(); it != open_.end();) {
         bool shown = false;
         for (const Target& t : ts) shown = shown || (t.clip == it->first.first && t.effect == it->first.second);
-        if (!shown && !(down_ && pressed_.clip == it->first.first && pressed_.effect == it->first.second)) it = open_.erase(it);
-        else ++it;
+        if (!shown && !(down_ && pressed_.clip == it->first.first && pressed_.effect == it->first.second)) {
+            // (what a late answer set is still written, if it has come)
+            Effect late;
+            if (it->second.interact && it->second.interact->lateEdits(late)) applyLate(it->second.target, late);
+            it = open_.erase(it);
+        } else {
+            ++it;
+        }
     }
+    // (controls closed with an answer out are let go as it comes)
+    if (ofx::Interact::tidyClosed() && !poll_->isActive()) poll_->start();
+    int notes = 0;
     for (const Target& t : ts) {
         const Effect* e = effectOf(t);
         ofx::View v;
@@ -153,8 +181,30 @@ void OfxOverlay::paint(QPainter& p, const QRectF&) {
         ofx::Interact* in = interactFor(t, *e);
         if (!in) continue;
         ofx::Overlay o;
-        if (in->draw(*e, double(t.lt), v, o)) ofx::paintOverlay(p, o, v);
-        else state_->message(tr("%1's on-screen controls stopped working").arg(QString::fromStdString(e->s("ofx_name"))), 6000);
+        const bool drew = in->draw(*e, double(t.lt), v, o);
+        const QString name = QString::fromStdString(e->s("ofx_name"));
+        // (controls in a host that did not answer in time keep their last picture up, marked)
+        if (drew || !o.gl.isNull()) ofx::paintOverlay(p, o, v);
+        // What a late reply set once the pen was up: written as its own step (not while a drag is going on).
+        Effect late;
+        if (!down_ && !state_->inGesture() && in->lateEdits(late)) applyLate(t, late);
+        if (in->waiting() && !poll_->isActive()) poll_->start();
+        if (!drew) {
+            const std::string why = in->failure();
+            state_->message(why.empty() ? tr("%1's on-screen controls stopped working").arg(name)
+                                        : tr("%1's on-screen controls stopped: it %2").arg(name, QString::fromStdString(why)),
+                            8000);
+        } else if (in->unresponsive()) {
+            const QString note = tr("%1's on-screen controls are not responding").arg(name);
+            p.save();
+            const QFontMetrics fm(p.font());
+            const QRect box(8, 8 + notes * (fm.height() + 8), fm.horizontalAdvance(note) + 12, fm.height() + 4);
+            p.fillRect(box, QColor(0, 0, 0, 170));
+            p.setPen(QColor(255, 200, 60));
+            p.drawText(box, Qt::AlignCenter, note);
+            p.restore();
+            ++notes;
+        }
     }
 }
 
@@ -177,6 +227,22 @@ void OfxOverlay::apply(const Target& t, const Effect& edited, bool gesture) {
     };
     if (gesture) state_->updateGesture([fn](Project& p, Sequence& s) { fn(p, s); });
     else state_->edit(tr("Change %1").arg(QString::fromStdString(edited.s("ofx_name"))), fn);
+}
+
+void OfxOverlay::applyLate(const Target& t, const Effect& changes) {
+    // (after the paint it was found in, and after any drag going on then)
+    QTimer::singleShot(state_->inGesture() ? 100 : 0, this, [this, t, changes] {
+        if (state_->inGesture()) {
+            applyLate(t, changes);
+            return;
+        }
+        const Effect* now = effectOf(t);
+        if (!now) return;
+        Effect edited = *now;
+        for (const auto& [key, param] : changes.params) edited.params[key] = param;
+        for (const auto& [key, value] : changes.strings) edited.strings[key] = value;
+        apply(t, edited, false);
+    });
 }
 
 bool OfxOverlay::pen(ofx::Interact::Pen kind, QEvent* ev) {
@@ -234,6 +300,17 @@ bool OfxOverlay::pen(ofx::Interact::Pen kind, QEvent* ev) {
 bool OfxOverlay::eventFilter(QObject* obj, QEvent* e) {
     if (obj != viewer_) return false;
     switch (e->type()) {
+    case QEvent::FocusIn:
+    case QEvent::FocusOut:
+        // (the controls showing hear that the monitor gained or lost the keyboard)
+        for (const Target& t : targets()) {
+            const auto it = open_.find({t.clip, t.effect});
+            const Effect* ef = effectOf(t);
+            ofx::View v;
+            if (it == open_.end() || !it->second.interact || !ef || !view(t.clip, v)) continue;
+            it->second.interact->focus(e->type() == QEvent::FocusIn, *ef, double(t.lt), v);
+        }
+        return false;
     // (a tablet event taken is accepted, so no mouse event is made from it as well)
     case QEvent::MouseButtonPress:
     case QEvent::TabletPress: {
@@ -269,8 +346,9 @@ bool OfxOverlay::eventFilter(QObject* obj, QEvent* e) {
             if (!in) continue;
             Effect edited = *ef;
             bool changed = false;
-            if (in->key(e->type() == QEvent::KeyPress, sym, k->text().toStdString(), *ef, double(t.lt), v, edited, changed)) {
-                if (changed) apply(t, edited, false);
+            const bool took = in->key(e->type() == QEvent::KeyPress, sym, k->text().toStdString(), *ef, double(t.lt), v, edited, changed);
+            if (changed) apply(t, edited, false);  // (what a late answer set comes with a key not taken too)
+            if (took) {
                 viewer_->update();
                 return true;
             }

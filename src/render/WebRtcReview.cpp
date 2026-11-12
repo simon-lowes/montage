@@ -79,6 +79,49 @@ std::vector<std::string> reviewCertificateHosts() {
     return out;
 }
 
+int RungSteering::report(int rung, int last, double loss, Clock::time_point at, Clock::time_point now,
+                         const std::function<bool(int)>& tooBig, const std::function<bool(int)>& usable) {
+    using std::chrono::milliseconds;
+    // A try that has lasted 20 s without heavy loss fits (a link that buffers a long way brings its loss late).
+    if (trying && now - triedAt > std::chrono::seconds(20)) {
+        trying = false;
+        hold = milliseconds(8000);
+    }
+    if (at - movedAt < milliseconds(700)) return rung;  // (it counts the rung before's packets)
+    auto move = [&](int to) {
+        movedAt = now;
+        nextTry = now + hold;
+        postponed = false;
+        return to;
+    };
+    if (loss > 0.10) {
+        if (trying) hold = std::min(hold * 2, milliseconds(32000));
+        trying = false;
+        int to = std::min(rung + 1, last);
+        while (to < last && tooBig(to)) ++to;
+        while (to > rung && !usable(to)) --to;
+        if (to > rung) return move(to);
+        nextTry = std::max(nextTry, now + hold);  // (the smallest already, or none below works)
+        return rung;
+    }
+    if (loss >= 0.02 && !postponed) {
+        nextTry = std::max(nextTry, now + hold);
+        postponed = true;
+    }
+    if (rung > 0 && now >= nextTry && usable(rung - 1)) {
+        trying = true;
+        triedAt = now;
+        return move(rung - 1);
+    }
+    return rung;
+}
+
+void RungSteering::switched(Clock::time_point now) {
+    movedAt = now;
+    nextTry = std::max(nextTry, now + hold);
+    if (trying) triedAt = now;
+}
+
 #ifndef MONTAGE_WITH_WEBRTC
 
 bool makeReviewCertificate(const std::vector<std::string>&, std::string&, std::string&, std::string* error) {
@@ -113,11 +156,15 @@ std::vector<ReviewPointer> BrowserReviewBackend::pointers() const { return {}; }
 
 namespace {
 
+const std::string kColourSpaceExtension = "http://www.webrtc.org/experiments/rtp-hdrext/color-space";
+
 using Clock = std::chrono::steady_clock;
 
 constexpr qsizetype kMaxHeader = 16 * 1024, kMaxBody = 256 * 1024;  // (an offer is a few kilobytes)
 constexpr int kMaxConnections = 64, kMaxConnectionsFrom = 8;  // (all, and from one address or IPv6 /64)
-constexpr double kGuessRate = 5, kGuessBurst = 20;            // passphrases tried a second, from anywhere
+constexpr double kGuessRate = 5;                               // passphrases tried a second by all who guessed wrong lately
+constexpr double kNetworkBurst = 3;                           // and at once from one network that has
+constexpr double kListedBurst = 256;                          // (fewer once the networks listed are more than a third of this)
 constexpr double kPeerRate = 1, kPeerBurst = 8;               // and from one address or IPv6 /64 not yet let in
 constexpr std::chrono::hours kTrustedMemory{1};               // how long a right passphrase lets its address past the rest
 constexpr int kHandshakeMs = 5000;                            // a TLS handshake not done by then is dropped
@@ -334,6 +381,14 @@ struct PeerBucket {
     Clock::time_point at = Clock::now();
 };
 
+// A network that has guessed wrong lately, and the passphrases it may still try: a ration of its own, so that no
+// network's guessing uses up another's tries.
+struct NetworkRation {
+    Clock::time_point last;  // when one there last guessed wrong
+    double tokens = kNetworkBurst;
+    Clock::time_point at = Clock::now();
+};
+
 }  // namespace
 
 bool makeReviewCertificate(const std::vector<std::string>& hosts, std::string& certificatePem, std::string& keyPem, std::string* error) {
@@ -423,9 +478,7 @@ struct Viewer {
     // (send's thread) How the ladder steers them: reports read, when they last moved, when they may next try the rung
     // above, how long they wait between tries (doubled each time one fails), and what was sent them lately.
     uint64_t seenReports = 0;
-    Clock::time_point movedAt = Clock::now(), nextTry = Clock::now() + std::chrono::seconds(3);
-    std::chrono::milliseconds hold{8000};
-    bool trying = false;  // moved up a rung lately, to see whether it fits
+    RungSteering steering;
     int64_t lastPts = -1;
     std::deque<std::pair<Clock::time_point, size_t>> sent;
 };
@@ -675,10 +728,8 @@ struct BrowserReviewBackend::Impl {
     std::map<QString, Failures> failures;  // (that thread's)
     std::map<QString, PeerBucket> peerBuckets;          // (that thread's) by guesser()
     std::map<QString, Clock::time_point> trusted;       // (that thread's) addresses that gave the right passphrase lately
-    std::map<QString, Clock::time_point> guessingNetworks;  // (that thread's) by network(): when one there last guessed wrong
-    // Passphrases that may be tried now: from addresses and networks that have guessed wrong lately, and from the rest.
-    double guesses = kGuessBurst, freshGuesses = kGuessBurst;
-    Clock::time_point guessesAt = Clock::now(), freshGuessesAt = Clock::now();
+    std::map<QString, NetworkRation> guessingNetworks;  // (that thread's) by network(): those that guessed wrong lately
+    NetworkRation elsewhere;  // (that thread's) every network not listed, once the list is full
 
     std::map<std::string, std::shared_ptr<Viewer>> viewers;
     // Viewers let go, kept a few seconds more: a callback of theirs still running is never the last to hold one (a
@@ -752,15 +803,20 @@ struct BrowserReviewBackend::Impl {
 #endif
             return;
         }
-        const QList<QSslSocket*> open = server.findChildren<QSslSocket*>();
+        const QList<QSslSocket*> all = server.findChildren<QSslSocket*>();
         // (counted by IPv6 /64, as one computer can have many addresses in one)
         const QString from = guesser(c->peerAddress());
-        const auto fromThere = std::count_if(open.begin(), open.end(), [&](QSslSocket* o) { return guesser(o->peerAddress()) == from; });
+        const auto fromThere = std::count_if(all.begin(), all.end(), [&](QSslSocket* o) { return guesser(o->peerAddress()) == from; });
         if (fromThere > kMaxConnectionsFrom) {
             c->abort();
             c->deleteLater();
             return;
         }
+        // (the places are for connections with something to wait for. One only waiting to be told its passphrase was
+        // wrong holds none: guessers from many addresses, each waiting, keep nobody out. authorised() bounds those.)
+        QList<QSslSocket*> open;
+        for (QSslSocket* o : all)
+            if (!o->property("refusing").toBool()) open.append(o);
         if (open.size() > kMaxConnections) {
             // Full. A reviewer who gave the passphrase lately still gets in, in the place of the oldest connection
             // still waiting to be answered from anyone else. Anyone else gets in by their share: in the place of the
@@ -855,12 +911,14 @@ struct BrowserReviewBackend::Impl {
     }
 
     // The passphrase as a bearer token. An address that has guessed wrong too often lately is refused at once; each
-    // address (IPv6 /64) may try only so many a second, and all of them together only so many more (the rest refused
-    // untried), except addresses that gave the right one lately, so that guessing elsewhere never shuts reviewers
-    // already in out. Addresses whose network (IPv4 /24, IPv6 /48) has guessed wrong lately share that budget; the
-    // rest share one of their own, so that guessing from a few networks never shuts a newcomer out either (one who
-    // would must bring a fresh network for each wrong guess). Wrong ones are told a second after the one before from
-    // the same address.
+    // address (IPv6 /64) may try only so many a second (the rest refused untried), except addresses that gave the
+    // right one lately, so that guessing elsewhere never shuts reviewers already in out. A network (IPv4 /24, IPv6
+    // /48) is rationed from its first wrong guess: it has a few tries at once (fewer when very many networks are
+    // guessing) and then its share of the few a second that all the networks which guessed wrong lately have
+    // between them, split evenly. A network's guessing
+    // therefore uses up nobody else's tries: a newcomer from elsewhere is tried at once however many networks are
+    // guessing, and one who mistypes has a ration of their own. Wrong ones are told a second after the one before
+    // from the same address.
     bool authorised(QSslSocket* c, const Request& r) {
         const QString peer = guesser(c->peerAddress());
         const auto now = Clock::now();
@@ -873,13 +931,13 @@ struct BrowserReviewBackend::Impl {
         while (failures.size() > 4096)
             failures.erase(std::min_element(failures.begin(), failures.end(), [](const auto& a, const auto& b) { return a.second.last < b.second.last; }));
         const bool known = trusted.count(peer) > 0;
-        // (an address, or a network around it, that has guessed wrong lately; newcomers from elsewhere have a
-        // budget of their own, so that guessing from a few networks never shuts them out)
+        // (the network around it, if one there has guessed wrong lately. With the list of networks full, every
+        // network not in it shares one ration: guessing from more networks than the list holds gains nothing)
         const QString around = network(c->peerAddress());
-        forget(guessingNetworks, [&](Clock::time_point t) { return now - t > kFailureMemory; });
-        // (with the list of networks full, every network not in it counts as one that guessed: guessing from more
-        // networks than it holds never empties the newcomers' budget)
-        const bool suspect = failures.count(peer) > 0 || guessingNetworks.count(around) > 0 || guessingNetworks.size() >= 4096;
+        forget(guessingNetworks, [&](const NetworkRation& n) { return now - n.last > kFailureMemory; });
+        const bool full = guessingNetworks.size() >= 4096;
+        auto listed = guessingNetworks.find(around);
+        NetworkRation* ration = listed != guessingNetworks.end() ? &listed->second : full ? &elsewhere : nullptr;
         // (an address a reviewer is in lately, as a shared network's, is blocked only after many more)
         auto blocked = failures.find(peer);
         if (blocked != failures.end() && blocked->second.count >= (known ? 100 : 10)) {
@@ -896,15 +954,18 @@ struct BrowserReviewBackend::Impl {
                 return false;
             }
             mine.tokens -= 1;
-            double& pool = suspect ? guesses : freshGuesses;
-            Clock::time_point& poolAt = suspect ? guessesAt : freshGuessesAt;
-            pool = std::min(kGuessBurst, pool + std::chrono::duration<double>(now - poolAt).count() * kGuessRate);
-            poolAt = now;
-            if (pool < 1) {
-                respond(c, "429 Too Many Requests", {{"Retry-After", "5"}}, "Too many passphrases tried: try again shortly");
-                return false;
+            if (ration) {
+                const double rate = kGuessRate / double(guessingNetworks.size() + (full ? 1 : 0));
+                ration->tokens = std::min(kNetworkBurst, ration->tokens + std::chrono::duration<double>(now - ration->at).count() * rate);
+                ration->at = now;
+                if (ration->tokens < 1) {
+                    const int wait = int(std::clamp(std::ceil((1 - ration->tokens) / rate), 1.0, 600.0));
+                    respond(c, "429 Too Many Requests", {{"Retry-After", QByteArray::number(wait)}},
+                            "Too many wrong passphrases from this network: try again shortly");
+                    return false;
+                }
+                ration->tokens -= 1;
             }
-            pool -= 1;
         }
         QByteArray given = r.header("authorization");
         if (given.toLower().startsWith("bearer ")) given = given.mid(7).trimmed();
@@ -916,14 +977,35 @@ struct BrowserReviewBackend::Impl {
         Failures& f = failures[peer];
         ++f.count;
         f.last = now;
-        if (guessingNetworks.size() < 4096 || guessingNetworks.count(around)) guessingNetworks[around] = now;
-        // (per address: wrong guesses from elsewhere never hold back anyone's answer, the shared bucket above bounds
-        // how fast all of them together may guess)
+        // (the network's first wrong guess lists it, with the tries it has at once still to use: three while few
+        // networks are guessing, fewer and then none as they become many, so that guessing from very many networks
+        // gains little more than each one's first try)
+        if (listed != guessingNetworks.end()) {
+            listed->second.last = now;
+        } else if (!full) {
+            NetworkRation& n = guessingNetworks[around];
+            n.last = now;
+            n.tokens = std::clamp(std::floor(kListedBurst / double(guessingNetworks.size())), 0.0, kNetworkBurst);
+        }
+        // (per address: wrong guesses from elsewhere never hold back anyone's answer, the rations above bound how
+        // fast all of them together may guess)
         f.nextRefusal = std::max(now, f.nextRefusal) + std::chrono::seconds(1);
         const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(f.nextRefusal - now).count());
-        QTimer::singleShot(ms, c, [this, c] {
-            respond(c, "401 Unauthorized", {{"WWW-Authenticate", "Bearer realm=\"Montage review\""}}, "Wrong passphrase");
-        });
+        // (only waiting to be told so, and holding no place meanwhile. No more than a set number wait at once: past
+        // that, the one that has waited longest is told now.)
+        c->setProperty("refusing", true);
+        auto tell = [this](QSslSocket* o) {
+            if (!o->property("refusing").toBool()) return;
+            o->setProperty("refusing", false);
+            respond(o, "401 Unauthorized", {{"WWW-Authenticate", "Bearer realm=\"Montage review\""}}, "Wrong passphrase");
+        };
+        QTimer::singleShot(ms, c, [tell, c] { tell(c); });
+        if (c->parent()) {
+            QList<QSslSocket*> waiting;
+            for (QSslSocket* o : c->parent()->findChildren<QSslSocket*>())
+                if (o->property("refusing").toBool()) waiting.append(o);
+            if (waiting.size() > kMaxConnections) tell(waiting.front());  // (children are listed oldest first)
+        }
         return false;
     }
 
@@ -1070,10 +1152,12 @@ struct BrowserReviewBackend::Impl {
             conf.enableIceUdpMux = true;
             conf.portRangeBegin = conf.portRangeEnd = uint16_t(port);
         }
-        // (bound to the review's own address, unless that is this computer's loopback and a relay elsewhere must be
-        // reached)
-        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4 && (!relayInUse || !host.isLoopback()))
-            conf.bindAddress = host.toString().toStdString();
+        // (bound to the review's own address; when that is this computer's loopback and a relay elsewhere must be
+        // reached, unbound but through the relay only, so no other interface's address is offered)
+        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4) {
+            if (!relayInUse || !host.isLoopback()) conf.bindAddress = host.toString().toStdString();
+            else conf.iceTransportPolicy = rtc::TransportPolicy::Relay;
+        }
         v->pc = std::make_shared<rtc::PeerConnection>(conf);
         // Only codecs this FFmpeg can encode are offered back: a browser picked one it cannot would see no picture.
         std::vector<std::string> order;
@@ -1100,8 +1184,10 @@ struct BrowserReviewBackend::Impl {
             bool hdr = false;
             bool colourExtension = false;
             rtc::Description::Media offeredMedia = media;  // (extIds is not const)
+            // (an ID of 1-14 only: libdatachannel writes this extension's element in the one-byte form whatever its
+            // ID, so one above 14 would arrive malformed and the picture's transfer lost; such a viewer gets SDR)
             for (int id : offeredMedia.extIds())
-                if (const auto* e = offeredMedia.extMap(id); e && e->uri == "http://www.webrtc.org/experiments/rtp-hdrext/color-space") colourExtension = true;
+                if (const auto* e = offeredMedia.extMap(id); e && e->uri == kColourSpaceExtension && id >= 1 && id <= 14) colourExtension = true;
             if (isVideo && !tenBit.empty() && colourExtension) {
                 pick = choose(media, tenBit, true);
                 hdr = pick.pt >= 0;
@@ -1137,7 +1223,7 @@ struct BrowserReviewBackend::Impl {
                     answer->addExtMap(rtc::Description::Media::ExtMap(id, e->uri));
                     cfg->playoutDelayId = uint8_t(id);
                     cfg->playoutDelayMin = cfg->playoutDelayMax = 0;
-                } else if (isVideo && e->uri == "http://www.webrtc.org/experiments/rtp-hdrext/color-space") {
+                } else if (isVideo && e->uri == kColourSpaceExtension && colourExtension) {
                     answer->addExtMap(rtc::Description::Media::ExtMap(id, e->uri));
                     cfg->colorSpaceId = uint8_t(id);
                     cfg->colorRange = 1;  // (limited)
@@ -1554,9 +1640,7 @@ struct BrowserReviewBackend::Impl {
         while (!v.sent.empty() && now - v.sent.front().first > std::chrono::seconds(3)) v.sent.pop_front();
     }
 
-    // Moves a viewer down the ladder when their receiver reports lose more than a tenth of the packets (to the rung
-    // that fits what got through, at least one down), and up one rung after a while without loss to try it: a try that
-    // fails is not made again for twice as long (8 s at first, at most 32 s).
+    // Moves a viewer on the ladder by their receiver reports (RungSteering).
     void steer(Viewer& v, Clock::time_point now) {
         const int last = int(ladder.size()) - 1;
         if (last <= 0 || v.wantRung != v.rung) return;
@@ -1569,34 +1653,13 @@ struct BrowserReviewBackend::Impl {
             loss = v.loss;
             at = v.reportAt;
         }
-        if (v.trying && now - v.movedAt > std::chrono::seconds(6)) {
-            v.trying = false;
-            v.hold = std::chrono::milliseconds(8000);
-        }
         if (reports == v.seenReports) return;
         v.seenReports = reports;
-        if (at - v.movedAt < std::chrono::milliseconds(700)) return;  // (it counts the rung before's packets)
-        const int r = v.rung;
-        auto usable = [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); };
-        auto move = [&](int to) {
-            v.wantRung = to;
-            v.movedAt = now;
-            v.nextTry = now + v.hold;
-        };
-        if (loss > 0.10 && r < last) {
-            const double through = sentKbps(v, now) * (1 - loss);
-            int to = r + 1;
-            while (to < last && double(ladder[size_t(to)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through) ++to;
-            while (to > r && !usable(to)) --to;
-            if (v.trying) v.hold = std::min(v.hold * 2, std::chrono::milliseconds(32000));
-            v.trying = false;
-            if (to > r) move(to);
-        } else if (loss >= 0.02) {
-            v.nextTry = std::max(v.nextTry, now + v.hold);
-        } else if (r > 0 && now >= v.nextTry && usable(r - 1)) {
-            v.trying = true;
-            move(r - 1);
-        }
+        const double through = sentKbps(v, now) * (1 - loss);
+        v.wantRung = v.steering.report(
+            v.rung, last, loss, at, now,
+            [&](int i) { return double(ladder[size_t(i)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through; },
+            [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); });
     }
 
     // A picture to each viewer: from the encoder for their codec, rung and depth (each one's tag first: its RTP
@@ -1638,8 +1701,7 @@ struct BrowserReviewBackend::Impl {
                 v->rung = want;
                 v->needKey = false;
                 // (reports and tries count from the switch, not from when it was asked for)
-                v->movedAt = now;
-                v->nextTry = std::max(v->nextTry, now + v->hold);
+                v->steering.switched(now);
                 rungMessage(*v);
                 continue;
             }
@@ -1953,8 +2015,12 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
     d.relayInUse = false;
     for (const std::string& s : d.settings.iceServers) {
         try {
-            d.iceServers.emplace_back(s);
-            d.relayInUse = d.relayInUse || d.iceServers.back().type == rtc::IceServer::Type::Turn;
+            // (a relay over TLS or TCP is the browsers' alone: Montage's ICE reaches relays over UDP only, and one it
+            // cannot use must not cost the viewers the shared port)
+            rtc::IceServer server(s);
+            if (server.type == rtc::IceServer::Type::Turn && server.relayType != rtc::IceServer::RelayType::TurnUdp) continue;
+            d.relayInUse = d.relayInUse || server.type == rtc::IceServer::Type::Turn;
+            d.iceServers.push_back(std::move(server));
         } catch (const std::exception& e) {
             return fail(std::string("ICE server ") + s + ": " + e.what());
         }

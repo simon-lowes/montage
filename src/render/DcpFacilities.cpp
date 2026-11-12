@@ -73,6 +73,27 @@ std::vector<std::string> roles(const std::string& commonName) {
     return out;
 }
 
+// What a leaf's ST 430-2 roles say of a security manager: 1 it names SM; -1 it names other devices' roles only (a link
+// encryptor's, a projector's, ...); 0 it names none Montage knows.
+int serverRole(const std::string& commonName) {
+    const std::vector<std::string> r = roles(commonName);
+    if (std::find(r.begin(), r.end(), "SM") != r.end()) return 1;
+    static const char* others[] = {"LE", "LS", "LD", "PR", "CS", "MDI", "MDA", "MDS", "MDE", "FMI", "FMA", "FME"};
+    for (const std::string& x : r)
+        if (std::any_of(std::begin(others), std::end(others), [&](const char* o) { return x == o; })) return -1;
+    return 0;
+}
+
+// The same certificate (PEM, however its lines are broken).
+std::string certificateKey(const std::string& pem) {
+    std::string out;
+    for (const QString& line : QString::fromStdString(pem).split('\n')) {
+        const QString t = line.trimmed();
+        if (!t.startsWith(QLatin1String("-----"))) out += t.toStdString();
+    }
+    return out;
+}
+
 // A device's chain checked and its thumbprint taken; `what` names it in errors.
 bool takeChain(FacilityDevice& d, const std::vector<std::string>& certificates, bool allowPartial, const std::string& what, std::string* error) {
     dcp::ChainCheck check;
@@ -113,16 +134,21 @@ bool readDevice16(const QDomElement& e, FacilityDevice& d, const std::string& wh
     const std::string identifier = id.text().simplified().toStdString();
     const std::string what = where + ", " + (d.type.empty() ? std::string("a device") : d.type) + (d.serial.empty() ? "" : " " + d.serial);
     d.name = d.model.empty() ? d.type : d.model;
-    // Each KeyInfo a whole chain, every one checked; the device is known by the first.
+    // Each KeyInfo a whole chain, every one checked; the device is known by the first, but a security manager by the
+    // first whose leaf names it one (a server can list its link encryptor's chain too, and KDMs go to the SM's).
     std::vector<std::string> certs;
+    int role = -2;
     for (const QDomElement& keys : children(child(e, "KeyInfoList"), "KeyInfo")) {
         const std::vector<std::string> chain = certificatesIn(keys);
         if (chain.empty()) continue;
         FacilityDevice other = d;
         if (!takeChain(other, chain, false, what, error)) return false;
-        if (certs.empty()) certs = chain;
+        const int r = d.type == "SM" ? serverRole(other.commonName) : 0;
+        if (certs.empty() || r > role) certs = chain, role = r;
     }
     if (!certs.empty()) {
+        if (d.type == "SM" && role < 0)
+            return fail(error, what + ": its certificates name other devices' roles, not a security manager's (SM)");
         if (!takeChain(d, certs, false, what, error)) return false;
         if (byThumbprint && identifier != d.thumbprint) {
             dcp::CertificateInfo leaf;
@@ -190,6 +216,10 @@ bool readEtm(const std::string& xml, const QDomElement& root, Facility& f, std::
     dcp::SignatureCheck check;
     std::string err;
     if (!dcp::verifyXmlSignature(xml, &err, &check)) return fail(error, "The FLM's signature does not hold: " + err);
+    // (and its signer's chain checks as a device's does: the root it goes up to is what must be trusted)
+    dcp::ChainCheck signer;
+    if (!dcp::checkCertificateChain(check.certificates, signer, &err)) return fail(error, "The FLM's signer: " + err);
+    f.signer = signer.certificates;
     const std::string publicRef = "#" + pub.attribute(QStringLiteral("Id")).toStdString();
     if (std::none_of(check.references.begin(), check.references.end(), [&](const std::string& r) { return r.empty() || (r == publicRef && r.size() > 1); }))
         return fail(error, "The FLM's signature does not cover its public part");
@@ -217,7 +247,10 @@ bool readEtm(const std::string& xml, const QDomElement& root, Facility& f, std::
         d.manufacturer = text(desc, "ManufacturerName");
         d.model = text(desc, "ModelNumber");
         d.name = text(desc, "DeviceName");
-        if (!takeChain(d, certificatesIn(child(e, "KeyInfo")), false, f.name + ", device " + std::to_string(++n), error)) return false;
+        const std::string what = f.name + ", device " + std::to_string(++n);
+        if (!takeChain(d, certificatesIn(child(e, "KeyInfo")), false, what, error)) return false;
+        if (d.type == "SM" && serverRole(d.commonName) < 0)
+            return fail(error, what + ": its certificate names other devices' roles, not a security manager's (SM)");
         if (d.name.empty()) d.name = d.commonName.substr(d.commonName.find('.') == std::string::npos ? 0 : d.commonName.find('.') + 1);
         (d.type == "SM" ? servers : others).push_back(std::move(d));
     }
@@ -337,6 +370,7 @@ bool loadFacilities(std::vector<Facility>& out, std::string* error, const std::s
             c.screens.push_back(std::move(screen));
         }
         for (const QJsonValue& d : o.value("other_devices").toArray()) c.otherDevices.push_back(deviceFrom(d.toObject()));
+        for (const QJsonValue& p : o.value("signer").toArray()) c.signer.push_back(p.toString().toStdString());
         out.push_back(std::move(c));
     }
     return true;
@@ -346,7 +380,8 @@ bool saveFacilities(const std::vector<Facility>& list, std::string* error, const
     const QString path = QString::fromStdString(file.empty() ? facilitiesFile() : file);
     QJsonArray cinemas;
     for (const Facility& c : list) {
-        QJsonArray screens, others, emails, notes;
+        QJsonArray screens, others, emails, notes, signer;
+        for (const std::string& p : c.signer) signer.append(QString::fromStdString(p));
         for (const FacilityScreen& s : c.screens) {
             QJsonArray devices;
             for (const FacilityDevice& d : s.devices) devices.append(toJson(d));
@@ -364,7 +399,8 @@ bool saveFacilities(const std::vector<Facility>& list, std::string* error, const
                                    {"kdm_emails", emails},
                                    {"notes", notes},
                                    {"screens", screens},
-                                   {"other_devices", others}});
+                                   {"other_devices", others},
+                                   {"signer", signer}});
     }
     if (!QDir().mkpath(QFileInfo(path).path())) return fail(error, "Cannot make " + QFileInfo(path).path().toStdString());
     if (!dcp::writeWholeFile(path.toStdString(), QJsonDocument(QJsonObject{{"cinemas", cinemas}}).toJson().toStdString()))
@@ -372,9 +408,18 @@ bool saveFacilities(const std::vector<Facility>& list, std::string* error, const
     return true;
 }
 
-size_t mergeFacility(std::vector<Facility>& list, Facility f) {
+size_t mergeFacility(std::vector<Facility>& list, Facility f, std::vector<std::string>* changes) {
     for (size_t i = 0; i < list.size(); ++i)
         if (!f.id.empty() && list[i].id == f.id) {
+            if (changes) {
+                for (const FacilityScreen& s : f.screens)
+                    for (const FacilityScreen& was : list[i].screens)
+                        if (sameName(was.name, s.name) && !was.server.thumbprint.empty() && was.server.thumbprint != s.server.thumbprint)
+                            changes->push_back(f.name + ", screen " + s.name + ": its server's certificate has changed (thumbprint " +
+                                               was.server.thumbprint + " before, " + s.server.thumbprint + " now)");
+                if (!list[i].signer.empty() && !f.signer.empty() && certificateKey(list[i].signer.back()) != certificateKey(f.signer.back()))
+                    changes->push_back(f.name + ": its FLM is signed by another certificate than before (" + rootDescription(f.signer.back()) + ")");
+            }
             for (FacilityScreen& s : list[i].screens)
                 if (s.byHand && std::none_of(f.screens.begin(), f.screens.end(), [&](const FacilityScreen& o) { return sameName(o.name, s.name); }))
                     f.screens.push_back(std::move(s));
@@ -383,6 +428,101 @@ size_t mergeFacility(std::vector<Facility>& list, Facility f) {
         }
     list.push_back(std::move(f));
     return list.size() - 1;
+}
+
+std::string trustedRootsFile(const std::string& facilities) {
+    const QFileInfo list(QString::fromStdString(facilities.empty() ? facilitiesFile() : facilities));
+    return list.dir().filePath(QStringLiteral("dcp-trusted-roots.pem")).toStdString();
+}
+
+bool loadTrustedRoots(std::vector<std::string>& pems, std::string* error, const std::string& facilities) {
+    pems.clear();
+    QFile f(QString::fromStdString(trustedRootsFile(facilities)));
+    if (!f.exists()) return true;
+    if (!f.open(QIODevice::ReadOnly)) return fail(error, "Cannot read " + f.fileName().toStdString());
+    pems = dcp::splitCertificates(f.readAll().toStdString());
+    return true;
+}
+
+bool trustRoots(const std::vector<std::string>& given, std::string* error, const std::string& facilities) {
+    if (!dcp::securityAvailable()) return fail(error, "This build has no OpenSSL, so it cannot check certificates");
+    std::vector<std::string> roots;
+    if (!loadTrustedRoots(roots, error, facilities)) return false;
+    bool added = false;
+    for (const std::string& text : given)
+        for (const std::string& pem : dcp::splitCertificates(text)) {
+            // A root: a certificate authority that issues itself (its signature is checked with each chain it ends).
+            dcp::CertificateInfo info;
+            if (!dcp::readCertificate(pem, info)) return fail(error, "A root certificate cannot be read");
+            if (!info.ca || info.subject != info.issuer) return fail(error, info.commonName + " is not a root certificate (a self-signed certificate authority)");
+            if (std::any_of(roots.begin(), roots.end(), [&](const std::string& r) { return certificateKey(r) == certificateKey(pem); })) continue;
+            roots.push_back(pem);
+            added = true;
+        }
+    if (!added) return true;
+    std::string text;
+    for (const std::string& r : roots) text += r.back() == '\n' ? r : r + "\n";
+    const QString path = QString::fromStdString(trustedRootsFile(facilities));
+    if (!QDir().mkpath(QFileInfo(path).path())) return fail(error, "Cannot make " + QFileInfo(path).path().toStdString());
+    if (!dcp::writeWholeFile(path.toStdString(), text)) return fail(error, "Cannot write " + path.toStdString());
+    return true;
+}
+
+std::string rootDescription(const std::string& pem) {
+    dcp::CertificateInfo info;
+    if (!dcp::readCertificate(pem, info)) return "a certificate that cannot be read";
+    std::string name = info.commonName.empty() ? info.subject : info.commonName;
+    if (!info.organisation.empty()) name += " (" + info.organisation + ")";
+    return name + ", thumbprint " + info.thumbprint;
+}
+
+std::vector<std::string> untrustedRoots(const Facility& f, const std::vector<Facility>& list, const std::vector<std::string>& trusted) {
+    std::vector<std::string> known;  // what the list already holds for this cinema: certificates trusted before
+    for (const Facility& c : list) {
+        if (f.id.empty() || c.id != f.id) continue;
+        auto keep = [&](const FacilityDevice& d) {
+            if (!d.certificates.empty()) known.push_back(certificateKey(d.certificates.back()));
+        };
+        for (const FacilityScreen& s : c.screens) {
+            keep(s.server);
+            for (const FacilityDevice& d : s.devices) keep(d);
+        }
+        for (const FacilityDevice& d : c.otherDevices) keep(d);
+        if (!c.signer.empty()) known.push_back(certificateKey(c.signer.back()));
+    }
+    std::vector<std::string> roots;
+    for (const std::string& t : trusted) roots.push_back(certificateKey(t));
+    std::vector<std::string> out, seen;
+    auto check = [&](const std::vector<std::string>& chain) {
+        if (chain.empty()) return;
+        if (std::find(known.begin(), known.end(), certificateKey(chain.back())) != known.end()) return;
+        const std::string root = certificateKey(chain.front());
+        if (std::find(roots.begin(), roots.end(), root) != roots.end() || std::find(seen.begin(), seen.end(), root) != seen.end()) return;
+        seen.push_back(root);
+        out.push_back(chain.front());
+    };
+    for (const FacilityScreen& s : f.screens) {
+        if (s.byHand) continue;  // (given by the user)
+        check(s.server.certificates);
+        for (const FacilityDevice& d : s.devices) check(d.certificates);
+    }
+    for (const FacilityDevice& d : f.otherDevices) check(d.certificates);
+    check(f.signer);
+    return out;
+}
+
+bool takeFlm(std::vector<Facility>& list, Facility f, const std::vector<std::string>& trusted, std::string* error, std::vector<std::string>* untrusted,
+             std::vector<std::string>* changes) {
+    const std::vector<std::string> roots = untrustedRoots(f, list, trusted);
+    if (!roots.empty()) {
+        if (untrusted) *untrusted = roots;
+        std::string names;
+        for (const std::string& r : roots) names += (names.empty() ? "" : "; ") + rootDescription(r);
+        return fail(error, "The FLM of " + f.name + " has certificates from roots not trusted: " + names +
+                               ". Trust a root only once its maker or the cinema has confirmed its thumbprint");
+    }
+    mergeFacility(list, std::move(f), changes);
+    return true;
 }
 
 bool addScreenByHand(std::vector<Facility>& list, const std::string& cinema, const std::string& screen, const std::string& server,
@@ -427,7 +567,7 @@ KdmScreen kdmScreen(const Facility& cinema, const FacilityScreen& screen) {
     KdmScreen k;
     k.cinema = cinema.name;
     k.screen = screen.name;
-    k.certificate = screen.server.certificates.empty() ? std::string() : screen.server.certificates.back();
+    for (const std::string& c : screen.server.certificates) k.certificate += c.empty() || c.back() == '\n' ? c : c + "\n";  // (the chain: its dates checked)
     k.timeZone = cinema.timeZone;
     for (const FacilityDevice& d : screen.devices)
         if (d.active && !d.thumbprint.empty() && std::find(k.trustedDevices.begin(), k.trustedDevices.end(), d.thumbprint) == k.trustedDevices.end())

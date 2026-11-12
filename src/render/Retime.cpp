@@ -27,17 +27,22 @@ void sampleBilinear(const Image& img, double x, double y, float out[4]) {
     }
 }
 
-std::shared_ptr<const FlowField> flowBetween(const Image& a, const Image& b, const std::string& key, double& scale) {
+}  // namespace
+
+std::shared_ptr<const FlowField> frameFlow(const Image* a, const Image* b, const std::string& key, int width, double& scale) {
     static std::mutex m;
     static std::deque<std::pair<std::string, std::shared_ptr<const FlowField>>> cache;
-    const GrayImage ga = toGray(a, kFlowWidth);
-    scale = double(a.width) / ga.width;
+    // (as toGray shrinks a picture: by a whole number of pixels to one)
+    const int k = std::max(1, int(std::ceil(double(width) / kFlowWidth)));
+    scale = double(width) / std::max(1, width / k);
     if (!key.empty()) {
         std::lock_guard lock(m);
-        for (const auto& [k, f] : cache)
-            if (k == key) return f;
+        for (const auto& [k2, f] : cache)
+            if (k2 == key) return f;
     }
-    const GrayImage gb = toGray(b, kFlowWidth);
+    if (!a || !b) return nullptr;
+    const GrayImage ga = toGray(*a, kFlowWidth);
+    const GrayImage gb = toGray(*b, kFlowWidth);
     auto flow = std::make_shared<const FlowField>(denseFlow(ga, gb, kFlowStep));
     if (!key.empty()) {
         std::lock_guard lock(m);
@@ -46,8 +51,6 @@ std::shared_ptr<const FlowField> flowBetween(const Image& a, const Image& b, con
     }
     return flow;
 }
-
-}  // namespace
 
 Image blendFrames(const Image& a, const Image& b, double t) {
     if (a.width != b.width || a.height != b.height) return t < 0.5 ? a : b;
@@ -66,7 +69,7 @@ Image blendFrames(const Image& a, const Image& b, double t) {
 Image interpolateFrames(const Image& a, const Image& b, double t, const std::string& cacheKey) {
     if (a.width != b.width || a.height != b.height || a.width < 16 || a.height < 16) return blendFrames(a, b, t);
     double scale = 1;
-    const auto flow = flowBetween(a, b, cacheKey, scale);
+    const auto flow = frameFlow(&a, &b, cacheKey, a.width, scale);
     Image out(a.width, a.height, Image::Uninitialized{});
     const double u = std::clamp(t, 0.0, 1.0);
     parallelRows(a.height, [&](int y0, int y1) {

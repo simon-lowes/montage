@@ -64,6 +64,7 @@ struct HeifStillInfo {
     std::string codec;  // "hevc", "av1"
     bool grid = false;
     int primaries = 0, transfer = 0;
+    bool adobeRgb = false;  // its ICC profile's primaries are Adobe RGB's, which no code point names
     double maxCll = 0, maxFall = 0;
     bool gainMap = false;
     double hdrMaxCll = 0, hdrMaxFall = 0;  // (the gain map's HDR rendition's, from its tone-mapped item)

@@ -30,6 +30,7 @@
 #endif
 
 #include "core/Cea708.h"
+#include "media/JpegXs.h"
 #include "render/VideoPacking.h"
 
 namespace montage::st2110 {
@@ -325,7 +326,9 @@ bool videoFormatOk(const VideoFormat& f, std::string* why) {
         if (why) *why = w;
         return false;
     };
-    if (f.depth != 8 && f.depth != 10 && f.depth != 12) return fail("ST 2110-20 is sent here at 8, 10 or 12 bits");
+    if (f.codec != "raw" && f.codec != "jxsv") return fail("Montage sends and receives ST 2110-20 and ST 2110-22's JPEG XS, not " + f.codec);
+    if (f.depth != 8 && f.depth != 10 && f.depth != 12)
+        return fail(f.jpegXs() ? "ST 2110-22's JPEG XS is sent here at 8, 10 or 12 bits" : "ST 2110-20 is sent here at 8, 10 or 12 bits");
     if (f.width <= 0 || f.height <= 0 || !f.fps.valid()) return fail("ST 2110 carries pictures of a size at a frame rate");
     // (what an SDP, which anyone on the network can hand an NMOS receiver, may ask to be held)
     if (f.width > 8192 || f.height > 4320) return fail("ST 2110 pictures here are at most 8192 x 4320");
@@ -334,6 +337,14 @@ bool videoFormatOk(const VideoFormat& f, std::string* why) {
     // (and not both: what it may ask to be received a second is bounded too, at 8192 x 4320 at 60 frames)
     if (double(f.width) * f.height * f.fps.toDouble() > 8192.0 * 4320 * 60)
         return fail("ST 2110 pictures here are at most as many pixels a second as 8192 x 4320 at 60 frames");
+    if (f.jpegXs()) {
+        if (f.interlaced) return fail("ST 2110-22's JPEG XS is sent and received here progressive");
+        if (f.sampling == Sampling::Ycc422 && f.width % 2) return fail("JPEG XS at 4:2:2 needs an even width");
+        if (f.width < 16 || f.height < 16) return fail("JPEG XS pictures here are at least 16 x 16");
+        if (!(f.bpp >= 0.5 && f.bpp <= 24)) return fail("JPEG XS is coded here at 0.5 to 24 bits a pixel");
+        if (f.packetMode != 0 && f.packetMode != 1) return fail("RFC 9134's packetization mode is 0 (codestream) or 1 (slice)");
+        return true;
+    }
     const Pgroup pg = pgroup(f.sampling, f.depth);
     if (f.width % pg.pixels)
         return fail(samplingName(f.sampling) + " at " + std::to_string(f.depth) + " bits needs a width in whole groups of " +
@@ -373,10 +384,11 @@ std::string sdpSession(const SdpOptions& o, bool duplicated) {
     return s.str();
 }
 
-std::string sdpMedia(const Endpoint& to, const SdpOptions& o, const std::string& source, const std::string& media, int pt) {
+std::string sdpMedia(const Endpoint& to, const SdpOptions& o, const std::string& source, const std::string& media, int pt, int64_t kbps) {
     std::ostringstream s;
     s << "m=" << media << " " << to.port << " RTP/AVP " << pt << "\r\n"
       << "c=IN IP4 " << to.address << (isMulticast(to.address) ? "/" + std::to_string(o.ttl) : std::string()) << "\r\n";
+    if (kbps > 0) s << "b=AS:" << kbps << "\r\n";
     if (isMulticast(to.address) && !source.empty()) s << "a=source-filter: incl IN IP4 " << to.address << " " << source << "\r\n";
     return s.str();
 }
@@ -384,16 +396,31 @@ std::string sdpMedia(const Endpoint& to, const SdpOptions& o, const std::string&
 std::string sdpClock(const SdpOptions& o) { return "a=ts-refclk:" + o.refclk + "\r\na=mediaclk:direct=0\r\n"; }
 
 // The session, then each path's media description (the same attributes, its own address and "a=mid").
-std::string sdpStreams(const Endpoint& to, const SdpOptions& o, const Endpoint* to2, const std::string& media, int pt, const std::string& attributes) {
-    std::string out = sdpSession(o, to2 != nullptr) + sdpMedia(to, o, o.source, media, pt) + attributes;
+// (`kbps`: a b=AS line's bandwidth, 0 none)
+std::string sdpStreams(const Endpoint& to, const SdpOptions& o, const Endpoint* to2, const std::string& media, int pt, const std::string& attributes,
+                       int64_t kbps = 0) {
+    std::string out = sdpSession(o, to2 != nullptr) + sdpMedia(to, o, o.source, media, pt, kbps) + attributes;
     if (!to2) return out;
-    return out + "a=mid:primary\r\n" + sdpMedia(*to2, o, o.source2, media, pt) + attributes + "a=mid:secondary\r\n";
+    return out + "a=mid:primary\r\n" + sdpMedia(*to2, o, o.source2, media, pt, kbps) + attributes + "a=mid:secondary\r\n";
 }
 
 }  // namespace
 
 std::string videoSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOptions& o, const Endpoint* to2) {
     std::ostringstream s;
+    if (f.jpegXs()) {
+        // ST 2110-22 (its frame size, TP and SSN, and the bandwidth) with RFC 9134's parameters (sequential packets).
+        s << "a=rtpmap:" << pt << " jxsv/90000\r\n"
+          << "a=fmtp:" << pt << " packetmode=" << f.packetMode << "; transmode=1";
+        if (!f.profile.empty()) s << "; profile=" << f.profile;
+        if (!f.level.empty()) s << "; level=" << f.level;
+        if (!f.sublevel.empty()) s << "; sublevel=" << f.sublevel;
+        s << "; sampling=" << samplingName(f.sampling) << "; width=" << f.width << "; height=" << f.height << "; depth=" << f.depth
+          << "; exactframerate=" << rateText(f.fps) << "; colorimetry=" << f.colorimetry << "; TCS=" << f.tcs
+          << "; RANGE=NARROW; SSN=ST2110-22:2022; TP=2110TPW\r\n"
+          << sdpClock(o);
+        return sdpStreams(to, o, to2, "video", pt, s.str(), f.bandwidthKbps);
+    }
     // (RGB is full range in ST 2110-20's sense only when said; Montage sends it narrow, as YCbCr)
     s << "a=rtpmap:" << pt << " raw/90000\r\n"
       << "a=fmtp:" << pt << " sampling=" << samplingName(f.sampling) << "; width=" << f.width << "; height=" << f.height
@@ -422,19 +449,21 @@ std::string audioSdp(const AudioFormat& f, const Endpoint& to, int pt, const Sdp
 }
 
 std::string metadataSdp(const Endpoint& to, int pt, const SdpOptions& o, const std::vector<uint32_t>& types, const Endpoint* to2) {
+    // (ST 2110-41:2026: an "application" media type; SSN as its 2024 edition, which it keeps; DIT in hexadecimal,
+    // capitals without "0x" or spaces)
     std::ostringstream s;
-    s << "a=rtpmap:" << pt << " ST2110-41/90000\r\n";
+    s << "a=rtpmap:" << pt << " ST2110-41/90000\r\n"
+      << "a=fmtp:" << pt << " SSN=ST2110-41:2024";
     if (!types.empty()) {
-        s << "a=fmtp:" << pt << " DIT=";
+        s << "; DIT=";
         char t[16];
         for (size_t i = 0; i < types.size(); ++i) {
-            std::snprintf(t, sizeof t, "%s0x%06X", i ? "," : "", unsigned(types[i] & 0x3FFFFF));
+            std::snprintf(t, sizeof t, "%s%X", i ? "," : "", unsigned(types[i] & 0x3FFFFF));
             s << t;
         }
-        s << "\r\n";
     }
-    s << sdpClock(o);
-    return sdpStreams(to, o, to2, "video", pt, s.str());
+    s << "\r\n" << sdpClock(o);
+    return sdpStreams(to, o, to2, "application", pt, s.str());
 }
 
 std::string ancSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOptions& o, const std::vector<std::pair<int, int>>& ids,
@@ -763,9 +792,17 @@ std::vector<uint32_t> unpackAm824(const uint8_t* payload, size_t size, int chann
 
 // ---- ST 2110-41.
 
+namespace {
+// Whether ST 2110-41 carries the item: some words, no more than an item holds, a type of 22 bits.
+bool metadataFits(const FastMetadata& m) {
+    return !m.words.empty() && m.words.size() <= kMaxMetadataWords && 4 + m.words.size() * 4 <= kMaxMetadataPayload && m.type <= 0x3FFFFF;
+}
+}  // namespace
+
 bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload) {
+    const size_t room = std::clamp<size_t>(size_t(std::max(maxPayload, 8)), 8, kMaxMetadataPayload);
     for (const FastMetadata& m : items)
-        if (m.words.size() > 511 || m.type > 0x3FFFFF) return false;
+        if (!metadataFits(m)) return false;
     std::vector<uint8_t> packet;
     bool ok = true;
     size_t i = 0;
@@ -774,19 +811,79 @@ bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp
         packet.assign(12, 0);
         while (i < items.size()) {
             const size_t bytes = 4 + items[i].words.size() * 4;
-            // (items a packet holds; one alone bigger than that still goes, a packet of its own)
-            if (packet.size() > 12 && packet.size() - 12 + bytes > size_t(std::max(maxPayload, 4))) break;
+            // (items a packet holds; one alone longer than `maxPayload` still goes, a packet of its own within the
+            // UDP size limit)
+            if (packet.size() > 12 && packet.size() - 12 + bytes > room) break;
             const size_t at = packet.size();
             packet.resize(at + bytes);
             put32(packet.data() + at, items[i].type << 10 | uint32_t(items[i].k) << 9 | uint32_t(items[i].words.size()));
             for (size_t w = 0; w < items[i].words.size(); ++w) put32(packet.data() + at + 4 + w * 4, items[i].words[w]);
             ++i;
         }
-        rtpHeader(packet.data(), i >= items.size(), rtp, timestamp);
+        // (ST 2110-41:2026: the marker bit 0 on every packet)
+        rtpHeader(packet.data(), false, rtp, timestamp);
         ++rtp.sequence;
         ok = send(packet.data(), packet.size()) && ok;
     } while (ok && i < items.size());
     return ok;
+}
+
+std::vector<FastMetadata> segmentObject(uint32_t type, const uint8_t* data, size_t size, size_t maxWords) {
+    std::vector<FastMetadata> out;
+    const size_t per = std::clamp<size_t>(maxWords, 2, kMaxMetadataWords) - 1;
+    const size_t words = (size + 3) / 4;
+    for (size_t at = 0; at < words || (words == 0 && out.empty()); at += per) {
+        FastMetadata m;
+        m.type = type & 0x3FFFFF;
+        const size_t n = std::min(per, words - at);
+        m.k = at + n >= words;
+        m.words.reserve(n + 1);
+        m.words.push_back(uint32_t(at));
+        for (size_t w = 0; w < n; ++w) {
+            uint32_t v = 0;
+            for (size_t b = 0; b < 4; ++b) {
+                const size_t k = (at + w) * 4 + b;
+                v = v << 8 | (k < size ? data[k] : 0);
+            }
+            m.words.push_back(v);
+        }
+        out.push_back(std::move(m));
+        if (words == 0) break;
+    }
+    return out;
+}
+
+FastMetadata frameItem(int64_t frame, const output::Timecode& tc) {
+    FastMetadata m;
+    m.type = kFrameItemType;
+    const uint32_t when = uint32_t(tc.dropFrame) << 31 | uint32_t(tc.hours & 0x7F) << 24 | uint32_t(tc.minutes & 0xFF) << 16 |
+                          uint32_t(tc.seconds & 0xFF) << 8 | uint32_t(tc.frames & 0xFF);
+    m.words = {uint32_t(uint64_t(frame) >> 32), uint32_t(uint64_t(frame)), when};
+    return m;
+}
+
+bool parseFrameItem(const FastMetadata& m, int64_t& frame, output::Timecode* tc) {
+    if (m.type != kFrameItemType || m.words.size() < 3) return false;
+    frame = int64_t(uint64_t(m.words[0]) << 32 | m.words[1]);
+    if (tc) {
+        const uint32_t w = m.words[2];
+        tc->dropFrame = w >> 31;
+        tc->hours = int((w >> 24) & 0x7F), tc->minutes = int((w >> 16) & 0xFF), tc->seconds = int((w >> 8) & 0xFF), tc->frames = int(w & 0xFF);
+    }
+    return true;
+}
+
+bool joinObject(const std::vector<FastMetadata>& items, uint32_t type, std::vector<uint32_t>& out) {
+    out.clear();
+    for (const FastMetadata& m : items) {
+        if (m.type != type || m.words.empty()) continue;
+        // (a segment from offset 0 starts the object again)
+        if (m.words[0] == 0) out.clear();
+        else if (m.words[0] != out.size()) continue;
+        out.insert(out.end(), m.words.begin() + 1, m.words.end());
+        if (m.k) return true;
+    }
+    return false;
 }
 
 bool unpackFastMetadata(const uint8_t* payload, size_t size, std::vector<FastMetadata>& out) {
@@ -1136,6 +1233,17 @@ std::string sourceAddress(const std::string& interfaceAddress, const sockaddr_in
 
 }  // namespace
 
+struct Sender::Jxs {
+    JxsEncoder encoder;
+};
+
+namespace {
+std::string withoutSpaces(std::string t) {
+    t.erase(std::remove(t.begin(), t.end(), ' '), t.end());
+    return t;
+}
+}  // namespace
+
 Sender::Sender() = default;
 Sender::~Sender() { close(); }
 
@@ -1166,6 +1274,41 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
     if (o.sendAudio && !audio.aes3 && (audio.rate != 48000 || audio.channels < 1 || audio.channels > 8 || (audio.bits != 24 && audio.bits != 16) ||
                         (audio.packetUs != 1000 && audio.packetUs != 125)))
         return fail("ST 2110-30 here carries 1 to 8 channels at 48 kHz, L24 or L16, in 1 ms or 125 µs packets");
+    // ST 2110-22: the encoder, and from a first codestream the stream's profile, level, packets and bandwidth.
+    VideoFormat vf = video;
+    jxs_.reset();
+    codestream_.clear();
+    boxes_.clear();
+    units_.clear();
+    if (vf.jpegXs() && o.sendVideo) {
+        if (!jpegXsAvailable()) return fail("This build of Montage has no JPEG XS (SVT-JPEG-XS)");
+        jxs_ = std::make_unique<Jxs>();
+        JxsEncodeSettings es;
+        es.width = vf.width;
+        es.height = vf.height;
+        es.depth = vf.depth;
+        es.sampling = vf.sampling == Sampling::Ycc422 ? JxsSampling::Ycc422 : vf.sampling == Sampling::Ycc444 ? JxsSampling::Ycc444 : JxsSampling::Rgb;
+        es.bppNum = int(std::lround(vf.bpp * 1000));
+        es.bppDen = 1000;
+        es.slices = vf.packetMode == 1;
+        if (!jxs_->encoder.open(es, &why)) return fail(why);
+        Raster grey(vf.width, vf.height, vf.sampling, vf.depth);
+        std::fill(grey.samples.begin(), grey.samples.end(), uint16_t(1 << (vf.depth - 1)));
+        std::vector<uint8_t> cs;
+        std::vector<uint32_t> units;
+        JxsHeader h;
+        if (!jxs_->encoder.encode(jxsPictureOf(grey), cs, &units, &why)) return fail(why);
+        if (!readJxsHeader(cs.data(), cs.size(), h)) return fail("SVT-JPEG-XS made no JPEG XS codestream");
+        vf.profile = withoutSpaces(jxsProfileName(h.ppih));
+        vf.level = withoutSpaces(jxsLevelName(h.plev));
+        vf.sublevel = withoutSpaces(jxsSublevelName(h.plev));
+        boxes_ = jxsvBoxes(vf, h.ppih, h.plev, uint32_t(cs.size()));
+        // (ST 2110-22's b=AS: each frame's IP packets, their IPv4, UDP and RTP headers and RFC 9134's, in kilobits a
+        // second, rounded up)
+        const int packets = jxsvPacketCount(boxes_.size(), cs.size(), units, vf.packetMode, o.maxPayload);
+        const double bits = (double(boxes_.size() + cs.size()) + double(packets) * (20 + 8 + 12 + 4)) * 8;
+        vf.bandwidthKbps = int64_t(std::ceil(bits * vf.fps.num / vf.fps.den / 1000));
+    }
     s_ = std::make_unique<Sockets>();
     s_->s = senderSocket(o, o.interfaceAddress, &why);
     if (s_->s == kBad) return fail(why);
@@ -1184,7 +1327,7 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
     s_->audio = socketAddress(o.audio);
     s_->anc = socketAddress(o.anc);
     o_ = o;
-    video_ = video;
+    video_ = vf;
     audio_ = audio;
     std::random_device rd;
     std::mt19937 rng(rd());
@@ -1207,7 +1350,10 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
     return true;
 }
 
-void Sender::close() { s_.reset(); }
+void Sender::close() {
+    s_.reset();
+    jxs_.reset();
+}
 
 bool Sender::isOpen() const { return s_ != nullptr; }
 int64_t Sender::packetsDropped() const { return s_ ? s_->queueDrops : 0; }
@@ -1257,6 +1403,13 @@ void Sender::queueAes3(const uint32_t* words, int frames) {
 bool Sender::send(const uint8_t* data, size_t stride, output::PixelFormat format, const float* audio, int audioFrames,
                   const output::Timecode* timecode, const std::vector<AncPacket>& anc, const std::atomic<bool>* stop) {
     if (!s_) return false;
+    if (video_.jpegXs()) {
+        // (the rows as a raster of 4:2:2 at their depth, then coded)
+        if (format == output::PixelFormat::P216 || !data || video_.sampling != Sampling::Ycc422 || video_.depth != (tenBit(format) ? 10 : 8)) return false;
+        Raster r(video_.width, video_.height, Sampling::Ycc422, video_.depth);
+        for (int y = 0; y < video_.height; ++y) rowComponents(data + size_t(y) * stride, format, video_.width, r.row(y));
+        return sendJxs(r, audio, audioFrames, timecode, anc, stop);
+    }
     // (rows of the reference output: 4:2:2 at the video format's size)
     return sendFrame([&](int field, uint32_t ts, const PacketSink& keep) {
         return packVideo(data, stride, format, video_.width, video_.height, field, ts, rtpVideo_, keep, o_.maxPayload);
@@ -1268,8 +1421,23 @@ bool Sender::send(const Raster& picture, const float* audio, int audioFrames, co
     if (!s_ || picture.width != video_.width || picture.height != video_.height || picture.sampling != video_.sampling ||
         picture.depth != video_.depth)
         return false;
+    if (video_.jpegXs()) return sendJxs(picture, audio, audioFrames, timecode, anc, stop);
     return sendFrame([&](int field, uint32_t ts, const PacketSink& keep) { return packVideo(picture, field, ts, rtpVideo_, keep, o_.maxPayload); },
                      audio, audioFrames, timecode, anc, stop);
+}
+
+bool Sender::sendJxs(const Raster& picture, const float* audio, int audioFrames, const output::Timecode* timecode, const std::vector<AncPacket>& anc,
+                     const std::atomic<bool>* stop) {
+    // Coded before its slot comes (a constant number of bytes, so of packets), then sent as the slot's packets are.
+    if (o_.sendVideo) {
+        if (!jxs_) return false;
+        std::string why;
+        if (!jxs_->encoder.encode(jxsPictureOf(picture), codestream_, &units_, &why)) return false;
+    }
+    const int64_t frame = frames_;
+    return sendFrame([&](int, uint32_t ts, const PacketSink& keep) {
+        return packJxsv(boxes_, codestream_.data(), codestream_.size(), units_, video_.packetMode, frame, ts, rtpVideo_, keep, o_.maxPayload);
+    }, audio, audioFrames, timecode, anc, stop);
 }
 
 bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const PacketSink& keep)>& pack, const float* audio, int audioFrames,
@@ -1295,7 +1463,9 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
     const int64_t catchUp = std::max<int64_t>(1, num / (5 * den));
     if (nextFrame_ == 0 || frameStart(nextFrame_ + catchUp) < now) {
         const bool behind = nextFrame_ != 0;
-        nextFrame_ = mulDiv(now, num, second * den) + 1;
+        const int64_t from = mulDiv(now, num, second * den) + 1;
+        if (behind) skipped_ += std::max<int64_t>(0, from - nextFrame_);
+        nextFrame_ = from;
         audioSample_ = mulDiv(frameStart(nextFrame_), audio_.rate, second);
         audioFifo_.clear();
         // (AES3 words fallen behind dropped as the PCM is, all but a frame's, in whole blocks of 192 frames so the
@@ -1358,6 +1528,9 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
             ok = packAnc(out, field, ts, rtpAnc_, [&](const uint8_t* p, size_t n) { return s_->to(2, p, n); });
         }
         if (ok && o_.sendMetadata && f == 0) {
+            // (an item the stream cannot carry is left out: the frame's picture and sound go all the same)
+            nextMetadata_.erase(std::remove_if(nextMetadata_.begin(), nextMetadata_.end(), [](const FastMetadata& m) { return !metadataFits(m); }),
+                                nextMetadata_.end());
             ok = packFastMetadata(nextMetadata_, ts, rtpMeta_, [&](const uint8_t* p, size_t n) { return s_->to(3, p, n); }, o_.maxPayload);
             nextMetadata_.clear();
         }
@@ -1389,6 +1562,11 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
                 if (stopped()) return false;
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
+        }
+        if (ok && o_.sendMetadata && f == 0 && end - start > second / 2) {
+            // (ST 2110-41: a packet at least every 500 ms, so below two frames a second an empty one between)
+            if (!waitUntil(start + (end - start) / 2)) return false;
+            ok = packFastMetadata({}, ts, rtpMeta_, [&](const uint8_t* p, size_t n) { return s_->to(3, p, n); }, o_.maxPayload);
         }
     }
     if (!ok) return false;
@@ -1559,10 +1737,24 @@ public:
                                                            : st2110::Sampling::Ycc422;
         v.tcs = signal.eotf == Eotf::Pq ? "PQ" : signal.eotf == Eotf::Hlg ? "HLG" : "SDR";
         v.colorimetry = signal.eotf != Eotf::Sdr ? "BT2100" : signal.bt2020 ? "BT2020" : "BT709";
+        if (o.jpegXs) {
+            // (ST 2110-22: the same pictures coded as JPEG XS)
+            v.codec = "jxsv";
+            v.bpp = o.jpegXsBpp;
+            v.packetMode = o.jpegXsPacketMode;
+        }
         st2110::AudioFormat a;
         a.channels = std::max(1, audioChannels);
         a.rate = audioRate;
+        if (o.aes3) {
+            // (ST 2110-31: the same sound as AES3 subframes, PCM with professional channel status)
+            a.aes3 = true;
+            if (a.channels > 6) a.packetUs = 125;
+        }
         o.sendAudio = o.sendAudio && audioChannels > 0;
+        // (ST 2110-41: each frame's number and time code, the item named in the SDP)
+        if (o.sendMetadata && std::find(o.metadataTypes.begin(), o.metadataTypes.end(), st2110::kFrameItemType) == o.metadataTypes.end())
+            o.metadataTypes.push_back(st2110::kFrameItemType);
         std::lock_guard lock(m_);
         stop_ = false;
         cdpSequence_ = 0;
@@ -1581,6 +1773,7 @@ public:
         }
         const float* audio = a.channels > 0 ? a.samples : nullptr;
         const int audioFrames = a.channels > 0 ? a.frames : 0;
+        if (sender_.options().sendMetadata) sender_.setNextMetadata({st2110::frameItem(f.frame, f.timecode)});
         if (f.format == PixelFormat::V210 || f.format == PixelFormat::Uyvy8)
             return sender_.send(f.data, f.stride, f.format, audio, audioFrames, &f.timecode, anc, &stop_);
         // The 16-bit formats' samples cut to the stream's depth.
@@ -1623,6 +1816,7 @@ public:
         out["video"] = sender_.sdpVideo();
         if (!sender_.sdpAudio().empty()) out["audio"] = sender_.sdpAudio();
         if (!sender_.sdpAnc().empty()) out["data"] = sender_.sdpAnc();
+        if (!sender_.sdpMetadata().empty()) out["metadata"] = sender_.sdpMetadata();
         return out;
     }
     bool streams(st2110::VideoFormat& video, st2110::AudioFormat& audio, st2110::SenderOptions& options) {

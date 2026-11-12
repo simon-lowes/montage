@@ -2,7 +2,8 @@
 // ST 2110 streams from their SDP files, SRT, RIST or UDP streams, an Open Media Transport source, a camera or capture
 // card). Each tile shows its picture with its label, its tally (red while it records, green while it is on the Source
 // monitor), its sound's meters and its timecode. The inputs chosen are recorded while Record is on, each into the
-// capture folder and the Captures bin as File › Capture records them (growing there as they record); a tile
+// capture folder and the Captures bin as File › Capture records them (growing there as they record), from the
+// reception it is watched by (its feed is not opened again to record it, nor when its recording ends); a tile
 // double-clicked is watched on the Source monitor, where In and Out are marked live and the range cut in. An input
 // whose feed stops is waited for again.
 #pragma once
@@ -52,6 +53,8 @@ public:
         int width = 0, height = 0;
         std::vector<float> peaks;
         QString path;            // being or last recorded
+        int64_t repeated = 0;    // pictures the recording holds again for frames that did not come
+        int opened = 0;          // times its feed was opened (recording an input being watched does not open it again)
         Id media = 0;            // its media item, once imported
         QString error;           // why it is not showing
     };

@@ -9,8 +9,10 @@
 // for bit, as the plug-in gives in Montage's own process.
 //
 // How plug-ins are grouped into hosts is a setting: each plug-in in a host of its own (the default: the instances of
-// one plug-in share it, and a fault in one plug-in reaches no other), one host for each maker, all plug-ins in one host,
-// or none (in Montage's own process). ARA plug-ins always run in Montage's process, as ARA shares the document.
+// one plug-in share it, and a fault in one plug-in reaches no other), each instance in a host of its own, one host for
+// each maker, all plug-ins in one host, or none (in Montage's own process). ARA plug-ins always run in Montage's
+// process, as ARA shares the document. A host notes which plug-in it is loading, so one that crashes while loading in
+// a shared host is blocked alone, and the others in that host are started again as if nothing of theirs failed.
 //
 // When a host fails — it crashes, it does not answer for a set number of audio blocks in a row during playback, or it
 // uses more memory than the limit — every instance in it is bypassed (its input passes, delayed by its latency, or
@@ -33,8 +35,10 @@
 
 namespace montage::plugins {
 
-enum class Isolation { PerPlugin, PerVendor, Shared, InProcess };
-const char* isolationName(Isolation i);  // "plugin", "vendor", "shared", "off"
+// (PerInstance: each instance in a host of its own, so a fault in one reaches not even another instance of the same
+// plug-in; the most memory.)
+enum class Isolation { PerPlugin, PerVendor, Shared, InProcess, PerInstance };
+const char* isolationName(Isolation i);  // "plugin", "vendor", "shared", "off", "instance"
 std::optional<Isolation> isolationFromName(std::string_view name);
 
 struct HostingSettings {
@@ -79,6 +83,22 @@ private:
 };
 bool renderingRealtime();
 
+// An export marks its thread with this for as long as it renders. A plug-in that fails in its host, or is found
+// bypassed, by an offline render on a thread so marked stops that export (offlineFailureSerial() goes up). Met by any
+// other offline render, such as a background analysis with a mixer of its own, it is recorded for the main window's
+// bar and nothing more: an export running beside it carries on, as its own mixer has lost nothing.
+class ExportScope {
+public:
+    ExportScope();
+    ~ExportScope();
+    ExportScope(const ExportScope&) = delete;
+    ExportScope& operator=(const ExportScope&) = delete;
+
+private:
+    bool previous_;
+};
+bool renderingForExport();
+
 // An audio plug-in in a host process of the given grouping, whatever the setting (null with why when it cannot start).
 std::unique_ptr<Instance> instantiateIsolated(const Descriptor& d, Isolation grouping, std::string* error = nullptr);
 // The host process an instance runs in (0: Montage's own process).
@@ -101,7 +121,8 @@ struct HostFailure {
 std::vector<HostFailure> hostFailures();
 // Goes up with each failure, restart or change of the list (the main window's bar watches it).
 uint64_t hostFailureSerial();
-// Goes up with each failure during an offline render; lastOfflineFailure() says what it was.
+// Goes up with each failure during an export's render (ExportScope; an OpenFX plug-in's during any offline render);
+// lastOfflineFailure() says what it was.
 uint64_t offlineFailureSerial();
 std::string lastOfflineFailure();
 // Starts the plug-in's bypassed instances again, in fresh hosts, with their last saved states (false: none bypassed).

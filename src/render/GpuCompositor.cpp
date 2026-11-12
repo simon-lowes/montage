@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "Processing.h"
+#include "ShapeRaster.h"
 #include "media/HwAccel.h"
 
 namespace montage::gpu {
@@ -158,6 +159,8 @@ public:
 
     bool draw(const Frame& frame, Image* out, QImage* out8);
     long filterPasses = 0, mixPasses = 0;  // (the last frame's)
+    long shaderBuilds = 0;                 // (shader steps built, the last frame)
+    long shapeLayers = 0;                  // (Shape layers drawn, the last frame)
     long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
     std::string hwFallback;                // (why the last of them that could not be mapped was copied back)
     std::atomic<bool> lose{false};         // (tests: the next frame finds the device lost)
@@ -181,6 +184,7 @@ private:
     void release(QRhiTexture* tex);  // back to the pool, for later passes of the frame
     Target* target(QRhiTexture* tex);  // (null, and the frame failed, when the device cannot draw into it)
     QRhiTexture* lutTexture(const std::shared_ptr<const Lut3D>& lut, QRhiResourceUpdateBatch* u, QRhiTexture** table1d);
+    QRhiTexture* sharedTable(const std::shared_ptr<const std::vector<float>>& rows, int width, QRhiResourceUpdateBatch* u);
     QRhiBuffer* uniforms(QRhiResourceUpdateBatch* u, const float (&p)[64]);
     void pass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdateBatch* u,
               const std::vector<std::pair<int, QRhiTexture*>>& textures, QRhiBuffer* ubuf, QRhiResourceUpdateBatch* after = nullptr);
@@ -268,6 +272,14 @@ private:
     std::map<const Lut3D*, LutTex> luts_;
     // Those first uploaded in this frame: forgotten if it fails, as their uploads may not have been submitted.
     std::vector<const Lut3D*> lutsNew_;
+    // Filters' shared tables uploaded (Aperture Glare's spectra and twiddles), by the table, kept while it lives; and
+    // those uploaded in this frame.
+    struct SharedTex {
+        std::weak_ptr<const std::vector<float>> rows;
+        QRhiTexture* tex;
+    };
+    std::map<const std::vector<float>*, SharedTex> sharedTables_;
+    std::vector<const std::vector<float>*> sharedTablesNew_;
 };
 
 bool Device::start(std::string* why) {
@@ -575,6 +587,9 @@ void Device::destroy() {
     for (auto& [lut, t] : luts_) delete t.tex;
     luts_.clear();
     lutsNew_.clear();
+    for (auto& [rows, t] : sharedTables_) delete t.tex;
+    sharedTables_.clear();
+    sharedTablesNew_.clear();
     for (auto& [tex, t] : targets_) delete t.rt, delete t.rp;
     targets_.clear();
     for (Pooled& p : pool_) delete p.tex;
@@ -682,6 +697,29 @@ QRhiTexture* Device::lutTexture(const std::shared_ptr<const Lut3D>& lut, QRhiRes
     return it->second.tex;
 }
 
+QRhiTexture* Device::sharedTable(const std::shared_ptr<const std::vector<float>>& rows, int width, QRhiResourceUpdateBatch* u) {
+    for (auto it = sharedTables_.begin(); it != sharedTables_.end();)
+        if (it->second.rows.expired()) {
+            delete it->second.tex;
+            it = sharedTables_.erase(it);
+        } else {
+            ++it;
+        }
+    if (auto it = sharedTables_.find(rows.get()); it != sharedTables_.end() && it->second.tex->pixelSize().width() == width) return it->second.tex;
+    const int h = std::max(1, int(rows->size() / (size_t(width) * 4)));
+    QRhiTexture* t = rhi_->newTexture(QRhiTexture::RGBA32F, QSize(width, h));
+    if (!t->create()) {
+        delete t;
+        return nullptr;
+    }
+    QRhiTextureSubresourceUploadDescription d(rows->data(), quint32(size_t(width) * size_t(h) * 16));
+    u->uploadTexture(t, QRhiTextureUploadEntry(0, 0, d));
+    if (auto it = sharedTables_.find(rows.get()); it != sharedTables_.end()) delete it->second.tex, sharedTables_.erase(it);
+    sharedTables_.emplace(rows.get(), SharedTex{rows, t});
+    sharedTablesNew_.push_back(rows.get());
+    return t;
+}
+
 QRhiBuffer* Device::uniforms(QRhiResourceUpdateBatch* u, const float (&p)[64]) {
     if (ubufUsed_ >= ubufs_.size()) {
         QRhiBuffer* b = rhi_->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kUniformBytes);
@@ -759,7 +797,7 @@ Device::Program* Device::program(const ShaderStep& step, QRhiResourceUpdateBatch
     // The step's function on the picture's straight colour, premultiplied again (pixels without alpha left alone).
     const std::string source = "#version 440\n"
                                "layout(location = 0) out vec4 fragColor;\n"
-                               "layout(std140, binding = 0) uniform Params { vec4 p[16]; };\n"
+                               "layout(std140, binding = 0) uniform Params { vec4 montageValues[16]; };\n"
                                "layout(binding = 1) uniform sampler2D srcTex;\n" +
                                step.source +
                                "\nvoid main() {\n"
@@ -781,6 +819,7 @@ Device::Program* Device::program(const ShaderStep& step, QRhiResourceUpdateBatch
     baker.setGeneratedShaderVariants({QShader::StandardShader});
     baker.setSourceString(QByteArray::fromStdString(source), QShader::FragmentStage);
     const QShader frag = baker.bake();
+    ++shaderBuilds;
     if (!frag.isValid()) return broken("it does not compile: " + baker.errorMessage().toStdString());
     using T = QRhiTexture;
     using B = QRhiShaderResourceBinding;
@@ -971,6 +1010,25 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         pass(colorPs_, cur, u, textures, ub);
         u = rhi_->nextResourceUpdateBatch();
         release(raw);
+    } else if (l.shapes) {
+        // A Shape layer's paints, each pixel from its tile's commands in the table (render/ShapeRaster).
+        const ShapeRaster& sr = *l.shapes;
+        const int rows = int(sr.table.size() / (size_t(kShapeTableWidth) * 4));
+        cur = texture(T::RGBA32F, sr.width, sr.height, true);
+        QRhiTexture* table = rows > 0 ? texture(T::RGBA32F, kShapeTableWidth, rows, false) : nullptr;
+        if (!cur || !table) {
+            if (cur) release(cur);
+            if (table) release(table);
+            return nullptr;
+        }
+        QRhiTextureSubresourceUploadDescription d(sr.table.data(), quint32(sr.table.size() * sizeof(float)));
+        u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
+        p[0] = 56, p[4] = float(sr.tilesX);
+        pass(filterPs_, cur, u, {{5, table}}, uniforms(u, p));
+        u = rhi_->nextResourceUpdateBatch();
+        release(table);
+        ++filterPasses;
+        ++shapeLayers;
     } else {
         const int w = l.image.width, h = l.image.height;
         if (w <= 0 || h <= 0) return nullptr;
@@ -1073,7 +1131,9 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             };
             auto slotAt = [&](int i) { return i >= 0 && size_t(i) < saved.size() ? saved[size_t(i)] : nullptr; };
             bool failed = false;
+            std::vector<float> flags;  // (read back from a pass that makes them)
             for (const ColorOp::FilterPass& fp : op.passes) {
+                if (fp.when >= 0 && size_t(fp.when) < flags.size() && flags[size_t(fp.when)] == 0) continue;
                 QRhiTexture* made = texture(T::RGBA32F, fp.width > 0 ? fp.width : size.width(), fp.height > 0 ? fp.height : size.height(), true);
                 if (!made) {
                     failed = true;
@@ -1083,24 +1143,47 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 p[0] = float(fp.mode);
                 std::copy(fp.params, fp.params + 60, p + 4);
                 QRhiTexture* table = nullptr;
-                if (fp.tableWidth > 0 && !fp.table.empty()) {
-                    const int rows = int(fp.table.size() / (size_t(fp.tableWidth) * 4));
+                QRhiTexture* kept = nullptr;  // (a shared table, held on the GPU)
+                const std::vector<float>& rowsOf = fp.sharedTable ? *fp.sharedTable : fp.table;
+                if (fp.sharedTable && fp.tableWidth > 0 && !rowsOf.empty()) {
+                    kept = sharedTable(fp.sharedTable, fp.tableWidth, u);
+                    if (!kept) {
+                        release(made);
+                        failed = true;
+                        break;
+                    }
+                } else if (fp.tableWidth > 0 && !rowsOf.empty()) {
+                    const int rows = int(rowsOf.size() / (size_t(fp.tableWidth) * 4));
                     table = texture(T::RGBA32F, fp.tableWidth, std::max(1, rows), false);
                     if (!table) {
                         release(made);
                         failed = true;
                         break;
                     }
-                    QRhiTextureSubresourceUploadDescription d(fp.table.data(), quint32(fp.table.size() * sizeof(float)));
+                    QRhiTextureSubresourceUploadDescription d(rowsOf.data(), quint32(rowsOf.size() * sizeof(float)));
                     u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
                 }
                 std::vector<std::pair<int, QRhiTexture*>> bound = {{1, at}, {4, cur}};
                 if (QRhiTexture* t = slotAt(fp.extra)) bound.push_back({2, t});
-                if (QRhiTexture* t = table ? table : slotAt(fp.tableSlot)) bound.push_back({5, t});
+                if (QRhiTexture* t = table ? table : kept ? kept : slotAt(fp.tableSlot)) bound.push_back({5, t});
                 pass(filterPs_, made, u, bound, uniforms(u, p));
                 u = rhi_->nextResourceUpdateBatch();
                 if (table) release(table);
                 ++filterPasses;
+                if (fp.flags) {
+                    // (read back now, the work so far waited for: a small texture)
+                    QRhiReadbackResult read;
+                    QRhiResourceUpdateBatch* rb = rhi_->nextResourceUpdateBatch();
+                    rb->readBackTexture({made}, &read);
+                    cb_->resourceUpdate(rb);
+                    rhi_->finish();
+                    const size_t n = size_t(made->pixelSize().width()) * size_t(made->pixelSize().height());
+                    flags.clear();
+                    if (size_t(read.data.size()) >= n * 16) {
+                        flags.resize(n);
+                        for (size_t i = 0; i < n; ++i) std::memcpy(&flags[i], read.data.constData() + i * 16, sizeof(float));
+                    }
+                }
                 if (fp.save >= 0) {
                     if (saved.size() <= size_t(fp.save)) saved.resize(size_t(fp.save) + 1, nullptr);
                     QRhiTexture* old = saved[size_t(fp.save)];
@@ -1133,6 +1216,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             if (!prog) return nullptr;
             using B = QRhiShaderResourceBinding;
             std::fill(p, p + 64, 0.0f);
+            std::copy_n(op.values.begin(), std::min<size_t>(64, op.values.size()), p);  // (its dynamic properties)
             QVarLengthArray<QRhiShaderResourceBinding, 8> bindings = {B::uniformBuffer(0, B::FragmentStage, uniforms(u, p)),
                                                                       B::sampledTexture(1, B::FragmentStage, cur, sampler_)};
             for (const auto& [tex, linear] : prog->textures)
@@ -1281,7 +1365,7 @@ void Device::endFrame() {
 
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
-    filterPasses = mixPasses = 0;
+    filterPasses = mixPasses = shaderBuilds = shapeLayers = 0;
     hwMapped = hwGpuCopies = 0;
     hwFallback.clear();
     if (!rhi_) return false;  // (lost, and not set up again)
@@ -1338,19 +1422,37 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         u = rhi_->nextResourceUpdateBatch();
         return to;
     };
-    auto mixed = [&](QRhiTexture* a, QRhiTexture* b, const float* params, int n) -> QRhiTexture* {
+    auto mixed = [&](QRhiTexture* a, QRhiTexture* b, const float* params, int n, const std::vector<float>* rows = nullptr,
+                     int rowWidth = 0) -> QRhiTexture* {
         QRhiTexture* to = a && b ? texture(T::RGBA32F, W, H, true) : nullptr;
-        if (!to) return nullptr;
+        if (!to) {
+            if (a) release(a);
+            if (b) release(b);
+            return nullptr;
+        }
         float q[64] = {};
         std::copy(params, params + n, q);
-        pass(mixPs_, to, u, {{1, a}, {4, b}}, uniforms(u, q));
+        QRhiTexture* table = nullptr;  // (Smooth Cut's flow)
+        if (rows && rowWidth > 0 && !rows->empty()) {
+            table = texture(T::RGBA32F, rowWidth, int(rows->size() / (size_t(rowWidth) * 4)), false);
+            if (!table) {
+                release(to);
+                return nullptr;
+            }
+            QRhiTextureSubresourceUploadDescription d(rows->data(), quint32(rows->size() * sizeof(float)));
+            u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
+        }
+        std::vector<std::pair<int, QRhiTexture*>> bound = {{1, a}, {4, b}};
+        if (table) bound.push_back({5, table});
+        pass(mixPs_, to, u, bound, uniforms(u, q));
         u = rhi_->nextResourceUpdateBatch();
         ++mixPasses;
         release(a), release(b);
+        if (table) release(table);
         return to;
     };
     // (Nothing to draw, transparent: no picture, or an adjustment layer over nothing.)
-    auto absent = [&](const Layer& l) { return l.canvas ? !canvas : !l.frame && l.image.empty(); };
+    auto absent = [&](const Layer& l) { return l.canvas ? !canvas : !l.frame && l.image.empty() && !l.shapes; };
     Layer full;  // (a picture the canvas's size already)
     full.place.full = true;
     for (const Item& it : frame.items) {
@@ -1362,15 +1464,41 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
             break;
         }
         const Layer* la = &it.a;
-        if ((it.b && it.transition >= 0) || it.matte) {
-            // Placed on the canvas, then mixed: a transition, then a track matte.
+        if ((it.b && it.transition >= 0) || it.matte || it.displace) {
+            // Placed on the canvas, then mixed: a transition, then a displacement, then a track matte.
             QRhiTexture* m = placed(&it.a, a);
+            QRhiTexture* self = it.displace && it.displaceSelf ? placed(&it.a, a) : nullptr;  // (its own map, as it was)
             if (a && a != canvas) release(a);
             if (m && it.b && it.transition >= 0) {
                 QRhiTexture* mb = placed(&*it.b, b);
                 if (b && b != canvas) release(b);
                 b = nullptr;
-                m = mixed(m, mb, it.transitionParams, 44);
+                m = mixed(m, mb, it.transitionParams, 44, &it.transitionTable, it.transitionTableWidth);
+            }
+            if (m && it.displace) {
+                QRhiTexture* map = self;
+                if (!it.displaceSelf) {
+                    QRhiTexture* mt = it.displaceMap ? layer(*it.displaceMap, u) : nullptr;
+                    if (!mt && it.displaceMap && !absent(*it.displaceMap)) {
+                        release(m);
+                        ok = false;
+                        break;
+                    }
+                    map = placed(it.displaceMap ? &*it.displaceMap : nullptr, mt);
+                    if (mt) release(mt);
+                }
+                if (map && !it.displaceBlur.empty()) {
+                    // (its blur run over it at the canvas's size, as an adjustment layer's filters are)
+                    Layer blur;
+                    blur.canvas = true;
+                    blur.ops = it.displaceBlur;
+                    QRhiTexture* blurred = layer(blur, u, map);
+                    if (blurred != map) release(map);
+                    map = blurred;
+                }
+                m = mixed(m, map, it.displaceParams, 24);  // (both let go, whatever comes of it)
+            } else if (self) {
+                release(self);
             }
             if (m && it.matte) {
                 QRhiTexture* matte = layer(*it.matte, u);
@@ -1441,6 +1569,13 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
                 luts_.erase(it);
             }
     lutsNew_.clear();
+    if (!ok)
+        for (const std::vector<float>* rows : sharedTablesNew_)
+            if (auto it = sharedTables_.find(rows); it != sharedTables_.end()) {
+                delete it->second.tex;
+                sharedTables_.erase(it);
+            }
+    sharedTablesNew_.clear();
     if (!ok)
         for (const std::string& key : programsNew_)
             if (auto it = programs_.find(key); it != programs_.end()) {
@@ -1518,20 +1653,22 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     std::shared_lock lock(gDeviceMutex);
     if (!gDevice || !gDevice->ready()) return false;
     Device* d = gDevice.get();
-    long filters = 0, mixes = 0, mapped = 0, copied = 0;
+    long filters = 0, mixes = 0, mapped = 0, copied = 0, builds = 0, shapes = 0;
     std::string hwFallback;
     const bool ok = d->run([&] {
         const bool drawn = d->draw(frame, out, out8);
-        filters = d->filterPasses, mixes = d->mixPasses;
+        filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds, shapes = d->shapeLayers;
         mapped = d->hwMapped, copied = d->hwGpuCopies, hwFallback = d->hwFallback;
         return drawn;
     });
     std::lock_guard statsLock(gStatsMutex);
     if (ok) {
-        ++gStats.gpuFrames;
+        if (!frame.part) ++gStats.gpuFrames;
         gStats.filterPasses += filters;
         gStats.mixPasses += mixes;
+        gStats.shapeLayers += shapes;
     }
+    gStats.shaderBuilds += builds;
     gStats.hwMapped += mapped;
     gStats.hwGpuCopies += copied;
     if (!hwFallback.empty()) gStats.lastHwFallback = hwFallback;

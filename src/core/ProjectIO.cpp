@@ -17,6 +17,7 @@
 #include <QJsonObject>
 #include <QSaveFile>
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <utility>
 
@@ -636,14 +637,24 @@ QJsonObject trackToJson(const Track& t) {
             if (sl.choke) so["choke"] = sl.choke;
             if (sl.pitchVariation != 0) so["pitchVariation"] = sl.pitchVariation;
             if (sl.levelVariation != 0) so["levelVariation"] = sl.levelVariation;
+            if (sl.velocityCurve != 0) so["velocityCurve"] = sl.velocityCurve;
+            if (!sl.velocityPoints.empty()) {
+                QJsonArray points;
+                for (const auto& [in, out] : sl.velocityPoints) points.append(QJsonArray{in, out});
+                so["velocityPoints"] = points;
+            }
+            if (sl.output) so["output"] = double(sl.output);
             pads.append(so);
         }
         for (const SamplerPass& ps : t.sampler.passes) {
             QJsonArray notes;
             for (const SamplerNote& n : ps.notes) notes.append(QJsonArray{n.key, n.velocity, double(n.at), double(n.length)});
-            passes.append(QJsonObject{{"lane", double(ps.lane)}, {"seed", double(ps.seed)}, {"notes", notes}});
+            QJsonObject po{{"lane", double(ps.lane)}, {"seed", double(ps.seed)}, {"notes", notes}};
+            if (ps.track) po["track"] = double(ps.track);
+            passes.append(po);
         }
         QJsonObject so;
+        if (t.sampler.clipPerHit) so["clipPerHit"] = true;
         if (!pads.isEmpty()) so["slots"] = pads;
         if (!passes.isEmpty()) so["passes"] = passes;
         o["sampler"] = so;
@@ -720,6 +731,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     t.colorClips = o.value("colorClips").toBool(false);
     {
         const QJsonObject so = o.value("sampler").toObject();
+        t.sampler.clipPerHit = so.value("clipPerHit").toBool(false);
         for (const auto& v : so.value("slots").toArray()) {
             const QJsonObject x = v.toObject();
             SamplerSlot sl;
@@ -746,6 +758,12 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
             sl.choke = std::clamp(x.value("choke").toInt(0), 0, 16);
             sl.pitchVariation = std::clamp(x.value("pitchVariation").toDouble(0), 0.0, 12.0);
             sl.levelVariation = std::clamp(x.value("levelVariation").toDouble(0), 0.0, 24.0);
+            sl.velocityCurve = std::clamp(x.value("velocityCurve").toInt(0), 0, 3);
+            for (const auto& pt : x.value("velocityPoints").toArray()) {
+                const QJsonArray a = pt.toArray();
+                if (a.size() >= 2) sl.velocityPoints.push_back({std::clamp(a[0].toInt(), 1, 127), std::clamp(a[1].toInt(), 1, 127)});
+            }
+            sl.output = Id(i64(x.value("output")));
             if (std::none_of(t.sampler.pads.begin(), t.sampler.pads.end(), [&](const SamplerSlot& e) { return e.key == sl.key; }))
                 t.sampler.pads.push_back(std::move(sl));
         }
@@ -754,6 +772,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
             SamplerPass ps;
             ps.lane = Id(i64(x.value("lane")));
             ps.seed = uint32_t(i64(x.value("seed")));
+            ps.track = Id(i64(x.value("track")));
             for (const auto& n : x.value("notes").toArray()) {
                 const QJsonArray a = n.toArray();
                 if (a.size() < 4) continue;
@@ -1357,7 +1376,9 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
                      {"name", qs(p.name)},
                      {"activeSequence", double(p.activeSequence)},
                      {"nextId", double(p.nextId)},
-                     {"mediaStereo", 2}};  // the media's stereo packing is recorded (2: MV-HEVC's too)
+                     {"mediaStereo", 2},  // the media's stereo packing is recorded (2: MV-HEVC's too)
+                     {"cameraLens", 1},     // depth of field through the scene's camera is the Camera clip's
+                     {"chromaSiting", 1}};  // untagged 4:2:2 is read co-sited unless a media item says otherwise
     QJsonArray media;
     for (const auto& m : p.media) {
         QJsonObject o{{"id", double(m.id)},
@@ -1523,6 +1544,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     p.activeSequence = Id(i64(root.value("activeSequence")));
     p.nextId = Id(i64(root.value("nextId"), 1));
     p.stereoChecked = root.value("mediaStereo").toInt() >= 2;
+    // (saved before untagged 4:2:2 was read co-sited: before the camera-lens marker, which came after that)
+    p.chromaChecked = root.value("chromaSiting").toInt() >= 1 || root.value("cameraLens").toInt() >= 1;
     if (root.value("mergeBase").isObject())
         p.mergeBase = std::make_shared<const std::string>(QJsonDocument(root.value("mergeBase").toObject()).toJson(QJsonDocument::Compact).toStdString());
     const QJsonObject mergeIds = root.value("mergeIds").toObject();
@@ -1755,6 +1778,35 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     // A compositing node shared between clips (saved so) given a fresh owner id.
     for (Sequence& s : p.sequences) separateCompositeIds(p, s);
+    // Depth of field through the scene's camera is the Camera clip's (its lens's): in a project saved before that, a card
+    // seen through it with its own on gives the camera its settings (when the camera's is not on already) and leaves its
+    // own off.
+    const bool cardLenses = root.value("cameraLens").toInt() < 1;
+    for (Sequence& s : p.sequences)
+        for (Track& t : s.videoTracks)
+            for (Clip& c : t.clips)
+                for (Effect& e : c.effects) {
+                    if (!cardLenses || e.type != "layer_3d" || std::lround(e.p("camera", 0, 3)) != 3 || e.p("depth_of_field", 0, 0) <= 0.5) continue;
+                    auto cameraOn = [&](Track& k) -> Clip* {
+                        if (k.muted) return nullptr;  // (as the renderer finds it)
+                        for (Clip& x : k.clips)
+                            if (x.enabled && x.isGenerator() && x.generator.type == "camera3d" && c.start >= x.start && c.start < x.end()) return &x;
+                        return nullptr;
+                    };
+                    const long named = std::lround(e.p("camera_track", 0, 0)) - 1;
+                    Clip* camera = named >= 0 && size_t(named) < s.videoTracks.size() ? cameraOn(s.videoTracks[size_t(named)]) : nullptr;
+                    for (size_t k = s.videoTracks.size(); !camera && k-- > 0;) camera = cameraOn(s.videoTracks[k]);
+                    if (!camera) continue;
+                    Effect& g = camera->generator;
+                    if (g.p("dof", 0, 0) <= 0.5) {
+                        const double units = e.p("units_m", 0, 0);
+                        g.params["dof"] = 1.0;
+                        g.params["fstop"] = e.p("fstop", 0, 2.8);
+                        g.params["focus_distance"] = e.p("focus_distance", 0, 0);
+                        g.params["units_m"] = units > 0 ? units : 1000.0;
+                    }
+                    e.params["depth_of_field"] = 0.0;
+                }
     out = std::move(p);
     return true;
 }

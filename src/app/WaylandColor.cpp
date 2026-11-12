@@ -1,0 +1,329 @@
+#include "WaylandColor.h"
+
+#ifdef MONTAGE_WAYLAND_COLOR
+
+#include <unistd.h>
+#include <wayland-client.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+#include "color-management-v1-client-protocol.h"
+
+namespace montage {
+
+namespace {
+
+// Version 1 of every interface: its events are the ones handled here, whichever revision of the protocol's XML the
+// code was generated from.
+constexpr uint32_t kVersion = 1;
+
+// Primaries' chromaticities (red, green, blue, white) in millionths, as the protocol takes them.
+std::array<int32_t, 8> millionths(Primaries p) {
+    double xy[8] = {};
+    primariesChromaticities(p, xy);
+    std::array<int32_t, 8> out{};
+    for (size_t i = 0; i < 8; ++i) out[i] = int32_t(std::lround(xy[i] * 1e6));
+    return out;
+}
+
+}  // namespace
+
+struct WaylandColor::State {
+    wl_display* display = nullptr;
+    wl_event_queue* queue = nullptr;
+    wl_display* wrapper = nullptr;  // the display, its new objects on `queue`
+    wl_registry* registry = nullptr;
+    wp_color_manager_v1* manager = nullptr;
+    uint32_t features = 0, tfs = 0, primaries = 0, intents = 0;  // bit sets of the protocol's enum values
+    bool managerDone = false;
+
+    wl_surface* surface = nullptr;
+    wp_color_management_surface_v1* cmSurface = nullptr;
+    wp_color_management_surface_feedback_v1* feedback = nullptr;
+    bool preferredChanged = false;
+    Preferred preferred;
+    bool hasDescribed = false;
+    Description described;
+
+    // An image description being made or read: ready or failed, and what get_information told.
+    struct Pending {
+        bool ready = false, failed = false;
+        uint32_t cause = 0;  // wp_image_description_v1.cause, when failed
+        std::string why;
+        bool infoDone = false;
+        Preferred info;
+    };
+
+    bool roundtrip() { return display && queue && wl_display_roundtrip_queue(display, queue) >= 0; }
+    bool has(uint32_t set, uint32_t value) const { return value < 32 && (set & (1u << value)); }
+
+    // Waits for the description to be ready or to fail (a roundtrip at a time: the compositor answers at once).
+    bool waitFor(Pending& p) {
+        for (int i = 0; i < 4 && !p.ready && !p.failed; ++i)
+            if (!roundtrip()) return false;
+        return p.ready;
+    }
+
+    // Reads what the compositor prefers for a surface through its feedback object into `out`: Known; Unknown if it
+    // has none to read (not parametric, no luminances); Later if it cannot say just now (no output for the surface
+    // at the moment, or no answer). `out` is written only when Known.
+    enum class Answer { Known, Unknown, Later };
+    Answer read(wp_color_management_surface_feedback_v1* from, Preferred& out);
+};
+
+namespace {
+
+using Preferred = WaylandColor::Preferred;
+
+void addBit(uint32_t& set, uint32_t value) {
+    if (value < 32) set |= 1u << value;
+}
+
+void registryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
+    auto* s = static_cast<WaylandColor::State*>(data);
+    if (!s->manager && std::strcmp(interface, wp_color_manager_v1_interface.name) == 0 && version >= kVersion)
+        s->manager = static_cast<wp_color_manager_v1*>(wl_registry_bind(registry, name, &wp_color_manager_v1_interface, kVersion));
+}
+
+void registryGlobalRemove(void*, wl_registry*, uint32_t) {}
+
+const wl_registry_listener kRegistryListener = {registryGlobal, registryGlobalRemove};
+
+const wp_color_manager_v1_listener kManagerListener = [] {
+    wp_color_manager_v1_listener l{};
+    l.supported_intent = [](void* data, wp_color_manager_v1*, uint32_t v) { addBit(static_cast<WaylandColor::State*>(data)->intents, v); };
+    l.supported_feature = [](void* data, wp_color_manager_v1*, uint32_t v) { addBit(static_cast<WaylandColor::State*>(data)->features, v); };
+    l.supported_tf_named = [](void* data, wp_color_manager_v1*, uint32_t v) { addBit(static_cast<WaylandColor::State*>(data)->tfs, v); };
+    l.supported_primaries_named = [](void* data, wp_color_manager_v1*, uint32_t v) {
+        addBit(static_cast<WaylandColor::State*>(data)->primaries, v);
+    };
+    l.done = [](void* data, wp_color_manager_v1*) { static_cast<WaylandColor::State*>(data)->managerDone = true; };
+    return l;
+}();
+
+const wp_image_description_v1_listener kDescriptionListener = [] {
+    wp_image_description_v1_listener l{};
+    l.failed = [](void* data, wp_image_description_v1*, uint32_t cause, const char* msg) {
+        auto* p = static_cast<WaylandColor::State::Pending*>(data);
+        p->failed = true;
+        p->cause = cause;
+        p->why = msg && *msg ? msg : "cause " + std::to_string(cause);
+    };
+    l.ready = [](void* data, wp_image_description_v1*, uint32_t) { static_cast<WaylandColor::State::Pending*>(data)->ready = true; };
+    return l;
+}();
+
+const wp_image_description_info_v1_listener kInfoListener = [] {
+    using Pending = WaylandColor::State::Pending;
+    wp_image_description_info_v1_listener l{};
+    l.done = [](void* data, wp_image_description_info_v1*) { static_cast<Pending*>(data)->infoDone = true; };
+    l.icc_file = [](void*, wp_image_description_info_v1*, int32_t fd, uint32_t) { close(fd); };
+    l.primaries = [](void*, wp_image_description_info_v1*, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t) {};
+    l.primaries_named = [](void*, wp_image_description_info_v1*, uint32_t) {};
+    l.tf_power = [](void*, wp_image_description_info_v1*, uint32_t) {};
+    l.tf_named = [](void*, wp_image_description_info_v1*, uint32_t) {};
+    l.luminances = [](void* data, wp_image_description_info_v1*, uint32_t, uint32_t maxLum, uint32_t referenceLum) {
+        Preferred& p = static_cast<Pending*>(data)->info;
+        p.maxNits = maxLum;
+        p.referenceNits = referenceLum;
+    };
+    l.target_primaries = [](void*, wp_image_description_info_v1*, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t) {};
+    l.target_luminance = [](void* data, wp_image_description_info_v1*, uint32_t, uint32_t maxLum) {
+        static_cast<Pending*>(data)->info.targetMaxNits = maxLum;
+    };
+    l.target_max_cll = [](void*, wp_image_description_info_v1*, uint32_t) {};
+    l.target_max_fall = [](void*, wp_image_description_info_v1*, uint32_t) {};
+    return l;
+}();
+
+const wp_color_management_surface_feedback_v1_listener kFeedbackListener = [] {
+    wp_color_management_surface_feedback_v1_listener l{};
+    l.preferred_changed = [](void* data, wp_color_management_surface_feedback_v1*, uint32_t) {
+        static_cast<WaylandColor::State*>(data)->preferredChanged = true;
+    };
+    return l;
+}();
+
+}  // namespace
+
+WaylandColor::State::Answer WaylandColor::State::read(wp_color_management_surface_feedback_v1* from, Preferred& out) {
+    if (!from) return Answer::Later;
+    Pending p;
+    // As parameters (its luminances are what is read), not as an ICC profile, which an output may be described with.
+    // (where the generated header has the request)
+#ifdef WP_COLOR_MANAGEMENT_SURFACE_FEEDBACK_V1_GET_PREFERRED_PARAMETRIC
+    wp_image_description_v1* d = has(features, WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC)
+                                     ? wp_color_management_surface_feedback_v1_get_preferred_parametric(from)
+                                     : wp_color_management_surface_feedback_v1_get_preferred(from);
+#else
+    wp_image_description_v1* d = wp_color_management_surface_feedback_v1_get_preferred(from);
+#endif
+    wp_image_description_v1_add_listener(d, &kDescriptionListener, &p);
+    Answer answer = Answer::Later;
+    if (waitFor(p)) {
+        wp_image_description_info_v1* info = wp_image_description_v1_get_information(d);
+        wp_image_description_info_v1_add_listener(info, &kInfoListener, &p);
+        for (int i = 0; i < 4 && !p.infoDone; ++i)
+            if (!roundtrip()) break;
+        wp_image_description_info_v1_destroy(info);  // (the compositor's side went with `done`)
+        if (p.infoDone && p.info.referenceNits > 0) {
+            out = p.info;
+            out.known = true;
+            answer = Answer::Known;
+        } else if (p.infoDone) {
+            answer = Answer::Unknown;  // (described, but not by luminances)
+        }
+    } else if (p.failed && p.cause != WP_IMAGE_DESCRIPTION_V1_CAUSE_NO_OUTPUT) {
+        answer = Answer::Unknown;  // (it has no such description: an output described by an ICC profile, say)
+    }
+    wp_image_description_v1_destroy(d);
+    return answer;
+}
+
+WaylandColor::WaylandColor(wl_display* display) : s_(std::make_unique<State>()) {
+    State& s = *s_;
+    if (!display) return;
+    s.display = display;
+    s.queue = wl_display_create_queue(display);
+    s.wrapper = static_cast<wl_display*>(wl_proxy_create_wrapper(display));
+    if (!s.queue || !s.wrapper) return;
+    wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(s.wrapper), s.queue);
+    s.registry = wl_display_get_registry(s.wrapper);
+    wl_registry_add_listener(s.registry, &kRegistryListener, &s);
+    if (!s.roundtrip() || !s.manager) return;
+    wp_color_manager_v1_add_listener(s.manager, &kManagerListener, &s);
+    for (int i = 0; i < 4 && !s.managerDone; ++i)
+        if (!s.roundtrip()) break;
+}
+
+WaylandColor::~WaylandColor() {
+    State& s = *s_;
+    detach();
+    if (s.manager) wp_color_manager_v1_destroy(s.manager);
+    if (s.registry) wl_registry_destroy(s.registry);
+    if (s.wrapper) wl_proxy_wrapper_destroy(s.wrapper);
+    if (s.display) wl_display_flush(s.display);
+    if (s.queue) wl_event_queue_destroy(s.queue);
+}
+
+bool WaylandColor::available() const { return s_->manager && s_->managerDone; }
+
+std::string WaylandColor::unsupported() const {
+    const State& s = *s_;
+    if (!available()) return "no colour manager";
+    if (!s.has(s.features, WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC)) return "no parametric image descriptions";
+    if (!s.has(s.tfs, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ)) return "no PQ transfer function";
+    if (!s.has(s.primaries, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020) && !s.has(s.features, WP_COLOR_MANAGER_V1_FEATURE_SET_PRIMARIES))
+        return "no BT.2020 primaries";
+    if (!s.has(s.intents, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL)) return "no perceptual rendering intent";
+    return {};
+}
+
+bool WaylandColor::supportsHlg() const { return s_->has(s_->tfs, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG); }
+
+bool WaylandColor::attach(wl_surface* surface) {
+    State& s = *s_;
+    if (surface == s.surface && s.cmSurface) return true;
+    detach();
+    if (!surface || !available()) return false;
+    s.surface = surface;
+    s.cmSurface = wp_color_manager_v1_get_surface(s.manager, surface);
+    s.feedback = wp_color_manager_v1_get_surface_feedback(s.manager, surface);
+    wp_color_management_surface_feedback_v1_add_listener(s.feedback, &kFeedbackListener, &s);
+    s.preferredChanged = false;
+    s.read(s.feedback, s.preferred);
+    return wl_display_get_error(s.display) == 0;
+}
+
+void WaylandColor::detach() {
+    State& s = *s_;
+    // (destroying is allowed when the wl_surface has gone: the objects are inert then)
+    if (s.feedback) wp_color_management_surface_feedback_v1_destroy(s.feedback);
+    if (s.cmSurface) wp_color_management_surface_v1_destroy(s.cmSurface);
+    s.feedback = nullptr;
+    s.cmSurface = nullptr;
+    s.surface = nullptr;
+    s.hasDescribed = false;
+    s.preferred = Preferred();
+    if (s.display) wl_display_flush(s.display);
+}
+
+wl_surface* WaylandColor::surface() const { return s_->surface; }
+
+bool WaylandColor::describe(const Description& d, std::string* error) {
+    State& s = *s_;
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (!s.cmSurface) return fail("no surface");
+    if (const std::string why = unsupported(); !why.empty()) return fail(why);
+    wp_image_description_creator_params_v1* c = wp_color_manager_v1_create_parametric_creator(s.manager);
+    const bool hlg = d.transfer == Transfer::Hlg && supportsHlg();
+    wp_image_description_creator_params_v1_set_tf_named(
+        c, hlg ? WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG : WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+    if (s.has(s.primaries, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020))
+        wp_image_description_creator_params_v1_set_primaries_named(c, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+    else {
+        const std::array<int32_t, 8> p = millionths(Primaries::Bt2020);
+        wp_image_description_creator_params_v1_set_primaries(c, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    }
+    // (the luminances are PQ's and HLG's defaults: 0.005 nits, 10 000 or 1000, and reference white at 203)
+    const bool mastering = s.has(s.features, WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES);
+    // (kept inside what the protocol allows whatever the caller gave: a light outside it is a protocol error)
+    const HdrSurfaceLightArgs light = hdrSurfaceLightArgs(d.light, hlg ? Transfer::Hlg : Transfer::Pq, mastering);
+    if (mastering) {
+        // (P3-D65, as Montage's HDR10 files state it: render/Exporter)
+        const std::array<int32_t, 8> m = millionths(Primaries::P3D65);
+        wp_image_description_creator_params_v1_set_mastering_display_primaries(c, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+        wp_image_description_creator_params_v1_set_mastering_luminance(c, light.masteringMin10k, light.masteringMax);
+    }
+    if (light.maxCll) wp_image_description_creator_params_v1_set_max_cll(c, light.maxCll);
+    if (light.maxFall) wp_image_description_creator_params_v1_set_max_fall(c, light.maxFall);
+    State::Pending p;
+    wp_image_description_v1* desc = wp_image_description_creator_params_v1_create(c);  // (the creator goes with it)
+    wp_image_description_v1_add_listener(desc, &kDescriptionListener, &p);
+    const bool ready = s.waitFor(p);
+    if (ready) wp_color_management_surface_v1_set_image_description(s.cmSurface, desc, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+    wp_image_description_v1_destroy(desc);  // (set_image_description copies it)
+    wl_display_flush(s.display);
+    if (!ready) return fail(p.failed ? p.why : "no answer from the compositor");
+    s.described = d;
+    s.hasDescribed = true;
+    return true;
+}
+
+const WaylandColor::Description* WaylandColor::described() const { return s_->hasDescribed ? &s_->described : nullptr; }
+
+const WaylandColor::Preferred& WaylandColor::preferred() const { return s_->preferred; }
+
+void WaylandColor::dispatch() {
+    State& s = *s_;
+    if (!s.display || !s.queue) return;
+    wl_display_dispatch_queue_pending(s.display, s.queue);
+    if (!s.preferredChanged || !s.feedback) return;
+    s.preferredChanged = false;
+    // (what was known is kept if the compositor cannot say just now, an output going or coming; not if it has
+    // nothing to say for where the surface is now)
+    if (s.read(s.feedback, s.preferred) == State::Answer::Unknown) s.preferred = Preferred();
+}
+
+WaylandColor::Preferred WaylandColor::preferredFor(wl_surface* surface) {
+    State& s = *s_;
+    Preferred out;
+    if (!surface || !available()) return out;
+    // (a feedback object of its own: a surface may have several, beside the toolkit's)
+    wp_color_management_surface_feedback_v1* feedback = wp_color_manager_v1_get_surface_feedback(s.manager, surface);
+    s.read(feedback, out);
+    wp_color_management_surface_feedback_v1_destroy(feedback);
+    wl_display_flush(s.display);
+    return out;
+}
+
+}  // namespace montage
+
+#endif

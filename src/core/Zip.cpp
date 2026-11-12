@@ -394,7 +394,7 @@ constexpr uint32_t kDosTime = 0, kDosDate = (1u << 5) | 1u;  // 1980-01-01 00:00
 
 }  // namespace
 
-void ZipWriter::add(const std::string& name, const std::string& data) {
+void ZipWriter::add(const std::string& name, const std::string& data, size_t align) {
     Item it;
     it.name = name;
     it.crc = crc32(data.data(), data.size());
@@ -410,8 +410,21 @@ void ZipWriter::add(const std::string& name, const std::string& data) {
     put32(out_, it.size);
     put32(out_, it.size);
     put16(out_, uint32_t(name.size()));
-    put16(out_, 0);
+    // (padding the data to a multiple of `align` from the archive's start: an extra field of its own, id 0x1986, as
+    // USDZ packages pad theirs)
+    size_t pad = 0;
+    if (align > 1) {
+        const size_t at = out_.size() + 2 + name.size();
+        pad = (align - at % align) % align;
+        if (pad && pad < 4) pad += align;
+    }
+    put16(out_, uint32_t(pad));
     out_ += name;
+    if (pad) {
+        put16(out_, 0x1986);
+        put16(out_, uint32_t(pad - 4));
+        out_.append(pad - 4, '\0');
+    }
     out_ += data;
     items_.push_back(std::move(it));
 }

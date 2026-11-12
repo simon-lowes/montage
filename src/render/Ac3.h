@@ -34,6 +34,15 @@ struct Ac3Metadata {
 // The dialnorm for a loudness in LKFS (rounded, held to -31..-1).
 int ac3Dialnorm(double lkfs);
 
+// A DASH AudioChannelConfiguration element for AC-3 or E-AC-3 with this many channels (1, 2, 6 or 8; L R C LFE Ls Rs
+// [Lrs Rrs]): DASH-IF and DVB-DASH ask for the scheme ETSI TS 102 366 defines, its 16-bit channel mask in hex
+// ("F801" for 5.1), not MPEG's CICP numbers.
+std::string ac3DashChannelConfiguration(int channels);
+// The same from the stream's own channels (FFmpeg's AV_CH_* mask), so 3.0, quad and 5.0 get theirs: the surrounds are
+// the side pair (or the back pair where there is no side pair), a back pair beside a side pair is Lrs/Rrs. With no
+// mask (0), or channels the scheme has no place for, as the count gives.
+std::string ac3DashChannelConfiguration(uint64_t avChannelMask, int channels);
+
 // Options for FFmpeg's "ac3" or "eac3" encoder carrying this metadata (set into `opts` for avcodec_open2), with
 // per-frame metadata on so the dialogue level can be set after the encoder opens (ac3SetDialnorm). `channels` and
 // `centre` / `surround` say which mix levels the layout has.

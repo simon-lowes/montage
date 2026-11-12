@@ -43,7 +43,25 @@
 //      last step (the picture, orig, towards its blur by the distance from the band, and the saturation)
 //   33 Mesh Warp and Grid Warp (render/MeshWarp's drawWarp): the mesh's triangles, listed by the tiles they reach, in the table
 // and 34 Depth Map and Depth Fog (each pixel towards the table's colour by its w, from the frame's depth); Light Rays
-// (35 the light above the threshold, 36 a pass along the lines to the centre, 37 added to the picture) and 38 Lens Flare.
+// (35 the light above the threshold, 36 a pass along the lines to the centre, 37 added to the picture; with Shadows
+// Block Rays, 40 the small copy of what blocks them and 41 the light let through) and 38 Lens Flare;
+// 39 Radial Blur (render/StyleFx's radialBlur: p[1] the centre, the zoom's share of the way there, the spin in radians);
+// and Aperture Glare (render/StyleFx's apertureGlare, its convolution by FFTs in tiles; each texel of a transform holds
+// red + i green in xy and blue in zw): 70 which tiles have any light (along each row of each, then 71 down them, read
+// back so the others are passed over), 45 the glare cleared, 42 a tile's light above the threshold, shrunk, 43 a stage
+// of a transform, 44 through the kernel (the table its spectra, M rows of red and green, then M of blue), 46 a tile's
+// glare added to what the tiles before made (extra), 47 the glare (extra) added to the picture.
+// Painterly (render/PaintFx): 49 the structure tensor, smoothed by 1's boxes or 48's kernel, 50 its flow; then 52 the
+// anisotropic Kuwahara filter (a wide brush on 55 the picture and 51 its squares, each through 1's boxes) or 53 the
+// smear along the flow.
+// 56 a Shape layer's paints (render/ShapeRaster): each pixel's tile's commands, each path's coverage from its backdrop and
+// lines, its paint laid down over what is below, groups through their opacity; p[1].x the tiles across.
+// Lens Blur (Depth) (render/LensBlur's lensBlur, its plan worked out on the CPU from the depth; the state, S, twice the
+// layer's width: what is laid down so far, premultiplied in light, on the left, and on the right its coverage and
+// whether the pixel keeps its own value): 58 the picture in light with highlights lifted (left) and each pixel's
+// two layers from the table (right), 59 nothing, 60 a sharp layer laid down, 61 a level of the pyramid pulled (sums,
+// weights right), 63 a level's mean colours pushed down, 64 what is behind filled in, 65 a layer at 1/f of its size,
+// 66 gathered through the aperture's taps, 67 laid over S, 68 back from light; 69 Focus Breathing.
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -336,6 +354,96 @@ vec4 warpSample(ivec2 size, float x, float y) {
     const vec4 top = a + (b - a) * fx, bottom = c + (e - c) * fx;
     return top + (bottom - top) * fy;
 }
+
+// render/ShapeRaster's lineCover: the signed area of the pixel (lx, ly) (the tile's pixels) right of the line, down its
+// height, in up to three straight pieces each worked out at its middle.
+float shapeLineCover(vec4 e, float lx, float ly) {
+    const float ya = min(e.y, e.w), yb = max(e.y, e.w);
+    const float t0 = max(ya, ly), t1 = min(yb, ly + 1.0);
+    if (!(t1 > t0)) return 0.0;
+    const float k = (e.z - e.x) / (e.w - e.y);
+    const float xa = e.x + k * (t0 - e.y), xb = e.x + k * (t1 - e.y);
+    const float ga = lx + 1.0 - xa, d = (lx + 1.0 - xb) - ga;
+    float s1 = 0.0, s2 = 0.0;
+    if (d != 0.0) {
+        s1 = clamp01(-ga / d);
+        s2 = clamp01((1.0 - ga) / d);
+        if (s1 > s2) {
+            const float sw = s1;
+            s1 = s2;
+            s2 = sw;
+        }
+    }
+    const float sum = s1 * clamp01(ga + d * (s1 * 0.5)) + (s2 - s1) * clamp01(ga + d * ((s1 + s2) * 0.5)) +
+                      (1.0 - s2) * clamp01(ga + d * ((s2 + 1.0) * 0.5));
+    return (e.w > e.y ? 1.0 : -1.0) * (t1 - t0) * sum;
+}
+// render/ShapeRaster's paintAt: a paint's colour (premultiplied) at (x, y) in the frame's pixels.
+vec4 shapePaint(int at, float x, float y) {
+    const vec4 h = tableTexel(at);
+    const int kind = int(h.x);
+    if (kind == 0) return tableTexel(at + 1);
+    const vec4 m1 = tableTexel(at + 1), m2 = tableTexel(at + 2), pts = tableTexel(at + 3), k = tableTexel(at + 4);
+    const float gx = m1.x * x + m1.y * y + m1.z, gy = m2.x * x + m2.y * y + m2.z;
+    float t;
+    if (kind == 1) {
+        t = ((gx - pts.x) * pts.z + (gy - pts.y) * pts.w) * k.x;
+    } else {
+        const float qx = gx - pts.x, qy = gy - pts.y, A = k.y, B = qx * pts.z + qy * pts.w, C = qx * qx + qy * qy;
+        bool none = false;
+        if (A == 0.0) {
+            none = !(B > 0.0);
+            t = none ? 0.0 : C / (2.0 * B);
+        } else {
+            const float disc = B * B - A * C;
+            none = disc < 0.0;
+            const float s = sqrt(max(disc, 0.0));
+            t = A < 0.0 ? (B - s) / A : (B + s) / A;
+            none = none || t < 0.0;
+        }
+        if (none) return vec4(0.0);
+    }
+    const int spread = int(h.y);
+    if (spread == 0) {
+        t = clamp01(t);
+    } else if (spread == 2) {
+        t = t - floor(t);
+    } else {
+        t = t - 2.0 * floor(t * 0.5);
+        t = t > 1.0 ? 2.0 - t : t;
+    }
+    const int n = int(h.z), s0 = int(h.w);
+    if (!(t > tableTexel(s0).x)) return tableTexel(s0 + 1);
+    for (int i = 1; i < n; ++i) {
+        const float p0 = tableTexel(s0 + 2 * (i - 1)).x, p1 = tableTexel(s0 + 2 * i).x;
+        if (t < p1) {
+            const float f = (t - p0) / (p1 - p0);
+            const vec4 a = tableTexel(s0 + 2 * (i - 1) + 1), b = tableTexel(s0 + 2 * i + 1);
+            return a + (b - a) * f;
+        }
+    }
+    return tableTexel(s0 + 2 * (n - 1) + 1);
+}
+
+// Aperture Glare's light above the threshold at a pixel of the glare (gx, gy): the mean of the f x f of the picture's
+// (orig) it shrinks.
+vec3 glareLight(int gx, int gy, int f, float threshold) {
+    const ivec2 full = textureSize(orig, 0);
+    vec3 sum = vec3(0.0);
+    int n = 0;
+    for (int y = gy * f; y < min(full.y, (gy + 1) * f); ++y)
+        for (int x = gx * f; x < min(full.x, (gx + 1) * f); ++x) {
+            const vec4 q = texelFetch(orig, ivec2(x, y), 0);
+            const float l = q.a > 0.0 ? lumaOf(q) / q.a : 0.0;
+            if (!isinf(l) && !isnan(l) && l > threshold) sum += q.rgb * ((l - threshold) / l);
+            ++n;
+        }
+    if (f > 1) sum /= float(n);
+    return sum;
+}
+
+// Lens Blur's weight of a pixel's layers (bin0 in x, the nearer one's share in y) for layer k.
+float lbWeight(vec4 b, int k) { return int(b.x) == k ? 1.0 - b.y : int(b.x) + 1 == k ? b.y : 0.0; }
 
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
@@ -756,10 +864,331 @@ void main() {
         return;
     }
     if (mode == 37) {
-        // The rays (srcTex) added to the picture (orig) by p[1].x; light shows on transparent areas too
+        // The rays (srcTex) added to the picture (orig) by p[1].x; light shows on transparent areas too. With p[1].y,
+        // the rays are the ones kept (extra), and srcTex the light let through to each of the small copy's pixels (40
+        // and 41), drawn up between them
         const vec4 o = texelFetch(orig, xy, 0);
-        const vec3 add = px.rgb * p[1].x;
+        float k = p[1].x;
+        vec3 rays = px.rgb;
+        if (p[1].y > 0.5) {
+            rays = texelFetch(extra, xy, 0).rgb;
+            const ivec2 n = textureSize(srcTex, 0), full = textureSize(orig, 0);
+            const float fx = clamp((float(xy.x) + 0.5) * float(n.x) / float(full.x) - 0.5, 0.0, float(n.x - 1));
+            const float fy = clamp((float(xy.y) + 0.5) * float(n.y) / float(full.y) - 0.5, 0.0, float(n.y - 1));
+            const int x0 = int(fx), y0 = int(fy), x1 = min(n.x - 1, x0 + 1), y1 = min(n.y - 1, y0 + 1);
+            const float ax = fx - float(x0), ay = fy - float(y0);
+            const float t00 = texelFetch(srcTex, ivec2(x0, y0), 0).r, t10 = texelFetch(srcTex, ivec2(x1, y0), 0).r;
+            const float t01 = texelFetch(srcTex, ivec2(x0, y1), 0).r, t11 = texelFetch(srcTex, ivec2(x1, y1), 0).r;
+            k *= (t00 * (1.0 - ax) + t10 * ax) * (1.0 - ay) + (t01 * (1.0 - ax) + t11 * ax) * ay;
+        }
+        const vec3 add = rays * k;
         fragColor = vec4(o.rgb + add, min(1.0, o.a + max(add.r, max(add.g, add.b))));
+        return;
+    }
+    if (mode == 40) {
+        // Shadows Block Rays' small copy: of the picture's (orig) pixels this one covers (the table's x of the column
+        // index: the columns from and to; zw of the row index: the rows), how much light each lets through, by its
+        // brightness against the threshold p[1].x, blocked by p[1].y
+        const vec4 cols = texelFetch(table, ivec2(xy.x, 0), 0), rows = texelFetch(table, ivec2(xy.y, 0), 0);
+        const int ax = int(cols.x), bx = int(cols.y), ay = int(rows.z), by = int(rows.w);
+        float sum = 0.0;
+        for (int sy = ay; sy < by; ++sy)
+            for (int sx = ax; sx < bx; ++sx) {
+                const vec4 q = texelFetch(orig, ivec2(sx, sy), 0);
+                const float l = q.a > 0.0 ? lumaOf(q) / q.a : 0.0;
+                sum += isinf(l) || isnan(l) ? 1.0 : clamp(l / p[1].x, 0.0, 1.0);
+            }
+        fragColor = vec4(1.0 - p[1].y * (1.0 - sum / float((bx - ax) * (by - ay))), 0.0, 0.0, 0.0);
+        return;
+    }
+    if (mode == 41) {
+        // The light let through to each of the small copy's pixels (srcTex, 40) from the centre's side: a step a pixel
+        // along p[1].z of the way to the centre (p[1].xy, the small copy's), each blocking by its share (p[1].w per
+        // pixel), bilinear between them, until the march leaves the picture
+        const ivec2 n = size;
+        const float x = float(xy.x) + 0.5, y = float(xy.y) + 0.5, len = p[1].z;
+        const float dx = p[1].x - x, dy = p[1].y - y, reach = sqrt(dx * dx + dy * dy) * len;
+        const int steps = max(1, int(ceil(reach)));
+        float logT = 0.0;
+        for (int j = 1; j <= steps; ++j) {
+            const float f = len * float(j) / float(steps);
+            const float qx = x + dx * f, qy = y + dy * f;
+            if (!(qx >= 0.0 && qy >= 0.0 && qx < float(n.x) && qy < float(n.y))) break;
+            const float fx = clamp(qx - 0.5, 0.0, float(n.x - 1)), fy = clamp(qy - 0.5, 0.0, float(n.y - 1));
+            const int x0 = int(fx), y0 = int(fy), x1 = min(n.x - 1, x0 + 1), y1 = min(n.y - 1, y0 + 1);
+            const float ax = fx - float(x0), ay = fy - float(y0);
+            const float v = (texelFetch(srcTex, ivec2(x0, y0), 0).r * (1.0 - ax) + texelFetch(srcTex, ivec2(x1, y0), 0).r * ax) * (1.0 - ay) +
+                            (texelFetch(srcTex, ivec2(x0, y1), 0).r * (1.0 - ax) + texelFetch(srcTex, ivec2(x1, y1), 0).r * ax) * ay;
+            logT += log(max(1e-4, v)) * (reach / float(steps)) * p[1].w;
+        }
+        fragColor = vec4(exp(logT), 0.0, 0.0, 0.0);
+        return;
+    }
+    if (mode == 39) {
+        // Radial Blur: Zoom Blur's and Spin's taps, one every 1.5 px the smear reaches (up to 64), towards the centre and
+        // turned either side, bilinear, transparent outside
+        const float fx = float(xy.x) + 0.5 - p[1].x, fy = float(xy.y) + 0.5 - p[1].y;
+        const float d = sqrt(fx * fx + fy * fy), zr = p[1].z * d, sr = p[1].w * d;
+        const int taps = clamp(int(sqrt(zr * zr + sr * sr) / 1.5) + 1, 1, 64);
+        vec4 acc = vec4(0.0);
+        for (int k = 0; k < taps; ++k) {
+            const float f = taps > 1 ? float(k) / float(taps - 1) : 0.0;
+            const float sc = 1.0 - p[1].z * f, ang = taps > 1 ? p[1].w * (f - 0.5) : 0.0;
+            const float cs = cos(ang), sn = sin(ang);
+            acc += bilinear(size, p[1].x + (fx * cs - fy * sn) * sc, p[1].y + (fx * sn + fy * cs) * sc);
+        }
+        fragColor = acc / float(taps);
+        return;
+    }
+    if (mode == 45) {
+        fragColor = vec4(0.0);
+        return;
+    }
+    if (mode == 42) {
+        // A tile's light above the threshold (p[1].x) at the glare's size (each its picture's pixels shrunk p[1].y times
+        // each way, their mean), from p[1].zw, p[2].xy wide and high; nothing beyond
+        const int f = int(p[1].y), tx = int(p[1].z), ty = int(p[1].w);
+        if (xy.x >= int(p[2].x) || xy.y >= int(p[2].y)) {
+            fragColor = vec4(0.0);
+            return;
+        }
+        fragColor = vec4(glareLight(tx + xy.x, ty + xy.y, f, p[1].x), 0.0);
+        return;
+    }
+    if (mode == 70) {
+        // Whether any of a row's light (as 42 has it) in tile p[2].x wide is more than nothing: 1 or 0
+        const int f = int(p[1].y), T = int(p[2].x), GW = int(p[2].y);
+        float lit = 0.0;
+        for (int gx = xy.x * T; gx < min(GW, (xy.x + 1) * T) && lit == 0.0; ++gx) {
+            const vec3 l = glareLight(gx, xy.y, f, p[1].x);
+            if (l.r > 0.0 || l.g > 0.0 || l.b > 0.0) lit = 1.0;
+        }
+        fragColor = vec4(lit, 0.0, 0.0, 0.0);
+        return;
+    }
+    if (mode == 71) {
+        // Whether any row of the tile (70's, srcTex) is
+        const int T = int(p[2].x), GH = int(p[2].z);
+        float lit = 0.0;
+        for (int gy = xy.y * T; gy < min(GH, (xy.y + 1) * T); ++gy) lit = max(lit, texelFetch(srcTex, ivec2(xy.x, gy), 0).r);
+        fragColor = vec4(lit, 0.0, 0.0, 0.0);
+        return;
+    }
+    if (mode == 43) {
+        // A stage of a transform, M (p[1].x) along rows (p[1].z 0) or columns (1), forward or inverse (p[1].w): pairs
+        // p[1].y apart in the last stage's order, the second turned by its twiddle (the table's), summed and
+        // differenced into natural order (Stockham)
+        const int n = int(p[1].x), ns = int(p[1].y);
+        const bool column = p[1].z > 0.5;
+        const int j = column ? xy.y : xy.x;
+        const int r = j % (2 * ns), k = r % ns, i = (j / (2 * ns)) * ns + k;
+        const vec4 a = texelFetch(srcTex, column ? ivec2(xy.x, i) : ivec2(i, xy.y), 0);
+        const vec4 b = texelFetch(srcTex, column ? ivec2(xy.x, i + n / 2) : ivec2(i + n / 2, xy.y), 0);
+        vec2 w = texelFetch(table, ivec2(k * (n / (2 * ns)), 0), 0).xy;
+        if (p[1].w > 0.5) w.y = -w.y;
+        const vec4 v = vec4(b.x * w.x - b.y * w.y, b.x * w.y + b.y * w.x, b.z * w.x - b.w * w.y, b.z * w.y + b.w * w.x);
+        fragColor = r < ns ? a + v : a - v;
+        return;
+    }
+    if (mode == 44) {
+        // Through the kernel: red and green parted by the transform's symmetry, each by its own spectrum, blue by its
+        const int n = int(p[1].x);
+        const vec4 x = texelFetch(srcTex, xy, 0), y = texelFetch(srcTex, ivec2((n - xy.x) % n, (n - xy.y) % n), 0);
+        const vec2 red = vec2(x.x + y.x, x.y - y.y) * 0.5;               // (X + conj(Y)) / 2
+        const vec2 d = vec2(x.x - y.x, x.y + y.y);                       // X - conj(Y)
+        const vec2 green = vec2(d.y * -0.5, d.x * 0.5) * -1.0;           // times -i / 2
+        const vec4 s01 = texelFetch(table, xy, 0), s2 = texelFetch(table, ivec2(xy.x, xy.y + n), 0);
+        const vec2 rs = vec2(red.x * s01.x - red.y * s01.y, red.x * s01.y + red.y * s01.x);
+        const vec2 gs = vec2(green.x * s01.z - green.y * s01.w, green.x * s01.w + green.y * s01.z);
+        const vec2 bs = vec2(x.z * s2.x - x.w * s2.y, x.z * s2.y + x.w * s2.x);
+        fragColor = vec4(rs.x - gs.y, rs.y + gs.x, bs.x, bs.y);  // red + i green
+        return;
+    }
+    if (mode == 46) {
+        // A tile's glare (srcTex, unscaled: by p[2].z) added where it reaches (its tile, p[1], and the kernel's radius
+        // p[2].x round it) to what the tiles before made (extra, when p[2].w)
+        vec4 o = p[2].w > 0.5 ? texelFetch(extra, xy, 0) : vec4(0.0);
+        const int x = xy.x - int(p[1].x), y = xy.y - int(p[1].y), r = int(p[2].x), n = int(p[2].y);
+        if (x >= -r && y >= -r && x < int(p[1].z) + r && y < int(p[1].w) + r) {
+            const vec4 g = texelFetch(srcTex, ivec2((x + n) % n, (y + n) % n), 0);
+            o.rgb += vec3(g.x, g.y, g.z) * p[2].z;
+        }
+        fragColor = o;
+        return;
+    }
+    if (mode == 47) {
+        // The glare (extra, shrunk p[1].x times: drawn back up between its pixels) added to the picture by p[1].y
+        const vec4 o = texelFetch(orig, xy, 0);
+        const int f = int(p[1].x);
+        vec3 g;
+        if (f == 1) {
+            g = texelFetch(extra, xy, 0).rgb;
+        } else {
+            const ivec2 n = textureSize(extra, 0);
+            const float sx = clamp((float(xy.x) + 0.5) / float(f) - 0.5, 0.0, float(n.x - 1));
+            const float sy = clamp((float(xy.y) + 0.5) / float(f) - 0.5, 0.0, float(n.y - 1));
+            const int x0 = int(sx), y0 = int(sy), x1 = min(n.x - 1, x0 + 1), y1 = min(n.y - 1, y0 + 1);
+            const float fx = sx - float(x0), fy = sy - float(y0);
+            g = (texelFetch(extra, ivec2(x0, y0), 0).rgb * (1.0 - fx) + texelFetch(extra, ivec2(x1, y0), 0).rgb * fx) * (1.0 - fy) +
+                (texelFetch(extra, ivec2(x0, y1), 0).rgb * (1.0 - fx) + texelFetch(extra, ivec2(x1, y1), 0).rgb * fx) * fy;
+        }
+        const vec3 add = max(vec3(0.0), g) * p[1].y;
+        fragColor = vec4(o.rgb + add, min(1.0, o.a + max(add.r, max(add.g, add.b))));
+        return;
+    }
+    if (mode == 48) {
+        // a Gaussian's kernel along a row (p[1].y 0) or down a column (1), its p[1].x + 1 weights from the centre in
+        // p[2..], edges held (render/PaintFx's gaussian)
+        const int r = int(p[1].x);
+        const bool column = p[1].y > 0.5;
+        const int n = column ? size.y : size.x, at = column ? xy.y : xy.x;
+        vec4 acc = vec4(0.0);
+        for (int i = -r; i <= r; ++i) {
+            const int k = clamp(at + i, 0, n - 1), a = abs(i);
+            acc += p[2 + a / 4][a % 4] * texelFetch(srcTex, column ? ivec2(xy.x, k) : ivec2(k, xy.y), 0);
+        }
+        fragColor = acc;
+        return;
+    }
+    if (mode == 49) {
+        // the structure tensor of the picture's luma (Sobel, edges held): gx^2, gx gy, gy^2
+        const ivec2 hi = size - ivec2(1);
+        float L[9];
+        for (int j = -1; j <= 1; ++j)
+            for (int i = -1; i <= 1; ++i) {
+                const vec4 c = texelFetch(srcTex, clamp(xy + ivec2(i, j), ivec2(0), hi), 0);
+                L[(j + 1) * 3 + i + 1] = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+            }
+        const float gx = ((L[2] + 2.0 * L[5] + L[8]) - (L[0] + 2.0 * L[3] + L[6])) / 4.0;
+        const float gy = ((L[6] + 2.0 * L[7] + L[8]) - (L[0] + 2.0 * L[1] + L[2])) / 4.0;
+        fragColor = vec4(gx * gx, gx * gy, gy * gy, 0.0);
+        return;
+    }
+    if (mode == 50) {
+        // the flow from the smoothed tensor: the unit tangent (across the gradient) and the anisotropy; the tangent
+        // from whichever of its two equal forms keeps clear of cancellation
+        const float E = px.x, F = px.y, G = px.z;
+        const float root = sqrt((E - G) * (E - G) + 4.0 * F * F);
+        vec2 t;
+        if (E > G) t = vec2(abs(F), -(((E - G) + root) / 2.0) * sign(F));  // (l1 - G, without the cancellation)
+        else t = vec2(((G - E) + root) / 2.0, -F);                         // (l1 - E, likewise)
+        const float len = sqrt(t.x * t.x + t.y * t.y);
+        if (len > 1e-12) t /= len;
+        else t = E >= G && E > 0.0 ? vec2(0.0, 1.0) : vec2(1.0, 0.0);
+        fragColor = vec4(t, E + G > 1e-12 ? root / (E + G) : 0.0, 0.0);
+        return;
+    }
+    if (mode == 51) {
+        // the picture's squares (for a wide brush's box of them), 55 the picture as it is
+        const vec4 c = texelFetch(orig, xy, 0);
+        fragColor = vec4(c.rgb * c.rgb, 0.0);
+        return;
+    }
+    if (mode == 55) {
+        fragColor = texelFetch(orig, xy, 0);
+        return;
+    }
+    if (mode == 52) {
+        // the anisotropic Kuwahara filter (render/PaintFx's anisotropicKuwahara): p[1] the radius, alpha, q and the
+        // step; the flow in extra, the picture (orig) or at a step past 1 its box (srcTex) and its squares' (table);
+        // p[2].x the mix with the picture
+        const float radius = p[1].x, alpha = p[1].y, q = p[1].z;
+        const int step = int(p[1].w);
+        const vec4 fl = texelFetch(extra, xy, 0);
+        const float A = fl.z;
+        const float a = radius * clamp((alpha + A) / alpha, 0.1, 2.0), b = radius * clamp(alpha / (alpha + A), 0.1, 2.0);
+        const float c = fl.x, sn = fl.y;
+        const int maxX = int(sqrt(a * a * c * c + b * b * sn * sn)) / step * step;
+        const int maxY = int(sqrt(a * a * sn * sn + b * b * c * c)) / step * step;
+        vec4 m[8];
+        vec3 sq[8];
+        float mw[8];
+        for (int s = 0; s < 8; ++s) m[s] = vec4(0.0), sq[s] = vec3(0.0), mw[s] = 0.0;
+        const ivec2 hi = size - ivec2(1);
+        const float h = sqrt(0.5);
+        for (int j = -maxY; j <= maxY; j += step)
+            for (int k = -maxX; k <= maxX; k += step) {
+                float vx = (c * float(k) + sn * float(j)) * 0.5 / a, vy = (-sn * float(k) + c * float(j)) * 0.5 / b;
+                const float d2 = vx * vx + vy * vy;
+                if (d2 > 0.25) continue;
+                const ivec2 at = clamp(xy + ivec2(k, j), ivec2(0), hi);
+                const vec4 pc = step > 1 ? texelFetch(srcTex, at, 0) : texelFetch(orig, at, 0);
+                const vec3 p2 = step > 1 ? texelFetch(table, at, 0).rgb : pc.rgb * pc.rgb;
+                float w[8], n = 0.0;
+                for (int hf = 0; hf < 2; ++hf) {
+                    if (hf == 1) {
+                        const float rx = h * (vx - vy), ry = h * (vx + vy);
+                        vx = rx, vy = ry;
+                    }
+                    const float xx = 0.33 - 0.84 * vx * vx, yy = 0.33 - 0.84 * vy * vy;
+                    float z;
+                    z = max(0.0, vy + xx), w[hf] = z * z, n += w[hf];
+                    z = max(0.0, -vx + yy), w[2 + hf] = z * z, n += w[2 + hf];
+                    z = max(0.0, -vy + xx), w[4 + hf] = z * z, n += w[4 + hf];
+                    z = max(0.0, vx + yy), w[6 + hf] = z * z, n += w[6 + hf];
+                }
+                if (n <= 0.0) continue;
+                const float g = exp(-3.125 * d2) / n;
+                for (int s = 0; s < 8; ++s) {
+                    const float ws = w[s] * g;
+                    m[s] += ws * pc;
+                    sq[s] += ws * p2;
+                    mw[s] += ws;
+                }
+            }
+        vec4 outc = vec4(0.0);
+        float total = 0.0;
+        for (int s = 0; s < 8; ++s) {
+            const float ws = mw[s];
+            if (ws <= 0.0) continue;
+            const vec3 mean = m[s].rgb / ws, v = abs(sq[s] / ws - mean * mean);
+            const float sigma2 = v.r + v.g + v.b;
+            const float weight = 1.0 / (1.0 + (sigma2 > 0.0 ? pow(255.0 * sigma2, 0.5 * q) : 0.0));
+            outc += weight * (m[s] / ws);
+            total += weight;
+        }
+        const vec4 before = texelFetch(orig, xy, 0);
+        const vec4 painted = total > 0.0 ? outc / total : before;
+        fragColor = before + (painted - before) * p[2].x;
+        return;
+    }
+    if (mode == 53) {
+        // the smear along the flow (render/PaintFx's contourSmear): p[1] the steps each way, the Gaussian's sigma along
+        // them, the levels and the mix; the flow in srcTex, the picture in orig. Positions are kept as offsets from the
+        // pixel, so they stay as exact as the CPU's.
+        const int steps = int(p[1].x), levels = int(p[1].z);
+        const float sigma = p[1].y;
+        const ivec2 hi = size - ivec2(1);
+        vec4 acc = texelFetch(orig, xy, 0);
+        float total = 1.0;
+        for (int dir = -1; dir <= 1; dir += 2) {
+            vec2 o = vec2(0.5);  // (the position less the pixel's corner)
+            vec2 l = texelFetch(srcTex, xy, 0).xy * float(dir);
+            for (int k = 1; k <= steps; ++k) {
+                const vec2 mid = o + l * 0.5;
+                vec2 t = texelFetch(srcTex, clamp(xy + ivec2(floor(mid)), ivec2(0), hi), 0).xy;
+                if (t.x * l.x + t.y * l.y < 0.0) t = -t;
+                o += t;
+                l = t;
+                const vec2 at = vec2(xy) + o;
+                if (at.x < 0.0 || at.y < 0.0 || at.x >= float(size.x) || at.y >= float(size.y)) break;
+                const float w = exp(-0.5 * float(k * k) / (sigma * sigma));
+                // (bilinear, edges held)
+                const vec2 f = o - 0.5, fl = floor(f), fr = f - fl;
+                const ivec2 b = xy + ivec2(fl);
+                const vec4 p00 = texelFetch(orig, clamp(b, ivec2(0), hi), 0), p10 = texelFetch(orig, clamp(b + ivec2(1, 0), ivec2(0), hi), 0);
+                const vec4 p01 = texelFetch(orig, clamp(b + ivec2(0, 1), ivec2(0), hi), 0), p11 = texelFetch(orig, clamp(b + ivec2(1, 1), ivec2(0), hi), 0);
+                acc += w * (p00 * ((1.0 - fr.x) * (1.0 - fr.y)) + p10 * (fr.x * (1.0 - fr.y)) + p01 * ((1.0 - fr.x) * fr.y) + p11 * (fr.x * fr.y));
+                total += w;
+            }
+        }
+        vec4 d = acc / total;
+        if (levels >= 2 && d.a > 0.0) {
+            const float n = float(levels - 1);
+            for (int ch = 0; ch < 3; ++ch) d[ch] = floor(clamp(d[ch] / d.a, 0.0, 1.0) * n + 0.5) / n * d.a;  // (std::round, at or above 0)
+        }
+        const vec4 before = texelFetch(orig, xy, 0);
+        fragColor = before + (d - before) * p[1].w;
         return;
     }
     if (mode == 38) {
@@ -777,7 +1206,7 @@ void main() {
             const float streak = exp(-(dy / (0.006 * R)) * (dy / (0.006 * R))) * exp(-abs(dx) / (0.8 * R));
             light += vec3(0.25, 0.45, 0.9) * streak;
         } else {
-            const float a = atan(dy, dx);
+            const float a = dx == 0.0 && dy == 0.0 ? 0.0 : atan(dy, dx);  // (undefined at the light itself: 0, as on the CPU)
             const float ray = pow(abs(cos(float(spokes) * 0.5 * a)), lens == 0 ? 60.0 : 120.0) * exp(-d / (lens == 0 ? 0.25 : 0.35));
             light += 0.5 * ray;
         }
@@ -828,7 +1257,9 @@ void main() {
                     sat = 1.0 + (sat - 1.0) * w;
                 }
                 const float u = sat * f, start = p[1].z;
-                const float target = u <= start ? u : start + (1.0 - start) * tanh((u - start) / (1.0 - start));
+                // (tanh's argument held to 10, where it is 1 to a float: some drivers compute it as (e^2x - 1) / (e^2x + 1),
+                // NaN once e^2x overflows, as near-black, slightly negative pixels would make it)
+                const float target = u <= start ? u : start + (1.0 - start) * tanh(min((u - start) / (1.0 - start), 10.0));
                 b = Y + (b - Y) * (target / f);
                 rgb = mat3Rows(6, b);
             }
@@ -983,6 +1414,262 @@ void main() {
             o[c] = grainEncoded(tf, l[c] + p[1].y * grainAmplitude(c, light) * gn) * a;
         }
         fragColor = vec4(o, a);
+        return;
+    }
+    if (mode >= 58 && mode <= 69 && mode != 62) {
+        const int W = int(p[1].w);
+        const int x = xy.x, y = xy.y;
+        const bool right = x >= W;
+        const int xx = right ? x - W : x;
+        if (mode == 58) {
+            // p[1] the transfer tables or none, the lift's threshold and strength; p[2].x the transfer function
+            if (right) {
+                fragColor = texelFetch(table, ivec2(xx, 1 + y), 0);
+                return;
+            }
+            const vec4 o = texelFetch(orig, ivec2(xx, y), 0);
+            vec4 q = o;
+            if (p[1].x > 0.5 && o.a > 1e-6)
+                for (int c = 0; c < 3; ++c) q[c] = tableDecode(int(p[2].x), o[c] / o.a) * o.a;
+            const float thr = p[1].y, la = p[1].z;
+            if (la > 0.0 && q.a > 1e-6) {
+                const float l = lumaOf(q) / q.a;
+                if (l > thr) {
+                    const float u = l - thr, to = l + la * u * u;
+                    q.rgb = q.rgb * to / l;
+                }
+            }
+            fragColor = q;
+            return;
+        }
+        if (mode == 59) {
+            fragColor = vec4(0.0);
+            return;
+        }
+        if (mode == 60) {
+            // A sharp layer (p[2].x) over its box (p[2].yzw, p[3].x): S in extra, the picture and layers in the table
+            const vec4 sv = texelFetch(extra, xy, 0);
+            const int k = int(p[2].x);
+            if (xx < int(p[2].y) || y < int(p[2].z) || xx > int(p[2].w) || y > int(p[3].x)) {
+                fragColor = sv;
+                return;
+            }
+            const float w = lbWeight(texelFetch(table, ivec2(xx + W, y), 0), k);
+            if (!(w > 0.0)) {
+                fragColor = sv;
+                return;
+            }
+            if (right) fragColor = vec4(w + sv.x * (1.0 - w), w >= 1.0 ? 1.0 : 0.0, 0.0, 0.0);
+            else fragColor = texelFetch(table, ivec2(xx, y), 0) * w + sv * (1.0 - w);
+            return;
+        }
+        if (mode == 61) {
+            // A level pulled: from S (extra; p[2].x 1) over the box from (p[2].y, p[2].z), or from the level below
+            // (srcTex), w x h (p[2].w, p[3].x) of it; that one's left half p[3].y wide; this one's p[1].w
+            const bool fromS = p[2].x > 0.5;
+            const int ox = int(p[2].y), oy = int(p[2].z), w = int(p[2].w), h = int(p[3].x), halfW = int(p[3].y);
+            vec4 c = vec4(0.0);
+            float a = 0.0;
+            for (int yy = 2 * y; yy < min(h, 2 * y + 2); ++yy)
+                for (int x2 = 2 * xx; x2 < min(w, 2 * xx + 2); ++x2) {
+                    const ivec2 at = ivec2(ox + x2, oy + yy);
+                    const float ai = fromS ? texelFetch(extra, at + ivec2(halfW, 0), 0).x : texelFetch(srcTex, at + ivec2(halfW, 0), 0).x;
+                    if (ai <= 0.0) continue;
+                    a += ai;
+                    c += fromS ? texelFetch(extra, at, 0) : texelFetch(srcTex, at, 0);
+                }
+            fragColor = right ? vec4(a, 0.0, 0.0, 0.0) : c;
+            return;
+        }
+        if (mode == 63) {
+            // A level's mean colours (its sums in extra, p[1].w wide), or its parent's (srcTex; p[2].x 1 when it has one)
+            const vec4 c = texelFetch(extra, xy, 0);
+            const float a = texelFetch(extra, xy + ivec2(W, 0), 0).x;
+            if (a > 1e-6) fragColor = c / a;
+            else if (p[2].x > 0.5) fragColor = texelFetch(srcTex, xy / 2, 0);
+            else fragColor = c;
+            return;
+        }
+        if (mode == 64) {
+            // What is behind filled in over the box (p[2]), from the first level's means (srcTex), S in extra, when the
+            // top level (the table) holds anything
+            const vec4 sv = texelFetch(extra, xy, 0);
+            const int rx0 = int(p[2].x), ry0 = int(p[2].y);
+            if (texelFetch(table, ivec2(1, 0), 0).x <= 1e-6 || xx < rx0 || y < ry0 || xx > int(p[2].z) || y > int(p[2].w)) {
+                fragColor = sv;
+                return;
+            }
+            const float cov = texelFetch(extra, ivec2(xx + W, y), 0).x;
+            const float missing = 1.0 - min(1.0, cov);
+            if (missing <= 1e-4) {
+                fragColor = sv;
+                return;
+            }
+            if (right) fragColor = vec4(1.0, sv.y, sv.z, sv.w);
+            else fragColor = sv + missing * texelFetch(srcTex, ivec2((xx - rx0) / 2, (y - ry0) / 2), 0);
+            return;
+        }
+        if (mode == 65) {
+            // Layer p[2].x at 1/f (p[3].y; each pixel's weight p[3].z) over its window (p[2].yzw, p[3].x), from the
+            // picture and layers (extra); this one p[1].w wide
+            const int k = int(p[2].x), x0 = int(p[2].y), y0 = int(p[2].z), x1 = int(p[2].w), y1 = int(p[3].x), f = int(p[3].y);
+            const int SW = int(p[3].w);
+            vec4 c = vec4(0.0);
+            float a = 0.0;
+            for (int yy = y0 + y * f; yy < min(y1 + 1, y0 + (y + 1) * f); ++yy)
+                for (int x2 = x0 + xx * f; x2 < min(x1 + 1, x0 + (xx + 1) * f); ++x2) {
+                    const float w = lbWeight(texelFetch(extra, ivec2(x2 + SW, yy), 0), k) * p[3].z;
+                    if (w <= 0.0) continue;
+                    a += w;
+                    c += texelFetch(extra, ivec2(x2, yy), 0) * w;
+                }
+            fragColor = right ? vec4(a, 0.0, 0.0, 0.0) : c;
+            return;
+        }
+        if (mode == 66) {
+            // Gathered through the taps (the table, two texels each: where from, the aperture's position; the weight):
+            // p[2] the taps, lh, rr, the cat's eye; p[3] the squeeze, x0, y0, f; p[4] the frame's centre and corner;
+            // p[5] whether the window meets the frame's left, right, top and bottom
+            const int lw = W, lh = int(p[2].y), n = int(p[2].x);
+            const float rr = p[2].z, cat = p[2].w, sq = p[3].x, f = p[3].w;
+            float ox = 0.0, oy = 0.0;
+            if (cat > 0.0) {
+                const float px = p[3].y + (float(xx) + 0.5) * f, py = p[3].z + (float(y) + 0.5) * f;
+                ox = cat * rr * (px - p[4].x) / p[4].z, oy = cat * rr * sq * (py - p[4].y) / p[4].z;
+            }
+            vec4 sum = vec4(0.0);
+            float a = 0.0, norm = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const vec4 t = tableTexel(2 * i);
+                float w = tableTexel(2 * i + 1).x;
+                if (cat > 0.0) w = min(w, clamp(rr - length(vec2(t.z - ox, (t.w - oy) / sq)) + 0.5, 0.0, 1.0));
+                if (w <= 0.0) continue;
+                const int sx = xx + int(t.x), sy = y + int(t.y);
+                if ((sx < 0 && p[5].x > 0.5) || (sx >= lw && p[5].y > 0.5) || (sy < 0 && p[5].z > 0.5) || (sy >= lh && p[5].w > 0.5)) continue;
+                norm += w;
+                if (sx < 0 || sy < 0 || sx >= lw || sy >= lh) continue;
+                const float la = texelFetch(srcTex, ivec2(sx + lw, sy), 0).x;
+                if (la <= 0.0) continue;
+                a += w * la;
+                sum += w * texelFetch(srcTex, ivec2(sx, sy), 0);
+            }
+            if (norm <= 0.0) fragColor = vec4(0.0);
+            else fragColor = right ? vec4(a / norm, 0.0, 0.0, 0.0) : sum / norm;
+            return;
+        }
+        if (mode == 67) {
+            // The gathered layer (srcTex, lw p[3].y by lh p[3].z) laid over S (extra) over its window (p[2]), drawn up
+            // from 1/f (p[3].x)
+            const vec4 sv = texelFetch(extra, xy, 0);
+            const int x0 = int(p[2].x), y0 = int(p[2].y), lw = int(p[3].y), lh = int(p[3].z);
+            const float f = p[3].x;
+            if (xx < x0 || y < y0 || xx > int(p[2].z) || y > int(p[2].w)) {
+                fragColor = sv;
+                return;
+            }
+            const float fy = clamp((float(y - y0) + 0.5) / f - 0.5, 0.0, float(lh - 1));
+            const int ly0 = int(fy), ly1 = min(ly0 + 1, lh - 1);
+            const float wy = fy - float(ly0);
+            const float fx = clamp((float(xx - x0) + 0.5) / f - 0.5, 0.0, float(lw - 1));
+            const int lx0 = int(fx), lx1 = min(lx0 + 1, lw - 1);
+            const float wx = fx - float(lx0);
+            const int off = right ? lw : 0;
+            const vec4 a = texelFetch(srcTex, ivec2(lx0 + off, ly0), 0), b = texelFetch(srcTex, ivec2(lx1 + off, ly0), 0);
+            const vec4 c = texelFetch(srcTex, ivec2(lx0 + off, ly1), 0), d = texelFetch(srcTex, ivec2(lx1 + off, ly1), 0);
+            const vec4 top = a + (b - a) * wx, bottom = c + (d - c) * wx, v = top + (bottom - top) * wy;
+            // (the coverage, worked out the same on both halves)
+            const vec4 ra = texelFetch(srcTex, ivec2(lx0 + lw, ly0), 0), rb = texelFetch(srcTex, ivec2(lx1 + lw, ly0), 0);
+            const vec4 rc = texelFetch(srcTex, ivec2(lx0 + lw, ly1), 0), rd = texelFetch(srcTex, ivec2(lx1 + lw, ly1), 0);
+            const float rtop = ra.x + (rb.x - ra.x) * wx, rbottom = rc.x + (rd.x - rc.x) * wx;
+            const float A = min(1.0, rtop + (rbottom - rtop) * wy);
+            if (A <= 0.0) {
+                fragColor = sv;
+                return;
+            }
+            if (right) fragColor = vec4(A + sv.x * (1.0 - A), 0.0, 0.0, 0.0);
+            else fragColor = v + sv * (1.0 - A);
+            return;
+        }
+        if (mode == 68) {
+            // Back from light (S in extra), highlights brought down: p[1] as 58's, p[2].x the transfer function
+            const vec4 o = texelFetch(orig, xy, 0);
+            const vec4 sv = texelFetch(extra, xy, 0), r = texelFetch(extra, xy + ivec2(W, 0), 0);
+            if (r.y > 0.5 || r.x <= 1e-4) {
+                fragColor = o;
+                return;
+            }
+            vec4 q = sv / r.x;
+            const float thr = p[1].y, la = p[1].z;
+            if (la > 0.0 && q.a > 1e-6) {
+                const float l = lumaOf(q) / q.a;
+                if (l > thr) {
+                    const float to = thr + (-1.0 + sqrt(1.0 + 4.0 * la * (l - thr))) / (2.0 * la);
+                    q.rgb = q.rgb * to / l;
+                }
+            }
+            const float a = clamp(q.a, 0.0, 1.0);
+            vec4 outc = vec4(q.rgb, a);
+            if (p[1].x > 0.5 && q.a > 1e-6)
+                for (int c = 0; c < 3; ++c) outc[c] = tableEncode(int(p[2].x), q[c] / q.a) * a;
+            fragColor = outc;
+            return;
+        }
+        if (mode == 69) {
+            // Focus Breathing: the picture scaled about its centre by p[2].x, the edges held
+            const float cx = float(size.x) / 2.0, cy = float(size.y) / 2.0, k = p[2].x;
+            fragColor = warpSample(size, cx + (float(x) + 0.5 - cx) / k, cy + (float(y) + 0.5 - cy) / k);
+            return;
+        }
+    }
+    if (mode == 56) {
+        const int tilesX = int(p[1].x);
+        const ivec2 tc = xy / 16;
+        const vec4 hd = tableTexel(tc.y * tilesX + tc.x);
+        int i = int(hd.x) * 4096 + int(hd.y);
+        const int end = int(hd.z) * 4096 + int(hd.w);
+        const float lx = float(xy.x - tc.x * 16), ly = float(xy.y - tc.y * 16);
+        const float cx = float(xy.x) + 0.5, cy = float(xy.y) + 0.5;
+        const int row = xy.y - tc.y * 16;
+        vec4 acc = vec4(0.0);
+        vec4 stack[8];
+        int sp = 0;
+        while (i < end) {
+            const vec4 c = tableTexel(i);
+            const int type = int(c.x);
+            if (type == 1) {
+                if (sp < 8) stack[sp] = acc;
+                ++sp;
+                acc = vec4(0.0);
+                ++i;
+                continue;
+            }
+            if (type == 2) {
+                const vec4 g = acc * c.y;
+                --sp;
+                acc = sp >= 0 && sp < 8 ? stack[sp] : vec4(0.0);
+                acc = g + acc * (1.0 - g.a);
+                ++i;
+                continue;
+            }
+            const int lines = int(c.z);
+            float wind = tableTexel(i + 1 + row / 4)[row % 4];
+            for (int l = 0; l < lines; ++l) wind += shapeLineCover(tableTexel(i + 5 + l), lx, ly);
+            float cov;
+            if (c.w > 0.5) {
+                float a = abs(wind);
+                a = a - 2.0 * floor(a * 0.5);
+                cov = a > 1.0 ? 2.0 - a : a;
+            } else {
+                cov = min(1.0, abs(wind));
+            }
+            if (cov > 0.0) {
+                const vec4 col = shapePaint(int(c.y), cx, cy);
+                const float sa = col.a * cov;
+                acc = col * cov + acc * (1.0 - sa);
+            }
+            i += 5 + lines;
+        }
+        fragColor = acc;
         return;
     }
     fragColor = px;

@@ -37,6 +37,7 @@
 #include "media/Exr.h"
 #include "media/Av2.h"
 #include "media/Jxl.h"
+#include "media/JpegXs.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
@@ -55,6 +56,11 @@ const QString kSettingsPreset = QStringLiteral("export/preset");
 
 bool hasVideo(const ExportSettings& s) { return !s.videoCodec.empty() && s.videoCodec != "none"; }
 bool hasAudio(const ExportSettings& s) { return !s.audioCodec.empty() && s.audioCodec != "none"; }
+
+// Whether an export's video can state an HRD: x264's and x265's (not AVC-Intra, whose class fixes its rate).
+bool statesHrd(const ExportSettings& s) {
+    return (s.videoCodec == "libx264" || s.videoCodec == "libx265") && s.profile != "avci100";
+}
 
 bool usesCrf(const std::string& codec) {
     return codec == "libx264" || codec == "libx265" || codec == "libvpx-vp9" || codec == "libsvtav1" || codec == "liboapv" || codec == "av2";
@@ -83,6 +89,7 @@ QString videoCodecName(const ExportSettings& s) {
     if (c == "libsvtav1") return QStringLiteral("AV1");
     if (c == "av2") return s.pixFmt.find("10") != std::string::npos ? QStringLiteral("AV2 10-bit") : QStringLiteral("AV2");
     if (c == "mjpeg") return QStringLiteral("Motion JPEG");
+    if (c == "jpegxs") return QStringLiteral("JPEG XS");
     if (c == "cfhd") return s.alpha ? QStringLiteral("CineForm RGBA") : QStringLiteral("CineForm");
     if (c == "ffv1") return QStringLiteral("FFV1 (lossless)");
     if (c == "v210") return QStringLiteral("Uncompressed 10-bit");
@@ -185,10 +192,12 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     sizeRow->addStretch(1);
 
     quality_ = new QSpinBox(form_);
+    quality_->setObjectName(QStringLiteral("exportQuality"));
     quality_->setRange(0, 51);
     quality_->setToolTip(tr("Constant rate factor: lower values give higher quality and larger files"));
 
     summary_ = new QLabel(form_);
+    summary_->setObjectName(QStringLiteral("exportSummary"));
     summary_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     summary_->setFrameShape(QFrame::StyledPanel);
     summary_->setMargin(6);
@@ -203,6 +212,42 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     form->addRow(tr("Size:"), matchSize_);
     form->addRow(QString(), sizeRow);
     form->addRow(tr("Quality (CRF):"), quality_);
+    // A stated buffer model, as broadcast ingest checks it: the stream says the rate its bits arrive at and the buffer
+    // a decoder needs, and keeps to them.
+    hrd_ = new QComboBox(form_);
+    hrd_->setObjectName(QStringLiteral("exportHrd"));
+    hrd_->addItem(tr("Not stated"), QString());
+    hrd_->addItem(tr("Constant bit rate (CBR)"), QStringLiteral("cbr"));
+    hrd_->addItem(tr("Variable bit rate (VBR)"), QStringLiteral("vbr"));
+    hrd_->setToolTip(tr("States a buffer model (HRD) in H.264 or H.265 video, as broadcast ingest checks it. Constant: exactly this "
+                        "rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set "
+                        "above. The export is checked against it when it is written."));
+    hrdRate_ = new QSpinBox(form_);
+    hrdRate_->setObjectName(QStringLiteral("exportHrdRate"));
+    hrdRate_->setRange(100, 800000);
+    hrdRate_->setSingleStep(500);
+    hrdRate_->setSuffix(tr(" kbit/s"));
+    hrdRate_->setToolTip(tr("The rate the stream states: its bit rate when constant, its highest when variable"));
+    hrdBuffer_ = new QSpinBox(form_);
+    hrdBuffer_->setObjectName(QStringLiteral("exportHrdBuffer"));
+    hrdBuffer_->setRange(0, 800000);
+    hrdBuffer_->setSingleStep(500);
+    hrdBuffer_->setSuffix(tr(" kbit"));
+    hrdBuffer_->setSpecialValueText(tr("A second's buffer"));
+    hrdBuffer_->setToolTip(tr("The decoder buffer the stream states. The lowest setting is a second at the rate."));
+    {
+        const QSettings stored = appSettings();
+        hrd_->setCurrentIndex(std::max(0, hrd_->findData(stored.value("export/hrd").toString())));
+        hrdRate_->setValue(stored.value("export/hrdRate", 8000).toInt());
+        hrdBuffer_->setValue(stored.value("export/hrdBuffer", 0).toInt());
+    }
+    auto* hrdRow = new QHBoxLayout;
+    hrdRow->setContentsMargins(0, 0, 0, 0);
+    hrdRow->addWidget(hrd_);
+    hrdRow->addWidget(hrdRate_);
+    hrdRow->addWidget(hrdBuffer_);
+    hrdRow->addStretch(1);
+    form->addRow(tr("Buffer model (HRD):"), hrdRow);
     captions_ = new QComboBox(form_);
     captions_->addItem(tr("None"), 0);
     captions_->addItem(tr("Burn into the picture"), 1);
@@ -300,9 +345,15 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     }
     interlaced_ = new QCheckBox(tr("Interlaced, top field first"), form_);
     interlaced_->setObjectName(QStringLiteral("exportInterlaced"));
-    interlaced_->setToolTip(tr("Coded as two fields, the top first (each picture as both fields: PsF), as 1080i deliveries ask"));
+    interlaced_->setToolTip(tr("Coded as two fields, the top first, each rendered at its own moment half a frame apart, as 1080i deliveries ask"));
     interlaced_->setChecked(appSettings().value("export/interlaced", false).toBool());
     form->addRow(QString(), interlaced_);
+    segmentedFields_ = new QCheckBox(tr("Both fields from one picture (PsF)"), form_);
+    segmentedFields_->setObjectName(QStringLiteral("exportSegmentedFields"));
+    segmentedFields_->setToolTip(tr("Each frame's two halves as its fields, as progressive pictures are carried in 1080i, instead of each field rendered at its own moment"));
+    segmentedFields_->setChecked(appSettings().value("export/segmentedFields", false).toBool());
+    form->addRow(QString(), segmentedFields_);
+    connect(interlaced_, &QCheckBox::toggled, this, [this] { updateControls(); });
     {
         auto* row = new QWidget(form_);
         auto* h = new QHBoxLayout(row);
@@ -417,6 +468,14 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         jxlDepth_->hide();
         jxlPremultiplied_->hide();
     }
+    jpegXsRate_ = new QComboBox(form_);
+    jpegXsRate_->setObjectName(QStringLiteral("exportJpegXsRate"));
+    jpegXsRate_->addItem(tr("The preset's"), 0.0);
+    for (double bpp : {2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0}) jpegXsRate_->addItem(tr("%1 bits a pixel").arg(bpp), bpp);
+    jpegXsRate_->setCurrentIndex(std::max(0, jpegXsRate_->findData(appSettings().value("export/jpegXsBpp", 0.0).toDouble())));
+    jpegXsRate_->setToolTip(tr("JPEG XS's rate: each picture the same number of bytes, its width times its height times this, over 8"));
+    if (jpegXsAvailable()) form->addRow(tr("JPEG XS:"), jpegXsRate_);
+    else jpegXsRate_->hide();
     // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
     stereo_ = new QComboBox(form_);
     stereo_->setObjectName(QStringLiteral("exportStereo"));
@@ -659,6 +718,12 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     connect(width_, &QSpinBox::valueChanged, this, [this](int w) { widthChanged(w); });
     connect(height_, &QSpinBox::valueChanged, this, [this](int h) { heightChanged(h); });
     connect(quality_, &QSpinBox::valueChanged, this, [this] { updateSummary(); });
+    connect(hrd_, &QComboBox::currentIndexChanged, this, [this] {
+        updateControls();
+        updateSummary();
+    });
+    connect(hrdRate_, &QSpinBox::valueChanged, this, [this] { updateSummary(); });
+    connect(hrdBuffer_, &QSpinBox::valueChanged, this, [this] { updateSummary(); });
     connect(color_, &QComboBox::currentIndexChanged, this, [this] {
         updateSummary();
         updateControls();
@@ -867,11 +932,21 @@ void ExportDialog::updateControls() {
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
         jxlQuality_->setEnabled(video && vc == "jxl" && jxlAvailable());
         jxlDepth_->setEnabled(jxlQuality_->isEnabled());
+        jpegXsRate_->setEnabled(video && vc == "jpegxs" && jpegXsAvailable());
         jxlPremultiplied_->setEnabled(jxlQuality_->isEnabled() && p->settings.alpha && jxlWritesPremultiplied());
     }
     loudness_->setEnabled(p && hasAudio(p->settings));
     loudnessReport_->setEnabled(p && hasAudio(p->settings));
-    quality_->setEnabled(p && usesCrf(p->settings.videoCodec));
+    {
+        // A stated HRD: x264's and x265's (not AVC-Intra, whose rate its class fixes). At a constant rate the bits are
+        // the rate's, so the quality setting does not apply.
+        const bool states = p && statesHrd(p->settings);
+        const QString mode = states ? hrd_->currentData().toString() : QString();
+        hrd_->setEnabled(states);
+        hrdRate_->setEnabled(!mode.isEmpty());
+        hrdBuffer_->setEnabled(!mode.isEmpty());
+        quality_->setEnabled(p && usesCrf(p->settings.videoCodec) && mode != QLatin1String("cbr"));
+    }
     const Sequence* seq = state_ ? state_->sequence() : nullptr;
     const CaptionTrack* ct = seq ? captionTrackFor(*seq) : nullptr;
     captions_->setEnabled(video && ct && !ct->captions.empty());
@@ -933,6 +1008,7 @@ void ExportDialog::updateControls() {
         const bool fields = r.size() == 3 && r[0] == QLatin1String("pulldown") && nd.size() == 2 && nd[1].toDouble() > 0 &&
                             nd[0].toDouble() / nd[1].toDouble() < 40;
         interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks" || vc == "ffv1") && d != "as11-dpp" && !fields);
+        if (segmentedFields_) segmentedFields_->setEnabled((interlaced_->isEnabled() && interlaced_->isChecked()) || (video && d == "as11-dpp"));
     }
     if (credentials_) {
         ExportSettings would = p ? p->settings : ExportSettings{};
@@ -952,13 +1028,14 @@ void ExportDialog::updateControls() {
     }
     const QString vc = p ? QString::fromStdString(p->settings.videoCodec) : QString();
     const bool intra = vc == "prores_ks" || vc == "dnxhd";
-    const bool longGop = vc == "libx264" || vc == "libx265" || vc == "mpeg2video";
+    const bool longGop = vc == "libx264" || vc == "libx265" || vc == "mpeg2video" || vc == "libsvtav1" || vc == "libvpx-vp9";
     smart_->setEnabled(intra || longGop);
     smart_->setToolTip(intra ? tr("Frames that are one untouched clip already in this ProRes or DNxHR flavour, size and rate are copied from "
                                   "the source instead of being encoded again: faster, and exactly the original pictures")
-                       : longGop ? tr("Untouched footage already coded as this export is (H.264, HEVC or XDCAM's MPEG-2 at this size, rate "
-                                      "and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again")
-                                 : tr("Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422"));
+                       : longGop ? tr("Untouched footage already coded as this export is (H.264, HEVC, AV1, VP9 or XDCAM's MPEG-2 at this "
+                                      "size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles "
+                                      "are encoded again")
+                                 : tr("Smart rendering works with ProRes, DNxHR, H.264, HEVC, AV1, VP9 and XDCAM HD422"));
     chapters_->setToolTip(!chapterFile ? tr("Chapters can be written into MP4, MOV and MKV files")
                           : anyChapters ? tr("Players and YouTube show the chapter markers as chapters")
                                         : tr("Add chapter markers (Sequence > Add Chapter Marker) to export chapters"));
@@ -999,7 +1076,16 @@ void ExportDialog::updateSummary() {
                            .arg(w)
                            .arg(h)
                            .arg(fpsLabel(seq->fps));
-        if (usesCrf(s.videoCodec)) line += (s.videoCodec == "liboapv" ? tr(", QP %1") : tr(", CRF %1")).arg(quality_->value());
+        const QString hrdMode = statesHrd(s) ? hrd_->currentData().toString() : QString();
+        if (usesCrf(s.videoCodec) && hrdMode != QLatin1String("cbr"))
+            line += (s.videoCodec == "liboapv" ? tr(", QP %1") : tr(", CRF %1")).arg(quality_->value());
+        if (!hrdMode.isEmpty()) {
+            const int buffer = hrdBuffer_->value() > 0 ? hrdBuffer_->value() : hrdRate_->value();
+            line += (hrdMode == QLatin1String("cbr") ? tr(", a constant %1 kbit/s with its buffer model stated (%2 kbit)")
+                                                     : tr(", no more than %1 kbit/s with its buffer model stated (%2 kbit)"))
+                        .arg(hrdRate_->value())
+                        .arg(buffer);
+        }
         // (AV2's ISO BMFF binding is not final: a player may read its MP4 differently later; IVF and OBU are settled)
         if (s.videoCodec == "av2") {
             const QString suffix = QFileInfo(path_->text()).suffix().toLower();
@@ -1107,7 +1193,20 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.height = height_->value();
     }
     if (usesCrf(s.videoCodec)) s.crf = quality_->value();
+    if (statesHrd(s)) {
+        // The stated HRD: its rate and buffer (0: a second at the rate). At a constant rate the rate is the bit rate.
+        // (Not stated here, a preset that states one itself keeps its own.)
+        if (const std::string mode = hrd_->currentData().toString().toStdString(); !mode.empty()) {
+            s.hrd = mode;
+            s.vbvMaxrate = int64_t(hrdRate_->value()) * 1000;
+            s.vbvBuffer = int64_t(hrdBuffer_->value()) * 1000;
+        }
+        settings.setValue("export/hrd", hrd_->currentData().toString());
+        settings.setValue("export/hrdRate", hrdRate_->value());
+        settings.setValue("export/hrdBuffer", hrdBuffer_->value());
+    }
     if (s.videoCodec == "av2" && av2ContainerForPath(s.path) != Av2Container::Mp4) s.audioCodec = "none";  // (IVF and OBU hold no sound)
+    if (s.videoCodec == "jpegxs" && jxsContainerForPath(s.path) != JxsContainer::Mxf) s.audioCodec = "none";  // (nor do raw codestreams)
     if (captions_->isEnabled()) {
         const int mode = captions_->currentData().toInt();
         s.burnInCaptions = mode & 1;
@@ -1135,6 +1234,10 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         settings.setValue("export/jxlDistance", s.jxlDistance);
         s.jxlDepth = jxlDepth_->currentData().toString().toStdString();
         settings.setValue("export/jxlDepth", jxlDepth_->currentData());
+    }
+    if (jpegXsRate_->isEnabled()) {
+        if (const double bpp = jpegXsRate_->currentData().toDouble(); bpp > 0) s.jpegXsBpp = bpp;
+        settings.setValue("export/jpegXsBpp", jpegXsRate_->currentData());
     }
     if (jxlPremultiplied_->isEnabled()) {
         s.jxlPremultiplied = jxlPremultiplied_->isChecked();
@@ -1167,6 +1270,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/startTimecode", startTc_->text().trimmed());
     s.interlaced = interlaced_->isEnabled() && interlaced_->isChecked();
     settings.setValue("export/interlaced", interlaced_->isChecked());
+    s.segmentedFields = segmentedFields_->isEnabled() && segmentedFields_->isChecked();
+    settings.setValue("export/segmentedFields", segmentedFields_->isChecked());
     if (const QStringList r = rate_->currentData().toString().split(QLatin1Char('|')); rate_->isEnabled() && r.size() == 3) {
         s.rateChange = r[0].toStdString();
         const QStringList nd = r[1].split(QLatin1Char('/'));

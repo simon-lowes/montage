@@ -1,9 +1,15 @@
 #include "St2110Receive.h"
 
+#include "media/JpegXs.h"
+
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
+
+#include <QFile>
 
 namespace montage::st2110 {
 
@@ -38,6 +44,7 @@ struct Media {
     std::map<std::string, std::string> fmtp;
     std::string rtpmap;
     double ptimeMs = 1;
+    int64_t kbps = 0;  // (b=AS)
 };
 
 // An RTP timestamp at `rate` as a whole count of its ticks since the PTP epoch, taken to be the one nearest now.
@@ -93,6 +100,8 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
             n.address = sessionAddress;
             n.source = sessionSource;
             media.push_back(n);
+        } else if (line[0] == 'b' && m && v.rfind("AS:", 0) == 0) {
+            m->kbps = std::max<int64_t>(0, std::atoll(v.c_str() + 3));
         } else if (line[0] == 'c') {
             std::istringstream cs(v);
             std::string net, type, addr;
@@ -161,16 +170,45 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
             s.fullRange = m.fmtp["RANGE"].rfind("FULL", 0) == 0;
             std::string why;
             if (!videoFormatOk(f, &why)) return fail(why);
+        } else if (s.encoding == "jxsv") {
+            // ST 2110-22's JPEG XS (RFC 9134): progressive here, its packetization mode required.
+            VideoFormat& f = s.video;
+            f.codec = "jxsv";
+            if (!m.fmtp.count("packetmode")) return fail("The JPEG XS stream's SDP gives no packetmode");
+            f.packetMode = std::atoi(m.fmtp["packetmode"].c_str());
+            if (m.fmtp.count("transmode") && m.fmtp["transmode"] != "1")
+                return fail("Montage receives JPEG XS sent in order (RFC 9134's transmode 1)");
+            if (!parseSampling(m.fmtp["sampling"], f.sampling))
+                return fail("Montage receives JPEG XS at YCbCr-4:2:2, YCbCr-4:4:4 and RGB, not " + m.fmtp["sampling"]);
+            f.width = std::atoi(m.fmtp["width"].c_str());
+            f.height = std::atoi(m.fmtp["height"].c_str());
+            f.depth = m.fmtp.count("depth") ? std::atoi(m.fmtp["depth"].c_str()) : 10;
+            f.interlaced = m.fmtp.count("interlace") > 0;
+            if (!rational(m.fmtp["exactframerate"], f.fps)) return fail("The video's SDP gives no exactframerate");
+            if (m.fmtp.count("TCS")) f.tcs = m.fmtp["TCS"];
+            if (m.fmtp.count("colorimetry")) f.colorimetry = m.fmtp["colorimetry"];
+            f.profile = m.fmtp["profile"];
+            f.level = m.fmtp["level"];
+            f.sublevel = m.fmtp["sublevel"];
+            f.bandwidthKbps = m.kbps;
+            // (bits a pixel from the bandwidth, which counts the packets' headers too: near enough to size buffers)
+            if (m.kbps > 0 && f.width > 0 && f.height > 0 && f.fps.valid())
+                f.bpp = std::clamp(double(m.kbps) * 1000 / f.fps.toDouble() / (double(f.width) * f.height), 0.5, 24.0);
+            s.fullRange = m.fmtp["RANGE"].rfind("FULL", 0) == 0;
+            std::string why;
+            if (!videoFormatOk(f, &why)) return fail(why);
         } else if (s.encoding == "smpte291") {
             if (m.fmtp.count("exactframerate")) rational(m.fmtp["exactframerate"], s.video.fps);
         } else if (s.encoding == "ST2110-41") {
-            // (DIT: the data item types, apart by commas)
+            // (DIT: the data item types in hexadecimal, apart by commas; "0x" before each, as ST 2110-41's first
+            // edition's senders may write them, taken too)
             std::istringstream types(m.fmtp["DIT"]);
             for (std::string t; std::getline(types, t, ',');) {
                 t = trim(t);
+                if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) t = t.substr(2);
                 if (t.empty()) continue;
                 char* end = nullptr;
-                const unsigned long v = std::strtoul(t.c_str(), &end, 0);
+                const unsigned long v = std::strtoul(t.c_str(), &end, 16);
                 if (end && *end == 0 && v <= 0x3FFFFF) s.metadataTypes.push_back(uint32_t(v));
             }
         } else if (s.encoding == "L24" || s.encoding == "L16" || s.encoding == "AM824") {
@@ -188,7 +226,7 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
             if (a.rate != 44100 && a.rate != 48000 && a.rate != 96000) return fail("ST 2110-30 here is at 44.1, 48 or 96 kHz");
             if (a.packetUs > 20000) return fail("The audio's packets are at most 20 ms here");
         } else {
-            return fail("Montage receives ST 2110-20, -30, -31, -40 and -41 streams, not " + m.rtpmap);
+            return fail("Montage receives ST 2110-20, -22 (JPEG XS), -30, -31, -40 and -41 streams, not " + m.rtpmap);
         }
     }
     // ST 2022-7: a group's second description is its first's other path.
@@ -264,11 +302,12 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
     auto turnAway = [&] {
         ++rejected;
         if (who.others.size() > 8) {
-            // (a few strangers counted at a time: the one heard least let go)
-            auto least = who.others.begin();
+            // (a few strangers counted at a time: the one heard longest ago let go, never this one, so a sender that
+            // keeps sending builds up its count however many strays trickle in beside it)
+            auto least = who.others.end();
             for (auto it = who.others.begin(); it != who.others.end(); ++it)
-                if (it->second.count < least->second.count) least = it;
-            who.others.erase(least);
+                if (it->first != p.ssrc && (least == who.others.end() || it->second.last < least->second.last)) least = it;
+            if (least != who.others.end()) who.others.erase(least);
         }
     };
     if (!who.have && started_ && other.have && p.ssrc != other.ssrc && std::llabs(place() - next_) > int64_t(window_)) {
@@ -279,7 +318,8 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
         // (each counted against the other path's packets since it was first heard: a stray heard long before on this
         // leg does not hold back a sender that starts on it once the other leg has died)
         auto heard = who.others.find(p.ssrc);
-        if (heard == who.others.end()) heard = who.others.emplace(p.ssrc, Heard{0, received[otherSide]}).first;
+        if (heard == who.others.end()) heard = who.others.emplace(p.ssrc, Heard{0, received[otherSide], 0}).first;
+        heard->second.last = ++heardClock_;
         const int64_t theirs = ++heard->second.count;
         if (theirs <= int64_t(window_) || (received[otherSide] - heard->second.otherAt) * 4 >= theirs) return turnAway();
         other = Sender{};
@@ -292,7 +332,9 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
     if (who.have && p.ssrc != who.ssrc) {
         // (the one taken's packets counted from the first stranger's; all counted again once it has sent a window)
         if (who.others.empty()) who.own = 0;
-        const int64_t theirs = ++who.others[p.ssrc].count;
+        Heard& h = who.others[p.ssrc];
+        h.last = ++heardClock_;
+        const int64_t theirs = ++h.count;
         if (theirs <= int64_t(window_) || who.own * 4 >= theirs) return turnAway();
         // A window of another sender's, with few of the one taken between: that one now. The count starts again from
         // its numbers, unless the other path's new sender has just started it (both legs' senders started again).
@@ -377,8 +419,14 @@ struct Input::Stream {
     std::mutex m;
     PathMerger merger{true};
     std::unique_ptr<VideoAssembler> assembler;
+    std::unique_ptr<JxsvAssembler> jxsv;  // (ST 2110-22's, and its decoder)
+    std::unique_ptr<JxsDecoder> decoder;
     std::chrono::steady_clock::time_point last[2];  // when each path last brought a packet
-    Stream(int k, const SdpStream& s) : kind(k), sdp(s), merger(k == 0) {}
+    // Ancillary data and metadata: the latest RTP timestamp this stream brought (the input's lock held).
+    bool dataSeen = false;
+    uint32_t dataLatest = 0;
+    // (RFC 4175's extended sequence numbers for ST 2110-20; RFC 9134's are RTP's own)
+    Stream(int k, const SdpStream& s) : kind(k), sdp(s), merger(k == 0 && !s.video.jpegXs()) {}
 };
 
 Input::Input() = default;
@@ -395,7 +443,7 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
     stop_ = false;
     int channels = 0;
     for (const SdpStream& s : streams) {
-        const int kind = s.encoding == "raw" ? 0 : s.encoding == "smpte291" ? 2 : s.encoding == "ST2110-41" ? 3 : 1;
+        const int kind = s.encoding == "raw" || s.encoding == "jxsv" ? 0 : s.encoding == "smpte291" ? 2 : s.encoding == "ST2110-41" ? 3 : 1;
         if (kind == 0)
             for (const auto& have : streams_)
                 if (have->kind == 0) return fail("Montage takes one video stream at a time (with any number of sound and data streams)");
@@ -405,12 +453,20 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
             std::string why;
             if (!videoFormatOk(s.video, &why)) return fail(why);
             video_ = s.video;
-            st->assembler = std::make_unique<VideoAssembler>(s.video.width, s.video.height, s.video.sampling, s.video.depth, s.video.interlaced);
+            double frameBytes = 0;
+            if (s.video.jpegXs()) {
+                if (!jpegXsAvailable()) return fail("This build of Montage has no JPEG XS (SVT-JPEG-XS) to receive ST 2110-22 with");
+                st->jxsv = std::make_unique<JxsvAssembler>();
+                st->decoder = std::make_unique<JxsDecoder>();
+                frameBytes = double(s.video.width) * s.video.height * s.video.bpp / 8;
+            } else {
+                st->assembler = std::make_unique<VideoAssembler>(s.video.width, s.video.height, s.video.sampling, s.video.depth, s.video.interlaced);
+                const Pgroup pg = pgroup(s.video.sampling, s.video.depth);
+                frameBytes = double(s.video.width) * s.video.height * pg.bytes / pg.pixels;
+            }
             // ST 2022-7's paths may be some milliseconds apart: a gap is waited on for 30 ms of the stream's packets
             // (from its bytes a second; packets carry at most about 1,400 bytes of pixels), and fewer large pictures
             // are held for a reader that falls behind.
-            const Pgroup pg = pgroup(s.video.sampling, s.video.depth);
-            const double frameBytes = double(s.video.width) * s.video.height * pg.bytes / pg.pixels;
             st->merger.setWindow(std::max<size_t>(512, size_t(frameBytes * s.video.fps.toDouble() * 0.03 / 1000)));
             // (each held as a raster of 16-bit samples)
             const double rasterBytes = double(s.video.width) * s.video.height * (s.video.sampling == Sampling::Ycc422 ? 2 : 3) * 2;
@@ -433,6 +489,10 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
         } else {
             hasMeta_ = true;
         }
+        // (a gap waited on, and a new sender passed over, for about half a second of packets: a data stream sends a
+        // packet or two a frame, so 512 of them were twenty seconds; sound by its packet time)
+        if (kind == 1) st->merger.setWindow(std::clamp<size_t>(size_t(500000 / std::max(1, s.audio.packetUs)), 64, 4096));
+        else if (kind >= 2) st->merger.setWindow(32);
         for (int p = 0; p < (s.redundant() ? 2 : 1); ++p) {
             std::string why;
             const std::string& at = s.interfaceAddress[p].empty() ? o.interfaceAddress[p] : s.interfaceAddress[p];
@@ -442,7 +502,7 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
     }
     bool video = false;
     for (const auto& s : streams_) video = video || s->kind == 0;
-    if (!video) return fail("The SDP has no video stream (ST 2110-20)");
+    if (!video) return fail("The SDP has no video stream (ST 2110-20 or -22)");
     for (const auto& s : streams_)
         for (int p = 0; p < (s->sdp.redundant() ? 2 : 1); ++p) threads_.emplace_back([this, st = s.get(), p] { receive(st, p); });
     return true;
@@ -518,12 +578,34 @@ void Input::receive(Stream* s, int path) {
 void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
     RtpPacket p;
     if (!parseRtp(packet.data(), packet.size(), p)) return;  // (the merger took RTP of the stream's payload type alone)
-    if (s.kind == 0) {
+    if (s.kind == 0 && s.jxsv) {
+        // ST 2110-22: the codestream rebuilt, decoded to the stream's sampling and depth.
+        if (!s.jxsv->add(p)) return;
+        JxsPicture pic;
+        const JxsSampling s444 = s.sdp.video.sampling == Sampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444;
+        const std::vector<uint8_t>& cs = s.jxsv->codestream();
+        const JxsSampling want = video_.sampling == Sampling::Ycc422 ? JxsSampling::Ycc422 : s444;
+        // (a codestream of another size or depth than the SDP's is not decoded at all)
+        JxsHeader h;
+        const bool ok = readJxsHeader(cs.data(), cs.size(), h) && h.width == video_.width && h.height == video_.height && h.depth == video_.depth &&
+                        s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && pic.width == video_.width && pic.height == video_.height &&
+                        pic.depth == video_.depth && pic.sampling == want;
+        std::lock_guard lock(m_);
+        if (!ok) {
+            ++stats_.incomplete;
+            return;
+        }
+        while (pending_.size() >= pendingLimit_) pending_.pop_front(), ++stats_.dropped;
+        pending_.push_back({rasterOf(pic), s.jxsv->timestamp(), s.jxsv->lostInFrame(), std::chrono::steady_clock::now(), cs});
+        if (s.jxsv->lostInFrame()) ++stats_.incomplete;
+        stats_.concealedSlices += s.jxsv->concealedSlices();
+        cv_.notify_all();
+    } else if (s.kind == 0) {
         if (!s.assembler->add(p)) return;
         std::lock_guard lock(m_);
         // (a reader that falls behind loses the oldest frames, not the newest)
         while (pending_.size() >= pendingLimit_) pending_.pop_front(), ++stats_.dropped;
-        pending_.push_back({s.assembler->raster(), s.assembler->timestamp(), s.assembler->lostInFrame(), std::chrono::steady_clock::now()});
+        pending_.push_back({s.assembler->raster(), s.assembler->timestamp(), s.assembler->lostInFrame(), std::chrono::steady_clock::now(), {}});
         if (s.assembler->lostInFrame()) ++stats_.incomplete;
         cv_.notify_all();
     } else if (s.kind == 1) {
@@ -573,11 +655,15 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         std::vector<FastMetadata> items;
         if (!unpackFastMetadata(p.payload, p.size, items)) return;
         std::lock_guard lock(m_);
-        auto& at = meta_[p.timestamp];
-        if (at.size() + items.size() > 256) return;
+        // (no entry made for what is refused: an empty one would never be let go)
+        const auto have = meta_.find(p.timestamp);
+        if ((have == meta_.end() ? 0 : have->second.size()) + items.size() > 256) return;
+        auto& at = have == meta_.end() ? meta_[p.timestamp] : have->second;
         at.insert(at.end(), items.begin(), items.end());
         if (!metaSeen_ || int32_t(p.timestamp - metaLatest_) > 0) metaLatest_ = p.timestamp;
         metaSeen_ = true;
+        if (!s.dataSeen || int32_t(p.timestamp - s.dataLatest) > 0) s.dataLatest = p.timestamp;
+        s.dataSeen = true;
         while (meta_.size() > 64) {
             auto oldest = meta_.begin();
             for (auto it = meta_.begin(); it != meta_.end(); ++it)
@@ -589,11 +675,15 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         std::vector<AncPacket> anc;
         if (!unpackAnc(p.payload, p.size, anc)) return;
         std::lock_guard lock(m_);
-        auto& at = anc_[p.timestamp];
-        // (a frame carries a few dozen packets: no more held for one time, whatever a sender repeats)
-        if (at.size() + anc.size() > 256) return;
+        // (a frame carries a few dozen packets: no more held for one time, whatever a sender repeats; and no entry
+        // made for what is refused)
+        const auto have = anc_.find(p.timestamp);
+        if ((have == anc_.end() ? 0 : have->second.size()) + anc.size() > 256) return;
+        auto& at = have == anc_.end() ? anc_[p.timestamp] : have->second;
         at.insert(at.end(), anc.begin(), anc.end());
         if (!ancSeen_ || int32_t(p.timestamp - ancLatest_) > 0) ancLatest_ = p.timestamp;
+        if (!s.dataSeen || int32_t(p.timestamp - s.dataLatest) > 0) s.dataLatest = p.timestamp;
+        s.dataSeen = true;
         // (the oldest let go: furthest behind the latest, as the map's order breaks where the timestamps wrap)
         while (anc_.size() > 64) {
             auto oldest = anc_.begin();
@@ -624,9 +714,10 @@ Span spanOf(uint32_t ts, Rational fps, int rate) {
 
 bool Input::ready(const Pending& p, std::chrono::steady_clock::time_point now) {
     if (now - p.at > std::chrono::milliseconds(options_.waitMs)) return true;
-    // (its ancillary data, sent alongside on a socket of its own, may come a little after the picture)
-    if (hasAnc_ && !(ancSeen_ && int32_t(ancLatest_ - p.ts) >= 0)) return false;
-    if (hasMeta_ && !(metaSeen_ && int32_t(metaLatest_ - p.ts) >= 0)) return false;
+    // (its ancillary data and metadata, sent alongside on sockets of their own, may come a little after the picture:
+    // each such stream must have reached the picture's time, not only the quickest of them)
+    for (const auto& st : streams_)
+        if ((st->kind == 2 || st->kind == 3) && !(st->dataSeen && int32_t(st->dataLatest - p.ts) >= 0)) return false;
     if (!hasAudio_) return true;
     const Span sp = spanOf(p.ts, video_.fps, audio_.rate);
     for (const Sound& s : sounds_)
@@ -637,6 +728,7 @@ bool Input::ready(const Pending& p, std::chrono::steady_clock::time_point now) {
 void Input::build(Pending& p, InputFrame& out) {
     const Span sp = spanOf(p.ts, video_.fps, hasAudio_ ? audio_.rate : 48000);
     out.picture = std::move(p.picture);
+    out.codestream = std::move(p.codestream);
     out.rtpTimestamp = p.ts;
     out.number = sp.number;
     out.ptpNs = sp.startNs;
@@ -713,6 +805,84 @@ bool Input::next(InputFrame& out, int ms) {
         if (stop_ || now >= until) return false;
         cv_.wait_until(lock, std::min(until, now + std::chrono::milliseconds(10)));
     }
+}
+
+std::string fastMetadataSidecar(const std::string& recording) { return recording + ".st2110-41.jsonl"; }
+
+std::string fastMetadataLine(int64_t frame, const std::vector<FastMetadata>& items) {
+    std::string line = "{\"frame\":" + std::to_string(frame) + ",\"items\":[";
+    char hex[16];
+    for (size_t i = 0; i < items.size(); ++i) {
+        std::snprintf(hex, sizeof hex, "%06X", unsigned(items[i].type & 0x3FFFFF));
+        line += std::string(i ? "," : "") + "{\"type\":\"" + hex + "\",\"k\":" + (items[i].k ? "true" : "false") + ",\"words\":\"";
+        for (uint32_t w : items[i].words) {
+            std::snprintf(hex, sizeof hex, "%08X", unsigned(w));
+            line += hex;
+        }
+        line += "\"}";
+    }
+    return line + "]}";
+}
+
+bool readFastMetadataSidecar(const std::string& file, std::map<int64_t, std::vector<FastMetadata>>& out, std::string* error) {
+    out.clear();
+    QFile in(QString::fromStdString(file));
+    if (!in.open(QIODevice::ReadOnly)) {
+        if (error) *error = "Cannot read " + file;
+        return false;
+    }
+    // (the lines as fastMetadataLine writes them: its fields in its order)
+    auto field = [](const std::string& s, size_t& at, const char* name) {
+        const std::string key = std::string("\"") + name + "\":";
+        const size_t p = s.find(key, at);
+        if (p == std::string::npos) return false;
+        at = p + key.size();
+        return true;
+    };
+    auto quoted = [](const std::string& s, size_t& at, std::string& v) {
+        if (at >= s.size() || s[at] != '"') return false;
+        const size_t end = s.find('"', at + 1);
+        if (end == std::string::npos) return false;
+        v = s.substr(at + 1, end - at - 1);
+        at = end + 1;
+        return true;
+    };
+    auto isHex = [](const std::string& v) { return std::all_of(v.begin(), v.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }); };
+    int number = 0;
+    while (!in.atEnd()) {
+        const std::string line = in.readLine().trimmed().toStdString();
+        ++number;
+        if (line.empty()) continue;
+        auto bad = [&] {
+            if (error) *error = file + ": line " + std::to_string(number) + " is not fast metadata";
+            out.clear();
+            return false;
+        };
+        size_t at = 0;
+        if (!field(line, at, "frame")) return bad();
+        char* end = nullptr;
+        const long long frame = std::strtoll(line.c_str() + at, &end, 10);
+        if (end == line.c_str() + at || frame < 0) return bad();
+        at = size_t(end - line.c_str());
+        if (!field(line, at, "items")) return bad();
+        std::vector<FastMetadata>& items = out[frame];
+        while (true) {
+            const size_t next = line.find("{\"type\":", at);
+            if (next == std::string::npos) break;
+            at = next + 1;
+            FastMetadata m;
+            std::string type, words;
+            if (!field(line, at, "type") || !quoted(line, at, type) || type.empty() || type.size() > 6 || !isHex(type)) return bad();
+            m.type = uint32_t(std::stoul(type, nullptr, 16));
+            if (!field(line, at, "k")) return bad();
+            if (line.compare(at, 4, "true") == 0) m.k = true;
+            else if (line.compare(at, 5, "false") != 0) return bad();
+            if (!field(line, at, "words") || !quoted(line, at, words) || words.size() % 8 || !isHex(words)) return bad();
+            for (size_t i = 0; i < words.size(); i += 8) m.words.push_back(uint32_t(std::stoul(words.substr(i, 8), nullptr, 16)));
+            items.push_back(std::move(m));
+        }
+    }
+    return true;
 }
 
 }  // namespace montage::st2110

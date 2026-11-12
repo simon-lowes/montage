@@ -10,6 +10,8 @@
 // servers the user names (none by default). Other WHEP players can pull the same stream with the passphrase.
 #pragma once
 
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,6 +27,26 @@ bool makeReviewCertificate(const std::vector<std::string>& hosts, std::string& c
                            std::string* error = nullptr);
 // This computer's names and addresses, for such a certificate.
 std::vector<std::string> reviewCertificateHosts();
+
+// How one viewer is steered on the simulcast ladder (rung 0 the largest) from their receiver reports. More than a
+// tenth of the packets lost moves them down (to the rung that fits what got through, at least one down); after a while
+// without much loss they try the rung above. A try fails when heavy loss comes within 20 s of it, however late the
+// reports bring it, and is then not made again for twice as long (8 s at first, at most 32 s). Some loss (2-10%)
+// puts the next try off once, not for good: a link that always loses a little still climbs back.
+struct RungSteering {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point movedAt = Clock::now(), nextTry = Clock::now() + std::chrono::seconds(3);
+    Clock::time_point triedAt;  // when the last try began
+    std::chrono::milliseconds hold{8000};
+    bool trying = false;         // moved up a rung lately, to see whether it fits
+    bool postponed = false;      // the next try already put off by some loss
+    // A receiver report (made at `at`, read at `now`) with this share lost: the rung to go to (`rung` to stay).
+    // tooBig(i): rung i's rate is more than what got through; usable(i): rung i has a working encoder.
+    int report(int rung, int last, double loss, Clock::time_point at, Clock::time_point now,
+               const std::function<bool(int)>& tooBig, const std::function<bool(int)>& usable);
+    // The viewer is on the new rung now (reports and tries count from here, not from when it was asked for).
+    void switched(Clock::time_point now);
+};
 
 class BrowserReviewBackend : public ReviewBackend {
 public:

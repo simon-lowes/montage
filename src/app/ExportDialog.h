@@ -83,6 +83,10 @@ private:
     QSpinBox* width_ = nullptr;
     QSpinBox* height_ = nullptr;
     QSpinBox* quality_ = nullptr;
+    // A stated HRD (H.264, H.265): none, a constant or a variable rate, with the buffer's rate and size (render/HrdCheck.h).
+    QComboBox* hrd_ = nullptr;
+    QSpinBox* hrdRate_ = nullptr;    // kbit/s
+    QSpinBox* hrdBuffer_ = nullptr;  // kbit; 0: a second at the rate
     QComboBox* captions_ = nullptr;
     QCheckBox* chapters_ = nullptr;
     QComboBox* streams_ = nullptr;      // more audio streams after the mix: none, per role, per track
@@ -92,6 +96,7 @@ private:
     QCheckBox* adaptiveHdr_ = nullptr;  // adaptive HDR metadata (PQ and HLG)
     QComboBox* exrCompression_ = nullptr;  // OpenEXR frames' compression
     QComboBox* jxlQuality_ = nullptr;      // JPEG XL frames: lossless or a distance
+    QComboBox* jpegXsRate_ = nullptr;      // JPEG XS: bits a pixel (0: the preset's)
     QComboBox* jxlDepth_ = nullptr;        // and their depth (the preset's, 8 or 16-bit, half or float)
     QCheckBox* jxlPremultiplied_ = nullptr;  // and alpha written premultiplied
     QCheckBox* smart_ = nullptr;
@@ -104,6 +109,7 @@ private:
     QCheckBox* ancTeletext_ = nullptr;
     QSpinBox* teletextPage_ = nullptr;
     QCheckBox* interlaced_ = nullptr;
+    QCheckBox* segmentedFields_ = nullptr;  // (interlaced: both fields the halves of one picture)
     QComboBox* rate_ = nullptr;      // the frame rate delivered (render/RateConversion.h)
     QCheckBox* ratePitch_ = nullptr;
     QString as11Text_;  // "Name=value" lines

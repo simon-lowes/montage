@@ -31,6 +31,7 @@ endif()
 set_tests_properties(test_render PROPERTIES TIMEOUT 900 ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=900000")
 montage_test(test_media)
 target_link_libraries(test_media PRIVATE Qt6::Network)  # (a free port for the capture tests)
+target_sources(test_media PRIVATE FileAge.cpp)  # (makeOlder: folders' times set back, Windows too)
 if(TARGET OpenEXR::OpenEXR)
   target_link_libraries(test_media PRIVATE OpenEXR::OpenEXR)  # (writing multi-part files)
 endif()
@@ -82,6 +83,23 @@ endif()
 if(MONTAGE_WITH_FDL)
   target_compile_definitions(test_render PRIVATE MONTAGE_TEST_FDL_DIR="${ascfdl_SOURCE_DIR}/resources/FDL")
 endif()
+if(MONTAGE_WITH_VMAF)
+  # libvmaf's own `vmaf` program, built from the same sources (a test tool, never shipped): test_render checks that
+  # Montage's VMAF is the one it measures.
+  set(vmaf_tools ${vmaf_SOURCE_DIR}/libvmaf/tools)
+  add_executable(montage_test_vmaf ${vmaf_tools}/vmaf.c ${vmaf_tools}/cli_parse.c ${vmaf_tools}/y4m_input.c
+                 ${vmaf_tools}/vidinput.c ${vmaf_tools}/yuv_input.c)
+  target_link_libraries(montage_test_vmaf PRIVATE montage_vmaf)
+  target_include_directories(montage_test_vmaf PRIVATE ${PROJECT_SOURCE_DIR}/third_party/libvmaf ${vmaf_tools})
+  target_compile_definitions(montage_test_vmaf PRIVATE OC_NEW_STYLE_INCLUDES $<$<NOT:$<BOOL:${WIN32}>>:HAVE_STRSEP>
+                             $<IF:$<BOOL:${APPLE}>,_DARWIN_C_SOURCE,_GNU_SOURCE>)
+  set_target_properties(montage_test_vmaf PROPERTIES C_STANDARD 11 AUTOMOC OFF)
+  if(NOT MSVC)
+    target_compile_options(montage_test_vmaf PRIVATE -w)
+  endif()
+  add_dependencies(test_render montage_test_vmaf)
+  target_compile_definitions(test_render PRIVATE MONTAGE_TEST_VMAF_TOOL="$<TARGET_FILE:montage_test_vmaf>")
+endif()
 
 if(MONTAGE_BUILD_APP)
   add_executable(test_app test_app.cpp)
@@ -91,11 +109,12 @@ if(MONTAGE_BUILD_APP)
   montage_test_command(test_app command)
   add_test(NAME test_app COMMAND ${command})
   set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 600)
-  add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe)
+  add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe montage-pluginhost)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
     MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
     MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
+    MONTAGE_PLUGIN_HOST="$<TARGET_FILE:montage-pluginhost>"
     MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
     MONTAGE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
   # Qt's lupdate, to check it finds every tr() text (everyTranslatableTextIsFound).

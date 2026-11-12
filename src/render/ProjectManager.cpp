@@ -51,11 +51,13 @@ std::set<Id> keptSequences(const Project& p, const std::vector<Id>& chosen) {
     return kept;
 }
 
-// A file name not yet used in `taken`.
-fs::path uniqueIn(const fs::path& dir, const std::string& stem, const std::string& ext, std::set<std::string>& taken) {
+// A file name not yet used in `taken`, nor by a file there already, unless that file is one of `own` (what an
+// earlier run of the same job began: it is written again).
+fs::path uniqueIn(const fs::path& dir, const std::string& stem, const std::string& ext, std::set<std::string>& taken,
+                  const std::set<std::string>& own = {}) {
     for (int n = 1;; ++n) {
         const std::string name = stem + (n > 1 ? "-" + std::to_string(n) : "") + ext;
-        if (!taken.count(name) && !fs::exists(dir / u8path(name))) {
+        if (!taken.count(name) && (!fs::exists(dir / u8path(name)) || own.count(utf8(dir / u8path(name))))) {
             taken.insert(name);
             return dir / u8path(name);
         }
@@ -139,6 +141,10 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
     });
 
     std::set<std::string> taken;
+    const std::set<std::string> own(o.replace.begin(), o.replace.end());
+    auto begin = [&](const fs::path& file) {
+        if (o.began) o.began(utf8(file));
+    };
     std::map<std::string, std::string> copiedFiles;  // source file -> its copy
     const size_t total = std::max<size_t>(1, q.media.size());
     for (size_t i = 0; i < q.media.size(); ++i) {
@@ -156,7 +162,8 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
         const fs::path src = u8path(mediaFileOnDisk(m.path));
         if (imageSequence && !o.trim) {
             // Every frame into a folder of its own, named as they were.
-            const fs::path folder = uniqueIn(mediaDir, utf8(src.stem()), "", taken);
+            const fs::path folder = uniqueIn(mediaDir, utf8(src.stem()), "", taken, own);
+            begin(folder);
             fs::create_directories(folder, ec);
             for (int n = frames.first; n <= frames.last; ++n) {
                 const fs::path from = u8path(imageSequenceFrame(frames, n)), to = folder / from.filename();
@@ -200,7 +207,8 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
         if (trimHere) {
             const double from = std::max(0.0, first - o.handles), to = m.duration > 0 ? std::min(m.duration, last + o.handles) : last + o.handles;
             const bool prores = o.codec != "libx264";
-            const fs::path dest = uniqueIn(mediaDir, utf8(src.stem()) + "_trim", prores ? ".mov" : ".mp4", taken);
+            const fs::path dest = uniqueIn(mediaDir, utf8(src.stem()) + "_trim", prores ? ".mov" : ".mp4", taken, own);
+            begin(dest);
             // Render the span through a sequence of the media's own size and rate.
             Project t = makeDefaultProject();
             Sequence& ts = *t.active();
@@ -292,8 +300,11 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
                 m.proxyPath.clear();
                 continue;
             }
-            const fs::path dest = uniqueIn(mediaDir, utf8(src.stem()), utf8(src.extension()), taken);
-            if (!fs::copy_file(src, dest, fs::copy_options::none, ec)) return fail("Cannot copy " + m.path + ": " + ec.message());
+            const fs::path dest = uniqueIn(mediaDir, utf8(src.stem()), utf8(src.extension()), taken, own);
+            begin(dest);
+            // (a copy the run before had begun is written over)
+            if (!fs::copy_file(src, dest, own.count(utf8(dest)) ? fs::copy_options::overwrite_existing : fs::copy_options::none, ec))
+                return fail("Cannot copy " + m.path + ": " + ec.message());
             copiedFiles[utf8(src)] = utf8(dest);
             m.path = interpretedPath(psdLayer ? psdLayerPath(utf8(dest), layer) : utf8(dest), reading);
             m.proxyPath.clear();

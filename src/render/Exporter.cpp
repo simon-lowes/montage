@@ -1,13 +1,18 @@
 #include "Exporter.h"
 #include "TrimPasses.h"
 #include "media/SpatialAudio.h"
+#include "media/FieldRecorder.h"
 #include "render/SpatialVideo.h"
 #include "core/AudioDescription.h"
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
 #include "media/Av2.h"
+#include "media/JpegXs.h"
+#include "media/ProResEncoder.h"
+#include "render/ProRes.h"
 #include "render/SegmentedExport.h"
+#include "render/ExportScaler.h"
 
 #include "core/ColorGroups.h"
 #include "core/Expression.h"
@@ -194,18 +199,6 @@ AVPixelFormat tenBitFormat(AVPixelFormat f, const AVCodecContext* ctx, const AVC
     return f;
 }
 
-// ISO 639-2 code for a caption track's ISO 639-1 language (MP4 and MKV store three letters).
-const char* iso639_2(const std::string& code) {
-    static const std::pair<const char*, const char*> table[] = {
-        {"en", "eng"}, {"es", "spa"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"pt", "por"}, {"nl", "nld"},
-        {"pl", "pol"}, {"sv", "swe"}, {"da", "dan"}, {"no", "nor"}, {"fi", "fin"}, {"cs", "ces"}, {"el", "ell"},
-        {"tr", "tur"}, {"ru", "rus"}, {"uk", "ukr"}, {"ar", "ara"}, {"he", "heb"}, {"hi", "hin"}, {"id", "ind"},
-        {"vi", "vie"}, {"th", "tha"}, {"ja", "jpn"}, {"ko", "kor"}, {"zh", "zho"}, {"cy", "cym"}, {"ga", "gle"}};
-    for (const auto& [two, three] : table)
-        if (code == two) return three;
-    return code.size() == 3 ? code.c_str() : nullptr;
-}
-
 // Text subtitle encoders take ASS events and need an ASS header with a Default style.
 const char* kAssHeader =
     "[Script Info]\r\nScriptType: v4.00+\r\nPlayResX: 384\r\nPlayResY: 288\r\nScaledBorderAndShadow: yes\r\n\r\n"
@@ -246,6 +239,18 @@ struct Output {
     std::unique_ptr<Av2Writer> av2;
     AVFrame* av2Picture = nullptr;  // (a raw packet's planes, as AVM is handed them)
     std::string av2Error;
+    // JPEG XS (media/JpegXs.h): the video "encoder" gives raw pictures, which SVT-JPEG-XS codes; it writes the file (the
+    // muxer is FFmpeg's null one), the PCM sound's packets too.
+    std::unique_ptr<JxsWriter> jxs;
+    AVFrame* jxsPicture = nullptr;
+    int jxsSoundBits = 24;
+    std::vector<float> jxsSound;
+    std::string jxsError;
+    // ProRes 4444 and 4444 XQ at 12 bits: the video "encoder" gives raw pictures (16 bits a sample), which Montage's
+    // own encoder codes (media/ProResEncoder.h).
+    std::unique_ptr<prores::OwnEncoder> prores;
+    std::vector<uint16_t> proresPlanes[4];  // (the picture at 12 bits, alpha at 16)
+    std::string proresError;
     // E-AC-3 above 5.1: the audio "encoder" is a description, the sound coded by two encoders as two substreams.
     std::map<AVCodecContext*, std::unique_ptr<Eac3Extended>> extended;
     bool headerWritten = false;
@@ -254,6 +259,7 @@ struct Output {
         av_frame_free(&vframe);
         av_frame_free(&aframe);
         av_frame_free(&av2Picture);
+        av_frame_free(&jxsPicture);
         av_packet_free(&pkt);
         avcodec_free_context(&vctx);
         avcodec_free_context(&actx);
@@ -287,8 +293,57 @@ int writeSpatial(Output& o, std::vector<SpatialVideoEncoder::Packet>& coded) {
     return 0;
 }
 
-// Why writing video failed: x265's own words for spatial video.
-std::string videoError(const Output& o, int rc) { return !o.av2Error.empty() ? o.av2Error : o.spatialError.empty() ? averr(rc) : o.spatialError; }
+// Why writing video failed: x265's own words for spatial video, Montage's ProRes encoder's for its pictures.
+std::string videoError(const Output& o, int rc) {
+    return !o.proresError.empty() ? o.proresError
+           : !o.av2Error.empty()  ? o.av2Error
+           : !o.jxsError.empty()  ? o.jxsError
+           : o.spatialError.empty() ? averr(rc)
+                                    : o.spatialError;
+}
+
+// A raw picture (Y'CbCr 4:4:4 at 16 bits a sample, alpha too when it has it) coded as ProRes by Montage's encoder and
+// written as the video stream's packet.
+int writeOwnProRes(Output& o, AVCodecContext* ctx, AVPacket* raw) {
+    const int W = ctx->width, H = ctx->height;
+    uint8_t* data[4] = {};
+    int linesize[4] = {};
+    if (av_image_fill_arrays(data, linesize, raw->data, ctx->pix_fmt, W, H, 1) < 0) return AVERROR(EINVAL);
+    const bool alpha = o.prores->settings().alpha;
+    for (int p = 0; p < (alpha ? 4 : 3); ++p) {
+        std::vector<uint16_t>& plane = o.proresPlanes[p];
+        plane.resize(size_t(W) * size_t(H));
+        for (int y = 0; y < H; ++y) {
+            const auto* row = reinterpret_cast<const uint16_t*>(data[p] + size_t(y) * size_t(linesize[p]));
+            uint16_t* dst = plane.data() + size_t(y) * size_t(W);
+            if (p == 3) std::copy(row, row + W, dst);  // (alpha keeps its 16 bits)
+            else
+                for (int x = 0; x < W; ++x) dst[x] = uint16_t(std::min<uint32_t>(4095, (uint32_t(row[x]) + 8) >> 4));
+        }
+    }
+    prores::PlanarPicture pic;
+    pic.y = o.proresPlanes[0].data();
+    pic.cb = o.proresPlanes[1].data();
+    pic.cr = o.proresPlanes[2].data();
+    pic.yStride = pic.cStride = pic.aStride = W;
+    pic.alpha = alpha ? o.proresPlanes[3].data() : nullptr;
+    std::vector<uint8_t> coded;
+    if (!o.prores->encode(pic, coded, &o.proresError)) return AVERROR_EXTERNAL;
+    AVPacket* p = av_packet_alloc();
+    if (!p || av_new_packet(p, int(coded.size())) < 0) {
+        av_packet_free(&p);
+        return AVERROR(ENOMEM);
+    }
+    std::memcpy(p->data, coded.data(), coded.size());
+    p->pts = p->dts = raw->pts;
+    p->duration = raw->duration;
+    p->flags |= AV_PKT_FLAG_KEY;
+    p->stream_index = o.vst->index;
+    av_packet_rescale_ts(p, ctx->time_base, o.vst->time_base);
+    const int rc = av_interleaved_write_frame(o.oc, p);
+    av_packet_free(&p);
+    return rc;
+}
 
 Eac3Extended* extendedFor(Output& o, AVCodecContext* ctx) {
     auto it = o.extended.find(ctx);
@@ -332,6 +387,40 @@ int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
             if (!ok) return AVERROR_EXTERNAL;
             continue;
         }
+        if (o.jxs && st == o.vst) {
+            // (A picture, raw: coded by SVT-JPEG-XS.)
+            AVFrame* f = o.jxsPicture;
+            f->format = ctx->pix_fmt;
+            f->width = ctx->width;
+            f->height = ctx->height;
+            const bool ok = av_image_fill_arrays(f->data, f->linesize, o.pkt->data, ctx->pix_fmt, ctx->width, ctx->height, 1) >= 0 &&
+                            o.jxs->write(f, &o.jxsError);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
+            continue;
+        }
+        if (o.jxs && st == o.ast) {
+            // (Interleaved PCM, 16 or 24 bits little-endian, to the writer's samples: exact, a float holding 24 bits.)
+            const int bytes = o.jxsSoundBits / 8;
+            const size_t n = size_t(o.pkt->size) / size_t(bytes);
+            o.jxsSound.resize(n);
+            const uint8_t* d = o.pkt->data;
+            for (size_t i = 0; i < n; ++i, d += bytes) {
+                int32_t v = bytes == 3 ? int32_t(uint32_t(d[0]) << 8 | uint32_t(d[1]) << 16 | uint32_t(d[2]) << 24) >> 8 : int16_t(d[0] | d[1] << 8);
+                o.jxsSound[i] = float(double(v) / double(1 << (o.jxsSoundBits - 1)));
+            }
+            const int ch = ctx->ch_layout.nb_channels > 0 ? ctx->ch_layout.nb_channels : 1;
+            const bool ok = o.jxs->audio(o.jxsSound.data(), int(n / size_t(ch)), &o.jxsError);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
+            continue;
+        }
+        if (o.prores && st == o.vst) {
+            rc = writeOwnProRes(o, ctx, o.pkt);
+            av_packet_unref(o.pkt);
+            if (rc < 0) return rc;
+            continue;
+        }
         if (o.av2 && st == o.ast) {
             const bool ok = o.av2->audio(o.pkt, &o.av2Error);
             av_packet_unref(o.pkt);
@@ -368,11 +457,13 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
         v.push_back(preset("ProRes 422 LT", "mov", "Lighter ProRes for offline / proxies", "prores_ks", "pcm_s16le", 0, "", "lt"));
         v.push_back(preset("ProRes 422 Proxy", "mov", "The smallest ProRes, for offline editing", "prores_ks", "pcm_s16le", 0, "", "proxy"));
         {
-            ExportPreset p = preset("ProRes 4444 (alpha)", "mov", "Keeps transparency for graphics", "prores_ks", "pcm_s24le", 0, "", "4444");
+            // (12 bits, as 4444 is made to carry, by Montage's own encoder)
+            ExportPreset p = preset("ProRes 4444 (alpha)", "mov", "12-bit 4:4:4, keeps transparency for graphics", "prores_ks", "pcm_s24le", 0, "", "4444",
+                                    "yuva444p12le");
             p.settings.alpha = true;
             v.push_back(p);
-            ExportPreset xq = preset("ProRes 4444 XQ (alpha)", "mov", "The highest-quality ProRes, with transparency", "prores_ks",
-                                     "pcm_s24le", 0, "", "4444xq");
+            ExportPreset xq = preset("ProRes 4444 XQ (alpha)", "mov", "The highest-quality ProRes, 12-bit 4:4:4 with transparency", "prores_ks",
+                                     "pcm_s24le", 0, "", "4444xq", "yuva444p12le");
             xq.settings.alpha = true;
             v.push_back(xq);
         }
@@ -400,6 +491,18 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
                                     "pcm_s24le", 16, "", "4444");
             a.settings.alpha = true;
             v.push_back(a);
+        }
+        if (everyBuild || jpegXsAvailable()) {
+            // JPEG XS (SVT-JPEG-XS, media/JpegXs.h): a light intra codec at a constant number of bytes a picture, in MXF
+            // (ST 2124) with 24-bit sound; the rate is its bits a pixel.
+            ExportPreset x = preset("JPEG XS 4:2:2 10-bit (MXF)", "mxf", "Light intra-frame mezzanine at 5 bits a pixel, for live production and contribution",
+                                    "jpegxs", "pcm_s24le", 0, "", "", "yuv422p10le");
+            x.settings.jpegXsBpp = 5;
+            v.push_back(x);
+            x = preset("JPEG XS 4:4:4 12-bit (MXF)", "mxf", "JPEG XS at 8 bits a pixel, 12-bit 4:4:4, for finishing and graphics", "jpegxs", "pcm_s24le", 0,
+                       "", "", "yuv444p12le");
+            x.settings.jpegXsBpp = 8;
+            v.push_back(x);
         }
         v.push_back(preset("Uncompressed 10-bit (v210)", "mov", "Uncompressed 10-bit 4:2:2, for broadcast ingest", "v210", "pcm_s24le", 0, ""));
         {
@@ -922,7 +1025,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (error) *error = msg;
         return false;
     };
-    // A plug-in that fails in its host while this renders stops the export, naming it (audio/PluginHost.h).
+    // A plug-in that fails in its host while this renders stops the export, naming it (audio/PluginHost.h). Only one
+    // this export's own mixers meet: this thread is marked as an export's while it renders.
+    const plugins::ExportScope exporting;
     const uint64_t pluginFailures = plugins::offlineFailureSerial();
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
@@ -981,6 +1086,37 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (wantAudio && s.audioCodec != "aac") return fail("AV2 in MP4 takes AAC sound");
         if (s.monoAudioTracks > 0 || !s.extraAudio.empty()) return fail("AV2 in MP4 holds one sound stream");
     }
+    // JPEG XS coded by SVT-JPEG-XS (media/JpegXs.h): MXF (ST 2124) with its PCM sound when the file name ends .mxf, else
+    // a raw codestream file.
+    const bool jxsOut = s.videoCodec == "jpegxs" && wantVideo;
+    const JxsContainer jxsHolder = jxsContainerForPath(s.path);
+    AVPixelFormat jxsFormat = AV_PIX_FMT_YUV422P10LE;
+    if (jxsOut) {
+        if (!jpegXsAvailable()) return fail("This build of Montage writes no JPEG XS (SVT-JPEG-XS)");
+        if (!s.pixFmt.empty()) {
+            jxsFormat = av_get_pix_fmt(s.pixFmt.c_str());
+            const AVPixelFormat ok[] = {AV_PIX_FMT_YUV422P,    AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV422P12LE, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV444P10LE,
+                                        AV_PIX_FMT_YUV444P12LE, AV_PIX_FMT_GBRP,       AV_PIX_FMT_GBRP10LE,    AV_PIX_FMT_GBRP12LE};
+            if (std::find(std::begin(ok), std::end(ok), jxsFormat) == std::end(ok))
+                return fail("JPEG XS is written as 4:2:2 or 4:4:4 Y'CbCr, or R'G'B', at 8, 10 or 12 bits (yuv422p10le, yuv444p12le, gbrp12le...)");
+        }
+        if (s.jpegXsBpp < 0 || s.jpegXsBpp > 24) return fail("A JPEG XS rate is up to 24 bits a pixel");
+        if (s.alpha || interlacedOut) return fail("JPEG XS is written without alpha or fields");
+        if (s.cea608 || s.embedCaptions) return fail("JPEG XS is written without embedded captions: burn them in, or deliver them beside the file");
+        if (s.adaptiveHdr) return fail("JPEG XS is written without adaptive HDR metadata");
+        if (s.twoPass || s.pass != 0) return fail("JPEG XS is written in one pass");
+        if (seq.stereo3d && s.stereo == "mv") return fail("Spatial video is MV-HEVC: choose H.265 (HEVC)");
+        if (seq.spherical) return fail("JPEG XS is written without 360° metadata");
+        StereoView eyes = StereoView::Left;
+        if (seq.stereo3d && stereoViewFromName(s.stereo.empty() ? "sbs" : s.stereo, eyes) && eyes != StereoView::Left &&
+            eyes != StereoView::Right && eyes != StereoView::Anaglyph)
+            return fail("JPEG XS is written without stereoscopic 3D metadata: export one eye or an anaglyph");
+        if (s.chapters && std::any_of(seq.markers.begin(), seq.markers.end(), [](const Marker& m) { return m.chapter; }))
+            return fail("JPEG XS is written without chapters: turn chapters off");
+        if (wantAudio && jxsHolder != JxsContainer::Mxf) return fail("A JPEG XS codestream file holds no sound: export it as .mxf for sound, or choose no audio codec");
+        if (wantAudio && s.audioCodec != "pcm_s24le" && s.audioCodec != "pcm_s16le") return fail("JPEG XS in MXF takes PCM sound (pcm_s24le or pcm_s16le)");
+        if (s.monoAudioTracks > 0 || !s.extraAudio.empty()) return fail("JPEG XS in MXF writes one sound stream, a mono track for each of its channels");
+    }
     // (through the OpenEXR library whenever it is there, so the file says its colour space: the colorInteropID attribute)
     const bool exrLibrary = floatFrames && (exrAvailable() || !s.exrCompression.empty() || s.exrLayers);
     if ((!s.exrCompression.empty() || s.exrLayers) && wantVideo) {
@@ -1000,7 +1136,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     }
     Output o;
-    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : av2Out ? "null" : s.format.empty() ? nullptr : s.format.c_str(),
+    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : av2Out || jxsOut ? "null" : s.format.empty() ? nullptr : s.format.c_str(),
                                             outPath.c_str());
     if (rc < 0 || !o.oc) return fail("Unknown output format for " + s.path);
     if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
@@ -1068,7 +1204,27 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             c = "png";
         }
         if (av2Out) c = "rawvideo";  // (FFmpeg's raw "encoder" hands each picture to AVM)
-        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : jxlFrames ? std::string("libjxl") : av2Out ? std::string("AVM (AV2)") : c;
+        if (jxsOut) c = "rawvideo";  // (and to SVT-JPEG-XS)
+        // ProRes 4444 and 4444 XQ at 12 bits (a 12-bit pixel format asked for): Montage's own encoder, handed each
+        // picture by FFmpeg's raw "encoder" at 16 bits a sample, so alpha keeps its 16.
+        const AVPixelFormat askedFormat = s.pixFmt.empty() ? AV_PIX_FMT_NONE : av_get_pix_fmt(s.pixFmt.c_str());
+        const AVPixFmtDescriptor* askedDesc = askedFormat == AV_PIX_FMT_NONE ? nullptr : av_pix_fmt_desc_get(askedFormat);
+        const bool ownProRes = c == "prores_ks" && askedDesc && askedDesc->comp[0].depth == 12;
+        const int ownProfile = ownProRes ? prores::profileOf(s.profile.empty() ? "hq" : s.profile) : 0;
+        const bool ownAlpha = ownProRes && (s.alpha || (askedDesc->flags & AV_PIX_FMT_FLAG_ALPHA));
+        if (ownProRes) {
+            if (!prores::fourFourFour(ownProfile)) return fail("12-bit ProRes is 4444 or 4444 XQ (4:2:2 ProRes is 10 bits)");
+            if (askedDesc->log2_chroma_w || askedDesc->log2_chroma_h || (askedDesc->flags & AV_PIX_FMT_FLAG_RGB))
+                return fail("12-bit ProRes takes Y'CbCr 4:4:4 (yuv444p12le, or yuva444p12le with alpha)");
+            c = "rawvideo";
+        }
+        if (encoderUsed)
+            *encoderUsed = spatial    ? std::string("x265 (MV-HEVC)")
+                           : jxlFrames ? std::string("libjxl")
+                           : av2Out    ? std::string("AVM (AV2)")
+                           : jxsOut    ? std::string("SVT-JPEG-XS (JPEG XS)")
+                           : ownProRes ? std::string("Montage ProRes (12-bit)")
+                                       : c;
         // FFmpeg's CineForm encoder reads memory it never wrote below a picture whose height is not a multiple of 8
         // (Valgrind shows it at 320 x 180, not at 184 or 1080), so the same export came out different each time.
         if (c == "cfhd" && H % 8 != 0)
@@ -1086,6 +1242,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (outSpace.hdr() && s.pixFmt.empty()) o.vctx->pix_fmt = tenBitFormat(o.vctx->pix_fmt, o.vctx, codec);
         // (AV2 in 4:2:0, 10 bits for HDR or when asked)
         if (av2Out) o.vctx->pix_fmt = outSpace.hdr() || s.pixFmt.find("10") != std::string::npos ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+        if (ownProRes) o.vctx->pix_fmt = ownAlpha ? AV_PIX_FMT_YUVA444P16LE : AV_PIX_FMT_YUV444P16LE;
+        if (jxsOut) o.vctx->pix_fmt = jxsFormat;
         o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(dseq.fpsValue() * 2)));
         if (s.gop == 1) o.vctx->max_b_frames = 0;
         const ColorTags tags = colorTags(outSpace);
@@ -1108,7 +1266,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             // Coded as two fields, the top first: a progressive picture's two halves (PsF), as 1080i deliveries ask.
             // (FFmpeg codes DNxHR, the only DNx Montage writes, progressive only; FFV1 keeps the woven frame losslessly,
             // as archives keep interlaced tape, its field order in the file.)
-            if (c != "mpeg2video" && c != "libx264" && c != "prores_ks" && c != "ffv1")
+            if (c != "mpeg2video" && c != "libx264" && c != "prores_ks" && c != "ffv1" && !ownProRes)
                 return fail("Interlaced output is for MPEG-2, H.264 (AVC-Intra), ProRes and FFV1, not " + c);
             o.vctx->flags |= AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME;
             o.vctx->field_order = AV_FIELD_TT;
@@ -1167,6 +1325,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 if (hrdCbr && pass != 1) o.vctx->bit_rate = o.vctx->rc_min_rate = hrdRate;
                 if (s.vbvInit > 0) o.vctx->rc_initial_buffer_occupancy = int(std::clamp(s.vbvInit, 0.05, 1.0) * double(o.vctx->rc_buffer_size));
             }
+            // (x265 states a constant rate, cbr_flag, whenever its bit rate is not below the buffer's, and then leaves the
+            // bits it does not spend unfilled, which no decoder's buffer holds: at a variable rate its target is kept a
+            // kilobit a second under the HRD's rate)
+            if (hrdVbr && c == "libx265" && o.vctx->bit_rate > 0 && o.vctx->bit_rate / 1000 >= hrdRate / 1000)
+                o.vctx->bit_rate = std::max<int64_t>(1000, (hrdRate / 1000 - 1) * 1000);
             if ((s.videoBitrate <= 0 && !hrdCbr) || pass == 1) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
             if (pass && c == "libx264") av_dict_set(&opts, "stats", s.passStats.c_str(), 0);
@@ -1270,6 +1433,30 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
         o.vst->time_base = o.vctx->time_base;
         o.vst->avg_frame_rate = fps;
+        if (ownProRes) {
+            prores::OwnSettings ps;
+            ps.width = W;
+            ps.height = H;
+            ps.profile = ownProfile;
+            ps.fields = interlacedOut ? 1 : 0;  // (the top first, as every interlaced export here)
+            ps.primaries = int(o.vctx->color_primaries);
+            ps.transfer = int(o.vctx->color_trc);
+            ps.matrix = int(o.vctx->colorspace);
+            ps.alpha = ownAlpha;
+            ps.frameRateCode = prores::frameRateCode(av_q2d(fps));
+            o.prores = std::make_unique<prores::OwnEncoder>();
+            std::string e;
+            if (!o.prores->open(ps, &e)) return fail(e);
+            // The stream as the muxer sees it: ProRes 4444 or 4444 XQ, 12 bits.
+            AVCodecParameters* par = o.vst->codecpar;
+            par->codec_id = AV_CODEC_ID_PRORES;
+            par->codec_tag = ownProfile == 6 ? MKTAG('a', 'p', '4', 'x') : MKTAG('a', 'p', '4', 'h');
+            par->profile = ownProfile - 1;  // (FFmpeg's numbering: 4 4444, 5 4444 XQ)
+            par->format = ownAlpha ? AV_PIX_FMT_YUVA444P12LE : AV_PIX_FMT_YUV444P12LE;
+            par->bits_per_raw_sample = 12;
+            par->bits_per_coded_sample = ownAlpha ? 32 : 24;
+            par->field_order = interlacedOut ? AV_FIELD_TT : AV_FIELD_PROGRESSIVE;
+        }
         if (spatial) {
             SpatialVideoSettings sv;
             sv.width = W / 2;
@@ -1698,7 +1885,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering of long-GOP video (render/LongGopCopy.h): planned before the header, which carries the copied
     // sources' parameter sets. Only where nothing would change the source's pictures for the whole export, as below.
     std::unique_ptr<LongGopCopier> longGop;
-    if (wantVideo && s.smartRender && o.vctx && !o.spatial && !av2Out && !floatFrames && W == seq.width && H == seq.height && !seq.stereo3d && !s.useProxies &&
+    if (wantVideo && s.smartRender && o.vctx && !o.spatial && !av2Out && !o.prores && !floatFrames && W == seq.width && H == seq.height && !seq.stereo3d && !s.useProxies &&
         !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && !s.alpha && !wantHdr10 && !wantAdaptive && sameColorSpace(outSpace, seqSpace) &&
         !trim && !sceneReferredWorking(seq) && !conv.active() && s.profile != "avci100") {
         LongGopEncoder lge;
@@ -1742,6 +1929,39 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!o.av2->open(s.path, as, &o.av2Error)) return fail(o.av2Error);
         opened = true;  // (removed if the export fails after AVM's writer has finished it)
         if (o.actx && !o.av2->addAudio(o.ast->codecpar, o.actx->time_base.num, o.actx->time_base.den, &o.av2Error)) return fail(o.av2Error);
+    }
+    if (jxsOut && o.vctx) {
+        // SVT-JPEG-XS at the bits a pixel asked (5 when none), in the sampling and depth of the picture's format, colour
+        // stated as the delivery's; MXF with the sound beside it, a mono track for each channel.
+        JxsWriteSettings xs;
+        xs.container = jxsHolder;
+        const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(o.vctx->pix_fmt);
+        xs.encode.width = W;
+        xs.encode.height = H;
+        xs.encode.depth = d->comp[0].depth;
+        xs.encode.sampling = (d->flags & AV_PIX_FMT_FLAG_RGB) ? JxsSampling::Rgb : d->log2_chroma_w ? JxsSampling::Ycc422 : JxsSampling::Ycc444;
+        const double bpp = s.jpegXsBpp > 0 ? s.jpegXsBpp : 5.0;
+        xs.encode.bppNum = int(std::lround(bpp * 1000));
+        xs.encode.bppDen = 1000;
+        xs.fpsNum = fps.num;
+        xs.fpsDen = fps.den;
+        xs.primaries = int(o.vctx->color_primaries);
+        xs.transfer = int(o.vctx->color_trc);
+        xs.matrix = xs.encode.sampling == JxsSampling::Rgb ? 0 : int(o.vctx->colorspace);
+        xs.fullRange = xs.encode.sampling == JxsSampling::Rgb;
+        xs.timecode = s.startTimecode.empty() ? std::string("00:00:00:00") : s.startTimecode;
+        xs.dropFrame = xs.timecode.find(';') != std::string::npos;
+        if (o.actx) {
+            xs.channels = o.actx->ch_layout.nb_channels;
+            xs.sampleRate = o.actx->sample_rate;
+            xs.bits = o.actx->codec_id == AV_CODEC_ID_PCM_S16LE ? 16 : 24;
+            o.jxsSoundBits = xs.bits;
+        }
+        o.jxs = std::make_unique<JxsWriter>();
+        o.jxsPicture = av_frame_alloc();
+        if (!o.jxsPicture) return fail("Out of memory");
+        if (!o.jxs->open(s.path, xs, &o.jxsError)) return fail(o.jxsError);
+        opened = true;  // (removed if the export fails after the writer has finished it)
     }
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
@@ -2141,9 +2361,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (trim) applyTrimPass(img, seq, f, *trim, sceneLight, true);
         return img;
     };
+    // Interlaced at the programme's rate: each picture's second field at its own moment, half a frame after the first,
+    // from the project with its sequences at twice their rate (its captions and burn-ins those of the frame).
+    // Stereoscopic sequences, and PsF when asked, keep each picture's two halves.
+    const bool fieldsApart = interlacedOut && !conv.active() && !seq.stereo3d && !s.segmentedFields;
+    const Sequence fieldSeq = fieldsApart ? fieldRateSequence(seq) : Sequence{};
+    const Project fieldProject = fieldsApart ? fieldRateProject(p) : Project{};
     // A frame of the programme, in the output space: rendered, with captions and burn-ins unless they go on the
-    // delivered frames; `eye` 1 or 2 is the left or right eye alone.
-    auto programmeFrame = [&](FrameTime f, int eye = 0) {
+    // delivered frames; `eye` 1 or 2 is the left or right eye alone; `secondField`, the moment of its second field.
+    auto programmeFrame = [&](FrameTime f, int eye = 0, bool secondField = false) {
         auto burn = [&](Image& img) {
             if (burnCaptions) drawCaption(img, *burnCaptions, f, &frameSpace);
             if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &frameSpace);
@@ -2159,13 +2385,18 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             burn(right);
             img = combineStereo(left, right, stereoView);
         } else {
-            img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
-            if (trim) applyTrimPass(img, seq, f, *trim, sceneLight, true);
+            const Project& from = secondField ? fieldProject : p;
+            const Sequence& on = secondField ? fieldSeq : seq;
+            const FrameTime at = secondField ? 2 * f + 1 : f;
+            img = s.alpha && !on.stereo3d ? renderSequenceFrame(from, on, at, ro) : renderProgramFrame(from, on, at, ro);
+            if (trim) applyTrimPass(img, on, at, *trim, sceneLight, true);
             if (!burnDelivered) burn(img);
         }
         convertColor(img, frameSpace, outSpace, peakNits);
         return img;
     };
+    // Interlaced at the programme's rate: each picture's second field (programmeFrame's `secondField`) at its own moment.
+    auto secondFieldPicture = [&](FrameTime f) { return programmeFrame(f, 0, true); };
     // Delivered at another rate: the programme's pictures kept while the frames round them use them again (a standards
     // conversion's in-betweens and its cut test, pulldown's fields), each with its look.
     static std::atomic<uint64_t> exportRuns{0};
@@ -2419,47 +2650,19 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + videoError(o, rc));
             } else {
             toRgba16(img, rgba16);
-            AVPixelFormat srcFmt = AV_PIX_FMT_RGBA64LE;
-            const int swsFlags = SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INP;
-            if (!o.sws && (o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT || o.vctx->chroma_sample_location == AVCHROMA_LOC_LEFT)) {
-                // Chroma made where the encoder's format sites it (otherwise FFmpeg's scaler centres it, as the
-                // decoder reads untagged 4:2:0 pictures). The cached context below keeps this one, as it matches.
-                o.sws = sws_alloc_context();
-                if (o.sws) {
-                    av_opt_set_int(o.sws, "srcw", img.width, 0);
-                    av_opt_set_int(o.sws, "srch", img.height, 0);
-                    av_opt_set_int(o.sws, "src_format", srcFmt, 0);
-                    av_opt_set_int(o.sws, "dstw", W, 0);
-                    av_opt_set_int(o.sws, "dsth", H, 0);
-                    av_opt_set_int(o.sws, "dst_format", o.vctx->pix_fmt, 0);
-                    av_opt_set_int(o.sws, "sws_flags", swsFlags, 0);
-                    av_opt_set_int(o.sws, "dst_h_chr_pos", 0, 0);
-                    // (in 1/256 luma pixels: left, and top or centred between the lines it spans, as the decoder takes it)
-                    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(o.vctx->pix_fmt);
-                    const int spans = d ? 1 << d->log2_chroma_h : 1;
-                    av_opt_set_int(o.sws, "dst_v_chr_pos", o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT ? 0 : (spans - 1) * 128, 0);
-                    if (sws_init_context(o.sws, nullptr, nullptr) < 0) {
-                        sws_freeContext(o.sws);
-                        o.sws = nullptr;
-                    }
-                }
-            }
-            o.sws = sws_getCachedContext(o.sws, img.width, img.height, srcFmt, W, H, o.vctx->pix_fmt, swsFlags, nullptr, nullptr, nullptr);
+            // (render/ExportScaler: Compare Encode makes the sequence's chroma with the same scaler)
+            o.sws = exportPictureScaler(o.sws, img.width, img.height, W, H, o.vctx->pix_fmt, o.vctx->chroma_sample_location,
+                                        o.vctx->colorspace, o.vctx->color_range);
             if (!o.sws) return fail("Cannot convert to the encoder pixel format");
-            const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(o.vctx->pix_fmt);
-            if (desc && !(desc->flags & AV_PIX_FMT_FLAG_RGB))
-                sws_setColorspaceDetails(o.sws, sws_getCoefficients(SWS_CS_DEFAULT), 1,
-                                         sws_getCoefficients(o.vctx->colorspace == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : SWS_CS_ITU709),
-                                         o.vctx->color_range == AVCOL_RANGE_JPEG ? 1 : 0, 0, 1 << 16, 1 << 16);
             if (av_frame_make_writable(o.vframe) < 0) return fail("Out of memory");
             const uint8_t* srcData[4] = {reinterpret_cast<const uint8_t*>(rgba16.data()), nullptr, nullptr, nullptr};
             int srcStride[4] = {img.width * 8, 0, 0, 0};
             sws_scale(o.sws, srcData, srcStride, 0, img.height, o.vframe->data, o.vframe->linesize);
-            if (const DeliveredPicture pic = conv.active() ? deliveredPicture(conv, f - din, out - in) : DeliveredPicture{}; pic.woven) {
-                // Pulldown's B C and C D frames: the second (bottom) field from the next picture, woven in the encoder's
-                // format, each plane's lines alternating (4:2:0 chroma too, as FFmpeg's telecine and field matching
-                // weave it).
-                Image second = secondFieldOf(f, pic);
+            if (const DeliveredPicture pic = conv.active() ? deliveredPicture(conv, f - din, out - in) : DeliveredPicture{}; pic.woven || fieldsApart) {
+                // Pulldown's B C and C D frames, and interlaced pictures' fields at their own moments: the second
+                // (bottom) field from the next picture, woven in the encoder's format, each plane's lines alternating
+                // (4:2:0 chroma too, as FFmpeg's telecine and field matching weave it).
+                Image second = pic.woven ? secondFieldOf(f, pic) : secondFieldPicture(f);
                 if (second.width != img.width || second.height != img.height) second = resizeImage(second, img.width, img.height);
                 toRgba16(second, rgba16);
                 const uint8_t* secondData[4] = {reinterpret_cast<const uint8_t*>(rgba16.data()), nullptr, nullptr, nullptr};
@@ -2599,6 +2802,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
         if (!o.av2->finish(&o.av2Error)) return fail(o.av2Error);
     }
+    if (o.jxs && !o.jxs->finish(&o.jxsError)) return fail(o.jxsError);
     if (o.spatial) {
         // The second view's configuration and Apple's stereo boxes, which FFmpeg does not write.
         if ((rc = avio_closep(&o.oc->pb)) < 0) return fail("Writing the file failed: " + averr(rc));
@@ -3080,6 +3284,7 @@ bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSetti
                            containerCarriesStreams(s.path);
     // Smart rendering that cannot go on as planned (HEVC copied as hvc1 whose footage is not found where it was): made
     // again, encoded whole.
+    const plugins::ExportScope exporting;
     const uint64_t pluginFailures = plugins::offlineFailureSerial();
     auto exportOnce = [&](const Sequence& q, const ExportSettings& st) {
         bool again = false;
@@ -3344,6 +3549,7 @@ bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::
     st.videoCodec = apv ? "liboapv" : "prores_ks";
     st.profile = "4444";  // with its transparency
     st.alpha = true;
+    if (!apv) st.pixFmt = "yuva444p12le";  // (12 bits, by Montage's own ProRes encoder)
     st.crf = 12;  // (APV's QP: near lossless, as ProRes 4444 is)
     st.audioCodec = "none";
     st.smartRender = false;
@@ -3449,6 +3655,7 @@ bool bakeCompositeClips(Project& p, Id seqId, const std::string& output, std::st
         st.videoCodec = "prores_ks";
         st.profile = "4444";  // with its transparency
         st.alpha = true;
+        st.pixFmt = "yuva444p12le";  // (12 bits, by Montage's own ProRes encoder)
         st.crf = 12;
         st.audioCodec = "none";
         st.smartRender = false;
@@ -3488,8 +3695,37 @@ bool bakeCompositeClips(Project& p, Id seqId, const std::string& output, std::st
     return true;
 }
 
-bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
-                     const ExportProgress& progress, const std::atomic<bool>* cancel) {
+BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip& c) {
+    BroadcastStamp st;
+    const MediaItem* m = p.findMedia(c.mediaId);
+    // The source's timecode where the clip starts: its media's start (midnight without one) plus the clip's offset.
+    // Samples since midnight: past 24:00:00 it goes round.
+    st.seconds = std::fmod(std::max(0.0, (m && m->timecode >= 0 ? m->timecode : 0.0) + c.sourceAt(0) / seq.fpsValue()), 86400.0);
+    st.timecodeRate = m && m->fps.valid() ? m->fps : seq.fps;
+    st.description = c.name;
+    if (m) {
+        auto meta = [&](const char* key) {
+            const auto it = m->metadata.find(key);
+            return it == m->metadata.end() ? std::string() : it->second;
+        };
+        // A recording's own timecode rate ("30000/1001 DF", as applyFieldRecording keeps it) where it has one.
+        const std::string rate = meta("timecode_rate");
+        int num = 0, den = 0;
+        if (std::sscanf(rate.c_str(), "%d/%d", &num, &den) == 2 && num > 0 && den > 0) {
+            st.timecodeRate = Rational{num, den};
+            st.dropFrame = rate.find("DF") != std::string::npos;
+        }
+        st.project = meta("project");
+        st.scene = meta("scene");
+        st.take = meta("take");
+        st.tape = meta("tape");
+    }
+    return st;
+}
+
+namespace {
+bool writeClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                    const ExportProgress& progress, const std::atomic<bool>* cancel, bool effects, bool stamp) {
     const Clip* c = edit::clipById(seq, clip);
     if (!c) {
         if (error) *error = "No such clip";
@@ -3512,6 +3748,7 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
     Clip copy = *c;
     copy.linkGroup = 0;
     copy.audio.params.clear();  // volume and pan stay live on the clip
+    if (!effects) copy.effects.clear();
     own.clips.push_back(copy);
     bool placed = false;
     for (Track& t : alone.audioTracks)
@@ -3527,7 +3764,26 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
     st.audioCodec = "pcm_s24le";
     st.in = copy.start;
     st.out = copy.start + copy.duration;
-    return exportSequence(p, alone, st, progress, cancel, error);
+    if (!exportSequence(p, alone, st, progress, cancel, error)) return false;
+    // Stamped with the source's timecode where the clip starts: what extracting is for, a courtesy for a render (whose
+    // sound stands without it).
+    std::string why;
+    if (!writeBroadcastStamp(path, clipSoundStamp(p, seq, *c), &why) && stamp) {
+        if (error) *error = why;
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                     const ExportProgress& progress, const std::atomic<bool>* cancel) {
+    return writeClipSound(p, seq, clip, path, error, progress, cancel, true, false);
+}
+
+bool extractClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                      const ExportProgress& progress, const std::atomic<bool>* cancel) {
+    return writeClipSound(p, seq, clip, path, error, progress, cancel, false, true);
 }
 
 bool stillRendition(const Sequence& seq, const std::string& rendition, RenderOptions& ro, const ColorSpace*& space, double& peak,
@@ -3642,6 +3898,8 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
     } else {
         std::vector<uint8_t> rgba = toRgba8(img);
         QImage qi(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888);
+        // (Adobe RGB, which no tag names: said by its ICC profile, which PNG, JPEG and WebP carry)
+        if (space->primaries == Primaries::AdobeRgb) qi.setColorSpace(QColorSpace(QColorSpace::AdobeRgb));
         const bool lossy = ext == ".jpg" || ext == ".jpeg" || ext == ".webp";
         if (!qi.save(QString::fromStdString(path), nullptr, lossy ? std::clamp(options.quality, 0, 100) : -1))
             return fail("Cannot write " + path);

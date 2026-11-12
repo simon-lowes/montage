@@ -153,7 +153,7 @@ std::vector<std::string> checkDciCodestream(const uint8_t* data, size_t size);
 // devices (its projector, link decryptors and so on), which go into the KDM's AuthorizedDeviceInfo (ST 430-1).
 struct KdmScreen {
     std::string cinema, screen;
-    std::string certificate;                  // the server's leaf, PEM
+    std::string certificate;                  // the server's chain or leaf, PEM (a chain's leaf: the one not a certificate authority)
     std::vector<std::string> trustedDevices;  // base64 SHA-1 thumbprints (ST 430-2); empty: any device
     std::string timeZone;                     // IANA ("Europe/Paris"): the window is written in it; empty: offsetMinutes
 };
@@ -162,7 +162,8 @@ struct KdmScreen {
 // and one for each screen, the keys valid from `notBefore` to `notAfter` (seconds since the epoch). Server
 // certificates' KDMs go into `folder`; screens' into a folder of their cinema's in it, each cinema's also zipped beside
 // that folder ("KDM_<title>_<cinema>_<date>.zip"), as distributors send them. The window must sit inside the DKDM's
-// and each server certificate's, or nothing is made.
+// and that of each certificate of each server's chain given, and each server's key must be allowed to encipher keys, or
+// nothing is made.
 struct KdmRequest {
     std::string dkdm;                     // the DKDM file (exportDcp's DcpResult::dkdm)
     std::vector<std::string> recipients;  // the servers' leaf certificates

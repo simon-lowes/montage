@@ -157,20 +157,22 @@ void captureLog(bmx::LogLevel level, const char* format, ...) {
     va_end(args);
 }
 
+void connectBmxLog() {
+    static bool connected = false;
+    if (!connected) {
+        bmx::log = captureLog;
+        bmx::vlog = captureVlog;
+        bmx::vlog2 = captureVlog2;
+        bmx::LOG_LEVEL = bmx::WARN_LOG;
+        bmx::connect_libmxf_logging();
+        connected = true;
+    }
+    bmxLog().clear();
+}
+
 struct BmxSession {
     std::lock_guard<std::mutex> lock{bmxMutex()};
-    BmxSession() {
-        static bool connected = false;
-        if (!connected) {
-            bmx::log = captureLog;
-            bmx::vlog = captureVlog;
-            bmx::vlog2 = captureVlog2;
-            bmx::LOG_LEVEL = bmx::WARN_LOG;
-            bmx::connect_libmxf_logging();
-            connected = true;
-        }
-        bmxLog().clear();
-    }
+    BmxSession() { connectBmxLog(); }
 };
 
 bool fail(std::string* error, const std::string& why) {
@@ -264,6 +266,10 @@ bool setAs11Metadata(bmx::AS11Helper& helper, const BroadcastMxfOptions& o, std:
 }
 
 }  // namespace
+
+BmxUse::BmxUse() : lock_(bmxMutex()) { connectBmxLog(); }
+
+std::string BmxUse::log() const { return bmxLog(); }
 
 bool broadcastMxfAvailable() { return true; }
 

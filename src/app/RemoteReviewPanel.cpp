@@ -1,8 +1,5 @@
 #include "RemoteReviewPanel.h"
 
-#include <QAudioDevice>
-#include <QAudioFormat>
-#include <QAudioSink>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
@@ -15,7 +12,6 @@
 #include <QJsonArray>
 #include <QLabel>
 #include <QLineEdit>
-#include <QMediaDevices>
 #include <QNetworkInterface>
 #include <QPainter>
 #include <QPushButton>
@@ -30,6 +26,7 @@
 #include <algorithm>
 
 #include "Settings.h"
+#include "SoundOut.h"
 #include "render/ColorSpace.h"
 
 namespace montage {
@@ -915,12 +912,7 @@ ReviewViewerWindow::~ReviewViewerWindow() {
 }
 
 void ReviewViewerWindow::stopSound() {
-    if (sink_) {
-        sink_->stop();
-        delete sink_;
-    }
-    sink_ = nullptr;
-    sound_ = nullptr;
+    if (sound_) sound_->close();
 }
 
 void ReviewViewerWindow::toggle() {
@@ -946,17 +938,10 @@ void ReviewViewerWindow::toggle() {
     tag_ = {};
     connect_->setText(tr("Stop"));
     status_->setText(tr("Connecting…"));
-    // Its sound on this computer's speakers, as it comes (a small buffer: a review is live).
-    const QAudioDevice dev = QMediaDevices::defaultAudioOutput();
-    QAudioFormat fmt;
-    fmt.setSampleRate(48000);
-    fmt.setChannelCount(2);
-    fmt.setSampleFormat(QAudioFormat::Float);
-    if (!dev.isNull() && dev.isFormatSupported(fmt)) {
-        sink_ = new QAudioSink(dev, fmt);
-        sink_->setBufferSize(fmt.bytesForDuration(150000));
-        sound_ = sink_->start();
-    }
+    // Its sound as it comes, through the audio device chosen (else this computer's speakers), with a small buffer: a
+    // review is live.
+    if (!sound_) sound_ = new SoundOut(this);
+    sound_->open(48000, 2, 0.15);
     timer_->start();
 }
 
@@ -972,10 +957,10 @@ void ReviewViewerWindow::poll() {
         }
     }
     std::vector<float> sound = receiver_.takeAudio();
-    if (sound_ && sink_ && !sound.empty()) {
+    if (sound_ && sound_->isOpen() && sound.size() >= 2) {
         // As much as there is room for, the latest kept (a review is live: sound that would lag is let go).
-        const qint64 room = sink_->bytesFree() / 8 * 8, bytes = std::min<qint64>(room, qint64(sound.size() * sizeof(float)));
-        if (bytes > 0) sound_->write(reinterpret_cast<const char*>(sound.data() + sound.size()) - bytes, bytes);
+        const qint64 frames = qint64(sound.size() / 2), n = std::min(frames, sound_->room());
+        if (n > 0) sound_->write(sound.data() + size_t(frames - n) * 2, n);
     }
     const output::ReviewReceiver::Status st = receiver_.status();
     if (!st.connected && tag_.frame >= 0) {  // (a frame from before the stream dropped is not marked)

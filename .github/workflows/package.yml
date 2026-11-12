@@ -72,8 +72,17 @@ jobs:
           key: c2pa-${{ runner.os }}-${{ steps.rust.outputs.version }}-${{ hashFiles('scripts/build-c2pa.sh') }}
       - name: C2PA library (Content Credentials)
         run: scripts/build-c2pa.sh ~/c2pa
+      - name: Cache SVT-JPEG-XS
+        uses: actions/cache@v4
+        with:
+          path: ~/svt-jpegxs
+          key: svt-jpegxs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-svt-jpegxs.sh') }}
+      - name: SVT-JPEG-XS (JPEG XS)
+        run: |
+          scripts/build-svt-jpegxs.sh ~/svt-jpegxs
+          echo "MONTAGE_TEST_SVTJPEGXS=$HOME/svt-jpegxs/bin" >> "$GITHUB_ENV"
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DSVTJPEGXS_ROOT="$HOME/svt-jpegxs" -DMONTAGE_REQUIRE_JPEGXS=ON
       - name: Build
         run: cmake --build build
       - name: Cache the AI models
@@ -197,8 +206,17 @@ jobs:
           key: c2pa-${{ runner.os }}-ucrt64-${{ steps.rust.outputs.version }}-${{ hashFiles('scripts/build-c2pa.sh') }}
       - name: C2PA library (Content Credentials)
         run: scripts/build-c2pa.sh "$(cygpath -u "$USERPROFILE")/c2pa"  # where actions/cache's ~ points
+      - name: Cache SVT-JPEG-XS
+        uses: actions/cache@v4
+        with:
+          path: ~/svt-jpegxs
+          key: svt-jpegxs-${{ runner.os }}-ucrt64-${{ hashFiles('scripts/build-svt-jpegxs.sh') }}
+      - name: SVT-JPEG-XS (JPEG XS)
+        run: |
+          scripts/build-svt-jpegxs.sh "$(cygpath -u "$USERPROFILE")/svt-jpegxs"
+          echo "MONTAGE_TEST_SVTJPEGXS=$(cygpath -m "$USERPROFILE")/svt-jpegxs/bin" >> "$GITHUB_ENV"
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$(cygpath -m "$USERPROFILE")/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$(cygpath -m "$USERPROFILE")/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DSVTJPEGXS_ROOT="$(cygpath -m "$USERPROFILE")/svt-jpegxs" -DMONTAGE_REQUIRE_JPEGXS=ON
       - name: Build
         run: cmake --build build
       - name: Cache the AI models

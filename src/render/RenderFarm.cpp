@@ -197,6 +197,7 @@ void visitSettings(S& s, V& v) {
     v("jxlDistance", s.jxlDistance);
     v("jxlEffort", s.jxlEffort);
     v("jxlPremultiplied", s.jxlPremultiplied);
+    v("jpegXsBpp", s.jpegXsBpp);
     v("colorSpace", s.colorSpace);
     v("toneMapping", s.toneMapping);
     v("trimTarget", s.trimTarget);
@@ -253,6 +254,8 @@ void visitImf(S& s, V& v) {
     v("supplementOf", s.supplementOf);
     v("originalSequence", s.originalSequence);
     v("application", s.application);
+    v("edition", s.edition);
+    v("events", s.events);
     v("graded", s.graded);
     v("immersive", s.immersive);
     v("sadm", s.sadm);

@@ -140,5 +140,8 @@ bool writeImageSubtitles(const CaptionTrack& track, const Sequence& seq, const s
 
 // ISO 639-1 for a language as files tag it ("eng", "fre", "deu", "en"...): "" when unknown.
 std::string languageFromTag(const std::string& tag);
+// ISO 639-2/T for an ISO 639-1 language, as MP4 and Matroska store it ("en": "eng"); a three-letter code as it is,
+// else null.
+const char* iso639_2(const std::string& code);
 
 }  // namespace montage

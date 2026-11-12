@@ -32,6 +32,7 @@ class Engine;
 }
 
 class RenderWorker;
+class SoundOut;
 class MixerDevice;
 namespace output {
 class Scheduler;
@@ -161,6 +162,7 @@ public:
     bool loop() const { return loop_; }
     // Play a short audio snippet when seeking while paused (scrubbing).
     void setAudioScrubbing(bool on) { scrubbing_ = on; }
+    const SoundOut* scrubOutput() const { return scrubOut_; }  // (null until scrubbing was first heard)
 
 public slots:
     void play();                  // forward at 1x
@@ -255,9 +257,9 @@ private:
     MixerDevice* device_ = nullptr;
     bool audioClock_ = false;
     bool scrubbing_ = true;
-    QAudioSink* scrubSink_ = nullptr;
-    QIODevice* scrubIo_ = nullptr;
-    int scrubRate_ = 0;
+    SoundOut* scrubOut_ = nullptr;  // (through the audio device, or Qt Multimedia's output)
+    bool scrubNoOutput_ = false, scrubTriedDevice_ = false;
+    int scrubTriedRate_ = 0;
     AudioMixer scrubMixer_;
     bool globalMute_ = false;
     bool ambisonicBinaural_ = true;

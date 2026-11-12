@@ -2,7 +2,7 @@
 // a network stream (SRT, RIST, UDP or RTP MPEG-TS, RTMP, HLS or any URL FFmpeg opens), an Open Media Transport source
 // (media/Omt.h: omt://host:port or its announced name, with its timecode and colour when Montage sent it) or a capture
 // device FFmpeg reaches (V4L2 and ALSA or PulseAudio on Linux, AVFoundation on macOS, DirectShow on Windows; built with
-// libavdevice), recorded to ProRes or DNxHR with its sound (up to 16 channels, 24-bit) and timecode (the
+// libavdevice), recorded to ProRes, DNxHR or JPEG XS (MXF) with its sound (up to 16 channels, 24-bit) and timecode (the
 // feed's own SMPTE 12-M timecode, one given, or the time of day). QuickTime files are written in fragments half a
 // second long, so the file can be imported and cut while it records (EditorState's growing media) and survives a crash;
 // MXF is written whole at the end. Recording runs on a thread of its own at the feed's frame rate (frames late or
@@ -10,8 +10,11 @@
 // time against the pictures' (silence where it is missing, trimmed where it runs early), and stops when asked, after
 // a set time, or when the feed stops (pictures and sound then end together).
 // A feed can also be watched live as it records, or without recording at all (LiveFeed: its latest picture, its
-// sound's levels and its timecode), as the Source monitor and the multiviewer show it. An MPEG transport stream's
-// own time code (its video's GOP time code, as an encoder sends it over SRT, RIST or UDP) is the feed's.
+// sound's levels and its timecode), as the Source monitor and the multiviewer show it, and a feed being watched or
+// recorded is recorded to another file from the same reception (Recorder::recordTo: nothing is opened again). An MPEG
+// transport stream's own time code (its video's GOP time code, as an encoder sends it over SRT, RIST or UDP) is the
+// feed's. ST 2110-41 fast metadata that came with an ST 2110 feed's frames is kept beside the recording
+// (render/St2110Receive.h, fastMetadataSidecar).
 // SDI and HDMI cards (Blackmagic DeckLink) and NDI need their makers' runtimes and are not here.
 #pragma once
 
@@ -27,6 +30,8 @@
 #include <vector>
 
 #include <QImage>
+
+#include "Image.h"
 
 struct AVFrame;
 struct SwsContext;
@@ -46,7 +51,9 @@ struct CaptureSettings {
     CaptureSource video;
     std::optional<CaptureSource> audio;  // a sound device of its own (else the video source's sound, if any)
     std::string path;                    // .mov or .mxf; "" to watch it without recording (`live` given)
-    std::string codec = "prores_hq";     // prores_proxy, prores_lt, prores, prores_hq, dnxhr_lb, dnxhr_sq, dnxhr_hq, dnxhr_hqx
+    std::string codec = "prores_hq";     // prores_proxy, prores_lt, prores, prores_hq, dnxhr_lb, dnxhr_sq, dnxhr_hq, dnxhr_hqx,
+                                         // jpeg_xs (10-bit 4:2:2 in MXF, ST 2124, through SVT-JPEG-XS)
+    double jpegXsBpp = 5;                // jpeg_xs: bits a pixel (a constant number of bytes each picture)
     std::string timecode;                // the first frame's ("hh:mm:ss:ff"); "" the feed's own, else the time of day
     double seconds = 0;                  // stop after this long (0: when stopped)
     double openTimeout = 10;             // seconds to wait for the feed to start (and to send again, at least 5)
@@ -65,15 +72,46 @@ struct CaptureSettings {
     // Each picture and each stretch of sound as it is recorded, on the recording thread (so kept brief: a live package
     // copies them, render/LivePackage.h): the picture as coded into the file, its pts the frame's number there at
     // fpsNum/fpsDen frames a second; the sound at 48 kHz, its pts the first sample's number.
+    // The picture keeps the feed's CEA-608 and CTA-708 caption data (AV_FRAME_DATA_A53_CC, as its decoder read it from
+    // the video's user data; a repeated picture has none, and a dropped one's is carried to the next).
     std::function<void(const AVFrame* picture, int fpsNum, int fpsDen)> onPicture;
     std::function<void(const AVFrame* sound)> onSound;
+    // Every sound stream of the feed, not only the one recorded (a network stream's or file's: each language of a
+    // broadcast, its commentary, its descriptions): the others given apart, track 1 on, placed against the pictures as
+    // the recorded one is, at 48 kHz in planar float with their own channels (at most 8). `onSoundTracks` names them
+    // all (track 0 the recorded one) before the first picture is given. The file records track 0 only. (The feed's
+    // own sound streams: not with a sound device of its own.)
+    bool allSound = false;
+    std::function<void(int track, const AVFrame* sound)> onTrackSound;
+    struct SoundTrack {
+        int track = 0;
+        std::string language;  // the stream's (ISO 639-2, as MPEG-TS and MP4 state it), "" when not said
+        std::string title;
+        int channels = 0;
+    };
+    std::function<void(const std::vector<SoundTrack>& tracks)> onSoundTracks;
+    // SCTE 35 cue messages in the feed (an MPEG transport stream's splice_info_sections, over SRT, RIST or UDP), each
+    // as it came: its bytes, the feed's clock (seconds, the 90 kHz clock of the stream's times) at the recording's first
+    // picture (its times, pts_time, are on that clock), and when it came (seconds into the recording, by its own
+    // stream time; NaN when it had none). Given once the recording has begun (those before, then).
+    std::function<void(const std::vector<uint8_t>& section, double feedZero, double at)> onCue;
     // Watched live as it records (or, with no path, instead of recording).
     std::shared_ptr<LiveFeed> live;
 };
 
-// A feed as it is now, for watching it live: its latest picture (scaled to fit `maxWidth` by `maxHeight`), that
-// picture's number in the recording and its timecode, and the sound's peak level on each channel (held, falling 20 dB
-// a second, as a meter shows it).
+// What a feed is recorded to: CaptureSettings' own file, or another while it is received (Recorder::recordTo).
+struct CaptureFile {
+    std::string path;                 // .mov or .mxf; "" to watch on without recording
+    std::string codec = "prores_hq";  // (as CaptureSettings::codec)
+    double jpegXsBpp = 5;
+    std::string timecode;             // the first frame's; "" the feed's own then, else the time of day
+    std::string reel;
+};
+
+// A feed as it is now, for watching it live: its latest picture (scaled to fit `maxWidth` by `maxHeight`; an HDR
+// feed's as an SDR display shows it, 640 by 360 at most), that picture's number in the recording and its timecode,
+// and the sound's peak level on each channel (held, falling 20 dB a second, as a meter shows it). The latest picture
+// is also kept as it came, at the feed's own size, for a viewer that shows it whole (full()).
 // A Recorder fills it on its own thread (CaptureSettings::live); it is read from any thread.
 class LiveFeed {
 public:
@@ -91,8 +129,22 @@ public:
         int64_t pictures = 0;    // pictures seen in all
         std::vector<float> peaks;  // each channel's peak level (0 to 1), held and falling
         bool running = false;    // pictures still coming (since begin, until the recording ended)
+        std::string hdr;         // an HDR feed's transfer: "pq" or "hlg" (BT.2100, as the feed states it); "" SDR
     };
     Now look() const;
+    // The latest picture at the feed's own size (scaled down, its shape kept, only where it is larger than `maxWidth`
+    // by `maxHeight`), converted on the calling thread (any but the recording's, which is not held up by it): an SDR
+    // feed's as `picture`; an HDR feed's as `light`, its R'G'B' code values (0 to 1, alpha 1) in `space`
+    // ("rec2100pq" or "rec2100hlg"), for render/HdrView.h and convertColor. Nothing (pictures 0) before the first
+    // picture, or when the latest is still picture number `after` (Now::pictures, as an earlier call gave it).
+    struct Full {
+        int64_t pictures = 0;
+        QImage picture;
+        Image light;
+        std::string space;
+        int width = 0, height = 0;  // the feed's own size
+    };
+    Full full(int maxWidth, int maxHeight, int64_t after = 0) const;
     // The timecode of picture `frame` (its number in the recording): the first's counted on at the feed's rate.
     std::string timecodeAt(int64_t frame) const;
     std::string firstTimecode() const;
@@ -110,7 +162,12 @@ private:
     std::string first_;
     int fpsNum_ = 25, fpsDen_ = 1;
     SwsContext* sws_ = nullptr;
-    int swsKey_[6] = {0, 0, -1, 0, 0, 0};
+    int swsKey_[7] = {0, 0, -1, 0, 0, 0, 0};
+    AVFrame* latest_ = nullptr;  // the latest picture as it came (a reference to its planes)
+    // (full()'s scaler, kept from call to call: one caller at a time)
+    mutable std::mutex fullM_;
+    mutable SwsContext* fullSws_ = nullptr;
+    mutable int fullKey_[7] = {0, 0, -1, 0, 0, 0, 0};
 };
 
 // The clock CaptureSettings::label is asked by (seconds, steady).
@@ -121,8 +178,10 @@ std::vector<std::pair<std::string, std::string>> captureCodecs();
 // The capture devices this build can open: "omt" (Open Media Transport) and FFmpeg's (none without libavdevice).
 std::vector<std::string> captureDeviceKinds();
 
+// (of the file being recorded, or of the feed since it was last begun to be watched: Recorder::recordTo begins both again)
 struct CaptureStatus {
     bool recording = false, finished = false;
+    std::string path;  // the file being recorded ("" while the feed is only watched)
     int64_t frames = 0, dropped = 0, repeated = 0;
     double seconds = 0;
     int width = 0, height = 0, channels = 0;
@@ -149,11 +208,27 @@ public:
     bool recording() const;
     CaptureStatus status() const;
 
+    // While it runs: the feed recorded to another file, or (path "") watched on without recording, from the same
+    // reception: nothing is opened again (a caller is not made to call again, a multicast group not left and joined),
+    // the file being recorded ends at the picture reached, its sound with it, and the next picture begins the new
+    // one, with the feed's timecode at that picture and the sound that belongs from there on. A live view
+    // (CaptureSettings::live) begins again with it, as does status(). Waits until the file being recorded is
+    // finished (onFileFinished has been called by then; never call it from one of the recorder's own notices, which
+    // run on the thread it waits for). False with why when `file` cannot be recorded (as start says) or the feed has
+    // ended. (A set length, CaptureSettings::seconds, and a range by timecode are the first file's alone.)
+    // `wait` false: asked for and not waited for, as for a feed still being opened, which takes it once it runs (a
+    // file that cannot be begun is then told by onFileFinished alone).
+    bool recordTo(const CaptureFile& file, std::string* error = nullptr, bool wait = true);
+
     // On the recording thread: the file's first second is written (it can be opened and imported now), and the
     // recording ended: ok (the file finished; `message` any warning) or not (`message` why: the feed not found, a
     // disk full...).
     std::function<void()> onFirstFragment;
     std::function<void(bool ok, const std::string& message)> onFinished;
+    // On the recording thread: a file recordTo ended (ok: finished; `message` any warning; status() is still that
+    // file's while it is called), or one it named that could not be begun (not ok, `message` why: the feed is watched
+    // on).
+    std::function<void(const std::string& path, bool ok, const std::string& message)> onFileFinished;
 
     struct State;
 

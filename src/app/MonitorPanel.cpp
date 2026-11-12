@@ -28,6 +28,7 @@
 #include <utility>
 
 #include <QFutureWatcher>
+#include <QThreadPool>
 #include <QtConcurrent>
 
 #include "DisplayCalibration.h"
@@ -37,7 +38,10 @@
 #include "media/Capture.h"
 #include "media/Image.h"
 #include "media/MediaPool.h"
+#include "render/ColorSpace.h"
 #include "render/Compositor.h"
+#include "render/HdrView.h"
+#include "render/MonitorCalibration.h"
 #include "render/Spherical.h"
 #include "core/EditOps.h"
 #include "Theme.h"
@@ -821,6 +825,12 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         badge->setStyleSheet(QStringLiteral("QToolButton { color: #888; font-weight: 600; padding: 0 4px; border-radius: 3px; }"
                                             "QToolButton:checked { color: white; background: #c62828; }"));
         badge->hide();
+        {
+            // (its place kept while hidden: going live must not widen a narrow monitor, and with it the window)
+            QSizePolicy keep = badge->sizePolicy();
+            keep.setRetainSizeWhenHidden(true);
+            badge->setSizePolicy(keep);
+        }
         bar->addWidget(badge);
         liveBadge_ = badge;
         connect(badge, &QToolButton::toggled, this, [this](bool on) {
@@ -832,6 +842,7 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
                 emit liveChanged();  // (live again: the multiviewer's tally)
             } else {
                 viewer_->setImage(QImage());
+                viewer_->setHdrPicture(nullptr);
                 emit liveChanged();  // (the recording so far, as media)
                 controller_->requestFrame();
                 refresh();
@@ -1141,6 +1152,7 @@ void MonitorPanel::setLiveFeed(std::shared_ptr<LiveFeed> feed, Id media, const Q
         liveTimer_->stop();
         if (was) {
             viewer_->setImage(QImage());
+            viewer_->setHdrPicture(nullptr);
             controller_->requestFrame();
         }
         refresh();
@@ -1190,12 +1202,8 @@ void MonitorPanel::liveTick() {
     const LiveFeed::Now now = live_->look();
     livePeaks_ = now.peaks;
     if (!liveBadge_->isChecked()) return;
-    if (!now.picture.isNull() && now.pictures != liveShown_) {
-        liveShown_ = now.pictures;
-        viewer_->setImage(now.picture);
-    } else {
-        viewer_->update();  // (the meters)
-    }
+    if (now.pictures > 0 && now.pictures != liveShown_ && !liveConverting_) showLivePicture();
+    else viewer_->update();  // (the meters)
     const Sequence* s = state_->sequence();
     const FrameTime t = sequenceFrame(now, s);
     scrub_->setRange(std::max<FrameTime>(t + 1, 1));
@@ -1212,6 +1220,53 @@ void MonitorPanel::liveTick() {
         text += QStringLiteral(" · ") + durationString(s, t + 1);
     }
     durationLabel_->setText(text);
+}
+
+// The feed's newest picture at its own size, scaled down only where the monitor has fewer pixels than it (never below
+// 1280 by 720), made ready off this thread (one at a time: pictures that come meanwhile are passed over). An HDR
+// feed's is HDR light for the HDR viewer while that shows HDR (through the display's calibration, as a sequence's),
+// with its SDR view for everything else.
+void MonitorPanel::showLivePicture() {
+    liveConverting_ = true;
+    const qreal dpr = viewer_->devicePixelRatioF();
+    const int maxWidth = std::max(1280, int(std::ceil(viewer_->width() * dpr))), maxHeight = std::max(720, int(std::ceil(viewer_->height() * dpr)));
+    const bool hdrShown = controller_->hdrOutput();
+    const std::shared_ptr<const Lut3D> calibration = hdrShown ? DisplayCalibration::instance().screenLut(viewer_->screen(), true) : nullptr;
+    const double white = viewer_->hdrSdrWhiteNits();
+    const std::shared_ptr<LiveFeed> feed = live_;
+    const int64_t after = liveShown_;
+    QPointer<MonitorPanel> self(this);
+    QThreadPool::globalInstance()->start([self, feed, maxWidth, maxHeight, after, hdrShown, calibration, white] {
+        LiveFeed::Full full = feed->full(maxWidth, maxHeight, after);
+        QImage view = full.picture;
+        HdrPicturePtr hdr;
+        if (const ColorSpace* space = full.light.empty() ? nullptr : findColorSpace(full.space)) {
+            if (hdrShown) {
+                auto pic = std::make_shared<HdrPicture>();
+                pic->width = full.light.width;
+                pic->height = full.light.height;
+                pic->contentPeak = hdrContentPeak(*space, 1000);
+                pic->transfer = space->transfer;
+                hdrViewImage(full.light, *space, 1000, pic->contentPeak, pic->rgba);  // (rolled off as drawn)
+                if (calibration) calibrateHdrPicture(pic->rgba, pic->width, pic->height, *calibration, white);
+                hdr = std::move(pic);
+            }
+            convertColor(full.light, *space, rec709Space());
+            view = QImage(full.light.width, full.light.height, QImage::Format_RGBA8888);
+            toRgba8(full.light, view.bits(), size_t(view.bytesPerLine()));
+        }
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [self, feed, pictures = full.pictures, view, hdr] {
+            if (self) self->livePictureReady(feed, pictures, view, hdr);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void MonitorPanel::livePictureReady(const std::shared_ptr<LiveFeed>& feed, int64_t pictures, const QImage& view, HdrPicturePtr hdr) {
+    liveConverting_ = false;
+    if (feed != live_ || !liveShowing() || pictures <= 0 || view.isNull()) return;  // (another feed's by now, or no newer picture)
+    liveShown_ = pictures;
+    viewer_->setImage(view);
+    viewer_->setHdrPicture(std::move(hdr));
 }
 
 void MonitorPanel::goToIn() {

@@ -59,6 +59,7 @@
 #include "render/BackgroundJobs.h"
 #include "render/Dcp.h"
 #include "render/DcpFacilities.h"
+#include "render/DcpSecurity.h"
 #include "render/Adm.h"
 #include "render/Iamf.h"
 #include "render/Imf.h"
@@ -82,6 +83,7 @@
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
 #include "media/Av2.h"
+#include "media/JpegXs.h"
 #include "media/Offload.h"
 #include "media/Recover.h"
 #include "media/Proxy.h"
@@ -625,6 +627,7 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.par > 0) o["pixel_aspect"] = i.par;
     if (!i.alpha.empty()) o["alpha"] = QString::fromStdString(i.alpha);
     if (!i.fields.empty()) o["field_order"] = QString::fromStdString(i.fields);
+    if (!i.chroma.empty()) o["chroma_siting"] = QString::fromStdString(i.chroma);
     if (std::vector<PulldownStretch> st; parsePulldown(i.pulldown, st) && !st.empty()) {
         // Pulldown removed: the cadence's stretches (a break where an edit after the pulldown changed it).
         QJsonArray stretches;
@@ -887,6 +890,91 @@ struct McpServer::Impl {
         }
     }
 
+    // The files and folders side-by-side calls running now write or read: a call writing one waits until no other call
+    // uses it, and a call reading one waits only while another writes it, so two background renders to one path never
+    // write it at once and calls that only read a file run side by side.
+    std::mutex outputsMutex;
+    std::condition_variable outputsFree;
+    struct PathUse {
+        int readers = 0, writers = 0;
+    };
+    std::map<QString, PathUse> pathsInUse;
+    // The paths a call's arguments name: what it writes (output, report, any *_output or *_report, and of a tool that
+    // is not read-only the folders too: folder, dir, any *_folder or *_dir, where exports write) and what it reads (path,
+    // file, files, paths, any *_path or *_file, and a read-only tool's folders; lists of them too). A path it both reads
+    // and writes counts as written.
+    struct CallPaths {
+        QStringList writes, reads;
+    };
+    static CallPaths pathsOf(const QJsonObject& a, bool readOnly) {
+        CallPaths out;
+        const auto kind = [readOnly](const QString& k) {
+            const auto named = [&k](const char* n) { return k == QLatin1String(n) || k.endsWith(QLatin1Char('_') + QLatin1String(n)); };
+            for (const char* w : {"output", "report"})
+                if (named(w)) return 2;
+            for (const char* f : {"folder", "dir"})
+                if (named(f)) return readOnly ? 1 : 2;
+            for (const char* r : {"path", "file", "files", "paths"})
+                if (named(r)) return 1;
+            return 0;
+        };
+        for (auto it = a.begin(); it != a.end(); ++it) {
+            const int k = kind(it.key());
+            if (!k) continue;
+            const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
+            for (const QJsonValue& v : list)
+                if (v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << QDir::cleanPath(absolute(v.toString()));
+        }
+        out.writes.removeDuplicates();
+        out.reads.removeDuplicates();
+        for (const QString& w : out.writes) out.reads.removeAll(w);
+        return out;
+    }
+    struct OutputClaim {
+        Impl* d = nullptr;
+        CallPaths paths;
+        ~OutputClaim() {
+            if (!d) return;
+            {
+                std::lock_guard l(d->outputsMutex);
+                auto drop = [&](const QString& p, bool write) {
+                    auto it = d->pathsInUse.find(p);
+                    if (it == d->pathsInUse.end()) return;
+                    (write ? it->second.writers : it->second.readers) -= 1;
+                    if (it->second.readers <= 0 && it->second.writers <= 0) d->pathsInUse.erase(it);
+                };
+                for (const QString& p : paths.writes) drop(p, true);
+                for (const QString& p : paths.reads) drop(p, false);
+            }
+            d->outputsFree.notify_all();
+        }
+    };
+    // Waits (its turn held, so later calls keep their order) while a running call writes one of the paths this one
+    // uses, or uses one it writes; false when the call is cancelled or the server stops meanwhile.
+    bool claimOutputs(OutputClaim& claim, const CallPaths& paths, const std::atomic<bool>& cancel) {
+        std::unique_lock l(outputsMutex);
+        const auto free = [&] {
+            for (const QString& p : paths.writes)
+                if (auto it = pathsInUse.find(p); it != pathsInUse.end() && (it->second.readers > 0 || it->second.writers > 0)) return false;
+            for (const QString& p : paths.reads)
+                if (auto it = pathsInUse.find(p); it != pathsInUse.end() && it->second.writers > 0) return false;
+            return true;
+        };
+        while (!free()) {
+            if (cancel) return false;
+            {
+                std::lock_guard jl(jobsMutex);
+                if (stopping) return false;
+            }
+            outputsFree.wait_for(l, std::chrono::milliseconds(200));
+        }
+        for (const QString& p : paths.writes) ++pathsInUse[p].writers;
+        for (const QString& p : paths.reads) ++pathsInUse[p].readers;
+        claim.d = this;
+        claim.paths = paths;
+        return true;
+    }
+
     // Tools that leave the project as it is and may run alongside each other in the background.
     static bool runsSideBySide(const Tool& t) {
         static const std::set<QString> also = {"montage_render", "montage_export_dcp", "montage_export_imf", "montage_export_review",
@@ -941,19 +1029,26 @@ struct McpServer::Impl {
         }
     }
     // At the start (montage-cli mcp): the calls a server before this one was running (or had waiting) when it stopped or crashed. Those of
-    // tools that leave the project alone are run again, in their order; the rest wait for montage_job's resume.
+    // tools that leave the project alone are run again, in their order, up to the first of that server's that cannot be
+    // (an edit, say): the calls after it may need what it would have done, so they wait with it for montage_job's resume.
     int resumeStored() {
         int n = 0;
+        std::set<QString> held;  // (servers whose calls wait from here on)
         for (const jobs::Record& r : jobs::all(QStringLiteral("mcp"))) {
             if (r.status != QLatin1String("interrupted") && r.status != QLatin1String("waiting")) continue;
             // (one left by a server of this same process waits for montage_job's resume: only a call whose process
             // stopped, or crashed, is taken up by itself)
             if (jobs::runningElsewhere(r) || jobs::runningHere(r) || r.data.value("session").toString() == session) continue;
+            const QString from = r.data.value("session").toString();
+            if (held.count(from)) continue;
             const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == r.data.value("tool").toString(); });
-            if (tool == tools.end() || !runsSideBySide(*tool) || r.data.value("secret").toBool() || !r.data.contains("args")) continue;
             // (its relative paths read as they were: only by a server started in the same folder)
-            if (r.data.value("cwd").toString() != QDir::currentPath()) continue;
-            if (resume(r, *tool)) ++n;
+            if (tool == tools.end() || !runsSideBySide(*tool) || r.data.value("secret").toBool() || !r.data.contains("args") ||
+                r.data.value("cwd").toString() != QDir::currentPath() || !resume(r, *tool)) {
+                held.insert(from);
+                continue;
+            }
+            ++n;
         }
         // (the store kept from growing: the newest 200 finished calls kept)
         jobs::prune(QStringLiteral("mcp"), 200);
@@ -999,6 +1094,7 @@ struct McpServer::Impl {
         job->args = args;
         job->sideBySide = runsSideBySide(tool);
         job->resumedFrom = resumedFrom;
+        bool prune = false;
         {
             std::lock_guard l(jobsMutex);
             if (jobQueue.size() >= kMaxQueuedJobs) return nullptr;
@@ -1009,8 +1105,12 @@ struct McpServer::Impl {
             jobQueue.push_back(job);
             spawnWorkers();
             jobsWake.notify_all();
-            if (jobsMade % 64 == 0) pruneJobs();
+            prune = jobsMade % 64 == 0;
+            if (prune) pruneJobs();
         }
+        // (and the store's finished calls, as montage-cli mcp prunes them when it starts: the GUI's link never starts
+        // so. Outside the lock: it reads every job's folder.)
+        if (prune) jobs::prune(QStringLiteral("mcp"), 200);
         persist(*job, true);
         return job;
     }
@@ -1068,9 +1168,12 @@ struct McpServer::Impl {
             std::unique_lock<std::shared_mutex> alone(toolMutex, std::defer_lock);
             if (job->sideBySide) shared.lock();
             else alone.lock();
+            OutputClaim outputs;
+            const bool claimed = !job->sideBySide || tool == tools.end() ||
+                                 claimOutputs(outputs, pathsOf(job->args, tool->readOnly), job->cancel);
             {
                 std::lock_guard jl(job->m);
-                if (job->cancel || tool == tools.end()) {
+                if (!claimed || job->cancel || tool == tools.end()) {
                     job->status = QStringLiteral("cancelled");
                 } else {
                     job->status = QStringLiteral("running");
@@ -1171,7 +1274,9 @@ struct McpServer::Impl {
     ToolResult storedAction(montage::jobs::Record r, const QString& action) {
         const bool queue = r.owner == QLatin1String("render-queue");
         if (action == "cancel" && !r.finished() && r.status != QLatin1String("resumed")) {
-            if (queue || montage::jobs::runningElsewhere(r)) {
+            // (a dialog's job in Montage hears it too, also when this server is Montage's own live link)
+            const bool dialog = r.owner == QLatin1String("app") && r.status == QLatin1String("running");
+            if (queue || dialog || montage::jobs::runningElsewhere(r)) {
                 // (whoever runs it hears it: the render queue within a fifth of a second, a server at its next progress)
                 QFile f(montage::jobs::jobFolder(r.id) + QStringLiteral("/cancel"));
                 if (!f.open(QIODevice::WriteOnly)) return fail(QStringLiteral("Cannot ask %1 to stop").arg(r.id));
@@ -1190,6 +1295,8 @@ struct McpServer::Impl {
         }
         if (action == "resume") {
             if (queue) return fail(QStringLiteral("%1 is the render queue's: Montage renders it again when it starts").arg(r.id));
+            if (r.owner == QLatin1String("app"))
+                return fail(QStringLiteral("%1 was started from a dialog in Montage: a consolidation is taken up again when Montage next starts, other jobs are not").arg(r.id));
             if (r.status != QLatin1String("interrupted") && r.status != QLatin1String("waiting"))
                 return fail(QStringLiteral("%1 is %2: only a call cut short is taken up again").arg(r.id, r.status));
             if (montage::jobs::runningElsewhere(r)) return fail(QStringLiteral("%1 is held by a server still running").arg(r.id));
@@ -1460,6 +1567,35 @@ ToolResult McpServer::Impl::renderLive(const QJsonObject& a) {
     if (ls.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
     if (a.contains("audio_name")) ls.audioName = str(a, "audio_name").toStdString();
     if (a.contains("audio_language")) ls.audioLanguage = str(a, "audio_language").toStdString();
+    const QJsonValue languages = lo.value("languages");
+    if (!languages.isUndefined() && !languages.isBool() && !languages.isArray()) throw ArgError{"\"languages\" is true or a list of languages"};
+    const bool allSound = languages.isArray() || languages.toBool();
+    for (const QJsonValue& v : languages.toArray()) {
+        if (!v.isString()) throw ArgError{"\"languages\" lists each sound stream's language, as text"};
+        ls.languages.push_back(v.toString().toStdString());
+    }
+    ls.captions = str(lo, "captions", "auto").toStdString();
+    if (ls.captions != "auto" && ls.captions != "always" && ls.captions != "none") throw ArgError{"\"captions\" is auto, always or none"};
+    ls.captionLanguage = str(lo, "caption_language", "en").toStdString();
+    ls.captionName = str(lo, "caption_name").toStdString();
+    ls.cueCommand = str(so, "cue", "splice_insert").toStdString();
+    if (ls.cueCommand != "splice_insert" && ls.cueCommand != "time_signal") throw ArgError{"\"cue\" is splice_insert or time_signal"};
+    const bool feedCues = lo.value("feed_cues").toBool(true);
+    std::vector<LiveCue> cues;
+    for (const QJsonValue& v : lo.value("cues").toArray()) {
+        const QJsonObject c = v.toObject();
+        LiveCue cue;
+        cue.at = c.value("at").toDouble(-1), cue.duration = c.value("duration").toDouble(0);
+        if (cue.at < 0 || cue.duration < 0) throw ArgError{"Each cue has its time (\"at\", seconds into the recording) and a duration of 0 or more"};
+        cues.push_back(cue);
+    }
+    std::vector<std::pair<double, std::string>> chapters;
+    for (const QJsonValue& v : lo.value("chapters").toArray()) {
+        const QJsonObject c = v.toObject();
+        const double at = c.value("at").toDouble(-1);
+        if (at < 0 || !c.value("title").isString()) throw ArgError{"Each chapter has its time (\"at\", seconds into the recording) and a title"};
+        chapters.emplace_back(at, c.value("title").toString().toStdString());
+    }
 
     CaptureSettings cs;
     cs.video.url = need(lo, "url").toStdString();
@@ -1490,6 +1626,18 @@ ToolResult McpServer::Impl::renderLive(const QJsonObject& a) {
     const int servedPort = serve ? origin.port() : 0;
     cs.onPicture = [&](const AVFrame* f, int num, int den) { packager.picture(f, num, den); };
     cs.onSound = [&](const AVFrame* f) { packager.sound(f); };
+    if (allSound) {
+        cs.allSound = true;
+        cs.onTrackSound = [&](int track, const AVFrame* f) { packager.sound(f, track); };
+        cs.onSoundTracks = [&](const std::vector<CaptureSettings::SoundTrack>& tracks) {
+            std::vector<LiveSoundTrack> list;
+            for (const auto& t : tracks) list.push_back({t.language, t.title, t.channels});
+            packager.soundTracks(list);
+        };
+    }
+    if (feedCues) cs.onCue = [&](const std::vector<uint8_t>& section, double zero, double at) { packager.cueFromFeed(section, zero, at); };
+    for (const LiveCue& c : cues) packager.cue(c);
+    for (const auto& [at, title] : chapters) packager.chapter(title, at);
     Recorder recorder;
     if (!recorder.start(cs, &why)) return fail(QString::fromStdString(why));
     const std::atomic<bool>* cancel = cancelFlag();
@@ -1523,6 +1671,18 @@ ToolResult McpServer::Impl::renderLive(const QJsonObject& a) {
     if (!ps.hls.empty()) o["hls"] = QString::fromStdString(ps.hls), text += QStringLiteral("\nHLS: %1").arg(QString::fromStdString(ps.hls));
     if (!ps.dash.empty()) o["dash"] = QString::fromStdString(ps.dash), text += QStringLiteral("\nDASH: %1").arg(QString::fromStdString(ps.dash));
     if (ls.audioCodec == "ac3" || ls.audioCodec == "eac3") o["dialnorm"] = ps.dialnorm;
+    o["sound_renditions"] = ps.soundRenditions;
+    o["captioned"] = ps.captioned;
+    if (ps.captioned) {
+        o["caption_cues"] = double(ps.captionCues);
+        text += QStringLiteral("\nCaptions: %1 shown").arg(ps.captionCues);
+    }
+    QJsonArray cueList;
+    for (const LiveCueStatus& c : ps.cues)
+        cueList.append(QJsonObject{{"id", c.id}, {"frame", double(c.frame)}, {"seconds", c.seconds}, {"duration", c.duration},
+                                   {"from_feed", c.fromFeed}, {"keyframe", c.keyframe}, {"returned", c.returned}, {"late", c.late}});
+    if (!cueList.isEmpty()) o["cues"] = cueList, text += QStringLiteral("\n%1 ad cue(s) placed").arg(cueList.size());
+    if (ps.chapters) o["chapters"] = ps.chapters, text += QStringLiteral("\n%1 chapter(s) in chapters.vtt").arg(ps.chapters);
     if (ps.dropped) text += QStringLiteral("\n%1 picture(s) dropped while the encoders fell behind").arg(ps.dropped);
     if (serve) {
         const QString url = QStringLiteral("http://%1:%2/").arg(QString::fromStdString(address == "0.0.0.0" ? "127.0.0.1" : address)).arg(servedPort);
@@ -1819,14 +1979,17 @@ void McpServer::Impl::addTools() {
     add("montage_midi_map", "MIDI controller maps",
         "The maps MIDI Learn keeps for each MIDI controller (one JSON file per device, found again by its name when it is "
         "plugged back in): `list` the devices with maps and the MIDI inputs plugged in now; `show` a device's mappings; "
-        "`map` a control onto a target (replacing that control's mapping for that panel); `unmap` it. Controls: "
-        "cc:<channel>:<n>, cc14:<channel>:<n> (the 14-bit pair n and n+32, n 0-31), note:<channel>:<n>, "
-        "nrpn:<channel>:<parameter> and rpn:<channel>:<parameter> (0-16383), bend:<channel>:0, program:<channel>:<n>, "
-        "channels counted from 1. Targets: command:<a menu command's id as Keyboard Shortcuts lists it, e.g. "
+        "`map` a control onto a target (replacing that control's mappings for that panel; with `add` true, one more "
+        "target for it, each with its own range: one fader on several parameters); `unmap` it (with `target`, only that "
+        "one). Controls: cc:<channel>:<n>, cc14:<channel>:<n> (the 14-bit pair n and n+32, n 0-31), note:<channel>:<n>, "
+        "nrpn:<channel>:<parameter> and rpn:<channel>:<parameter> (0-16383; data increment and decrement move the "
+        "target by `step`), bend:<channel>:0, program:<channel>:<n>, at:<channel>:0 (channel aftertouch), "
+        "pat:<channel>:<note> (polyphonic aftertouch), channels counted from 1. Targets: command:<a menu command's id as Keyboard Shortcuts lists it, e.g. "
         "Sequence/Add Marker>, widget:<panel>/<control name> (e.g. widget:inspector/param_3_opacity; add #x or #y for a "
-        "colour wheel's axis), strip:<n>:volume|pan|mute|solo (n from 1, counted from the bank's first track), "
+        "colour wheel's axis; widget:dialog:<dialog name>/<control name> in a dialog), strip:<n>:volume|pan|mute|solo (n from 1, counted from the bank's first track), "
         "master:volume, bank:previous|next. Encodings: absolute (faders, knobs), button, and relative encoders: "
-        "twos-complement, sign-magnitude, offset-64. A running Montage uses the change at once.",
+        "twos-complement, sign-magnitude, offset-64. `output` names another MIDI output the target's value is shown on "
+        "(motor faders, LED rings), following automation. A running Montage uses the change at once.",
         R"json({"type":"object","properties":{
             "action":{"type":"string","enum":["list","show","map","unmap"],"default":"list"},
             "device":{"type":"string","description":"The controller's MIDI input name"},
@@ -1839,7 +2002,9 @@ void McpServer::Impl::addTools() {
             "curve":{"type":"number","description":"Above 1 finer at the bottom of the travel"},
             "invert":{"type":"boolean"},"toggle":{"type":"boolean","description":"Buttons: each press flips the target"},
             "pickup":{"type":"boolean","description":"Soft takeover (default true)"},
-            "step":{"type":"number","description":"Relative encoders: the part of the range one step turns (default 1/128)"},
+            "step":{"type":"number","description":"Relative encoders and NRPN increments: the part of the range one step turns (default 1/128)"},
+            "add":{"type":"boolean","description":"map: one more target for the control (default false: its only one)"},
+            "output":{"type":"string","description":"map: the MIDI output the target's value is shown on (default the controller's own)"},
             "bank_size":{"type":"integer","minimum":1,"maximum":64},
             "folder":{"type":"string","description":"Where maps are kept (default Montage's own)"}}})json",
         false, [](const QJsonObject& a) {
@@ -1900,30 +2065,38 @@ void McpServer::Impl::addTools() {
             }
             if (action == QLatin1String("map")) {
                 QJsonObject o{{"control", need(a, "control")}, {"target", need(a, "target")}};
-                for (const char* k : {"encoding", "low", "high", "curve", "invert", "toggle", "pickup", "step"})
+                for (const char* k : {"encoding", "low", "high", "curve", "invert", "toggle", "pickup", "step", "output"})
                     if (a.contains(k)) o[k] = a.value(k);
                 if (a.contains("panel")) o["layer"] = a.value("panel");
                 midimap::Mapping m;
                 QString why;
                 if (!midimaps::fromJson(o, m, &why)) return fail(why);
-                bool replaced = false;
-                for (midimap::Mapping& old : map.mappings)
-                    if (old.key == m.key && old.layer == m.layer) {
-                        old = m;
-                        replaced = true;
-                    }
-                if (!replaced) map.mappings.push_back(m);
+                // (as the app's map does: in the place of the first it replaces; with `add`, only one onto the same target)
+                const bool adding = a.value("add").toBool(false);
+                auto same = [&](const midimap::Mapping& old) {
+                    return old.key == m.key && old.layer == m.layer && (!adding || old.target == m.target);
+                };
+                const auto first = std::find_if(map.mappings.begin(), map.mappings.end(), same);
+                const bool replaced = first != map.mappings.end();
+                if (replaced) {
+                    *first = m;
+                    const auto at = first - map.mappings.begin();
+                    for (auto i = map.mappings.size(); i-- > size_t(at) + 1;)
+                        if (same(map.mappings[i])) map.mappings.erase(map.mappings.begin() + std::ptrdiff_t(i));
+                } else {
+                    map.mappings.push_back(m);
+                }
                 return saved(QStringLiteral("%1 %2 → %3").arg(replaced ? QStringLiteral("Remapped") : QStringLiteral("Mapped"),
                                                              QString::fromStdString(midimap::keyLabel(m.key)), QString::fromStdString(m.target)));
             }
             if (action == QLatin1String("unmap")) {
                 const auto key = midimap::keyFromName(need(a, "control").toStdString());
                 if (!key) return fail(QStringLiteral("unknown control \"%1\"").arg(str(a, "control")));
-                const std::string layer = str(a, "panel").toStdString();
-                const auto it = std::find_if(map.mappings.begin(), map.mappings.end(),
-                                             [&](const midimap::Mapping& m) { return m.key == *key && m.layer == layer; });
-                if (it == map.mappings.end()) return fail(QStringLiteral("%1 has no mapping for %2").arg(device, str(a, "control")));
-                map.mappings.erase(it);
+                const std::string layer = str(a, "panel").toStdString(), target = str(a, "target").toStdString();
+                const size_t gone = std::erase_if(map.mappings, [&](const midimap::Mapping& m) {
+                    return m.key == *key && m.layer == layer && (target.empty() || m.target == target);
+                });
+                if (!gone) return fail(QStringLiteral("%1 has no mapping for %2").arg(device, str(a, "control")));
                 return saved(QStringLiteral("Unmapped %1").arg(QString::fromStdString(midimap::keyLabel(*key))));
             }
             return fail(QStringLiteral("unknown action \"%1\" (list, show, map, unmap)").arg(action));
@@ -2282,6 +2455,74 @@ void McpServer::Impl::addTools() {
             check(edit::removeClips(l.project, l.seq(), ids, a.value("ripple").toBool()));
             save(l);
             return ok(QStringLiteral("Removed %1 clip(s)").arg(ids.size()), projectJson(l.project));
+        });
+
+    add("montage_nest_range", "Nest a range in place",
+        "Replace a stretch of the timeline with one compound clip: every unlocked track (or just `tracks`) is cut at "
+        "`in` and `out` and what lies between, linked sound with its picture and gaps kept, moves into a new sequence "
+        "named `name`, played by one compound clip from `in` on the lowest video and audio tracks that had any. Its "
+        "picture and sound are the range's as they were. Default `in` and `out`: the sequence's In and Out. One undo step.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "in":{"type":["number","string"],"description":"Timeline time the range starts; default the sequence's In"},
+            "out":{"type":["number","string"],"description":"Timeline time it ends (the first frame after it); default after the sequence's Out"},
+            "tracks":{"type":"array","items":{"type":"string"},"description":"Tracks taking part (V1, A2...); default every one"},
+            "name":{"type":"string","default":"Nested Sequence"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime in = a.contains("in") ? timeArg(a.value("in"), s, "in") : s.inPoint;
+            const FrameTime out = a.contains("out") ? timeArg(a.value("out"), s, "out") : s.outPoint >= 0 ? s.outPoint + 1 : -1;
+            if (in < 0 || out <= in) throw ArgError{"Give \"in\" and \"out\" (or mark the sequence's In and Out), out after in"};
+            std::vector<TrackRef> tracks;
+            for (const QJsonValue& v : a.value("tracks").toArray()) tracks.push_back(trackArg(v.toString(), s, false));
+            if (!a.contains("tracks")) tracks = allTracks(s);
+            if (tracks.empty()) throw ArgError{"\"tracks\" must list tracks"};
+            const std::string name = str(a, "name", "Nested Sequence").toStdString();
+            const edit::Result r = edit::nestRange(l.project, s, in, out, tracks, name);
+            check(r);
+            save(l);
+            Sequence& after = l.seq();
+            QJsonArray made;
+            for (Id id : r.created)
+                if (const Clip* c = edit::clipById(after, id)) made.append(clipJson(l.project, after, *c));
+            QJsonObject outJson = projectJson(l.project);
+            outJson["clips"] = made;
+            return ok(QStringLiteral("Nested %1 to %2 as \"%3\"").arg(tc(in, after), tc(out, after), QString::fromStdString(name)), outJson);
+        });
+
+    add("montage_replace_source", "Point clips at another bin item",
+        "Repoint several timeline clips (and the clips linked to them) at one media item: the online file, a VFX "
+        "version, a render with the grade baked in. Each keeps its place, length and effects; with by \"source_time\" "
+        "(the default) it shows the same source times of the new item, with \"timecode\" the frames whose timecode "
+        "matches what it showed (for an item whose start differs; both need timecode). All or nothing: fails naming "
+        "the clip the item does not cover. One undo step.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
+            "media":{"type":"string","description":"The media item's name or file in the project, or a file to bring in"},
+            "by":{"type":"string","enum":["source_time","timecode"],"default":"source_time"}},"required":["project","clips","media"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(Id(v.toDouble()));
+            if (ids.empty()) throw ArgError{"\"clips\" must list clip ids"};
+            const QString by = str(a, "by", "source_time");
+            if (by != QLatin1String("source_time") && by != QLatin1String("timecode")) throw ArgError{"\"by\" is source_time or timecode"};
+            const QString ref = need(a, "media");
+            Id media = 0;
+            const std::string abs = absolute(ref).toStdString();
+            for (const MediaItem& m : l.project.media)
+                if (!media && ((!m.path.empty() && m.path == abs) || m.name == ref.toStdString())) media = m.id;
+            if (!media) media = mediaFor(l.project, ref);
+            Sequence& s = l.seq();
+            const edit::Result r = edit::replaceSources(l.project, s, ids, media, by == QLatin1String("timecode"));
+            check(r);
+            save(l);
+            Sequence& after = l.seq();
+            QJsonArray clips;
+            for (Id id : r.created)
+                if (const Clip* c = edit::clipById(after, id)) clips.append(clipJson(l.project, after, *c));
+            QJsonObject out = projectJson(l.project);
+            out["clips"] = clips;
+            return ok(QStringLiteral("Repointed %1 clip(s)").arg(r.created.size()), out);
         });
 
     add("montage_strip_silence", "Strip silence",
@@ -3217,12 +3458,16 @@ void McpServer::Impl::addTools() {
         "(from and len count UTF-16 characters, newlines included): font, size, bold, italic, color and outline_color as "
         "[r, g, b] in 0..1, outline width, tracking, baseline shift (pixels up) and a variable font's axes ({\"wght\": 650}). "
         "path sets the text along a circle (radius), a wave, SVG path data from the title's position, one of the title "
-        "clip's masks (mask; add one with montage_add_effect) or a shape layer's path below it (shape: track, item), from "
+        "clip's masks (mask; add one with montage_add_effect) or a shape layer's path below it (shape: track, item), or "
+        "another clip's mask or shape path (clip: its name or id), set off by the mask's expansion and, with feather, "
+        "across its feather (-100 its inner edge, 100 its outer), from "
         "offset % along it (offset_keys animate it), aligned at its start, middle or end or spread over it, the letters "
         "at right angles to it unless perpendicular is false. axes sets a variable font's axes for the whole title; "
         "motion_blur blurs moving letters (shutter angle, samples). animations move "
         "the text a letter, word or line at a time: a range (start, end and offset in % of the text; shape) selects "
-        "units, and what it changes there (x, y, scale %, rotation, opacity %, blur, tracking, fill and outline colour) "
+        "units, and what it changes there (x, y, scale %, rotation, opacity %, blur, tracking, fill and outline colour; "
+        "a 3D title's: depth, x, y, z towards the camera, rot_x, rot_y and rotation about its middle, scale, and its face "
+        "(fill) and side colours) "
         "goes as far as it selects them; sweep runs the range across the text from the start (in_across) or to the end "
         "(out_across), or takes the whole change away (in_together) or brings it on (out_together), over sweep_seconds.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
@@ -3244,7 +3489,9 @@ void McpServer::Impl::addTools() {
                 "item":{"type":"string","description":"shape: the path item's name or id (the first path when not given)"},
                 "perpendicular":{"type":"boolean","default":true,"description":"letters stand at right angles to the path (false: upright)"},
                 "upright":{"type":"boolean"},"reverse":{"type":"boolean","description":"run the other way (inside a circle)"},
-                "data":{"type":"string","description":"custom: SVG path data, pixels from the title's position"}},"required":["shape"]},
+                "data":{"type":"string","description":"custom: SVG path data, pixels from the title's position"},
+                "clip":{"type":"string","description":"mask or shape: the clip (name or id) whose mask or shape layer it follows, not the title's own"},
+                "feather":{"type":"number","description":"mask: how far across the mask's feather (-100 inner edge, 0 middle, 100 outer)"}},"required":["shape"]},
             "animations":{"type":"array","items":{"type":"object","properties":{
                 "by":{"type":"string","enum":["letters","letters_not_spaces","words","lines"],"default":"letters"},
                 "shape":{"type":"string","enum":["square","ramp_up","ramp_down","triangle","round","smooth"],"default":"square"},
@@ -3254,7 +3501,9 @@ void McpServer::Impl::addTools() {
                 "x":{"type":"number"},"y":{"type":"number"},"scale":{"type":"number"},"rotation":{"type":"number"},"opacity":{"type":"number"},
                 "blur":{"type":"number"},"tracking":{"type":"number"},"fill":{"type":"array","items":{"type":"number"}},"fill_amount":{"type":"number"},
                 "outline_color":{"type":"array","items":{"type":"number"}},"outline_color_amount":{"type":"number"},
-                "depth":{"type":"number","description":"3d: extrusion added where it selects (pixels)"}}}},
+                "depth":{"type":"number","description":"3d: extrusion added where it selects (pixels)"},
+                "z":{"type":"number","description":"3d: moved towards the camera (pixels)"},"rot_x":{"type":"number"},"rot_y":{"type":"number"},
+                "side":{"type":"array","items":{"type":"number"},"description":"3d: the sides' colour"},"side_amount":{"type":"number"}}}},
             "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels); an animation's depth adds to it letter by letter"},
             "axes":{"type":"object","additionalProperties":{"type":"number"},"description":"A variable font's axes for the whole title ({\"wght\": 650})"},
             "motion_blur":{"type":"boolean","description":"Blur letters as they move"},
@@ -3336,6 +3585,24 @@ void McpServer::Impl::addTools() {
                 if (pa.contains("mask")) c.generator.params["path_mask"] = Param(double(std::clamp(pa.value("mask").toInt(1), 1, 64)));
                 if (pa.contains("track")) c.generator.params["path_track"] = Param(double(std::clamp(pa.value("track").toInt(0), 0, 99)));
                 if (pa.contains("item")) c.generator.strings["path_item"] = pa.value("item").toString().toStdString();
+                if (pa.contains("clip")) {
+                    if (sh != 4 && sh != 5) throw ArgError{"A path's clip is for the mask and shape paths"};
+                    const QString who = pa.value("clip").toString().trimmed();
+                    bool found = false, fits = false;
+                    for (const Track& tr : s.videoTracks)
+                        for (const Clip& k : tr.clips)
+                            if (k.name == who.toStdString() || QString::number(k.id) == who) {
+                                found = true;
+                                fits = fits || sh == 4 || (k.isGenerator() && k.generator.type == "shape");
+                            }
+                    if (who.isEmpty() || !found) throw ArgError{QStringLiteral("No clip \"%1\" for the path").arg(who)};
+                    if (!fits) throw ArgError{QStringLiteral("\"%1\" is not a shape layer").arg(who)};
+                    c.generator.strings["path_clip"] = who.toStdString();
+                }
+                if (pa.contains("feather")) {
+                    if (sh != 4 || !pa.value("feather").isDouble()) throw ArgError{"A path's feather is a number, for a mask path"};
+                    c.generator.params["path_feather"] = Param(std::clamp(pa.value("feather").toDouble(), -100.0, 100.0));
+                }
                 if (pa.contains("align")) {
                     const QStringList aligns{"as_text", "start", "middle", "end", "spread"};
                     const int al = int(aligns.indexOf(pa.value("align").toString()));
@@ -3384,17 +3651,23 @@ void McpServer::Impl::addTools() {
                              {"start", "start"}, {"end", "end"}, {"offset", "offset"}, {"ease", "ease"}, {"amount", "amount"},
                              {"sweep_seconds", "sweep_dur"}, {"random", "random"}, {"seed", "seed"}, {"x", "x"}, {"y", "y"},
                              {"scale", "scale"}, {"rotation", "rotation"}, {"opacity", "opacity"}, {"blur", "blur"},
-                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}, {"depth", "depth"}})
+                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}, {"depth", "depth"},
+                             {"z", "z"}, {"rot_x", "rot_x"}, {"rot_y", "rot_y"}, {"side_amount", "side_mix"}})
                         if (o.contains(key)) {
-                            if (std::string(name) == "depth" && type != "title3d") throw ArgError{"An animation's depth is for the 3d template"};
-                            if (type == "title3d" && std::string(name) != "depth" && std::string(" start end offset ease amount sweep_dur random seed ").find(" " + std::string(name) + " ") == std::string::npos)
-                                throw ArgError{QStringLiteral("A 3D title's animations select letters and set depth; \"%1\" is for flat titles").arg(key)};
+                            const std::string pn = " " + std::string(name) + " ";
+                            if (std::string(" depth z rot_x rot_y side_mix ").find(pn) != std::string::npos && type != "title3d")
+                                throw ArgError{QStringLiteral("An animation's %1 is for the 3d template").arg(key)};
+                            if (type == "title3d" &&
+                                std::string(" start end offset ease amount sweep_dur random seed depth x y z rot_x rot_y rotation scale fill_mix side_mix ").find(pn) == std::string::npos)
+                                throw ArgError{QStringLiteral("A 3D title's animations select letters, extrude, move, turn, scale and colour them; \"%1\" is for flat titles").arg(key)};
                             if (!o.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
                             set(name, o.value(key).toDouble());
                         }
                     if (o.value("random_order").toBool()) set("shuffle", 1);
-                    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{{"fill", "fill"}, {"outline_color", "outline_color"}})
+                    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{{"fill", "fill"}, {"outline_color", "outline_color"}, {"side", "side"}})
                         if (o.contains(key)) {
+                            if (std::string(key) == "side" && type != "title3d") throw ArgError{"An animation's side colour is for the 3d template"};
+                            if (std::string(key) == "outline_color" && type == "title3d") throw ArgError{"A 3D title's letters have no outline"};
                             const QJsonArray rgb = o.value(key).toArray();
                             if (rgb.size() != 3) throw ArgError{QStringLiteral("\"%1\" is [r, g, b] in 0..1").arg(key)};
                             for (int ch = 0; ch < 3; ++ch) set((std::string(name) + "." + "rgb"[ch]).c_str(), std::clamp(rgb[ch].toDouble(), 0.0, 1.0));
@@ -4133,8 +4406,10 @@ void McpServer::Impl::addTools() {
     add("montage_plugins", "Plug-in hosting",
         "How plug-ins are hosted, and how they have failed. Audio plug-ins (CLAP, VST3, LV2, Audio Units) and OpenFX video "
         "plug-ins run in plug-in host processes of their own, so one that crashes, hangs or uses too much memory is bypassed "
-        "(playback carries on; an export stops, naming it) and started again with its last settings. `isolation` reads or "
-        "sets the grouping: \"plugin\" (each plug-in in a host of its own, the default), \"vendor\" (one host for each maker), "
+        "(playback carries on; an export stops, naming it) and started again with its last settings; OpenFX on-screen "
+        "controls are drawn in the host too. `isolation` reads or "
+        "sets the grouping: \"plugin\" (each plug-in in a host of its own, the default), \"instance\" (each instance in a "
+        "host of its own), \"vendor\" (one host for each maker), "
         "\"shared\" (all plug-ins in one host) or \"off\" (in Montage's own process). ARA plug-ins always run in Montage's "
         "process. Also sets missed_blocks (audio blocks a host may be late with in a row before it counts as hung), bypass "
         "(\"input\" or \"silence\"), memory_limit_mb (0: none), export_timeout_s and auto_restarts (a session, for each "
@@ -4142,13 +4417,13 @@ void McpServer::Impl::addTools() {
         "memory or load; when first and last, how many times, restarts, whether it is bypassed now). `restart` starts a "
         "failed plug-in again; `disable` keeps it bypassed and turns it off in the plug-in list; `clear_failures` empties "
         "the list.",
-        R"json({"type":"object","properties":{"isolation":{"type":"string","enum":["plugin","vendor","shared","off"]},"missed_blocks":{"type":"integer","minimum":1,"maximum":1000},"bypass":{"type":"string","enum":["input","silence"]},"memory_limit_mb":{"type":"integer","minimum":0},"export_timeout_s":{"type":"number","minimum":1},"auto_restarts":{"type":"integer","minimum":0,"maximum":100},"restart":{"type":"string","description":"the plug-in id of a failure to start again"},"disable":{"type":"string","description":"the plug-in id of a failure to keep bypassed"},"clear_failures":{"type":"boolean"}}})json",
+        R"json({"type":"object","properties":{"isolation":{"type":"string","enum":["plugin","instance","vendor","shared","off"]},"missed_blocks":{"type":"integer","minimum":1,"maximum":1000},"bypass":{"type":"string","enum":["input","silence"]},"memory_limit_mb":{"type":"integer","minimum":0},"export_timeout_s":{"type":"number","minimum":1},"auto_restarts":{"type":"integer","minimum":0,"maximum":100},"restart":{"type":"string","description":"the plug-in id of a failure to start again"},"disable":{"type":"string","description":"the plug-in id of a failure to keep bypassed"},"clear_failures":{"type":"boolean"}}})json",
         false, [](const QJsonObject& a) {
             plugins::HostingSettings h = plugins::hosting();
             bool changed = false;
             if (a.contains("isolation")) {
                 const auto i = plugins::isolationFromName(str(a, "isolation").toStdString());
-                if (!i) return fail("isolation is plugin, vendor, shared or off");
+                if (!i) return fail("isolation is plugin, instance, vendor, shared or off");
                 h.isolation = *i;
                 changed = true;
             }
@@ -4199,6 +4474,7 @@ void McpServer::Impl::addTools() {
                                 {"hosts", hosts},
                                 {"failures", failures}};
             QString text = QStringLiteral("Plug-ins: %1").arg(h.isolation == plugins::Isolation::PerPlugin  ? "each in a host of its own"
+                                                              : h.isolation == plugins::Isolation::PerInstance ? "each instance in a host of its own"
                                                               : h.isolation == plugins::Isolation::PerVendor ? "one host for each maker"
                                                               : h.isolation == plugins::Isolation::Shared    ? "all in one host"
                                                                                                              : "in Montage's own process");
@@ -5770,7 +6046,11 @@ void McpServer::Impl::addTools() {
         "in one recording (Split by Onsets) and puts them on successive keys from `key`. remove clears a key. play "
         "records a pass from a list of notes (key, velocity, at, length in seconds or timecode): rendered to a WAV file "
         "beside the project, put on a new take lane and given to the comp, its notes kept. revoice renders a pass's notes "
-        "again through the slots as they are now, with the same timing.",
+        "again through the slots as they are now, with the same timing. A slot's velocity_curve (linear, soft, hard, or "
+        "drawn through velocity_points, [in, out] pairs 1-127) shapes how the force played comes out; its output (a track, "
+        "\"\" this one) records its part of each pass onto that track's own lane; clip_per_hit (play) places a pass as "
+        "one clip a note. load without files changes a slot's settings. Sounds longer than 20 seconds are streamed from "
+        "disk as they play, their first second in memory.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
             "action":{"type":"string","enum":["show","load","slice","remove","play","revoice"]},
             "key":{"type":"integer","description":"A MIDI key 0-127 (load, remove; slice: the first key)"},
@@ -5780,6 +6060,10 @@ void McpServer::Impl::addTools() {
             "name":{"type":"string"},"gain":{"type":"number","description":"dB"},"attack":{"type":"number"},"release":{"type":"number"},
             "one_shot":{"type":"boolean"},"choke":{"type":"integer","description":"0 none, 1-16"},
             "pitch_variation":{"type":"number","description":"± semitones"},"level_variation":{"type":"number","description":"± dB"},
+            "velocity_curve":{"type":"string","enum":["linear","soft","hard","drawn"]},
+            "velocity_points":{"type":"array","items":{"type":"array","items":{"type":"integer"}},"description":"drawn: [velocity in, velocity out] pairs"},
+            "output":{"type":"string","description":"The track this slot's part of a pass is recorded onto (A2...; \"\" this one)"},
+            "clip_per_hit":{"type":"boolean","description":"play: one clip a note (kept for the track's later passes)"},
             "sensitivity":{"type":"number","default":50},"min_gap":{"type":"number","default":0.05},
             "notes":{"type":"array","items":{"type":"object","properties":{"key":{"type":"integer"},"velocity":{"type":"integer","default":100},
                 "at":{"type":["number","string"]},"length":{"type":"number","default":0.1}},"required":["key","at"]}},
@@ -5796,11 +6080,11 @@ void McpServer::Impl::addTools() {
                 if (!v.isDouble() || v.toInt() < 0 || v.toInt() > 127) throw ArgError{QStringLiteral("\"key\" must be a MIDI key, 0 to 127")};
                 return v.toInt();
             };
-            auto files = [&]() {
+            auto files = [&](bool optional = false) {
                 QStringList out;
                 if (a.contains("file")) out << absolute(need(a, "file"));
                 for (const QJsonValue& v : a.value("files").toArray()) out << absolute(v.toString());
-                if (out.isEmpty()) throw ArgError{QStringLiteral("\"file\" or \"files\" is required")};
+                if (out.isEmpty() && !optional) throw ArgError{QStringLiteral("\"file\" or \"files\" is required")};
                 for (const QString& f : out)
                     if (!QFileInfo::exists(f)) throw ArgError{QStringLiteral("No file %1").arg(f)};
                 return out;
@@ -5821,6 +6105,25 @@ void McpServer::Impl::addTools() {
             };
             const Track& t0 = *trackAt(s, track);
             const QString trackName = t0.name.empty() ? QStringLiteral("A%1").arg(track.index + 1) : QString::fromStdString(t0.name);
+            // This track's passes: its own, and the parts its slots sent to other tracks (kept there with their lanes).
+            auto ownPasses = [&]() {
+                std::vector<std::pair<const SamplerPass*, const Track*>> out;
+                for (const Track& t : s.audioTracks)
+                    for (const SamplerPass& ps : t.sampler.passes)
+                        if (&t == &t0 ? !ps.track || ps.track == t0.id : ps.track == t0.id) out.push_back({&ps, &t});
+                return out;
+            };
+            static const char* const curveNames[] = {"linear", "soft", "hard", "drawn"};
+            auto points = [](const SamplerSlot& sl) {
+                QJsonArray out;
+                for (const auto& [in, o] : sl.velocityPoints) out.append(QJsonArray{in, o});
+                return out;
+            };
+            auto outputName = [&](Id id) {
+                for (size_t i = 0; i < s.audioTracks.size(); ++i)
+                    if (id && s.audioTracks[i].id == id) return QStringLiteral("A%1").arg(i + 1);
+                return QString();
+            };
             if (action == "show") {
                 QJsonArray pads, passes;
                 QString text;
@@ -5830,12 +6133,15 @@ void McpServer::Impl::addTools() {
                         sounds.append(QJsonObject{{"file", QString::fromStdString(sd.path)}, {"start", sd.start}, {"end", sd.end}, {"vel_low", sd.velLow}, {"vel_high", sd.velHigh}});
                     pads.append(QJsonObject{{"key", sl.key}, {"name", QString::fromStdString(sl.name)}, {"sounds", sounds}, {"gain", sl.gainDb},
                                              {"attack", sl.attack}, {"release", sl.release}, {"one_shot", sl.oneShot}, {"choke", sl.choke},
-                                             {"pitch_variation", sl.pitchVariation}, {"level_variation", sl.levelVariation}});
+                                             {"pitch_variation", sl.pitchVariation}, {"level_variation", sl.levelVariation},
+                                             {"velocity_curve", QString::fromLatin1(curveNames[std::clamp(sl.velocityCurve, 0, 3)])},
+                                             {"velocity_points", points(sl)}, {"output", outputName(sl.output)}});
                     text += QStringLiteral("Key %1 %2: %3 sound(s)%4\n").arg(sl.key).arg(QString::fromStdString(sl.name)).arg(sl.sounds.size())
                                 .arg(sl.choke ? QStringLiteral(", choke group %1").arg(sl.choke) : QString());
                 }
-                for (const SamplerPass& ps : t0.sampler.passes) {
-                    const TakeLane* ln = edit::findTakeLane(t0, ps.lane);
+                for (const auto& [pp, on] : ownPasses()) {
+                    const SamplerPass& ps = *pp;
+                    const TakeLane* ln = edit::findTakeLane(*on, ps.lane);
                     QJsonArray notes;
                     for (const SamplerNote& n : ps.notes)
                         notes.append(QJsonObject{{"key", n.key}, {"velocity", n.velocity}, {"at", double(n.at) / s.sampleRate}, {"length", double(n.length) / s.sampleRate}});
@@ -5851,10 +6157,38 @@ void McpServer::Impl::addTools() {
                 sl.key = key;
                 for (const SamplerSlot& e : t0.sampler.pads)
                     if (e.key == key) sl = e;
-                if (!a.value("add").toBool(false)) sl.sounds.clear();
+                // (no files: the slot's settings changed, its sounds kept)
+                const QStringList given = files(!sl.sounds.empty());
+                if (!given.isEmpty() && !a.value("add").toBool(false)) sl.sounds.clear();
                 const int lo = std::clamp(a.value("vel_low").toInt(1), 1, 127), hi = std::clamp(a.value("vel_high").toInt(127), lo, 127);
-                for (const QString& f : files())
+                for (const QString& f : given)
                     sl.sounds.push_back({f.toStdString(), std::max(0.0, a.value("start").toDouble(0)), std::max(0.0, a.value("end").toDouble(0)), lo, hi});
+                if (a.contains("velocity_curve")) {
+                    const QString c = str(a, "velocity_curve");
+                    int k = -1;
+                    for (int i = 0; i < 4; ++i)
+                        if (c == QLatin1String(curveNames[i])) k = i;
+                    if (k < 0) throw ArgError{QStringLiteral("\"velocity_curve\" is linear, soft, hard or drawn")};
+                    sl.velocityCurve = k;
+                }
+                if (a.contains("velocity_points")) {
+                    sl.velocityPoints.clear();
+                    for (const QJsonValue& v : a.value("velocity_points").toArray()) {
+                        const QJsonArray pt = v.toArray();
+                        if (pt.size() != 2) throw ArgError{QStringLiteral("Each of \"velocity_points\" is [velocity in, velocity out]")};
+                        sl.velocityPoints.push_back({std::clamp(pt[0].toInt(), 1, 127), std::clamp(pt[1].toInt(), 1, 127)});
+                    }
+                    if (!a.contains("velocity_curve")) sl.velocityCurve = 3;
+                }
+                if (a.contains("output")) {
+                    const QString o = str(a, "output");
+                    if (o.isEmpty()) sl.output = 0;
+                    else {
+                        const TrackRef to = trackArg(o, s, false);
+                        if (to.kind != TrackKind::Audio) throw ArgError{QStringLiteral("A slot's output is an audio track")};
+                        sl.output = to == track ? 0 : trackAt(s, to)->id;
+                    }
+                }
                 if (a.contains("name")) sl.name = str(a, "name").toStdString();
                 else if (sl.name.empty()) sl.name = QFileInfo(QString::fromStdString(sl.sounds.front().path)).completeBaseName().toStdString();
                 if (a.contains("gain")) sl.gainDb = std::clamp(a.value("gain").toDouble(), -96.0, 24.0);
@@ -5907,20 +6241,27 @@ void McpServer::Impl::addTools() {
                 }
                 if (notes.empty()) throw ArgError{QStringLiteral("\"notes\" is required")};
                 const uint32_t seed = uint32_t(a.value("seed").toInt(1));
+                if (a.contains("clip_per_hit")) trackAt(s, track)->sampler.clipPerHit = a.value("clip_per_hit").toBool();
                 const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
                 edit::Result r = sampler::addPass(l.project, s, track, kit(), notes, seed, file.toStdString());
                 check(r);
                 save(l);
-                const TakeLane* ln = edit::findTakeLane(*trackAt(s, track), r.created.front());
+                // (the first lane made: this track's, or the first track a slot sends to)
+                const TakeLane* ln = nullptr;
+                for (const Track& t : s.audioTracks)
+                    if (!ln) ln = edit::findTakeLane(t, r.created.front());
                 return ok(QStringLiteral("%1 note(s) recorded to lane %2 (%3)").arg(notes.size()).arg(QString::fromStdString(ln->name), file),
                           {{"lane", double(ln->id)}, {"lane_name", QString::fromStdString(ln->name)}, {"file", file}, {"start", secs(ln->start, s)}});
             }
             if (action == "revoice") {
                 const QJsonValue v = a.value("lane");
                 Id lane = 0;
-                for (const TakeLane& ln : t0.lanes)
-                    if ((v.isDouble() && ln.id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(ln.name).compare(v.toString(), Qt::CaseInsensitive) == 0))
-                        lane = ln.id;
+                // (this track's passes: their lanes here, or on the tracks its slots send to)
+                for (const auto& [ps, on] : ownPasses())
+                    if (const TakeLane* ln = edit::findTakeLane(*on, ps->lane))
+                        if ((v.isDouble() && ln->id == Id(v.toDouble())) ||
+                            (v.isString() && QString::fromStdString(ln->name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                            lane = ln->id;
                 if (!lane) throw ArgError{QStringLiteral("No such lane on that track (see action show)")};
                 const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
                 check(sampler::revoicePass(l.project, s, track, lane, kit(), file.toStdString()));
@@ -6051,7 +6392,7 @@ void McpServer::Impl::addTools() {
             "rating":{"type":"integer"},"name":{"type":"string"},"shown":{"type":"boolean"},
             "version":{"type":"string","enum":["new","switch","rename","delete"]},"index":{"type":"integer"},"empty":{"type":"boolean"},
             "line":{"type":"string","description":"suggest: the words the take should say"},
-            "group":{"type":"boolean","default":true,"description":"comp, rate and suggest act on the track's group (montage_track) when its comp switch is on; false for this track alone"},
+            "group":{"type":"boolean","default":true,"description":"comp, rate and suggest act on the track's group (montage_track) when its comp switch is on, record when its record switch is on (a channel of the file a track); false for this track alone"},
             "apply":{"type":"boolean","default":false,"description":"suggest: give the suggested take's from..to to the comp (on the group)"}},"required":["project","action"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -6144,14 +6485,34 @@ void McpServer::Impl::addTools() {
                 if (in < 0 || out <= in) return fail(QStringLiteral("record needs in and out (or the sequence's In and Out)"));
                 std::vector<bool> complete;
                 std::string err;
-                const std::vector<std::string> passes = splitLoopRecording(
-                    file.toStdString(), a.value("preroll").toDouble(0), double(out - in) / fps, s.sampleRate > 0 ? s.sampleRate : 48000,
-                    (QFileInfo(l.path).absolutePath() + QStringLiteral("/Takes")).toStdString(), QFileInfo(file).completeBaseName().toStdString() + " pass ",
-                    &complete, &err);
-                if (passes.empty()) return fail(QString::fromStdString(err));
-                std::vector<Id> media;
-                for (const std::string& f : passes) media.push_back(mediaFor(l.project, QString::fromStdString(f)));
-                r = edit::addLoopTakes(l.project, s, track, media, complete, in, out);
+                // Record arming through the track's group: every grouped track records, a channel of the file each
+                // (this track the first, the others in order), their passes recorded together.
+                std::vector<TrackRef> tracks;
+                if (grouped)
+                    for (TrackRef t : groupTracks(s, track, GroupSwitch::Record))
+                        if (t.kind == TrackKind::Audio) tracks.push_back(t);
+                if (tracks.size() < 2) tracks = {track};
+                int channels = 1;
+                if (tracks.size() > 1) {
+                    MediaItem probed;
+                    std::string why;
+                    if (!probeMedia(file.toStdString(), probed, &why)) return fail(QString::fromStdString(why));
+                    channels = std::max(1, probed.channels);
+                }
+                std::vector<std::vector<Id>> media;
+                for (size_t t = 0; t < tracks.size(); ++t) {
+                    const std::string stem = QFileInfo(file).completeBaseName().toStdString() +
+                                             (tracks.size() > 1 ? " A" + std::to_string(tracks[t].index + 1) : std::string()) + " pass ";
+                    const std::vector<std::string> passes = splitLoopRecording(
+                        file.toStdString(), a.value("preroll").toDouble(0), double(out - in) / fps, s.sampleRate > 0 ? s.sampleRate : 48000,
+                        (QFileInfo(l.path).absolutePath() + QStringLiteral("/Takes")).toStdString(), stem, &complete, &err,
+                        tracks.size() > 1 ? int(t) % channels : -1);
+                    if (passes.empty()) return fail(QString::fromStdString(err));
+                    media.emplace_back();
+                    for (const std::string& f : passes) media.back().push_back(mediaFor(l.project, QString::fromStdString(f)));
+                }
+                r = tracks.size() > 1 ? edit::addGroupLoopTakes(l.project, s, tracks, media, complete, in, out)
+                                      : edit::addLoopTakes(l.project, s, track, media.front(), complete, in, out);
             } else if (action == "comp") {
                 // On the grouped tracks too (their lanes of the same pass, over the same frames).
                 const FrameTime from = timeArg(a.value("from"), s, "from"), to = timeArg(a.value("to"), s, "to");
@@ -6289,7 +6650,7 @@ void McpServer::Impl::addTools() {
         "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones). `report` writes "
         "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's). `compare` sets a delivered "
         "file against the sequence's own render (or against `reference`, another file), aligned over ±12 frames, frame by "
-        "frame: PSNR, SSIM, MS-SSIM, ΔICtCp (BT.2124) and, where Montage is built with libvmaf, VMAF (`metrics` picks "
+        "frame: PSNR, SSIM, MS-SSIM, ΔICtCp (BT.2124) and VMAF (libvmaf's v1 model; `metrics` picks "
         "them); frames past `min_psnr`, `min_vmaf` or `max_delta_ictcp` are problems, the worst frames get orange markers "
         "with `markers`, and `report` also writes report-quality.csv and report-quality.pdf.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
@@ -6320,7 +6681,7 @@ void McpServer::Impl::addTools() {
             "reference":{"type":"string","description":"Compare against this file instead of the sequence"},
             "hrd":{"type":"string","description":"An H.264, HEVC or MPEG-2 file to check against its buffer model (H.264/H.265 Annex C HRD, MPEG-2 VBV; CBR and VBR): each underflow and overflow at the frame it falls on, and a summary line (taken as an export of the range)"},
             "metrics":{"type":"array","items":{"type":"string","enum":["psnr","ssim","ms_ssim","delta_ictcp","vmaf"]},
-                "description":"What to measure (default all but vmaf)"},
+                "description":"What to measure (default all; VMAF of HDR only where libvmaf has an HDR model)"},
             "min_psnr":{"type":"number","description":"Frames with luma PSNR under this (dB) are problems"},
             "min_vmaf":{"type":"number","description":"Frames with VMAF under this are problems"},
             "max_delta_ictcp":{"type":"number","description":"Frames whose mean ΔE_ITP is over this are problems"}},"required":["project"]})json",
@@ -6342,8 +6703,8 @@ void McpServer::Impl::addTools() {
                         if (!bit) throw ArgError{"Unknown metric " + m.toString()};
                         q.compareMetrics |= bit;
                     }
+                    if ((q.compareMetrics & MetricVmaf) && !vmafAvailable()) throw ArgError{"This Montage was built without libvmaf, so it cannot measure VMAF"};
                 }
-                if ((q.compareMetrics & MetricVmaf) && !vmafAvailable()) throw ArgError{"This Montage was built without libvmaf, so it cannot measure VMAF"};
                 q.qualityLimits.minPsnr = std::max(0.0, a.value("min_psnr").toDouble(0));
                 q.qualityLimits.minVmaf = std::max(0.0, a.value("min_vmaf").toDouble(0));
                 q.qualityLimits.maxDeltaItp = std::max(0.0, a.value("max_delta_ictcp").toDouble(0));
@@ -6434,6 +6795,7 @@ void McpServer::Impl::addTools() {
                                  num(comparison.worst.ssim, 5), num(comparison.mean.msSsim, 5), num(comparison.mean.deltaItp, 3),
                                  num(comparison.worst.deltaItp, 3));
                 if (comparison.vmafScored) text += QStringLiteral(", VMAF %1 (worst %2)").arg(num(comparison.mean.vmaf, 2), num(comparison.worst.vmaf, 2));
+                else if (!comparison.vmafNote.empty()) text += QStringLiteral(" (%1)").arg(QString::fromStdString(comparison.vmafNote));
                 text += '\n';
                 if (!comparison.worstFrames.empty()) {
                     QStringList worst;
@@ -9542,7 +9904,8 @@ void McpServer::Impl::addTools() {
         "right, e.g. \"top left\": where the captions sit, kept in every caption format) or raise_over_titles (captions "
         "shown over lower thirds and other low titles move to the top). `captions` (indices) limits shift, replace and place. Limits "
         "can be changed: max_cps, max_line_chars, max_lines, min_seconds, max_seconds, min_gap_frames. Shot changes (the "
-        "sequence's cuts and its shot-change markers; `shot_changes` adds markers at those times first, and action "
+        "sequence's cuts and its shot-change markers; `shot_changes` adds markers at those times first, each on the clip "
+        "shown there so that it moves with the clip, or on the sequence where there is none; action "
         "shot_changes lists them) are kept clear of by check and fix_timing under `profile` netflix (the default: no caption "
         "starts or ends within half a second of one, except starting on it or ending min_gap_frames before it; "
         "`shot_zone_seconds` changes the half second) or off.",
@@ -9574,19 +9937,11 @@ void McpServer::Impl::addTools() {
             if (profile != QLatin1String("netflix") && profile != QLatin1String("off")) throw ArgError{"profile is netflix or off"};
             if (profile == QLatin1String("off")) lim.shotZoneSeconds = 0;
             else if (a.contains("shot_zone_seconds")) lim.shotZoneSeconds = std::max(0.0, a.value("shot_zone_seconds").toDouble());
-            // Shot changes given: marked first (kept with the sequence).
+            // Shot changes given: marked first, each on the clip showing its picture there (so it follows the clip
+            // when that moves), or on the sequence where no clip does.
             bool marked = false;
-            for (const QJsonValue& v : a.value("shot_changes").toArray()) {
-                const FrameTime f = timeArg(v, s, "shot_changes");
-                if (std::any_of(s.markers.begin(), s.markers.end(), [f](const Marker& m) { return m.shotChange && m.t == f; })) continue;
-                Marker m;
-                m.t = f;
-                m.name = "Shot change";
-                m.shotChange = true;
-                s.markers.push_back(m);
-                marked = true;
-            }
-            if (marked) std::sort(s.markers.begin(), s.markers.end(), [](const Marker& x, const Marker& y) { return x.t < y.t; });
+            for (const QJsonValue& v : a.value("shot_changes").toArray())
+                if (markShotChange(s, timeArg(v, s, "shot_changes"))) marked = true;
             const std::vector<FrameTime> cuts = lim.shotZoneSeconds > 0 ? captionShotChanges(s) : std::vector<FrameTime>();
             std::vector<size_t> chosen;
             for (const QJsonValue& v : a.value("captions").toArray()) {
@@ -10964,6 +11319,7 @@ void McpServer::Impl::addTools() {
             "pixel_aspect":{"type":["number","string"],"description":"Pixel aspect ratio, or \"file\""},
             "alpha":{"type":"string","enum":["file","straight","premultiplied","ignore","invert"]},
             "field_order":{"type":"string","enum":["file","progressive","upper","lower"]},
+            "chroma_siting":{"type":"string","enum":["file","left","center","topleft"],"description":"Where a subsampled picture's colour samples sit: file (as the file says: untagged 4:2:2 as left, untagged 4:2:0 as center), left, center or topleft"},
             "keep_pitch":{"type":"boolean","description":"A conformed sound keeps its pitch"},
             "remove_pulldown":{"type":"string","enum":["off","auto","A","B","C","D"],"description":"29.97 or 30 frame video carrying 23.976 or 24 frame pictures with 2:3 pulldown: woven back into those frames (it then plays at 23.976 or 24, with no combed or repeated frames). auto finds the cadence from the fields, stretch by stretch (an edit made after the pulldown breaks it); A to D say which frame of the cadence the file starts on (A A, B B, B C, C D), the fields in field_order (or as the file says)"},
             "raw_exposure":{"type":"number","description":"Camera RAW, CinemaDNG, ProRes RAW and Magic Lantern Video: exposure in stops (-5 to 5)"},
@@ -11008,6 +11364,7 @@ void McpServer::Impl::addTools() {
                 if (fileOr("pixel_aspect", par)) i.par = par;
                 if (a.contains("alpha")) i.alpha = str(a, "alpha") == "file" ? "" : str(a, "alpha").toStdString();
                 if (a.contains("field_order")) i.fields = str(a, "field_order") == "file" ? "" : str(a, "field_order").toStdString();
+                if (a.contains("chroma_siting")) i.chroma = str(a, "chroma_siting") == "file" ? "" : str(a, "chroma_siting").toStdString();
                 if (a.contains("keep_pitch")) i.keepPitch = a.value("keep_pitch").toBool();
                 if (a.contains("remove_pulldown")) {
                     const QString pd = str(a, "remove_pulldown");
@@ -12500,11 +12857,16 @@ void McpServer::Impl::addTools() {
         "screen in `screens` from the facility list, encrypted to the screen's server with its projector and other "
         "devices in AuthorizedDeviceInfo, a folder and a zip for each cinema. `flm` reads Facility List Messages (Extended "
         "FLMs, SMPTE ST 430-16, or ST 430-7 FLMs) into the facility list first, every certificate chain checked; with "
-        "`flm` alone (no dkdm) it only reads them. The window must sit inside the DKDM's and each server certificate's. "
+        "`flm` alone (no dkdm) it only reads them. An FLM is read only when each chain in it goes up to a root the user "
+        "trusts, or ends in a certificate the list already holds for that cinema: `trust_roots` adds roots (a root "
+        "certificate file, or the thumbprint of a root in the FLM that the user has confirmed with its maker or the "
+        "cinema; an FLM refused names its roots' thumbprints). A cinema's changed server certificates are returned in "
+        "`changes`. The window must sit inside the DKDM's and each server certificate's. "
         "Returns the KDM files, the cinemas' zips, and the cinemas and screens read.",
         R"json({"type":"object","properties":{"dkdm":{"type":"string","description":"The DCP's DKDM (montage_export_dcp returns it)"},
             "servers":{"type":"array","items":{"type":"string"},"description":"The servers' certificate files (PEM)"},
             "flm":{"type":"array","items":{"type":"string"},"description":"FLM files to read into the facility list (kept for later bookings)"},
+            "trust_roots":{"type":"array","items":{"type":"string"},"description":"Roots to trust: root certificate files (PEM), or thumbprints (base64 SHA-1) of roots in the FLMs, confirmed by the user"},
             "screens":{"type":"array","items":{"type":"string"},"description":"Screens from the facility list: \"Cinema/Screen\", or \"Cinema\" for all its screens"},
             "from":{"type":"string","description":"ISO 8601 date and time; default now"},
             "until":{"type":"string","description":"ISO 8601 date and time; default a week after from"},
@@ -12518,10 +12880,34 @@ void McpServer::Impl::addTools() {
             if (reading || a.contains("screens")) {
                 if (!loadFacilities(facilities, &err)) return fail(QString::fromStdString(err));
             }
+            QJsonArray changed;
             if (reading) {
+                // The roots trusted: the user's, with the files and thumbprints given added.
+                std::vector<std::string> trusted, files;
+                QStringList thumbprints;
+                for (const QJsonValue& v : a.value("trust_roots").toArray()) {
+                    const QString t = v.toString().trimmed();
+                    if (QRegularExpression(QStringLiteral("^[A-Za-z0-9+/]{27}=$")).match(t).hasMatch()) thumbprints << t;
+                    else {
+                        QFile c(absolute(t));
+                        if (!c.open(QIODevice::ReadOnly)) throw ArgError{QStringLiteral("Cannot read the root certificate %1").arg(t)};
+                        files.push_back(c.readAll().toStdString());
+                    }
+                }
+                if (!files.empty() && !trustRoots(files, &err)) return fail(QString::fromStdString(err));
+                if (!loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
                 for (const QJsonValue& v : a.value("flm").toArray()) {
                     Facility f;
                     if (!readFlmFile(absolute(v.toString()).toStdString(), f, &err)) return fail(QString::fromStdString(err));
+                    // (a thumbprint given trusts the root of the FLM that has it)
+                    std::vector<std::string> confirmed;
+                    for (const std::string& root : untrustedRoots(f, facilities, trusted)) {
+                        dcp::CertificateInfo info;
+                        if (dcp::readCertificate(root, info) && thumbprints.contains(QString::fromStdString(info.thumbprint))) confirmed.push_back(root);
+                    }
+                    if (!confirmed.empty()) {
+                        if (!trustRoots(confirmed, &err) || !loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
+                    }
                     QJsonArray screens, notes;
                     for (const FacilityScreen& sc : f.screens) {
                         QJsonArray devices;
@@ -12536,11 +12922,16 @@ void McpServer::Impl::addTools() {
                     for (const std::string& n : f.notes) notes.append(QString::fromStdString(n));
                     read.append(QJsonObject{{"cinema", QString::fromStdString(f.name)}, {"id", QString::fromStdString(f.id)},
                                             {"source", QString::fromStdString(f.source)}, {"screens", screens}, {"notes", notes}});
-                    mergeFacility(facilities, std::move(f));
+                    std::vector<std::string> changes;
+                    if (!takeFlm(facilities, std::move(f), trusted, &err, nullptr, &changes))
+                        return fail(QString::fromStdString(err) + QStringLiteral(" (then pass its thumbprint in trust_roots)"));
+                    for (const std::string& c : changes) changed.append(QString::fromStdString(c));
                 }
                 if (!saveFacilities(facilities, &err)) return fail(QString::fromStdString(err));
                 if (!a.contains("dkdm"))
-                    return ok(QStringLiteral("Read %1 FLM(s) into the facility list").arg(read.size()), QJsonObject{{"cinemas", read}});
+                    return ok(QStringLiteral("Read %1 FLM(s) into the facility list").arg(read.size()) +
+                                  (changed.isEmpty() ? QString() : QStringLiteral("; %1 change(s): %2").arg(changed.size()).arg(changed.at(0).toString())),
+                              QJsonObject{{"cinemas", read}, {"changes", changed}});
             }
             KdmRequest r;
             r.dkdm = absolute(need(a, "dkdm")).toStdString();
@@ -12572,17 +12963,23 @@ void McpServer::Impl::addTools() {
             for (const std::string& z : zipped) zips.append(QString::fromStdString(z));
             QJsonObject out{{"kdms", made}, {"zips", zips}};
             if (!read.isEmpty()) out.insert("cinemas", read);
+            if (!changed.isEmpty()) out.insert("changes", changed);
             return ok(QStringLiteral("Made %1 KDM(s) in %2").arg(files.size()).arg(folder), out);
         });
 
     add("montage_export_imf", "Export an IMF master",
         "Make an IMF (Interoperable Master Format) package of the active sequence, as Netflix, Amazon, Disney+ and "
-        "broadcasters ask for: Application #2E (SMPTE ST 2067-21:2021), JPEG 2000 pictures in the IMF profiles (lossless "
+        "broadcasters ask for: Application #2E (SMPTE ST 2067-21:2026, or `edition` 2021 for the earlier identification as "
+        "before), JPEG 2000 pictures in the IMF profiles (lossless "
         "by default) as full-range RGB 4:4:4 of 10 or 12 bits in Rec.709, P3-D65 PQ, Rec.2020 PQ or Rec.2020 HLG (HDR "
         "with mastering display metadata), 24-bit 48 kHz sound in stereo, 5.1 or 7.1 DS with multichannel labels, a "
         "composition playlist with the essence descriptors, packing list with hashes and asset map, in a new folder under "
         "`folder`. The package is checked when done (as montage_verify_imf). `htj2k` codes the pictures as High-Throughput "
-        "JPEG 2000 instead (ST 2067-21:2023, lossless), far faster to code and decode. Versions: `sounds` makes a sound "
+        "JPEG 2000 instead (ST 2067-21:2023, lossless), far faster to code and decode; the 2026 edition takes pictures to "
+        "8192 x 6224 (`size` 8k: 7680 x 4320) in its 8K profiles. With it the sequence's markers (`events`, on by default; "
+        "Application #2E to the 2026 edition only) go in as event-based metadata (ST 2067-206: a Simple Scheme timed events track related to "
+        "the picture), each with its frame, duration, name, comment, colour and kind, and come back as markers when the "
+        "package is imported; a supplemental carries only the events that changed. Versions: `sounds` makes a sound "
         "track per language and kind (each mixed from the roles it hears), the caption tracks become IMSC 1.1 subtitles, "
         "captions or forced narratives (`texts`), and `supplement_of` (an earlier package's folder) makes a supplemental "
         "package carrying only what changed since it: the composition plays the earlier package's track files where the "
@@ -12599,13 +12996,15 @@ void McpServer::Impl::addTools() {
         "4444 as Y'CbCr 4:4:4 (to 1920 x 1080, Rec.709) and `full_range` codes 4:4:4 R'G'B' over the full range (QE.2). "
         "`application` \"dpp_prores\" makes a broadcaster's master (Application DPP (ProRes), SMPTE RDD 59-1, as UK and "
         "North American broadcasters ask for it): 422 HQ at 1920 x 1080 or 3840 x 2160 (`size` hd or uhd), progressive, Rec.709, Rec.2020 PQ or "
-        "HLG, with the DPP's identification and content kind (`kind` programme by default: programme, commercial, "
+        "HLG (4444 and 4444 XQ at 12 bits in Rec.2020 PQ or HLG only), with the DPP's identification and content kind (`kind` programme by default: programme, commercial, "
         "sponsorship, infomercial, presentation_event, promotion or music_video). Its 4:4:4 is 12 bits, which FFmpeg's "
         "ProRes encoder does not make, and RDD 45 takes no alpha, so neither is offered.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test","programme","commercial","sponsorship","infomercial","presentation_event","music_video"],"description":"Default feature (dpp_prores: programme; the last six are Application DPP's only)"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
-            "size":{"type":"string","enum":["sequence","hd","uhd","4k"],"default":"sequence"},
+            "size":{"type":"string","enum":["sequence","hd","uhd","4k","8k"],"default":"sequence","description":"8k (7680 x 4320): Application #2E to the 2026 edition"},
+            "edition":{"type":"integer","enum":[2026,2021],"default":2026,"description":"Application #2E: ST 2067-21:2026's identification (8K, timed events), or the 2021 one, the package as before (a supplemental keeps the earlier package's)"},
+            "events":{"type":"boolean","default":true,"description":"The sequence's markers as ST 2067-206 timed events (Application #2E to the 2026 edition)"},
             "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
             "lossless":{"type":"boolean","default":true},"htj2k":{"type":"boolean","default":false},"megabits_per_second":{"type":"number","minimum":20,"maximum":6400,"description":"Lossy: the cap (default 400)"},
             "mastering_peak":{"type":"number","minimum":100,"maximum":10000,"description":"HDR: the mastering display's peak, cd/m^2"},
@@ -12621,8 +13020,9 @@ void McpServer::Impl::addTools() {
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
             "application":{"enum":[2,5,"prores","dpp_prores"],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master; \"prores\": Application ProRes (RDD 45); \"dpp_prores\": Application DPP (ProRes, RDD 59-1)"},
-            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's; DPP: hq)"},
-            "fields":{"type":"string","enum":["progressive","tff","bff"],"default":"progressive","description":"Application ProRes: two fields a picture, the top (tff) or the bottom (bff) first"},
+            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's; DPP: hq at 10 bits, or 4444 or 4444xq at 12)"},
+            "fields":{"type":"string","enum":["progressive","tff","bff"],"default":"progressive","description":"Application ProRes: two fields a picture, the top (tff) or the bottom (bff) first, each rendered at its own moment"},
+            "segmented_fields":{"type":"boolean","default":false,"description":"With fields: both fields the halves of one picture (PsF), as a progressive programme delivered interlaced"},
             "ycbcr444":{"type":"boolean","default":false,"description":"Application ProRes: 4444 described as Y'CbCr 4:4:4, not R'G'B'"},
             "full_range":{"type":"boolean","default":false,"description":"Application ProRes: 4:4:4 R'G'B' over the full range (QE.2)"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
@@ -12677,6 +13077,9 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(sq.name) == name) st.originalSequence = sq.id;
                 if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
             }
+            st.edition = a.contains("edition") && !a.value("edition").isDouble() ? 0 : a.value("edition").toInt(2026);
+            if (st.edition != 2026 && st.edition != 2021) throw ArgError{"\"edition\" is 2026 or 2021"};
+            st.events = a.value("events").toBool(true);
             if (a.value("application").isString()) {
                 const QString app = a.value("application").toString();
                 if (app != "prores" && app != "dpp_prores") throw ArgError{"\"application\" is 2, 5, \"prores\" or \"dpp_prores\""};
@@ -12689,6 +13092,7 @@ void McpServer::Impl::addTools() {
             const QString fields = str(a, "fields", "progressive");
             if (fields != "progressive" && fields != "tff" && fields != "bff") throw ArgError{"\"fields\" is progressive, tff or bff"};
             st.fields = fields == "progressive" ? std::string() : fields.toStdString();
+            st.segmentedFields = a.value("segmented_fields").toBool();
             st.ycbcr444 = a.value("ycbcr444").toBool();
             st.fullRange = a.value("full_range").toBool();
             st.graded = a.value("graded").toBool(true);
@@ -12725,7 +13129,9 @@ void McpServer::Impl::addTools() {
                                   {"width", r.width}, {"height", r.height}, {"bits", r.bits}, {"channels", r.channels},
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
-                                  {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
+                                  {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application},
+                                  {"events", r.events}, {"new_events", r.newEvents}};
+            if (r.application == 2) out["edition"] = r.edition;
             if (r.application == 45 || r.application == 59) {
                 out["application"] = r.application == 45 ? "prores" : "dpp_prores";
                 out["prores_profile"] = QString::fromStdString(r.prores);
@@ -12751,7 +13157,8 @@ void McpServer::Impl::addTools() {
         "Check an IMF package folder: asset map, every file present at its size, packing list hashes, each composition's "
         "resources in the package with their essence descriptors and durations, the Application #2E or #5 identification, "
         "picture track files JPEG 2000 in an IMF profile (or ACES OpenEXR images, with their target frames) with the right number of frames, sound 24-bit 48 kHz with the "
-        "right number of samples, timed text that reads. A supplemental package's track files from earlier packages are "
+        "right number of samples, timed text that reads, timed events (ST 2067-206) as a Simple Scheme document with its "
+        "parameter set, Application #2E's sizes and profiles by its edition. A supplemental package's track files from earlier packages are "
         "looked for in the folders beside it. Returns the problems found (none: it passed).",
         R"json({"type":"object","properties":{"folder":{"type":"string"}},"required":["folder"]})json", true, [](const QJsonObject& a) {
             const QString folder = absolute(need(a, "folder"));
@@ -12853,7 +13260,8 @@ void McpServer::Impl::addTools() {
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
             "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
-            "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first (each picture as both fields: PsF), as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes"},
+            "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first, as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes; each field rendered at its own moment"},
+            "segmented_fields":{"type":"boolean","default":false,"description":"With interlaced: both fields the halves of one picture (PsF), as a progressive programme delivered interlaced"},
             "rate_change":{"type":"string","enum":["none","pulldown","speed","convert"],"default":"none","description":"Deliver at another frame rate: pulldown (a 23.976 or 24 sequence with 2:3 or 2:2:2:4 pulldown, into fields at 29.97 or 30, coded interlaced: MPEG-2, AVC-Intra or H.264, ProRes, FFV1; or as repeated frames at 59.94 or 60); speed (each frame shown once at frame_rate, the programme faster or slower, as PAL's 25 from 24 is 4 % shorter, its sound sped with it, captions and markers with it); convert (a standards conversion to frame_rate, keeping its length: each new frame made from the two nearest by optical flow, or RIFE where installed, never blended across a cut)"},
             "frame_rate":{"type":["number","string"],"description":"With rate_change: the rate delivered (23.976, 24, 25, 29.97, 30, 50, 59.94, 60...); pulldown's default is 29.97 (30 from 24)"},
             "pulldown_cadence":{"type":"string","enum":["2:3","2:2:2:4"],"default":"2:3","description":"With pulldown: 2:3 (A A, B B, B C, C D, D D) or 2:2:2:4 (no frame of mixed fields)"},
@@ -12873,7 +13281,10 @@ void McpServer::Impl::addTools() {
             "jxl_depth":{"type":"string","enum":["8","16","half","float"],"description":"JPEG XL preset: the frames' samples (default 16-bit, half floats in linear light)"},
             "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL preset: 0 lossless, else libjxl's distance (1 visually lossless)"},
             "jxl_premultiplied":{"type":"boolean","default":false,"description":"JPEG XL preset with alpha: written premultiplied rather than straight (libjxl 0.9 or later)"},
-            "video_codec":{"type":"string","enum":["av2"],"description":"av2: AV2 instead of the preset's video, coded by AVM (builds made with AV2 only), in the container the output's extension names: .ivf, .obu (a bare OBU stream) or else MP4 by AV2's ISO BMFF binding, a working draft. MP4 keeps the preset's sound as AAC; IVF and OBU have none"},
+            "video_codec":{"type":"string","enum":["av2","jpeg_xs"],"description":"av2: AV2 instead of the preset's video, coded by AVM (builds made with AV2 only), in the container the output's extension names: .ivf, .obu (a bare OBU stream) or else MP4 by AV2's ISO BMFF binding, a working draft. MP4 keeps the preset's sound as AAC; IVF and OBU have none. jpeg_xs: JPEG XS through SVT-JPEG-XS, in MXF (ST 2124) with 24-bit PCM sound when the output ends .mxf, else a raw codestream file without sound"},
+            "jpeg_xs_bpp":{"type":"number","minimum":0.5,"maximum":24,"default":5,"description":"JPEG XS: bits a pixel, a constant number of bytes each picture (3 to 8 for most mezzanine work)"},
+            "jpeg_xs_sampling":{"type":"string","enum":["422","444","rgb"],"default":"422","description":"JPEG XS: 4:2:2 or 4:4:4 Y'CbCr, or R'G'B' (the preset's when it is a JPEG XS preset)"},
+            "jpeg_xs_depth":{"type":"integer","enum":[8,10,12],"default":10,"description":"JPEG XS: bits a sample"},
             "av2_speed":{"type":"integer","minimum":0,"maximum":6,"default":6,"description":"AV2: AVM's speed preset, 0 slowest (smallest) to 6 fastest"},
             "av2_quality":{"type":"integer","minimum":0,"maximum":63,"default":32,"description":"AV2 without a bitrate: the quantiser, 0 (best) to 63"},
             "av2_10bit":{"type":"boolean","default":false,"description":"AV2: 10 bits (always for HDR)"},
@@ -12883,6 +13294,8 @@ void McpServer::Impl::addTools() {
                 "codec":{"type":"string","enum":["libx264","libx265","libsvtav1"],"default":"libx264","description":"The default ladder's codec"},
                 "segment_seconds":{"type":"number","minimum":2,"maximum":6,"default":4},
                 "cut_aligned":{"type":"boolean","default":false,"description":"Segments end at the cut nearest each nominal end"},
+                "per_shot":{"type":"boolean","default":false,"description":"Rungs set per shot: each shot (from the cuts and shot changes) starts a segment, is tried at several CRFs on each rung and scored by VMAF, and gets the CRF that reaches vmaf_target for the fewest bits (or, with no target, that spends the rung's bitrate best); each rung's bitrate is then its cap. Writes ladder.csv"},
+                "vmaf_target":{"type":"number","minimum":0,"maximum":100,"description":"With per_shot: the VMAF each shot is to reach on each rung (default none: fill each rung's bitrate)"},
                 "hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
                 "iframe_playlists":{"type":"boolean","default":true},
                 "cue":{"type":"string","enum":["splice_insert","time_signal"],"default":"splice_insert"},
@@ -12902,7 +13315,17 @@ void McpServer::Impl::addTools() {
                     "part_seconds":{"type":"number","minimum":0.1,"maximum":1,"default":0.5},
                     "serve":{"type":"boolean","default":false,"description":"Serve the package over HTTP while it records (blocking playlist reloads, growing segments sent as they grow)"},
                     "port":{"type":"integer","minimum":0,"maximum":65535,"default":0,"description":"serve: the port (0 any free one)"},
-                    "address":{"type":"string","enum":["127.0.0.1","0.0.0.0"],"default":"127.0.0.1","description":"serve: this computer only, or the network's"}},
+                    "address":{"type":"string","enum":["127.0.0.1","0.0.0.0"],"default":"127.0.0.1","description":"serve: this computer only, or the network's"},
+                    "languages":{"type":["boolean","array"],"items":{"type":"string"},"description":"Every sound stream of the feed packaged, each a rendition (an adaptation set) in its language: true for the languages the feed states, or each stream's language in order (\"\" the feed's own), as RFC 5646 or ISO 639-2 codes. Left out: the main sound only"},
+                    "captions":{"type":"string","enum":["auto","always","none"],"default":"auto","description":"The feed's CEA-608/708 captions as live WebVTT (HLS) and IMSC 1 (DASH): auto when the feed carries them, always listed, or none"},
+                    "caption_language":{"type":"string","default":"en"},
+                    "caption_name":{"type":"string","description":"The caption rendition's name (default the language's)"},
+                    "feed_cues":{"type":"boolean","default":true,"description":"The feed's SCTE 35 cues (an MPEG transport stream's) placed as EXT-X-DATERANGE and DASH events on a keyframe at their splice"},
+                    "cues":{"type":"array","description":"Ad breaks placed while it records, each on a keyframe made there: a splice_insert (or time_signal, streaming.cue) as EXT-X-DATERANGE and a DASH event","items":{"type":"object","properties":{
+                        "at":{"type":"number","minimum":0,"description":"Seconds into the recording"},
+                        "duration":{"type":"number","minimum":0,"default":0,"description":"The break's length (0 not known)"}},"required":["at"]}},
+                    "chapters":{"type":"array","description":"Chapters (each to the next), as the package's chapters.vtt","items":{"type":"object","properties":{
+                        "at":{"type":"number","minimum":0,"description":"Seconds into the recording"},"title":{"type":"string"}},"required":["at","title"]}}},
                     "required":["url","seconds"]}}},
             "bitrate":{"type":"integer","minimum":0,"description":"The video's bitrate in bits a second, for codecs that take one (H.264, H.265, AV1...); 0 or left out: by quality"},
             "hrd":{"type":"string","enum":["","cbr","vbr"],"default":"","description":"H.264 and H.265 (x264, x265): state a hypothetical reference decoder, as broadcast ingest checks it: cbr (a constant rate at bitrate, else vbv_maxrate, filler where the pictures need less) or vbr (no more than vbv_maxrate). The file is checked against it after rendering (the result's hrd)"},
@@ -12962,6 +13385,7 @@ void McpServer::Impl::addTools() {
             if (st.twoPass && ((st.videoCodec != "libx264" && st.videoCodec != "libx265") || st.videoBitrate <= 0))
                 throw ArgError{"\"two_pass\" is for H.264 and H.265 (software) with a \"bitrate\""};
             st.interlaced = a.value("interlaced").toBool(st.interlaced);
+            st.segmentedFields = a.value("segmented_fields").toBool(st.segmentedFields);
             if (a.contains("mxf_delivery")) {
                 const std::string d = str(a, "mxf_delivery").toStdString();
                 if (d != "op1a" && d != "rdd9" && d != "as11-dpp" && d != "as11-x2" && d != "as11-x8")
@@ -13004,8 +13428,36 @@ void McpServer::Impl::addTools() {
                 st.jxlDistance = std::clamp(a.value("jxl_distance").toDouble(0), 0.0, 25.0);
                 st.jxlPremultiplied = a.value("jxl_premultiplied").toBool();
             }
-            if (a.contains("video_codec")) {
-                if (str(a, "video_codec") != "av2") throw ArgError{"\"video_codec\" is av2"};
+            if (a.contains("video_codec") && str(a, "video_codec") == "jpeg_xs") {
+                if (!jpegXsAvailable()) throw ArgError{"This build of Montage writes no JPEG XS (SVT-JPEG-XS)"};
+                const bool wasXs = st.videoCodec == "jpegxs";
+                st.videoCodec = "jpegxs";
+                if (!wasXs) st.pixFmt = "yuv422p10le";
+                st.profile.clear();
+                st.alpha = false;
+                st.chapters = false;
+                st.monoAudioTracks = 0;
+                if (st.audioCodec != "none") st.audioCodec = "pcm_s24le";
+                st.format.clear();
+            }
+            if (a.contains("jpeg_xs_bpp") || a.contains("jpeg_xs_sampling") || a.contains("jpeg_xs_depth")) {
+                if (st.videoCodec != "jpegxs") throw ArgError{"\"jpeg_xs_bpp\", \"jpeg_xs_sampling\" and \"jpeg_xs_depth\" are for JPEG XS (\"video_codec\": \"jpeg_xs\")"};
+                if (a.contains("jpeg_xs_bpp")) {
+                    st.jpegXsBpp = a.value("jpeg_xs_bpp").toDouble();
+                    if (!(st.jpegXsBpp >= 0.5 && st.jpegXsBpp <= 24)) throw ArgError{"\"jpeg_xs_bpp\" is 0.5 to 24 bits a pixel"};
+                }
+                const QString cur = QString::fromStdString(st.pixFmt);
+                QString sampling = cur.startsWith("gbrp") ? "rgb" : cur.startsWith("yuv444") ? "444" : "422";
+                int depth = cur.endsWith("12le") ? 12 : cur.endsWith("10le") ? 10 : cur.isEmpty() ? 10 : 8;
+                if (a.contains("jpeg_xs_sampling")) sampling = str(a, "jpeg_xs_sampling");
+                if (a.contains("jpeg_xs_depth")) depth = a.value("jpeg_xs_depth").toInt();
+                if (sampling != "422" && sampling != "444" && sampling != "rgb") throw ArgError{"\"jpeg_xs_sampling\" is 422, 444 or rgb"};
+                if (depth != 8 && depth != 10 && depth != 12) throw ArgError{"\"jpeg_xs_depth\" is 8, 10 or 12"};
+                st.pixFmt = (sampling == "rgb" ? "gbrp" : sampling == "444" ? "yuv444p" : "yuv422p") + (depth == 8 ? std::string() : std::to_string(depth) + "le");
+            }
+            if (st.videoCodec == "jpegxs" && jxsContainerForPath(st.path) != JxsContainer::Mxf) st.audioCodec = "none";
+            if (a.contains("video_codec") && str(a, "video_codec") != "jpeg_xs") {
+                if (str(a, "video_codec") != "av2") throw ArgError{"\"video_codec\" is av2 or jpeg_xs"};
                 if (!av2EncoderAvailable()) throw ArgError{"This build of Montage writes no AV2 (AVM)"};
                 st.videoCodec = "av2";
                 st.preset = std::to_string(std::clamp(a.value("av2_speed").toInt(6), 0, 6));
@@ -13163,6 +13615,10 @@ void McpServer::Impl::addTools() {
                 ss.segmentSeconds = so.value("segment_seconds").toDouble(4);
                 if (ss.segmentSeconds < 2 || ss.segmentSeconds > 6) throw ArgError{"\"segment_seconds\" is 2 to 6"};
                 ss.cutAligned = so.value("cut_aligned").toBool();
+                ss.perShot = so.value("per_shot").toBool();
+                ss.vmafTarget = so.value("vmaf_target").toDouble(0);
+                if (so.contains("vmaf_target") && !ss.perShot) throw ArgError{"\"vmaf_target\" is for per_shot"};
+                if (!(ss.vmafTarget >= 0 && ss.vmafTarget <= 100)) throw ArgError{"\"vmaf_target\" is 0 to 100"};
                 ss.hls = so.value("hls").toBool(true), ss.dash = so.value("dash").toBool(true);
                 ss.iframePlaylists = so.value("iframe_playlists").toBool(true);
                 ss.cueCommand = str(so, "cue", "splice_insert").toStdString();
@@ -13203,6 +13659,20 @@ void McpServer::Impl::addTools() {
                 if (!res.hls.empty()) o["hls"] = QString::fromStdString(res.hls), text += QStringLiteral("\nHLS: %1").arg(QString::fromStdString(res.hls));
                 if (!res.dash.empty()) o["dash"] = QString::fromStdString(res.dash), text += QStringLiteral("\nDASH: %1").arg(QString::fromStdString(res.dash));
                 if (!res.breaks.empty()) text += QStringLiteral("\n%1 ad break(s) as SCTE 35 cues").arg(res.breaks.size());
+                if (!res.perShot.empty()) {
+                    // (each rung's shots: CRF, rate and VMAF as delivered)
+                    QJsonArray rungs;
+                    for (const StreamingRungShots& rs : res.perShot) {
+                        QJsonArray shots;
+                        for (const StreamingShot& sh : rs.shots)
+                            shots.append(QJsonObject{{"from", tc(sh.first + std::max<FrameTime>(0, ss.in), s)}, {"frames", double(sh.end - sh.first)},
+                                                     {"crf", sh.crf}, {"bitrate", double(sh.bitrate)}, {"vmaf", sh.vmaf}});
+                        rungs.append(QJsonObject{{"rendition", QString::fromStdString(rs.rendition)}, {"bitrate", double(rs.bitrate)}, {"vmaf", rs.vmaf}, {"shots", shots}});
+                        text += QStringLiteral("\n%1: %2 kb/s, VMAF %3 over %4 shots").arg(QString::fromStdString(rs.rendition)).arg(rs.bitrate / 1000).arg(rs.vmaf, 0, 'f', 1).arg(rs.shots.size());
+                    }
+                    o["per_shot"] = rungs;
+                    o["ladder_report"] = QString::fromStdString(res.ladderReport);
+                }
                 for (const std::string& w : res.warnings) text += QStringLiteral("\n") + QString::fromStdString(w);
                 return ok(text, o);
             }

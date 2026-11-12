@@ -44,6 +44,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QComboBox>
+#include <QRadioButton>
 #include <QEventLoop>
 #include <QFontDatabase>
 #include <QFormLayout>
@@ -178,6 +179,7 @@ extern "C" {
 #include "render/TrimPasses.h"
 #include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
+#include "DialogJobs.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
 #include "render/BackgroundJobs.h"
@@ -265,7 +267,9 @@ extern "C" {
 #include "media/Sofa.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
+#include "render/EncodeCompare.h"
 #include "render/Exporter.h"
+#include "media/FieldRecorder.h"
 #include "render/StreamingPackage.h"
 #include "render/Processing.h"
 #include "render/FrameRepair.h"
@@ -350,6 +354,18 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(state_, &EditorState::sourceChanged, this, &MainWindow::rebuildSourceProject);
     connect(state_, &EditorState::historyChanged, this, &MainWindow::updateActions);
     connect(state_, &EditorState::selectionChanged, this, &MainWindow::updateActions);
+    // Clicking another clip ends Trim mode (its edit points remembered for Reselect Last Edit Points).
+    connect(state_, &EditorState::selectionChanged, this, [this] {
+        if (!trimEdit_ || trimShuttle_ || !state_->sequence()) return;
+        // (the clips either side of the edit, and those linked to them, are not another clip)
+        std::vector<Id> own = trimSelection_;
+        for (Id id : edit::expandLinks(*state_->sequence(), {trimEdit_->outgoing, trimEdit_->incoming})) own.push_back(id);
+        for (Id id : state_->selectedClips())
+            if (std::find(own.begin(), own.end(), id) == own.end()) {
+                endTrimMode();
+                return;
+            }
+    });
     connect(state_, &EditorState::fileStateChanged, this, &MainWindow::updateTitle);
     connect(state_, &EditorState::statusMessage, this, [this](const QString& text, int ms) {
         statusBar()->showMessage(text, ms);
@@ -611,6 +627,11 @@ void MainWindow::buildPanels() {
     surface_->setCommand(QStringLiteral("monitorMute"), [this] { monitoring_->toggleMute(); });
     surface_->setCommand(QStringLiteral("talkbackOn"), [this] { program_->setTalkback(program_->monitoring().cue.on); });
     surface_->setCommand(QStringLiteral("talkbackOff"), [this] { program_->setTalkback(false); });
+    // (F5 and F6: a live package's ad break and chapter)
+    for (const char* name : {"liveAdBreak", "liveChapter"})
+        surface_->setCommand(QString::fromLatin1(name), [this, name] {
+            if (QAction* a = findChild<QAction*>(QString::fromLatin1(name))) a->trigger();
+        });
     osc_->setFeedbackPort(quint16(appSettings().value(QStringLiteral("osc/feedbackPort"), 0).toInt()));
     osc_->setToolsAllowed(appSettings().value(QStringLiteral("osc/tools"), false).toBool());
     if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool()) {
@@ -792,6 +813,14 @@ void MainWindow::buildPanels() {
         if (!folder.isEmpty()) queueTrimPasses(folder);
     });
     queue_ = new RenderQueue(this, jobs::storeFolder());  // (kept on disk: after a restart or a crash its jobs go on)
+    // The dialogs' jobs are kept there too: a consolidation cut short by a crash is taken up again now, in the
+    // background, and says so when it is done.
+    dialogJobs_ = new DialogJobs(this, jobs::storeFolder());
+    connect(dialogJobs_, &DialogJobs::resumed, this, [this](const QString& title) {
+        statusBar()->showMessage(tr("Taking up again what Montage was doing when it stopped: %1").arg(title), 8000);
+    });
+    connect(dialogJobs_, &DialogJobs::finished, this, [this](const QString&, bool, const QString& text) { statusBar()->showMessage(text, 10000); });
+    dialogJobs_->resume();
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     production_ = new ProductionPanel(state_, this);
     productionDock_ = makeDock(tr("Production"), "production", production_);
@@ -866,7 +895,7 @@ void MainWindow::buildPanels() {
     }
     // 1–9 cut to an angle of the bank of nine they reach (live while playing); Shift cuts at the playhead when stopped;
     // Alt+1–9 picks the bank (angles 1–9, 10–18, 19–27...).
-    std::vector<QShortcut*> banks;
+    std::vector<QPointer<QShortcut>> banks;  // (guarded: focus moves while the window's children are being deleted)
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
         connect(sw, &QShortcut::activated, this, [this, i] { multicam_->switchKey(i, false); });
@@ -882,7 +911,8 @@ void MainWindow::buildPanels() {
     connect(qApp, &QApplication::focusChanged, this, [this, banks](QWidget*, QWidget* now) {
         const bool typing = qobject_cast<QLineEdit*>(now) || qobject_cast<QTextEdit*>(now) || qobject_cast<QPlainTextEdit*>(now) ||
                             qobject_cast<QAbstractSpinBox*>(now) || qobject_cast<QKeySequenceEdit*>(now);
-        for (QShortcut* b : banks) b->setEnabled(!typing && !keymap::conflict(this, b->key()));
+        if (std::any_of(banks.begin(), banks.end(), [](const QPointer<QShortcut>& b) { return b.isNull(); })) return;  // (closing)
+        for (const QPointer<QShortcut>& b : banks) b->setEnabled(!typing && !keymap::conflict(this, b->key()));
     });
     // In the Colour workspace the numeric keypad sets printer lights, as on a timer's console: 7, 8, 9 add a point of
     // red, green or blue, 4, 5, 6 take one away, + and - move all three. Elsewhere its keys do what they did: digits cut
@@ -1419,6 +1449,16 @@ void MainWindow::buildMenus() {
         d->raise();
         d->activateWindow();
     })->setObjectName(QStringLiteral("capture"));
+    // While File > Capture packages its feed live: an ad break (the dialog's length) or a chapter from the next
+    // picture, from a key, OSC's /montage/command/file/... or a control surface's F5 and F6.
+    for (const bool cue : {true, false})
+        add(file, cue ? Name(QT_TR_NOOP("Live Ad &Break")) : Name(QT_TR_NOOP("Live C&hapter")), QKeySequence(), [this, cue] {
+            QString why;
+            if (!(capture_ && (cue ? capture_->liveCue(-1, &why) : capture_->liveChapter(QString(), &why))))
+                statusBar()->showMessage(why.isEmpty() ? tr("No live package is being made") : why, 4000);
+            else
+                statusBar()->showMessage(cue ? tr("Ad break placed") : tr("Chapter placed"), 2000);
+        })->setObjectName(cue ? QStringLiteral("liveAdBreak") : QStringLiteral("liveChapter"));
     add(file, QT_TR_NOOP("&Multiviewer…"), QKeySequence(), [this] {
         Multiviewer* m = multiviewer();
         m->show();
@@ -1646,6 +1686,16 @@ void MainWindow::buildMenus() {
         if (!ok || name.isEmpty()) return;
         state_->apply(tr("Nest"), [sel, name](Project& p, Sequence& s) { return edit::makeCompound(p, s, sel, name.toStdString()); });
     });
+    add(clipM, QT_TR_NOOP("Nest In to Out…"), QKeySequence(), [this] {
+        const Sequence* s = state_->sequence();
+        if (!s || s->inPoint < 0 || s->outPoint < 0) {
+            state_->message(tr("Mark In and Out on the timeline first"));
+            return;
+        }
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("Nest In to Out"), tr("Compound clip name:"), QLineEdit::Normal, tr("Nested Sequence"), &ok);
+        if (ok && !name.isEmpty()) nestInToOut(name);
+    })->setObjectName(QStringLiteral("nestInToOut"));
     add(clipM, QT_TR_NOOP("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
     add(clipM, QT_TR_NOOP("Export &LUT from Grade…"), QKeySequence(), [this] {
         if (!clipForCommand()) {
@@ -2103,6 +2153,17 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("previousVfxVersion"));
     add(clipM, QT_TR_NOOP("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
         ->setObjectName(QStringLiteral("replaceWithSource"));
+    add(clipM, QT_TR_NOOP("Replace Source of Selected…"), QKeySequence(), [this] {
+        if (QDialog* d = replaceSourceDialog()) d->open();
+    })->setObjectName(QStringLiteral("replaceSourceOfSelected"));
+    add(clipM, QT_TR_NOOP("Extract Sound to Files…"), QKeySequence(), [this] {
+        if (state_->selectedClips().empty()) {
+            state_->message(tr("Select the clips whose sound to write out"));
+            return;
+        }
+        const QString folder = QFileDialog::getExistingDirectory(this, tr("Extract Sound to Files"));
+        if (!folder.isEmpty()) extractSoundToFiles(folder);
+    })->setObjectName(QStringLiteral("extractSound"));
     add(clipM, QT_TR_NOOP("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
     add(clipM, QT_TR_NOOP("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
     add(clipM, QT_TR_NOOP("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
@@ -2400,6 +2461,8 @@ void MainWindow::buildMenus() {
     seqM->addSeparator();
     add(seqM, QT_TR_NOOP("Select Nearest Edit (Trim Mode)"), QKeySequence("Shift+T"), [this] { selectNearestEdit(); })->setObjectName(QStringLiteral("selectEdit"));
     add(seqM, QT_TR_NOOP("Cycle Trim Side"), QKeySequence("Alt+T"), [this] { cycleTrimSide(); })->setObjectName(QStringLiteral("cycleTrimSide"));
+    add(seqM, QT_TR_NOOP("Reselect Last Edit Points"), QKeySequence("Alt+Shift+T"), [this] { reselectLastEditPoints(); })
+        ->setObjectName(QStringLiteral("reselectEditPoints"));
     add(seqM, QT_TR_NOOP("Extend Edit"), QKeySequence("E"), [this] { extendEdit(); })->setObjectName(QStringLiteral("extendEdit"));
     add(seqM, QT_TR_NOOP("Trim Backward"), QKeySequence("Ctrl+Left"), [this] { trimSelectedEdit(-1); })->setObjectName(QStringLiteral("trimBackward"));
     add(seqM, QT_TR_NOOP("Trim Forward"), QKeySequence("Ctrl+Right"), [this] { trimSelectedEdit(1); })->setObjectName(QStringLiteral("trimForward"));
@@ -4656,7 +4719,7 @@ bool MainWindow::selectNearestEdit() {
         if (c.start == best) e.incoming = c.id;
     }
     e.side = e.outgoing && e.incoming ? 0 : e.outgoing ? 1 : 2;
-    trimEdit_ = e;
+    selectTrimEdit(e);
     state_->setPlayhead(best);
     showTrimEdit();
     return true;
@@ -4810,9 +4873,50 @@ bool MainWindow::stopTrimShuttle(bool keep) {
     return true;
 }
 
+namespace {
+bool sameEdit(const MainWindow::TrimEdit& a, const MainWindow::TrimEdit& b) { return a.outgoing == b.outgoing && a.incoming == b.incoming; }
+}  // namespace
+
+void MainWindow::rememberTrimEdit(const TrimEdit& e) {
+    // Once each, the latest last.
+    trimHistory_.erase(std::remove_if(trimHistory_.begin(), trimHistory_.end(), [&](const TrimEdit& o) { return sameEdit(o, e); }),
+                       trimHistory_.end());
+    trimHistory_.push_back(e);
+    if (trimHistory_.size() > 32) trimHistory_.erase(trimHistory_.begin());
+}
+
+void MainWindow::selectTrimEdit(const TrimEdit& e) {
+    if (trimEdit_ && !sameEdit(*trimEdit_, e)) rememberTrimEdit(*trimEdit_);
+    trimEdit_ = e;
+    trimSelection_ = state_->selectedClips();
+}
+
+bool MainWindow::reselectLastEditPoints() {
+    const Sequence* s = state_->sequence();
+    // Its clips still there, and a roll's still meeting.
+    auto usable = [&](const TrimEdit& e) {
+        const Clip* out = s && e.outgoing ? edit::clipById(*s, e.outgoing) : nullptr;
+        const Clip* in = s && e.incoming ? edit::clipById(*s, e.incoming) : nullptr;
+        if ((e.outgoing && !out) || (e.incoming && !in) || (!out && !in)) return false;
+        return !(out && in) || out->end() == in->start;
+    };
+    while (!trimHistory_.empty()) {
+        const TrimEdit e = trimHistory_.back();
+        trimHistory_.pop_back();
+        if (!usable(e) || (trimEdit_ && sameEdit(*trimEdit_, e))) continue;
+        stopTrimShuttle(true);
+        selectTrimEdit(e);
+        showTrimEdit();
+        return true;
+    }
+    statusBar()->showMessage(tr("No edit points to reselect"), 4000);
+    return false;
+}
+
 void MainWindow::endTrimMode() {
     stopTrimShuttle(false);
     if (!trimEdit_) return;
+    rememberTrimEdit(*trimEdit_);
     trimEdit_.reset();
     timeline_->clearTrimEdit();
     programPanel_->endTrimView();
@@ -5977,18 +6081,35 @@ int MainWindow::matchColourChart() {
 
 namespace {
 
+// The window's job store for its dialogs (DialogJobs.h), found from any widget under it.
+DialogJobs* dialogJobsOf(QWidget* w) {
+    for (; w; w = w->parentWidget())
+        if (auto* win = qobject_cast<MainWindow*>(w)) return win->dialogJobs();
+    return nullptr;
+}
+
 // Runs `work` off the UI thread behind a progress dialog with Cancel; false if
-// it fails (the error shown in the status bar) or is cancelled.
+// it fails (the error shown in the status bar) or is cancelled. The job is kept in the job store while it runs and
+// after (`job`: one already begun there, as the Project Manager's is; else it is begun here), so montage_job lists
+// it and can ask it to stop.
 bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
-                     const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work) {
+                     const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work,
+                     const QString& job = {}) {
     QProgressDialog progress(title, QObject::tr("Cancel"), 0, 1000, parent);
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(400);
     auto done = std::make_shared<std::atomic<double>>(0.0);
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     QObject::connect(&progress, &QProgressDialog::canceled, parent, [cancel] { *cancel = true; });
+    DialogJobs* const jobs = dialogJobsOf(parent);
+    const QString id = !job.isEmpty() ? job : jobs ? jobs->begin(QStringLiteral("dialog"), title) : QString();
     QTimer tick;
-    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done, cancel, jobs, id] {
+        progress.setValue(int(*done * 1000));
+        if (!jobs) return;
+        jobs->setProgress(id, *done);
+        if (jobs->cancelAsked(id)) *cancel = true;
+    });
     tick.start(100);
     using Out = std::pair<bool, std::string>;
     QFutureWatcher<Out> watcher;
@@ -6004,6 +6125,7 @@ bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
     progress.disconnect(parent);
     progress.close();
     const Out r = watcher.result();
+    if (jobs) jobs->end(id, r.first, *cancel, QString::fromStdString(r.second));
     if (!r.first && !*cancel && !r.second.empty()) state->message(QString::fromStdString(r.second), 6000);
     return r.first && !*cancel;
 }
@@ -6341,10 +6463,15 @@ bool MainWindow::runProjectManager(const ConsolidateOptions& o) {
     }
     const Project project = state_->project();
     ConsolidateResult res;
-    const bool ok = runWithProgress(this, state_, o.trim ? tr("Consolidating the project…") : tr("Collecting the project's media…"),
+    // Kept in the job store with the project as it is now: cut short by a crash, it is taken up again when Montage
+    // next starts (DialogJobs.h).
+    const QString title = o.trim ? tr("Consolidating the project…") : tr("Collecting the project's media…");
+    const QString job = dialogJobs_->beginConsolidate(project, o, title);
+    const ConsolidateOptions run = dialogJobs_->tracked(job, o);
+    const bool ok = runWithProgress(this, state_, title,
                                     [&](const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string* error) {
-                                        return consolidateProject(project, o, &res, progress, cancel, error);
-                                    });
+                                        return consolidateProject(project, run, &res, progress, cancel, error);
+                                    }, job);
     if (!ok) return false;
     QString text = tr("Copied the project to %1: %n file(s) copied", nullptr, res.copied).arg(QString::fromStdString(res.projectPath));
     if (res.trimmed) text += tr(", %n consolidated", nullptr, res.trimmed);
@@ -8333,6 +8460,32 @@ void MainWindow::exportStreamingDialog() {
     form->addRow(tr("Segments:"), seconds);
     auto* cutAligned = new QCheckBox(tr("End segments at cuts"));
     form->addRow(cutAligned);
+    // Each rung's rate set per shot from a trial at several qualities, scored by VMAF: to a score, or filling the rate.
+    auto* perShot = new QCheckBox(tr("Set each rung's rate per shot"));
+    perShot->setObjectName(QStringLiteral("streamingPerShot"));
+    auto* target = new QDoubleSpinBox;
+    target->setObjectName(QStringLiteral("streamingVmafTarget"));
+    target->setRange(0, 100);
+    target->setDecimals(1);
+    target->setValue(93);
+    target->setSpecialValueText(tr("Fill the rung's rate"));
+    target->setPrefix(tr("VMAF "));
+    target->setToolTip(tr("Each shot gets the quality that reaches this VMAF for the fewest bits, the rung's rate its cap; at 0, the "
+                          "rung's rate spread over the shots for the most VMAF. The package gets ladder.csv, each shot's rate and score."));
+    perShot->setToolTip(tr("Each shot (between cuts and marked shot changes, a second at the least) starts a segment and is "
+                           "first encoded at several qualities on each rung, then scored by VMAF at the rung's size: longer to make"));
+    const bool vmaf = vmafAvailable() && !(hdr && vmafModelFor([&] {
+                                                     QualityPicture q;
+                                                     q.width = s->width, q.height = s->height, q.transfer = cs->transfer == Transfer::Pq ? "pq" : "hlg";
+                                                     return q;
+                                                 }(), CompareOptions{}).empty());
+    perShot->setEnabled(vmaf);
+    if (!vmaf) perShot->setToolTip(tr("Needs VMAF (libvmaf %1), and for HDR an HDR VMAF model").arg(QString::fromStdString(vmafVersion())));
+    target->setEnabled(false);
+    connect(perShot, &QCheckBox::toggled, target, &QWidget::setEnabled);
+    auto* rates = new QHBoxLayout;
+    rates->addWidget(perShot), rates->addWidget(target), rates->addStretch();
+    form->addRow(tr("Rates:"), rates);
     auto* hls = new QCheckBox(tr("HLS"));
     auto* dash = new QCheckBox(tr("DASH"));
     hls->setChecked(true), dash->setChecked(true);
@@ -8387,6 +8540,8 @@ void MainWindow::exportStreamingDialog() {
     st.segmentSeconds = seconds->value();
     st.cutAligned = cutAligned->isChecked();
     st.hls = hls->isChecked(), st.dash = dash->isChecked();
+    st.perShot = perShot->isChecked();
+    st.vmafTarget = st.perShot ? target->value() : 0;
     st.audioCodec = audio->currentData().toString().toStdString();
     st.segmentFormat = segmentFormat->currentData().toString().toStdString();
     if (st.segmentFormat == "ts" && (st.audioCodec == "libopus" || codec->currentData().toString() != "libx264")) {
@@ -8404,7 +8559,19 @@ void MainWindow::exportStreamingDialog() {
                                         return exportStreamingPackage(project, seq, st, [&](double f, FrameTime) { progress(f); }, cancel, err, &result);
                                     });
     if (!ok) return;
-    state_->message(tr("Streaming package written in %1: %2 renditions, %3 segments").arg(QString::fromStdString(st.folder)).arg(result.renditions.size()).arg(result.segments.size()),
+    QString shots;
+    if (!result.perShot.empty()) {
+        // (each rung's mean rate and VMAF, set per shot)
+        QStringList r;
+        for (const StreamingRungShots& rs : result.perShot)
+            r << tr("%1 %2 kb/s, VMAF %3").arg(QString::fromStdString(rs.rendition)).arg(double(rs.bitrate) / 1000, 0, 'f', 0).arg(rs.vmaf, 0, 'f', 1);
+        shots = tr("; set per shot (ladder.csv): %1").arg(r.join(QStringLiteral(", ")));
+    }
+    state_->message(tr("Streaming package written in %1: %2 renditions, %3 segments%4")
+                        .arg(QString::fromStdString(st.folder))
+                        .arg(result.renditions.size())
+                        .arg(result.segments.size())
+                        .arg(shots),
                     10000);
 }
 
@@ -8436,7 +8603,7 @@ void MainWindow::exportImfDialog() {
     form->addRow(tr("Title:"), title);
     auto* kind = new QComboBox(&dlg);
     kind->setObjectName(QStringLiteral("imfKind"));
-    // (ST 2067-3's kinds; Application DPP's own, RDD 59-1 Table 6, when that is the master)
+    // (ST 2067-3's kinds; Application DPP's own, RDD 59-1 Table 5, when that is the master)
     const std::vector<std::pair<QString, QString>> kinds{{tr("Feature"), "feature"},     {tr("Episode"), "episode"},
                                                          {tr("Short"), "short"},         {tr("Trailer"), "trailer"},
                                                          {tr("Teaser"), "teaser"},       {tr("Advertisement"), "advertisement"},
@@ -8459,11 +8626,23 @@ void MainWindow::exportImfDialog() {
     if (prores::encoderAvailable()) {
         application->addItem(tr("Broadcast master (Application DPP (ProRes), RDD 59-1)"), 59);
         application->setItemData(application->count() - 1,
-                                 tr("ProRes 422 HQ at 1920 x 1080 or 3840 x 2160, progressive, in Rec.709, Rec.2020 PQ or HLG, as UK and "
-                                    "North American broadcasters' IMF delivery specifications ask"),
+                                 tr("ProRes 422 HQ at 1920 x 1080 or 3840 x 2160, progressive, in Rec.709, Rec.2020 PQ or HLG (4444 in "
+                                    "Rec.2020 PQ or HLG), as UK and North American broadcasters' IMF delivery specifications ask"),
                                  Qt::ToolTipRole);
     }
     form->addRow(tr("Master:"), application);
+    // Application #2E's edition: ST 2067-21:2026 (8K, the markers as timed events), or the 2021 identification as before.
+    auto* edition = new QComboBox(&dlg);
+    edition->setObjectName(QStringLiteral("imfEdition"));
+    edition->addItem(tr("ST 2067-21:2026"), 2026);
+    edition->addItem(tr("ST 2067-21:2021 (as packages were before the 2026 edition)"), 2021);
+    edition->setToolTip(tr("The 2026 edition takes 8K pictures and carries the markers; a supplemental keeps the earlier package's edition"));
+    form->addRow(tr("Edition:"), edition);
+    auto* events = new QCheckBox(tr("Markers as timed events (their names, comments and colours)"), &dlg);
+    events->setObjectName(QStringLiteral("imfEvents"));
+    events->setChecked(true);
+    events->setToolTip(tr("Event-based metadata (SMPTE ST 2067-206) on a track of its own, read back as markers when the package is imported"));
+    form->addRow(QString(), events);
     // Application ProRes: the profile (4:2:2 Y'CbCr, or 4:4:4 R'G'B').
     auto* proresProfile = new QComboBox(&dlg);
     proresProfile->setObjectName(QStringLiteral("imfProResProfile"));
@@ -8502,6 +8681,7 @@ void MainWindow::exportImfDialog() {
     size->addItem(tr("HD (1920 x 1080)"), "hd");
     size->addItem(tr("UHD (3840 x 2160)"), "uhd");
     size->addItem(tr("4K (4096 x 2160)"), "4k");
+    size->addItem(tr("8K (7680 x 4320)"), "8k");
     form->addRow(tr("Picture:"), size);
     auto* colour = new QComboBox(&dlg);
     colour->setObjectName(QStringLiteral("imfColour"));
@@ -8645,16 +8825,26 @@ void MainWindow::exportImfDialog() {
         const bool proresApp = application->currentData().toInt() == 45 || dpp;
         size->setEnabled(!supplemental->isChecked());
         colour->setEnabled(!supplemental->isChecked() && !aces);
-        for (QWidget* w : {static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)}) w->setEnabled(!supplemental->isChecked() && !aces && !proresApp);
-        // (Application DPP: 422 HQ here, progressive, narrow range; its 4:4:4 is 12 bits, which no encoder here makes)
+        coding->setEnabled(!supplemental->isChecked() && !aces && !proresApp);
+        // (Application DPP: 422 HQ at 10 bits or 4444 and 4444 XQ R'G'B' at 12, progressive, narrow range)
         // Application DPP takes HD or UHD and no P3-D65 PQ: the others greyed out while it is chosen.
         auto offer = [](QComboBox* box, const char* value, bool on) {
             if (auto* m = qobject_cast<QStandardItemModel*>(box->model()))
                 if (QStandardItem* i = m->item(box->findData(QString::fromLatin1(value)))) i->setEnabled(on);
         };
         for (const char* v : {"sequence", "4k"}) offer(size, v, !dpp);
+        // (8K: Application #2E to the 2026 edition only)
+        const bool app2 = application->currentData().toInt() == 2;
+        edition->setEnabled(app2 && !supplemental->isChecked());
+        const bool eightK = app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026);
+        offer(size, "8k", eightK);
+        if (!eightK && size->currentData().toString() == "8k") size->setCurrentIndex(size->findData("uhd"));
+        events->setEnabled(app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026));
         offer(colour, "p3d65-pq", !dpp);
-        if (dpp && !beforeDpp->kept) *beforeDpp = {true, proresProfile->currentIndex(), fields->currentIndex(), ycbcr444->isChecked(), fullRange->isChecked()};
+        offer(proresProfile, "422", !dpp);
+        offer(proresProfile, "lt", !dpp);
+        const bool enteringDpp = dpp && !beforeDpp->kept;
+        if (enteringDpp) *beforeDpp = {true, proresProfile->currentIndex(), fields->currentIndex(), ycbcr444->isChecked(), fullRange->isChecked()};
         if (!dpp && beforeDpp->kept) {
             const BeforeDpp was = *beforeDpp;
             beforeDpp->kept = false;
@@ -8665,15 +8855,21 @@ void MainWindow::exportImfDialog() {
         }
         if (dpp) {
             if (colour->currentData().toString() == "p3d65-pq") colour->setCurrentIndex(colour->findData("rec2020-pq"));
-            proresProfile->setCurrentIndex(proresProfile->findData("hq"));
+            const QString chosen = proresProfile->currentData().toString();
+            if (enteringDpp || (chosen != "hq" && chosen != "4444" && chosen != "4444xq")) proresProfile->setCurrentIndex(proresProfile->findData("hq"));
             fields->setCurrentIndex(0);
             ycbcr444->setChecked(false);
             fullRange->setChecked(false);
             if (size->currentData().toString() != "hd" && size->currentData().toString() != "uhd")
                 size->setCurrentIndex(size->findData(s->width > 1920 || s->height > 1080 ? "uhd" : "hd"));
         }
-        proresProfile->setEnabled(!supplemental->isChecked() && proresApp && !dpp);
+        proresProfile->setEnabled(!supplemental->isChecked() && proresApp);
         const bool fourFourFour = prores::fourFourFour(prores::profileOf(proresProfile->currentData().toString().toStdString()));
+        // (Application DPP's 4:4:4 has no Rec.709, RDD 59-1:2022 Table 1)
+        offer(colour, "rec709", !(dpp && fourFourFour));
+        if (dpp && fourFourFour && colour->currentData().toString() == "rec709") colour->setCurrentIndex(colour->findData("rec2020-pq"));
+        // (the depth: JPEG 2000's choice; Application ProRes's 4:4:4 at 10 or 12 bits, its 4:2:2 at 10; DPP's by profile)
+        bits->setEnabled(!supplemental->isChecked() && !aces && (!proresApp || (!dpp && fourFourFour)));
         fields->setEnabled(!supplemental->isChecked() && proresApp && !dpp && !fourFourFour);
         ycbcr444->setEnabled(!supplemental->isChecked() && proresApp && !dpp && fourFourFour);
         fullRange->setEnabled(!supplemental->isChecked() && proresApp && !dpp && fourFourFour && !ycbcr444->isChecked());
@@ -8692,6 +8888,7 @@ void MainWindow::exportImfDialog() {
     connect(application, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
     connect(proresProfile, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
     connect(ycbcr444, &QCheckBox::toggled, &dlg, syncSupplemental);
+    connect(edition, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
     syncSupplemental();
     auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("imf/issuer"), QStringLiteral("Montage")).toString(), &dlg);
     issuer->setObjectName(QStringLiteral("imfIssuer"));
@@ -8732,6 +8929,8 @@ void MainWindow::exportImfDialog() {
     st.title = title->text().trimmed().toStdString();
     st.kind = kind->currentData().toString().toStdString();
     st.application = application->currentData().toInt();
+    st.edition = edition->currentData().toInt();
+    st.events = events->isEnabled() && events->isChecked();
     if (st.application == 45 || st.application == 59) {
         st.prores = proresProfile->currentData().toString().toStdString();
         if (fields->isEnabled()) st.fields = fields->currentData().toString().toStdString();
@@ -8744,7 +8943,10 @@ void MainWindow::exportImfDialog() {
     }
     st.size = size->currentData().toString().toStdString();
     st.colour = colour->currentData().toString().toStdString();
-    st.bits = st.application == 45 || st.application == 59 ? 10 : bits->currentData().toInt();
+    // (Application ProRes: 10 bits unless 12 are chosen for 4:4:4; Application DPP: 10 for 422 HQ, 12 for 4:4:4)
+    if (st.application == 59) st.bits = 0;
+    else if (st.application == 45) st.bits = bits->isEnabled() && bits->currentData().toInt() == 12 ? 12 : 10;
+    else st.bits = bits->currentData().toInt();
     st.lossless = coding->currentData().toInt() <= 0;
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();
@@ -9049,8 +9251,28 @@ void MainWindow::makeKdmsDialog() {
                                                                 tr("FLMs (*.xml);;All files (*)"));
         if (files.isEmpty()) return;
         appSettings().setValue(QStringLiteral("dcp/flmFolder"), QFileInfo(files.front()).path());
-        QStringList problems;
+        QStringList problems, changed;
         int screens = 0, read = 0;
+        std::vector<std::string> trusted;
+        std::string trustError;
+        if (!loadTrustedRoots(trusted, &trustError)) problems << QString::fromStdString(trustError);
+        std::vector<Facility> waiting;     // (read, but from roots not yet trusted)
+        std::vector<std::string> roots;  // those roots, each once
+        auto take = [&](Facility f) {
+            std::string err;
+            std::vector<std::string> untrusted, changes;
+            const int n = int(f.screens.size());
+            if (!takeFlm(facilities, f, trusted, &err, &untrusted, &changes)) {
+                if (untrusted.empty()) problems << QString::fromStdString(err);
+                for (const std::string& r : untrusted)
+                    if (std::find(roots.begin(), roots.end(), r) == roots.end()) roots.push_back(r);
+                if (!untrusted.empty()) waiting.push_back(std::move(f));
+                return;
+            }
+            screens += n;
+            ++read;
+            for (const std::string& c : changes) changed << QString::fromStdString(c);
+        };
         for (const QString& file : files) {
             Facility f;
             std::string err;
@@ -9058,12 +9280,35 @@ void MainWindow::makeKdmsDialog() {
                 problems << QString::fromStdString(err);
                 continue;
             }
-            screens += int(f.screens.size());
-            ++read;
-            mergeFacility(facilities, std::move(f));
+            take(std::move(f));
+        }
+        // Roots not trusted yet: the user is asked, showing each root's thumbprint to check with its maker or the cinema
+        // (a root is never trusted for coming with the FLM).
+        if (!roots.empty()) {
+            QStringList names, cinemas;
+            for (const std::string& r : roots) names << QString::fromStdString(rootDescription(r));
+            for (const Facility& f : waiting) cinemas << QString::fromStdString(f.name);
+            QMessageBox ask(QMessageBox::Warning, tr("Read FLMs"),
+                            tr("The certificates of %1 come from roots Montage does not trust yet:\n\n%2\n\nTrust a root only once the cinema or "
+                               "the device's maker has confirmed its thumbprint. KDMs are made for whoever holds these certificates.")
+                                .arg(cinemas.join(QStringLiteral(", ")), names.join('\n')),
+                            QMessageBox::Cancel, &dlg);
+            ask.setObjectName(QStringLiteral("kdmTrustRoots"));
+            QPushButton* yes = ask.addButton(tr("Trust and Read"), QMessageBox::AcceptRole);
+            yes->setObjectName(QStringLiteral("kdmTrustRootsYes"));
+            ask.setDefaultButton(QMessageBox::Cancel);
+            ask.exec();
+            std::string err;
+            if (ask.clickedButton() == yes) {
+                if (!trustRoots(roots, &err) || !loadTrustedRoots(trusted, &err)) problems << QString::fromStdString(err);
+                else
+                    for (Facility& f : std::exchange(waiting, {})) take(std::move(f));
+            }
+            for (const Facility& f : waiting) problems << tr("%1: its roots are not trusted").arg(QString::fromStdString(f.name));
         }
         store();
         state_->message(tr("Read %n FLM(s) with %1 screen(s)", nullptr, read).arg(screens), 10000);
+        if (!changed.isEmpty()) QMessageBox::information(&dlg, tr("Read FLMs"), tr("Changed since the cinemas' last FLMs:\n%1").arg(changed.join('\n')));
         if (!problems.isEmpty()) QMessageBox::warning(&dlg, tr("Read FLMs"), tr("Not read:\n%1").arg(problems.join('\n')));
     });
     auto* addScreen = new QPushButton(tr("Add Screen…"), &dlg);
@@ -10375,6 +10620,99 @@ bool MainWindow::replaceWithSource() {
     const Id id = target->id, media = m->id;
     return state_->apply(tr("Replace with Source Clip"),
                          [=](Project& p, Sequence& sq) { return edit::replaceClip(p, sq, id, media, align, at); });
+}
+
+bool MainWindow::replaceSourceOfSelected(Id media, bool byTimecode) {
+    const std::vector<Id> sel = state_->selectedClips();
+    if (sel.empty()) {
+        state_->message(tr("Select the clips to repoint"));
+        return false;
+    }
+    return state_->apply(tr("Replace Source of Selected"),
+                         [=](Project& p, Sequence& sq) { return edit::replaceSources(p, sq, sel, media, byTimecode); });
+}
+
+QDialog* MainWindow::replaceSourceDialog() {
+    if (state_->selectedClips().empty() || state_->project().media.empty()) {
+        state_->message(tr("Select the clips to repoint"));
+        return nullptr;
+    }
+    auto* dlg = new QDialog(this);
+    dlg->setObjectName(QStringLiteral("replaceSourceDialog"));
+    dlg->setWindowTitle(tr("Replace Source of Selected"));
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    auto* v = new QVBoxLayout(dlg);
+    v->addWidget(new QLabel(tr("Point the %n selected clip(s) at:", "", int(state_->selectedClips().size())), dlg));
+    auto* item = new QComboBox(dlg);
+    item->setObjectName(QStringLiteral("replaceSourceItem"));
+    for (const MediaItem& m : state_->project().media) {
+        QString label = QString::fromStdString(m.name);
+        if (!m.bin.empty()) label += QStringLiteral("  (%1)").arg(QString::fromStdString(m.bin));
+        item->addItem(label, QVariant::fromValue(qulonglong(m.id)));
+    }
+    if (const int at = item->findData(QVariant::fromValue(qulonglong(state_->sourceMedia()))); at >= 0) item->setCurrentIndex(at);
+    v->addWidget(item);
+    auto* same = new QRadioButton(tr("Keep each clip's source times"), dlg);
+    same->setObjectName(QStringLiteral("replaceSourceTimes"));
+    auto* tc = new QRadioButton(tr("Match by timecode"), dlg);
+    tc->setObjectName(QStringLiteral("replaceSourceTimecode"));
+    same->setChecked(true);
+    v->addWidget(same);
+    v->addWidget(tc);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dlg);
+    v->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, dlg, [this, dlg, item, tc] {
+        if (replaceSourceOfSelected(Id(item->currentData().toULongLong()), tc->isChecked())) dlg->accept();
+    });
+    return dlg;
+}
+
+bool MainWindow::nestInToOut(const QString& name) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->inPoint < 0 || s->outPoint < 0) {
+        state_->message(tr("Mark In and Out on the timeline first"));
+        return false;
+    }
+    const FrameTime a = s->inPoint, b = s->outPoint + 1;  // (Out is the last frame in)
+    const std::string n = name.toStdString();
+    return state_->apply(tr("Nest In to Out"), [=](Project& p, Sequence& sq) { return edit::nestRange(p, sq, a, b, allTracks(sq), n); });
+}
+
+int MainWindow::extractSoundToFiles(const QString& folder) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<Id> clips;
+    for (Id id : edit::expandLinks(*s, state_->selectedClips()))
+        if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
+    if (clips.empty()) {
+        state_->message(tr("Select clips with sound"));
+        return 0;
+    }
+    QDir().mkpath(folder);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    int written = 0;
+    QString failure;
+    for (Id id : clips) {
+        const Clip* c = edit::clipById(*s, id);
+        QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^\\w\\- ]")), QStringLiteral("_"));
+        if (base.isEmpty()) base = tr("Clip");
+        QString path = QDir(folder).filePath(base + QStringLiteral(".wav"));
+        for (int n = 2; QFileInfo::exists(path); ++n) path = QDir(folder).filePath(QStringLiteral("%1 %2.wav").arg(base).arg(n));
+        std::string err;
+        if (!extractClipSound(state_->project(), *s, id, path.toStdString(), &err)) {
+            failure = QString::fromStdString(err);
+            break;
+        }
+        ++written;
+    }
+    QApplication::restoreOverrideCursor();
+    if (!failure.isEmpty()) {
+        state_->message(tr("Extracting the sound failed: %1").arg(failure), 6000);
+        return -1;
+    }
+    state_->message(tr("Wrote %n sound file(s) to %1", "", written).arg(QDir::toNativeSeparators(folder)), 5000);
+    return written;
 }
 
 bool MainWindow::fitToFill() {

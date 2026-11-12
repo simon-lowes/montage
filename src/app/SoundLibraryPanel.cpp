@@ -1,11 +1,7 @@
 #include "SoundLibraryPanel.h"
 
 #include <QCoreApplication>
-#include <QAudioDevice>
-#include <QAudioFormat>
-#include <QAudioSink>
 #include <QApplication>
-#include <QBuffer>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDesktopServices>
@@ -47,6 +43,7 @@
 #include "EditorState.h"
 #include "ModelPacks.h"
 #include "Settings.h"
+#include "SoundOut.h"
 #include "audio/AudioRepair.h"
 #include "media/SoundSearch.h"
 
@@ -258,6 +255,9 @@ SoundLibraryPanel::SoundLibraryPanel(EditorState* state, std::shared_ptr<SoundLi
     rescanSoon_ = new QTimer(this);
     rescanSoon_->setSingleShot(true);
     rescanSoon_->setInterval(2000);
+    feed_ = new QTimer(this);  // (the preview, pushed as there is room)
+    feed_->setInterval(20);
+    connect(feed_, &QTimer::timeout, this, &SoundLibraryPanel::topUp);
     watcher_ = new QFileSystemWatcher(this);
 
     connect(query_, &QLineEdit::textChanged, this, [this] {
@@ -628,41 +628,38 @@ std::vector<float> SoundLibraryPanel::auditionSound() const {
 
 void SoundLibraryPanel::play() {
     stop();
-    const std::vector<float> sound = auditionSound();
+    std::vector<float> sound = auditionSound();
     if (sound.empty()) return;
-    const QAudioDevice dev = QMediaDevices::defaultAudioOutput();
-    QAudioFormat fmt;
-    fmt.setSampleRate(48000);
-    fmt.setChannelCount(2);
-    fmt.setSampleFormat(QAudioFormat::Float);
-    if (dev.isNull() || !dev.isFormatSupported(fmt)) {
+    // Through the audio device chosen (Monitoring › Audio device), else Qt Multimedia's output: pushed a little at a
+    // time, as there is room.
+    if (!out_) out_ = new SoundOut(this);
+    if (!out_->open(48000, 2, 0.5)) {
         state_->message(tr("No sound output to play on"), 4000);
         return;
     }
-    playing_ = new QBuffer(this);
-    playing_->setData(reinterpret_cast<const char*>(sound.data()), qsizetype(sound.size() * sizeof(float)));
-    playing_->open(QIODevice::ReadOnly);
-    sink_ = new QAudioSink(dev, fmt, this);
-    connect(sink_, &QAudioSink::stateChanged, this, [this](QAudio::State s) {
-        if (s == QAudio::IdleState) QTimer::singleShot(0, this, [this] { stop(); });
-    });
-    sink_->start(playing_);
+    preview_ = std::move(sound);
+    sent_ = 0;
+    playing_ = true;
+    topUp();
+    feed_->start();
+}
+
+void SoundLibraryPanel::topUp() {
+    if (!playing_ || !out_) return;
+    const qint64 frames = qint64(preview_.size() / 2);
+    if (sent_ < frames) sent_ += out_->write(preview_.data() + size_t(sent_) * 2, frames - sent_);
+    if (sent_ >= frames && out_->queued() == 0) stop();  // (all of it heard)
 }
 
 void SoundLibraryPanel::stop() {
-    if (sink_) {
-        sink_->disconnect(this);
-        sink_->stop();
-        sink_->deleteLater();
-        sink_ = nullptr;
-    }
-    if (playing_) {
-        playing_->deleteLater();
-        playing_ = nullptr;
-    }
+    if (feed_) feed_->stop();
+    if (out_) out_->close();
+    playing_ = false;
+    preview_.clear();
+    sent_ = 0;
 }
 
-bool SoundLibraryPanel::playing() const { return sink_ != nullptr; }
+bool SoundLibraryPanel::playing() const { return playing_; }
 
 bool SoundLibraryPanel::eventFilter(QObject* o, QEvent* e) {
     if (o == table_ || o == wave_) {

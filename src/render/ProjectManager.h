@@ -21,6 +21,11 @@ struct ConsolidateOptions {
     double handles = 1.0;        // seconds kept either side of what is used, when trimming
     std::string codec = "prores_ks";  // trimmed copies: prores_ks (ProRes 422 HQ, .mov) or libx264 (.mp4)
     bool keepUnused = false;     // keep media items nothing uses
+    // A job taken up again after it was cut short (app/DialogJobs.h): `began` is told each file or folder in the
+    // folder's Media before it is written, and those of the run before, given as `replace`, are this job's own, so
+    // they are written again under the same names rather than beside themselves.
+    std::function<void(const std::string& file)> began;
+    std::vector<std::string> replace;
 };
 
 struct ConsolidateResult {

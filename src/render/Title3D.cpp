@@ -9,6 +9,7 @@
 #include <QPolygonF>
 #include <QStringList>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -211,9 +212,10 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
     double blockW = 0;
     for (const QString& l : lines) blockW = std::max(blockW, fm.horizontalAdvance(l));
     const int align = int(std::lround(g.p("align", t, 1)));
-    // Letter by letter when text animations set the letters' depths or the title has font axes of its own (each glyph
-    // cluster its own depth, those as deep as each other one outline); else the text as one outline, its styled runs (render/Titles.h) each in its
-    // own font, size, weight and tracking.
+    // Letter by letter when the title has text animations or font axes of its own: each glyph cluster its own depth
+    // (those as deep as each other, and not moved, one outline), and a letter the animations move, turn, scale or
+    // colour a solid of its own, sorted with the rest by depth; else the text as one outline, its styled runs
+    // (render/Titles.h) each in its own font, size, weight and tracking.
     const std::vector<int> anims = textAnimators(g);
     const bool perLetter = !anims.empty() || !titleAxes(g).empty();
     const double lineSpacing = std::clamp(g.p("line_spacing", t, 1.1), 0.5, 3.0);
@@ -226,8 +228,27 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
     struct Solid {
         std::vector<Contour> contours;
         double depth = 0;
+        // Its own turn, scale and move about its middle (object space, before the title's): a point p of it is at
+        // rot * ((p - pivot) * s) + pivot + move; and its colours.
+        M3 rot;
+        V3 pivot, move;
+        double s = 1;
+        float face[3] = {0, 0, 0}, side[3] = {0, 0, 0};
+        V3 place(V3 p) const { return rot * ((p - pivot) * s) + pivot + move; }
     };
-    std::vector<std::pair<QPainterPath, double>> outlines;  // each outline and its depth
+    const float face[3] = {float(g.p("color.r", t, 0.95)), float(g.p("color.g", t, 0.95)), float(g.p("color.b", t, 0.95))};
+    const float side[3] = {float(g.p("side_color.r", t, 0.45)), float(g.p("side_color.g", t, 0.5)), float(g.p("side_color.b", t, 0.6))};
+    // Each outline and how it stands: its depth, and (a letter the animations move, turn, scale or colour) where it
+    // turns about, how, how far it moves and its own colours.
+    struct Outline {
+        QPainterPath path;
+        double depth = 0;
+        bool own = false;  // moved, turned, scaled or coloured: a solid of its own
+        double ox = 0, oy = 0, oz = 0, rx = 0, ry = 0, rz = 0, s = 1;  // raster pixels (y up, z towards the camera), degrees
+        std::array<double, 3> face{0, 0, 0}, side{0, 0, 0};
+        bool coloured = false;
+    };
+    std::vector<Outline> outlines;
     const double baseDepth = std::max(0.0, g.p("depth", t, 40)) * px;
     if (perLetter) {
         int letters = 0, solids = 0, words = 0, nLines = 0;
@@ -235,21 +256,45 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
         for (const TitleCharOutline& c : chars) {
             if (c.path.isEmpty()) continue;
             double d = g.p("depth", t, 40);
+            Outline o;
+            o.path = c.path;
+            for (int q = 0; q < 3; ++q) o.face[size_t(q)] = face[q], o.side[size_t(q)] = side[q];
             for (int k : anims) {
                 const std::string pre = "ta" + std::to_string(k) + ".";
                 const int by = int(std::lround(g.p(pre + "by", t)));
                 const int i = by == 0 ? c.letter : by == 1 ? c.solid : by == 2 ? c.word : c.line;
                 const int n = by == 0 ? letters : by == 1 ? solids : by == 2 ? words : nLines;
                 if (i < 0) continue;
-                d += g.p(pre + "depth", t) * textSelection(g, k, t, fps, duration, i, n);
+                const double v = textSelection(g, k, t, fps, duration, i, n);
+                if (v == 0) continue;
+                d += g.p(pre + "depth", t) * v;
+                o.ox += g.p(pre + "x", t) * px * v;
+                o.oy -= g.p(pre + "y", t) * px * v;
+                o.oz += g.p(pre + "z", t) * px * v;
+                o.rx += g.p(pre + "rot_x", t) * v;
+                o.ry += g.p(pre + "rot_y", t) * v;
+                o.rz += g.p(pre + "rotation", t) * v;
+                o.s *= std::max(0.0, 1 + (g.p(pre + "scale", t, 100) / 100 - 1) * v);
+                // Colours mixed in as the 2D title's are, each animation over what the ones before it left.
+                const double fm = std::clamp(g.p(pre + "fill_mix", t) / 100 * v, 0.0, 1.0), sm = std::clamp(g.p(pre + "side_mix", t) / 100 * v, 0.0, 1.0);
+                const char* ch[3] = {".r", ".g", ".b"};
+                for (int q = 0; q < 3; ++q) {
+                    o.face[size_t(q)] += (std::clamp(g.p(pre + "fill" + ch[q], t, 1), 0.0, 1.0) - o.face[size_t(q)]) * fm;
+                    o.side[size_t(q)] += (std::clamp(g.p(pre + "side" + ch[q], t, 1), 0.0, 1.0) - o.side[size_t(q)]) * sm;
+                }
+                o.coloured = o.coloured || fm > 0 || sm > 0;
             }
-            // (letters as deep as each other one outline, so where they overlap they merge, as a whole title does)
-            const double depth = std::max(0.0, d) * px;
-            auto same = std::find_if(outlines.begin(), outlines.end(), [&](const auto& o) { return std::abs(o.second - depth) < 1e-9; });
-            if (same == outlines.end()) outlines.emplace_back(c.path, depth);
-            else same->first.addPath(c.path);
+            // (letters as deep as each other and left in place are one outline, so where they overlap they merge, as a
+            // whole title does)
+            o.depth = std::max(0.0, d) * px;
+            o.own = o.ox != 0 || o.oy != 0 || o.oz != 0 || o.rx != 0 || o.ry != 0 || o.rz != 0 || o.s != 1 || o.coloured;
+            if (o.s <= 0) continue;
+            auto same = o.own ? outlines.end()
+                              : std::find_if(outlines.begin(), outlines.end(), [&](const Outline& u) { return !u.own && std::abs(u.depth - o.depth) < 1e-9; });
+            if (same == outlines.end()) outlines.push_back(std::move(o));
+            else same->path.addPath(c.path);
         }
-        for (auto& o : outlines) o.first.setFillRule(Qt::WindingFill);
+        for (Outline& o : outlines) o.path.setFillRule(Qt::WindingFill);
     } else {
         QPainterPath path = styledTextOutline(g, t, px, 120, lineSpacing);
         path.setFillRule(Qt::WindingFill);
@@ -259,7 +304,13 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
                 const double x = align == 0 ? 0 : align == 2 ? blockW - lw : (blockW - lw) / 2;
                 path.addText(QPointF(x, fm.ascent() + i * lineH), font, lines[i]);
             }
-        if (!path.isEmpty()) outlines.emplace_back(path, baseDepth);
+        if (!path.isEmpty()) {
+            Outline o;
+            o.path = path;
+            o.depth = baseDepth;
+            for (int q = 0; q < 3; ++q) o.face[size_t(q)] = face[q], o.side[size_t(q)] = side[q];
+            outlines.push_back(std::move(o));
+        }
     }
     if (outlines.empty()) return out;
     // Overlaps merged (letters run together by tight tracking or line spacing, fonts built from overlapping
@@ -267,15 +318,15 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
     // and each edge's outward normal is (dy, -dx). All turn about the middle of the whole text.
     std::vector<QPainterPath> simple;
     QRectF box;
-    for (const auto& [path, d] : outlines) {
-        simple.push_back(path.simplified());
+    for (const Outline& o : outlines) {
+        simple.push_back(o.path.simplified());
         box = box.isNull() ? simple.back().boundingRect() : box.united(simple.back().boundingRect());
     }
     const QPointF centre = box.center();
     std::vector<Solid> solids;
     for (size_t o = 0; o < outlines.size(); ++o) {
         Solid so;
-        so.depth = outlines[o].second;
+        so.depth = outlines[o].depth;
         std::vector<Contour>& contours = so.contours;
         for (const QPolygonF& poly : simple[o].toSubpathPolygons()) {
             Contour c;
@@ -304,7 +355,18 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
             }
             if ((contours[i].area > 0) == (around % 2 == 1)) std::reverse(contours[i].pts.begin(), contours[i].pts.end());
         }
-        if (!contours.empty()) solids.push_back(std::move(so));
+        if (contours.empty()) continue;
+        const Outline& ol = outlines[o];
+        if (ol.own) {
+            // About the middle of the letter's box, halfway back through its depth.
+            const QRectF b = simple[o].boundingRect();
+            so.pivot = {b.center().x() - centre.x(), centre.y() - b.center().y(), 0};  // (z set below, with the face)
+            so.rot = rotation(ol.rx, ol.ry, ol.rz);
+            so.s = ol.s;
+            so.move = {ol.ox, ol.oy, ol.oz};
+        }
+        for (int q = 0; q < 3; ++q) so.face[q] = ol.own ? float(ol.face[size_t(q)]) : face[q], so.side[q] = ol.own ? float(ol.side[size_t(q)]) : side[q];
+        solids.push_back(std::move(so));
     }
     if (solids.empty()) return out;
 
@@ -346,8 +408,6 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
     light.light = normalized({std::sin(az) * std::cos(el), std::cos(az) * std::cos(el), std::sin(el)});
     light.ambient = std::clamp(g.p("ambient", t, 35) / 100, 0.0, 1.0);
     light.specular = std::clamp(g.p("specular", t, 40) / 100, 0.0, 1.0);
-    const float face[3] = {float(g.p("color.r", t, 0.95)), float(g.p("color.g", t, 0.95)), float(g.p("color.b", t, 0.95))};
-    const float side[3] = {float(g.p("side_color.r", t, 0.45)), float(g.p("side_color.g", t, 0.5)), float(g.p("side_color.b", t, 0.6))};
 
     // Everything is projected first (clipped where it comes nearer than the near plane), so the raster only needs
     // to cover where the title lands.
@@ -358,8 +418,11 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
     // The sides: a quad along every edge, lit at its corners with normals smoothed where the outline curves.
     std::vector<Tri> tris;
     const double zf = depth / 2 / k;  // object space (scaled by k with everything else): every face at the front
+    for (Solid& so : solids) so.pivot.z = zf - so.depth / 2;
+    auto toCam = [&](const Solid& so, V3 p) { return toCamera(so.place(p)); };
     const double smooth = std::cos(35 * kDeg);
     for (const Solid& so : solids) {
+        const M3 Rs = R * so.rot;  // its normals into the camera's space
         const double zb = zf - so.depth;
         if (so.depth <= 0) continue;
         for (const Contour& c : so.contours) {
@@ -374,17 +437,17 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
                 const V3 na = dot(edgeN[(i + n - 1) % n], edgeN[i]) > smooth ? normalized(edgeN[(i + n - 1) % n] + edgeN[i]) : edgeN[i];
                 const V3 nb = dot(edgeN[i], edgeN[j]) > smooth ? normalized(edgeN[i] + edgeN[j]) : edgeN[i];
                 std::vector<Corner> quad(4);
-                quad[0].p = toCamera({c.pts[i].x, c.pts[i].y, zf});
-                quad[1].p = toCamera({c.pts[j].x, c.pts[j].y, zf});
-                quad[2].p = toCamera({c.pts[j].x, c.pts[j].y, zb});
-                quad[3].p = toCamera({c.pts[i].x, c.pts[i].y, zb});
+                quad[0].p = toCam(so, {c.pts[i].x, c.pts[i].y, zf});
+                quad[1].p = toCam(so, {c.pts[j].x, c.pts[j].y, zf});
+                quad[2].p = toCam(so, {c.pts[j].x, c.pts[j].y, zb});
+                quad[3].p = toCam(so, {c.pts[i].x, c.pts[i].y, zb});
                 // Facing away from the camera all along: hidden behind the rest.
-                const V3 nc = R * edgeN[i];
+                const V3 nc = Rs * edgeN[i];
                 if (dot(nc, quad[0].p) > 0 && dot(nc, quad[1].p) > 0 && dot(nc, quad[2].p) > 0 && dot(nc, quad[3].p) > 0) continue;
-                light.shade(R * na, quad[0].p, side, quad[0].c);
-                light.shade(R * nb, quad[1].p, side, quad[1].c);
-                light.shade(R * nb, quad[2].p, side, quad[2].c);
-                light.shade(R * na, quad[3].p, side, quad[3].c);
+                light.shade(Rs * na, quad[0].p, so.side, quad[0].c);
+                light.shade(Rs * nb, quad[1].p, so.side, quad[1].c);
+                light.shade(Rs * nb, quad[2].p, so.side, quad[2].c);
+                light.shade(Rs * na, quad[3].p, so.side, quad[3].c);
                 const std::vector<Corner> poly = clipNear(quad, cam.nearest);
                 for (size_t m = 1; m + 1 < poly.size(); ++m) {
                     Tri tr;
@@ -417,14 +480,14 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
         const double z = face_ == 0 ? zf : zf - so.depth;
         if (face_ == 1 && so.depth <= 0) break;  // flat: one face, seen from either side
         Face fc;
-        fc.normal = R * V3{0, 0, face_ == 0 ? 1.0 : -1.0};
-        const V3 onPlane = toCamera({0, 0, z});
+        fc.normal = R * so.rot * V3{0, 0, face_ == 0 ? 1.0 : -1.0};
+        const V3 onPlane = toCam(so, {0, 0, z});
         fc.nd = dot(fc.normal, onPlane);
         if (so.depth > 0 && fc.nd >= 0) continue;  // facing away
-        light.shade(fc.normal, onPlane, face, fc.col);
+        light.shade(fc.normal, onPlane, so.face, fc.col);
         for (const Contour& c : so.contours) {
             std::vector<Corner> ring(c.pts.size());
-            for (size_t i = 0; i < c.pts.size(); ++i) ring[i].p = toCamera({c.pts[i].x, c.pts[i].y, z});
+            for (size_t i = 0; i < c.pts.size(); ++i) ring[i].p = toCam(so, {c.pts[i].x, c.pts[i].y, z});
             const std::vector<Corner> kept = clipNear(ring, cam.nearest);
             for (size_t i = 0; i < kept.size(); ++i) {
                 const Screen a = cam.project(kept[i].p), b = cam.project(kept[(i + 1) % kept.size()].p);

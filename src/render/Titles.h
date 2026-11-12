@@ -14,6 +14,7 @@
 #include <QPainterPath>
 #include <QPointF>
 #include <QString>
+#include <QTransform>
 #include <array>
 #include <functional>
 #include <map>
@@ -76,20 +77,58 @@ bool titleIsStyled(const Effect& g, FrameTime t);
 // elliptic arcs, in the order the text runs along them.
 struct TitlePathCurve {
     struct Segment {
-        int kind = 0;    // 0 a line p[0] to p[1], 1 a cubic p[0] p[1] p[2] p[3], 2 an elliptic arc
+        int kind = 0;    // 0 a line p[0] to p[1], 1 a cubic p[0] p[1] p[2] p[3], 2 an elliptic arc, 3 an arc of an
+                         // ellipse given by conjugate axes: p[0] + cos(a) p[1] + sin(a) p[2]
         QPointF p[4];    // (an arc: its centre in p[0], its radii in p[1])
-        double rotation = 0, from = 0, to = 0;  // an arc's: its axes turned (radians), and its angles
+        double rotation = 0, from = 0, to = 0;  // an arc's: its axes turned (radians, kind 2), and its angles
     };
     std::vector<Segment> segments;
     bool closed = false;
+    // How far the text's baseline is set off the path (output pixels): outwards from a closed path, to the left of the
+    // way an open one runs (on screen); every point moved along its normal (a mask's expansion and feather).
+    double offset = 0;
 };
 // The path at a time (clip frames, fractional within a frame for motion blur); nothing when there is none.
 using TitlePathFn = std::function<std::optional<TitlePathCurve>(double t)>;
-// The path a title clip `c` in `seq` sets its text on when it is not its own (render/Compositor.cpp): one of its
-// effects' masks (path_shape 4, the Mask Number-th ellipse, rectangle or Bézier mask) or a shape layer's path under it
-// (5), in pixels of the title's w x h picture, at a clip time. Empty for a title on any other path. It refers to `p`,
+// The path a title clip `c` in `seq` sets its text on when it is not its own (render/Compositor.cpp): one of the
+// effects' masks (path_shape 4, the Mask Number-th ellipse, rectangle or Bézier mask) on its own clip or the clip Path
+// From Clip names (path_clip, its id or name), set off by the mask's expansion and as far across its feather as On the
+// Feather says; or a shape layer's path (5) under it or on the clip named. In pixels of the title's w x h picture, at
+// a clip time, following the other clip's transform and keys. Empty for a title on any other path. It refers to `p`,
 // `seq` and `c`, which must outlive it.
 TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h);
+// SVG path data (M L H V C S Q T A Z, absolute and relative) as a curve: its first subpath, quadratics raised to
+// cubics, arcs as arcs.
+TitlePathCurve svgPathCurve(const std::string& d);
+// A curve through an affine map (exactly: arcs stay arcs of the mapped ellipse).
+TitlePathCurve mappedCurve(TitlePathCurve c, const QTransform& m);
+
+// Where the shape layer an SVG title follows (its svg_layer) is at a time: its pixels (from its middle, y down) to the
+// title's picture's (render/Compositor.cpp titleLayerSource). Without one, the layer is taken to sit in the middle of
+// the frame, a sequence pixel a layer pixel.
+using TitleLayerFn = std::function<std::optional<QTransform>(double t)>;
+TitleLayerFn titleLayerSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h);
+
+// An SVG text element's layout, kept on the title it was made into (its string "svg_text", JSON): the text's own
+// coordinates to the layer's pixels (its transform, the drawing's fit and any turn or slant), each character's x, y,
+// dx, dy and rotate (SVG's per-glyph positions and rotations, x and y unset where the SVG leaves them), text-anchor,
+// and a textPath's path (its data and its own coordinates to the text's) with its startOffset.
+struct SvgTextLayout {
+    QTransform matrix;
+    std::vector<std::optional<double>> x, y, rotate;
+    std::vector<double> dx, dy;
+    int anchor = 0;  // 0 start, 1 middle, 2 end
+    std::string path;     // textPath: SVG path data, empty for none
+    QTransform pathMatrix;
+    double start = 0;     // startOffset: along the path (the text's units), or a percentage of it
+    bool startPercent = false;
+    // The title's Position when it was laid out: moved from there, the text moves with it (output pixels).
+    double atX = 0, atY = 0;
+    bool empty() const { return matrix.isIdentity() && x.empty() && y.empty() && rotate.empty() && dx.empty() && dy.empty() && anchor == 0 && path.empty(); }
+};
+std::string svgTextLayoutJson(const SvgTextLayout& l);
+std::optional<SvgTextLayout> parseSvgTextLayout(const std::string& json);
+
 // The title's font axes of its own (params "axis.<tag>", for every character; runs' axes override them).
 std::vector<std::string> titleAxes(const Effect& g);
 
@@ -106,13 +145,17 @@ struct TitleGlyph {
 };
 // The glyphs a styled title draws at frame t on a w x h frame (empty for a plain one).
 std::vector<TitleGlyph> titleGlyphs(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps,
-                                    const TitlePathFn& path = {});
+                                    const TitlePathFn& path = {}, const TitleLayerFn& layer = {});
 
 // The "title" generator at frame t of a clip `duration` frames long. With Motion Blur (letter_blur), the average of
 // letter_samples renders spread evenly over the shutter (letter_shutter degrees of a frame) centred on the frame.
-Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {});
+// Letters that draw the same at every one of those times (and nothing that moves comes near them) are drawn once, the
+// rest at every time.
+Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {},
+                  const TitleLayerFn& layer = {});
 // One render at a time between frames, without motion blur.
-Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {});
+Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {},
+                    const TitleLayerFn& layer = {});
 
 // A styled title's text as one outline, laid out with its runs (no path or animation), lines `lineHeight` apart, for
 // the 3D titles: px output pixels per sequence pixel. Empty when it has no runs.

@@ -637,6 +637,12 @@ struct SamplerSlot {
     int choke = 0;                      // a choke group (1..16): a note cuts every other voice of its group; 0 none
     double pitchVariation = 0;          // ± semitones, at random for each hit
     double levelVariation = 0;          // ± dB, at random for each hit
+    // How the force a key is played with comes out (its level, and which velocity layer answers): 0 linear, 1 soft
+    // (light playing comes out louder), 2 hard (more force for the same level), 3 drawn (through `velocityPoints`,
+    // velocity in to velocity out, 1-127, straight between them).
+    int velocityCurve = 0;
+    std::vector<std::pair<int, int>> velocityPoints;
+    Id output = 0;  // the audio track its part of a pass is recorded onto (its own lane and strip); 0 the sampler's own
     bool operator==(const SamplerSlot&) const = default;
 };
 // A note played: `at` and `length` in samples at the sequence's rate, from the sequence's start.
@@ -650,12 +656,15 @@ struct SamplerPass {
     Id lane = 0;
     uint32_t seed = 1;  // the hits' random variation
     std::vector<SamplerNote> notes;
+    // A part sent here by another track's slots (SamplerSlot::output): the sampler track that played it; 0 this one's.
+    Id track = 0;
     bool operator==(const SamplerPass&) const = default;
 };
 struct SamplerSettings {
     std::vector<SamplerSlot> pads;   // by key, at most one a key
     std::vector<SamplerPass> passes;
-    bool empty() const { return pads.empty() && passes.empty(); }
+    bool clipPerHit = false;  // a pass's sound placed as one clip a hit (cut at each note), not one clip
+    bool empty() const { return pads.empty() && passes.empty() && !clipPerHit; }
     bool operator==(const SamplerSettings&) const = default;
 };
 
@@ -844,6 +853,9 @@ struct Project {
     // Whether its media's stereo packing (MediaItem::stereo) has been read: false for a project saved before Montage
     // read it, until media/Decoder.h checkStereoMedia looks (not saved).
     bool stereoChecked = true;
+    // False for a project saved while untagged 4:2:2 footage was read with its chroma centred: checkStereoMedia then
+    // marks such footage to be read so still, once, so the project renders as it did.
+    bool chromaChecked = true;
 
     Id newId() { return nextId++; }
     MediaItem* findMedia(Id id);

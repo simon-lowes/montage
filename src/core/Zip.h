@@ -52,10 +52,11 @@ private:
     std::vector<Entry> entries_;
 };
 
-// A zip archive of stored (uncompressed) entries, names in UTF-8, built in memory.
+// A zip archive of stored (uncompressed) entries, names in UTF-8, built in memory. `align` (when more than 1): the
+// entry's data starts at a multiple of it from the archive's start (USDZ's packages want 64).
 class ZipWriter {
 public:
-    void add(const std::string& name, const std::string& data);
+    void add(const std::string& name, const std::string& data, size_t align = 0);
     std::string finish();  // the archive's bytes (the writer is empty again)
 
 private:

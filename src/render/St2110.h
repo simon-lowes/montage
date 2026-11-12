@@ -6,7 +6,11 @@
 //  - ST 2110-30 audio: AES67's L24 or L16, 1 ms or 125 µs packets, up to 8 channels at 48 kHz.
 //  - ST 2110-31 AES3 transparent audio: each AES3 subframe whole (its 24 bits, validity, user and channel status bits)
 //    in an AM824 word, so a payload that is not PCM (an ST 337 data burst) goes through bit for bit.
-//  - ST 2110-41 fast metadata: data items (a 22-bit type, its K bit and contents in 32-bit words) with each frame.
+//  - ST 2110-22 constant bit-rate compressed video: JPEG XS (media/JpegXs.h, through SVT-JPEG-XS) as RFC 9134
+//    carries it, in its codestream or slice packetisation mode, each frame the same number of bytes in the same number
+//    of packets, paced evenly over the frame as ST 2110-21's wide senders send.
+//  - ST 2110-41 fast metadata (as its 2026 edition has it): data items (a 22-bit type, its K bit and contents in 32-bit
+//    words) with each frame, and objects too big for a packet in segments (its Annex A).
 //  - ST 2022-7: each stream sent on two paths at once (and merged again by RTP sequence number where received).
 //  - ST 2110-40 ancillary data (RFC 8331): ancillary time code (ST 12-2), CEA-608/708 captions in a CDP (ST 334) and
 //    HDR static metadata (ST 2108-1), a packet each frame or field even with none.
@@ -28,6 +32,10 @@
 
 #include "core/Model.h"
 #include "render/ReferenceOutput.h"
+
+namespace montage {
+struct JxsPicture;
+}
 
 namespace montage::st2110 {
 
@@ -57,6 +65,15 @@ struct VideoFormat {
     int depth = 10;       // 8, 10 or 12
     std::string colorimetry = "BT709";  // BT709, BT2020 or BT2100
     std::string tcs = "SDR";            // SDR, PQ or HLG
+    // ST 2110-22: "jxsv", JPEG XS (RFC 9134), in place of ST 2110-20's "raw" pixel groups.
+    std::string codec = "raw";
+    double bpp = 5;          // (jxsv) bits a pixel, so each frame's bytes: width x height x bpp / 8
+    int packetMode = 0;      // (jxsv) RFC 9134's packetization mode: 0 codestream, 1 slice
+    // (jxsv) the codestream's profile, level and sublevel as RFC 9134's SDP names them, and the stream's bandwidth
+    // (ST 2110-22's b=AS: its IP packets' kilobits a second); a sender finds them when it opens, a receiver from the SDP
+    std::string profile, level, sublevel;
+    int64_t bandwidthKbps = 0;
+    bool jpegXs() const { return codec == "jxsv"; }
 };
 struct AudioFormat {
     int channels = 2;
@@ -81,7 +98,7 @@ std::string audioSdp(const AudioFormat& f, const Endpoint& to, int payloadType, 
 // (`ids`: the DID/SDID pairs it carries)
 std::string ancSdp(const VideoFormat& f, const Endpoint& to, int payloadType, const SdpOptions& o,
                    const std::vector<std::pair<int, int>>& ids = {{0x60, 0x60}, {0x61, 0x01}}, const Endpoint* to2 = nullptr);
-// ST 2110-41 fast metadata's stream (`types`: the data item types it carries, its fmtp's DIT).
+// ST 2110-41 fast metadata's stream (`types`: the data item types it carries, its fmtp's DIT, in hexadecimal).
 std::string metadataSdp(const Endpoint& to, int payloadType, const SdpOptions& o, const std::vector<uint32_t>& types, const Endpoint* to2 = nullptr);
 // An SDP's media format parameters (its a=fmtp line's "name=value;" pairs) and rtpmap encoding ("raw/90000").
 std::map<std::string, std::string> sdpParameters(const std::string& sdp, std::string* encoding = nullptr);
@@ -125,10 +142,63 @@ Pgroup pgroup(Sampling s, int depth);
 // Whether ST 2110-20 carries a picture of this width in whole pixel groups at this sampling and depth.
 bool videoFormatOk(const VideoFormat& f, std::string* why = nullptr);
 
+// Where packets go as they are made (false: sending failed).
+using PacketSink = std::function<bool(const uint8_t* data, size_t size)>;
+
+// ---- ST 2110-22's JPEG XS (RFC 9134).
+// A raster as JPEG XS's planes (Y, Cb, Cr or R, G, B) and back.
+JxsPicture jxsPictureOf(const Raster& r);
+Raster rasterOf(const JxsPicture& p);
+// The boxes RFC 9134 puts before each codestream (ISO/IEC 21122-3's): the video support box (the stream's maximum bit
+// rate, frame rate, sampling, profile and level) and the colour specification box (the format's CICP code points).
+std::vector<uint8_t> jxsvBoxes(const VideoFormat& f, uint16_t ppih, uint16_t plev, uint32_t codestreamBytes);
+// One frame (progressive) as RFC 9134's packets: `boxes`, then the codestream (as JxsEncoder makes it; `units` its
+// header's and each slice's bytes, for the slice packetization mode), each packet a 4-byte payload header and at most
+// `maxPayload` bytes, every packet of a packetization unit as long but its last; `frameCount` the F counter's frame.
+bool packJxsv(const std::vector<uint8_t>& boxes, const uint8_t* codestream, size_t size, const std::vector<uint32_t>& units, int packetMode,
+              int64_t frameCount, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
+// Packets a frame of `size` bytes makes (`units` its slices', in the slice mode).
+int jxsvPacketCount(size_t boxBytes, size_t size, const std::vector<uint32_t>& units, int packetMode, int maxPayload = 1200);
+// Rebuilds codestreams from RFC 9134 packets. A frame missing packets keeps what came: the slices they carried are
+// taken from the frame before (the same bytes each frame, at a constant bit rate), so a lost packet damages only the
+// lines of its slices; without a frame before to take them from, the frame is passed over.
+class JxsvAssembler {
+public:
+    JxsvAssembler() = default;
+    // A packet; true when it completed a frame (`codestream()` then holds it, `timestamp()` its timestamp).
+    bool add(const RtpPacket& p);
+    const std::vector<uint8_t>& codestream() const { return done_; }
+    uint32_t timestamp() const { return doneTimestamp_; }
+    int64_t lost() const { return lost_; }            // packets missing by their sequence numbers
+    int64_t lostInFrame() const { return doneLost_; } // packets missing from the frame last completed (0: whole)
+    int concealedSlices() const { return doneConcealed_; }  // its slices taken from the frame before
+    int64_t passedOver() const { return passedOver_; }      // frames too damaged to rebuild
+    int packetMode() const { return mode_; }
+
+private:
+    struct Part {
+        int sep = 0, p = 0;
+        bool last = false;
+        std::vector<uint8_t> data;
+    };
+    std::vector<Part> parts_;
+    uint32_t timestamp_ = 0, doneTimestamp_ = 0;
+    bool started_ = false;
+    int mode_ = 0;
+    int64_t lastSeq_ = -1, lost_ = 0, frameLost_ = 0, doneLost_ = 0, passedOver_ = 0;
+    int doneConcealed_ = 0;
+    // The frame before: its codestream, where its slices start (and its end), its boxes' bytes, a full packet's
+    // payload, and its packets.
+    std::vector<uint8_t> prev_;
+    std::vector<size_t> prevSlices_;
+    size_t prevBoxes_ = 0, unit_ = 0;
+    std::vector<uint8_t> done_;
+    bool finish();
+};
+
 // One picture (a frame, or with `field` 1 or 2 an interlaced frame's field: its rows of that parity) as ST 2110-20
 // packets: `format` V210 or UYVY rows (the reference output's), `stride` bytes apart, cut into packets of at most
 // `maxPayload` bytes of pixels (whole pixel groups, a row range each), the last marked.
-using PacketSink = std::function<bool(const uint8_t* data, size_t size)>;
 bool packVideo(const uint8_t* data, size_t stride, output::PixelFormat format, int width, int height, int field, uint32_t timestamp,
                RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
 // The same from a raster, at its sampling and depth.
@@ -196,16 +266,33 @@ bool packAm824(const uint32_t* words, int frames, int channels, uint32_t timesta
 std::vector<uint32_t> unpackAm824(const uint8_t* payload, size_t size, int channels);
 
 // ---- ST 2110-41 fast metadata: data items, each a 32-bit header (its type, 22 bits; the K bit; its length in 32-bit
-// words, 9 bits) and its contents, as many as fit in a packet, the frame's last packet marked.
+// words, 9 bits, never 0) and its contents, as many as fit in a packet, no packet marked; every packet within
+// ST 2110-10's standard UDP size limit, so an item is at most kMaxMetadataWords words.
 struct FastMetadata {
     uint32_t type = 0;  // (22 bits)
     bool k = false;
-    std::vector<uint32_t> words;  // (at most 511)
+    std::vector<uint32_t> words;  // (1 to kMaxMetadataWords)
     bool operator==(const FastMetadata& o) const = default;
 };
+// (1,460 bytes a UDP datagram: its 8-byte header, RTP's 12 and an item's 4 leave 359 words)
+constexpr size_t kMaxMetadataPayload = 1460 - 8 - 12;
+constexpr size_t kMaxMetadataWords = (kMaxMetadataPayload - 4) / 4;
+// (false when an item is empty, too long or of a type past 22 bits: nothing is sent then)
 bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
 // (false when an item runs past the payload)
 bool unpackFastMetadata(const uint8_t* payload, size_t size, std::vector<FastMetadata>& out);
+// Annex A's simple object segmentation: an object of `size` bytes (zeros after it to a whole word) as items of `type`,
+// each its segment's offset in words and then at most `maxWords` - 1 of its words, the last with K set.
+std::vector<FastMetadata> segmentObject(uint32_t type, const uint8_t* data, size_t size, size_t maxWords = kMaxMetadataWords);
+// The item Montage's own senders put with each frame (an experimental type, from ST 2110-41's 3FF000h to 3FFFFFh,
+// which need no registration): the sequence's frame number (64 bits, two words) and the frame's time code (hours,
+// minutes, seconds and frames a byte each, drop frame in the top bit).
+constexpr uint32_t kFrameItemType = 0x3FF4D0;
+FastMetadata frameItem(int64_t frame, const output::Timecode& tc);
+bool parseFrameItem(const FastMetadata& m, int64_t& frame, output::Timecode* tc = nullptr);
+// And back: the object's words from a stream's items of `type` in the order they came (the segments from offset 0 to
+// the one with K set, each where the one before ended); false while it is not whole.
+bool joinObject(const std::vector<FastMetadata>& items, uint32_t type, std::vector<uint32_t>& out);
 
 // ---- Ancillary data (ST 291 packets), as RFC 8331 carries them.
 struct AncPacket {
@@ -258,7 +345,15 @@ struct SenderOptions {
     Endpoint metadata{"239.100.0.4", 5004}, metadata2{"239.101.0.4", 5004};
     int metadataPayload = 101;
     std::vector<uint32_t> metadataTypes;
-    int maxPayload = 1200;  // bytes of pixels a packet
+    int maxPayload = 1200;  // bytes of pixels a packet (ST 2110-22: of codestream, after RFC 9134's payload header)
+    // ST 2110-22's JPEG XS in place of ST 2110-20 (the reference output's: its VideoFormat's codec, bits a pixel and
+    // packetization mode when it opens).
+    bool jpegXs = false;
+    double jpegXsBpp = 5;
+    int jpegXsPacketMode = 0;
+    // ST 2110-31 in place of ST 2110-30 (the reference output's: its sound as AES3 subframes, AudioFormat::aes3, in
+    // 125 µs packets above 6 channels).
+    bool aes3 = false;
     std::string refclk = "ptp=IEEE1588-2008:traceable";
     // ST 2022-7: every packet also sent to these (from `interfaceAddress2`), when `redundant`.
     bool redundant = false;
@@ -299,6 +394,8 @@ public:
     void queueAes3(const uint32_t* words, int frames);
     // ST 2110-41: data items sent with the next frame.
     void setNextMetadata(std::vector<FastMetadata> items) { nextMetadata_ = std::move(items); }
+    // ST 2110-22: the codestream of the frame last sent (as packed, its boxes aside).
+    const std::vector<uint8_t>& lastCodestream() const { return codestream_; }
     void close();
     bool isOpen() const;
     std::string sdpVideo() const, sdpAudio() const, sdpAnc() const, sdpMetadata() const;
@@ -307,6 +404,9 @@ public:
     const VideoFormat& videoFormat() const { return video_; }
     const AudioFormat& audioFormat() const { return audio_; }
     int64_t framesSent() const { return frames_; }
+    // Frame slots passed over because `send` was called too late (over a fifth of a second behind): the frames after
+    // go out from now, so their timestamps run that many frames ahead of their count.
+    int64_t slotsSkipped() const { return skipped_; }
     int64_t packetsDropped() const;  // packets lost because the system's send queue stayed full
     // Packets path 0 or 1 could not send (its network down, say); with ST 2022-7 the other path goes on, and `send`
     // fails only when both do.
@@ -329,8 +429,15 @@ private:
     bool aesQueued_ = false;  // (queueAes3 used: send's PCM not sent)
     std::vector<AncPacket> frameAnc_;
     std::vector<FastMetadata> nextMetadata_;
+    struct Jxs;  // (ST 2110-22's encoder)
+    std::unique_ptr<Jxs> jxs_;
+    std::vector<uint8_t> codestream_, boxes_;
+    std::vector<uint32_t> units_;
+    bool sendJxs(const Raster& picture, const float* audio, int audioFrames, const output::Timecode* timecode,
+                 const std::vector<AncPacket>& anc, const std::atomic<bool>* stop);
     std::string clock_, source_, source2_;
     int64_t frames_ = 0;
+    std::atomic<int64_t> skipped_{0};
 };
 
 // What an ST 2110 output (output::backends()'s "ST 2110") sends now: its streams' formats and where they go; false when

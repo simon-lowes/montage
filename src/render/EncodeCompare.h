@@ -6,8 +6,9 @@
 //  - ΔICtCp, the colour difference of ITU-R BT.2124 (ΔE_ITP = 720 √(ΔI² + (ΔCt/2)² + ΔCp²), 1 the smallest
 //    difference seen), on the light each picture shows: PQ as coded, HLG on a 1000-nit display, SDR with white at
 //    100 nits;
-//  - VMAF where Montage is built with libvmaf (MONTAGE_WITH_VMAF, off by default): Netflix's v1 model for SDR and its
-//    HDR v1 model for PQ and HLG.
+//  - VMAF through libvmaf (built with Montage, MONTAGE_WITH_VMAF): Netflix's v1 model for SDR, built into libvmaf, and
+//    its HDR v1 model for PQ and HLG where libvmaf has it built in or it is in the VMAF models folder (libvmaf v3.2.1
+//    has none, so HDR encodes are compared without VMAF until then).
 // The two are aligned first by a search over ±N frames on small pictures. The encode is compared in its own format:
 // the reference is converted to it (size, sampling, bit depth and matrix) where it differs.
 #pragma once
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,6 +33,7 @@ struct QualityPicture {
     bool rgb = false;             // planes G, B, R (as FFmpeg's planar RGB) instead of Y, Cb, Cr
     bool fullRange = false;
     bool chromaLeft = true;       // subsampled chroma sited with the left luma sample (as MPEG's default), else centred
+    int chromaLoc = 0;            // the file's chroma site as tagged (FFmpeg's AVChromaLocation; 0 untagged)
     double kr = 0.2126, kb = 0.0722;  // the matrix's weights
     // What the code values mean, for ΔICtCp: "bt1886" (SDR), "pq" or "hlg"; "bt709", "bt2020" or "p3" primaries.
     std::string transfer = "bt1886", primaries = "bt709";
@@ -76,8 +79,32 @@ enum QualityMetric : unsigned {
 };
 // "psnr", "ssim", "ms_ssim", "delta_ictcp", "vmaf"; 0 for anything else.
 unsigned qualityMetricFromName(const std::string& name);
-// Whether Montage was built with libvmaf.
+// Whether Montage was built with libvmaf (it is unless configured without MONTAGE_WITH_VMAF), its version
+// ("v3.2.1"), and whether it has this model built in, by its version ("vmaf_v1.0.16_3d0h").
 bool vmafAvailable();
+std::string vmafVersion();
+bool vmafModelBuiltIn(const std::string& version);
+// Whether VMAF can measure a picture of this layout: Y′CbCr 4:2:0, 4:2:2 or 4:4:4.
+bool vmafMeasures(const QualityPicture& p);
+
+// VMAF through libvmaf: pairs of pictures (of one layout) fed in order, each pair's score read at the end. Also used
+// by the per-shot streaming ladders' trial encodes (render/StreamingPackage).
+class VmafMeter {
+public:
+    VmafMeter();
+    ~VmafMeter();
+    VmafMeter(const VmafMeter&) = delete;
+    VmafMeter& operator=(const VmafMeter&) = delete;
+    // `model`: a model's JSON file, or one libvmaf has built in, by its version (as vmafModelFor gives).
+    bool open(const std::string& model, int threads, std::string* error = nullptr);
+    bool add(const QualityPicture& reference, const QualityPicture& encode);
+    bool finish(std::vector<double>& scores);  // a score a pair, in the order they were added
+    unsigned pictures() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> d;
+};
 
 constexpr double kNoScore = std::numeric_limits<double>::quiet_NaN();
 
@@ -97,13 +124,16 @@ struct FrameQuality {
 };
 
 struct CompareOptions {
-    unsigned metrics = MetricPsnr | MetricSsim | MetricMsSsim | MetricDeltaItp;  // VMAF only when asked for
+    unsigned metrics = MetricsAll;  // (VMAF is left out where Montage has no libvmaf)
     int search = 12;         // the encode may start up to this many frames before or after the reference
     int alignFrames = 48;    // frames compared for the alignment
     int threads = 0;         // 0 = as many as the computer has; results are the same whatever this is
     int worstCount = 5;      // the worst frames listed (by R′G′B′ PSNR, else SSIM, else VMAF)
-    std::string vmafModel;   // a model's JSON file; "" = the v1 model (HDR v1 for PQ and HLG) from vmafModelDir
-    // Where VMAF's model files are: MONTAGE_VMAF_MODELS, else the models folder beside the program.
+    // A model's JSON file, or a built-in model's version; "" = the v1 model built into libvmaf (for PQ and HLG the
+    // HDR v1 model, built in or from vmafModelDir; for pictures whose chroma is under 80 samples either way, which the
+    // v1 model's chroma feature cannot measure, the v0.6.1 model).
+    std::string vmafModel;
+    // Where HDR VMAF's model file may be: MONTAGE_VMAF_MODELS, else the vmaf-models folder beside the program.
     std::string vmafModelDir;
     // What the files' code values mean when their tags do not say (Y4M, untagged streams): "" = from the tags,
     // else as QualityPicture's transfer and primaries.
@@ -124,6 +154,7 @@ struct EncodeComparison {
     std::vector<FrameTime> worstFrames;  // the worst first
     bool vmafScored = false;
     std::string vmafModel;       // the model used
+    std::string vmafNote;        // why VMAF was asked for and not measured (HDR with no HDR model), else ""
     // How many frames each has after the alignment's offset is taken off (-1: not known), frames the decoder reported
     // damaged in the encode, and what is wrong but did not stop the comparison (frames missing or extra, damage).
     int64_t referenceFrames = -1, encodeFrames = -1;
@@ -152,6 +183,9 @@ PictureSource openPictureFile(const std::string& path, const QualityPicture* lik
                               std::string* error = nullptr);
 // The first picture of a file, as decoded (its layout and tags).
 bool probePictureFile(const std::string& path, QualityPicture& out, const CompareOptions& o, std::string* error = nullptr);
+// The VMAF model a comparison in `like`'s layout and tags uses (o.vmafModel when given); "" when there is none for it
+// (HDR with no HDR model).
+std::string vmafModelFor(const QualityPicture& like, const CompareOptions& o);
 
 // Two files.
 EncodeComparison compareEncodeFiles(const std::string& reference, const std::string& encode, const CompareOptions& o,

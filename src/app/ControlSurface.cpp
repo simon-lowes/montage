@@ -435,7 +435,7 @@ void ControlSurface::command(const QString& name) {
 }
 
 void ControlSurface::button(int note, bool down) {
-    // The monitor keys (F1 Dim, F2 Mono, F3 Mute; F4 talks back while it is held).
+    // The monitor keys (F1 Dim, F2 Mono, F3 Mute; F4 talks back while it is held; F5 and F6 mark a live package).
     if (note == mcu::F1 + 3) {
         command(down ? QStringLiteral("talkbackOn") : QStringLiteral("talkbackOff"));
         return;
@@ -443,6 +443,11 @@ void ControlSurface::button(int note, bool down) {
     if (!down) return;
     if (note >= mcu::F1 && note < mcu::F1 + 3) {
         command(note == mcu::F1 ? QStringLiteral("dim") : note == mcu::F1 + 1 ? QStringLiteral("mono") : QStringLiteral("monitorMute"));
+        return;
+    }
+    // (F5 and F6: an ad break and a chapter in the live package File > Capture is making)
+    if (note == mcu::F1 + 4 || note == mcu::F1 + 5) {
+        command(note == mcu::F1 + 4 ? QStringLiteral("liveAdBreak") : QStringLiteral("liveChapter"));
         return;
     }
     const int n = tracks();

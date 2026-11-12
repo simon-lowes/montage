@@ -6,6 +6,7 @@
  *   hang     never returns
  *   overrun  writes far past the end of the buffer it was given
  *   leak     takes 64 MB more memory each call (touched, never given back)
+ *   slow     takes 0.4 s, then goes on as usual
  * The tests set it only while a plug-in host starts, so it reaches the host and never the test's own process. */
 #ifndef MONTAGE_TEST_FAULT_H
 #define MONTAGE_TEST_FAULT_H
@@ -70,6 +71,8 @@ static void montage_test_fault(const char* call, float* buf, size_t n) {
         for (; i < n + 64 * 1024; i += 1024) ((volatile float*)p)[i] = 1.0f;
         for (; i < ((size_t)1 << 32); i += (size_t)1 << 18) ((volatile float*)p)[i] = 1.0f;
         abort();
+    } else if (!strcmp(kind, "slow")) {
+        for (int i = 0; i < 4; ++i) montage_test_fault_sleep();
     } else if (!strcmp(kind, "leak")) {
         const size_t bytes = (size_t)64 << 20;
         char* m = (char*)malloc(bytes);

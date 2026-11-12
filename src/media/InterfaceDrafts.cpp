@@ -9,6 +9,7 @@
 #include "render/Exporter.h"
 
 #include <QRegularExpression>
+#include <QSet>
 #include <QString>
 #include <algorithm>
 #include <cstdlib>
@@ -151,6 +152,35 @@ InterfaceDraftStats interfaceTranslationStatus(const std::string& ts) {
 // model made of them ("(*.Montage)", "(*. srt)"): only each filter's name is the translation's, less any separator the
 // model doubled or wrote its own way (";;;", "؛"). A draft that lost or merged a filter, or kept no name for one or only
 // pieces of the patterns ("*.otio *.edl)", "WebVTT*.vtt"), is not kept.
+bool garbledDraft(const std::string& source, const std::string& draft) {
+    const QString src = QString::fromStdString(source), d = QString::fromStdString(draft);
+    if (d.contains(QStringLiteral("<unk>")) || d.count('\\') > src.count('\\') || d.count('+') > src.count('+')) return true;
+    // (a letter of another script than Latin: Greek and on, but not Latin's own extended letters)
+    const bool latin = std::none_of(d.begin(), d.end(), [](QChar c) {
+        return c.isLetter() && c.unicode() >= 0x370 && !(c.unicode() >= 0x1e00 && c.unicode() <= 0x1eff);
+    });
+    if (latin) return false;
+    static const QRegularExpression english(QStringLiteral("[A-Za-z]+"));
+    QSet<QString> words;
+    for (auto it = english.globalMatch(src); it.hasNext();) words.insert(it.next().captured());
+    // Each run of letters in the draft that is three English letters or more and no word of the source, but one with
+    // its first letter gone.
+    for (qsizetype i = 0; i < d.size();) {
+        if (!d[i].isLetter()) {
+            ++i;
+            continue;
+        }
+        qsizetype j = i;
+        while (j < d.size() && d[j].isLetter()) ++j;
+        const QString w = d.mid(i, j - i);
+        i = j;
+        if (w.size() < 3 || words.contains(w) || !english.match(w).hasMatch() || english.match(w).capturedLength() != w.size()) continue;
+        for (const QString& x : words)
+            if (x.size() == w.size() + 1 && x.mid(1) == w) return true;
+    }
+    return false;
+}
+
 static bool keepFilters(const QString& src, QString& d) {
     static const QRegularExpression patterns(QStringLiteral("\\(([^()]*\\*[^()]*)\\)\\s*$"));
     const QStringList from = src.split(QStringLiteral(";;")), to = d.split(QStringLiteral(";;"));
@@ -237,7 +267,7 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
         // text stays in English.
         // (and one that wrote backslashes for words it could not place, a run or a single one the source has not, is
         // garbled the same way)
-        const bool garbled = d.contains(QStringLiteral("<unk>")) || d.count('\\') > src.count('\\');
+        const bool garbled = garbledDraft(m.source, d.toStdString());
         if (d.isEmpty() || garbled || placeholders(d) != placeholders(src) || !keepFilters(src, d)) {
             ++st.skipped;
             continue;

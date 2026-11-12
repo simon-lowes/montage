@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -85,6 +86,8 @@ public:
     void feedChase(const float* samples, int frames, int channels);
     LtcChase::Position chasePosition() const;
     QString chaseStatus() const;
+    // The samples taken from the audio device's input so far (-1: not chasing through the device).
+    int64_t chaseSamplesFromDevice() const;
 
     static QByteArray toolJson();
     QString runTool(const QJsonObject& args, QJsonObject& structured, bool& isError);
@@ -98,6 +101,7 @@ signals:
 private:
     void publish();
     void chaseTick();
+    void drainChase();  // what the device's input brought, into the chase
     LtcChase::Position chaseNow() const;
     void finishWork();
     int base() const;
@@ -123,6 +127,16 @@ private:
     QByteArray chasePending_;  // a sample frame split between reads
     double chaseRate_ = 48000;
     std::chrono::steady_clock::time_point chaseFed_;
+    // Through the audio device: its input's channel, queued on the audio thread and drained here.
+    // The device's LTC input, from the audio thread to this one: a ring (four seconds, made before it starts) the
+    // audio thread writes without a lock or an allocation.
+    struct ChaseQueue {
+        std::vector<float> ring = std::vector<float>(size_t(48000) * 4);
+        std::atomic<int64_t> written{0}, read{0};
+        std::atomic<int64_t> taken{0};
+    };
+    std::shared_ptr<ChaseQueue> chaseQueue_;
+    int chaseInputId_ = -1;
     QString statusError_;
     std::chrono::steady_clock::time_point statusFailed_;
 };

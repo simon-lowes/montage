@@ -92,6 +92,7 @@ public:
     void setHdrViewer(bool on);
     bool hdrViewer() const { return hdrWanted_; }
     void setHdrPicture(montage::HdrPicturePtr picture);  // null: none (an SDR sequence)
+    montage::HdrPicturePtr hdrPicture() const { return hdrPicture_; }
     bool hdrShowing() const;
     double hdrHeadroom() const;
     // The nits the HDR viewer shows SDR white at, where the system says; else BT.2408's 203.
@@ -230,6 +231,9 @@ public:
     // HDR viewing (ViewerWidget::setHdrViewer): HDR sequences shown as HDR where the build and display can; the
     // controller renders their light only while that is so. An "HDR" badge says when it is.
     void setHdrViewer(bool on);
+    // (Its picture is the feed's own size, scaled down only where the monitor has fewer pixels than it (never below
+    // 1280 by 720), and an HDR feed's (BT.2100 PQ or HLG) is shown as HDR while the HDR viewer shows HDR, tone mapped
+    // as an HDR sequence's is otherwise.)
     // Source: a feed watched live (media/Capture.h LiveFeed), its newest picture shown with its timecode in the
     // counter, its sound's meters over the picture and a LIVE badge, while `feed` is set (null: the media as it is
     // again). `recording`: it is being recorded; `media`, the recording's media item once imported (0 until then).
@@ -287,6 +291,9 @@ private:
     QToolButton* liveBadge_ = nullptr;
     std::vector<float> livePeaks_;
     int64_t liveShown_ = -1;  // the feed's picture count when last shown
+    bool liveConverting_ = false;  // its newest picture is being made ready, off this thread
+    void showLivePicture();
+    void livePictureReady(const std::shared_ptr<LiveFeed>& feed, int64_t pictures, const QImage& view, montage::HdrPicturePtr hdr);
 
     void renderTrimView();
     void updateLookAround();

@@ -22,6 +22,7 @@ class QImage;
 namespace montage {
 
 struct Lut3D;
+struct ShapeRaster;
 
 namespace gpu {
 
@@ -47,6 +48,9 @@ struct ShaderStep {
         std::vector<float> values;
     };
     std::vector<Texture> textures;
+    // Values set while it runs (OCIO's dynamic properties): floats each `uniforms[i]` names, the source reading them as
+    // montageValues[i / 4][i % 4] (the Params block), given by the ColorOp drawing it (ColorOp::values).
+    std::vector<std::string> uniforms;
 };
 
 // One colour step on a layer at its source size (render/Processing's colour effects, as they run there).
@@ -67,13 +71,19 @@ struct ColorOp {
         int mode = 0;           // gpufilter.frag's
         float params[60] = {};  // its p[1..15]
         std::vector<float> table;  // RGBA rows of tableWidth (its `table`, as the mode says), or none
+        std::shared_ptr<const std::vector<float>> sharedTable;  // (or kept elsewhere, not copied: read in `table`'s place)
         int tableWidth = 0;
         int width = 0, height = 0;  // what it makes (0: the layer's size)
         int save = -1;              // the filter's slot it keeps what it makes in, for a later pass
         int extra = -1, tableSlot = -1;  // slots read as gpufilter.frag's `extra`, and as its `table` instead of `table` above
+        // What it makes read back as flags (each texel's red, 0 or not), and a pass left out where flag `when` is 0
+        // (Aperture Glare's tiles with no light). (A sharedTable stays on the GPU while it lives, for later frames.)
+        bool flags = false;
+        int when = -1;
     };
     std::vector<FilterPass> passes;  // Filter
     std::shared_ptr<const ShaderStep> shader;  // Shader
+    std::vector<float> values;                 // Shader: its uniforms' values
     int slot = 0;                // Store, Load
     int passMode = 0;            // Pass
     int in[3] = {-1, -1, -1};    // Pass
@@ -108,6 +118,7 @@ struct Layer {
     Frame16Ptr frame;                    // or a decoded frame, RGBA or Y′CbCr planes (premultiplied on the GPU) ...
     std::shared_ptr<const Lut3D> input;  // ... and its input transform, if any
     Image image;                         // or a picture made on the CPU (premultiplied, working space)
+    std::shared_ptr<const ShapeRaster> shapes;  // or a Shape layer's paints, drawn here (gpufilter.frag's 56) at their size
     std::vector<ColorOp> ops;
     Placement place;
 };
@@ -120,10 +131,20 @@ struct Item {
     // gpuTransitionParams), both clips placed on the canvas first. (-1: a cross dissolve, mixed as they are placed.)
     int transition = -1;
     float transitionParams[44] = {};
+    // (Smooth Cut, 18: its flow, a grid of moves in RGBA rows of transitionTableWidth, read as gpumix.frag's table)
+    std::vector<float> transitionTable;
+    int transitionTableWidth = 0;
     // A track matte: the clip seen through another track's picture (placed at the canvas's size), by its alpha or
     // luma, or the reverse (render/Compositor's applyTrackMatte).
     std::optional<Layer> matte;
     bool matteLuma = false, matteReverse = false;
+    // Displace by Layer (render/PaintFx's displaceByMap, before the track matte): the clip, placed on the canvas, moved
+    // by the channels of a map, another track's picture (displaceMap, placed at the canvas's size) or its own
+    // (displaceSelf), through displaceBlur's filters first; gpumix.frag's 31 with displaceParams.
+    bool displace = false, displaceSelf = false;
+    std::optional<Layer> displaceMap;
+    std::vector<ColorOp> displaceBlur;
+    float displaceParams[24] = {};
     int blendMode = 0;       // render/Processing's blendModeIndex
 };
 
@@ -131,6 +152,7 @@ struct Frame {
     int width = 0, height = 0;
     std::vector<Item> items;  // bottom first
     bool flatten = true;      // over black
+    bool part = false;        // the canvas so far, read back part way through a frame (not counted as a frame)
     std::shared_ptr<const Lut3D> display;  // the display transform, if any
 };
 
@@ -142,6 +164,8 @@ struct Stats {
     long gpuFrames = 0, cpuFrames = 0;  // frames asked of the GPU path: drawn there, or fallen back
     long gpuLayers = 0, cpuLayers = 0;  // their layers: drawn from the source, or made on the CPU and uploaded
     long filterPasses = 0, mixPasses = 0;  // passes of filters (gpufilter.frag) and of transitions and mattes (gpumix.frag)
+    long shaderBuilds = 0;                 // shader steps built (ShaderStep, once a key), since resetStats
+    long shapeLayers = 0;                  // Shape layers drawn on the GPU (Layer::shapes)
     std::string lastFallback;
     std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
     // Hardware-decoded frames (render/GpuHardware): drawn from the decoding device's memory (hwGpuCopies of them

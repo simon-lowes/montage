@@ -248,4 +248,84 @@ bool looksLikeCut(const ShotLook& a, const ShotLook& b, const ShotLook* before, 
     return d > 0.2 && d > around * 3 + 0.05;
 }
 
+namespace {
+
+void twice(Param& p) {
+    for (Keyframe& k : p.keys) {
+        const double t = 2 * k.time();
+        k.t = FrameTime(std::floor(t));
+        k.sub = t - double(k.t);
+        k.inDt *= 2;
+        k.outDt *= 2;
+    }
+    p.exprFrom *= 2;
+}
+void twice(Effect& e) {
+    for (auto& [name, param] : e.params) twice(param);
+}
+void twice(std::vector<Effect>& effects) {
+    for (Effect& e : effects) twice(e);
+}
+void twice(Marker& m) {
+    m.t *= 2;
+    m.duration *= 2;
+    if (m.drawnAt >= 0) m.drawnAt *= 2;
+}
+void twice(Clip& c) {
+    c.start *= 2;
+    c.duration *= 2;
+    c.sourceIn *= 2;
+    for (Effect* e : {&c.generator, &c.motion, &c.audio, &c.timing}) twice(*e);
+    twice(c.effects);
+    for (auto& [id, trim] : c.trims) twice(trim);
+    for (GradeVersion& g : c.gradeVersions) twice(g.effects);
+    for (CompositeNode& n : c.composite.nodes) {
+        n.offset *= 2;  // (a media input's frame, in sequence frames)
+        twice(n.generator);
+        twice(n.effects);
+    }
+    for (Marker& m : c.markers) twice(m);
+    for (Take& t : c.takes) t.offset *= 2;
+}
+
+}  // namespace
+
+Sequence fieldRateSequence(const Sequence& seq) {
+    Sequence d = seq;
+    d.fps = Rational{seq.fps.num * 2, seq.fps.den};
+    for (std::vector<Track>* tracks : {&d.videoTracks, &d.audioTracks})
+        for (Track& t : *tracks) {
+            for (Clip& c : t.clips) twice(c);
+            for (Transition& x : t.transitions) {
+                x.duration *= 2;
+                twice(x.params);
+            }
+            twice(t.effects);
+            for (Param* a : {&t.volumeAuto, &t.panAuto, &t.volumeTrim, &t.surroundXAuto, &t.surroundYAuto, &t.surroundZAuto, &t.muteAuto}) twice(*a);
+            for (TakeLane& l : t.lanes) l.start *= 2;
+        }
+    for (Marker& m : d.markers) twice(m);
+    for (CaptionTrack& t : d.captionTracks)
+        for (Caption& c : t.captions) {
+            c.start *= 2;
+            c.end *= 2;
+        }
+    for (ColorGroup& g : d.colorGroups) {
+        twice(g.pre);
+        twice(g.post);
+    }
+    for (SharedNode& n : d.sharedNodes) twice(n.effects);
+    twice(d.masterEffects);
+    if (d.inPoint >= 0) d.inPoint *= 2;
+    if (d.outPoint >= 0) d.outPoint = d.outPoint * 2 + 1;
+    d.playhead *= 2;
+    return d;
+}
+
+Project fieldRateProject(const Project& p) {
+    Project d = p;
+    for (Sequence& s : d.sequences) s = fieldRateSequence(s);
+    return d;
+}
+
 }  // namespace montage

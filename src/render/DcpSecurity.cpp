@@ -306,6 +306,7 @@ struct SignatureParts {
     std::vector<Reference> references;
     QString canonicalization, method, value;
     std::vector<std::string> certificates;  // PEM, as KeyInfo lists them (leaf first)
+    int signatures = 0;                     // ds:Signature elements in the document
 };
 
 bool readSignature(const std::string& xml, SignatureParts& out) {
@@ -317,7 +318,7 @@ bool readSignature(const std::string& xml, SignatureParts& out) {
         if (x.isStartElement()) {
             const QString name = x.name().toString();
             const bool dsig = x.namespaceUri() == QLatin1String(kDsig);
-            if (dsig && name == QLatin1String("Signature")) inSignature = true;
+            if (dsig && name == QLatin1String("Signature")) inSignature = true, ++out.signatures;
             if (!inSignature || !dsig) continue;
             element = name;
             const QString algorithm = x.attributes().value(QStringLiteral("Algorithm")).toString();
@@ -359,7 +360,7 @@ const EVP_MD* digestFor(const QString& uri) {
 
 bool securityAvailable() { return true; }
 
-bool makeCertificateChain(const std::string& organisation, CertificateChain& out, std::string* error) {
+bool makeCertificateChain(const std::string& organisation, CertificateChain& out, std::string* error, const std::string& leafRole) {
     auto fail = [&](const std::string& why) {
         if (error) *error = opensslError(why);
         return false;
@@ -370,7 +371,12 @@ bool makeCertificateChain(const std::string& organisation, CertificateChain& out
         if (std::isalnum(static_cast<unsigned char>(c)) || std::strchr(" '()+,-./:=?", c)) org += c;
     while (!org.empty() && org.back() == ' ') org.pop_back();
     if (org.empty()) org = "Montage";
-    const char* names[3] = {".montage.smpte-430-2.ROOT", ".montage.smpte-430-2.INTERMEDIATE", "CS.montage.smpte-430-2.LEAF"};
+    std::string role;
+    for (char c : leafRole)
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == ' ') role += c;
+    if (role.empty()) role = "CS";
+    const std::string leafName = role + ".montage.smpte-430-2.LEAF";
+    const char* names[3] = {".montage.smpte-430-2.ROOT", ".montage.smpte-430-2.INTERMEDIATE", leafName.c_str()};
     const char* constraints[3] = {"critical,CA:TRUE,pathlen:3", "critical,CA:TRUE,pathlen:2", "critical,CA:FALSE"};
     const char* usages[3] = {"keyCertSign,cRLSign", "keyCertSign,cRLSign", "digitalSignature,keyEncipherment"};
     const char* authority[3] = {"keyid:always,issuer:always", "keyid:always,issuer:always", "keyid,issuer:always"};
@@ -515,6 +521,7 @@ bool readCertificate(const std::string& pem, CertificateInfo& out, std::string* 
     info.notBefore = isoTime(X509_get0_notBefore(c.get()));
     info.notAfter = isoTime(X509_get0_notAfter(c.get()));
     info.ca = X509_check_ca(c.get()) > 0;
+    info.encipherment = (X509_get_key_usage(c.get()) & KU_KEY_ENCIPHERMENT) != 0;  // (all bits set when it states none)
     if (EVP_PKEY* key = X509_get0_pubkey(c.get())) info.bits = EVP_PKEY_get_bits(key);
     out = std::move(info);
     return true;
@@ -666,6 +673,8 @@ bool verifyXmlSignature(const std::string& xml, std::string* error, SignatureChe
     };
     SignatureParts parts;
     if (!readSignature(xml, parts)) return fail("The document has no signature");
+    // (one only: the references of every signature are read, but only the first SignedInfo is checked)
+    if (parts.signatures != 1) return fail("The document has more than one signature");
     if (parts.certificates.empty()) return fail("The signature names no certificate");
     if (parts.references.empty()) return fail("The signature covers nothing");
     for (const auto& r : parts.references) {
@@ -704,6 +713,7 @@ bool verifyXmlSignature(const std::string& xml, std::string* error, SignatureChe
         check->references.clear();
         for (const auto& r : parts.references) check->references.push_back(r.uri.toStdString());
         check->signerThumbprint = base64(thumbprintBytes(leaf.get()));
+        check->certificates = parts.certificates;
     }
     return true;
 }

@@ -31,6 +31,10 @@ bool validFieldOrder(const std::string& fields) {
     return fields.empty() || fields == "progressive" || fields == "upper" || fields == "lower";
 }
 
+bool validChromaSiting(const std::string& chroma) {
+    return chroma.empty() || chroma == "left" || chroma == "center" || chroma == "topleft";
+}
+
 bool parsePulldown(const std::string& value, std::vector<PulldownStretch>& out) {
     out.clear();
     if (value.empty()) return true;
@@ -134,6 +138,7 @@ bool parseInterpretation(const std::string& path, Interpretation& out) {
         else if (key == "par") out.par = std::max(0.0, parseNumber(value));
         else if (key == "alpha" && validAlphaMode(value)) out.alpha = value == "straight" ? "" : value;
         else if (key == "fields" && validFieldOrder(value)) out.fields = value;
+        else if (key == "chroma" && validChromaSiting(value)) out.chroma = value;
         else if (key == "pulldown") {
             if (std::vector<PulldownStretch> st; parsePulldown(value, st)) out.pulldown = value;
         } else if (key == "pitch") out.keepPitch = value == "1";
@@ -171,6 +176,7 @@ std::string interpretedPath(const std::string& path, const Interpretation& i) {
     if (i.par > 0) add("par=" + formatNumber(i.par, 6));
     if (!i.alpha.empty() && i.alpha != "straight") add("alpha=" + i.alpha);
     if (!i.fields.empty()) add("fields=" + i.fields);
+    if (!i.chroma.empty()) add("chroma=" + i.chroma);
     if (!i.pulldown.empty()) add("pulldown=" + i.pulldown);
     auto number = [](double v) { return formatNumber(v, 6); };
     if (i.rawExposure != 0) add("rawexp=" + number(i.rawExposure));

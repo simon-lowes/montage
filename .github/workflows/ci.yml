@@ -41,8 +41,19 @@ jobs:
           command -v meson > /dev/null || sudo apt-get install -y --no-install-recommends meson
           scripts/build-av2.sh ~/av2
           echo "MONTAGE_TEST_AV2_TOOLS=$HOME/av2/bin" >> "$GITHUB_ENV"
+      # SVT-JPEG-XS (JPEG XS in files, MXF and ST 2110-22), from a pinned tag checked against its commit, with its own
+      # encoder and decoder, which the JPEG XS tests compare Montage's frames with.
+      - name: Cache SVT-JPEG-XS
+        uses: actions/cache@v4
+        with:
+          path: ~/svt-jpegxs
+          key: svt-jpegxs-${{ runner.os }}-${{ hashFiles('scripts/build-svt-jpegxs.sh') }}
+      - name: SVT-JPEG-XS
+        run: |
+          scripts/build-svt-jpegxs.sh ~/svt-jpegxs
+          echo "MONTAGE_TEST_SVTJPEGXS=$HOME/svt-jpegxs/bin" >> "$GITHUB_ENV"
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DMONTAGE_WITH_AV2=ON -DAV2_ROOT="$HOME/av2"
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DMONTAGE_WITH_AV2=ON -DAV2_ROOT="$HOME/av2" -DSVTJPEGXS_ROOT="$HOME/svt-jpegxs" -DMONTAGE_REQUIRE_JPEGXS=ON
       - name: Build
         run: cmake --build build
       - name: Cache the speech model
@@ -224,6 +235,15 @@ jobs:
           (sudo apt-get update > /dev/null && sudo apt-get install -y --no-install-recommends libdav1d-dev > /dev/null && scripts/build-avifgainmaputil.sh ~/libavif) \
             && echo "MONTAGE_TEST_AVIFGAINMAP=$HOME/libavif/bin/avifgainmaputil" >> "$GITHUB_ENV" \
             || echo "::warning::Could not build libavif's avifgainmaputil; its part of the HDR stills test will be skipped"
+      - name: Cache tinyusdz and its reader
+        uses: actions/cache@v4
+        with:
+          path: ~/tinyusdz
+          key: tinyusdz-${{ runner.os }}-${{ hashFiles('scripts/build-tinyusdz.sh', 'tests/tools/usd_readback.cc') }}
+      - name: tinyusdz, an independent USD reader for the 3D compositing test
+        run: |
+          scripts/build-tinyusdz.sh ~/tinyusdz && echo "MONTAGE_TEST_TINYUSDZ=$HOME/tinyusdz/bin/usd_readback" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not build tinyusdz; the 3D compositing test's independent USD read-back will be skipped"
       - name: libheif's decoder for the HDR stills test
         run: |
           sudo apt-get install -y --no-install-recommends libheif-examples libheif-plugin-libde265 > /dev/null \
@@ -296,7 +316,7 @@ jobs:
           MONTAGE_GPU_LOG: "1"
         run: |
           # Every GPU test must run on both: a skip (no device, no shader compiler) fails the step.
-          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuYcbcrPlanes gpuHardwareFrames gpuExportMatchesCpu gpuOcioMatchesCpu ofxControlsAndOpenGl"
+          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuYcbcrPlanes gpuHardwareFrames gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl"
           for backend in opengl vulkan; do
             echo "::group::$backend"
             MONTAGE_GPU=$backend xvfb-run -a build/tests/test_render $tests -o "$RUNNER_TEMP/$backend.txt,txt" -o -,txt || failed=1
@@ -307,3 +327,61 @@ jobs:
             fi
           done
           exit "${failed:-0}"
+
+  # HDR viewing on Linux: the viewer under Weston (headless, GL on llvmpipe, Wayland's colour management) built from
+  # source, as Ubuntu 24.04's Weston and wayland-protocols are too old for color-management-v1; Qt 6.8 for its RHI.
+  wayland-hdr:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: |
+          ./scripts/setup-deps.sh
+          # (Weston's build: Meson, libwayland, pixman, xkbcommon, libinput, libdrm, LittleCMS, EGL and GLES, cairo and
+          # hwdata for libdisplay-info; Mesa's drivers for its GL renderer and the viewer; what Qt 6.8's Wayland
+          # platform and its Gui targets need)
+          sudo apt-get install -y -q --no-install-recommends meson ninja-build libwayland-dev libwayland-bin libpixman-1-dev \
+            libxkbcommon-dev libinput-dev libevdev-dev libudev-dev libdrm-dev liblcms2-dev libegl-dev libgles-dev libgbm-dev \
+            libcairo2-dev libpng-dev hwdata libegl-mesa0 libgl1-mesa-dri libwayland-egl1 libwayland-cursor0 libxkbcommon0 \
+            libxcb-cursor0 libxkbcommon-x11-0 > /dev/null
+      - name: Cache Weston
+        uses: actions/cache@v4
+        with:
+          path: ~/weston
+          key: weston-${{ runner.os }}-${{ hashFiles('scripts/build-weston.sh') }}
+      - name: Weston with colour management, and wayland-protocols 1.46
+        run: scripts/build-weston.sh ~/weston
+      - name: Cache Qt 6.8
+        uses: actions/cache@v4
+        with:
+          path: ~/Qt
+          key: qt-6.8.3-linux_gcc_64-multimedia
+      - name: Qt 6.8 with Qt Multimedia (aqtinstall)
+        run: |
+          if [ ! -d ~/Qt/6.8.3/gcc_64 ]; then
+            python3 -m venv ~/aqt && ~/aqt/bin/pip install -q aqtinstall==3.3.0
+            ~/aqt/bin/aqt install-qt linux desktop 6.8.3 linux_gcc_64 -m qtmultimedia -O ~/Qt
+          fi
+          ls ~/Qt/6.8.3/gcc_64/plugins/platforms/libqwayland-egl.so
+      - name: Configure
+        run: |
+          set -o pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="$HOME/Qt/6.8.3/gcc_64" \
+            -DMONTAGE_WAYLAND_PROTOCOLS_DIR="$HOME/weston/share/wayland-protocols" | tee "$RUNNER_TEMP/configure.log"
+          # (Montage's own binding of the protocol, not Qt's)
+          grep -q "HDR viewer on Wayland: colour management" "$RUNNER_TEMP/configure.log"
+      - name: Build the app tests
+        run: cmake --build build --target test_app
+      - name: The HDR viewer under Weston, with colour management and without
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: scripts/wayland-hdr-check.sh ~/weston build/tests/test_app "$RUNNER_TEMP/wayland-hdr"
+      - name: Weston's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-hdr-logs
+          path: ${{ runner.temp }}/wayland-hdr
+          if-no-files-found: ignore

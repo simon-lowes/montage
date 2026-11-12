@@ -9,6 +9,7 @@
 #include <QStandardPaths>
 #include <QFileInfo>
 #include <QImage>
+#include <QPainter>
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -21,6 +22,8 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <thread>
 
 #include "audio/AraHost.h"
 #include "audio/AudioDevice.h"
@@ -271,6 +274,146 @@ int64_t recordClick(audiodev::Engine& e, int rate = 48000) {
     e.removeInput(in);
     e.removeOutput(out);
     return take.click();
+}
+
+// A tone's frequency in a recording: its rising zero crossings counted, from the first to the last (0 if fewer than 3).
+double toneHz(const std::vector<float>& x, int rate) {
+    double first = -1, last = -1;
+    int crossings = 0;
+    for (size_t i = 1; i < x.size(); ++i)
+        if (x[i - 1] < 0 && x[i] >= 0) {
+            const double at = double(i - 1) + double(-x[i - 1]) / double(x[i] - x[i - 1]);
+            if (first < 0) first = at;
+            last = at;
+            ++crossings;
+        }
+    return crossings < 3 ? 0.0 : double(crossings - 1) * rate / (last - first);
+}
+
+// A device test's recording of the first input, every sample as it comes (no clock).
+struct Listener {
+    std::mutex m;
+    std::vector<float> got;
+    void add(const float* in, int channels, int frames) {
+        std::lock_guard<std::mutex> lock(m);
+        for (int i = 0; i < frames; ++i) got.push_back(in[size_t(i) * size_t(channels)]);
+    }
+    std::vector<float> take() {
+        std::lock_guard<std::mutex> lock(m);
+        std::vector<float> out;
+        out.swap(got);
+        return out;
+    }
+    size_t size() {
+        std::lock_guard<std::mutex> lock(m);
+        return got.size();
+    }
+};
+
+// A 1 kHz sine at its own rate, for as long as it is asked.
+struct TonePump {
+    std::atomic<int64_t> pos{0};
+    int rate = 48000;
+    int64_t render(float* out, int channels, int frames) {
+        const int64_t p = pos.fetch_add(frames);
+        for (int i = 0; i < frames; ++i) {
+            const float v = float(0.4 * std::sin(2 * M_PI * 1000 * double(p + i) / rate));
+            for (int c = 0; c < channels; ++c) out[size_t(i) * size_t(channels) + size_t(c)] = v;
+        }
+        return p;
+    }
+};
+
+// libjackserver driven from a Python child (its own process: never alongside the JACK client library Montage loads):
+// a server on the dummy driver at 48 kHz, its rate switched when asked ("rate N" on stdin). Lines it prints for the
+// test begin "@@ ".
+const char* kJackServerScript =
+    "import ctypes, sys\n"
+    "name = sys.argv[1]\n"
+    "try:\n"
+    "    js = ctypes.CDLL('libjackserver.so.0')\n"
+    "except OSError:\n"
+    "    print('@@ nolib', flush=True)\n"
+    "    sys.exit(0)\n"
+    "class JSList(ctypes.Structure):\n"
+    "    pass\n"
+    "JSList._fields_ = [('data', ctypes.c_void_p), ('next', ctypes.POINTER(JSList))]\n"
+    "class Value(ctypes.Union):\n"
+    "    _fields_ = [('ui', ctypes.c_uint32), ('i', ctypes.c_int32), ('s', ctypes.c_char * 128), ('b', ctypes.c_bool), ('c', ctypes.c_char)]\n"
+    "V = ctypes.c_void_p\n"
+    "L = ctypes.POINTER(JSList)\n"
+    "def sig(f, res, args):\n"
+    "    getattr(js, f).restype = res\n"
+    "    getattr(js, f).argtypes = args\n"
+    "sig('jackctl_server_create2', V, [V, V, V])\n"
+    "sig('jackctl_server_get_drivers_list', L, [V])\n"
+    "sig('jackctl_server_get_parameters', L, [V])\n"
+    "sig('jackctl_driver_get_name', ctypes.c_char_p, [V])\n"
+    "sig('jackctl_driver_get_parameters', L, [V])\n"
+    "sig('jackctl_parameter_get_name', ctypes.c_char_p, [V])\n"
+    "sig('jackctl_parameter_set_value', ctypes.c_bool, [V, ctypes.POINTER(Value)])\n"
+    "sig('jackctl_server_open', ctypes.c_bool, [V, V])\n"
+    "sig('jackctl_server_switch_master', ctypes.c_bool, [V, V])\n"
+    "for f in ('jackctl_server_start', 'jackctl_server_stop', 'jackctl_server_close'):\n"
+    "    sig(f, ctypes.c_bool, [V])\n"
+    "sig('jackctl_server_destroy', None, [V])\n"
+    "def items(lst):\n"
+    "    out = []\n"
+    "    while lst:\n"
+    "        out.append(lst.contents.data)\n"
+    "        lst = lst.contents.next\n"
+    "    return out\n"
+    "def setp(params, key, field, value):\n"
+    "    for p in items(params):\n"
+    "        if js.jackctl_parameter_get_name(p) == key:\n"
+    "            v = Value()\n"
+    "            setattr(v, field, value)\n"
+    "            return js.jackctl_parameter_set_value(p, ctypes.byref(v))\n"
+    "    return False\n"
+    "server = js.jackctl_server_create2(None, None, None)\n"
+    "if not server:\n"
+    "    print('@@ noserver', flush=True)\n"
+    "    sys.exit(0)\n"
+    "sp = js.jackctl_server_get_parameters(server)\n"
+    "setp(sp, b'name', 's', name.encode())\n"
+    "setp(sp, b'realtime', 'b', False)\n"
+    "drivers = [d for d in items(js.jackctl_server_get_drivers_list(server)) if js.jackctl_driver_get_name(d) == b'dummy']\n"
+    "if not drivers:\n"
+    "    print('@@ nodrivers', flush=True)\n"
+    "    sys.exit(0)\n"
+    "dummy = drivers[0]\n"
+    "dp = js.jackctl_driver_get_parameters(dummy)\n"
+    "setp(dp, b'rate', 'ui', 48000)\n"
+    "setp(dp, b'period', 'ui', 256)\n"
+    "if not (js.jackctl_server_open(server, dummy) and js.jackctl_server_start(server)):\n"
+    "    print('@@ nostart', flush=True)\n"
+    "    sys.exit(0)\n"
+    "print('@@ started', flush=True)\n"
+    "for line in iter(sys.stdin.readline, ''):\n"
+    "    words = line.split()\n"
+    "    if len(words) == 2 and words[0] == 'rate':\n"
+    "        setp(dp, b'rate', 'ui', int(words[1]))\n"
+    "        print('@@ switched %d' % int(js.jackctl_server_switch_master(server, dummy)), flush=True)\n"
+    "    else:\n"
+    "        break\n"
+    "js.jackctl_server_stop(server)\n"
+    "js.jackctl_server_close(server)\n"
+    "js.jackctl_server_destroy(server)\n"
+    "print('@@ stopped', flush=True)\n";
+
+// The next line from the script beginning "@@ " (its server's own output passed over), "" when none comes in time.
+QString scriptLine(QProcess& p, int ms) {
+    QElapsedTimer t;
+    t.start();
+    while (t.elapsed() < ms) {
+        while (p.canReadLine()) {
+            const QString line = QString::fromUtf8(p.readLine()).trimmed();
+            if (line.startsWith(QLatin1String("@@ "))) return line.mid(3);
+        }
+        if (p.state() == QProcess::NotRunning && !p.canReadLine()) return {};
+        p.waitForReadyRead(100);
+    }
+    return {};
 }
 
 // Each test runs twice: in Montage's own process and in plug-in hosts.
@@ -1094,6 +1237,48 @@ private slots:
         QVERIFY(other && other->activate(48000, 512));
         QVERIFY(other->loadState(state));
         QVERIFY(std::fabs(other->parameter(0) - 300) < 1);
+    }
+
+    // Phase 15 #2: Apple's own Audio Units in a plug-in host give what they give in Montage's process, bit for bit.
+    void appleAudioUnitsInAHost() {
+        auto au = readStaticMetadata(Format::AudioUnit, "AudioUnit");
+        QVERIFY(au.has_value());
+        for (const char* id : {"aufx:dely:appl", "aufx:lpas:appl"}) {
+            std::optional<Descriptor> d;
+            for (const Descriptor& x : *au)
+                if (x.pluginId == id) d = x;
+            QVERIFY2(d.has_value(), id);
+            std::string err;
+            auto here = instantiateHere(*d, &err);
+            QVERIFY2(here, err.c_str());
+            auto there = instantiateIsolated(*d, Isolation::PerPlugin, &err);
+            QVERIFY2(there, err.c_str());
+            QVERIFY(hostProcessOf(there.get()) > 0 && hostProcessOf(here.get()) == 0);
+            QVERIFY(here->activate(48000, 512) && there->activate(48000, 512));
+            QCOMPARE(there->latencySamples(), here->latencySamples());
+            // A short delay (AUDelay's time, in seconds), so its echoes fall inside the test.
+            for (const auto& p : here->parameters())
+                if (QString::fromStdString(p.name).contains("time", Qt::CaseInsensitive)) {
+                    here->setParameter(p.id, 0.02);
+                    there->setParameter(p.id, 0.02);
+                }
+            uint32_t x = 7;
+            for (int b = 0; b < 40; ++b) {
+                std::vector<float> l(512), r(512);
+                for (int i = 0; i < 512; ++i) {
+                    x = x * 1664525u + 1013904223u;
+                    l[size_t(i)] = r[size_t(i)] = (float(x >> 8) / float(1 << 24) - 0.5f) * (b < 4 ? 1.0f : 0.0f);
+                }
+                std::vector<float> l2 = l, r2 = r;
+                float* a[2] = {l.data(), r.data()};
+                float* c[2] = {l2.data(), r2.data()};
+                here->process(a, 2, 512);
+                there->process(c, 2, 512);
+                QVERIFY2(std::memcmp(l.data(), l2.data(), l.size() * 4) == 0 && std::memcmp(r.data(), r2.data(), r.size() * 4) == 0,
+                         qPrintable(QString("%1, block %2").arg(id).arg(b)));
+            }
+            QVERIFY(!bypassed(there.get()));
+        }
     }
 #endif
 
@@ -1944,6 +2129,9 @@ private slots:
         QVERIFY(firstHost > 0);
         const uint64_t offlineBefore = offlineFailureSerial();
         RenderModeScope mode(realtime);
+        // (the offline render is an export's: it is told of the failure)
+        std::optional<ExportScope> exporting;
+        if (!realtime) exporting.emplace();
         std::vector<float> l(128), r(128);
         float* ch[2] = {l.data(), r.data()};
         auto block = [&] {
@@ -1997,6 +2185,66 @@ private slots:
         }, 10000));
         QVERIFY(std::fabs(inst->parameter(half.id) - half.value) < 1e-4);
         QVERIFY(eventually([&] { return failureOf(d->id)->restarts == 1; }));
+    }
+
+    // Nightly 10 Nov: a hang in a shared host is recorded once. The other instance in that host (idle, or playing on
+    // into the host Montage stopped) is started again without a "crashed (signal 9)" of its own, and without using
+    // an automatic restart.
+    void hangInASharedHostRecordedOnce() {
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting h(Isolation::Shared, [](HostingSettings& s) {
+            s.missedBlocks = 4;
+            s.autoRestarts = 1;
+        });
+        std::string err;
+        std::unique_ptr<Instance> hangs, idle;
+        {
+            Fault f("hang:process:3");
+            hangs = instantiate(*d, &err);
+            QVERIFY2(hangs, err.c_str());
+            idle = instantiate(*d, &err);
+            QVERIFY2(idle, err.c_str());
+        }
+        QVERIFY(hangs->activate(48000, 128) && idle->activate(48000, 128));
+        QVERIFY(hostProcessOf(hangs.get()) > 0 && hostProcessOf(hangs.get()) == hostProcessOf(idle.get()));
+        RenderModeScope mode(true);
+        std::vector<float> l(128), r(128);
+        float* ch[2] = {l.data(), r.data()};
+        auto block = [&](Instance& inst) {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            inst.process(ch, 2, 128);
+        };
+        for (int i = 0; i < 200 && !bypassed(hangs.get()); ++i) block(*hangs);
+        QVERIFY(bypassed(hangs.get()));
+        QVERIFY(eventually([&] { return failureOf(d->id).has_value(); }));
+        // Both come back (the hung one with the one automatic restart, the other freely), the failure once.
+        QVERIFY(eventually([&] {
+            block(*idle);
+            block(*hangs);
+            return !bypassed(idle.get()) && !bypassed(hangs.get());
+        }));
+        QThread::msleep(500);  // (the supervisor's passes after it)
+        const HostFailure f = *failureOf(d->id);
+        QCOMPARE(f.count, 1);
+        QVERIFY2(f.kind == "hang", (f.kind + ": " + f.reason).c_str());
+    }
+
+    // Nightly 10 Nov: shared memory is reserved when it is made, so a block /dev/shm cannot hold is refused then
+    // (with why), rather than Montage ending with SIGBUS when the plug-in host's picture first reaches it.
+    void sharedMemoryTooLargeIsRefused() {
+#ifdef __linux__
+        std::string err;
+        auto huge = ipc::SharedMemory::create(ipc::uniqueName("t"), size_t(1) << 44, &err);  // (16 TB)
+        QVERIFY(!huge);
+        QVERIFY2(err.find("not enough shared memory") != std::string::npos || err.find("cannot") != std::string::npos, err.c_str());
+        auto fine = ipc::SharedMemory::create(ipc::uniqueName("t"), size_t(1) << 20, &err);
+        QVERIFY2(fine && fine->size() == size_t(1) << 20, err.c_str());
+        std::memset(fine->data(), 1, fine->size());
+#else
+        QSKIP("/dev/shm is Linux's");
+#endif
     }
 
     void bypassCanBeSilence() {
@@ -2122,6 +2370,54 @@ private slots:
         QVERIFY(eventually([] { return runningHosts().empty(); }, 20000));
         err.clear();
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+    }
+
+    void backgroundRenderStopsNoExport() {
+        // A plug-in that fails in an offline render that is no export's (a background analysis, with a mixer and an
+        // instance of its own) is bypassed and recorded, and an export rendering meanwhile is told of nothing. The
+        // same failure met by the export's own instance stops it, by name.
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerInstance, [](HostingSettings& s) { s.autoRestarts = 0; });
+        std::string err;
+        std::unique_ptr<Instance> theirs, ours;
+        {
+            Fault f("crash:process:3");
+            theirs = instantiateIsolated(*d, Isolation::PerInstance, &err);
+            QVERIFY2(theirs, err.c_str());
+            ours = instantiateIsolated(*d, Isolation::PerInstance, &err);
+            QVERIFY2(ours, err.c_str());
+        }
+        QVERIFY(theirs->activate(48000, 128) && ours->activate(48000, 128));
+        QVERIFY(hostProcessOf(theirs.get()) != hostProcessOf(ours.get()));
+        auto renderUntilBypassed = [](Instance* inst) {
+            RenderModeScope offline(false);
+            std::vector<float> l(128), r(128);
+            float* ch[2] = {l.data(), r.data()};
+            for (int n = 0; n < 200 && !bypassed(inst); ++n) {
+                std::fill(l.begin(), l.end(), 0.5f);
+                std::fill(r.begin(), r.end(), 0.5f);
+                inst->process(ch, 2, 128);
+            }
+            // (and once more, finding it bypassed)
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            inst->process(ch, 2, 128);
+        };
+        // An export is rendering on this thread; the analysis runs on a thread of its own.
+        ExportScope exporting;
+        const uint64_t before = offlineFailureSerial();
+        std::thread analysis([&] { renderUntilBypassed(theirs.get()); });
+        analysis.join();
+        QVERIFY(bypassed(theirs.get()));
+        QVERIFY(!bypassed(ours.get()));
+        QVERIFY(eventually([&] { return failureOf(d->id).has_value(); }));
+        QCOMPARE(offlineFailureSerial(), before);
+        // The export's own instance fails the same way: the export is told at once.
+        renderUntilBypassed(ours.get());
+        QVERIFY(bypassed(ours.get()));
+        QVERIFY(offlineFailureSerial() != before);
+        QVERIFY2(QString::fromStdString(lastOfflineFailure()).startsWith(QString::fromStdString(d->name)), lastOfflineFailure().c_str());
     }
 
     void offlineRenderWaitsForARestart() {
@@ -2407,6 +2703,400 @@ private slots:
         QVERIFY2(r.first && std::fabs(r.second - 0.8f) < 1e-5f, err.c_str());
     }
 
+    // Phase 15 #2: OpenFX on-screen controls drawn by the plug-in's host. The host draws them (the Draw Suite and
+    // OpenGL alike) into one premultiplied picture at the monitor's size and pixel ratio; it is the drawing Montage
+    // makes in its own process, within 1/255, and a drag sets what it sets there. No instance is made in Montage.
+    void isolatedOpenFxControlsDrawTheSame() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-controls-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc probe, invert;
+        QVERIFY(reg.find("org.montage.test.probe/1", probe) && reg.find("org.montage.test.invert/1", invert));
+        Project p = makeDefaultProject();
+        Effect e = ofx::makeEffect(p, probe);
+        e.params["param.centre.x"] = Param(0.3);
+        e.params["param.centre.y"] = Param(0.6);
+        // A 400 x 200 frame shown at its own size, y down: Centre (0.3, 0.6) is at view (120, 80).
+        ofx::View v;
+        v.width = 400, v.height = 200, v.frameW = 400, v.frameH = 200;
+        v.m[0] = 1, v.m[1] = 0, v.m[2] = 0, v.m[3] = 0, v.m[4] = -1, v.m[5] = 200;
+        auto painted = [](const ofx::Overlay& o, const ofx::View& view) {
+            QImage img(view.width, view.height, QImage::Format_ARGB32_Premultiplied);
+            img.fill(Qt::transparent);
+            QPainter painter(&img);
+            ofx::paintOverlay(painter, o, view);
+            painter.end();
+            return img;
+        };
+        auto worst = [](const QImage& a, const QImage& b) {
+            int w = a.size() == b.size() ? 0 : 255;
+            for (int y = 0; w < 255 && y < a.height(); ++y)
+                for (int x = 0; x < a.width(); ++x) {
+                    const QRgb p = a.pixel(x, y), q = b.pixel(x, y);
+                    w = std::max({w, std::abs(qRed(p) - qRed(q)), std::abs(qGreen(p) - qGreen(q)), std::abs(qBlue(p) - qBlue(q)),
+                                  std::abs(qAlpha(p) - qAlpha(q))});
+                }
+            return w;
+        };
+        // A press on the square, a drag and the release: Centre where the pen let go.
+        auto drag = [&](ofx::Interact& c, Effect& now) {
+            Effect edited;
+            bool changed = false;
+            if (!c.pen(ofx::Interact::Pen::Down, now, 0, v, 120, 80, 1, edited, changed)) return false;
+            if (!c.pen(ofx::Interact::Pen::Move, now, 0, v, 150, 60, 1, edited, changed) || !changed) return false;
+            now = edited;
+            if (!c.pen(ofx::Interact::Pen::Up, now, 0, v, 160, 50, 1, edited, changed) || !changed) return false;
+            now = edited;
+            return true;
+        };
+        std::string err;
+        QImage here, there;
+        Effect draggedHere = e, draggedThere = e;
+        {
+            Hosting h(Isolation::InProcess);
+            auto c = ofx::Interact::open(e, &err);
+            QVERIFY2(c && !c->remote(), err.c_str());
+            ofx::Overlay o;
+            QVERIFY(c->draw(e, 0, v, o));
+            here = painted(o, v);
+            QVERIFY(drag(*c, draggedHere));
+        }
+        const int made = ofx::instancesCreated();
+        {
+            Hosting h(Isolation::PerPlugin);
+            auto c = ofx::Interact::open(e, &err);
+            QVERIFY2(c && c->remote(), err.c_str());
+            ofx::Overlay o;
+            QVERIFY(c->draw(e, 0, v, o));
+            QVERIFY(o.ops.empty() && !o.gl.isNull());  // (one picture, drawn in the host)
+            there = painted(o, v);
+            QVERIFY(!c->unresponsive());
+            QVERIFY(drag(*c, draggedThere));
+            // At twice the pixels (a high-density monitor): drawn that finely, shown at the view's size.
+            ofx::View fine = v;
+            fine.pixelRatio = 2;
+            QVERIFY(c->draw(e, 0, fine, o));
+            QCOMPARE(o.gl.size(), QSize(800, 400));
+            QCOMPARE(o.gl.devicePixelRatio(), 2.0);
+            const QColor centre = o.gl.pixelColor(240, 160);
+            QVERIFY2(centre.alpha() == 255 && centre.red() == 255 && centre.green() == 0, qPrintable(centre.name(QColor::HexArgb)));
+        }
+        QCOMPARE(ofx::instancesCreated(), made);  // (none made in this process)
+        const QColor square = there.pixelColor(120, 80);
+        QVERIFY2(square.alpha() == 255 && square.red() == 255 && square.green() == 0, qPrintable(square.name(QColor::HexArgb)));
+        QVERIFY2(worst(here, there) <= 1, qPrintable(QString::number(worst(here, there))));
+        for (const char* k : {"param.centre.x", "param.centre.y"}) {
+            QVERIFY(draggedHere.params.at(k) == draggedThere.params.at(k));
+            QVERIFY(std::fabs(draggedThere.params.at(k).at(0) - e.params.at(k).at(0)) > 0.01);  // (it moved)
+        }
+        QVERIFY(std::fabs(draggedThere.params.at("param.centre.x").at(0) - 0.4) < 1e-9);  // view x 160 of 400
+        // OpenGL controls (Test Invert's green square, canonical (100, 100) to (200, 200)), drawn in the host's own
+        // offscreen OpenGL. (This test is no GUI application, so Montage's process has no OpenGL to compare with: the
+        // drawing it makes there, which render's ofxControlsAndOpenGl checks, is the square on the view's pixels.)
+        if (invert.overlay != 1) QSKIP("The test plug-in was built without OpenGL");
+        const Effect inv = ofx::makeEffect(p, invert);
+        here = QImage(v.width, v.height, QImage::Format_ARGB32_Premultiplied);
+        here.fill(Qt::transparent);
+        for (int y = 0; y < 100; ++y)
+            for (int x = 100; x < 200; ++x) here.setPixel(x, y, qRgba(0, 255, 0, 255));
+        {
+            Hosting h(Isolation::PerPlugin);
+            auto c = ofx::Interact::open(inv, &err);
+            QVERIFY2(c && c->remote(), err.c_str());
+            ofx::Overlay o;
+            QVERIFY(c->draw(inv, 0, v, o));
+            if (o.gl.isNull()) QSKIP("No OpenGL in the plug-in host here (it drew nothing, as in Montage then)");
+            there = painted(o, v);
+        }
+        QCOMPARE(qGreen(there.pixel(150, 50)), 255);
+        QCOMPARE(qAlpha(there.pixel(150, 150)), 0);
+        QVERIFY2(worst(here, there) <= 1, qPrintable(QString::number(worst(here, there))));
+    }
+
+    // Controls that crash their host leave Montage running: closed, the plug-in named and bypassed as for a render.
+    // Ones that hang keep their last picture up, marked as not responding within the deadline, and their host is
+    // stopped as hung once they have not answered for longer.
+    void failingOpenFxControlsAreBypassed() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-controls-fault-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc probe;
+        QVERIFY(reg.find("org.montage.test.probe/1", probe));
+        Project p = makeDefaultProject();
+        // (a host for each instance: each effect below starts one of its own, with the fault set then)
+        Hosting hostingMode(Isolation::PerInstance, [](HostingSettings& s) { s.autoRestarts = 0; });
+        ofx::View v;
+        v.width = 200, v.height = 100, v.frameW = 200, v.frameH = 100;
+        v.m[4] = -1, v.m[5] = 100;
+        std::string err;
+        const Effect crashing = ofx::makeEffect(p, probe);
+        std::unique_ptr<ofx::Interact> c;
+        {
+            Fault f("crash:draw:1");
+            c = ofx::Interact::open(crashing, &err);
+        }
+        QVERIFY2(c && c->remote(), err.c_str());
+        ofx::Overlay o;
+        QVERIFY(c->draw(crashing, 0, v, o) && !o.gl.isNull());
+        QVERIFY(!c->draw(crashing, 0, v, o));
+        QVERIFY(c->failed() && o.gl.isNull());
+        QVERIFY2(c->failure().find("crashed") != std::string::npos, c->failure().c_str());
+        auto f = failureOf(probe.id);
+        QVERIFY(f.has_value());
+        QCOMPARE(QString::fromStdString(f->kind), QString("crash"));
+        QCOMPARE(QString::fromStdString(f->name), QString("Test Probe"));
+        // Bypassed past its restarts (none here): its renders pass the picture as it came, until Restart.
+        Image img(8, 8);
+        img.fill(0.2f, 0.4f, 0.6f, 1.0f);
+        QVERIFY(!ofx::applyEffect(crashing, 0, img, 1.0, {}, &err));
+        QVERIFY2(err.find("bypassed") != std::string::npos, err.c_str());
+        QVERIFY(failureOf(probe.id)->bypassedNow >= 1);
+        c.reset();
+        QVERIFY(restartPlugin(probe.id));
+        QVERIFY2(ofx::applyEffect(crashing, 0, img, 1.0, {}, &err), err.c_str());
+        // A hang: the picture it drew last, at once, marked.
+        const Effect hanging = ofx::makeEffect(p, probe);
+        {
+            Fault fault("hang:draw:1");
+            c = ofx::Interact::open(hanging, &err);
+        }
+        QVERIFY2(c && c->remote(), err.c_str());
+        QVERIFY(c->draw(hanging, 0, v, o) && !o.gl.isNull());
+        const QImage last = o.gl;
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY(c->draw(hanging, 0, v, o));
+        QVERIFY2(clock.elapsed() < ofx::remote::Controls::kDeadlineMs + 400, qPrintable(QString::number(clock.elapsed())));
+        QVERIFY(c->unresponsive());
+        QVERIFY(o.gl == last);
+        clock.start();
+        QVERIFY(c->draw(hanging, 0, v, o) && o.gl == last);  // (not waited for again)
+        QVERIFY(clock.elapsed() < 100);
+        Effect edited;
+        bool changed = false;
+        QVERIFY(!c->pen(ofx::Interact::Pen::Down, hanging, 0, v, 100, 50, 1, edited, changed));  // (not sent meanwhile)
+        QVERIFY(eventually([&] {
+            c->draw(hanging, 0, v, o);
+            return c->failed();
+        }, 30000));
+        f = failureOf(probe.id);
+        QCOMPARE(QString::fromStdString(f->kind), QString("hang"));
+        QVERIFY2(f->reason.find("did not answer") != std::string::npos, f->reason.c_str());
+        QCOMPARE(f->count, 2);
+    }
+
+    // Controls that answer after the deadline but do answer: a slow draw's picture is taken at a later call (draws are
+    // then not waited for, each showing the picture the one before asked for), what a late pen reply set is handed on
+    // rather than lost, and controls closed with a reply still out let their channel go once it comes.
+    void lateOpenFxControlRepliesAreKept() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-controls-late-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc probe;
+        QVERIFY(reg.find("org.montage.test.probe/1", probe));
+        Project p = makeDefaultProject();
+        Hosting hostingMode(Isolation::PerInstance);
+        // (as isolatedOpenFxControlsDrawTheSame: Centre (0.3, 0.6) is at view (120, 80))
+        ofx::View v;
+        v.width = 400, v.height = 200, v.frameW = 400, v.frameH = 200;
+        v.m[0] = 1, v.m[1] = 0, v.m[2] = 0, v.m[3] = 0, v.m[4] = -1, v.m[5] = 200;
+        std::string err;
+        Effect slow = ofx::makeEffect(p, probe);
+        slow.params["param.centre.x"] = Param(0.3);
+        slow.params["param.centre.y"] = Param(0.6);
+        std::unique_ptr<ofx::Interact> c;
+        {
+            Fault f("slow:draw");
+            c = ofx::Interact::open(slow, &err);
+        }
+        QVERIFY2(c && c->remote(), err.c_str());
+        ofx::Overlay o;
+        QVERIFY(c->draw(slow, 0, v, o));
+        QVERIFY(o.gl.isNull() && c->waiting() && c->unresponsive());  // (nothing to show yet)
+        QVERIFY(eventually([&] {
+            c->draw(slow, 0, v, o);
+            return !o.gl.isNull();
+        }, 10000));
+        QVERIFY(qAlpha(o.gl.pixel(120, 80)) > 0);
+        QVERIFY(c->draw(slow, 0, v, o) && !o.gl.isNull() && !c->waiting());  // (unchanged: not asked again)
+        // Moved: asked without waiting, the last picture shown meanwhile and the new one at a later call.
+        Effect moved = slow;
+        moved.params["param.centre.x"] = Param(0.6);
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY(c->draw(moved, 0, v, o) && !o.gl.isNull() && qAlpha(o.gl.pixel(120, 80)) > 0);
+        QVERIFY2(clock.elapsed() < 100, qPrintable(QString::number(clock.elapsed())));  // (not waited for)
+        QVERIFY(c->waiting());
+        QVERIFY(eventually([&] {
+            c->draw(moved, 0, v, o);
+            return !o.gl.isNull() && qAlpha(o.gl.pixel(240, 80)) > 0 && qAlpha(o.gl.pixel(120, 80)) == 0;
+        }, 10000));
+        QVERIFY(!c->failed());
+        QVERIFY(c->draw(slow, 0, v, o) && c->waiting());
+        c.reset();  // (closed with a draw out)
+        // A release answered late: the Centre it set comes as a late edit.
+        Effect late = slow;
+        late.id = p.newId();
+        {
+            Fault f("slow:pen:1");
+            c = ofx::Interact::open(late, &err);
+        }
+        QVERIFY2(c && c->remote(), err.c_str());
+        Effect edited;
+        bool changed = false;
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, late, 0, v, 120, 80, 1, edited, changed));
+        QVERIFY(c->pen(ofx::Interact::Pen::Move, late, 0, v, 150, 60, 1, edited, changed) && changed);
+        late = edited;
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, late, 0, v, 160, 50, 1, edited, changed));  // (0.4 s: past the deadline)
+        QVERIFY(!changed && c->waiting());
+        Effect set;
+        QVERIFY(eventually([&] { return c->lateEdits(set); }, 10000));
+        QVERIFY(set.params.count("param.centre.x") && std::fabs(set.params.at("param.centre.x").at(0) - 0.4) < 1e-9);
+        QVERIFY(!c->lateEdits(set));  // (handed on once)
+        QVERIFY(!c->failed() && !failureOf(probe.id).has_value());
+        // Closed with the release still out: its host ends once the reply has come and the channel is let go.
+        changed = false;
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, late, 0, v, 150, 60, 1, edited, changed));  // (where the move left it)
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, late, 0, v, 170, 40, 1, edited, changed));
+        QVERIFY(c->waiting());
+        c.reset();
+        QVERIFY(eventually([] {
+            ofx::remote::releaseIdle();
+            return runningHosts().empty();
+        }, 20000));
+        QVERIFY(!failureOf(probe.id).has_value());
+    }
+
+    // In a host shared by a maker's plug-ins, the second of two crashes it while loading: that one alone is blocked
+    // (the host said which plug-in it was loading), and the first is started again as if nothing of its own failed.
+    void sharedHostBlamesThePlugInLoading() {
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-blame.json"), {clapDir("good"), clapDir("latency")});
+        reg.scan();
+        const auto gain = reg.find("clap:org.montage.test.gain"), delay = reg.find("clap:org.montage.test.delay64");
+        QVERIFY(gain && delay);
+        QCOMPARE(gain->vendor, delay->vendor);
+        QVERIFY(gain->path != delay->path);
+        Hosting hostingMode(Isolation::PerVendor, [](HostingSettings& s) { s.autoRestarts = 0; });
+        std::string err;
+        std::unique_ptr<Instance> first;
+        {
+            Fault f("crash:latency-init");
+            first = instantiate(*gain, &err);
+        }
+        QVERIFY2(first && first->activate(48000, 128), err.c_str());
+        const GainSetting half = halfGain("gain", *first);
+        first->setParameter(half.id, half.value);
+        const int64_t shared = hostProcessOf(first.get());
+        QVERIFY(shared > 0);
+        RenderModeScope playing(true);
+        std::vector<float> l(128), r(128);
+        float* ch[2] = {l.data(), r.data()};
+        auto block = [&] {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            first->process(ch, 2, 128);
+            return l[127];
+        };
+        QCOMPARE(block(), float(0.5 * half.gain));
+        QVERIFY(!instantiate(*delay, &err));  // (in the same host, which crashes as it loads it)
+        QVERIFY2(err.find("while loading") != std::string::npos, err.c_str());
+        bool delayBlocked = false, gainBlocked = false;
+        for (const Blocked& b : reg.blocklist()) {
+            delayBlocked |= b.path == delay->path;
+            gainBlocked |= b.path == gain->path;
+        }
+        QVERIFY(delayBlocked && !gainBlocked);
+        QVERIFY(!reg.find("clap:org.montage.test.delay64") && reg.find("clap:org.montage.test.gain"));
+        QCOMPARE(QString::fromStdString(failureOf(delay->id)->kind), QString("load"));
+        // The first plays on in a new host (with no automatic restarts left: its restart is not counted as one).
+        QVERIFY(eventually([&] {
+            block();
+            return !bypassed(first.get()) && hostProcessOf(first.get()) > 0 && hostProcessOf(first.get()) != shared;
+        }));
+        QVERIFY(eventually([&] { return std::fabs(block() - float(0.5 * half.gain)) < 1e-6f; }, 10000));
+        QVERIFY(!failureOf(gain->id).has_value());
+        reg.unblock(delay->path);
+        reg.scan();
+        QVERIFY(reg.find("clap:org.montage.test.delay64").has_value());
+    }
+
+    // A host for each instance: a crash in one leaves its sibling (the same plug-in) untouched, for audio and OpenFX.
+    void hostPerInstanceKeepsSiblingsApart() {
+        const auto gain = testPlugin("gain");
+        QVERIFY(gain.has_value());
+        Hosting hostingMode(Isolation::PerInstance, [](HostingSettings& s) { s.autoRestarts = 0; });
+        std::string err;
+        std::unique_ptr<Instance> crashing, sibling;
+        {
+            Fault f("crash:process:4");
+            crashing = instantiate(*gain, &err);
+        }
+        sibling = instantiate(*gain, &err);
+        QVERIFY2(crashing && sibling, err.c_str());
+        QVERIFY(crashing->activate(48000, 128) && sibling->activate(48000, 128));
+        QVERIFY(hostProcessOf(crashing.get()) > 0 && hostProcessOf(sibling.get()) > 0);
+        QVERIFY(hostProcessOf(crashing.get()) != hostProcessOf(sibling.get()));
+        int perInstance = 0;
+        for (const HostInfo& h : runningHosts()) perInstance += h.key.rfind("instance:" + gain->id + "#", 0) == 0;
+        QCOMPARE(perInstance, 2);
+        const GainSetting half = halfGain("gain", *sibling);
+        sibling->setParameter(half.id, half.value);
+        RenderModeScope playing(true);
+        std::vector<float> l(128), r(128);
+        float* ch[2] = {l.data(), r.data()};
+        bool siblingBypassed = false;
+        for (int i = 0; i < 40; ++i) {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            crashing->process(ch, 2, 128);
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            sibling->process(ch, 2, 128);
+            QCOMPARE(l[127], float(0.5 * half.gain));
+            siblingBypassed |= bypassed(sibling.get());
+        }
+        QVERIFY(bypassed(crashing.get()));
+        QVERIFY(!siblingBypassed);
+        QVERIFY(eventually([&] { return failureOf(gain->id).has_value(); }));
+        QCOMPARE(failureOf(gain->id)->count, 1);
+        // OpenFX: two Test Inverts, each in a host of its own; the one that crashes is bypassed alone.
+        ofx::Registry& oreg = ofx::Registry::instance();
+        oreg.setCachePath(path("ofx-instance-cache.json").toStdString());
+        oreg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        oreg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(oreg.scan(), 7);
+        ofx::PluginDesc invert;
+        QVERIFY(oreg.find("org.montage.test.invert/1", invert));
+        Project p = makeDefaultProject();
+        const Effect a = ofx::makeEffect(p, invert), b = ofx::makeEffect(p, invert);
+        auto render = [&](const Effect& e) {
+            Image img(8, 8);
+            img.fill(0.2f, 0.4f, 0.6f, 1.0f);
+            const bool ok = ofx::applyEffect(e, 0, img, 1.0, {}, &err);
+            return ok ? img.at(3, 3)[0] : -1.0f;
+        };
+        {
+            Fault f("crash:render:0");
+            QCOMPARE(render(a), -1.0f);
+        }
+        QVERIFY(std::fabs(render(b) - 0.8f) < 1e-5f);
+        QCOMPARE(render(a), -1.0f);  // (bypassed, past its restarts)
+        QVERIFY2(err.find("bypassed") != std::string::npos, err.c_str());
+        QVERIFY(std::fabs(render(b) - 0.8f) < 1e-5f);
+        bool own = false;
+        for (const HostInfo& h : runningHosts()) own |= h.key == "ofx:instance:" + invert.id + "#" + std::to_string(b.id);
+        QVERIFY(own);
+        QVERIFY(restartPlugin(invert.id));
+        QVERIFY(std::fabs(render(a) - 0.8f) < 1e-5f);
+    }
+
     void mcpReportsAndSetsPluginHosting() {
         // montage_plugins: the grouping read and set, the hosts running, and each failure (which plug-in, when, how
         // often), with Restart.
@@ -2513,11 +3203,38 @@ private slots:
         QCOMPARE(st.skip, 44);
         QCOMPARE(st.silence, int64_t(0));
         QCOMPARE(early.next(1212, 256).skip, 0);
+        // After an input overflow (a kilosample lost), the rest lands where its blocks say, not early; a few samples'
+        // jitter is kept as it comes.
+        QCOMPARE(early.next(1468 + 1024, 256).silence, int64_t(1024));
+        st = early.next(2748 + 10, 256);
+        QCOMPARE(st.silence, int64_t(0));
+        QCOMPARE(st.skip, 0);
+        // A jump back (the playback looped, or frames came twice) carries the take on from there: nothing passed over.
+        st = early.next(3014 - 600, 256);
+        QCOMPARE(st.skip, 0);
+        QCOMPARE(st.silence, int64_t(0));
+        QCOMPARE(early.next(2670, 256).skip, 0);
+        QCOMPARE(early.next(2926, 256).silence, int64_t(0));
+        // A hundred frames lost a block add up: kept twice (within a block), made up on the third.
+        QCOMPARE(early.next(3182 + 100, 256).silence, int64_t(0));
+        QCOMPARE(early.next(3538 + 100, 256).silence, int64_t(0));
+        QCOMPARE(early.next(3894 + 100, 256).silence, int64_t(300));
+        QCOMPARE(early.next(4250, 256).silence, int64_t(0));
+        // Moved on by more than two seconds (a seek): no minute of silence, the take goes on from there.
+        st = early.next(4506 + 480000, 256);
+        QCOMPARE(st.silence, int64_t(0));
+        QCOMPARE(st.skip, 0);
+        QCOMPARE(early.next(4762 + 480000, 256).silence, int64_t(0));
         // Unclocked, the input's latency is taken off its start.
         audiodev::TakeAligner loose(0, false, 300);
         QCOMPARE(loose.next(-1, 256).skip, 256);
         QCOMPARE(loose.next(-1, 256).skip, 44);
         QCOMPARE(loose.next(-1, 256).skip, 0);
+        // Two seconds are the take's own: at 192 kHz a gap of 1.5 s is still made up, and one of 2.5 s is a seek.
+        audiodev::TakeAligner fast(0, true, 0, 192000);
+        QCOMPARE(fast.next(0, 256).silence, int64_t(0));
+        QCOMPARE(fast.next(256 + 288000, 256).silence, int64_t(288000));
+        QCOMPARE(fast.next(288512 + 480000, 256).silence, int64_t(0));
     }
 
     void loopbackRecordingLandsAtZero_data() {
@@ -2595,6 +3312,188 @@ private slots:
         e.removeOutput(id);
         QVERIFY2(played > 40000 && played < 58000, qPrintable(QString::number(played)));
         audiodev::setLoopbackOptions({});
+    }
+
+    void rateWatchJudgesTheDevicesRate() {
+        // A host that says nothing when the device's rate changes (PortAudio): the rate judged from the callbacks' frames
+        // over time, a little jitter and drift aside, reported once.
+        audiodev::RateWatch w;
+        w.reset(48000);
+        int64_t ns = 0;
+        int calls = 0;
+        auto run = [&](double rate, double seconds, std::vector<int>& reported) {
+            const int frames = 256;
+            const int n = int(seconds * rate / frames);
+            for (int i = 0; i < n; ++i, ++calls) {
+                ns += int64_t(1e9 * frames / rate) + ((calls % 2) ? 150000 : -150000);  // (callbacks a little early, then late)
+                if (const int r = w.add(frames, ns)) reported.push_back(r);
+            }
+        };
+        std::vector<int> reported;
+        run(48000, 5, reported);
+        QVERIFY(reported.empty());
+        run(48000 * 1.01, 4, reported);  // (a clock a little fast: not another rate)
+        QVERIFY(reported.empty());
+        run(96000, 4, reported);
+        QCOMPARE(reported, std::vector<int>{96000});
+        QCOMPARE(w.rate(), 96000);
+        run(96000, 3, reported);
+        QCOMPARE(reported.size(), size_t(1));
+        run(60000, 4, reported);  // (no standard rate: kept)
+        QCOMPARE(w.rate(), 96000);
+        reported.clear();
+        ns += 2000000000LL;  // (a gap: the stream stopped a while)
+        run(44100, 4, reported);
+        QCOMPARE(reported, std::vector<int>{44100});
+    }
+
+    void feedPlaysThroughTheDevice() {
+        // Sound that is not the timeline (scrubbing, previews) played through the device at its own rate: every frame
+        // pushed is played, the tone keeps its pitch through the resampler, and what is queued can be let go.
+        audiodev::setLoopbackOptions({});
+        audiodev::Engine e;
+        audiodev::Feed closed(e);
+        std::string why;
+        QVERIFY(!closed.open(48000, 2, 0.5, &why) && !why.empty());  // (no device open)
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        Listener heard;
+        const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        QVERIFY(in >= 0);
+        audiodev::Feed f(e);
+        QVERIFY2(f.open(44100, 2, 0.25, &why), why.c_str());
+        QVERIFY(f.isOpen() && f.rate() == 44100 && f.channels() == 2);
+        QCOMPARE(f.room(), int64_t(11025));
+        std::vector<float> tone(size_t(44100) * 2);
+        for (int i = 0; i < 44100; ++i) tone[size_t(i) * 2] = tone[size_t(i) * 2 + 1] = float(0.4 * std::sin(2 * M_PI * 1000 * i / 44100.0));
+        heard.take();
+        int64_t sent = 0;
+        QElapsedTimer t;
+        t.start();
+        while ((sent < 44100 || f.queued() > 0) && t.elapsed() < 10000) {
+            if (sent < 44100) sent += f.push(tone.data() + size_t(sent) * 2, int(44100 - sent));
+            QThread::msleep(5);
+        }
+        QCOMPARE(sent, int64_t(44100));
+        QCOMPARE(f.queued(), int64_t(0));
+        QCOMPARE(f.played(), int64_t(44100));
+        QThread::msleep(100);
+        const std::vector<float> got = heard.take();
+        double energy = 0;
+        std::vector<float> sounding;
+        for (float v : got)
+            if (std::fabs(v) > 1e-4f || !sounding.empty()) sounding.push_back(v);
+        while (!sounding.empty() && std::fabs(sounding.back()) < 1e-4f) sounding.pop_back();
+        for (float v : sounding) energy += double(v) * v;
+        // A second of it at 48 kHz (the resampler's edges aside), at its pitch.
+        QVERIFY2(std::llabs(int64_t(sounding.size()) - 48000) < 600, qPrintable(QString::number(sounding.size())));
+        QVERIFY2(std::fabs(energy - 48000 * 0.08) < 48000 * 0.08 * 0.05, qPrintable(QString::number(energy)));
+        // (counted away from the ends, where the resampler's ringing crosses zero at a whisper)
+        const double hz = toneHz(std::vector<float>(sounding.begin() + 1000, sounding.end() - 1000), 48000);
+        QVERIFY2(std::fabs(hz - 1000) < 1, qPrintable(QString::number(hz)));
+        // Let go: what was queued is not played.
+        const int64_t played = f.played();
+        QCOMPARE(f.push(tone.data(), 11025), int64_t(11025));
+        f.clear();
+        QCOMPARE(f.queued(), int64_t(0));
+        QThread::msleep(100);
+        QVERIFY2(f.played() - played < 2048, qPrintable(QString::number(f.played() - played)));
+        QCOMPARE(f.room(), int64_t(11025));
+        f.close();
+        QVERIFY(!f.isOpen() && f.push(tone.data(), 10) == 0);
+        e.removeInput(in);
+    }
+
+    void jackServerRateChange() {
+        // Under JACK's dummy driver: the server's rate moves from 48 to 96 kHz while a 1 kHz tone plays (out of Montage's
+        // port and back into its input port); Montage follows, and the tone it hears keeps its pitch and its pace.
+        const QString python = QStandardPaths::findExecutable(QStringLiteral("python3"));
+        if (python.isEmpty()) QSKIP("No python3 to drive the JACK server");
+        const QString server = QStringLiteral("montage-rate-%1").arg(QCoreApplication::applicationPid());
+        qputenv("JACK_DEFAULT_SERVER", server.toUtf8());
+        qputenv("JACK_NO_AUDIO_RESERVATION", "1");
+        QProcess jack;
+        jack.start(python, {"-c", QString::fromUtf8(kJackServerScript), server});
+        QVERIFY(jack.waitForStarted(5000));
+        auto quit = [&] {
+            jack.write("quit\n");
+            jack.closeWriteChannel();
+            if (!jack.waitForFinished(5000)) {
+                jack.kill();
+                jack.waitForFinished(2000);
+            }
+        };
+        const QString started = scriptLine(jack, 15000);
+        if (started != QLatin1String("started")) {
+            quit();
+            QSKIP(qPrintable(QStringLiteral("No JACK server on the dummy driver here (%1)").arg(started.isEmpty() ? QStringLiteral("no answer") : started)));
+        }
+        if (audiodev::jackLibrary().empty()) {
+            quit();
+            QSKIP("No JACK library loads here");
+        }
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Jack;
+        s.bufferFrames = 256;
+        s.inputs = 1;
+        s.inputNames = {"Tone"};
+        s.autoConnect = false;
+        e.setOutputNames({"L", "R"});
+        QElapsedTimer t;
+        t.start();
+        do {
+            e.setSettings(audiodev::DeviceSettings{});
+            e.setSettings(s);
+            if (!e.isOpen()) QThread::msleep(200);
+        } while (!e.isOpen() && t.elapsed() < 10000);
+        if (!e.isOpen()) {
+            quit();
+            QFAIL(e.status().error.c_str());
+        }
+        QCOMPARE(e.status().rate, 48000);
+        const std::vector<std::string> ports = e.status().ports;
+        const std::string client = ports.front().substr(0, ports.front().find(':'));
+        QVERIFY(e.connect(client + ":L", client + ":Tone"));
+        TonePump tone;
+        Listener heard;
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        QVERIFY(out >= 0 && in >= 0);
+        auto listen = [&](double seconds) {
+            heard.take();
+            QElapsedTimer w;
+            w.start();
+            QThread::msleep(int(seconds * 1000));
+            const double took = double(w.nsecsElapsed()) / 1e9;
+            std::vector<float> got = heard.take();
+            return std::pair{got, double(got.size()) / took};
+        };
+        auto [before, paceBefore] = listen(1.0);
+        double hz = toneHz(before, 48000);
+        QVERIFY2(std::fabs(hz - 1000) < 5, qPrintable(QString::number(hz)));
+        jack.write("rate 96000\n");
+        const QString switched = scriptLine(jack, 15000);
+        QVERIFY2(switched == QLatin1String("switched 1"), qPrintable(switched));
+        t.restart();
+        while (e.status().rate != 96000 && t.elapsed() < 10000) QThread::msleep(50);
+        QCOMPARE(e.status().rate, 96000);
+        QVERIFY(e.status().rateChanges >= 1);
+        QThread::msleep(300);  // (the switch settles)
+        auto [after, paceAfter] = listen(1.5);
+        hz = toneHz(after, 48000);
+        QVERIFY2(std::fabs(hz - 1000) < 5, qPrintable(QString::number(hz)));
+        // Still about 48000 of its samples a second, as before (not twice as many, not half).
+        QVERIFY2(paceAfter > 40000 && paceAfter < 56000, qPrintable(QString::number(paceAfter)));
+        Q_UNUSED(paceBefore);
+        e.removeInput(in);
+        e.removeOutput(out);
+        e.setSettings(audiodev::DeviceSettings{});
+        quit();
     }
 
     void overloadedCallbackIsAnXrun() {

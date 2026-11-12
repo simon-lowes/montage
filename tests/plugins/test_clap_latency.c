@@ -1,9 +1,12 @@
 // A CLAP plugin for Montage's delay compensation tests:
 //   org.montage.test.delay64   delays stereo audio by 64 samples and reports a latency of 64.
-// Built as MontageTestLatency.clap.
+// Built as MontageTestLatency.clap. It misbehaves on request (test_fault.h) in the call "latency-init", which no other
+// test plug-in makes: a fault for it alone, in a host shared with the others.
 #include <clap/clap.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "test_fault.h"
 
 #define DELAY 64
 
@@ -33,7 +36,11 @@ static const clap_plugin_audio_ports_t kPorts = {ports_count, ports_get};
 static uint32_t latency_get(const clap_plugin_t* p) { (void)p; return DELAY; }
 static const clap_plugin_latency_t kLatency = {latency_get};
 
-static bool init(const clap_plugin_t* p) { (void)p; return true; }
+static bool init(const clap_plugin_t* p) {
+    (void)p;
+    montage_test_fault("latency-init", NULL, 0);
+    return true;
+}
 static void destroy(const clap_plugin_t* p) { free(p->plugin_data); }
 static bool activate(const clap_plugin_t* p, double sr, uint32_t a, uint32_t b) { (void)p; (void)sr; (void)a; (void)b; return true; }
 static void deactivate(const clap_plugin_t* p) { (void)p; }

@@ -46,6 +46,7 @@ std::atomic<int> gMemoryLimitMb{4096};
 std::atomic<int> gAutoRestarts{2};
 std::atomic<bool> gInHost{false};
 thread_local bool tRealtime = false;
+thread_local bool tExport = false;
 }  // namespace
 
 const char* isolationName(Isolation i) {
@@ -54,12 +55,13 @@ const char* isolationName(Isolation i) {
         case Isolation::PerVendor: return "vendor";
         case Isolation::Shared: return "shared";
         case Isolation::InProcess: return "off";
+        case Isolation::PerInstance: return "instance";
     }
     return "plugin";
 }
 
 std::optional<Isolation> isolationFromName(std::string_view name) {
-    for (Isolation i : {Isolation::PerPlugin, Isolation::PerVendor, Isolation::Shared, Isolation::InProcess})
+    for (Isolation i : {Isolation::PerPlugin, Isolation::PerVendor, Isolation::Shared, Isolation::InProcess, Isolation::PerInstance})
         if (name == isolationName(i)) return i;
     return std::nullopt;
 }
@@ -139,15 +141,22 @@ RenderModeScope::RenderModeScope(bool realtime) : previous_(tRealtime) { tRealti
 RenderModeScope::~RenderModeScope() { tRealtime = previous_; }
 bool renderingRealtime() { return tRealtime; }
 
+ExportScope::ExportScope() : previous_(tExport) { tExport = true; }
+ExportScope::~ExportScope() { tExport = previous_; }
+bool renderingForExport() { return tExport; }
+
 namespace remote {
 
 Isolation currentIsolation() { return Isolation(gIsolation.load()); }
 
-std::string hostKey(Isolation grouping, const std::string& id, const std::string& maker, bool ofx) {
+std::string hostKey(Isolation grouping, const std::string& id, const std::string& maker, bool ofx, const std::string& instance) {
     const std::string prefix = ofx ? "ofx:" : "";
     switch (grouping) {
         case Isolation::PerVendor: return prefix + "vendor:" + maker;
         case Isolation::Shared: return prefix + "all";
+        case Isolation::PerInstance:
+            if (!instance.empty()) return prefix + "instance:" + id + "#" + instance;
+            return prefix + "plugin:" + id;
         default: return prefix + "plugin:" + id;
     }
 }
@@ -176,6 +185,19 @@ void Channel::unlinkNames() {
 }
 
 uint32_t Host::crashCode() const { return control.h ? control.h->crashed.load(std::memory_order_acquire) : 0; }
+
+std::string Host::loading() const {
+    if (!control.h) return {};
+    // (written by the host, so read only as far as its field goes)
+    return std::string(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
+}
+
+bool Host::wasLoading(const std::string& id) const {
+    const std::string noted = loading();
+    if (noted.empty() || id.empty()) return false;
+    if (noted.size() == sizeof control.h->loading - 1) return id.compare(0, noted.size(), noted) == 0;
+    return noted == id;
+}
 
 bool Host::alive() {
     if (dead_.load(std::memory_order_acquire)) return false;
@@ -206,6 +228,7 @@ std::string Host::howItEnded() {
 }
 
 void Host::kill() {
+    killed_.store(true, std::memory_order_release);
     if (proc) proc->kill();
     dead_.store(true, std::memory_order_release);
 }
@@ -229,10 +252,13 @@ std::map<std::string, std::weak_ptr<Host>>& pool() {
 
 std::shared_ptr<Host> hostFor(const std::string& key, bool gpu, std::string* error) {
     std::lock_guard lock(gPoolM);
-    if (auto h = pool()[key].lock(); h && h->alive()) return h;
+    // (pooled by key and by --gpu: a host started without it never takes a GPU render, nor the other way round)
+    const std::string poolKey = gpu ? key + "\n--gpu" : key;
+    if (auto h = pool()[poolKey].lock(); h && h->alive()) return h;
     const std::string exe = hostExecutable();
     auto host = std::make_shared<Host>();
     host->key = key;
+    host->gpu = gpu;
     if (!host->control.create(error)) return nullptr;
     std::vector<std::string> args{"--control", host->control.mem->name(), "--parent", std::to_string(ipc::ownPid()),
                                   "--memory-limit-mb", std::to_string(gMemoryLimitMb.load())};
@@ -253,7 +279,7 @@ std::shared_ptr<Host> hostFor(const std::string& key, bool gpu, std::string* err
         return nullptr;
     }
     host->control.unlinkNames();
-    pool()[key] = host;
+    pool()[poolKey] = host;
     return host;
 }
 
@@ -313,7 +339,7 @@ Result call(Channel& c, Host& host, int64_t timeoutUs, const std::function<void(
     }
 }
 
-Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json) {
+Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json, const std::string& id) {
     Attached a;
     std::lock_guard lock(host.controlM);
     const bool alone = host.instances == 0;  // (a shared host may end for another plug-in's doing)
@@ -328,8 +354,11 @@ Attached attach(Host& host, Channel& chan, const std::string& kind, const std::s
     k.h->command = wire::Attach;
     const Result r = call(k, host, kLoadTimeoutUs);
     if (r == Result::Dead) {
-        a.hostDied = alone;
-        a.error = "its host " + host.howItEnded() + " while loading it";
+        // (the host says which plug-in it was loading; one that says none and held nothing else had only this one)
+        const std::string blamed = host.loading();
+        const bool self = host.wasLoading(id);
+        a.hostDied = self || (blamed.empty() && alone);
+        a.error = "its host " + host.howItEnded() + " while loading " + (blamed.empty() || self ? std::string("it") : blamed);
         return a;
     }
     if (r == Result::Timeout) {
@@ -376,13 +405,16 @@ bool sendPayload(Channel& c, Host& host, const std::string& data, int64_t timeou
 
 bool receiveBlob(Channel& c, Host& host, int64_t size, std::string& out, int64_t timeoutUs, Result* r) {
     *r = Result::Ok;
-    out.assign(wire::payload(c.base()), size_t(std::min<uint64_t>(uint64_t(std::max<int64_t>(0, size)), c.h->payloadBytes)));
+    out.clear();
+    // (what the host says is not trusted: a size past 256 MB is refused, and no more than the payload area is read)
+    if (size < 0 || size > (int64_t(256) << 20)) return false;
+    out.assign(wire::payload(c.base()), size_t(std::min<uint64_t>({uint64_t(size), c.h->payloadBytes, uint64_t(wire::kPayload)})));
     while (int64_t(out.size()) < size) {
         c.h->command = wire::FetchBlob;
         c.h->argI = int64_t(out.size());
         c.h->paramCount = 0;
         if ((*r = call(c, host, timeoutUs)) != Result::Ok || c.h->payloadBytes == 0) return false;
-        out.append(wire::payload(c.base()), size_t(std::min<uint64_t>(c.h->payloadBytes, wire::kPayload)));
+        out.append(wire::payload(c.base()), size_t(std::min<uint64_t>({c.h->payloadBytes, uint64_t(wire::kPayload), uint64_t(size) - out.size()})));
     }
     return true;
 }
@@ -436,6 +468,7 @@ void recordFailure(const std::string& id, const std::string& name, const std::st
 }
 
 void noteOfflineFailure(const std::string& name, const std::string& why) {
+    if (!tExport) return;  // (a background analysis's mixer: no export has lost anything)
     Book& b = book();
     {
         std::lock_guard lock(b.m);
@@ -514,6 +547,7 @@ enum Failure { NoFailure = 0, Crashed = 1, Hung = 2 };
 struct Core {
     Descriptor d;
     Isolation grouping = Isolation::PerPlugin;
+    std::string instance;  // (its own name, for a host of its own)
     std::atomic<Link*> next{nullptr};
     std::atomic<Link*> retired{nullptr};
     // 0 running, 1 bypassed, 2 a restart being made, 3 failing (bypassed, its failure not yet handed to the supervisor)
@@ -524,6 +558,9 @@ struct Core {
     std::atomic<int> missed{0};
     std::atomic<bool> attention{false};
     std::atomic<bool> restartAsked{false};
+    // In a shared host Montage stopped for another instance's failure: started again, nothing recorded, no automatic
+    // restart used (the failure was the other's, and is recorded once).
+    std::atomic<bool> innocent{false};
     std::atomic<int64_t> hostPid{0};
     std::weak_ptr<Host> host;  // (the supervisor's copy, under memM)
     // Remembered for a restart.
@@ -597,13 +634,13 @@ int64_t timeoutFor(int frames, double rate) {
 // Builds a link for `core` in a (new) host and gives it what the instance had: offline mode, channels, activation,
 // state and parameters.
 std::unique_ptr<Link> buildLink(Core& core, std::string* error) {
-    std::string key = hostKey(core.grouping, core.d.id, core.d.vendor.empty() ? core.d.path : core.d.vendor, false);
+    std::string key = hostKey(core.grouping, core.d.id, core.d.vendor.empty() ? core.d.path : core.d.vendor, false, core.instance);
     auto host = hostFor(key, false, error);
     if (!host) return nullptr;
     auto link = std::make_unique<Link>();
     link->host = host;
     if (!link->chan.create(error)) return nullptr;
-    const Attached a = attach(*host, link->chan, "audio", descriptorsToJson({core.d}));
+    const Attached a = attach(*host, link->chan, "audio", descriptorsToJson({core.d}), core.d.id);
     if (!a.ok) {
         if (error) *error = a.error;
         return nullptr;
@@ -684,6 +721,12 @@ void reportFailure(Core& core, bool same) {
         std::lock_guard lock(core.memM);
         host = core.host.lock();
     }
+    // (a host Montage stopped for another instance's failure, recorded by that one, or one that crashed while loading
+    // another plug-in, which is blocked for it: this one was only in it)
+    if (core.failure == Crashed && host && (host->stoppedByMontage() || (!host->loading().empty() && !host->wasLoading(core.d.id)))) {
+        core.innocent = true;
+        return;
+    }
     const bool offline = core.failedOffline.load();
     std::string kind = "crash", reason;
     if (core.failure == Hung) {
@@ -724,8 +767,9 @@ void Supervisor::pass() {
         if (core->attention.exchange(false)) reportFailure(*core, restartedNow.count(core->d.id) > 0);
         if (st != 1) continue;
         const bool asked = core->restartAsked.exchange(false);
+        const bool innocent = core->innocent.exchange(false);
         if (pluginHeldBypassed(core->d.id) && !asked) continue;
-        if (!asked && !restartedNow.count(core->d.id)) {
+        if (!asked && !innocent && !restartedNow.count(core->d.id)) {
             if (autoRestartsLeft(core->d.id) <= 0) continue;
             useAutoRestart(core->d.id);
         }
@@ -1034,7 +1078,8 @@ private:
         if (!core_->state.compare_exchange_strong(expected, 3)) return;
         core_->failure = f;
         core_->failedOffline = rendering && !tRealtime;
-        if (rendering && !tRealtime) {
+        // (an export's render alone: another offline render waits for the new host and carries on)
+        if (rendering && !tRealtime && tExport) {
             offlineNoted_ = true;
             // (an export checks for failures between frames: it hears of this one before it finishes)
             std::string how = f == Hung ? "did not answer within " + std::to_string(gExportTimeoutMs.load() / 1000) + " s and was stopped"
@@ -1110,9 +1155,10 @@ private:
     void processChunk(float* const* channels, int numChannels, int off, int frames) {
         core_->lastRenderOffline.store(!tRealtime, std::memory_order_relaxed);
         if (!usable()) {
-            if (!tRealtime && !offlineNoted_ && !pluginHeldBypassed(core_->d.id)) {
+            if (!tRealtime && tExport && !offlineNoted_ && !pluginHeldBypassed(core_->d.id)) {
                 // An export would leave it out: it stops instead, naming it (a plug-in the user disabled after it
-                // failed stays out, as asked).
+                // failed stays out, as asked). Only the export whose own mixer meets it here: an analysis in the
+                // background that finds it bypassed stops no export.
                 offlineNoted_ = true;
                 std::string how = core_->failure == Hung ? std::string("stopped responding") : link_ ? link_->host->howItEnded() : std::string();
                 noteOfflineFailure(core_->d.name.empty() ? core_->d.id : core_->d.name,
@@ -1257,7 +1303,9 @@ std::unique_ptr<Instance> instantiateIsolated(const Descriptor& d, Isolation gro
     auto core = std::make_shared<Core>();
     core->d = d;
     core->grouping = grouping;
-    const std::string key = hostKey(grouping, d.id, d.vendor.empty() ? d.path : d.vendor, false);
+    static std::atomic<uint64_t> instances{0};
+    core->instance = std::to_string(++instances);
+    const std::string key = hostKey(grouping, d.id, d.vendor.empty() ? d.path : d.vendor, false, core->instance);
     std::string err;
     auto host = hostFor(key, false, &err);
     if (!host) {
@@ -1270,14 +1318,15 @@ std::unique_ptr<Instance> instantiateIsolated(const Descriptor& d, Isolation gro
         if (error) *error = err;
         return nullptr;
     }
-    const Attached a = attach(*host, link->chan, "audio", descriptorsToJson({d}));
+    const Attached a = attach(*host, link->chan, "audio", descriptorsToJson({d}), d.id);
     if (!a.ok) {
         if (a.hostDied) {
             // As a crash while scanning: blocked until the file changes or the user tries it again.
             Registry::instance().blockAfterCrash(d.format, d.path, "crashed while loading: " + a.error);
-            recordFailure(d.id, d.name, d.vendor, "load", a.error + "; blocked", !tRealtime);
+            // (told to the export making it; an offline render that is no export's has none to tell)
+            recordFailure(d.id, d.name, d.vendor, "load", a.error + "; blocked", !tRealtime, true, !tExport);
         } else if (a.timedOut) {
-            recordFailure(d.id, d.name, d.vendor, "hang", a.error, !tRealtime);
+            recordFailure(d.id, d.name, d.vendor, "hang", a.error, !tRealtime, true, !tExport);
         }
         if (error) *error = a.error;
         return nullptr;
@@ -1318,6 +1367,8 @@ std::vector<HostFailure> hostFailures() {
     std::vector<HostFailure> out;
     {
         std::lock_guard lock(book().m);
+        for (const std::string& x : book().exhausted)
+            if (const size_t hash = x.rfind('#'); hash != std::string::npos) ++bypassedNow[x.substr(0, hash)];
         for (auto [id, f] : book().byId) {
             f.bypassedNow = std::max(bypassedNow[id], book().exhausted.count(id) || book().held.count(id) ? 1 : 0);
             f.disabled = book().held.count(id) > 0;
@@ -1341,7 +1392,16 @@ bool restartPlugin(const std::string& id) {
     {
         std::lock_guard lock(book().m);
         wasHeld = book().held.erase(id) > 0;
-        any = book().exhausted.erase(id) > 0 || wasHeld;
+        any = wasHeld;
+        // (an OpenFX instance in a host of its own is bypassed by itself: "<id>#<effect>")
+        for (auto it = book().exhausted.begin(); it != book().exhausted.end();) {
+            if (*it == id || it->rfind(id + "#", 0) == 0) {
+                it = book().exhausted.erase(it);
+                any = true;
+            } else {
+                ++it;
+            }
+        }
         book().autoUsed[id] = 0;
     }
     // (disabled from the failure bar: Restart is the user taking it back, so it is offered for new effects again)
@@ -1381,7 +1441,7 @@ std::vector<HostInfo> runningHosts() {
     std::vector<HostInfo> out;
     std::lock_guard lock(gPoolM);
     for (const auto& [key, w] : pool())
-        if (auto h = w.lock(); h && h->alive()) out.push_back({key, h->proc ? h->proc->pid() : 0, h->instances.load()});
+        if (auto h = w.lock(); h && h->alive()) out.push_back({h->key, h->proc ? h->proc->pid() : 0, h->instances.load()});
     return out;
 }
 

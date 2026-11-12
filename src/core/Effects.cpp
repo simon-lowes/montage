@@ -362,7 +362,8 @@ std::vector<EffectInfo> buildCatalog() {
     {
         // OpenColorIO transform from a config file, a built-in config or $OCIO (render/Ocio.h).
         EffectInfo ocio{"ocio", "OpenColorIO Transform", EffectCategory::VideoFilter, "Color",
-                        {boolean("inverse", "Inverse")},
+                        {boolean("inverse", "Inverse"), num("exposure", "Exposure (stops)", -10, 10, 0, 0.01),
+                         num("contrast", "Contrast", 0, 4, 1, 0.01), num("gamma", "Gamma", 0.1, 4, 1, 0.01)},
                         {str("config", "Config", StringKind::File), str("mode", "Mode", StringKind::Choice, "Colour Space"),
                          str("src", "Input Space", StringKind::Dynamic), str("dst", "Output Space", StringKind::Dynamic),
                          str("display", "Display", StringKind::Dynamic), str("view", "View", StringKind::Dynamic),
@@ -632,6 +633,12 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"directional_blur", "Directional Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("length", "Length (px)", 0, 300, 20, 0.5), angle("angle", "Direction", 0)},
                  {}});
+    // Smeared towards a centre (zoom) and round it (spin), or both, as the Zoom Blur and Spin transitions smear their
+    // pictures (render/StyleFx.h).
+    c.push_back({"radial_blur", "Radial Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {pct("zoom", "Zoom", 0, 100, 20), num("spin", "Spin (°)", 0, 180, 0, 0.1),
+                  num("center_x", "Center X", -0.5, 1.5, 0.5, 0.001), num("center_y", "Center Y", -0.5, 1.5, 0.5, 0.001)},
+                 {}});
     c.push_back({"chromatic_aberration", "Chromatic Aberration", EffectCategory::VideoFilter, "Stylize",
                  {num("amount", "Amount (px)", -30, 30, 3, 0.1)},
                  {}});
@@ -723,7 +730,7 @@ std::vector<EffectInfo> buildCatalog() {
                   boolean("ground", "Shadows on a Ground", false),
                   num("ground_y", "Ground Height (y)", -100000, 100000, 0, 0.01),
                   pct("ground_strength", "Ground Shadow Strength", 0, 100, 80),
-                  boolean("depth_of_field", "Depth of Field", false),
+                  boolean("depth_of_field", "Depth of Field (through the scene's camera: the Camera clip's)", false),
                   num("focus_distance", "Focus Distance (0: the card's middle)", 0, 10000000, 0, 0.01),
                   num("fstop", "F-Stop", 0.7, 64, 2.8, 0.1),
                   num("units_m", "Scene Units a Metre (0: 1000 for its own or the scene's camera, else 1)", 0, 1000000, 0, 0.001)},
@@ -1284,12 +1291,16 @@ std::vector<EffectInfo> buildCatalog() {
                              // (its Mask Number among them) or a path of a shape layer under the title (on Shape
                              // Track, 0 the nearest below; Shape Path its name or id, empty its first), starting at
                              // Offset (% of its length), placed along it as the text is aligned or as Along the Path
-                             // says, letters perpendicular to it unless kept upright.
+                             // says, letters perpendicular to it unless kept upright. The mask or shape layer can be
+                             // another clip's (Mask or Shape Path From Clip: its name or id); a mask's path is set off
+                             // by its expansion and, On the Feather, across its feather (-100 % its inner edge, 100 %
+                             // its outer).
                              choice("path_shape", "Text on a Path",
                                     {"None", "Circle", "Wave", "Custom (SVG Path Data)", "A Mask on the Clip", "A Shape Layer's Path"}, 0),
                              num("path_radius", "Path Radius (px)", 4, 4000, 300, 1),
                              num("path_wavelength", "Wavelength (px)", 4, 8000, 600, 1),
                              num("path_mask", "Mask Number", 1, 64, 1, 1),
+                             pct("path_feather", "On the Feather", -100, 100, 0),
                              num("path_track", "Shape Track (0 the Nearest Below)", 0, 99, 0, 1),
                              pct("path_offset", "Path Offset", -200, 200, 0),
                              choice("path_align", "Along the Path", {"As the Text Is Aligned", "From the Start", "In the Middle", "To the End", "Spread From End to End"}, 0),
@@ -1304,7 +1315,8 @@ std::vector<EffectInfo> buildCatalog() {
                          {str("text", "Text", StringKind::MultilineText, "Title"),
                           str("font", "Font", StringKind::Font, "Sans Serif"),
                           str("path_data", "Path (SVG Data)", StringKind::Text),
-                          str("path_item", "Shape Path", StringKind::Text)}};
+                          str("path_item", "Shape Path", StringKind::Text),
+                          str("path_clip", "Mask or Shape Path From Clip", StringKind::Text)}};
         c.push_back(title);
         // Extruded 3D text (render/Title3D.h): turned in space, lit, seen through a perspective camera (or a camera in a
         // USD or glTF file).
@@ -1429,6 +1441,16 @@ std::vector<EffectInfo> buildCatalog() {
                          num("aim_x", "Aim X", -100000, 100000, 0, 0.01),
                          num("aim_y", "Aim Y (up)", -100000, 100000, 0, 0.01),
                          num("aim_z", "Aim Z", -100000, 100000, 0, 0.01),
+                         // Its lens's depth of field over the whole scene seen through it (render/Layer3D.h
+                         // cameraDepthOfField): a thin lens on a 36 mm wide sensor, through an aperture of blades.
+                         num("focal_length", "Focal Length (mm on a 36 mm sensor; 0: from the field of view)", 0, 2000, 0, 0.1),
+                         boolean("dof", "Depth of Field", false),
+                         num("focus_distance", "Focus Distance (0: what is at the middle)", 0, 10000000, 0, 0.01),
+                         num("fstop", "F-Stop", 0.7, 64, 2.8, 0.1),
+                         num("units_m", "Scene Units a Metre", 0.001, 1000000, 1000, 0.001),
+                         num("blades", "Aperture Blades (0: round)", 0, 12, 0, 1),
+                         num("blade_rotation", "Blade Rotation (°)", -180, 180, 0, 0.5),
+                         num("squeeze", "Anamorphic Squeeze", 1, 4, 1, 0.01),
                      },
                      {}});
         // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").
@@ -1640,8 +1662,11 @@ std::vector<ParamInfo> textAnimatorParams(int k, const std::string& type) {
     const std::string pre = "ta" + std::to_string(k) + ".";
     ParamInfo rotation = angle(pre + "rotation", "Rotation");
     rotation.min = -720, rotation.max = 720;
-    // A 3D title's: what they pick, and how much deeper (or shallower) the letters picked are extruded.
-    if (type == "title3d")
+    // A 3D title's: what they pick, how much deeper (or shallower) the letters picked are extruded, and how they are
+    // moved (Z towards the camera), turned and scaled in 3D about their middles and coloured (face and sides).
+    if (type == "title3d") {
+        ParamInfo rx = angle(pre + "rot_x", "Tilt (X°)"), ry = angle(pre + "rot_y", "Turn (Y°)"), rz = angle(pre + "rotation", "Roll (Z°)");
+        for (ParamInfo* r : {&rx, &ry, &rz}) r->min = -720, r->max = 720;
         return {
             choice(pre + "by", "Animate", {"Letters", "Letters (Not Spaces)", "Words", "Lines"}),
             choice(pre + "shape", "Shape", {"Square", "Ramp Up", "Ramp Down", "Triangle", "Round", "Smooth"}),
@@ -1656,7 +1681,19 @@ std::vector<ParamInfo> textAnimatorParams(int k, const std::string& type) {
             boolean(pre + "shuffle", "Random Order"),
             num(pre + "seed", "Random Seed", 0, 10000, 0, 1),
             num(pre + "depth", "Extrusion (px)", -1000, 1000, 0, 0.5),
+            num(pre + "x", "Position X", -4000, 4000, 0, 1),
+            num(pre + "y", "Position Y", -4000, 4000, 0, 1),
+            num(pre + "z", "Position Z", -8000, 8000, 0, 1),
+            rx,
+            ry,
+            rz,
+            pct(pre + "scale", "Scale", 0, 1000, 100),
+            color(pre + "fill", "Face", 1, 1, 1),
+            pct(pre + "fill_mix", "Face Color Amount", 0, 100, 0),
+            color(pre + "side", "Sides", 1, 1, 1),
+            pct(pre + "side_mix", "Sides Color Amount", 0, 100, 0),
         };
+    }
     return {
         choice(pre + "by", "Animate", {"Letters", "Letters (Not Spaces)", "Words", "Lines"}),
         choice(pre + "shape", "Shape", {"Square", "Ramp Up", "Ramp Down", "Triangle", "Round", "Smooth"}),

@@ -31,6 +31,7 @@
 #include <QToolButton>
 #include <QJsonDocument>
 #include <algorithm>
+#include <set>
 #include <cmath>
 
 #include "ColorWheel.h"
@@ -146,6 +147,7 @@ void MidiLearn::disconnectDevice() {
     reconnectTimer_->stop();
     releaseHolds();
     connection_.reset();
+    outputs_.clear();
     ++generation_;
     appSettings().remove(QStringLiteral("midiLearn/device"));
     emit connectionChanged(false);
@@ -221,6 +223,30 @@ void MidiLearn::handle(const MidiMessage& m) {
             // The rest of the move that was just learnt (or the halves of its 14-bit pair) is not learnt again.
             if (justLearnt_ && now - justLearntAt_ < 600) {
                 const midimap::Key& k = *justLearnt_;
+                // A key just learnt and pressed into: its aftertouch takes the mapping over (pressure, not the press).
+                const bool pressed = k.kind == midimap::Kind::Note && e.key.channel == k.channel && e.value >= 8 &&
+                                     (e.key.kind == midimap::Kind::Aftertouch ||
+                                      (e.key.kind == midimap::Kind::PolyAftertouch && e.key.number == k.number));
+                if (pressed) {
+                    for (size_t i = 0; i < mapper_.mappings().size(); ++i) {
+                        Mapping m = mapper_.mappings()[i];
+                        if (m.key != k || QString::fromStdString(m.target) != justLearntTarget_) continue;
+                        mapper_.remove(i);
+                        m.key = e.key;
+                        m.encoding = Encoding::Absolute;
+                        m.toggle = false;
+                        if (learnAdds_) mapper_.add(m);
+                        else mapper_.map(m);
+                        saveMap();
+                        emit mapChanged();
+                        state_->message(tr("MIDI Learn: %1 controls %2").arg(QString::fromStdString(midimap::keyLabel(m.key)), targetLabel(justLearntTarget_)), 6000);
+                        emit learnt(QString::fromStdString(midimap::keyName(m.key)), justLearntTarget_);
+                        break;
+                    }
+                    justLearnt_ = e.key;
+                    justLearntAt_ = now;
+                    continue;
+                }
                 const bool same = e.key == k || (k.kind == midimap::Kind::Cc14 && e.key.kind == midimap::Kind::Cc &&
                                                  e.key.channel == k.channel && (e.key.number == k.number || e.key.number == k.number + 32));
                 if (same) {
@@ -250,8 +276,44 @@ void MidiLearn::handle(const MidiMessage& m) {
 
 void MidiLearn::refresh() {
     if (!connection_) return;
-    for (const MidiMessage& m : mapper_.refresh([this](const Mapping& map) { return targetValue(QString::fromStdString(map.target)); }))
-        connection_->send(m);
+    // (in order, each to its port: the controller's own, or a mapping's own output)
+    std::set<std::string> missing;
+    for (const midimap::Mapper::Out& o : mapper_.refreshAll([this](const Mapping& map) { return targetValue(QString::fromStdString(map.target)); }))
+        if (o.port.empty()) connection_->send(o.message);
+        else if (MidiConnection* port = outputPort(o.port)) port->send(o.message);
+        else missing.insert(o.port);
+    // (not there yet, or unplugged: shown once it can be opened, not only when the value next changes)
+    for (const std::string& port : missing) mapper_.reshow(port);
+}
+
+void MidiLearn::setOutputOpener(OutputOpener opener) {
+    openOutput_ = std::move(opener);
+    outputs_.clear();
+    outputFailed_.clear();
+}
+
+MidiConnection* MidiLearn::outputPort(const std::string& name) {
+    if (const auto it = outputs_.find(name); it != outputs_.end()) return it->second.get();
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (const auto it = outputFailed_.find(name); it != outputFailed_.end() && now - it->second < 2000) return nullptr;
+    QString why;
+    std::unique_ptr<MidiConnection> c;
+    if (openOutput_) {
+        c = openOutput_(QString::fromStdString(name), &why);
+    } else {
+        for (const MidiPortInfo& o : midiOutputs())
+            if (o.name == name) {
+                std::string err;
+                c = openMidi(std::string(), o.id, {}, &err);
+                break;
+            }
+    }
+    if (!c) {
+        outputFailed_[name] = now;  // (looked for again in a while: it may be plugged in later)
+        return nullptr;
+    }
+    outputFailed_.erase(name);
+    return (outputs_[name] = std::move(c)).get();
 }
 
 // ---- Learning.
@@ -304,6 +366,7 @@ void MidiLearn::complete() {
     }
     justLearnt_ = pendingControl_->key;
     justLearntAt_ = QDateTime::currentMSecsSinceEpoch();
+    justLearntTarget_ = pendingTarget_;
     learner_.clear();
     learnTimer_->stop();
     Mapping m;
@@ -321,7 +384,14 @@ void MidiLearn::complete() {
     const QString control = QString::fromStdString(midimap::keyLabel(m.key)), target = pendingTarget_;
     pendingControl_.reset();
     pendingTarget_.clear();
-    addMapping(m);
+    if (learnAdds_) {
+        // (one more of the control's targets: the others it drives stay)
+        mapper_.add(m);
+        saveMap();
+        emit mapChanged();
+    } else {
+        addMapping(m);
+    }
     state_->message(tr("MIDI Learn: %1 controls %2").arg(control, targetLabel(target)), 6000);
     emit learnt(QString::fromStdString(midimap::keyName(m.key)), target);
 }
@@ -359,12 +429,21 @@ bool MidiLearn::eventFilter(QObject* watched, QEvent* event) {
 
 bool MidiLearn::inApp(const QWidget* w) const {
     const QWidget* top = w ? w->window() : nullptr;
-    return top && (top == window_ || (qobject_cast<const QDockWidget*>(top) && top->parentWidget() == window_));
+    if (!top) return false;
+    if (top == window_ || (qobject_cast<const QDockWidget*>(top) && top->parentWidget() == window_)) return true;
+    // One of Montage's dialogs (named, so its parameters can be found again; MIDI Learn's own is not learnt from).
+    if (!qobject_cast<const QDialog*>(top) || top->objectName().isEmpty() || top->objectName() == QLatin1String("midiLearnDialog"))
+        return false;
+    for (const QWidget* p = top->parentWidget(); p; p = p->parentWidget())
+        if (p == window_) return true;
+    return false;
 }
 
 QString MidiLearn::panelOf(QWidget* w) const {
-    for (QWidget* p = w; p && p != window_; p = p->parentWidget())
+    for (QWidget* p = w; p && p != window_; p = p->parentWidget()) {
         if (auto* d = qobject_cast<QDockWidget*>(p)) return d->objectName();
+        if (p->isWindow() && qobject_cast<QDialog*>(p)) return QStringLiteral("dialog:") + p->objectName();
+    }
     return QStringLiteral("main");
 }
 
@@ -438,19 +517,26 @@ QWidget* MidiLearn::widgetFor(const QString& target) const {
     if (target == QLatin1String("master:volume")) return mixer_->masterFader();
     if (!target.startsWith(QLatin1String("widget:"))) return nullptr;
     // The widget found last time, while it is still the one shown (the Inspector rebuilds its rows).
-    if (const auto it = found_.find(target); it != found_.end() && it->second && it->second->isVisibleTo(window_))
+    if (const auto it = found_.find(target); it != found_.end() && it->second && (it->second->isVisibleTo(window_) || it->second->isVisible()))
         return it->second;
     QString path = target.mid(7);
     path = path.section(QLatin1Char('#'), 0, 0);
     const QString panel = path.section(QLatin1Char('/'), 0, 0), name = path.section(QLatin1Char('/'), 1);
     if (name.isEmpty()) return nullptr;
     QWidget* in = window_;
-    if (panel != QLatin1String("main"))
+    if (panel.startsWith(QLatin1String("dialog:"))) {
+        // A dialog open now, by its name (the latest shown when there are several).
+        in = nullptr;
+        for (QDialog* d : window_->findChildren<QDialog*>(panel.mid(7)))
+            if (d->isWindow() && (!in || d->isVisible())) in = d;
+        if (!in) return nullptr;
+    } else if (panel != QLatin1String("main")) {
         if (auto* d = window_->findChild<QDockWidget*>(panel)) in = d;
+    }
     QWidget* found = nullptr;
     for (QWidget* w : in->findChildren<QWidget*>(name)) {
-        if (panel == QLatin1String("main") && panelOf(w) != panel) continue;
-        if (w->isVisibleTo(window_)) {
+        if ((panel == QLatin1String("main") || in != window_) && panelOf(w) != panel) continue;
+        if (in != window_ && !qobject_cast<QDockWidget*>(in) ? w->isVisible() : w->isVisibleTo(window_)) {
             found_[target] = w;
             return w;
         }
@@ -636,8 +722,10 @@ void MidiLearn::setMapping(size_t index, const Mapping& m) {
     if (old.key == m.key && old.layer == m.layer) {
         mapper_.setMappingOptions(index, m);
     } else {
-        mapper_.unmap(old.key, old.layer);
-        mapper_.map(m);
+        // (onto another control: its mappings kept only when learning adds to a control's targets)
+        mapper_.remove(index);
+        if (learnAdds_) mapper_.add(m);
+        else mapper_.map(m);
     }
     saveMap();
     emit mapChanged();
@@ -645,8 +733,7 @@ void MidiLearn::setMapping(size_t index, const Mapping& m) {
 
 void MidiLearn::removeMapping(size_t index) {
     if (index >= mapper_.mappings().size()) return;
-    const Mapping m = mapper_.mappings()[index];
-    mapper_.unmap(m.key, m.layer);
+    mapper_.remove(index);
     saveMap();
     emit mapChanged();
 }
@@ -673,7 +760,7 @@ void MidiLearn::loadMap() {
     } else {
         if (midimaps::load(file, map, &why, &skipped)) {
             mapper_.clear();
-            for (const Mapping& m : map.mappings) mapper_.map(m);
+            for (const Mapping& m : map.mappings) mapper_.add(m);
             bankSize_ = map.bankSize;
             if (!skipped.isEmpty()) {
                 loadFailed_ = true;  // (what was left out is kept in a copy before the file is next written)
@@ -811,8 +898,13 @@ QDialog* MidiLearn::openDialog(QWidget* parent) {
     auto* inPanel = new QCheckBox(tr("Only while the panel clicked in has focus"), dlg);
     inPanel->setObjectName(QStringLiteral("midiLearnInPanel"));
     inPanel->setChecked(learnInPanel_);
+    auto* adds = new QCheckBox(tr("Add to its targets"), dlg);
+    adds->setObjectName(QStringLiteral("midiLearnAdds"));
+    adds->setToolTip(tr("A control learnt again also drives the new parameter (one fader on several), each with its own range"));
+    adds->setChecked(learnAdds_);
     learnRow->addWidget(learn);
     learnRow->addWidget(inPanel, 1);
+    learnRow->addWidget(adds);
     v->addLayout(learnRow);
     connect(learn, &QPushButton::toggled, this, &MidiLearn::setLearning);
     connect(this, &MidiLearn::learningChanged, learn, [learn](bool on) {
@@ -820,6 +912,7 @@ QDialog* MidiLearn::openDialog(QWidget* parent) {
         learn->setChecked(on);
     });
     connect(inPanel, &QCheckBox::toggled, this, &MidiLearn::setLearnInPanel);
+    connect(adds, &QCheckBox::toggled, this, &MidiLearn::setLearnAdds);
 
     auto* bankRow = new QHBoxLayout;
     auto* bankSize = new QSpinBox(dlg);
@@ -836,9 +929,11 @@ QDialog* MidiLearn::openDialog(QWidget* parent) {
     auto* table = new QTableWidget(dlg);
     table->setObjectName(QStringLiteral("midiLearnMap"));
     table->setAccessibleName(tr("MIDI map"));
-    table->setColumnCount(9);
+    table->setColumnCount(10);
     table->setHorizontalHeaderLabels({tr("Control"), tr("Controls"), tr("Panel"), tr("From"), tr("To"), tr("Curve"),
-                                      tr("Invert"), tr("Toggle"), tr("Takeover")});
+                                      tr("Invert"), tr("Toggle"), tr("Takeover"), tr("Shown on")});
+    table->horizontalHeaderItem(9)->setToolTip(tr("The MIDI output its value is sent to (motor faders, LED rings); "
+                                                  "empty: the controller's own"));
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
     table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     table->verticalHeader()->hide();
@@ -872,6 +967,7 @@ QDialog* MidiLearn::openDialog(QWidget* parent) {
             check(6, m.invert, true);
             check(7, m.toggle, m.encoding == Encoding::Button);
             check(8, m.pickup, m.encoding == Encoding::Absolute);
+            text(9, QString::fromStdString(m.output), true);
         }
     };
     fillTable();
@@ -889,6 +985,7 @@ QDialog* MidiLearn::openDialog(QWidget* parent) {
             case 6: m.invert = item->checkState() == Qt::Checked; break;
             case 7: m.toggle = item->checkState() == Qt::Checked; break;
             case 8: m.pickup = item->checkState() == Qt::Checked; break;
+            case 9: m.output = item->text().trimmed().toStdString(); break;
             default: break;
         }
         setMapping(r, m);

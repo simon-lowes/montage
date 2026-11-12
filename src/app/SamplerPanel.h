@@ -11,6 +11,7 @@
 #include <QPointer>
 #include <QWidget>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -89,6 +90,7 @@ private:
     const Track* audioTrack() const;
     int selectedKey() const;
     void setSlot(const SamplerSlot& slot, const QString& label);
+    void changeSlot(int key, const std::function<void(SamplerSlot&)>& change);  // the slot on that key, changed (one undo step)
     uint32_t seedFor(uint32_t index) const;
 
     EditorState* state_;
@@ -117,6 +119,7 @@ private:
     QSpinBox* velocityBox_;
     QTableWidget* table_;
     QPushButton* recordButton_;
+    QCheckBox* clipPerHitBox_;
     QComboBox* passBox_;
     QLabel* status_;
 };

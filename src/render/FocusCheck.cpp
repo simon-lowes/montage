@@ -96,7 +96,18 @@ struct TileSums {
     double fine = 0, broad = 0;           // energies of the bands
     double f[3] = {0, 0, 0}, b[3] = {0, 0, 0};  // structure tensors (xx, xy, yy) of the smear's two bands' gradients
     int64_t count = 0;
+    double noise = 0;                     // its noise's standard deviation, as estimated
 };
+
+// What white noise of unit variance leaves in a band (the difference of two Gaussians, each separable), per pixel.
+double noiseGain(const std::vector<float>& a, const std::vector<float>& b) {
+    double aa = 0, bb = 0, ab = 0;
+    const int ra = int(a.size() / 2), rb = int(b.size() / 2);
+    for (float v : a) aa += double(v) * v;
+    for (float v : b) bb += double(v) * v;
+    for (int i = -std::min(ra, rb); i <= std::min(ra, rb); ++i) ab += double(a[size_t(i + ra)]) * b[size_t(i + rb)];
+    return aa * aa - 2 * ab * ab + bb * bb;
+}
 
 std::string percent(double v) {
     char b[32];
@@ -192,8 +203,41 @@ FocusMeasure measureFocus(const float* luma, int w, int h, int threads) {
                     }
                 }
                 s.count = int64_t(x1 - x0) * int64_t(y1 - y0);
+                // The noise (grain, a sensor's at high gain): the median of a mask that leaves smooth shading and most
+                // edges out (Immerkær's), robust to what edges remain.
+                std::vector<float> r;
+                r.reserve(size_t(s.count));
+                for (int y = y0; y < y1; ++y)
+                    for (int x = x0; x < x1; ++x) {
+                        const float* c = luma + size_t(y) * size_t(w) + size_t(x);
+                        const float* up = c - w;
+                        const float* dn = c + w;
+                        r.push_back(std::fabs(up[-1] - 2 * up[0] + up[1] - 2 * (c[-1] - 2 * c[0] + c[1]) + dn[-1] - 2 * dn[0] + dn[1]));
+                    }
+                if (!r.empty()) {
+                    std::nth_element(r.begin(), r.begin() + std::ptrdiff_t(r.size() / 2), r.end());
+                    s.noise = 1.4826 * double(r[r.size() / 2]) / 6;
+                }
             }
     });
+    // The picture's noise (the median tile's), and what it leaves in each band: taken off, so grain that is there
+    // whatever the focus does not read as detail (a dark, grainy shot's soft frame scored over its sharp one).
+    {
+        std::vector<double> noise;
+        for (const TileSums& s : tiles)
+            if (s.count > 0) noise.push_back(s.noise);
+        double sigma = 0;
+        if (!noise.empty()) {
+            std::nth_element(noise.begin(), noise.begin() + std::ptrdiff_t(noise.size() / 2), noise.end());
+            sigma = noise[noise.size() / 2];
+        }
+        static const double fineGain = noiseGain(kernels[0], kernels[1]), broadGain = noiseGain(kernels[0], kernels[2]);
+        const double v = sigma * sigma;
+        for (TileSums& s : tiles) {
+            s.fine = std::max(0.0, s.fine - double(s.count) * v * fineGain);
+            s.broad = std::max(0.0, s.broad - double(s.count) * v * broadGain);
+        }
+    }
     // The busiest tiles: a quarter of them (at least four), of those with anything to judge.
     std::vector<size_t> order;
     for (size_t i = 0; i < tiles.size(); ++i)

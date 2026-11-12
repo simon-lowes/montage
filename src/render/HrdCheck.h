@@ -4,9 +4,11 @@
 //    sequence parameter set's VUI (NAL HRD, else VCL HRD; HEVC's in the VPS when the SPS has none), the buffering
 //    period SEI that starts each period and the picture timing SEI of every access unit. Each access unit's bits
 //    arrive at the stated bit rate (CBR: one after another; VBR: no earlier than the initial delay and offset allow),
-//    and are removed at the time its picture timing says. Underflow (a picture not all there when it is to be decoded)
-//    and overflow (more bits than the buffer holds) are reported by frame, and so is a buffering period whose initial
-//    delay does not agree with where the buffer stands (C.3 of H.264, C.4 of H.265).
+//    and are removed at the time its picture timing says, for every schedule the stream states (each SchedSelIdx of the
+//    NAL HRD, and of the VCL HRD when both are there: a stream conforms when it keeps them all). Underflow (a picture
+//    not all there when it is to be decoded) and overflow (more bits than the buffer holds) are reported by frame, and
+//    so is a buffering period whose initial delay does not agree with where the buffer stands (C.3 of H.264, C.4 of
+//    H.265).
 //  - A stream with no HRD stated is checked against its level's limits (H.264 Table A-1, H.265 Table A.8): VBR at the
 //    level's highest bit rate into its largest buffer, the buffer full before the first picture, the pictures removed
 //    at the container's times.
@@ -15,6 +17,14 @@
 //    arrives; the rate between pictures they imply must not pass the stated rate, and the buffer must neither run dry
 //    nor overflow. At a variable rate (vbv_delay 0xFFFF) the buffer fills at the stated rate until full and must not
 //    run dry.
+//  - AV1 (the AV1 specification's Annex E, the decoder model's smoothing buffer), where the sequence header states a
+//    decoder model for an operating point: each decodable frame group arrives at the level's highest bit rate, no
+//    earlier than the encoder's and decoder's buffer delays before its removal, and is removed when the frame's
+//    buffer_removal_time says, counted from the last random access point. A group not all there at its removal, more
+//    bits than a second at that rate, and a random access point whose stated delay is more than the buffer gives there
+//    are reported. Every operating point with a model is run. A stream with no decoder model is not checked (the
+//    model's other mode needs the decoder's frame buffers followed), and neither are the model's decoding and
+//    presentation times.
 // Sizes are counted as a byte stream: each NAL unit of an MP4, MOV or Matroska file with a four-byte start code (as
 // x264 and x265 count them), Annex B files (MPEG-TS, raw streams) as they are. Sub-picture HRD parameters are not modelled.
 #pragma once
@@ -33,12 +43,24 @@ struct HrdIssue {
     int64_t shown = 0;  // the frame it shows, in display order (counted from the file's first)
     std::string kind;   // "underflow", "overflow", "initial delay", "rate", "timing"
     std::string text;
+    int schedule = 0;   // which of the stream's schedules it was found on (an index into HrdReport::schedules)
+};
+
+// One of the delivery schedules a stream states (H.264 and HEVC: a SchedSelIdx of its NAL or VCL HRD), and what running
+// the stream through it found.
+struct HrdSchedule {
+    std::string model;  // "NAL HRD", "VCL HRD", "decoder model"
+    int index = 0;      // its SchedSelIdx (AV1: its operating point)
+    bool cbr = false;
+    double bitRate = 0, bufferBits = 0, initialDelay = 0;
+    double lowest = 1, highest = 0;
+    int64_t issueCount = 0;
 };
 
 struct HrdReport {
     bool checked = false;  // a buffer model was found and every picture run through it
-    std::string codec;     // "H.264", "HEVC", "MPEG-2"
-    std::string model;     // "NAL HRD", "VCL HRD", "VBV", "level 4.1 limits"
+    std::string codec;     // "H.264", "HEVC", "MPEG-2", "AV1"
+    std::string model;     // "NAL HRD", "VCL HRD", "VBV", "level 4.1 limits", "decoder model"
     bool cbr = false;
     bool signalled = false;   // stated in the stream (not the level's limits)
     double bitRate = 0;       // bits/s
@@ -46,7 +68,10 @@ struct HrdReport {
     double initialDelay = 0;  // seconds the first picture waits in the buffer
     int64_t frames = 0;
     double lowest = 1, highest = 0;  // the buffer's fullness, as a fraction of it: lowest just after a removal, highest just before
-    std::vector<HrdIssue> issues;    // the first 100
+    // Every schedule the stream states, the first (whose figures are the ones above) first. One entry for MPEG-2, for a
+    // stream checked against its level's limits and for AV1's operating point.
+    std::vector<HrdSchedule> schedules;
+    std::vector<HrdIssue> issues;    // the first 100, of every schedule
     int64_t issueCount = 0;
     std::string note;   // what was assumed, or why nothing was checked
     std::string error;  // the file could not be read
@@ -55,7 +80,7 @@ struct HrdReport {
     std::string summary() const;
 };
 
-// Checks the first video stream of `path` (H.264, HEVC or MPEG-2 in any container FFmpeg reads).
+// Checks the first video stream of `path` (H.264, HEVC, MPEG-2 or AV1 in any container FFmpeg reads).
 HrdReport checkHrd(const std::string& path, const std::atomic<bool>* cancel = nullptr);
 
 namespace hrd {
@@ -152,7 +177,7 @@ struct AccessUnit {
     bool irap = false;  // H.264 IDR; HEVC IRAP
     bool idr = false;
     int64_t bits = 0;   // counted as a byte stream
-    int vclBits = 0;
+    int vclBits = 0;    // its VCL and filler data NAL units' (what a VCL HRD, Type I, counts)
 };
 bool readAccessUnit(int codec, const uint8_t* d, size_t n, int lengthSize, std::map<int, Sps>& sps, std::map<int, Pps>& pps,
                     AccessUnit& au, std::map<int, Sps>* vpsHrd = nullptr);
@@ -176,10 +201,12 @@ class HrdSplicer {
 public:
     // H.264 and HEVC: the output's parameter sets (each NAL unit whole, without length or start code) and the length
     // size of its access units; the model comes from the first SPS with an HRD. MPEG-2: `mpeg2Rate` and
-    // `mpeg2Buffer` (bits/s and bits, a constant rate). `depth`: the frames the output decodes ahead of what it shows.
-    // False when there is no HRD to keep.
+    // `mpeg2Buffer` (bits/s and bits), at a constant rate or, with `mpeg2Cbr` false, a variable one: the rate is then
+    // the stream's stated maximum, every picture's vbv_delay is 0xFFFF (ours' and any copied one that stated a delay),
+    // ours' sequence headers state that maximum and buffer, and nothing is padded. `depth`: the frames the output
+    // decodes ahead of what it shows. False when there is no HRD to keep.
     bool start(int codec, const std::vector<std::vector<uint8_t>>& sets, int lengthSize, double fps, int depth, double mpeg2Rate = 0,
-               double mpeg2Buffer = 0);
+               double mpeg2Buffer = 0, bool mpeg2Cbr = true);
     bool active() const { return active_; }
     bool cbr() const { return cbr_; }
     double bitRate() const { return rate_; }
@@ -187,7 +214,9 @@ public:
     // A parameter set the output carries out of band (H.264's avcC) or will see in band.
     void addParameterSet(const uint8_t* nal, size_t n);
     // Seconds the next access unit's removal comes after the one held (or the first's initial delay) finished arriving,
-    // were nothing padded: where the buffer stands for what comes next (times the bit rate, its bits).
+    // were nothing padded: where the buffer stands for what comes next (times the bit rate, its bits). MPEG-2 at a
+    // variable rate: the bits the buffer holds when the next picture is decoded (filled at the maximum rate, up to
+    // full), as seconds at that rate.
     double nextDelay() const;
     // The next access unit's buffering period, when it brings its own (H.264 and HEVC: the first CPB's initial delay
     // in seconds; MPEG-2: its first picture's vbv_delay in seconds), so the one held is padded to meet it.
@@ -236,6 +265,7 @@ private:
     int64_t bpIndex_ = 0;
     int64_t init90_ = 0, offset90_ = 0;
     double mpegBits_ = 0;      // MPEG-2: bits written
+    double vbrLevel_ = 0;      // MPEG-2 at a variable rate: the buffer's bits when the next final picture is decoded
     Held pending_;
     bool havePending_ = false;
 };

@@ -29,10 +29,14 @@ std::vector<std::string> ocioChoices(const Effect& e, const std::string& param);
 
 // Applies the "ocio" effect to premultiplied RGBA in place. False (and the
 // image untouched) if the config or transform is invalid.
-bool applyOcio(const Effect& e, Image& img, std::string* error = nullptr);
-// The same transform as OCIO's GPU shader, for render/GpuCompositor (its textures declared from binding 2 up). Null
-// (with why) where the config or transform cannot be made, or the shader has values set while it runs (dynamic
-// properties, which the CPU's transform does not have).
+// Its exposure, contrast and gamma (at `t`), once any is set (ocioLiveControls), go first, on the input space's values
+// (OCIO's ExposureContrastTransform, linear style, pivot 0.18).
+bool applyOcio(const Effect& e, Image& img, std::string* error = nullptr, FrameTime t = 0);
+bool ocioLiveControls(const Effect& e);  // exposure, contrast or gamma set or keyed
+// The same transform as OCIO's GPU shader, for render/GpuCompositor (its textures declared from binding 2 up). Its
+// exposure, contrast and gamma are OCIO's dynamic properties there, the shader's `uniforms`, so changing them draws
+// with new values and does not build the shader again. Null (with why) where the config or transform cannot be made,
+// or the shader has values set while it runs of another kind.
 std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::string* error = nullptr);
 
 // One of OCIO's built-in transforms (e.g. "ACEScct_to_ACES2065-1") on RGB

@@ -108,6 +108,7 @@ private:
     void drainDevice();  // what the device's input has brought, into the take (on this thread)
     void closeDevice();
     Id stopLoop();
+    QStringList splitGroupTake(const std::vector<int>& grouped);  // the take's channels, a mono file a grouped track
 
     EditorState* state_;
     WavWriter writer_;

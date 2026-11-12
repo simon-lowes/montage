@@ -1429,17 +1429,21 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             connect(save, &QPushButton::clicked, this, [this, cs, owner] {
                 QString filter;
                 const QString chan = QFileDialog::getSaveFileName(window(), tr("Export Camera"), QStringLiteral("camera.chan"),
-                                                                  tr("Nuke camera (*.chan);;USD scene with the placed models (*.usda)"), &filter);
+                                                                  tr("Nuke camera (*.chan);;USD scene with the placed models (*.usda);;USD package with the placed models (*.usdz)"),
+                                                                  &filter);
                 if (chan.isEmpty()) return;
                 std::string err;
-                if (chan.endsWith(QLatin1String(".usda"), Qt::CaseInsensitive) || filter.contains(QLatin1String("usda"))) {
+                const bool package = chan.endsWith(QLatin1String(".usdz"), Qt::CaseInsensitive) || filter.contains(QLatin1String("usdz"));
+                if (package || chan.endsWith(QLatin1String(".usda"), Qt::CaseInsensitive) || filter.contains(QLatin1String("usda"))) {
                     // The camera, its points and the models placed in the shot, in one USD scene.
                     const Sequence* s = state_->sequence();
                     std::vector<SolvedSceneMesh> models;
                     for (size_t i = 0; s && i < s->videoTracks.size(); ++i)
                         for (const Clip& k : s->videoTracks[i].clips)
                             if (k.id == owner) models = solvedSceneModels(state_->project(), *s, i, k);
-                    const QString usd = chan.endsWith(QLatin1String(".usda"), Qt::CaseInsensitive) ? chan : QFileInfo(chan).path() + "/" + QFileInfo(chan).completeBaseName() + ".usda";
+                    // (a package holds the cards' pictures; a scene has them beside it)
+                    const QString ext = package ? QStringLiteral(".usdz") : QStringLiteral(".usda");
+                    const QString usd = chan.endsWith(ext, Qt::CaseInsensitive) ? chan : QFileInfo(chan).path() + "/" + QFileInfo(chan).completeBaseName() + ext;
                     if (!writeSolveUsda(cs, usd.toStdString(), models, &err)) state_->message(QString::fromStdString(err), 6000);
                     else state_->message(tr("Wrote %1").arg(QFileInfo(usd).fileName()), 4000);
                     return;
@@ -3022,7 +3026,7 @@ void InspectorWidget::addTextAnimations(const Clip& clip, const Target& target) 
     }
     auto* add = new QPushButton(tr("Add Text Animation"), content_);
     add->setObjectName(QStringLiteral("addTextAnimation"));
-    add->setToolTip(type == "title3d" ? tr("Extrude the letters deeper or shallower a letter, word or line at a time")
+    add->setToolTip(type == "title3d" ? tr("Extrude, move, turn, scale or recolour the letters in 3D a letter, word or line at a time")
                                       : tr("Move, scale, turn, fade, blur or recolour the text a letter, word or line at a time"));
     connect(add, &QPushButton::clicked, this, [this, target] {
         state_->edit(tr("Add Text Animation"), [target](Project&, Sequence& s) {

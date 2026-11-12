@@ -18,6 +18,7 @@
 #include "media/Image.h"
 
 #include <atomic>
+#include <vector>
 
 namespace montage {
 
@@ -62,5 +63,25 @@ bool contourSmear(Image& img, const SmearSettings& settings, const std::atomic<b
 
 // The Painterly effect.
 void paintEffect(const Effect& e, FrameTime t, Image& img, double pixelScale);
+// Its settings as paintEffect reads them (for render/Processing's GPU passes): the style (0 Oil Paint, 1 Contour Smear),
+// each style's settings and the mix with the picture (false: nothing to do).
+struct PaintSetup {
+    int style = 0;
+    KuwaharaSettings kuwahara;
+    SmearSettings smear;
+    double mix = 1;
+};
+bool paintSetup(const Effect& e, FrameTime t, double pixelScale, PaintSetup& out);
+// How the structure tensor is smoothed by a Gaussian of `sigma`: past 3, three boxes each way of these radii (along
+// rows, then down columns); otherwise its kernel's weights, from the centre out (empty: no smoothing).
+struct GaussianPlan {
+    int boxes[3] = {0, 0, 0};
+    std::vector<float> kernel;
+    bool byBoxes = false;
+};
+GaussianPlan gaussianPlan(double sigma);
+// The most samples a Kuwahara brush takes along its radius: past it, its ellipse is sampled every
+// ceil(radius / kKuwaharaSamples) pixels from the picture averaged over a box of about that size.
+constexpr double kKuwaharaSamples = 8;
 
 }  // namespace montage

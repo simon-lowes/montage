@@ -56,6 +56,8 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | [Lua](https://www.lua.org) 5.4 | MIT | [LICENSES/MIT-Lua.txt](LICENSES/MIT-Lua.txt) |
 | [PortAudio](https://www.portaudio.com) 19.7.0 (its ALSA, Core Audio and WASAPI host APIs), for the audio devices | MIT (with non-binding requests) | the source's `LICENSE.txt` (copied into the packages) |
 | [libvmx](https://github.com/openmediatransport/libvmx) (commit 31724bb), Open Media Transport's VMX codec, with [sse2neon](https://github.com/DLTcollab/sse2neon) on ARM | MIT, MIT | the source's `LICENSE.txt` (copied into the packages); [LICENSES/MIT-sse2neon.txt](LICENSES/MIT-sse2neon.txt) |
+| [libvmaf](https://github.com/Netflix/vmaf) v3.2.1 (commit f85a853), Netflix's VMAF, with its VMAF models compiled in (v0.6.1, v0.6.3, v1.0.16 and its high frame rate models), and the code it carries: [LIBSVM](https://www.csie.ntu.edu.tw/~cjlin/libsvm/) (Copyright (c) 2000-2019 Chih-Chung Chang and Chih-Jen Lin), Tom Distler's IQA (Copyright (c) 2011, Tom Distler), Xiph.Org's PSNR-HVS (Copyright 2001-2012 Xiph.Org and contributors) and pdjson (public domain). Copyright 2016-2026 Netflix, Inc. Montage builds it with its own CMake (`third_party/libvmaf`: the config.h and version stamp its build generates, and its CPUID queries in C) | BSD-2-Clause-Patent (the models too, in the same repository); BSD-3-Clause, BSD-3-Clause, BSD-2-Clause | the source's `LICENSE` (copied into the packages); [LICENSES/BSD-3-Clause-libsvm.txt](LICENSES/BSD-3-Clause-libsvm.txt), [LICENSES/BSD-3-Clause-IQA.txt](LICENSES/BSD-3-Clause-IQA.txt), [LICENSES/BSD-2-Clause-Xiph-PSNR-HVS.txt](LICENSES/BSD-2-Clause-Xiph-PSNR-HVS.txt) |
+| [SVT-JPEG-XS](https://github.com/OpenVisualCloud/SVT-JPEG-XS) v0.10.0 (commit 01bc7cc), the JPEG XS encoder and decoder (Copyright (c) 2024 Intel Corporation), with [cpuinfo](https://github.com/pytorch/cpuinfo) on x86-64 (Copyright (c) 2019 Google LLC, 2017-2018 Facebook Inc., 2012-2017 Georgia Institute of Technology, 2010-2012 Marat Dukhan), built by `scripts/build-svt-jpegxs.sh` | BSD-2-Clause-Patent, BSD-2-Clause | the sources' `LICENSE.md` and `LICENSE` (copied into the packages) |
 | [x265](https://www.x265.org) 4.2, built with its multiview encoder for spatial video (MV-HEVC) export | GPL-2.0-or-later | the source's `COPYING` (copied into the packages; the release sources carry its tarball) |
 | [ThorVG](https://github.com/thorvg/thorvg), with RapidJSON (MIT) and JerryScript (Apache-2.0) | MIT, MIT, Apache-2.0 | the source's licence files (copied into the packages) |
 | [OpenEXR](https://github.com/AcademySoftwareFoundation/openexr) 3.5 and [Imath](https://github.com/AcademySoftwareFoundation/Imath), with the [OpenJPH](https://github.com/aous72/OpenJPH) (BSD-2-Clause), [libdeflate](https://github.com/ebiggers/libdeflate) (MIT) and [zstd](https://github.com/facebook/zstd) (BSD-3-Clause) OpenEXR bundles | BSD-3-Clause, BSD-3-Clause, BSD-2-Clause, MIT, BSD-3-Clause | the sources' licence files (copied into the packages) |
@@ -71,6 +73,7 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | [OpenFX](https://github.com/AcademySoftwareFoundation/openfx) headers | BSD-3-Clause | [third_party/openfx/LICENSE](third_party/openfx/LICENSE) |
 | Blackmagic DeckLink SDK 12.0 headers | Blackmagic Design's header licence | [third_party/decklink/LICENSE](third_party/decklink/LICENSE) |
 | NDI SDK 6 headers | MIT (these files only) | [third_party/ndi/LICENSE](third_party/ndi/LICENSE) |
+| [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols)' color-management-v1 (1.41 or later; CI uses 1.46), compiled in as the client code wayland-scanner generates from it (Copyright 2019 Sebastian Wick, 2019 Erwin Burema, 2020 AMD, 2020-2024 Collabora, Ltd., 2024 Xaver Hugl, 2022-2025 Red Hat, Inc.), and [libwayland-client](https://gitlab.freedesktop.org/wayland/wayland) (Copyright © 2008-2012 Kristian Høgsberg, 2010-2012 Intel Corporation, 2011 Benjamin Franzke, 2012 Collabora, Ltd.), linked from the system: the HDR viewer on Linux (`src/app/WaylandColor.cpp`), where both are found | MIT, MIT | the copyright and permission notice in the protocol's XML; the source's `COPYING` |
 
 ## Libraries bundled in the packages
 
@@ -102,11 +105,6 @@ Montage does not include the Blackmagic Desktop Video driver, the NDI Runtime or
 when they are installed. NDI® is a registered trademark of Vizrt NDI AB ([ndi.video](https://ndi.video)). VST® is a
 registered trademark of Steinberg Media Technologies GmbH.
 
-Nor does it include [libvmaf](https://github.com/Netflix/vmaf) or Netflix's VMAF models (BSD-2-Clause-Patent,
-Copyright Netflix, Inc.): a build configured with `MONTAGE_WITH_VMAF` (off by default) links the libvmaf installed on
-the computer for Compare Encode's VMAF scores and reads the models from `MONTAGE_VMAF_MODELS` or a `vmaf-models`
-folder beside the program.
-
 Nor AV2's libraries, which are optional, not in packages, and flagged: a build configured with `MONTAGE_WITH_AV2` (off
 by default; `scripts/build-av2.sh` builds them from pinned tags) links VideoLAN's
 [dav2d](https://code.videolan.org/videolan/dav2d) 0.0.1 to read AV2 (BSD-2-Clause, as its COPYING states: Copyright ©
@@ -122,3 +120,16 @@ effects) are CC BY-SA 4.0, so they are downloaded from the authors' Zenodo recor
 The streaming package test plays packages with [hls.js](https://github.com/video-dev/hls.js) (Apache-2.0) and
 [dash.js](https://github.com/Dash-Industry-Forum/dash.js) (BSD-3-Clause), fetched from npm when the build is configured
 (`MONTAGE_TEST_STREAMING_PLAYERS`); neither is part of Montage or its packages.
+
+The tests also build libvmaf's own `vmaf` program from the same sources (`montage_test_vmaf`), to check Montage's VMAF
+scores against it; it is not part of Montage or its packages.
+
+The 3D compositing test reads Montage's USD exports back with [tinyusdz](https://github.com/lighttransport/tinyusdz)
+(Apache-2.0, Copyright (c) 2020-2023 Syoyo Fujita), which only the Linux CI job builds, at a pinned commit, with
+`scripts/build-tinyusdz.sh`, into a small reader of Montage's own (`tests/tools/usd_readback.cc`); it is not part of
+Montage or its packages.
+
+The HDR viewer's Linux test runs it under [Weston](https://gitlab.freedesktop.org/wayland/weston) 16.0.2 (MIT,
+Copyright © 2008-2012 Kristian Høgsberg, 2010-2012 Intel Corporation and others, as its `COPYING` lists), the Wayland
+reference compositor, with its colour management, which only a Linux CI job builds, from pinned tags, with
+`scripts/build-weston.sh` (and the libdisplay-info, MIT, its build fetches); it is not part of Montage or its packages.

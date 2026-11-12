@@ -21,6 +21,7 @@
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "core/History.h"
+#include "render/ExportScaler.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -405,6 +406,191 @@ bool vmafAvailable() {
 #endif
 }
 
+namespace {
+void signalToPicture(const Image& img, const QualityPicture& like, QualityPicture& out);
+}
+
+bool vmafModelBuiltIn(const std::string& version) {
+#ifdef MONTAGE_WITH_VMAF
+    VmafModel* m = nullptr;
+    VmafModelConfig mc{};
+    mc.name = "vmaf";
+    if (vmaf_model_load(&m, &mc, version.c_str()) < 0) return false;
+    vmaf_model_destroy(m);
+    return true;
+#else
+    (void)version;
+    return false;
+#endif
+}
+
+std::string vmafVersion() {
+#ifdef MONTAGE_WITH_VMAF
+    return vmaf_version();
+#else
+    return {};
+#endif
+}
+
+std::string vmafModelFor(const QualityPicture& p, const CompareOptions& o) {
+    if (!o.vmafModel.empty()) return o.vmafModel;
+    const bool uhd = p.height > 1440;
+    // SDR: the v1 model libvmaf has built in (its 4K form above 1440 lines); below 80 chroma samples either way (as
+    // 192 x 108 in 4:2:0), the v0.6.1 model, as the v1 model's chroma feature (SpEED, over four halvings into blocks
+    // of five) has nothing left to measure there.
+    if (p.transfer != "pq" && p.transfer != "hlg") {
+        if ((p.width >> p.log2ChromaW) < 80 || (p.height >> p.log2ChromaH) < 80) return "vmaf_v0.6.1";
+        return uhd ? "vmaf_v1.0.16_3d0h_2160" : "vmaf_v1.0.16_3d0h";
+    }
+    // HDR: the HDR v1 model, built in once a libvmaf release carries it, else from the models folder.
+    const std::string builtIn = uhd ? "hdr_vmaf_v1.1.8_3d0h_2160" : "hdr_vmaf_v1.1.8_3d0h";
+    if (vmafModelBuiltIn(builtIn)) return builtIn;
+    QString dir = QString::fromStdString(o.vmafModelDir);
+    if (dir.isEmpty()) dir = qEnvironmentVariable("MONTAGE_VMAF_MODELS");
+    if (dir.isEmpty() && QCoreApplication::instance()) dir = QCoreApplication::applicationDirPath() + "/vmaf-models";
+    const QString name = QStringLiteral("hdr_vmaf_v1.1.8/hdr_vmaf_v1.1.8_%1.json").arg(uhd ? "3d0h_2160" : "3d0h");
+    for (const QString& candidate : {dir + "/" + name, dir + "/" + QFileInfo(name).fileName()})
+        if (QFileInfo::exists(candidate)) return candidate.toStdString();
+    return {};
+}
+
+#ifdef MONTAGE_WITH_VMAF
+struct VmafMeter::Impl {
+    VmafContext* vmaf = nullptr;
+    VmafModel* model = nullptr;
+    unsigned index = 0;
+    ~Impl() {
+        if (model) vmaf_model_destroy(model);
+        if (vmaf) vmaf_close(vmaf);
+    }
+    // (only the samplings libvmaf takes: 4:2:0, 4:2:2 and 4:4:4; each plane copied as far as libvmaf's sizes it, which
+    // round odd chroma sizes down where Montage's round up)
+    static bool toVmaf(const QualityPicture& in, VmafPicture& out) {
+        if (!vmafMeasures(in)) return false;
+        // HDR models take PQ: HLG is given as the PQ picture of the light it shows on a 1000-nit display.
+        QualityPicture pq;
+        if (in.transfer == "hlg") pq = hlgAsPq(in);
+        const QualityPicture& p = in.transfer == "hlg" ? pq : in;
+        const VmafPixelFormat fmt = p.log2ChromaH ? VMAF_PIX_FMT_YUV420P : p.log2ChromaW ? VMAF_PIX_FMT_YUV422P : VMAF_PIX_FMT_YUV444P;
+        if (vmaf_picture_alloc(&out, fmt, unsigned(p.bits), unsigned(p.width), unsigned(p.height)) < 0) return false;
+        for (int c = 0; c < 3; ++c) {
+            const int w = p.planeWidth(c), h = std::min(p.planeHeight(c), int(out.h[c])), cw = std::min(w, int(out.w[c]));
+            for (int y = 0; y < h; ++y) {
+                uint8_t* row = static_cast<uint8_t*>(out.data[c]) + size_t(y) * size_t(out.stride[c]);
+                const uint16_t* src = &p.plane[c][size_t(y) * size_t(w)];
+                if (p.bits > 8) std::memcpy(row, src, size_t(cw) * 2);
+                else for (int x = 0; x < cw; ++x) row[x] = uint8_t(src[x]);
+            }
+        }
+        return true;
+    }
+    static QualityPicture hlgAsPq(const QualityPicture& p) {
+        Image img(p.width, p.height, Image::Uninitialized{});
+        for (int y = 0; y < p.height; ++y)
+            for (int x = 0; x < p.width; ++x) {
+                double rgb[3], nits[3];
+                signalAt(p, x, y, rgb);
+                nitsOfSignal(p, rgb, nits);
+                float* px = img.at(x, y);
+                for (int c = 0; c < 3; ++c) px[c] = float(pqInverse(nits[c]));
+                px[3] = 1;
+            }
+        QualityPicture like = p;
+        like.transfer = "pq";
+        like.primaries = "bt2020";
+        like.kr = 0.2627;
+        like.kb = 0.0593;
+        QualityPicture out;
+        signalToPicture(img, like, out);
+        return out;
+    }
+};
+#else
+struct VmafMeter::Impl {};
+#endif
+
+VmafMeter::VmafMeter() : d(std::make_unique<Impl>()) {}
+VmafMeter::~VmafMeter() = default;
+
+bool VmafMeter::open(const std::string& model, int threads, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+#ifdef MONTAGE_WITH_VMAF
+    if (d->vmaf) return fail("already open");
+    VmafConfiguration cfg{};
+    cfg.log_level = VMAF_LOG_LEVEL_NONE;
+    cfg.n_threads = unsigned(std::max(0, threads));
+    cfg.n_subsample = 1;
+    if (vmaf_init(&d->vmaf, cfg) < 0) return fail("libvmaf would not start");
+    VmafModelConfig mc{};
+    mc.name = "vmaf";
+    // (a model's JSON file, or a model libvmaf has built in, by its version)
+    const bool file = model.find('/') != std::string::npos || model.find('\\') != std::string::npos ||
+                      (model.size() > 5 && model.compare(model.size() - 5, 5, ".json") == 0);
+    if ((file ? vmaf_model_load_from_path(&d->model, &mc, model.c_str()) : vmaf_model_load(&d->model, &mc, model.c_str())) < 0)
+        return fail("cannot load the VMAF model " + model);
+    if (vmaf_use_features_from_model(d->vmaf, d->model) < 0) return fail("the VMAF model's features are not built in");
+    return true;
+#else
+    (void)model, (void)threads;
+    return fail("This Montage was built without libvmaf, so it cannot measure VMAF");
+#endif
+}
+
+bool VmafMeter::add(const QualityPicture& reference, const QualityPicture& encode) {
+#ifdef MONTAGE_WITH_VMAF
+    if (!d->vmaf || !reference.sameLayout(encode)) return false;
+    VmafPicture r{}, e{};
+    if (!Impl::toVmaf(reference, r)) return false;
+    if (!Impl::toVmaf(encode, e)) {
+        vmaf_picture_unref(&r);
+        return false;
+    }
+    if (vmaf_read_pictures(d->vmaf, &r, &e, d->index) == 0) {
+        ++d->index;
+        return true;
+    }
+    // (refused, libvmaf leaves them to be let go of here)
+    vmaf_picture_unref(&r);
+    vmaf_picture_unref(&e);
+    return false;
+#else
+    (void)reference, (void)encode;
+    return false;
+#endif
+}
+
+bool VmafMeter::finish(std::vector<double>& scores) {
+#ifdef MONTAGE_WITH_VMAF
+    scores.clear();
+    if (!d->vmaf) return false;
+    if (d->index > 0 && vmaf_read_pictures(d->vmaf, nullptr, nullptr, 0) < 0) return false;
+    scores.assign(d->index, kNoScore);
+    for (unsigned i = 0; i < d->index; ++i) {
+        double v = 0;
+        if (vmaf_score_at_index(d->vmaf, d->model, &v, i) == 0) scores[i] = v;
+    }
+    return true;
+#else
+    scores.clear();
+    return false;
+#endif
+}
+
+unsigned VmafMeter::pictures() const {
+#ifdef MONTAGE_WITH_VMAF
+    return d->index;
+#else
+    return 0;
+#endif
+}
+
+bool vmafMeasures(const QualityPicture& p) {
+    return !p.rgb && ((p.log2ChromaW == 1 && p.log2ChromaH <= 1) || (p.log2ChromaW == 0 && p.log2ChromaH == 0));
+}
+
 // ---- reading files -----------------------------------------------------------------------------------------------
 
 namespace {
@@ -572,6 +758,7 @@ public:
             p.rgb = like->rgb;
             p.fullRange = like->fullRange;
             p.chromaLeft = like->chromaLeft;
+            p.chromaLoc = like->chromaLoc;
             p.kr = like->kr;
             p.kb = like->kb;
         } else {
@@ -584,6 +771,7 @@ public:
             p.fullRange = srcFull;
             p.chromaLeft = f->chroma_location != AVCHROMA_LOC_CENTER && f->chroma_location != AVCHROMA_LOC_TOP &&
                            f->chroma_location != AVCHROMA_LOC_BOTTOM;
+            p.chromaLoc = int(f->chroma_location);
             p.kr = srcKr, p.kb = srcKb;
         }
         p.transfer = transfer;
@@ -795,123 +983,6 @@ std::string formatName(const QualityPicture& p) {
     return s + " " + std::to_string(p.bits) + "-bit";
 }
 
-#ifdef MONTAGE_WITH_VMAF
-void signalToPicture(const Image& img, const QualityPicture& like, QualityPicture& out);
-
-// VMAF through libvmaf: pictures fed in order, scores read back at the end.
-class VmafScorer {
-public:
-    ~VmafScorer() {
-        if (model_) vmaf_model_destroy(model_);
-        if (vmaf_) vmaf_close(vmaf_);
-    }
-    bool open(const std::string& modelPath, int threads, std::string* error) {
-        VmafConfiguration cfg{};
-        cfg.log_level = VMAF_LOG_LEVEL_NONE;
-        cfg.n_threads = unsigned(std::max(0, threads));
-        cfg.n_subsample = 1;
-        if (vmaf_init(&vmaf_, cfg) < 0) return fail(error, "libvmaf would not start");
-        VmafModelConfig mc{};
-        mc.name = "vmaf";
-        if (vmaf_model_load_from_path(&model_, &mc, modelPath.c_str()) < 0) return fail(error, "cannot load the VMAF model " + modelPath);
-        if (vmaf_use_features_from_model(vmaf_, model_) < 0) return fail(error, "the VMAF model's features are not built in");
-        return true;
-    }
-    bool add(const QualityPicture& ref, const QualityPicture& enc) {
-        VmafPicture r{}, e{};
-        if (!toVmaf(ref, r)) return false;
-        if (!toVmaf(enc, e)) {
-            vmaf_picture_unref(&r);
-            return false;
-        }
-        if (vmaf_read_pictures(vmaf_, &r, &e, index_++) == 0) return true;
-        // (refused, libvmaf leaves them to be let go of here)
-        vmaf_picture_unref(&r);
-        vmaf_picture_unref(&e);
-        return false;
-    }
-    bool finish(std::vector<double>& scores) {
-        if (vmaf_read_pictures(vmaf_, nullptr, nullptr, 0) < 0) return false;
-        scores.assign(index_, kNoScore);
-        for (unsigned i = 0; i < index_; ++i) {
-            double s = 0;
-            if (vmaf_score_at_index(vmaf_, model_, &s, i) == 0) scores[i] = s;
-        }
-        return true;
-    }
-
-private:
-    static bool fail(std::string* error, const std::string& why) {
-        if (error) *error = why;
-        return false;
-    }
-    // (only the samplings libvmaf takes: 4:2:0, 4:2:2 and 4:4:4; each plane copied as far as libvmaf's sizes it, which
-    // round odd chroma sizes down where Montage's round up)
-    static bool toVmaf(const QualityPicture& in, VmafPicture& out) {
-        if (in.rgb || !((in.log2ChromaW == 1 && in.log2ChromaH <= 1) || (in.log2ChromaW == 0 && in.log2ChromaH == 0))) return false;
-        // libvmaf knows PQ but not HLG: HLG is given as the PQ picture of the light it shows on a 1000-nit display.
-        QualityPicture pq;
-        if (in.transfer == "hlg") pq = hlgAsPq(in);
-        const QualityPicture& p = in.transfer == "hlg" ? pq : in;
-        VmafPixelFormat fmt = p.log2ChromaH ? VMAF_PIX_FMT_YUV420P : p.log2ChromaW ? VMAF_PIX_FMT_YUV422P : VMAF_PIX_FMT_YUV444P;
-        if (vmaf_picture_alloc(&out, fmt, unsigned(p.bits), unsigned(p.width), unsigned(p.height)) < 0) return false;
-        for (int c = 0; c < 3; ++c) {
-            const int w = p.planeWidth(c), h = std::min(p.planeHeight(c), int(out.h[c])), cw = std::min(w, int(out.w[c]));
-            for (int y = 0; y < h; ++y) {
-                uint8_t* row = static_cast<uint8_t*>(out.data[c]) + size_t(y) * size_t(out.stride[c]);
-                const uint16_t* src = &p.plane[c][size_t(y) * size_t(w)];
-                if (p.bits > 8) std::memcpy(row, src, size_t(cw) * 2);
-                else for (int x = 0; x < cw; ++x) row[x] = uint8_t(src[x]);
-            }
-        }
-        out.color.range = p.fullRange ? VMAF_COLOR_RANGE_FULL : VMAF_COLOR_RANGE_LIMITED;
-        out.color.primaries = p.primaries == "bt2020" ? VMAF_COLOR_PRIMARIES_BT2020
-                              : p.primaries == "p3"   ? VMAF_COLOR_PRIMARIES_SMPTE432
-                                                      : VMAF_COLOR_PRIMARIES_BT709;
-        out.color.trc = p.transfer == "pq" ? VMAF_COLOR_TRC_SMPTE2084 : VMAF_COLOR_TRC_BT709;
-        out.color.matrix = std::abs(p.kr - 0.2627) < 1e-3 ? VMAF_COLOR_MATRIX_BT2020_NCL : VMAF_COLOR_MATRIX_BT709;
-        return true;
-    }
-    static QualityPicture hlgAsPq(const QualityPicture& p) {
-        Image img(p.width, p.height, Image::Uninitialized{});
-        for (int y = 0; y < p.height; ++y)
-            for (int x = 0; x < p.width; ++x) {
-                double rgb[3], nits[3];
-                signalAt(p, x, y, rgb);
-                nitsOfSignal(p, rgb, nits);
-                float* px = img.at(x, y);
-                for (int c = 0; c < 3; ++c) px[c] = float(pqInverse(nits[c]));
-                px[3] = 1;
-            }
-        QualityPicture like = p;
-        like.transfer = "pq";
-        like.primaries = "bt2020";
-        like.kr = 0.2627;
-        like.kb = 0.0593;
-        QualityPicture out;
-        signalToPicture(img, like, out);
-        return out;
-    }
-    VmafContext* vmaf_ = nullptr;
-    VmafModel* model_ = nullptr;
-    unsigned index_ = 0;
-};
-#endif
-
-[[maybe_unused]] std::string vmafModelFor(const QualityPicture& p, const CompareOptions& o) {
-    if (!o.vmafModel.empty()) return o.vmafModel;
-    QString dir = QString::fromStdString(o.vmafModelDir);
-    if (dir.isEmpty()) dir = qEnvironmentVariable("MONTAGE_VMAF_MODELS");
-    if (dir.isEmpty() && QCoreApplication::instance()) dir = QCoreApplication::applicationDirPath() + "/vmaf-models";
-    const bool hdr = p.transfer == "pq" || p.transfer == "hlg";
-    const bool uhd = p.height > 1440;
-    const QString name = hdr ? QStringLiteral("hdr_vmaf_v1.1.8/hdr_vmaf_v1.1.8_%1.json").arg(uhd ? "3d0h_2160" : "3d0h")
-                             : QStringLiteral("vmaf_v1.0.16/vmaf_v1.0.16_%1.json").arg(uhd ? "3d0h_2160" : "3d0h");
-    for (const QString& candidate : {dir + "/" + name, dir + "/" + QFileInfo(name).fileName()})
-        if (QFileInfo::exists(candidate)) return candidate.toStdString();
-    return (dir + "/" + name).toStdString();
-}
-
 double meanOf(const std::vector<FrameQuality>& f, double FrameQuality::*m) {
     double s = 0;
     int n = 0;
@@ -1018,22 +1089,22 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
         const double perFrame = double(shape.width) * shape.height * ((o.metrics & MetricMsSsim) ? 24 : 12) + 1;
         threads = std::clamp(int(double(size_t(2) << 30) / perFrame), 1, threads);
     }
-    const bool wantVmaf = (o.metrics & MetricVmaf) && !shape.rgb &&
-                          ((shape.log2ChromaW == 1 && shape.log2ChromaH <= 1) || (shape.log2ChromaW == 0 && shape.log2ChromaH == 0));
-#ifdef MONTAGE_WITH_VMAF
-    std::unique_ptr<VmafScorer> vmaf;
-    if (wantVmaf) {
-        vmaf = std::make_unique<VmafScorer>();
+    // VMAF where it is built in and the encode is Y′CbCr libvmaf takes; for HDR, only once there is an HDR model.
+    std::unique_ptr<VmafMeter> vmaf;
+    if ((o.metrics & MetricVmaf) && vmafAvailable() && vmafMeasures(shape)) {
         res.vmafModel = vmafModelFor(shape, o);
-        std::string e;
-        if (!vmaf->open(res.vmafModel, threads, &e)) {
-            res.error = e;
-            return res;
+        if (res.vmafModel.empty()) {
+            // (said apart from the warnings: VMAF is asked for by default, and an HDR encode is not wrong for it)
+            res.vmafNote = "VMAF was not measured: libvmaf " + vmafVersion() + " has no HDR model, and none is in the VMAF models folder";
+        } else {
+            vmaf = std::make_unique<VmafMeter>();
+            std::string e;
+            if (!vmaf->open(res.vmafModel, threads, &e)) {
+                res.error = e;
+                return res;
+            }
         }
     }
-#else
-    if (wantVmaf) res.vmafModel = "";
-#endif
     const int batch = std::max(1, threads);
     const FrameTime firstIndex = std::max(0, -res.offset);
     // Frames are matched by the encode's timestamps where it has them (a dropped or repeated frame, or a variable
@@ -1114,17 +1185,14 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
         }
         for (int i = 0; i < n; ++i) {
             got[size_t(i)].frame = shows[size_t(i)];
-#ifdef MONTAGE_WITH_VMAF
             if (vmaf && !vmaf->add(refs[size_t(i)], encs[size_t(i)])) {
                 res.error = "libvmaf refused a picture";
                 return res;
             }
-#endif
             res.frames.push_back(got[size_t(i)]);
         }
         if (progress) progress(o.maxFrames > 0 ? std::min(1.0, double(res.frames.size()) / o.maxFrames) : -1);
     }
-#ifdef MONTAGE_WITH_VMAF
     if (vmaf) {
         std::vector<double> scores;
         if (!vmaf->finish(scores)) {
@@ -1134,7 +1202,6 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
         for (size_t i = 0; i < res.frames.size() && i < scores.size(); ++i) res.frames[i].vmaf = scores[i];
         res.vmafScored = true;
     }
-#endif
     if (cancelled()) {
         res.error = "cancelled";
         return res;
@@ -1331,6 +1398,69 @@ void signalToPicture(const Image& img, const QualityPicture& like, QualityPictur
         }
 }
 
+// A rendered frame (R′G′B′ signal, 0..1) as an export codes it in `like`'s Y′CbCr layout, sized to it: through the
+// export's own scaler (render/ExportScaler), so its chroma is made by the filter, and at the sites, the encode's was.
+// R′G′B′, and layouts FFmpeg has no planar format for, as signalToPicture makes them.
+struct ExportedPictures {
+    SwsContext* sws = nullptr;
+    AVFrame* frame = nullptr;
+    std::vector<uint16_t> rgba16;
+    ~ExportedPictures() {
+        sws_freeContext(sws);
+        av_frame_free(&frame);
+    }
+    bool convert(const Image& img, const QualityPicture& like, QualityPicture& out) {
+        // (the export's scaler codes BT.709 and BT.2020 only: another matrix, BT.601's, from another tool's encode, as
+        // signalToPicture codes it)
+        const bool bt2020 = std::abs(like.kr - 0.2627) < 1e-3, bt709 = std::abs(like.kr - 0.2126) < 1e-3;
+        const AVPixelFormat fmt = like.rgb || !(bt709 || bt2020) ? AV_PIX_FMT_NONE : planarFormat(false, like.log2ChromaW, like.log2ChromaH, like.bits);
+        if (fmt == AV_PIX_FMT_NONE) {
+            if (img.width == like.width && img.height == like.height) {
+                signalToPicture(img, like, out);
+            } else {
+                Image sized(like.width, like.height, Image::Uninitialized{});
+                const std::vector<float> resampled = resampleRgba(img.px.data(), img.width, img.height, like.width, like.height);
+                std::copy(resampled.begin(), resampled.end(), sized.px.begin());
+                signalToPicture(sized, like, out);
+            }
+            return true;
+        }
+        // (sited as the encode is tagged, as the export sited it: untagged 4:2:2 with the first luma sample of each
+        // pair, as the export makes it and Rec. 601 and 709 have it, where a container such as MOV drops the tag;
+        // other untagged chroma centred, as there)
+        AVChromaLocation loc = AVChromaLocation(like.chromaLoc);
+        if (loc == AVCHROMA_LOC_UNSPECIFIED && like.log2ChromaW == 1 && like.log2ChromaH == 0) loc = AVCHROMA_LOC_LEFT;
+        sws = exportPictureScaler(sws, img.width, img.height, like.width, like.height, fmt, loc, bt2020 ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709,
+                                  like.fullRange ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG);
+        if (!sws) return false;
+        if (!frame || frame->format != fmt || frame->width != like.width || frame->height != like.height) {
+            av_frame_free(&frame);
+            frame = av_frame_alloc();
+            if (!frame) return false;
+            frame->format = fmt;
+            frame->width = like.width;
+            frame->height = like.height;
+            if (av_frame_get_buffer(frame, 0) < 0) return false;
+        }
+        toRgba16(img, rgba16);
+        const uint8_t* srcData[4] = {reinterpret_cast<const uint8_t*>(rgba16.data()), nullptr, nullptr, nullptr};
+        const int srcStride[4] = {img.width * 8, 0, 0, 0};
+        sws_scale(sws, srcData, srcStride, 0, img.height, frame->data, frame->linesize);
+        out = like;
+        for (int c = 0; c < 3; ++c) {
+            const int w = out.planeWidth(c), h = out.planeHeight(c);
+            out.plane[c].resize(size_t(w) * size_t(h));
+            for (int y = 0; y < h; ++y) {
+                const uint8_t* row = frame->data[c] + size_t(y) * size_t(frame->linesize[c]);
+                uint16_t* dst = &out.plane[c][size_t(y) * size_t(w)];
+                if (out.bits > 8) std::memcpy(dst, row, size_t(w) * 2);
+                else for (int x = 0; x < w; ++x) dst[x] = row[x];
+            }
+        }
+        return true;
+    }
+};
+
 }  // namespace
 
 EncodeComparison compareEncodeWithSequence(const Project& p, const Sequence& s, FrameTime in, FrameTime out, const std::string& encode,
@@ -1368,19 +1498,14 @@ EncodeComparison compareEncodeWithSequence(const Project& p, const Sequence& s, 
     ro.cancel = cancel;
     auto openSeq = [&, ro, seqLike]() -> PictureSource {
         auto t = std::make_shared<FrameTime>(in);
-        return [&p, &s, ro, seqLike, t, end, cancel](QualityPicture& pic) {
+        auto coder = std::make_shared<ExportedPictures>();
+        return [&p, &s, ro, seqLike, t, end, cancel, coder](QualityPicture& pic) {
             if (*t >= end || (cancel && cancel->load())) return false;
             Image img = renderProgramFrame(p, s, (*t)++, ro);
             if (img.empty() || (cancel && cancel->load())) return false;
-            // (the render at the encode's own size exactly: a frame a pixel off by rounding, or of a slightly other shape)
-            if (img.width != seqLike.width || img.height != seqLike.height) {
-                Image sized(seqLike.width, seqLike.height, Image::Uninitialized{});
-                const std::vector<float> resampled = resampleRgba(img.px.data(), img.width, img.height, seqLike.width, seqLike.height);
-                std::copy(resampled.begin(), resampled.end(), sized.px.begin());
-                img = std::move(sized);
-            }
-            signalToPicture(img, seqLike, pic);
-            return true;
+            // (the render made the encode's own size exactly by the export's scaler, as a frame a pixel off by rounding
+            // or of a slightly other shape is in an export)
+            return coder->convert(img, seqLike, pic);
         };
     };
     // A whole delivery checked over a range: its frames before the range passed over.

@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -244,6 +246,30 @@ int ac3Words(int fscod, int frmsizecod) {
 Ac3FrameInfo::Ac3FrameInfo() {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     centreMixDb = surroundMixDb = ltrtCentreMixDb = ltrtSurroundMixDb = nan;
+}
+
+std::string ac3DashChannelConfiguration(int channels) {
+    // (the mask's bits, from the top: L C R Ls Rs Lc/Rc Lrs/Rrs Cs Ts Lsd/Rsd Lw/Rw Vhl/Vhr Vhc Lts/Rts LFE2 LFE)
+    const char* mask = channels == 1 ? "4000" : channels == 6 ? "F801" : channels == 8 ? "FA01" : "A000";
+    return std::string("<AudioChannelConfiguration schemeIdUri=\"tag:dolby.com,2014:dash:audio_channel_configuration:2011\" value=\"") + mask + "\"/>";
+}
+
+std::string ac3DashChannelConfiguration(uint64_t m, int channels) {
+    if (m == 0) return ac3DashChannelConfiguration(channels);
+    const bool sides = (m & (AV_CH_SIDE_LEFT | AV_CH_SIDE_RIGHT)) != 0;
+    const std::pair<uint64_t, unsigned> places[] = {
+        {AV_CH_FRONT_LEFT, 0x8000}, {AV_CH_FRONT_CENTER, 0x4000}, {AV_CH_FRONT_RIGHT, 0x2000},
+        {sides ? AV_CH_SIDE_LEFT : AV_CH_BACK_LEFT, 0x1000}, {sides ? AV_CH_SIDE_RIGHT : AV_CH_BACK_RIGHT, 0x0800},
+        {AV_CH_FRONT_LEFT_OF_CENTER | AV_CH_FRONT_RIGHT_OF_CENTER, 0x0400}, {sides ? AV_CH_BACK_LEFT | AV_CH_BACK_RIGHT : 0, 0x0200},
+        {AV_CH_BACK_CENTER, 0x0100}, {AV_CH_TOP_CENTER, 0x0080}, {AV_CH_LOW_FREQUENCY_2, 0x0002}, {AV_CH_LOW_FREQUENCY, 0x0001}};
+    unsigned mask = 0;
+    uint64_t placed = 0;
+    for (const auto& [ch, bit] : places)
+        if (ch && (m & ch)) mask |= bit, placed |= ch & m;
+    if (placed != m || mask == 0) return ac3DashChannelConfiguration(channels);
+    char hex[8];
+    std::snprintf(hex, sizeof hex, "%04X", mask);
+    return std::string("<AudioChannelConfiguration schemeIdUri=\"tag:dolby.com,2014:dash:audio_channel_configuration:2011\" value=\"") + hex + "\"/>";
 }
 
 int ac3Dialnorm(double lkfs) {

@@ -24,8 +24,13 @@
 // plug-in (render/OfxRemote.h): its pictures through shared memory, and frames at other times and inputs asked back
 // from Montage while it renders. One that crashes or does not answer is bypassed (the picture as it came) and named in
 // the failure list; it is started again for the next render, a set number of times. An OpenGL render runs in the
-// host's own OpenGL context and its pictures come back through shared memory too. On-screen controls stay in
-// Montage's process (their drawing and pen events are Montage's own), guarded as before.
+// host's own OpenGL context and its pictures come back through shared memory too. On-screen controls run in the host
+// as well: it draws them (Draw Suite and OpenGL alike, OpenGL in an offscreen context of its own) at the monitor's
+// size and pixel ratio into one premultiplied picture in the instance's shared block, which Montage lays over the
+// picture; pen, key and focus events go there with the same view, and the parameters a control sets come back. A
+// control that misses its deadline keeps its last picture up and is marked as not responding; one that crashes its
+// host, or does not answer for longer, is closed and its plug-in bypassed and named as for a render. No plug-in code
+// runs in Montage's process.
 //
 // GPU: a plugin that renders with OpenGL (kOfxImageEffectPropOpenGLRenderSupported) does so in Montage's own OpenGL
 // context, on a thread of its own, texture in and texture out; the pictures go up and come back. Without OpenGL, or
@@ -122,6 +127,8 @@ public:
     std::string guardPath() const;
     // Takes a plug-in Montage's own scan found (in montage-pluginhost, which scans nothing itself).
     void adopt(const PluginDesc& d);
+    // Blocks a binary that crashed its plug-in host while loading, as the scan would, until the file changes.
+    void blockAfterCrash(const std::string& binary, const std::string& reason);
     // The plug-in an effect runs, if this computer's scan found it and did not block it (else false, with why).
     bool lookUp(const Effect& e, PluginDesc& d, std::string* error = nullptr);
 
@@ -227,6 +234,7 @@ struct View {
     double m[6] = {1, 0, 0, 0, -1, 0};
     double renderScale = 1;       // of the pictures the monitor shows
     double frameW = 0, frameH = 0;  // the effect's full-size frame (canonical extent); 0: the project's
+    double pixelRatio = 1;          // the monitor's device pixels to one of the view's (a host draws that finely)
     double pixelScale() const;      // canonical pixels a screen pixel
     std::array<double, 2> toView(double x, double y) const;
     std::array<double, 2> toCanonical(double vx, double vy) const;
@@ -234,8 +242,12 @@ struct View {
 // Draws `o` with `p` (a QPainter on the view).
 void paintOverlay(QPainter& p, const Overlay& o, const View& v);
 
-// A plugin effect's on-screen control: an instance of its own (interactive) and its overlay interact. Calls come from
-// the GUI thread.
+namespace remote {
+class Controls;
+}
+
+// A plugin effect's on-screen control: an instance of its own (interactive) and its overlay interact, in this process
+// or, with plug-ins isolated, in the plug-in's host. Calls come from the GUI thread.
 class Interact {
 public:
     // Null (with `error` when something failed) when the effect's plugin has no overlay.
@@ -251,14 +263,35 @@ public:
     bool pen(Pen kind, const Effect& e, double t, const View& v, double vx, double vy, double pressure, Effect& edited, bool& changed);
     // A key (an OfxKeySyms code, and its text) pressed or let go.
     bool key(bool down, int keysym, const std::string& text, const Effect& e, double t, const View& v, Effect& edited, bool& changed);
-    bool failed() const { return failed_; }
+    // The view gained or lost the keyboard's focus.
+    void focus(bool gained, const Effect& e, double t, const View& v);
+    bool failed() const;
+    // (in a host) Its last reply missed the deadline: its last picture stays up, events are not sent until it answers.
+    bool unresponsive() const;
+    // (in a host) A message is still out: its answer is taken at a later call (a poll repaints for it).
+    bool waiting() const;
+    // (in a host) What the control set in a reply that came after its deadline and that no pen or key event has handed
+    // on: only those parameters and strings. False when there is none.
+    bool lateEdits(Effect& changes);
+    // Controls in hosts closed with an answer still out are let go as their answers come: true while some still wait
+    // (to be asked again a little later, from the GUI thread).
+    static bool tidyClosed();
+    // In a plug-in host (not this process).
+    bool remote() const { return remote_ != nullptr; }
+    // Why it failed, when it failed in a host ("crashed (signal 11)"...); "" otherwise.
+    std::string failure() const;
     struct Impl;
 
 private:
     explicit Interact(std::unique_ptr<Impl> impl);
+    explicit Interact(std::unique_ptr<remote::Controls> remote);
     std::unique_ptr<Impl> impl_;
+    std::unique_ptr<remote::Controls> remote_;
     bool failed_ = false;
 };
+
+// Called around each plug-in binary's loading, with the plug-in's id (montage-pluginhost notes it for blame).
+void setLoadWatcher(std::function<void(const std::string& id, bool loading)> watch);
 
 // The frames of the clip being rendered on this thread, for plugins that ask for other times: set by the compositor
 // around a clip's effects.

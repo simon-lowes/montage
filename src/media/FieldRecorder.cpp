@@ -1,10 +1,14 @@
 #include "FieldRecorder.h"
 
+#include <QDateTime>
 #include <QFile>
+#include <QSaveFile>
+#include <QXmlStreamWriter>
 #include <QString>
 #include <QRegularExpression>
 #include <QStringList>
 #include <QXmlStreamReader>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -170,6 +174,173 @@ void applyFieldRecording(const FieldRecording& f, MediaItem& m) {
     put("tracks", tracks);
     if (f.circled) put("circled", "Yes");
     if (f.timecodeRate.valid()) put("timecode_rate", std::to_string(f.timecodeRate.num) + "/" + std::to_string(f.timecodeRate.den) + (f.dropFrame ? " DF" : ""));
+}
+
+namespace {
+
+void putLe32(char* p, uint32_t v) {
+    for (int i = 0; i < 4; ++i) p[i] = char((v >> (8 * i)) & 0xff);
+}
+void putLe64(char* p, uint64_t v) {
+    putLe32(p, uint32_t(v & 0xffffffffu));
+    putLe32(p + 4, uint32_t(v >> 32));
+}
+// `text` in a fixed field of `size` bytes, cut short and NUL-padded.
+void putText(QByteArray& b, int at, int size, const std::string& text) {
+    const int n = std::min(size, int(text.size()));
+    std::memcpy(b.data() + at, text.data(), size_t(n));
+}
+QString rateText(Rational r) { return QStringLiteral("%1/%2").arg(r.num).arg(r.den); }
+
+struct WaveFormat {
+    int channels = 0, sampleRate = 0, bits = 0;
+};
+
+uint64_t timeReference(const BroadcastStamp& st, const WaveFormat& fmt) {
+    return uint64_t(std::max<long long>(0, std::llround(st.seconds * double(fmt.sampleRate))));
+}
+
+QByteArray bextBody(const BroadcastStamp& st, const WaveFormat& fmt) {
+    QByteArray b(602, '\0');
+    putText(b, 0, 256, st.description);
+    putText(b, 256, 32, "Montage");
+    const QDateTime now = QDateTime::currentDateTime();
+    putText(b, 320, 10, now.toString(QStringLiteral("yyyy-MM-dd")).toStdString());
+    putText(b, 330, 8, now.toString(QStringLiteral("hh:mm:ss")).toStdString());
+    putLe64(b.data() + 338, timeReference(st, fmt));
+    b[346] = 1;  // version 1 (with a UMID field, left empty)
+    const char* mode = fmt.channels == 1 ? "mono" : fmt.channels == 2 ? "stereo" : "multitrack";
+    b += QStringLiteral("A=PCM,F=%1,W=%2,M=%3,T=Montage\r\n").arg(fmt.sampleRate).arg(fmt.bits).arg(QLatin1String(mode)).toLatin1();
+    return b;
+}
+
+QByteArray ixmlBody(const BroadcastStamp& st, const WaveFormat& fmt) {
+    QByteArray out;
+    QXmlStreamWriter x(&out);
+    x.setAutoFormatting(true);
+    x.writeStartDocument();
+    x.writeStartElement(QStringLiteral("BWFXML"));
+    x.writeTextElement(QStringLiteral("IXML_VERSION"), QStringLiteral("2.10"));
+    auto field = [&](const char* tag, const std::string& v) {
+        if (!v.empty()) x.writeTextElement(QLatin1String(tag), QString::fromStdString(v));
+    };
+    field("PROJECT", st.project);
+    field("SCENE", st.scene);
+    field("TAKE", st.take);
+    field("TAPE", st.tape);
+    field("NOTE", st.note);
+    const uint64_t ref = timeReference(st, fmt);
+    x.writeStartElement(QStringLiteral("SPEED"));
+    const QString rate = rateText(st.timecodeRate.valid() ? st.timecodeRate : Rational{25, 1});
+    x.writeTextElement(QStringLiteral("MASTER_SPEED"), rate);
+    x.writeTextElement(QStringLiteral("CURRENT_SPEED"), rate);
+    x.writeTextElement(QStringLiteral("TIMECODE_RATE"), rate);
+    x.writeTextElement(QStringLiteral("TIMECODE_FLAG"), st.dropFrame ? QStringLiteral("DF") : QStringLiteral("NDF"));
+    x.writeTextElement(QStringLiteral("FILE_SAMPLE_RATE"), QString::number(fmt.sampleRate));
+    x.writeTextElement(QStringLiteral("AUDIO_BIT_DEPTH"), QString::number(fmt.bits));
+    x.writeTextElement(QStringLiteral("TIMESTAMP_SAMPLES_SINCE_MIDNIGHT_HI"), QString::number(ref >> 32));
+    x.writeTextElement(QStringLiteral("TIMESTAMP_SAMPLES_SINCE_MIDNIGHT_LO"), QString::number(ref & 0xffffffffu));
+    x.writeTextElement(QStringLiteral("TIMESTAMP_SAMPLE_RATE"), QString::number(fmt.sampleRate));
+    x.writeEndElement();
+    x.writeStartElement(QStringLiteral("BEXT"));
+    x.writeTextElement(QStringLiteral("BWF_DESCRIPTION"), QString::fromStdString(st.description));
+    x.writeTextElement(QStringLiteral("BWF_ORIGINATOR"), QStringLiteral("Montage"));
+    x.writeTextElement(QStringLiteral("BWF_TIME_REFERENCE_LOW"), QString::number(ref & 0xffffffffu));
+    x.writeTextElement(QStringLiteral("BWF_TIME_REFERENCE_HIGH"), QString::number(ref >> 32));
+    x.writeEndElement();
+    x.writeEndElement();
+    x.writeEndDocument();
+    return out;
+}
+
+}  // namespace
+
+bool writeBroadcastStamp(const std::string& path, const BroadcastStamp& stamp, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    const QString file = QString::fromStdString(path);
+    QFile in(file);
+    if (!in.open(QIODevice::ReadOnly)) return fail("Cannot read " + path);
+    char head[12];
+    if (in.read(head, 12) != 12) return fail("Not a WAV file");
+    const bool rf64 = std::memcmp(head, "RF64", 4) == 0 || std::memcmp(head, "BW64", 4) == 0;
+    if ((!rf64 && std::memcmp(head, "RIFF", 4) != 0) || std::memcmp(head + 8, "WAVE", 4) != 0) return fail("Not a WAV file");
+    QSaveFile out(file);
+    if (!out.open(QIODevice::WriteOnly)) return fail("Cannot write " + path);
+    out.write(head, 12);
+    WaveFormat fmt;
+    uint64_t dataSize64 = 0;
+    qint64 ds64At = -1;  // where the copy's ds64 body is
+    bool wroteStamp = false, sawData = false;
+    auto chunk = [&](const char* id, const QByteArray& body) {
+        char h[8];
+        std::memcpy(h, id, 4);
+        putLe32(h + 4, uint32_t(body.size()));
+        out.write(h, 8);
+        out.write(body);
+        if (body.size() & 1) out.write("\0", 1);
+    };
+    QByteArray buffer(1 << 20, Qt::Uninitialized);
+    while (!in.atEnd()) {
+        char ch[8];
+        if (in.read(ch, 8) != 8) break;
+        uint64_t size = le32(ch + 4);
+        const bool data = std::memcmp(ch, "data", 4) == 0;
+        if (data && rf64 && size == 0xFFFFFFFFu) size = dataSize64;
+        const uint64_t padded = size + (size & 1);
+        if (std::memcmp(ch, "bext", 4) == 0 || std::memcmp(ch, "iXML", 4) == 0) {  // replaced
+            if (!in.seek(in.pos() + qint64(padded))) break;
+            continue;
+        }
+        if (data && !wroteStamp) {
+            if (fmt.sampleRate <= 0) return fail("The WAV file has no format before its sound");
+            chunk("bext", bextBody(stamp, fmt));
+            chunk("iXML", ixmlBody(stamp, fmt));
+            wroteStamp = true;
+        }
+        if (std::memcmp(ch, "ds64", 4) == 0) ds64At = out.pos() + 8;
+        if (std::memcmp(ch, "fmt ", 4) == 0 && size >= 16) {
+            const QByteArray f = in.peek(16);
+            if (f.size() == 16) {
+                fmt.channels = int(uint8_t(f[2])) | int(uint8_t(f[3])) << 8;
+                fmt.sampleRate = int(le32(f.constData() + 4));
+                fmt.bits = int(uint8_t(f[14])) | int(uint8_t(f[15])) << 8;
+            }
+        }
+        if (std::memcmp(ch, "ds64", 4) == 0 && size >= 16) {
+            const QByteArray d = in.peek(16);
+            if (d.size() == 16) dataSize64 = le64(d.constData() + 8);
+        }
+        out.write(ch, 8);
+        uint64_t left = padded;
+        while (left > 0) {  // (a chunk cut short by the file's end is copied as far as it goes)
+            const qint64 n = in.read(buffer.data(), qint64(std::min<uint64_t>(left, uint64_t(buffer.size()))));
+            if (n <= 0) break;
+            if (out.write(buffer.constData(), n) != n) return fail("Cannot write " + path);
+            left -= uint64_t(n);
+        }
+        if (left > 0) break;
+        if (data) sawData = true;
+    }
+    if (!sawData) return fail("The WAV file has no sound");
+    const uint64_t riff = uint64_t(out.pos()) - 8;
+    char v[8];
+    if (rf64) {
+        if (ds64At < 0) return fail("The RF64 file has no ds64 chunk");
+        putLe64(v, riff);
+        out.seek(ds64At);
+        out.write(v, 8);
+    } else {
+        if (riff > 0xFFFFFFFFu) return fail("The WAV file would be larger than 4 GB");
+        putLe32(v, uint32_t(riff));
+        out.seek(4);
+        out.write(v, 4);
+    }
+    in.close();
+    if (!out.commit()) return fail("Cannot write " + path);
+    return true;
 }
 
 }  // namespace montage

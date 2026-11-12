@@ -58,7 +58,7 @@ cache_value() { sed -n "s/^$1:[A-Z]*=//p" "$BUILD/CMakeCache.txt" | head -1; }
 avcodec=$(cache_value pkgcfg_lib_FFMPEG_avcodec)
 FFSHARE="$(dirname "$(dirname "$avcodec")")/share/montage-ffmpeg"
 [ -d "$FFSHARE" ] || FFSHARE=""
-scripts/package-licences.sh "$LIC" "$BUILD" "$(cache_value C2PA_ROOT)" "$FFSHARE"
+scripts/package-licences.sh "$LIC" "$BUILD" "$(cache_value C2PA_ROOT)" "$FFSHARE" "$(cache_value SVTJPEGXS_ROOT)"
 BREW=$(brew --prefix)
 SOURCES=${MONTAGE_SOURCES_DIR:-}
 [ -z "$SOURCES" ] || mkdir -p "$SOURCES"

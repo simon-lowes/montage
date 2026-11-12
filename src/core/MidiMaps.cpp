@@ -27,6 +27,7 @@ QJsonObject toJson(const Mapping& m) {
     if (m.toggle) o["toggle"] = true;
     if (!m.pickup) o["pickup"] = false;
     if (m.step != 1.0 / 128) o["step"] = m.step;
+    if (!m.output.empty()) o["output"] = QString::fromStdString(m.output);
     return o;
 }
 
@@ -37,7 +38,7 @@ bool fromJson(const QJsonObject& o, Mapping& out, QString* error) {
     };
     const QString control = o.value("control").toString();
     const auto key = midimap::keyFromName(control.toStdString());
-    if (!key) return fail(QStringLiteral("unknown control \"%1\" (e.g. cc:1:7, cc14:1:7, note:10:36, nrpn:1:388)").arg(control));
+    if (!key) return fail(QStringLiteral("unknown control \"%1\" (e.g. cc:1:7, cc14:1:7, note:10:36, nrpn:1:388, at:1:0, pat:1:60)").arg(control));
     Mapping m;
     m.key = *key;
     if (o.contains("encoding")) {
@@ -67,6 +68,7 @@ bool fromJson(const QJsonObject& o, Mapping& out, QString* error) {
     m.pickup = o.value("pickup").toBool(true);
     m.step = o.value("step").toDouble(1.0 / 128);
     if (!(m.step > 0 && m.step <= 1)) return fail(QStringLiteral("step must be more than 0 and at most 1"));
+    m.output = o.value("output").toString().trimmed().toStdString();
     out = m;
     return true;
 }

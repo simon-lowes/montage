@@ -45,6 +45,11 @@ int shotChangeZone(Rational fps, const CaptionLimits& limits = {});
 // (Marker::shotChange: scene detection's on a clip's source, where the clip shows them now; those given on the
 // sequence), sorted, after its first frame.
 std::vector<FrameTime> captionShotChanges(const Sequence& seq);
+// Marks a shot change at timeline frame `f`: on the source of the picture clip shown there (the top one, with `f`
+// inside it), so the marker moves, slips and trims with the clip as scene detection's do; on the sequence where no
+// clip shows a picture at `f`, or where a retimed clip has no whole source frame that lands on `f`. False when the
+// sequence already has a shot change there (a cut or a marker).
+bool markShotChange(Sequence& seq, FrameTime f);
 
 // Characters a second for one caption.
 double captionCps(const Caption& c, Rational fps);

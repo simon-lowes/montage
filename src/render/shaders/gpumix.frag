@@ -7,11 +7,18 @@
 //   works out for it: p[0] y position, z softness, w direction; p[1] angle, strength, turn, brights first; p[2] the
 //   leak's colour and the glitch's seed; p[3] shape, count, cell, reach; p[4] the shape's cos and sin, 3D under way;
 //   p[5..7] and p[8..10] the 3D faces' inverse projections (nine each) and whether each faces the camera
+//   18: Smooth Cut, A's first frame morphed into B's last along their flow (render/Retime's interpolateFrames): p[0].y
+//   the position, p[1] the frames' pixels to the flow's, the flow's grid spacing and its size; `table` its moves
 //   30: a track matte, `aTex` through `bTex`'s alpha (or luma, p[0].y), or the reverse (p[0].z)
+//   31: Displace by Layer (render/PaintFx's displaceByMap), `aTex` moved by `bTex`'s channels: p[0].yzw the channels
+//   across and down and the edges, p[1] the amounts, bicubic and turned, p[2] the picture's own pixels (left, top,
+//   right, bottom); turned, p[3] its origin and across, p[4] down, the determinant's sign and size, p[5].xy how far
+//   to keep within its edges; p[5].zw whether it moves across and down
 layout(location = 0) out vec4 fragColor;
 layout(std140, binding = 0) uniform Params { vec4 p[16]; };
 layout(binding = 1) uniform sampler2D aTex;  // RGBA32F, premultiplied
 layout(binding = 4) uniform sampler2D bTex;
+layout(binding = 5) uniform sampler2D table;  // RGBA32F: Smooth Cut's flow
 
 const float PI = 3.14159265358979;
 
@@ -90,7 +97,38 @@ vec4 moved(bool b, ivec2 size, float fxp, float fyp, float k, bool zoom) {
     return o;
 }
 
+// Bilinear between pixel indices, clamped to the picture (render/Retime's sampleBilinear).
+vec4 clampedSample(sampler2D t, ivec2 size, float x, float y) {
+    x = clamp(x, 0.0, float(size.x - 1));
+    y = clamp(y, 0.0, float(size.y - 1));
+    const int x0 = int(x), y0 = int(y), x1 = min(x0 + 1, size.x - 1), y1 = min(y0 + 1, size.y - 1);
+    const float fx = x - float(x0), fy = y - float(y0);
+    const vec4 a = texelFetch(t, ivec2(x0, y0), 0), b = texelFetch(t, ivec2(x1, y0), 0);
+    const vec4 c = texelFetch(t, ivec2(x0, y1), 0), d = texelFetch(t, ivec2(x1, y1), 0);
+    const vec4 top = a + (b - a) * fx, bottom = c + (d - c) * fx;
+    return top + (bottom - top) * fy;
+}
+
+// Smooth Cut: the flow through this pixel (FlowField::at, bilinear on its grid), then A sampled where it was and B
+// where it will be.
+vec4 smoothCut(ivec2 xy, ivec2 size) {
+    const float u = p[0].y, scale = p[1].x, step = p[1].y;
+    const int gw = int(p[1].z), gh = int(p[1].w);
+    const float gx = clamp(((float(xy.x) + 0.5) / scale - 0.5) / step, 0.0, float(gw - 1));
+    const float gy = clamp(((float(xy.y) + 0.5) / scale - 0.5) / step, 0.0, float(gh - 1));
+    const int x0 = int(gx), y0 = int(gy), x1 = min(x0 + 1, gw - 1), y1 = min(y0 + 1, gh - 1);
+    const float fx = gx - float(x0), fy = gy - float(y0);
+    const vec2 a = texelFetch(table, ivec2(x0, y0), 0).xy, b = texelFetch(table, ivec2(x1, y0), 0).xy;
+    const vec2 c = texelFetch(table, ivec2(x0, y1), 0).xy, d = texelFetch(table, ivec2(x1, y1), 0).xy;
+    const vec2 f = ((a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + d * fx) * fy) * scale;
+    const float x = float(xy.x), y = float(xy.y);
+    const vec4 pa = clampedSample(aTex, size, x - u * f.x, y - u * f.y);
+    const vec4 pb = clampedSample(bTex, size, x + (1.0 - u) * f.x, y + (1.0 - u) * f.y);
+    return pa * (1.0 - u) + pb * u;
+}
+
 vec4 transition(int type, ivec2 xy, ivec2 size) {
+    if (type == 18) return smoothCut(xy, size);
     const int x = xy.x, y = xy.y, w = size.x, h = size.y;
     const float uf = p[0].y, soft = p[0].z, strength = p[1].y;
     const int dir = int(p[0].w);
@@ -239,6 +277,97 @@ vec4 transition(int type, ivec2 xy, ivec2 size) {
     return pa * (1.0 - uf) + pb * uf;
 }
 
+// Displace by Layer (31): render/PaintFx's channelOf, edgeIndex and sampleAt.
+float dispChannel(vec4 q, int ch) {
+    float v = 0.5;
+    if (ch == 4) {
+        v = q.a;
+    } else if (q.a > 0.0) {
+        const float inv = 1.0 / q.a;
+        if (ch == 0) v = (0.2126 * q.r + 0.7152 * q.g + 0.0722 * q.b) * inv;
+        else if (ch == 1) v = q.r * inv;
+        else if (ch == 2) v = q.g * inv;
+        else if (ch == 3) v = q.b * inv;
+    }
+    return isnan(v) ? 0.5 : clamp(v, 0.0, 1.0);
+}
+int dispEdge(int i, int lo, int hi, int edge) {
+    const int n = hi - lo;
+    if (edge == 0) {
+        // (wrapped; GLSL's % is undefined for negatives)
+        int k = i - lo;
+        k -= n * int(floor(float(k) / float(n)));
+        if (k < 0) k += n;
+        if (k >= n) k -= n;
+        return lo + k;
+    }
+    if (edge == 1) return clamp(i, lo, hi - 1);
+    return i < lo || i >= hi ? -1 : i;
+}
+vec4 dispPixel(ivec4 b, int edge, int xi, int yi, out bool present) {
+    const int X = dispEdge(xi, b.x, b.z, edge), Y = dispEdge(yi, b.y, b.w, edge);
+    present = X >= 0 && Y >= 0;
+    return present ? texelFetch(aTex, ivec2(X, Y), 0) : vec4(0.0);
+}
+// The picture at (x, y) in pixel indices (centres at whole numbers), bilinear or Catmull-Rom (kept within the four
+// nearest pixels, coverage within 0 and 1), outside `b` (x0, y0, x1, y1) as `edge` says.
+vec4 dispSample(ivec4 b, int edge, bool bicubic, float x, float y) {
+    const int x0 = int(floor(x)), y0 = int(floor(y));
+    const float fx = x - float(x0), fy = y - float(y0);
+    bool present;
+    if (!bicubic)
+        return dispPixel(b, edge, x0, y0, present) * ((1.0 - fx) * (1.0 - fy)) + dispPixel(b, edge, x0 + 1, y0, present) * (fx * (1.0 - fy)) +
+               dispPixel(b, edge, x0, y0 + 1, present) * ((1.0 - fx) * fy) + dispPixel(b, edge, x0 + 1, y0 + 1, present) * (fx * fy);
+    float wx[4], wy[4];
+    for (int k = 0; k < 2; ++k) {
+        const float t = k == 0 ? fx : fy, t2 = t * t, t3 = t2 * t;
+        const vec4 w = vec4(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2);
+        for (int i = 0; i < 4; ++i) {
+            if (k == 0) wx[i] = w[i];
+            else wy[i] = w[i];
+        }
+    }
+    vec4 acc = vec4(0.0);
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 4; ++i) acc += dispPixel(b, edge, x0 - 1 + i, y0 - 1 + j, present) * (wx[i] * wy[j]);
+    vec4 lo = vec4(0.0), hi = vec4(0.0);
+    for (int j = 0; j < 2; ++j)
+        for (int i = 0; i < 2; ++i) {
+            const vec4 q = dispPixel(b, edge, x0 + i, y0 + j, present);
+            lo = i + j == 0 ? q : min(lo, q);
+            hi = i + j == 0 ? q : max(hi, q);
+        }
+    acc = clamp(acc, lo, hi);
+    acc.a = clamp(acc.a, 0.0, 1.0);
+    return acc;
+}
+vec4 displaced(ivec2 xy, ivec2 size) {
+    const vec4 here = texelFetch(aTex, xy, 0);
+    const int edge = int(p[0].w);
+    const bool bicubic = p[1].z > 0.5, turned = p[1].w > 0.5;
+    const float o0 = p[3].x, o1 = p[3].y, a0 = p[3].z, a1 = p[3].w, d0 = p[4].x, d1 = p[4].y, sg = p[4].z, ad = p[4].w;
+    // (a point's place in a turned picture's axes, from the cross products worked out as the CPU works them out)
+    precise float rx = float(xy.x) + 0.5 - o0, ry = float(xy.y) + 0.5 - o1;
+    precise float na = (rx * d1 - ry * d0) * sg, nb = (a0 * ry - a1 * rx) * sg;
+    const ivec4 b = turned ? ivec4(0, 0, size) : ivec4(p[2]);
+    if (turned ? !(na >= 0.0 && na < ad && nb >= 0.0 && nb < ad) : (xy.x < b.x || xy.y < b.y || xy.x >= b.z || xy.y >= b.w)) return here;
+    const vec4 m = texelFetch(bTex, xy, 0);
+    const float dx = p[5].z > 0.5 ? p[1].x * (2.0 * dispChannel(m, int(p[0].y)) - 1.0) : 0.0;
+    const float dy = p[5].w > 0.5 ? p[1].y * (2.0 * dispChannel(m, int(p[0].z)) - 1.0) : 0.0;
+    if (dx == 0.0 && dy == 0.0) return here;
+    if (!turned) return dispSample(b, edge, bicubic, float(xy.x) + dx, float(xy.y) + dy);
+    precise float mx = float(xy.x) + 0.5 + dx - o0, my = float(xy.y) + 0.5 + dy - o1;
+    precise float ma = (mx * d1 - my * d0) * sg, mb = (a0 * my - a1 * mx) * sg;
+    if (edge == 2 && !(ma >= 0.0 && ma < ad && mb >= 0.0 && mb < ad)) return vec4(0.0);
+    // (where it is moved to, or, wrapped or held, the place within the picture that comes to)
+    const float u = ma / ad, v = mb / ad;
+    float wu = u, wv = v;
+    if (edge == 0) wu -= floor(wu), wv -= floor(wv);
+    if (edge != 2) wu = clamp(wu, p[5].x, 1.0 - p[5].x), wv = clamp(wv, p[5].y, 1.0 - p[5].y);
+    if (wu == u && wv == v) return dispSample(b, 1, bicubic, float(xy.x) + dx, float(xy.y) + dy);
+    return dispSample(b, 1, bicubic, o0 + wu * a0 + wv * d0 - 0.5, o1 + wu * a1 + wv * d1 - 0.5);
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const ivec2 size = textureSize(aTex, 0);
@@ -248,6 +377,10 @@ void main() {
         float m = p[0].y > 0.5 ? clamp(0.2126 * q.r + 0.7152 * q.g + 0.0722 * q.b, 0.0, 1.0) : q.a;
         if (p[0].z > 0.5) m = 1.0 - m;
         fragColor = texelFetch(aTex, xy, 0) * m;
+        return;
+    }
+    if (mode == 31) {
+        fragColor = displaced(xy, size);
         return;
     }
     fragColor = transition(mode, xy, size);

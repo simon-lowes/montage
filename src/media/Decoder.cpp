@@ -6,6 +6,7 @@
 #include "Exr.h"
 #include "Jxl.h"
 #include "Av2.h"
+#include "JpegXs.h"
 #include "render/DcpMxf.h"
 #include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
@@ -384,6 +385,28 @@ int openMediaInput(AVFormatContext** fmt, const std::string& decorated) {
 
 namespace {
 
+// The colour space an ICC profile names ("" for one of no space Montage reads differently: an sRGB profile reads as
+// the Rec.709 default).
+std::string iccProfileSpace(const uint8_t* data, size_t size) {
+    const QColorSpace cs = QColorSpace::fromIccProfile(QByteArray(reinterpret_cast<const char*>(data), int(size)));
+    if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::AdobeRgb) return "adobergb";
+    if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::DciP3D65) return "p3d65";
+    return {};
+}
+
+// The colour space the ICC profile a file states for a stream names: MOV and MP4's colr box of type prof, an AVIF's
+// colour property, as FFmpeg's probe reads them ("" without one).
+std::string streamIccColorSpace(const AVStream* st) {
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+    if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data, AV_PKT_DATA_ICC_PROFILE))
+        return iccProfileSpace(sd->data, sd->size);
+#else
+    size_t size = 0;
+    if (const uint8_t* d = av_stream_get_side_data(st, AV_PKT_DATA_ICC_PROFILE, &size)) return iccProfileSpace(d, size);
+#endif
+    return {};
+}
+
 // The colour space a still image's embedded ICC profile names, for images whose tags name none ("" when it has no
 // profile, or one of no space Montage reads differently: an sRGB profile reads as the Rec.709 default).
 std::string iccColorSpace(const std::string& path) {
@@ -404,11 +427,7 @@ std::string iccColorSpace(const std::string& path) {
         }
         if (!got && avcodec_send_packet(dec, nullptr) >= 0) got = avcodec_receive_frame(dec, frame) == 0;
         if (got)
-            if (const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_ICC_PROFILE)) {
-                const QColorSpace cs = QColorSpace::fromIccProfile(QByteArray(reinterpret_cast<const char*>(sd->data), int(sd->size)));
-                if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::AdobeRgb) out = "adobergb";
-                else if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::DciP3D65) out = "p3d65";
-            }
+            if (const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_ICC_PROFILE)) out = iccProfileSpace(sd->data, sd->size);
     }
     av_frame_free(&frame);
     av_packet_free(&pkt);
@@ -700,6 +719,35 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         out = m;
         return true;
     }
+    // JPEG XS (media/JpegXs.h), its pictures read with SVT-JPEG-XS: raw codestreams, or an MXF (ST 2124) whose sound is
+    // read as any other MXF's (FFmpeg has no JPEG XS, so its picture's facts come from the codestream and descriptor).
+    static thread_local bool jxsProbing = false;
+    if (const JxsContainer jc = jpegXsAvailable() && !jxsProbing ? jxsContainer(file) : JxsContainer::None; jc != JxsContainer::None) {
+        JxsFileInfo ji;
+        if (!readJxsFileInfo(file, ji, error)) return false;
+        MediaItem m = out;
+        if (jc == JxsContainer::Mxf) {
+            jxsProbing = true;
+            MediaItem viaContainer = out;
+            if (probeMedia(path, viaContainer, nullptr)) m = viaContainer;
+            jxsProbing = false;
+        }
+        m.path = path;
+        if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
+        // (one codestream alone is a still, as the decoder plays it)
+        const bool still = jc == JxsContainer::Codestream && ji.frames == 1;
+        m.kind = still ? MediaKind::Image : MediaKind::Video;
+        m.hasVideo = true;
+        if (jc != JxsContainer::Mxf || ji.soundTracks == 0) m.hasAudio = false;
+        m.width = std::max(1, int(std::lround(ji.header.width * (in.par > 0 ? in.par : 1.0))));
+        m.height = ji.header.height;
+        if (!still) m.fps = Rational{ji.fpsNum, ji.fpsDen};
+        m.duration = still ? 0 : ji.seconds() / in.timeScale();
+        m.videoCodec = "jpegxs";
+        m.colorSpace = ji.colorSpace;
+        out = m;
+        return true;
+    }
     // An IMF archival master's pictures (Application #5: ACES image containers, which FFmpeg does not read), in ACES 2065-1.
     if (file.size() >= 4 && exrAvailable() && QString::fromStdString(file.substr(file.size() - 4)).compare(".mxf", Qt::CaseInsensitive) == 0) {
         int w = 0, h = 0;
@@ -774,6 +822,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         const char* trc = av_color_transfer_name(AVColorTransferCharacteristic(hi.transfer));
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (m.colorSpace == "rec709") m.colorSpace.clear();
+        if (hi.adobeRgb) m.colorSpace = "adobergb";  // (its profile says: no code point names Adobe RGB)
         m.maxCll = hi.maxCll;
         m.maxFall = hi.maxFall;
         if (hi.gainMap) {
@@ -837,7 +886,15 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         const char* trc = av_color_transfer_name(st->codecpar->color_trc);
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
-        // A still whose primaries are not tagged: an embedded ICC profile may say (Adobe RGB has no tag of its own).
+        // Primaries that are not tagged: the ICC profile the file states for the stream may say (Adobe RGB has no tag
+        // of its own; video in MOV and MP4 carries the profile in the stream's colr box).
+        if (st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED)
+            if (const std::string icc = streamIccColorSpace(st); !icc.empty()) m.colorSpace = icc;
+        // (an AVIF's, where this FFmpeg's probe does not hand on the picture's colour property: read from its meta box)
+        if (HeifStillInfo hi; st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED && lowerExtension(file) == ".avif" && readHeifStill(file, hi) &&
+                              hi.adobeRgb)
+            m.colorSpace = "adobergb";
+        // A still whose primaries are not tagged: an embedded ICC profile may say.
         if (st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED &&
             (st->codecpar->codec_id == AV_CODEC_ID_PNG || st->codecpar->codec_id == AV_CODEC_ID_MJPEG || st->codecpar->codec_id == AV_CODEC_ID_TIFF ||
              st->codecpar->codec_id == AV_CODEC_ID_WEBP) &&
@@ -1070,6 +1127,7 @@ void VideoDecoder::close() {
     jxlFile_.clear();
     imf_.reset();
     av2_.reset();
+    jxs_.reset();
     pulldown_.reset();
     av_frame_free(&woven_);
     wovenIndex_ = -1;
@@ -1340,6 +1398,23 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         curPts_ = nextPts_ = -1;
         return true;
     }
+    // JPEG XS (media/JpegXs.h): decoded with SVT-JPEG-XS, each frame planar Y′CbCr or GBR as FFmpeg's would be.
+    if (jpegXsAvailable() && jxsContainer(file) != JxsContainer::None) {
+        auto reader = std::make_unique<JxsReader>();
+        if (!reader->open(file, error)) return false;
+        const JxsFileInfo& ji = reader->info();
+        jxs_ = std::move(reader);
+        rawFrame_ = -1;
+        dispW_ = std::max(1, int(std::lround(ji.header.width * (par_ > 0 ? par_ : 1.0))));
+        dispH_ = ji.header.height;
+        fps_ = ji.fpsNum > 0 && ji.fpsDen > 0 ? double(ji.fpsNum) / ji.fpsDen : 25.0;
+        duration_ = ji.seconds();
+        still_ = ji.frames == 1 && ji.container == JxsContainer::Codestream;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
+    }
     if (ext == ".mxf") {
         int w = 0, h = 0;
         if (std::shared_ptr<const dcp::ImfTrackReader> reader = imfPicture(file, w, h, &imfFullRange_)) {
@@ -1594,6 +1669,19 @@ bool VideoDecoder::decodeNext(AVFrame* into) {
         }
         // (IMF ProRes in full range, QE.2: its descriptor says so, the frames cannot)
         if (rc == 0 && imfFullRange_) into->color_range = AVCOL_RANGE_JPEG;
+        // A picture that does not say how its colour is coded takes what the file says of its stream (a hardware
+        // decoder's pictures can come without): below 720 lines it would otherwise be read by BT.601's matrix
+        // whatever the file states.
+        if (rc == 0) {
+            const AVCodecParameters* par = fmt_->streams[stream_]->codecpar;
+            if (into->colorspace == AVCOL_SPC_UNSPECIFIED && par->color_space != AVCOL_SPC_RGB) into->colorspace = par->color_space;
+            if (into->color_primaries == AVCOL_PRI_UNSPECIFIED) into->color_primaries = par->color_primaries;
+            if (into->color_trc == AVCOL_TRC_UNSPECIFIED) into->color_trc = par->color_trc;
+            // (Interpret Colour's chroma siting: where the colour samples sit, whatever the file says)
+            if (interp_.chroma == "left") into->chroma_location = AVCHROMA_LOC_LEFT;
+            else if (interp_.chroma == "center") into->chroma_location = AVCHROMA_LOC_CENTER;
+            else if (interp_.chroma == "topleft") into->chroma_location = AVCHROMA_LOC_TOPLEFT;
+        }
         if (rc == 0) return true;
         if (rc == AVERROR_EOF) return false;
         if (rc != AVERROR(EAGAIN)) return false;
@@ -2213,6 +2301,27 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         }
         if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_)) {
             stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality);
+            stillHq_ = highQuality;
+        }
+        curPts_ = double(n) / fps_;
+        return stillFrame_;
+    }
+    if (jxs_) {
+        // The frame shown at `t`, decoded once and kept while it is asked for again.
+        const int64_t n = std::clamp(int64_t(std::floor(std::min(std::max(0.0, t) * timeScale_ * fps_ + 1e-6, 1e15))), int64_t(0),
+                                     std::max<int64_t>(0, jxs_->info().frames - 1));
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        if (n != rawFrame_ || !raw_) {
+            if (!raw_ && !(raw_ = av_frame_alloc())) return nullptr;
+            rawFrame_ = -1;
+            if (!jxs_->frame(n, raw_)) return nullptr;
+            rawFrame_ = n;
+            stillFrame_.reset();
+        }
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_) ||
+            (stillFrame_->planes && !planes)) {
+            stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality, planes);
             stillHq_ = highQuality;
         }
         curPts_ = double(n) / fps_;
@@ -3011,6 +3120,36 @@ void checkStereoMedia(Project& p) {
         m.height = fresh.height;
         for (MediaItem& sub : p.media)
             if (sub.subclipOf == m.id) sub.colorSpace = m.colorSpace, sub.width = m.width, sub.height = m.height;
+    }
+    // A project saved while untagged 4:2:2 was read as centred: its footage of that kind keeps being read so, as an
+    // interpretation the bin's Interpret Colour menu shows and can take back, so the project renders as it did.
+    if (!p.chromaChecked) {
+        p.chromaChecked = true;
+        for (MediaItem& m : p.media) {
+            if (m.kind != MediaKind::Video || m.path.empty() || m.subclipOf) continue;
+            Interpretation in = interpretationOf(m);
+            if (!in.chroma.empty()) continue;
+            AVFormatContext* fmt = nullptr;
+            if (openMediaInput(&fmt, m.path) < 0) continue;
+            bool untagged422 = false;
+            if (avformat_find_stream_info(fmt, nullptr) >= 0)
+                if (const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0); v >= 0) {
+                    const AVCodecParameters* par = fmt->streams[v]->codecpar;
+                    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(par->format));
+                    untagged422 = d && !(d->flags & AV_PIX_FMT_FLAG_RGB) && d->nb_components >= 3 && d->log2_chroma_w == 1 && d->log2_chroma_h == 0 &&
+                                  par->chroma_location == AVCHROMA_LOC_UNSPECIFIED;
+                }
+            avformat_close_input(&fmt);
+            if (!untagged422) continue;
+            in.chroma = "center";
+            m.path = interpretedPath(m.path, in);
+            for (MediaItem& sub : p.media)
+                if (sub.subclipOf == m.id && !sub.path.empty()) {
+                    Interpretation si = interpretationOf(sub);
+                    si.chroma = "center";
+                    sub.path = interpretedPath(sub.path, si);
+                }
+        }
     }
     if (p.stereoChecked) return;
     p.stereoChecked = true;

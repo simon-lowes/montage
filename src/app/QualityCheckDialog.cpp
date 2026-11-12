@@ -226,6 +226,8 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
         minVmaf_ = spin("qcMinVmaf", tr("VMAF ≥ "), 100, 1, QString());
         vmaf_ = new QCheckBox(tr("VMAF"), lw);
         vmaf_->setObjectName(QStringLiteral("qcVmaf"));
+        vmaf_->setChecked(vmafAvailable());
+        vmaf_->setToolTip(tr("VMAF (libvmaf %1, its v1 model) as well; HDR encodes only where libvmaf has an HDR model").arg(QString::fromStdString(vmafVersion())));
         if (!vmafAvailable()) {
             vmaf_->setEnabled(false);
             minVmaf_->setEnabled(false);
@@ -314,7 +316,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.titleLanguage = titleSpellingLanguage().toStdString();
     q.compareFile = compareFile_->text().trimmed().toStdString();
     q.hrdFile = hrdFile_->text().trimmed().toStdString();
-    if (vmaf_->isChecked() && vmafAvailable()) q.compareMetrics |= MetricVmaf;
+    if (!vmaf_->isChecked() || !vmafAvailable()) q.compareMetrics &= ~unsigned(MetricVmaf);
     q.qualityLimits.minPsnr = minPsnr_->value();
     q.qualityLimits.maxDeltaItp = maxDeltaItp_->value();
     q.qualityLimits.minVmaf = vmafAvailable() ? minVmaf_->value() : 0;
@@ -371,6 +373,7 @@ bool QualityCheckDialog::runCheck() {
                           .arg(QString::fromStdString(comparison_.format), num(comparison_.mean.psnrY, 2), num(comparison_.worst.psnrY, 2),
                                num(comparison_.mean.ssim, 4), num(comparison_.mean.msSsim, 4), num(comparison_.mean.deltaItp, 2));
         if (comparison_.vmafScored) text += tr("; VMAF %1").arg(num(comparison_.mean.vmaf, 1));
+        else if (!comparison_.vmafNote.empty()) text += tr("; VMAF not measured: no HDR VMAF model");
         if (comparison_.offset) text += ' ' + tr("(the encode is %n frame(s) off the sequence)", nullptr, std::abs(comparison_.offset));
         emit compared(sequence.id, revision);
     }

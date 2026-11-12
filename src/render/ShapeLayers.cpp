@@ -11,6 +11,7 @@
 #include <QPainterPathStroker>
 #include <QRadialGradient>
 #include <QRegularExpression>
+#include <QTextBoundaryFinder>
 #include <QXmlStreamReader>
 #include <algorithm>
 #include <cmath>
@@ -19,6 +20,7 @@
 #include <map>
 #include <set>
 
+#include "ShapeRaster.h"
 #include "Shapes.h"
 #include "core/EditOps.h"
 
@@ -656,70 +658,19 @@ std::vector<ShapePaint> shapePaints(const Effect& g, FrameTime t, double fps) {
 }
 
 namespace {
-
-// Where what a paint draws can reach on the frame (device pixels), its stroke's half width and joins allowed for.
-QRectF paintBounds(const ShapePaint& op, const QTransform& to) {
-    if (op.isGroup) {
-        QRectF r;
-        for (const ShapePaint& c : op.group) r = r.united(paintBounds(c, c.transform * op.transform * to));
-        return r;
-    }
-    if (op.path.isEmpty()) return {};
-    const double grow = op.stroke ? op.pen.widthF() * std::max(1.0, op.pen.miterLimit()) / 2 + 1 : 1;
-    return to.mapRect(op.path.boundingRect().adjusted(-grow, -grow, grow, grow));
+// The layer's own position and rotation, in a w x h frame's pixels.
+QTransform shapeLayerTransform(const Effect& g, FrameTime t, int w, int h, double scale) {
+    QTransform layer;
+    layer.translate(w / 2.0 + g.p("pos_x", t) * scale, h / 2.0 + g.p("pos_y", t) * scale);
+    layer.rotate(g.p("rotation", t));
+    layer.scale(scale, scale);
+    return layer;
 }
-
-void drawPaints(QPainter& pa, const std::vector<ShapePaint>& ops, const QTransform& to, double opacity, int w, int h) {
-    for (const ShapePaint& op : ops) {
-        if (op.opacity <= 0) continue;
-        const QTransform m = op.transform * to;
-        if (op.isGroup) {
-            // Drawn together into a layer of their own over the part of the frame they reach, then laid down.
-            const QRect area = paintBounds(op, to).toAlignedRect().intersected(QRect(0, 0, w, h));
-            if (area.isEmpty()) continue;
-            QImage layer(area.size(), QImage::Format_RGBA8888_Premultiplied);
-            layer.fill(Qt::transparent);
-            {
-                QPainter lp(&layer);
-                lp.setRenderHint(QPainter::Antialiasing);
-                drawPaints(lp, op.group, m * QTransform::fromTranslate(-area.left(), -area.top()), 1.0, area.width(), area.height());
-            }
-            pa.resetTransform();
-            pa.setOpacity(opacity * op.opacity);
-            pa.drawImage(area.topLeft(), layer);
-            continue;
-        }
-        if (op.path.isEmpty()) continue;
-        pa.setTransform(m);
-        pa.setOpacity(opacity * op.opacity);
-        if (op.stroke) pa.strokePath(op.path, op.pen);
-        else pa.fillPath(op.path, op.brush);
-    }
-}
-
 }  // namespace
 
-Image renderShapeContents(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
-    QImage qi(w, h, QImage::Format_RGBA8888_Premultiplied);
-    qi.fill(Qt::transparent);
-    {
-        QPainter pa(&qi);
-        pa.setRenderHint(QPainter::Antialiasing);
-        QTransform layer;
-        layer.translate(w / 2.0 + g.p("pos_x", t) * scale, h / 2.0 + g.p("pos_y", t) * scale);
-        layer.rotate(g.p("rotation", t));
-        layer.scale(scale, scale);
-        const double opacity = std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0);
-        drawPaints(pa, shapePaints(g, t, fps), layer, opacity, w, h);
-    }
-    Image img(w, h);
-    const float k = 1.0f / 255.0f;
-    for (int y = 0; y < h; ++y) {
-        const uchar* s = qi.constScanLine(y);
-        float* d = img.row(y);
-        for (int x = 0; x < w * 4; ++x) d[x] = s[x] * k;
-    }
-    return img;
+ShapeRaster shapeContentsRaster(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
+    const double opacity = std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0);
+    return shapeRaster(shapePaints(g, t, fps), shapeLayerTransform(g, t, w, h, scale), opacity, w, h);
 }
 
 namespace {
@@ -905,10 +856,15 @@ struct SvgNode {
     std::vector<SvgNode> children;
     QString text;
     std::vector<int> childAt;  // where in `text` each child came (for text with tspans in it)
+    QStringList classes;       // its class attribute's names (split once, for the style sheets)
 };
 
 bool readSvgTree(QXmlStreamReader& xr, SvgNode& node, int depth = 0) {
     for (const QXmlStreamAttribute& a : xr.attributes()) node.attrs[a.qualifiedName().toString()] = a.value().toString();
+    if (auto it = node.attrs.find("class"); it != node.attrs.end()) {
+        static const QRegularExpression space(QStringLiteral(R"(\s+)"));
+        node.classes = it->second.split(space, Qt::SkipEmptyParts);
+    }
     while (!xr.atEnd()) {
         xr.readNext();
         if (xr.isStartElement()) {
@@ -958,6 +914,11 @@ struct CssRule {
     Style decls;
 };
 
+// (a drawing's style sheets read to this many rules, each of this many compound selectors at most: every rule is
+// tried on every element, so a crafted sheet cannot hold the import up)
+constexpr size_t kMaxCssRules = 2000;
+constexpr qsizetype kMaxCssCompounds = 16;
+
 std::vector<CssRule> parseCss(QString text, int& order) {
     std::vector<CssRule> out;
     static const QRegularExpression comments(QStringLiteral(R"(/\*.*?\*/)"), QRegularExpression::DotMatchesEverythingOption);
@@ -965,9 +926,18 @@ std::vector<CssRule> parseCss(QString text, int& order) {
     static const QRegularExpression compound(QStringLiteral(R"(^([A-Za-z_][\w-]*|\*)?((?:[.#][\w-]+)*)$)"));
     static const QRegularExpression part(QStringLiteral(R"([.#][\w-]+)"));
     qsizetype at = 0;
-    while (at < text.size()) {
+    while (at < text.size() && out.size() <= kMaxCssRules) {  // (one past: the importer notes what was left)
         const qsizetype open = text.indexOf('{', at);
         if (open < 0) break;
+        // (a statement at-rule, @charset or @import: to its semicolon, never into the rule after it)
+        static const QRegularExpression nonSpace(QStringLiteral(R"(\S)"));
+        if (const qsizetype from = text.indexOf(nonSpace, at); from >= 0 && from < open && text[from] == '@') {
+            const qsizetype semi = text.indexOf(';', from);
+            if (semi >= 0 && semi < open) {
+                at = semi + 1;
+                continue;
+            }
+        }
         // (to its matching brace: an @media or @supports block holds rules of its own)
         qsizetype close = open;
         for (int depth = 0; ++close < text.size();) {
@@ -985,7 +955,9 @@ std::vector<CssRule> parseCss(QString text, int& order) {
             sel.replace(QLatin1String(">"), QLatin1String(" > "));
             CssRule r;
             bool ok = !sel.isEmpty(), nextChild = false;
-            for (const QString& tok : sel.split(' ', Qt::SkipEmptyParts)) {
+            const QStringList toks = sel.split(' ', Qt::SkipEmptyParts);
+            if (toks.size() > kMaxCssCompounds) continue;
+            for (const QString& tok : toks) {
                 if (tok == ">") {
                     nextChild = true;
                     continue;
@@ -1019,12 +991,8 @@ std::vector<CssRule> parseCss(QString text, int& order) {
 bool compoundMatches(const CssCompound& c, const SvgNode& n) {
     if (!c.type.isEmpty() && c.type != n.name) return false;
     if (!c.id.isEmpty() && (!n.attrs.count("id") || n.attrs.at("id") != c.id)) return false;
-    if (!c.classes.isEmpty()) {
-        const QStringList have = n.attrs.count("class") ? n.attrs.at("class").split(QRegularExpression(QStringLiteral(R"(\s+)")), Qt::SkipEmptyParts)
-                                                         : QStringList();
-        for (const QString& k : c.classes)
-            if (!have.contains(k)) return false;
-    }
+    for (const QString& k : c.classes)
+        if (!n.classes.contains(k)) return false;
     return true;
 }
 
@@ -1069,22 +1037,6 @@ Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, con
     }
     if (auto it = n.attrs.find("style"); it != n.attrs.end()) declarations(it->second, s);
     return s;
-}
-
-// All the character data in an element and the elements in it (tspans), in order, its runs of white space made
-// single spaces.
-QString textIn(const SvgNode& n) {
-    QString t;
-    int from = 0;
-    for (size_t i = 0; i < n.children.size(); ++i) {
-        const int at = std::clamp(i < n.childAt.size() ? n.childAt[i] : int(n.text.size()), from, int(n.text.size()));
-        t += n.text.mid(from, at - from);
-        from = at;
-        const SvgNode& c = n.children[i];
-        if (c.name == "tspan" || c.name == "textPath" || c.name == "a") t += textIn(c);
-    }
-    t += n.text.mid(from);
-    return t.simplified();
 }
 
 std::vector<double> numbersIn(const QString& s) {
@@ -1271,17 +1223,27 @@ class SvgImporter {
 public:
     SvgImporter(Effect& g, std::vector<std::string>* notes) : g_(g), notes_(notes) {}
 
-    void gather(const SvgNode& n) {
+    void gather(const SvgNode& n, const QTransform& parent = QTransform()) {
         if (auto it = n.attrs.find("id"); it != n.attrs.end()) ids_[it->second] = &n;
+        // (where each element's own coordinates sit in the drawing's, for a textPath's path)
+        QTransform m = n.attrs.count("transform") ? transformOf(n.attrs.at("transform")) : QTransform();
+        if (n.name == "svg" && &n != root_)
+            m = QTransform::fromTranslate(lengthOf(n.attrs.count("x") ? n.attrs.at("x") : QString()), lengthOf(n.attrs.count("y") ? n.attrs.at("y") : QString())) * m;
+        const QTransform ctm = m * parent;
+        ctms_[&n] = ctm;
         // (style sheets apply to the whole drawing, wherever they are in it)
         if (n.name == "style") {
             const QString type = n.attrs.count("type") ? n.attrs.at("type").trimmed() : QString();
             if (type.isEmpty() || type == "text/css") {
                 std::vector<CssRule> rules = parseCss(n.text, cssOrder_);
+                if (sheet_.size() + rules.size() > kMaxCssRules) {
+                    note("Style sheets past their first " + std::to_string(kMaxCssRules) + " rules (not read)");
+                    rules.resize(kMaxCssRules - std::min(kMaxCssRules, sheet_.size()));
+                }
                 sheet_.insert(sheet_.end(), rules.begin(), rules.end());
             }
         }
-        for (const SvgNode& c : n.children) gather(c);
+        for (const SvgNode& c : n.children) gather(c, ctm);
     }
 
     void note(const std::string& what) {
@@ -1589,25 +1551,114 @@ public:
     // the layer comes after), its size there.
     void text(const SvgNode& n, const Style& st, const Style& own) {
         if (!texts_) return note("Text (add a title for it)");
-        const QString str = textIn(n);
-        if (str.isEmpty()) return;
         if (st.count("visibility") && (st.at("visibility") == "hidden" || st.at("visibility") == "collapse")) return;
         const QTransform m = (n.attrs.count("transform") ? transformOf(n.attrs.at("transform")) : QTransform()) * ctm_;
-        if (std::abs(m.m12()) > 1e-9 || std::abs(m.m21()) > 1e-9) note("Turned or slanted text (made a title upright)");
-        auto first = [&](const SvgNode& e, const char* k, double& v) {
-            if (!e.attrs.count(k)) return false;
-            const std::vector<double> ns = numbersIn(e.attrs.at(k));
-            if (ns.empty()) return false;
-            v = ns[0];
-            return true;
+        // Its characters (white space collapsed, as SVG lays it out) and each one's x, y, dx, dy and rotate: the
+        // innermost element giving one for it (a rotate list's last value going on for the rest of its element).
+        struct Lists {
+            std::vector<double> x, y, dx, dy, rotate;
+            int start = 0;
         };
-        double x = 0, y = 0;
-        bool hx = first(n, "x", x), hy = first(n, "y", y);
-        for (const SvgNode& c : n.children)
-            if (c.name == "tspan") {
-                if (!hx) hx = first(c, "x", x);
-                if (!hy) hy = first(c, "y", y);
+        QString str;
+        std::vector<std::optional<double>> X, Y, R;
+        std::vector<double> DX, DY;
+        std::vector<Lists> stack;
+        const SvgNode* onPath = nullptr;
+        int chars = 0;  // characters so far, as SVG counts them (code points: the lists' entries)
+        auto add = [&](const QString& chunk) {
+            for (QChar ch : chunk) {
+                if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+                if (ch == ' ' && (str.isEmpty() || str.back() == ' ')) continue;
+                if (str.size() >= 4096) return;
+                const bool second = ch.isLowSurrogate() && !str.isEmpty() && str.back().isHighSurrogate();
+                str += ch;
+                if (second) {  // (the rest of the character before: its entries again)
+                    X.push_back(X.back()), Y.push_back(Y.back()), R.push_back(R.back()), DX.push_back(DX.back()), DY.push_back(DY.back());
+                    continue;
+                }
+                const int i = chars++;
+                std::optional<double> x, y, r;
+                double dx = 0, dy = 0;
+                bool hdx = false, hdy = false;
+                for (auto l = stack.rbegin(); l != stack.rend(); ++l) {
+                    const size_t k = size_t(i - l->start);
+                    if (!x && k < l->x.size()) x = l->x[k];
+                    if (!y && k < l->y.size()) y = l->y[k];
+                    if (!hdx && k < l->dx.size()) dx = l->dx[k], hdx = true;
+                    if (!hdy && k < l->dy.size()) dy = l->dy[k], hdy = true;
+                    if (!r && !l->rotate.empty()) r = k < l->rotate.size() ? l->rotate[k] : l->rotate.back();
+                }
+                X.push_back(x), Y.push_back(y), R.push_back(r), DX.push_back(dx), DY.push_back(dy);
             }
+        };
+        std::function<void(const SvgNode&, int)> walk = [&](const SvgNode& e, int depth) {
+            Lists l;
+            l.start = chars;
+            auto read = [&](const char* k, std::vector<double>& v) {
+                if (e.attrs.count(k)) v = numbersIn(e.attrs.at(k));
+            };
+            if (e.name != "textPath") read("x", l.x), read("y", l.y);
+            read("dx", l.dx), read("dy", l.dy), read("rotate", l.rotate);
+            stack.push_back(std::move(l));
+            int from = 0;
+            for (size_t i = 0; i < e.children.size(); ++i) {
+                const int at = std::clamp(i < e.childAt.size() ? e.childAt[i] : int(e.text.size()), from, int(e.text.size()));
+                add(e.text.mid(from, at - from));
+                from = at;
+                const SvgNode& c = e.children[i];
+                if (depth < 32 && (c.name == "tspan" || c.name == "textPath" || c.name == "a")) {
+                    if (c.name == "textPath" && !onPath) onPath = &c;
+                    walk(c, depth + 1);
+                }
+            }
+            add(e.text.mid(from));
+            stack.pop_back();
+        };
+        walk(n, 0);
+        if (str.endsWith(' ')) {
+            str.chop(1);
+            X.pop_back(), Y.pop_back(), R.pop_back(), DX.pop_back(), DY.pop_back();
+        }
+        if (str.isEmpty()) return;
+        // A character each for every letter as the title lays it out (its first UTF-16 unit's).
+        SvgTextLayout lay;
+        lay.matrix = m;
+        {
+            QTextBoundaryFinder bf(QTextBoundaryFinder::Grapheme, str);
+            bool anyX = false, anyY = false, anyR = false, anyD = false;
+            for (int a = 0; a < str.size();) {
+                bf.setPosition(a);
+                int b = bf.toNextBoundary();
+                if (b <= a) b = a + 1;
+                const size_t i = size_t(a);
+                lay.x.push_back(X[i]), lay.y.push_back(Y[i]), lay.rotate.push_back(R[i]), lay.dx.push_back(DX[i]), lay.dy.push_back(DY[i]);
+                anyX |= bool(X[i]), anyY |= bool(Y[i]), anyR |= bool(R[i]) && *R[i] != 0, anyD |= DX[i] != 0 || DY[i] != 0;
+                a = b;
+            }
+            if (!anyX) lay.x.clear();
+            if (!anyY) lay.y.clear();
+            if (!anyR) lay.rotate.clear();
+            if (!anyD) lay.dx.clear(), lay.dy.clear();
+        }
+        // On a path: the path its href names (its data, and its coordinates to the text's), from startOffset.
+        if (onPath) {
+            const QString href = onPath->attrs.count("href") ? onPath->attrs.at("href") : onPath->attrs.count("xlink:href") ? onPath->attrs.at("xlink:href") : QString();
+            const auto target = href.startsWith('#') ? ids_.find(href.mid(1)) : ids_.end();
+            if (target != ids_.end() && target->second->name == "path" && target->second->attrs.count("d")) {
+                lay.path = target->second->attrs.at("d").toStdString();
+                const auto ctm = ctms_.find(target->second);
+                bool invertible = false;
+                const QTransform back = m.inverted(&invertible);
+                lay.pathMatrix = (ctm != ctms_.end() ? ctm->second : QTransform()) * (invertible ? back : QTransform());
+                const QString so = onPath->attrs.count("startOffset") ? onPath->attrs.at("startOffset").trimmed() : QString();
+                lay.startPercent = so.endsWith('%');
+                const std::vector<double> v = numbersIn(so);
+                lay.start = v.empty() ? 0.0 : v[0];
+            } else {
+                note("Text on a path that is not there (laid out straight)");
+            }
+        }
+        double x = lay.x.empty() || !lay.x[0] ? 0 : *lay.x[0], y = lay.y.empty() || !lay.y[0] ? 0 : *lay.y[0];
         SvgText t;
         t.text = str.toStdString();
         const QPointF at = m.map(QPointF(x, y));
@@ -1623,6 +1674,8 @@ public:
         t.italic = st.count("font-style") && (st.at("font-style") == "italic" || st.at("font-style") == "oblique");
         const QString anchor = st.count("text-anchor") ? st.at("text-anchor") : QString();
         t.anchor = anchor == "middle" ? 1 : anchor == "end" ? 2 : 0;
+        lay.anchor = t.anchor;
+        t.layout = std::move(lay);
         const QColor c = parseColour(st.count("fill") ? st.at("fill") : QString("black"));
         if (st.count("fill") && (st.at("fill") == "none" || st.at("fill").startsWith("url("))) {
             if (st.at("fill") == "none") return;
@@ -1653,6 +1706,12 @@ private:
     Effect& g_;
     std::vector<std::string>* notes_;
     std::map<QString, const SvgNode*> ids_;
+    std::map<const SvgNode*, QTransform> ctms_;
+
+public:
+    const SvgNode* root_ = nullptr;
+
+private:
     std::set<std::string> seen_, used_;
     int counter_ = 0;
 };
@@ -1697,6 +1756,7 @@ bool importSvgShapes(const std::string& file, Effect& g, double& width, double& 
     im.viewW_ = vw, im.viewH_ = vh;
     std::vector<SvgText> found;
     im.texts_ = texts ? &found : nullptr;
+    im.root_ = &root;
     im.gather(root);
     std::vector<ShapeItem> items;
     Style none;
@@ -1716,6 +1776,7 @@ bool importSvgShapes(const std::string& file, Effect& g, double& width, double& 
         for (SvgText& t : found) {
             const QPointF at = fit.map(QPointF(t.x, t.y));
             t.x = at.x(), t.y = at.y(), t.size *= k;
+            t.layout.matrix = t.layout.matrix * fit;
         }
         *texts = std::move(found);
     }
@@ -1763,6 +1824,11 @@ Effect svgTextTitle(const SvgText& t, double scale) {
     const double start = t.x * scale - (t.anchor == 1 ? width / 2 : t.anchor == 2 ? width : 0.0);
     e.params["pos_x"] = Param(start + width / 2);
     e.params["pos_y"] = Param(t.y * scale - fm.ascent() + fm.height() / 2);
+    // Laid out letter by letter as the SVG has it (render/Titles.h): its own coordinates to the layer's, at `scale`.
+    SvgTextLayout lay = t.layout;
+    lay.matrix = lay.matrix * QTransform::fromScale(scale, scale);
+    lay.atX = e.p("pos_x", 0), lay.atY = e.p("pos_y", 0);
+    e.strings["svg_text"] = svgTextLayoutJson(lay);
     return e;
 }
 
@@ -1770,6 +1836,14 @@ int placeSvgTexts(Project& p, Sequence& s, Id layer, const std::vector<SvgText>&
     const auto at = edit::locate(s, layer);
     if (!at || at->track.kind != TrackKind::Video) return 0;
     const Clip base = s.videoTracks[size_t(at->track.index)].clips[at->index];
+    // (imported again: the titles it made before go)
+    const std::string linked = std::to_string(layer);
+    std::vector<Id> earlier;
+    for (const Track& tr : s.videoTracks)
+        for (const Clip& k : tr.clips)
+            if (k.isGenerator() && k.generator.type == "title" && k.generator.s("svg_layer") == linked) earlier.push_back(k.id);
+    if (!earlier.empty() && !edit::removeClips(p, s, earlier, false).ok && notes)
+        notes->push_back("Titles from the earlier import kept (on a locked track)");
     int placed = 0;
     for (const SvgText& t : texts) {
         if (placed >= 32) {
@@ -1782,6 +1856,11 @@ int placeSvgTexts(Project& p, Sequence& s, Id layer, const std::vector<SvgText>&
         c.generator.id = id;
         c.generator.params["pos_x"] = Param(c.generator.p("pos_x", 0) + base.generator.p("pos_x", 0));
         c.generator.params["pos_y"] = Param(c.generator.p("pos_y", 0) + base.generator.p("pos_y", 0));
+        if (std::optional<SvgTextLayout> lay = parseSvgTextLayout(c.generator.s("svg_text"))) {
+            lay->atX = c.generator.p("pos_x", 0), lay->atY = c.generator.p("pos_y", 0);
+            c.generator.strings["svg_text"] = svgTextLayoutJson(*lay);
+        }
+        c.generator.strings["svg_layer"] = linked;
         c.start = base.start;
         c.name = QString::fromStdString(t.text).left(40).toStdString();
         // The first track above the layer free for its length.

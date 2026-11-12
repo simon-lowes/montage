@@ -12,9 +12,6 @@ namespace montage {
 
 namespace {
 
-// The most samples a Kuwahara brush takes along its radius (past it, its ellipse is sampled every few pixels).
-constexpr double kKuwaharaSamples = 8;
-
 // A box of 2r + 1 across `n`-channel rows (along x) or down columns (along y), edges held, `in` to `out`: a running
 // sum, so its cost does not grow with r. Each row (or column) on its own, so any number of threads gives the same.
 void boxPass(const std::vector<float>& in, std::vector<float>& out, int w, int h, int n, int r, bool alongY) {
@@ -64,33 +61,27 @@ void boxPass(const std::vector<float>& in, std::vector<float>& out, int w, int h
 // (past a sigma of 3) as three boxes each way (Kovesi's widths, "Fast Almost-Gaussian Filtering", 2010), whose cost
 // does not grow with the radius.
 void gaussian(std::vector<float>& v, int w, int h, int n, double sigma) {
-    if (sigma <= 0 || w <= 0 || h <= 0) return;
-    if (sigma > 3) {
-        const double ideal = std::sqrt(4 * sigma * sigma + 1);  // (12 sigma^2 / 3 boxes, + 1)
-        int lo = int(std::floor(ideal));
-        if (lo % 2 == 0) --lo;
-        const int m = int(std::lround((12 * sigma * sigma - 3.0 * lo * lo - 12.0 * lo - 9) / (-4.0 * lo - 4)));
+    if (w <= 0 || h <= 0) return;
+    const GaussianPlan plan = gaussianPlan(sigma);
+    if (plan.byBoxes) {
         std::vector<float> tmp(v.size());
         for (bool alongY : {false, true})
-            for (int pass = 0; pass < 3; ++pass) {
-                const int r = (pass < m ? lo : lo + 2) / 2;
+            for (int r : plan.boxes) {
                 boxPass(v, tmp, w, h, n, r, alongY);
                 v.swap(tmp);
             }
         return;
     }
-    const int r = std::max(1, int(std::ceil(3 * sigma)));
-    std::vector<float> k(size_t(2 * r + 1));
-    double sum = 0;
-    for (int i = -r; i <= r; ++i) sum += (k[size_t(i + r)] = float(std::exp(-0.5 * i * i / (sigma * sigma))));
-    for (float& x : k) x = float(x / sum);
+    if (plan.kernel.empty()) return;
+    const int r = int(plan.kernel.size()) - 1;
+    auto k = [&](int i) { return plan.kernel[size_t(std::abs(i))]; };
     std::vector<float> tmp(v.size());
     parallelRows(h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y)
             for (int x = 0; x < w; ++x)
                 for (int c = 0; c < n; ++c) {
                     float acc = 0;
-                    for (int i = -r; i <= r; ++i) acc += k[size_t(i + r)] * v[(size_t(y) * size_t(w) + size_t(std::clamp(x + i, 0, w - 1))) * size_t(n) + size_t(c)];
+                    for (int i = -r; i <= r; ++i) acc += k(i) * v[(size_t(y) * size_t(w) + size_t(std::clamp(x + i, 0, w - 1))) * size_t(n) + size_t(c)];
                     tmp[(size_t(y) * size_t(w) + size_t(x)) * size_t(n) + size_t(c)] = acc;
                 }
     });
@@ -99,7 +90,7 @@ void gaussian(std::vector<float>& v, int w, int h, int n, double sigma) {
             for (int x = 0; x < w; ++x)
                 for (int c = 0; c < n; ++c) {
                     float acc = 0;
-                    for (int i = -r; i <= r; ++i) acc += k[size_t(i + r)] * tmp[(size_t(std::clamp(y + i, 0, h - 1)) * size_t(w) + size_t(x)) * size_t(n) + size_t(c)];
+                    for (int i = -r; i <= r; ++i) acc += k(i) * tmp[(size_t(std::clamp(y + i, 0, h - 1)) * size_t(w) + size_t(x)) * size_t(n) + size_t(c)];
                     v[(size_t(y) * size_t(w) + size_t(x)) * size_t(n) + size_t(c)] = acc;
                 }
     });
@@ -259,13 +250,18 @@ void displaceTurned(Image& img, const Image& m, const DisplaceSettings& s, bool 
     const double* o = s.origin;
     const double* A = s.across;
     const double* D = s.down;
-    const double det = A[0] * D[1] - A[1] * D[0];
-    if (!(std::fabs(det) > 1e-9)) return;
-    // (a frame point in the picture's own axes: 0 to 1 across and down it)
+    if (!(std::fabs(A[0] * D[1] - A[1] * D[0]) > 1e-9)) return;
+    // (a frame point in the picture's own axes, 0 to 1 across and down it, and whether it lies in [0, 1) both ways:
+    // told from the cross products in floats, as the GPU works them out, so a pixel on the picture's edge is in or out
+    // on both)
+    const float o0 = float(o[0]), o1 = float(o[1]), a0 = float(A[0]), a1 = float(A[1]), d0 = float(D[0]), d1 = float(D[1]);
+    const float det = a0 * d1 - a1 * d0, sg = det < 0 ? -1.0f : 1.0f, ad = std::fabs(det);
+    if (!(ad > 0)) return;
     auto local = [&](double x, double y, double& a, double& b) {
-        const double rx = x - o[0], ry = y - o[1];
-        a = (rx * D[1] - ry * D[0]) / det;
-        b = (A[0] * ry - A[1] * rx) / det;
+        const float rx = float(x) - o0, ry = float(y) - o1;
+        const float na = (rx * d1 - ry * d0) * sg, nb = (a0 * ry - a1 * rx) * sg;
+        a = double(na) / double(ad), b = double(nb) / double(ad);
+        return na >= 0 && na < ad && nb >= 0 && nb < ad;
     };
     const double reach = s.bicubic ? 3.0 : 1.5;  // (frame pixels a sample reads about it, turned)
     const double ia = std::min(0.5, reach / std::max(1e-9, std::hypot(A[0], A[1])));
@@ -285,24 +281,27 @@ void displaceTurned(Image& img, const Image& m, const DisplaceSettings& s, bool 
         for (int y = r0 + q0; y < r0 + q1; ++y)
             for (int x = c0; x < c1; ++x) {
                 double a, b;
-                local(x + 0.5, y + 0.5, a, b);
-                if (a < 0 || a >= 1 || b < 0 || b >= 1) continue;  // (not the picture's: left as it is)
+                if (!local(x + 0.5, y + 0.5, a, b)) continue;  // (not the picture's: left as it is)
                 const float* mp = m.at(x, y);
                 const double dx = h ? s.horizontalAmount * (2.0 * channelOf(mp, s.horizontal) - 1) : 0;
                 const double dy = v ? s.verticalAmount * (2.0 * channelOf(mp, s.vertical) - 1) : 0;
                 if (dx == 0 && dy == 0) continue;
-                local(x + 0.5 + dx, y + 0.5 + dy, a, b);
+                const bool inside = local(x + 0.5 + dx, y + 0.5 + dy, a, b);
                 float* out = img.at(x, y);
+                // (where it is moved to, or, wrapped or held, the place within the picture that comes to)
+                double sx = x + 0.5 + dx, sy = y + 0.5 + dy;
                 if (s.edge == DisplaceEdge::Transparent) {
-                    if (a < 0 || a >= 1 || b < 0 || b >= 1) {
+                    if (!inside) {
                         out[0] = out[1] = out[2] = out[3] = 0;
                         continue;
                     }
                 } else {
-                    if (s.edge == DisplaceEdge::Wrap) a -= std::floor(a), b -= std::floor(b);
-                    a = std::clamp(a, ia, 1 - ia), b = std::clamp(b, ib, 1 - ib);
+                    double wa = a, wb = b;
+                    if (s.edge == DisplaceEdge::Wrap) wa -= std::floor(wa), wb -= std::floor(wb);
+                    wa = std::clamp(wa, ia, 1 - ia), wb = std::clamp(wb, ib, 1 - ib);
+                    if (wa != a || wb != b) sx = o[0] + wa * A[0] + wb * D[0], sy = o[1] + wa * A[1] + wb * D[1];
                 }
-                sampleAt(src, whole, o[0] + a * A[0] + b * D[0], o[1] + a * A[1] + b * D[1], DisplaceEdge::Clamp, s.bicubic, out);
+                sampleAt(src, whole, sx, sy, DisplaceEdge::Clamp, s.bicubic, out);
             }
     });
 }
@@ -357,6 +356,27 @@ DisplaceSettings displaceSettings(const Effect& e, FrameTime t, double pixelScal
     s.bicubic = std::lround(e.p("sampling", t, 0)) == 1;
     s.mapBlur = std::clamp(e.p("map_blur", t, 0), 0.0, 200.0) * pixelScale;
     return s;
+}
+
+GaussianPlan gaussianPlan(double sigma) {
+    GaussianPlan plan;
+    if (!(sigma > 0)) return plan;
+    if (sigma > 3) {
+        // (Kovesi's widths, "Fast Almost-Gaussian Filtering", 2010: 12 sigma^2 / 3 boxes, + 1)
+        const double ideal = std::sqrt(4 * sigma * sigma + 1);
+        int lo = int(std::floor(ideal));
+        if (lo % 2 == 0) --lo;
+        const int m = int(std::lround((12 * sigma * sigma - 3.0 * lo * lo - 12.0 * lo - 9) / (-4.0 * lo - 4)));
+        plan.byBoxes = true;
+        for (int pass = 0; pass < 3; ++pass) plan.boxes[pass] = (pass < m ? lo : lo + 2) / 2;
+        return plan;
+    }
+    const int r = std::max(1, int(std::ceil(3 * sigma)));
+    std::vector<float> k(size_t(2 * r + 1));
+    double sum = 0;
+    for (int i = -r; i <= r; ++i) sum += (k[size_t(i + r)] = float(std::exp(-0.5 * i * i / (sigma * sigma))));
+    for (int i = 0; i <= r; ++i) plan.kernel.push_back(float(k[size_t(i + r)] / sum));
+    return plan;
 }
 
 bool anisotropicKuwahara(Image& img, const KuwaharaSettings& s, const std::atomic<bool>* cancel) {
@@ -525,29 +545,29 @@ bool contourSmear(Image& img, const SmearSettings& s, const std::atomic<bool>* c
     return false;
 }
 
-void paintEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
-    const double mix = std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0);
-    if (img.empty() || mix <= 0) return;
-    const Image before = mix < 1 ? img : Image();
+bool paintSetup(const Effect& e, FrameTime t, double pixelScale, PaintSetup& out) {
+    out.mix = std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0);
     // (within the ranges the effect offers, whatever was stored; brush and smear capped in pixels on big sources)
     const double detail = std::clamp(e.p("detail", t, 2), 0.5, 20.0) * pixelScale;
+    out.style = std::lround(e.p("style", t, 0)) == 1 ? 1 : 0;
+    out.smear.length = std::clamp(std::clamp(e.p("length", t, 12), 1.0, 100.0) * pixelScale, 1.0, 200.0);
+    out.smear.levels = int(std::lround(std::clamp(e.p("levels", t, 8), 0.0, 64.0)));
+    out.smear.tensorBlur = detail;
+    out.kuwahara.radius = std::clamp(std::clamp(e.p("radius", t, 6), 1.0, 40.0) * pixelScale, 1.0, 80.0);
+    out.kuwahara.sharpness = std::clamp(e.p("sharpness", t, 8), 1.0, 18.0);
+    out.kuwahara.anisotropy = std::clamp(e.p("roundness", t, 1), 0.1, 10.0);
+    out.kuwahara.tensorBlur = detail;
+    return out.mix > 0;
+}
+
+void paintEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    PaintSetup ps;
+    if (img.empty() || !paintSetup(e, t, pixelScale, ps)) return;
+    const double mix = ps.mix;
+    const Image before = mix < 1 ? img : Image();
     // (it runs for seconds a frame on big pictures: stopped with the render)
     const SlowEffects& slow = currentSlowEffects();
-    bool finished = true;
-    if (std::lround(e.p("style", t, 0)) == 1) {
-        SmearSettings s;
-        s.length = std::clamp(std::clamp(e.p("length", t, 12), 1.0, 100.0) * pixelScale, 1.0, 200.0);
-        s.levels = int(std::lround(std::clamp(e.p("levels", t, 8), 0.0, 64.0)));
-        s.tensorBlur = detail;
-        finished = contourSmear(img, s, slow.cancel);
-    } else {
-        KuwaharaSettings s;
-        s.radius = std::clamp(std::clamp(e.p("radius", t, 6), 1.0, 40.0) * pixelScale, 1.0, 80.0);
-        s.sharpness = std::clamp(e.p("sharpness", t, 8), 1.0, 18.0);
-        s.anisotropy = std::clamp(e.p("roundness", t, 1), 0.1, 10.0);
-        s.tensorBlur = detail;
-        finished = anisotropicKuwahara(img, s, slow.cancel);
-    }
+    const bool finished = ps.style == 1 ? contourSmear(img, ps.smear, slow.cancel) : anisotropicKuwahara(img, ps.kuwahara, slow.cancel);
     if (!finished) {
         // (the render was stopped part way: the picture as it came, and the frame not final)
         if (slow.issues) slow.issues->note("Painterly was stopped before it finished");

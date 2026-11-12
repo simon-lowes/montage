@@ -64,7 +64,7 @@ struct QcSettings {
     // Compare Encode (render/EncodeCompare.h): this delivered file against the sequence's own render over the range,
     // its frames past the limits reported ("" = not compared).
     std::string compareFile;
-    unsigned compareMetrics = MetricPsnr | MetricSsim | MetricMsSsim | MetricDeltaItp;
+    unsigned compareMetrics = MetricsAll;  // (VMAF where Montage has libvmaf, as it does unless built without it)
     QualityLimits qualityLimits;
     // Buffer model (render/HrdCheck.h): this H.264, HEVC or MPEG-2 file against its HRD or VBV, each underflow and
     // overflow reported at the frame it falls on ("" = not checked). As with compareFile, the file is taken to be an export

@@ -1,6 +1,8 @@
 #include "ModelClip.h"
 
+#include <QBuffer>
 #include <QCryptographicHash>
+#include <QImage>
 #include <algorithm>
 #include <cmath>
 #include <list>
@@ -12,6 +14,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
 #include "render/Layer3D.h"
+#include "render/Processing.h"
 #include "render/Compositor.h"
 
 namespace montage {
@@ -490,7 +493,9 @@ void sceneCamera(const Project& p, const Sequence& seq, const Clip& camera, Fram
     const Effect& g = camera.generator;
     const FrameTime lt = t - camera.start;
     auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
-    frontCamera(seq, P("fov", 35), scale, cam);
+    // (a focal length, on a 36 mm wide sensor, in place of the field of view when it is given)
+    const double focal = P("focal_length", 0);
+    frontCamera(seq, focal > 0 ? 2 * std::atan(18 / focal) / kDeg : P("fov", 35), scale, cam);
     // Moved from where the frame fills its view, and turned (or aimed at a point, then rolled).
     const std::array<double, 3> at{P("pos_x", 0), P("pos_y", 0), cam.C[2] + P("pos_z", 0)};
     std::array<double, 3> right, up, back;
@@ -514,6 +519,18 @@ void sceneCamera(const Project& p, const Sequence& seq, const Clip& camera, Fram
     }
     cam.R = {right[0], right[1], right[2], -up[0], -up[1], -up[2], -back[0], -back[1], -back[2]};
     cam.C = at;
+}
+
+std::string shadowWorldOf(const Sequence& seq, const Clip& c, const Effect& g, FrameTime t) {
+    const bool model = &g == &c.generator;
+    const FrameTime lt = t - c.start;
+    const long mode = std::lround(g.p("camera", lt, model ? 0 : 3));
+    if (mode == 1) {
+        const int ti = trackOf(seq, c);
+        return "solve:" + std::to_string(ti >= 0 ? cameraTrackOf(seq, size_t(ti), g, lt, t) : -1);
+    }
+    if (mode == 2) return "file:" + (g.s("camera_file").empty() && model ? g.s("file") : g.s("camera_file"));
+    return "front";  // (its own camera and the scene's: the frame at z = 0, a unit a pixel)
 }
 
 bool effectCamera(const Project& p, const Sequence& seq, const Clip& c, const Effect& g, FrameTime t, double scale, ModelCamera& cam,
@@ -731,6 +748,41 @@ bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     return true;
 }
 
+namespace {
+
+// A card's picture at t as a PNG (sRGB, straight alpha, 8 bits): its clip's picture on the sequence's frame as its own
+// transform leaves it, before its 3D layer (drawn alone, the 3D layers on it turned off).
+std::string cardPicturePng(const Project& p, const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
+    Sequence alone = seq;
+    if (track >= alone.videoTracks.size()) return {};
+    for (Clip& k : alone.videoTracks[track].clips)
+        if (k.id == c.id)
+            for (Effect& e : k.effects)
+                if (e.type == "layer_3d") e.enabled = false;
+    RenderOptions o;
+    o.highQuality = true;
+    o.soloVideoTrack = int(track);
+    const Image img = renderSequenceFrame(p, alone, t, o);
+    if (img.empty()) return {};
+    QImage q(img.width, img.height, QImage::Format_RGBA8888);
+    for (int y = 0; y < img.height; ++y) {
+        uchar* row = q.scanLine(y);
+        for (int x = 0; x < img.width; ++x) {
+            const float* v = img.at(x, y);
+            const float a = std::clamp(v[3], 0.0f, 1.0f);
+            for (int k = 0; k < 3; ++k) row[x * 4 + k] = uchar(std::lround(std::clamp(a > 0 ? v[k] / a : 0.0f, 0.0f, 1.0f) * 255));
+            row[x * 4 + 3] = uchar(std::lround(a * 255));
+        }
+    }
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    buffer.open(QIODevice::WriteOnly);
+    if (!q.save(&buffer, "PNG")) return {};
+    return bytes.toStdString();
+}
+
+}  // namespace
+
 std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence& seq, size_t track, const Clip& footage) {
     std::vector<SolvedSceneMesh> out;
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
@@ -778,10 +830,26 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
                 if (!e && x.enabled && x.type == "layer_3d") e = &x;  // (its first, as the card is drawn by)
             if (!e || std::lround(e->p("camera", 0, 3)) != 1) continue;
             if (cameraTrackOf(seq, ti, *e, 0, c.start) != int(track) || clipOn(seq.videoTracks[track], c.start) != &footage) continue;
-            std::shared_ptr<const Model> plane;
-            const PosedTriangles tr =
-                layer3dTriangles(layer3dPlace(*e, 0, seq.width, seq.height), plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));
+            // Where it stands at each of the solve's frames it plays over (its matrix's rows its axes and middle), its
+            // plane then in its own space.
             SolvedSceneMesh m;
+            const std::shared_ptr<const CameraSolve> solve = parsedSolve(footage);
+            const FrameTime from = std::max(c.start, footage.start), to = std::min(c.end(), footage.end());
+            for (FrameTime t = from; solve && t < to; ++t) {
+                const int frame = cameraSolveFrame(seq, footage, *solve, t - footage.start);
+                if (frame < 0 || (!m.motion.empty() && m.motion.back().first >= frame)) continue;
+                const Layer3DPlace at = layer3dPlace(*e, t - c.start, seq.width, seq.height);
+                m.motion.push_back({double(frame), {at.axisU[0], at.axisU[1], at.axisU[2], 0, at.axisV[0], at.axisV[1], at.axisV[2], 0,
+                                                    at.normal[0], at.normal[1], at.normal[2], 0, at.origin[0], at.origin[1], at.origin[2], 1}});
+            }
+            Layer3DPlace place = layer3dPlace(*e, 0, seq.width, seq.height);
+            if (!m.motion.empty()) {
+                place.origin = {0, 0, 0}, place.axisU = {1, 0, 0}, place.axisV = {0, 1, 0}, place.normal = {0, 0, 1};
+                place.unit = layer3dPlace(*e, from - c.start, seq.width, seq.height).unit;
+            }
+            std::shared_ptr<const Model> plane;
+            const PosedTriangles tr = layer3dTriangles(place, plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));
+            m.picture = cardPicturePng(p, seq, ti, c, from < to ? from : c.start);
             m.card = true;
             m.name = c.name;
             m.color = {1, 1, 1, 1};
@@ -816,7 +884,29 @@ Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, Fram
         if (depth) depth->assign(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
         return Image(std::max(1, w), std::max(1, h));
     }
-    Image img = renderModel(scene, cam, w, h, depth);
+    // Its scene of shadows: the cards and other models seen through the same kind of camera (its settings' light takes
+    // their shadows even when it casts none itself), when a light of it can take them.
+    const bool settingsLight = std::lround(c.generator.p("light_kind", t - c.start, 0)) != 3;
+    if (std::any_of(scene.lights.begin(), scene.lights.end(),
+                    [&](const ModelLight& l) { return l.kind != ModelLight::Kind::Point && l.intensity > 0 && (l.shadows || settingsLight); })) {
+        const SceneShadows sh = sceneShadows(p, seq, t, shadowWorldOf(seq, c, c.generator, t), {}, trackLayer, &c);
+        if (sh.world) {
+            scene.shadowWorld = sh.world;
+            if (auto it = sh.ground.find(c.id); it != sh.ground.end()) scene.groundCasters = it->second;
+            if (settingsLight)
+                for (ModelLight& l : scene.lights) l.shadows = true;
+        }
+    }
+    std::vector<float> own;
+    const Clip* camera = depth ? nullptr : lensCamera(seq, c, c.generator, t);
+    Image img = renderModel(scene, cam, w, h, depth ? depth : camera ? &own : nullptr);
+    if (camera) {
+        // Used flat through the scene's camera with its depth of field on: blurred by its lens here, in the linear
+        // light it was drawn in (merged by depth, it is blurred with the rest where they are merged).
+        const WorkingSpaceScope linear(&linearColorSpace(Primaries::Bt709));
+        const SceneGradingScope ungraded(nullptr);
+        cameraDepthOfField(p, seq, *camera, t, scale, img, own);
+    }
     // Linear light into Rec.709 (as the other generators draw), straight then premultiplied again.
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y)

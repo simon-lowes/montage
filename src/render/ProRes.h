@@ -1,10 +1,10 @@
-// Montage — ProRes pictures one at a time (SMPTE RDD 36 frames, through FFmpeg's encoder and decoder), for track files
-// that wrap them as SMPTE RDD 44 maps them: IMF Application ProRes (RDD 45) and Application DPP (RDD 59-1, render/Imf.h).
-// A picture goes in as full-range R'G'B' and is coded as Y'CbCr (4:2:2 or 4:4:4 by the profile) through the colour's
+// Montage — ProRes pictures one at a time (SMPTE RDD 36 frames), for track files that wrap them as SMPTE RDD 44 maps
+// them (IMF Application ProRes, RDD 45, and Application DPP, RDD 59-1: render/Imf.h) and for exports at 12 bits. A
+// picture goes in as full-range R'G'B' and is coded as Y'CbCr (4:2:2 or 4:4:4 by the profile) through the colour's
 // matrix, narrow range (QE.1) or full range (QE.2: the decoded R'G'B' from 0 to the top code), as one progressive frame
-// or as two fields of it (the top or the bottom one first), with the colour codes RDD 45 Table 3 gives in the frame
-// header; 4444 and 4444 XQ can carry 16-bit alpha. Decoding gives full-range R'G'B' (and alpha) back, 4:4:4 at the 12
-// bits FFmpeg decodes it at.
+// or as two fields (the top or the bottom one first), with the colour codes RDD 45 Table 3 gives in the frame header;
+// 4444 and 4444 XQ can carry 16-bit alpha. At 10 bits FFmpeg's encoder codes it; at 12 (4444 and 4444 XQ) Montage's own
+// (media/ProResEncoder.h). Decoding (FFmpeg's) gives full-range R'G'B' (and alpha) back, 4:4:4 at 12 bits.
 #pragma once
 
 #include <cstdint>
@@ -39,13 +39,18 @@ struct ColourCodes {
 };
 bool colourCodes(const std::string& imfColour, ColourCodes& out);
 
-bool encoderAvailable();
+bool encoderAvailable();  // FFmpeg's, for 10 bits (Montage's, for 12, is always there)
 
 // How pictures are coded beyond their profile and colour.
 struct Coding {
     int fields = 0;          // 0 progressive, 1 two fields with the top first (interlace_mode 1), 2 the bottom first (2)
     bool fullRange = false;  // QE.2: Y'CbCr over the whole range, so the decoded R'G'B' is too
     bool alpha = false;      // 4444 and 4444 XQ: a 16-bit alpha channel (alpha_channel_type 2)
+    int bits = 10;           // 12: 4444 and 4444 XQ coded at 12 bits by Montage's encoder
+    double fps = 0;          // (12 bits) the frame header's frame_rate_code; 0 unknown
+    int threads = 0;         // (12 bits) slices coded on so many threads; 0 one a core
+    // Two pictures given together are the two fields of a frame at their own moments (12 bits and fields): the first
+    // field's lines from the first, the second's from the second (encodeFields).
 };
 
 class Encoder {
@@ -63,6 +68,12 @@ public:
     // width x height; null: opaque). Coded as two fields, each field is the picture's lines of its parity.
     bool encode(const uint16_t* rgb, std::vector<uint8_t>& out, std::string* error = nullptr) { return encode(rgb, nullptr, out, error); }
     bool encode(const uint16_t* rgb, const uint16_t* alpha, std::vector<uint8_t>& out, std::string* error = nullptr);
+    // A frame whose fields come from two pictures: the first field (in time) from `first`, the second from `second`
+    // (each a whole picture, its other lines unused; alpha optional for each, as encode's).
+    bool encodeFields(const uint16_t* first, const uint16_t* firstAlpha, const uint16_t* second, const uint16_t* secondAlpha,
+                      std::vector<uint8_t>& out, std::string* error = nullptr);
+    // (12 bits) each slice's quantization index of the last frame (1 the finest)
+    std::vector<uint8_t> lastQuantization() const;
 
 private:
     struct Impl;

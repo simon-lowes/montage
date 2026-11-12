@@ -2021,6 +2021,59 @@ Result replaceClip(Project& p, Sequence& s, Id clipId, Id mediaId, double srcAli
     return res;
 }
 
+Result replaceSources(Project& p, Sequence& s, const std::vector<Id>& ids, Id mediaId, bool byTimecode) {
+    const MediaItem* m = p.findMedia(mediaId);
+    if (!m) return Result::fail("Unknown media");
+    if (ids.empty()) return Result::fail("Select the clips to repoint");
+    if (m->kind == MediaKind::Sequence && sequenceUses(p, m->sequenceId, s.id)) return Result::fail("A sequence cannot be placed inside itself");
+    if (byTimecode && m->timecode < 0) return Result::fail("\"" + m->name + "\" has no timecode");
+    const double fps = s.fpsValue();
+    Sequence work = s;  // (the sequence changes only when every clip can be repointed)
+    Result res;
+    std::set<Id> done;
+    for (Id id : ids) {
+        if (done.count(id)) continue;
+        const Clip* picked = clipById(work, id);
+        if (!picked) return Result::fail("Unknown clip");
+        const Id from = picked->mediaId;
+        // The clip and those linked to it that play the same media (not a separate recorder's sound), each from its
+        // own source time (an L-cut's sound keeps its lead).
+        for (Id l : linkedClips(work, id)) {
+            if (!done.insert(l).second) continue;
+            const auto loc = locate(work, l);
+            if (!loc) continue;
+            Track* t = trackAt(work, loc->track);
+            Clip& c = t->clips[loc->index];
+            if (c.isGenerator() || c.mediaId != from || !editable(t)) continue;
+            const bool video = loc->track.kind == TrackKind::Video;
+            if (video ? !(m->hasVideo || m->kind == MediaKind::Image || m->kind == MediaKind::Sequence) : !m->hasAudio) continue;
+            double sourceIn = c.sourceIn;
+            if (byTimecode) {
+                const MediaItem* was = p.findMedia(c.mediaId);
+                if (!was || was->timecode < 0) return Result::fail("\"" + c.name + "\" has no timecode to match");
+                // The same moment of the day: the new file's frame showing what the old one showed.
+                sourceIn += (was->timecode - m->timecode) * fps;
+            }
+            if (sourceIn < -1e-6) return Result::fail("\"" + c.name + "\": the source does not reach back to the clip's start");
+            const std::string name = c.name;
+            const Clip fresh = makeClip(p, *m, loc->track.kind, work);
+            if (c.mediaId != mediaId) c.channels = fresh.channels;  // another file's channels
+            c.mediaId = mediaId;
+            c.name = fresh.name;
+            c.sourceIn = std::max(0.0, sourceIn);
+            c.unrendered.clear();
+            const FrameTime limit = sourceLimit(p, work, c);
+            if (limit < kInfiniteFrames && srcHigh(c) > double(limit) + 1e-6)
+                return Result::fail("\"" + name + "\": the source is too short for the clip");
+            res.created.push_back(l);
+        }
+    }
+    if (res.created.empty()) return Result::fail("Select clips that show media");
+    s = std::move(work);
+    res.applied = FrameTime(res.created.size());
+    return res;
+}
+
 Result fitToFill(Project& p, Sequence& s, Id mediaId, double srcIn, double srcOut, FrameTime tlIn, FrameTime tlOut,
                  TrackRef videoTrack, TrackRef audioTrack) {
     const MediaItem* m = p.findMedia(mediaId);
@@ -2126,7 +2179,7 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     Sequence s = *src;
     s.id = p.newId();
     s.name = name.empty() ? src->name + " Copy" : name;
-    std::map<Id, Id> clips, groups, buses;
+    std::map<Id, Id> clips, groups, buses, trackIds;
     // Effect ids are not unique within a sequence (a split clip's halves share them), so a clip's are found by both.
     std::map<std::pair<Id, Id>, Id> effects;
     Id owner = 0;  // the clip (its old id) whose effects are being renewed, 0 for others
@@ -2171,7 +2224,11 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     };
     for (auto* tracks : {&s.videoTracks, &s.audioTracks})
         for (Track& t : *tracks) {
-            t.id = p.newId();
+            {
+                const Id fresh = p.newId();
+                trackIds[t.id] = fresh;
+                t.id = fresh;
+            }
             if (t.output) t.output = buses.count(t.output) ? buses[t.output] : 0;
             // Sends go to the copy's buses (none to a bus that was not copied).
             for (Send& sd : t.sends) sd.bus = buses.count(sd.bus) ? buses[sd.bus] : 0;
@@ -2210,6 +2267,13 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
             for (SamplerPass& ps : t.sampler.passes) ps.lane = lanes.count(ps.lane) ? lanes[ps.lane] : 0;
             std::erase_if(t.sampler.passes, [](const SamplerPass& ps) { return !ps.lane; });
         }
+    // A sampler's slots sent to other tracks, and the parts they recorded there, follow the tracks to their copies.
+    for (Track& t : s.audioTracks) {
+        for (SamplerSlot& sl : t.sampler.pads)
+            if (sl.output) sl.output = trackIds.count(sl.output) ? trackIds[sl.output] : 0;
+        for (SamplerPass& ps : t.sampler.passes)
+            if (ps.track) ps.track = trackIds.count(ps.track) ? trackIds[ps.track] : 0;
+    }
     for (AdrCue& q : s.adrCues) {
         q.id = p.newId();
         q.clip = clips.count(q.clip) ? clips[q.clip] : 0;
@@ -2569,16 +2633,13 @@ Effect* ownedEffect(Sequence& s, Id owner, Id effect, FrameTime* origin) {
     return nullptr;
 }
 
-Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name) {
-    std::vector<Id> all = expandLinks(s, ids);
-    if (all.empty()) return Result::fail("Select clips to nest");
+namespace {
+// The clips `all` (linked partners already included) moved into a new sequence of the same tracks, from frame `lo`,
+// and replaced by one compound clip of it from `lo` to `hi`; with `pictureIfAny`, the compound has a picture only
+// when one of them has (a range of sound alone nests as sound).
+Result nestClips(Project& p, Sequence& s, const std::vector<Id>& all, const std::string& name, FrameTime lo, FrameTime hi,
+                 bool pictureIfAny) {
     const Id outerId = s.id;  // `s` lives in p.sequences, which we append to below
-    FrameTime lo = std::numeric_limits<FrameTime>::max(), hi = 0;
-    for (Id id : all) {
-        const Clip* c = clipById(s, id);
-        lo = std::min(lo, c->start);
-        hi = std::max(hi, c->end());
-    }
     Sequence nested = makeSequence(p, name, s.width, s.height, s.fps, int(s.videoTracks.size()),
                                    int(s.audioTracks.size()));
     nested.sampleRate = s.sampleRate;
@@ -2634,9 +2695,64 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
     p.sequences.push_back(std::move(nested));
     p.media.push_back(m);
     Sequence& sq = *p.findSequence(outerId);
+    const bool hasVideo = vIdx < int(sq.videoTracks.size());
     if (vIdx >= int(sq.videoTracks.size())) vIdx = 0;
     if (aIdx >= int(sq.audioTracks.size())) aIdx = 0;
-    return placeMedia(p, sq, m.id, lo, 0, double(hi - lo), {TrackKind::Video, vIdx}, {TrackKind::Audio, aIdx}, false);
+    return placeMedia(p, sq, m.id, lo, 0, double(hi - lo), {TrackKind::Video, vIdx}, {TrackKind::Audio, aIdx}, false,
+                      hasVideo || !pictureIfAny, true);
+}
+}  // namespace
+
+Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name) {
+    std::vector<Id> all = expandLinks(s, ids);
+    if (all.empty()) return Result::fail("Select clips to nest");
+    FrameTime lo = std::numeric_limits<FrameTime>::max(), hi = 0;
+    for (Id id : all) {
+        const Clip* c = clipById(s, id);
+        lo = std::min(lo, c->start);
+        hi = std::max(hi, c->end());
+    }
+    return nestClips(p, s, all, name, lo, hi, false);
+}
+
+Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks, const std::string& name) {
+    if (b <= a) return Result::fail("Set In and Out points first");
+    // Cut at In and Out on each track taking part; the pieces between get link groups of their own (so the clips
+    // left outside are not pulled in with them).
+    // The pieces after Out get theirs too, so they are not linked to those before In across the compound.
+    std::map<Id, Id> regroup, regroupTail;
+    std::vector<Id> inside;
+    std::vector<TrackRef> seen;
+    for (TrackRef r : tracks) {
+        Track* t = trackAt(s, r);
+        if (!editable(t) || std::find(seen.begin(), seen.end(), r) != seen.end()) continue;
+        seen.push_back(r);
+        for (FrameTime at : {a, b})
+            for (size_t i = 0; i < t->clips.size(); ++i)
+                if (t->clips[i].start < at && t->clips[i].end() > at) {
+                    const Id group = t->clips[i].linkGroup;
+                    const Id right = splitClip(p, *t, i, at);
+                    if (at == b && group) {
+                        auto it = regroupTail.find(group);
+                        if (it == regroupTail.end()) it = regroupTail.emplace(group, p.newId()).first;
+                        for (Clip& c : t->clips)
+                            if (c.id == right) c.linkGroup = it->second;
+                    }
+                    break;
+                }
+        normalize(*t);
+        for (Clip& c : t->clips) {
+            if (c.start < a || c.end() > b) continue;
+            if (c.linkGroup) {
+                auto it = regroup.find(c.linkGroup);
+                if (it == regroup.end()) it = regroup.emplace(c.linkGroup, p.newId()).first;
+                c.linkGroup = it->second;
+            }
+            inside.push_back(c.id);
+        }
+    }
+    if (inside.empty()) return Result::fail("Nothing between In and Out to nest");
+    return nestClips(p, s, inside, name, a, b, true);
 }
 
 // ---- Duplicate frames -------------------------------------------------------------

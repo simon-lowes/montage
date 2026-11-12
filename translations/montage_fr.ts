@@ -2641,10 +2641,6 @@
         <translation type="unfinished">Gardez les lettres droites</translation>
     </message>
     <message>
-        <source>Keeps transparency for graphics</source>
-        <translation type="unfinished">Préserve la transparence pour les graphiques</translation>
-    </message>
-    <message>
         <source>Key Color</source>
         <translation type="unfinished">Couleur de la clé</translation>
     </message>
@@ -4861,10 +4857,6 @@
         <translation type="unfinished">Le cadre complet</translation>
     </message>
     <message>
-        <source>The highest-quality ProRes, with transparency</source>
-        <translation type="unfinished">La ProRes de haute qualité, avec transparence</translation>
-    </message>
-    <message>
         <source>The smallest ProRes, for offline editing</source>
         <translation type="unfinished">Le plus petit ProRes, pour l&apos;édition hors ligne</translation>
     </message>
@@ -6320,6 +6312,142 @@
         <source>Low Band Type</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>12-bit 4:4:4, keeps transparency for graphics</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A Mask on the Clip</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A Shape Layer&apos;s Path</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AV2 (AVM, draft MP4 binding)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AV2 through its reference encoder (slow); its MP4 binding is a working draft, IVF or OBU by the file&apos;s extension</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Along the Path</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>As the Text Is Aligned</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>From the Start</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>H.264 + AC-3 (MPEG-TS)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>H.264 + E-AC-3 (MP4)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>H.264 with E-AC-3 sound to 7.1, its dialogue level measured</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In the Middle</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Mask Number</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Mask or Shape Path From Clip</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Motion Blur Samples</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>On the Feather</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Radial Blur</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shape Path</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shape Track (0 the Nearest Below)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Spin (°)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Spread From End to End</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The highest-quality ProRes, 12-bit 4:4:4 with transparency</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>To the End</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Transport stream for broadcast: H.264 with AC-3 sound to 5.1, its dialogue level measured</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Aperture Blades (0: round)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Blade Rotation (°)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Depth of Field (through the scene&apos;s camera: the Camera clip&apos;s)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Focal Length (mm on a 36 mm sensor; 0: from the field of view)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Focus Distance (0: what is at the middle)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scene Units a Metre</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS 4:2:2 10-bit (MXF)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS 4:4:4 12-bit (MXF)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS at 8 bits a pixel, 12-bit 4:4:4, for finishing and graphics</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Light intra-frame mezzanine at 5 bits a pixel, for live production and contribution</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -6370,6 +6498,29 @@
     <message>
         <source>Anamorphic 2x</source>
         <translation type="unfinished">2x anamorphe</translation>
+    </message>
+</context>
+<context>
+    <name>MonitorPanel</name>
+    <message>
+        <source>Red</source>
+        <translation type="unfinished">Rouge</translation>
+    </message>
+    <message>
+        <source>Green</source>
+        <translation type="unfinished">Vert</translation>
+    </message>
+    <message>
+        <source>Blue</source>
+        <translation type="unfinished">Bleu</translation>
+    </message>
+    <message>
+        <source>Yellow</source>
+        <translation type="unfinished">Jaune</translation>
+    </message>
+    <message>
+        <source>White</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -9467,6 +9618,265 @@ Download it now?</source>
         <source>Unknown action %1</source>
         <translation type="unfinished">Action inconnue %1</translation>
     </message>
+    <message>
+        <source> ms</source>
+        <translation type="unfinished"> ms</translation>
+    </message>
+    <message>
+        <source>How late a sound device&apos;s sound arrives (its input latency): taken off, so it lines up with the pictures (a feed&apos;s own sound keeps its times)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sound latency:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Watch it on the Source monitor (mark In and Out as it records)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Live package while recording</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The package&apos;s folder (what it held is replaced)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Live Package Folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HLS and DASH</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HLS</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>DASH</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>For:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>CMAF</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MPEG-TS for HLS (CMAF for DASH)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Segments:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AAC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Opus</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AC-3 (to 5.1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>E-AC-3 (to 7.1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>None</source>
+        <translation type="unfinished">Aucune</translation>
+    </message>
+    <message>
+        <source>Sound:</source>
+        <translation type="unfinished">Son &amp;&amp; #160;:</translation>
+    </message>
+    <message>
+        <source>Low latency (segments sent in parts as they are made)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> segments of 2 s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Window:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Serve on port</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Any free</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>To the network</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Off: players on this computer only</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Every sound stream of the feed, each in its language</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The recording keeps the main sound</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The feed&apos;s, when it has them</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Always listed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Captions:</source>
+        <translation type="unfinished">Sous-titres:</translation>
+    </message>
+    <message>
+        <source>Ad Break</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An ad break from the next picture, on a keyframe: a cue to the players and to what they pass it to</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Length not known</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Chapter</source>
+        <translation type="unfinished">Chapitre</translation>
+    </message>
+    <message>
+        <source>A chapter from the next picture, in the package&apos;s chapter list</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>While recording:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No live package is being made</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Chapter %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose a folder for the live package</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Live package: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A live package needs a folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The live package&apos;s captions are auto, always or none</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The live package&apos;s window is 3 to 100, its segments cmaf or ts, its sound aac, libopus, ac3, eac3 or none</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low latency needs CMAF segments (its parts are CMAF chunks)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Packaged live into %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An ad break&apos;s duration is 0 (not known) to 3600 seconds</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An ad break of %1 s from the next picture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An ad break from the next picture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A chapter from the next picture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Live: %n segment(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>Live package ended: %n segment(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>%n sound stream(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>captions</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n ad cue(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>%n chapter(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>%1 pictures dropped (the encoders fell behind)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>(and at this computer&apos;s address on the network)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This build does not record &quot;%1&quot; (see &quot;kinds&quot;)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>jpeg_xs_bpp is 0.5 to 24 bits a pixel</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::ChartMatchDialog</name>
@@ -10578,6 +10988,14 @@ Download it now?</source>
         <source>Unknown action</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>The audio device has no input %1 to read LTC from</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The audio device is not open: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::DeckDialog</name>
@@ -10803,6 +11221,43 @@ Download it now?</source>
     </message>
     <message>
         <source>The tape&apos;s In is not a timecode</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>montage::DialogJobs</name>
+    <message>
+        <source>Montage stopped while this ran</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Montage stopped %n time(s) while this ran: it was not taken up again</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>The project kept with it could not be read</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Taken up again after Montage stopped: the project was copied to %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>, %n file(s) missing</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Stopped: %1</source>
+        <translation type="unfinished">Arrêt &amp;&amp; #160;: %1</translation>
+    </message>
+    <message>
+        <source>Taken up again after Montage stopped, but it failed: %1</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -11686,10 +12141,6 @@ Download it now?</source>
         <translation type="unfinished">Interlacé, champ supérieur d&apos;abord</translation>
     </message>
     <message>
-        <source>Coded as two fields, the top first (each picture as both fields: PsF), as 1080i deliveries ask</source>
-        <translation type="unfinished">C&apos;est le premier des deux champs, le premier (chaque image étant les deux champs: PsF), que les livraisons 1080i demandent</translation>
-    </message>
-    <message>
         <source>MXF as broadcasters&apos; ingest checks it: RDD 9 for MPEG-2 HD 4:2:2, or AMWA AS-11 with its programme metadata and parts (from markers named Part 1, Part 2... with a duration)</source>
         <translation type="unfinished">MXF en tant que diffuseur le contrôle: RDD 9 pour MPEG-2 HD 4:2:2, ou AMWA AS-11 avec ses métadonnées de programme et ses parties (à partir de marqueurs nommés Part 1, Part 2... avec une durée)</translation>
     </message>
@@ -12328,14 +12779,6 @@ Do you want to replace it?</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Untouched footage already coded as this export is (H.264, HEVC or XDCAM&apos;s MPEG-2 at this size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Lossless</source>
         <translation type="unfinished">Sans perte</translation>
     </message>
@@ -12393,6 +12836,98 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>JPEG XL depth:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Coded as two fields, the top first, each rendered at its own moment half a frame apart, as 1080i deliveries ask</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Both fields from one picture (PsF)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each frame&apos;s two halves as its fields, as progressive pictures are carried in 1080i, instead of each field rendered at its own moment</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> (in MP4 by AV2&apos;s draft binding, which may still change: name the file .ivf or .obu for a settled form, without sound)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Exported %1, but it does not keep its buffer model (%2). A strict ingest check may refuse it; Quality Check&apos;s Buffer model lists the frames.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The preset&apos;s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 bits a pixel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS&apos;s rate: each picture the same number of bytes, its width times its height times this, over 8</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not stated</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Constant bit rate (CBR)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Variable bit rate (VBR)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>States a buffer model (HRD) in H.264 or H.265 video, as broadcast ingest checks it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set above. The export is checked against it when it is written.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> kbit/s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The rate the stream states: its bit rate when constant, its highest when variable</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> kbit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A second&apos;s buffer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The decoder buffer the stream states. The lowest setting is a second at the rate.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Buffer model (HRD):</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Untouched footage already coded as this export is (H.264, HEVC, AV1, VP9 or XDCAM&apos;s MPEG-2 at this size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC, AV1, VP9 and XDCAM HD422</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, a constant %1 kbit/s with its buffer model stated (%2 kbit)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, no more than %1 kbit/s with its buffer model stated (%2 kbit)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -12938,10 +13473,6 @@ Projects it was inserted into play its pictures from there, so they would need r
         <translation type="unfinished">L&apos;affichage HDR nécessite un affichage de bureau (celui-ci est « &amp;&amp; #160; %1 &amp;&amp; #160; »)</translation>
     </message>
     <message>
-        <source>HDR viewing is available on macOS (EDR displays) and Windows (with HDR switched on)</source>
-        <translation type="unfinished">La visualisation HDR est disponible sur macOS (affichage EDR) et Windows (avec HDR activé)</translation>
-    </message>
-    <message>
         <source>No graphics device for HDR viewing</source>
         <translation type="unfinished">Pas de périphérique graphique pour la visualisation HDR</translation>
     </message>
@@ -12960,6 +13491,46 @@ Projects it was inserted into play its pictures from there, so they would need r
     <message>
         <source>The graphics device was reset</source>
         <translation type="unfinished">Le périphérique graphique a été réinitialisé</translation>
+    </message>
+    <message>
+        <source>HDR viewing on Linux needs a Wayland session (this one is X11)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR viewing on Linux needs a Wayland session (this display is &quot;%1&quot;)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This compositor does not take HDR pictures (it has no Wayland colour management)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This compositor&apos;s colour management cannot describe HDR pictures (%1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This build cannot describe HDR pictures to Wayland (it needs wayland-protocols 1.41 or later, or Qt 6.10.2)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR viewing is available on macOS (EDR displays), Windows (with HDR switched on) and Wayland on Linux</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The graphics device cannot draw into half-float textures</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The graphics device could not make the HDR viewer&apos;s shaders</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The connection to the Wayland compositor failed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The compositor did not take the HDR picture&apos;s description (%1)</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -13720,10 +14291,6 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     <message>
         <source>Export Camera</source>
         <translation type="unfinished">Exporter une caméra</translation>
-    </message>
-    <message>
-        <source>Nuke camera (*.chan);;USD scene with the placed models (*.usda)</source>
-        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Wrote %1</source>
@@ -14761,6 +15328,58 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
         <source>Band Settings and Keyframes</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Font Axis Tag</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Axis tag (wght, wdth, slnt…)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Font Axis</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Set a variable font axis for the whole title, to key like any setting (styled runs set their own)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A font axis tag is up to four letters or digits, such as wght or wdth</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove the Font Axes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Font Axes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove Font Axes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Extrude, move, turn, scale or recolour the letters in 3D a letter, word or line at a time</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Gradient Stops</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Gradient Stop</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add a stop between the gradient&apos;s last two, its place, colour and opacity to key</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Nuke camera (*.chan);;USD scene with the placed models (*.usda);;USD package with the placed models (*.usdz)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::InterpretFootageDialog</name>
@@ -15173,6 +15792,10 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     <message>
         <source>This clip has none of the copied parameters</source>
         <translation type="unfinished">Ce clip n&apos;a aucun des paramètres copiés</translation>
+    </message>
+    <message>
+        <source>%1 Path</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -18477,10 +19100,6 @@ Take it over and edit it?</source>
         <translation type="unfinished">Arrêter le script…</translation>
     </message>
     <message>
-        <source>Renders are in progress. Stop them and quit?</source>
-        <translation type="unfinished">Les rennes sont en cours</translation>
-    </message>
-    <message>
         <source>Gap cut (%1)</source>
         <translation type="unfinished">Découpe des écarts (%1)</translation>
     </message>
@@ -20793,10 +21412,6 @@ Export the stereo bed anyway?</source>
         <translation type="unfinished">Marquer les KDM</translation>
     </message>
     <message>
-        <source>Keys for cinema servers to play an encrypted DCP: one KDM for each server certificate, valid between the times given. The cinema sends its servers&apos; certificates; the DKDM is the file Montage kept when it made the DCP.</source>
-        <translation type="unfinished">Les clés pour les serveurs de cinéma pour jouer un DCP chiffré : un KDM pour chaque certificat de serveur, valable entre les heures données. Le cinéma envoie les certificats de ses serveurs ; le DKDM est le fichier Montage conservé lorsqu&apos;il a fait le DCP.</translation>
-    </message>
-    <message>
         <source>DKDM:</source>
         <translation type="unfinished">DKDM:</translation>
     </message>
@@ -20807,14 +21422,6 @@ Export the stereo bed anyway?</source>
     <message>
         <source>KDMs (*.xml)</source>
         <translation type="unfinished">KDMs (*.xml)</translation>
-    </message>
-    <message>
-        <source>the servers&apos; certificates (.pem, .crt), separated by ;</source>
-        <translation type="unfinished">les certificats des serveurs (.pem, .crt), séparés par ;</translation>
-    </message>
-    <message>
-        <source>Servers:</source>
-        <translation type="unfinished">Serveurs &amp;&amp; #160;:</translation>
     </message>
     <message>
         <source>Choose the Servers&apos; Certificates</source>
@@ -22286,10 +22893,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>The sequence rendered once and encoded as a ladder of renditions, packaged as CMAF for HLS and DASH: the mix and the other audio streams, each caption track, chapters, and ad-break markers as SCTE 35 cues.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>H.264</source>
         <translation type="unfinished"></translation>
     </message>
@@ -22366,10 +22969,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Streaming package written in %1: %2 renditions, %3 segments</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>JPEG XL for SDR screens, lossless (*.jxl)</source>
         <translation type="unfinished"></translation>
     </message>
@@ -22421,6 +23020,500 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Plug-in &amp;Hosting…</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Live Ad &amp;Break</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Live C&amp;hapter</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No live package is being made</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Ad break placed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Chapter placed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Multiviewer…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Nest In to Out…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Mark In and Out on the timeline first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Nest In to Out</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Replace Source of Selected…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Extract Sound to Files…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select the clips whose sound to write out</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Extract Sound to Files</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track &amp;Groups…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Suspend Track Groups</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Resume Track Groups</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track groups suspended: each track acts alone (Ctrl+Shift+G again resumes them)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track groups resumed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Reselect Last Edit Points</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No multiviewer input %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Nothing is being recorded to watch: record with File › Capture (watched), or name a multiviewer input</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Source monitor is not showing a feed live</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not marked: the feed is watched, not recorded, or its recording is not in the bin yet</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An edit is insert, overwrite, append or place_on_top</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not edited in</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Source monitor shows no feed live</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Watching %1 live</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Renders are in progress. Stop them and quit? They render again when Montage next starts.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No edit points to reselect</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The sequence rendered once and encoded as a ladder of renditions, packaged as CMAF (or MPEG-TS) for HLS and DASH: the mix and the other audio streams, each caption track, chapters, and ad-break markers as SCTE 35 cues. Live packages are made from a recording: File › Capture.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Set each rung&apos;s rate per shot</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fill the rung&apos;s rate</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VMAF </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each shot gets the quality that reaches this VMAF for the fewest bits, the rung&apos;s rate its cap; at 0, the rung&apos;s rate spread over the shots for the most VMAF. The package gets ladder.csv, each shot&apos;s rate and score.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each shot (between cuts and marked shot changes, a second at the least) starts a segment and is first encoded at several qualities on each rung, then scored by VMAF at the rung&apos;s size: longer to make</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Needs VMAF (libvmaf %1), and for HDR an HDR VMAF model</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rates:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>CMAF</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MPEG-TS for HLS (CMAF for DASH)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Transport stream segments for HLS players and CDNs that ask for them: H.264, with AAC, AC-3 or E-AC-3</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Segment format:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AC-3 (to 5.1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>E-AC-3 (to 7.1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AC-3 and E-AC-3 state the mix&apos;s loudness (dialnorm) and the sequence&apos;s downmix levels</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MPEG-TS segments carry H.264, with AAC, AC-3 or E-AC-3</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 %2 kb/s, VMAF %3</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>; set per shot (ladder.csv): %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Streaming package written in %1: %2 renditions, %3 segments%4</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Programme</source>
+        <translation type="unfinished">Programme des</translation>
+    </message>
+    <message>
+        <source>Commercial</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sponsorship</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Infomercial</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Presentation (continuity, announcements)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Music video</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Broadcast master (Application DPP (ProRes), RDD 59-1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ProRes 422 HQ at 1920 x 1080 or 3840 x 2160, progressive, in Rec.709, Rec.2020 PQ or HLG (4444 in Rec.2020 PQ or HLG), as UK and North American broadcasters&apos; IMF delivery specifications ask</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ST 2067-21:2026</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ST 2067-21:2021 (as packages were before the 2026 edition)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The 2026 edition takes 8K pictures and carries the markers; a supplemental keeps the earlier package&apos;s edition</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edition:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Markers as timed events (their names, comments and colours)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Event-based metadata (SMPTE ST 2067-206) on a track of its own, read back as markers when the package is imported</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Progressive</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Interlaced, top field first</source>
+        <translation type="unfinished">Interlacé, champ supérieur d&apos;abord</translation>
+    </message>
+    <message>
+        <source>Interlaced, bottom field first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each picture coded as two fields (4:2:2, to 1920 x 1080 at 25, 29.97 or 30 fps, Rec.709), as 1080i deliveries ask</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fields:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>4:4:4 as Y&apos;CbCr (to 1920 x 1080, Rec.709), not RGB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Full range (QE.2: 0 to 1023, 4:4:4 RGB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>8K (7680 x 4320)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keys for cinema servers to play an encrypted DCP, valid between the times given: one KDM for each screen ticked below and each server certificate given. Cinemas send their screens as Facility List Messages (FLMs) or as certificates; the DKDM is the file Montage kept when it made the DCP.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The facility list cannot be read: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cinema and screen</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Server</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Devices in its KDMs</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Certificate ends</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>its server only</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>any device</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>From: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Time zone: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Screen %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 (inactive)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A certificate sent alone: its chain was not checked</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The facility list cannot be saved: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Read FLMs…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Read Facility List Messages</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>FLMs (*.xml);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Read FLMs</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The certificates of %1 come from roots Montage does not trust yet:
+
+%2
+
+Trust a root only once the cinema or the device&apos;s maker has confirmed its thumbprint. KDMs are made for whoever holds these certificates.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Trust and Read</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1: its roots are not trusted</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Read %n FLM(s) with %1 screen(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Changed since the cinemas&apos; last FLMs:
+%1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not read:
+%1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Screen…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add a Screen</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cinema:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Screen:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the server&apos;s certificate or chain (.pem, .crt)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Server:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose the Server&apos;s Certificate</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the projector&apos;s and other devices&apos; certificates, separated by ;</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Devices:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose the Devices&apos; Certificates</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The screen was not added: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Screens:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>other servers&apos; certificates (.pem, .crt), separated by ;</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Other servers:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A screen&apos;s KDM gives the window in its cinema&apos;s time zone when its FLM names one.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Made %n KDM(s) in %1, a folder and a zip for each of %2 cinema(s): send each its zip</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Select the clips to repoint</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Replace Source of Selected</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Point the %n selected clip(s) at:</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Keep each clip&apos;s source times</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Match by timecode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip</source>
+        <translation type="unfinished">Clip</translation>
+    </message>
+    <message>
+        <source>Extracting the sound failed: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Wrote %n sound file(s) to %1</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Taking up again what Montage was doing when it stopped: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -22465,10 +23558,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished">Supprimer le point de masque</translation>
     </message>
     <message>
-        <source>A mask path needs at least three points</source>
-        <translation type="unfinished">Un chemin de masque nécessite au moins trois points</translation>
-    </message>
-    <message>
         <source>Smooth Mask Point</source>
         <translation type="unfinished">Point de masque lisse</translation>
     </message>
@@ -22479,6 +23568,30 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Add Mask Point</source>
         <translation type="unfinished">Ajouter un point de masque</translation>
+    </message>
+    <message>
+        <source>Adjust Shape Path</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove Shape Path Point</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A closed path needs at least three points</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A path needs at least two points</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smooth Shape Path Point</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Shape Path Point</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -23370,6 +24483,52 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
             <numerusform></numerusform>
         </translation>
     </message>
+    <message>
+        <source>Check Focus</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Find soft focus and motion blur in each clip, frame by frame, and against the other angles of its scene; shown in the Focus column and written in the ALE</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Checking focus…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Checked focus in %n clip(s): %1 with soft focus or motion blur (see the Focus column)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>Checked focus in %n clip(s): all sharp</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Chroma siting</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>As the file says</source>
+        <translation type="unfinished">Comme le dit le fichier</translation>
+    </message>
+    <message>
+        <source>Left (co-sited)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Centre</source>
+        <translation type="unfinished">Centre</translation>
+    </message>
+    <message>
+        <source>Top left</source>
+        <translation type="unfinished">En haut à gauche</translation>
+    </message>
 </context>
 <context>
     <name>montage::MergeDialog</name>
@@ -23753,6 +24912,22 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Remove</source>
         <translation type="unfinished">Supprimer</translation>
+    </message>
+    <message>
+        <source>Add to its targets</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A control learnt again also drives the new parameter (one fader on several), each with its own range</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shown on</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The MIDI output its value is sent to (motor faders, LED rings); empty: the controller&apos;s own</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -24565,6 +25740,74 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>In–Out %1</source>
         <translation type="unfinished">En–hors %1</translation>
     </message>
+    <message>
+        <source>Focus peaking</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Focus peaking: the edges in focus marked in colour over the picture (its menu sets the colour, how sensitive it is, and whether edges are found at the monitor&apos;s size or in the picture&apos;s own pixels)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour</source>
+        <translation type="unfinished">Couleur</translation>
+    </message>
+    <message>
+        <source>Sensitivity</source>
+        <translation type="unfinished">Sensibilité</translation>
+    </message>
+    <message>
+        <source>Low (the crispest edges only)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Medium</source>
+        <translation type="unfinished">Moyenne</translation>
+    </message>
+    <message>
+        <source>High</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Found</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>At the Monitor&apos;s Size</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>At 1:1 (the Picture&apos;s Own Pixels)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>LIVE</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Live: %1, %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Watching %1 live (off: the recording so far)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The recording is in the Captures bin a moment after it starts: mark it then</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 cannot be marked live: it is only watched, or its recording comes into the bin when it ends</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Ended</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 (ended)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MonitoringPanel</name>
@@ -24828,6 +26071,196 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Unknown action %1</source>
         <translation type="unfinished">Action inconnue %1</translation>
     </message>
+    <message>
+        <source>System (Qt Multimedia)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JACK</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ALSA</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Core Audio</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>WASAPI</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>WASAPI (exclusive)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ASIO</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Loopback (a test device)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Audio device</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>What playback and recording go through: the system&apos;s devices through Qt Multimedia, or a driver for professional interfaces with its latency reported and taken off every recording</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Driver</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Output device</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Input device</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The sequence&apos;s</source>
+        <translation type="unfinished">La séquence est</translation>
+    </message>
+    <message>
+        <source>%1 Hz</source>
+        <translation type="unfinished">%1 Hz</translation>
+    </message>
+    <message>
+        <source>%1 samples</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rate and buffer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clock</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Their names, apart by commas (In 1, In 2...)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Inputs</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Out </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Measure Loopback</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>With a cable from the output to the input, a click is played and listened for: the round trip it takes is then taken off recordings instead of the latencies the device reports</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Forget</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Loopback</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Reset Xruns</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Loopback not measured: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Default</source>
+        <translation type="unfinished">Par défaut</translation>
+    </message>
+    <message>
+        <source>The device&apos;s own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>First input</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Through the system&apos;s devices (Qt Multimedia): their latency is not known</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not open: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1: %2 Hz, %3 samples; latency in %4 ms, out %5 ms; recordings moved %6 ms (%7); xruns %8</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>measured</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>as reported</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>; the rate changed %n time(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>%1 at %2 Hz, %3 samples, xruns %4</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Through the system&apos;s devices (Qt Multimedia)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>devices needs a host (see &quot;get&quot;)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n device(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>This build or computer has no %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The device could not be opened: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Audio device set</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Round trip %1 frames</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Xruns reset</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MulticamPanel</name>
@@ -25050,6 +26483,159 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
 </context>
 <context>
+    <name>montage::Multiviewer</name>
+    <message>
+        <source>Input</source>
+        <translation type="unfinished">Entrée</translation>
+    </message>
+    <message>
+        <source>Rec</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Record this input while Record is on</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Waiting for the feed…</source>
+        <translation type="unfinished">En attendant le repas…</translation>
+    </message>
+    <message>
+        <source>Multiviewer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Input…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Record</source>
+        <translation type="unfinished">Enregistrement</translation>
+    </message>
+    <message>
+        <source>Record the inputs chosen (Rec on their tiles), each into the folder and the Captures bin</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Into:</source>
+        <translation type="unfinished">Dans:</translation>
+    </message>
+    <message>
+        <source>Choose…</source>
+        <translation type="unfinished">Choisir…</translation>
+    </message>
+    <message>
+        <source>Record Into</source>
+        <translation type="unfinished">Enregistrement</translation>
+    </message>
+    <message>
+        <source>Add up to %1 inputs: double-click one to watch it on the Source monitor</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Options are name=value, apart by spaces</source>
+        <translation type="unfinished">Les options sont name=value, à part par espaces</translation>
+    </message>
+    <message>
+        <source>Not recorded: choose a folder to record into</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Captures</source>
+        <translation type="unfinished">Captures</translation>
+    </message>
+    <message>
+        <source>A multiviewer shows up to %1 inputs</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Name the input&apos;s address or device</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Off the Source Monitor</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Watch on the Source Monitor</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove</source>
+        <translation type="unfinished">Supprimer</translation>
+    </message>
+    <message>
+        <source>Choose a folder to record into</source>
+        <translation type="unfinished">Choisissez un dossier à enregistrer dans</translation>
+    </message>
+    <message numerus="yes">
+        <source>%n input(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>%1 live</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>recording %n</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>%1 on the Source monitor</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Input</source>
+        <translation type="unfinished">Ajouter l&apos;entrée</translation>
+    </message>
+    <message>
+        <source>Network stream (SRT, RIST, UDP...)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Feed:</source>
+        <translation type="unfinished">Aliments pour animaux:</translation>
+    </message>
+    <message>
+        <source>srt://0.0.0.0:9000?mode=listener, omt://host:6400, SDP files apart by ;</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Address or device:</source>
+        <translation type="unfinished">Adresse ou dispositif:</translation>
+    </message>
+    <message>
+        <source>name=value apart by spaces</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Options:</source>
+        <translation type="unfinished">Options:</translation>
+    </message>
+    <message>
+        <source>Camera 1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Label:</source>
+        <translation type="unfinished">Étiquette:</translation>
+    </message>
+    <message>
+        <source>Record it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No input %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>montage::OffloadDialog</name>
     <message>
         <source>Offload Card</source>
@@ -25180,6 +26766,14 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Adjust %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1&apos;s on-screen controls stopped: it %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1&apos;s on-screen controls are not responding</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -25802,10 +27396,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Instances of one plug-in share its host. Fewer hosts use less memory; a fault then reaches every plug-in in the same host.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Run plug-ins:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -25887,6 +27477,14 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
             <numerusform></numerusform>
             <numerusform></numerusform>
         </translation>
+    </message>
+    <message>
+        <source>Each instance in a host of its own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>With a host for each plug-in, its instances share it; with a host for each instance, a fault in one instance reaches no other, at the cost of more memory. Fewer hosts use less memory; a fault then reaches every plug-in in the same host, but one that crashes while loading is blocked alone.</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -26330,6 +27928,46 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Wrote %1.pdf and .csv</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Soft focus and motion blur</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stretches of a shot well under its own best, shots well under the other angles of their scene (from Group Shots, else the media&apos;s scene and camera), and blur that ran one way. Each frame is measured at up to 960 pixels wide, so this takes longer than the other picture checks.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An H.264, HEVC or MPEG-2 file to check against its buffer model (optional)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Runs the file&apos;s pictures through the buffer its stream states (the HRD of H.264 and HEVC, the VBV of MPEG-2), at a constant or a variable rate, and reports each frame where it would run dry or overflow, as broadcast ingest checks. A stream that states none is checked against its level&apos;s limits.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Buffer Model</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Video (*.mp4 *.mov *.mxf *.mkv *.m4v *.ts *.264 *.265 *.m2v);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Buffer model:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VMAF (libvmaf %1, its v1 model) as well; HDR encodes only where libvmaf has an HDR model</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>; VMAF not measured: no HDR VMAF model</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Buffer model: %1.</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::RecoveryManager</name>
@@ -26576,6 +28214,14 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>st2110.%1 is an IPv4 address and port, such as 239.100.0.1:5004</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>st2110.jpeg_xs_bpp is 0.5 to 24 bits a pixel, or 0 for uncompressed video</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This build of Montage has no JPEG XS (SVT-JPEG-XS)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::ReferenceOutputPanel</name>
@@ -26812,10 +28458,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>The second path&apos;s video, sound and data addresses and ports, apart by spaces</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Second path:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -26829,6 +28471,66 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Second path from:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Uncompressed (ST 2110-20)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS (ST 2110-22)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS sends each frame in a constant number of bytes, a fraction of the uncompressed picture&apos;s, with a few lines&apos; delay</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Video coding:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> bits a pixel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS&apos;s rate: 3 to 6 bits a pixel keep 4:2:2 10-bit pictures visually lossless</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS rate:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Packets a slice at a time (RFC 9134&apos;s slice mode)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each slice of 16 lines in packets of its own, so a receiver can decode as the slices come and a lost packet damages only its slice</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Send each frame&apos;s number and time code as fast metadata (ST 2110-41)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The fast metadata stream&apos;s address and port</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Metadata stream:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The second path&apos;s video, sound, data and fast metadata addresses and ports, apart by spaces</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Send the sound as AES3 (ST 2110-31)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AES3 subframes with channel status, for equipment that takes AES3 over IP, in place of ST 2110-30&apos;s PCM</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -27080,12 +28782,31 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Waiting for viewers at %1 (%2 × %3)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message numerus="yes">
+        <source>; %n note(s) received</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
     <message>
-        <source>, %1, %2 Mb/s each</source>
+        <source>, %1, up to %2 Mb/s each</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 at %2 × %3</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> (%1)</source>
+        <translation type="unfinished"> (%1)</translation>
+    </message>
+    <message>
+        <source>, </source>
         <translation type="unfinished"></translation>
     </message>
     <message numerus="yes">
-        <source>; %n note(s) received</source>
+        <source>, %n in HDR</source>
         <translation type="unfinished">
             <numerusform></numerusform>
             <numerusform></numerusform>
@@ -27319,7 +29040,75 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source> From another network they need TCP and UDP port %1 forwarded here, or an ICE server named above.</source>
+        <source>None</source>
+        <translation type="unfinished">Aucune</translation>
+    </message>
+    <message>
+        <source>A TURN relay you run (turn:host:3478, or turns:host:5349 over TLS), for viewers whose networks let nothing through directly. Reviewers&apos; pages are given it, with its user name and password, once they give the passphrase.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>TURN relay:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>User name</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Password</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Relay login:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Everything through the relay (never directly)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Full, half and quarter size</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Full and half size</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Full size only</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The picture encoded at each size at once; each viewer is moved between them as their own connection allows</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sizes:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR to browsers that show it (SDR to the rest)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An HDR sequence (PQ or HLG) goes as 10-bit HDR to browsers that say they decode it, and tone mapped to Rec. 709 as the viewer shows it to the rest</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VP9, where the browser plays it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> Their pictures go through the relay %1, never directly.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> Their browsers are given the relay %1 for when nothing gets through directly.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> From another network they need TCP and UDP port %1 forwarded here, or a TURN relay or ICE server named above.</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -27328,6 +29117,10 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Cancelled</source>
         <translation type="unfinished">Annulé</translation>
+    </message>
+    <message>
+        <source>Rendering</source>
+        <translation type="unfinished">La soumission</translation>
     </message>
 </context>
 <context>
@@ -27492,6 +29285,31 @@ montage-cli node &lt;folder&gt;</source>
         <source>Split a job sent to the farm into segments (at cuts near equal lengths) that several nodes
 render at once, then one joins: ProRes, DNxHR and FFV1 frame for frame, H.264, H.265 and AV1
 with rate control per segment, and image sequences. The sound is rendered once, by the node that joins.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cancel Job</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stop the picked job (the others go on), or set a waiting one aside</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Render </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> at once</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How many jobs render side by side (each with its own progress and cancel); also how many
+background calls MCP runs at once</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Waiting (stopped part way: renders again)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -27842,6 +29660,50 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     </message>
     <message>
         <source>Cannot open %1: %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Velocity Curve</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Output</source>
+        <translation type="unfinished">Produit</translation>
+    </message>
+    <message>
+        <source>One Clip a Hit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Place each pass recorded as a clip for each note, cut where the next note falls</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sampler: One Clip a Hit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>As Played</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Soft</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hard</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drawn</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drawn through %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This Track</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -28604,6 +30466,71 @@ View › Stereo 3D chooses what the viewer shows; exports are side by side unles
     <message>
         <source>New Sequence</source>
         <translation type="unfinished">Nouvelle séquence</translation>
+    </message>
+    <message>
+        <source>Centre %1 dB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Centre off</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Surrounds %1 dB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Surrounds off</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Downmix not stated</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lo/Ro preferred</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lt/Rt preferred</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How a surround mix folds down to stereo: as Montage plays it in stereo, and as AC-3 and E-AC-3
+exports tell decoders to (with the downmix a decoder should prefer)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stereo downmix:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Mix level not stated</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> dB SPL</source>
+        <translation type="unfinished"> DB SPL</translation>
+    </message>
+    <message>
+        <source>Room not stated</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Large room (dubbing stage)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Small room (flat monitor)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stated in AC-3 and E-AC-3 exports: the peak level the mix was monitored at, and the room it was mixed in</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Production:</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -30053,6 +31980,237 @@ Right-click: width, LFE, height and audio object.</source>
         <source>Keeps the track in a band under the ruler that stays put while the other tracks scroll</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source> (suspended)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>New Group...</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>New Track Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Group name:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Group %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add to %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Track to Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove from %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove Track from Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Suspend %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Suspend Track Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Resume Track Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track Groups...</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track Colour</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom...</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Its Clips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Track&apos;s Clips</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>montage::TrackGroupsDialog</name>
+    <message>
+        <source>Track Groups</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Groups:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track groups</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;New…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Make a group of the tracks ticked on the right, or of none to tick them after</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Rename…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Delete</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The group goes; its tracks stay</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A change on one track reaches the others for</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Selection and editing (cut, trim, move, delete, fades)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Mute and solo</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Volume (relative)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Pan (relative)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Automation modes and writes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Record &amp;arming</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Comping, auditions, ratings and Best Take</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>S&amp;uspended (each track acts alone)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sequence › Suspend Track Groups (Ctrl+Shift+G) suspends every group at once</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Tracks in the group:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Tracks in the group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track c&amp;olour:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour its c&amp;lips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clips without a label of their own are drawn in the track&apos;s colour</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Track&apos;s Clips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plain Track Clips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> (suspended)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>  (in %1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>None</source>
+        <translation type="unfinished">Aucune</translation>
+    </message>
+    <message>
+        <source>Custom (%1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>New Track Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Group name:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Group %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rename Track Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Delete Track Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track Group Switches</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Track to Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove Track from Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Track Colour</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::TranscribeDialog</name>
@@ -31077,6 +33235,18 @@ so the jump in the picture morphs across instead of cutting</source>
     <message>
         <source>Loop Record</source>
         <translation type="unfinished">Enregistrement de boucle</translation>
+    </message>
+    <message>
+        <source>The audio input could not be opened: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The grouped take could not be split by track (is the disk full?): it is kept in %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Some tracks of the grouped take could not be imported</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

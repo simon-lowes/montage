@@ -3,7 +3,9 @@
 // with the title standing in that scene), every setting keyframeable. Drawn by a small
 // z-buffered rasteriser at twice the size and filtered down: the front and back faces fill the projected outline
 // (nonzero winding, so letters keep their holes; each pixel's depth from the face's plane), and the sides are quads
-// along every edge, smooth where the outline curves and sharp at its corners.
+// along every edge, smooth where the outline curves and sharp at its corners. Text animations select letters, words or
+// lines as a 2D title's do and extrude them deeper, move them (Z towards the camera), turn them about X, Y and Z and
+// scale them about their middles, and colour their faces and sides: each such letter is a solid of its own.
 #pragma once
 
 #include "core/Model.h"

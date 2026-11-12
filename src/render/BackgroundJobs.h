@@ -44,7 +44,8 @@ bool load(const QString& id, Record& r, const QString& folder = {});
 // "interrupted".
 std::vector<Record> all(const QString& owner = {}, const QString& folder = {});
 bool remove(const QString& id, const QString& folder = {});
-// `owner`'s finished jobs but the `keep` most lately updated removed. Returns how many.
+// `owner`'s finished jobs but the `keep` most lately updated removed, and any job folder a day old without a readable
+// record. Returns how many.
 int prune(const QString& owner, int keep, const QString& folder = {});
 
 // This process, as a record's pid and process name it.

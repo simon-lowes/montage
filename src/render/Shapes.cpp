@@ -1,10 +1,10 @@
 #include "Shapes.h"
 
 #include "ShapeLayers.h"
+#include "ShapeRaster.h"
 
-#include <QImage>
 #include <QLinearGradient>
-#include <QPainter>
+#include <QPen>
 #include <QRadialGradient>
 #include <QTransform>
 #include <algorithm>
@@ -147,66 +147,62 @@ QPainterPath trimPath(const QPainterPath& path, double start, double end, double
     return out;
 }
 
-Image renderShape(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
-    if (!g.s("contents").empty()) return renderShapeContents(g, t, w, h, scale, fps);
-    QImage qi(w, h, QImage::Format_RGBA8888_Premultiplied);
-    qi.fill(Qt::transparent);
-    {
-        QPainter pa(&qi);
-        pa.setRenderHint(QPainter::Antialiasing);
-        const int kind = int(std::lround(g.p("shape", t)));
-        const double opacity = std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0);
-        pa.setOpacity(opacity);
-        const QPainterPath outline = shapeOutline(g, t, w, h, scale);
-        const double start = g.p("trim_start", t, 0) / 100.0, end = g.p("trim_end", t, 100) / 100.0;
-        const double offset = g.p("trim_offset", t, 0) / 360.0;
-        const bool trimmed = start > 0 || end < 1 || std::fabs(offset) > 1e-9;
-        const QPainterPath path = trimmed ? trimPath(outline, start, end, offset) : outline;
-        // Fill (not for a line), solid or a gradient across the shape.
-        if (kind != 4 && g.p("fill", t, 1) > 0.5 && !path.isEmpty()) {
-            const double fo = g.p("fill_opacity", t, 100) / 100.0;
-            const int grad = int(std::lround(g.p("gradient", t)));
-            const QRectF box = outline.boundingRect();
-            if (grad == 0) {
-                pa.fillPath(path, colorOf(g, "fill_color", t, fo));
+ShapeRaster shapeLayerRaster(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
+    if (!g.s("contents").empty()) return shapeContentsRaster(g, t, w, h, scale, fps);
+    // Its one shape: filled (not a line), solid or a gradient across it, then stroked (a line always is).
+    std::vector<ShapePaint> paints;
+    const int kind = int(std::lround(g.p("shape", t)));
+    const double opacity = std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0);
+    const QPainterPath outline = shapeOutline(g, t, w, h, scale);
+    const double start = g.p("trim_start", t, 0) / 100.0, end = g.p("trim_end", t, 100) / 100.0;
+    const double offset = g.p("trim_offset", t, 0) / 360.0;
+    const bool trimmed = start > 0 || end < 1 || std::fabs(offset) > 1e-9;
+    const QPainterPath path = trimmed ? trimPath(outline, start, end, offset) : outline;
+    if (kind != 4 && g.p("fill", t, 1) > 0.5 && !path.isEmpty()) {
+        const double fo = g.p("fill_opacity", t, 100) / 100.0;
+        const int grad = int(std::lround(g.p("gradient", t)));
+        const QRectF box = outline.boundingRect();
+        ShapePaint fill;
+        fill.path = path;
+        if (grad == 0) {
+            fill.brush = QBrush(colorOf(g, "fill_color", t, fo));
+        } else {
+            QGradientStops stops = {{0.0, colorOf(g, "fill_color", t, fo)}, {1.0, colorOf(g, "fill_color2", t, fo)}};
+            if (grad == 2) {
+                QRadialGradient rg(box.center(), std::max(box.width(), box.height()) / 2);
+                rg.setStops(stops);
+                fill.brush = QBrush(rg);
             } else {
-                QGradientStops stops = {{0.0, colorOf(g, "fill_color", t, fo)}, {1.0, colorOf(g, "fill_color2", t, fo)}};
-                if (grad == 2) {
-                    QRadialGradient rg(box.center(), std::max(box.width(), box.height()) / 2);
-                    rg.setStops(stops);
-                    pa.fillPath(path, rg);
-                } else {
-                    // Along the angle (0 left to right, 90 top to bottom), end to end across the shape.
-                    const double a = g.p("gradient_angle", t) * M_PI / 180;
-                    const QPointF dir(std::cos(a), std::sin(a));
-                    const double half = (std::fabs(dir.x()) * box.width() + std::fabs(dir.y()) * box.height()) / 2;
-                    QLinearGradient lg(box.center() - dir * half, box.center() + dir * half);
-                    lg.setStops(stops);
-                    pa.fillPath(path, lg);
-                }
+                // Along the angle (0 left to right, 90 top to bottom), end to end across the shape.
+                const double a = g.p("gradient_angle", t) * M_PI / 180;
+                const QPointF dir(std::cos(a), std::sin(a));
+                const double half = (std::fabs(dir.x()) * box.width() + std::fabs(dir.y()) * box.height()) / 2;
+                QLinearGradient lg(box.center() - dir * half, box.center() + dir * half);
+                lg.setStops(stops);
+                fill.brush = QBrush(lg);
             }
         }
-        // Stroke (a line always has one).
-        double sw = std::max(0.0, g.p("stroke", t)) * scale;
-        if (kind == 4 && sw <= 0) sw = 8 * scale;
-        if (sw > 0 && !path.isEmpty()) {
-            static const Qt::PenJoinStyle joins[] = {Qt::RoundJoin, Qt::MiterJoin, Qt::BevelJoin};
-            const int j = std::clamp(int(std::lround(g.p("join", t))), 0, 2);
-            QPen pen(colorOf(g, "stroke_color", t, g.p("stroke_opacity", t, 100) / 100.0), sw, Qt::SolidLine,
-                     j == 0 ? Qt::RoundCap : Qt::FlatCap, joins[j]);
-            const double dash = g.p("dash", t) * scale, gap = std::max(0.0, g.p("gap", t, 10)) * scale;
-            if (dash > 0) pen.setDashPattern({dash / sw, std::max(gap, 0.01) / sw});  // in stroke widths
-            pa.strokePath(path, pen);
-        }
+        paints.push_back(std::move(fill));
     }
-    Image img(w, h);
-    const float k = 1.0f / 255.0f;
-    for (int y = 0; y < h; ++y) {
-        const uchar* s = qi.constScanLine(y);
-        float* d = img.row(y);
-        for (int x = 0; x < w * 4; ++x) d[x] = s[x] * k;
+    double sw = std::max(0.0, g.p("stroke", t)) * scale;
+    if (kind == 4 && sw <= 0) sw = 8 * scale;
+    if (sw > 0 && !path.isEmpty()) {
+        static const Qt::PenJoinStyle joins[] = {Qt::RoundJoin, Qt::MiterJoin, Qt::BevelJoin};
+        const int j = std::clamp(int(std::lround(g.p("join", t))), 0, 2);
+        ShapePaint stroke;
+        stroke.stroke = true;
+        stroke.path = path;
+        stroke.pen = QPen(colorOf(g, "stroke_color", t, g.p("stroke_opacity", t, 100) / 100.0), sw, Qt::SolidLine,
+                          j == 0 ? Qt::RoundCap : Qt::FlatCap, joins[j]);
+        const double dash = g.p("dash", t) * scale, gap = std::max(0.0, g.p("gap", t, 10)) * scale;
+        if (dash > 0) stroke.pen.setDashPattern({dash / sw, std::max(gap, 0.01) / sw});  // in stroke widths
+        paints.push_back(std::move(stroke));
     }
-    return img;
+    return shapeRaster(paints, QTransform(), opacity, w, h);
+}
+
+Image renderShape(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
+    return drawShapeRaster(shapeLayerRaster(g, t, w, h, scale, fps));
 }
 
 }  // namespace montage

@@ -1,6 +1,8 @@
 // Engine tests: keyframes, timecode, edit operations, undo, project I/O.
 #include <QtTest>
 #include <QElapsedTimer>
+#include <QThread>
+#include <QFileInfo>
 #include <QTemporaryDir>
 #include <QImage>
 #include <cmath>
@@ -90,6 +92,7 @@
 #include "control/MackieControl.h"
 #include "control/Midi.h"
 #include "control/MidiMap.h"
+#include "core/MidiMaps.h"
 #include "audio/Sampler.h"
 #include "render/Titles.h"
 
@@ -1705,6 +1708,176 @@ private slots:
         }
     }
 
+    void samplerVelocityCurves() {
+        using namespace sampler;
+        // Every velocity 1-127 as the curve says: as played, soft (light playing louder), hard, and drawn.
+        SamplerSlot sl;
+        for (int v = 1; v <= 127; ++v) QCOMPARE(curveVelocity(sl, v), v);
+        QCOMPARE(curveVelocity(sl, 0), 1);
+        QCOMPARE(curveVelocity(sl, 200), 127);
+        sl.velocityCurve = 1;
+        for (int v = 1; v <= 127; ++v) {
+            QCOMPARE(curveVelocity(sl, v), int(std::lround(127 * std::sqrt(v / 127.0))));
+            QVERIFY(curveVelocity(sl, v) >= v);
+            if (v > 1) QVERIFY(curveVelocity(sl, v) >= curveVelocity(sl, v - 1));
+        }
+        QCOMPARE(curveVelocity(sl, 64), 90);
+        sl.velocityCurve = 2;
+        for (int v = 1; v <= 127; ++v) {
+            QCOMPARE(curveVelocity(sl, v), std::max(1, int(std::lround(127 * std::pow(v / 127.0, 2.0)))));
+            QVERIFY(curveVelocity(sl, v) <= v);
+        }
+        QCOMPARE(curveVelocity(sl, 64), 32);
+        sl.velocityCurve = 3;
+        sl.velocityPoints = {{127, 100}, {1, 20}, {64, 64}};  // (in any order)
+        QCOMPARE(curveVelocity(sl, 1), 20);
+        QCOMPARE(curveVelocity(sl, 32), 42);
+        QCOMPARE(curveVelocity(sl, 64), 64);
+        QCOMPARE(curveVelocity(sl, 96), 82);
+        QCOMPARE(curveVelocity(sl, 127), 100);
+        sl.velocityPoints = {{40, 10}, {80, 120}};  // (level outside the points)
+        QCOMPARE(curveVelocity(sl, 5), 10);
+        QCOMPARE(curveVelocity(sl, 60), 65);
+        QCOMPARE(curveVelocity(sl, 110), 120);
+        sl.velocityPoints.clear();
+        QCOMPARE(curveVelocity(sl, 77), 77);  // (drawn with no points: as played)
+
+        // Through the engine: the curved velocity picks the layer and sets the level.
+        const int rate = 48000;
+        auto level = [&](float v) {
+            auto b = std::make_shared<AudioBuffer>();
+            b->sampleRate = rate, b->channels = 2;
+            b->samples.assign(size_t(400) * 2, v);
+            return AudioBufferPtr(b);
+        };
+        std::map<std::string, AudioBufferPtr> files{{"soft", level(0.5f)}, {"loud", level(1.0f)}};
+        const Loader load = [&](const std::string& path, int, std::string*) { return files.at(path); };
+        SamplerSettings st;
+        SamplerSlot layered;
+        layered.key = 40;
+        layered.sounds = {{"soft", 0, 0, 1, 63}, {"loud", 0, 0, 64, 127}};
+        layered.velocityCurve = 1;
+        st.pads.push_back(layered);
+        Engine e(rate);
+        e.setKit(loadKit(st, rate, nullptr, load));
+        auto hit = [&](int velocity) {
+            std::vector<float> out(64 * 2, 0.0f);
+            e.reset();
+            e.noteOn(40, velocity, 0);
+            e.render(0, 64, out.data());
+            return out[10];
+        };
+        QVERIFY(std::fabs(hit(40) - 71 / 127.0) < 1e-6);        // (40 comes out 71: the loud layer)
+        QVERIFY(std::fabs(hit(10) - 0.5 * 36 / 127.0) < 1e-6);  // (10 comes out 36: the soft one)
+        st.pads[0].velocityCurve = 2;
+        e.setKit(loadKit(st, rate, nullptr, load));
+        QVERIFY(std::fabs(hit(100) - 79 / 127.0) < 1e-6);       // (hard: 100 comes out 79)
+        QVERIFY(std::fabs(hit(80) - 0.5 * 50 / 127.0) < 1e-6);  // (80 comes out 50: the soft layer)
+    }
+
+    void samplerStreamsLongSounds() {
+        using namespace sampler;
+        // A ten-minute sound (thirty seconds under valgrind: MONTAGE_TEST_SHORT) streamed from a slow disk, its first second
+        // in memory: played offline (as a pass is rendered) it is the same sound sample for sample as when it is held in
+        // memory whole, and played block by block at the device's pace no frame comes late.
+        const int rate = 48000;
+        const int64_t frames = int64_t(rate) * (qEnvironmentVariableIsSet("MONTAGE_TEST_SHORT") ? 30 : 600);
+        auto whole = std::make_shared<AudioBuffer>();
+        whole->sampleRate = rate, whole->channels = 2;
+        whole->samples.resize(size_t(frames) * 2);
+        uint32_t x = 12345;
+        for (int64_t i = 0; i < frames; ++i) {
+            x = x * 1664525u + 1013904223u;  // (no two stretches alike)
+            whole->samples[size_t(i) * 2] = float(0.4 * std::sin(double(i) * 0.0131)) + float(x >> 8) / float(1 << 24) * 0.1f;
+            whole->samples[size_t(i) * 2 + 1] = float((i % 9973) - 4986) / 9973.0f;
+        }
+        const Loader load = [&](const std::string&, int, std::string*) { return AudioBufferPtr(whole); };
+        SamplerSettings st;
+        SamplerSlot all, stretch;
+        all.key = 60;
+        all.sounds = {{"long", 0, 0, 1, 127}};
+        stretch.key = 61;
+        stretch.sounds = {{"long", 12.5, 0, 1, 127}};  // (from 12.5 s into the file)
+        st.pads = {all, stretch};
+        QTemporaryDir cache;
+        StreamOptions never;
+        never.longerThan = 0;
+        StreamOptions streamed;
+        streamed.longerThan = 10;  // (the stretch from 12.5 s is streamed too in the thirty-second run)
+        streamed.cacheDir = cache.path().toStdString();
+        KitPtr memory = loadKit(st, rate, nullptr, load, never);
+        KitPtr disk = loadKit(st, rate, nullptr, load, streamed);
+        QVERIFY(!memory->pads[0].sounds[0].disk);
+        const Kit::Sound& sd = disk->pads[0].sounds[0];
+        QVERIFY(sd.disk && sd.head == rate && sd.buffer->frames() == rate && sd.end == frames);
+        QVERIFY(disk->pads[1].sounds[0].disk && disk->pads[1].sounds[0].start == std::llround(12.5 * rate));
+        const std::string cacheFile = sd.disk->file;
+        QVERIFY(QFileInfo::exists(QString::fromStdString(cacheFile)));
+        {
+            // Offline, the disk at 100 MB/s: both keys, the second a little later.
+            setDiskThrottle(0.01);
+            Engine a(rate), b(rate);
+            a.setBlocking(true);
+            b.setBlocking(true);
+            a.setKit(memory);
+            b.setKit(disk);
+            for (Engine* e : {&a, &b}) {
+                e->noteOn(60, 127, 0);
+                e->noteOn(61, 90, 4801);
+            }
+            const int chunk = 48000;
+            std::vector<float> ma(size_t(chunk) * 2), mb(size_t(chunk) * 2);
+            for (int64_t at = 0; at < frames + rate; at += chunk) {
+                std::fill(ma.begin(), ma.end(), 0.0f);
+                std::fill(mb.begin(), mb.end(), 0.0f);
+                a.render(at, chunk, ma.data());
+                b.render(at, chunk, mb.data());
+                if (std::memcmp(ma.data(), mb.data(), ma.size() * sizeof(float)) != 0) {
+                    size_t k = 0;
+                    while (ma[k] == mb[k]) ++k;
+                    QFAIL(qPrintable(QStringLiteral("differs at frame %1").arg(at + int64_t(k / 2))));
+                }
+            }
+            QCOMPARE(b.activeVoices(), 0);
+        }
+        {
+            // At the device's pace (blocks of 256), the disk at 2 MB/s (five times what a voice needs): nothing late.
+            setDiskThrottle(0.5);
+            Engine a(rate), b(rate);
+            a.setKit(memory);
+            b.setKit(disk);
+            a.noteOn(61, 100, 0);
+            b.noteOn(61, 100, 0);
+            const int64_t before = streamUnderruns();
+            std::vector<float> ma(512), mb(512);
+            QElapsedTimer clock;
+            clock.start();
+            for (int64_t at = 0; at < 3 * rate; at += 256) {
+                std::fill(ma.begin(), ma.end(), 0.0f);
+                std::fill(mb.begin(), mb.end(), 0.0f);
+                a.render(at, 256, ma.data());
+                b.render(at, 256, mb.data());
+                QVERIFY2(ma == mb, qPrintable(QStringLiteral("differs in the block at %1").arg(at)));
+                const qint64 due = (at + 256) * 1000000 / rate;  // (microseconds)
+                const qint64 now = clock.nsecsElapsed() / 1000;
+                if (due > now) QThread::usleep(unsigned(due - now));
+            }
+            QCOMPARE(streamUnderruns(), before);
+            // Asked for far faster than the disk gives it (and not waiting, as the audio thread never does): silence
+            // where it has not caught up, counted.
+            Engine c(rate);
+            c.setKit(disk);
+            c.noteOn(60, 100, 0);
+            std::vector<float> mc(size_t(rate) * 2);
+            for (int64_t at = 0; at < 3 * rate; at += rate) c.render(at, rate, mc.data());
+            QVERIFY(streamUnderruns() > before);
+            setDiskThrottle(0);
+        }
+        memory.reset();
+        disk.reset();
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(cacheFile)));  // (a loader's sound: its cache goes with the kit)
+    }
+
     void midiLearnMapping() {
         using namespace montage::midimap;
         // ---- Decoding: synthetic byte streams through MidiParser and the decoder.
@@ -1994,6 +2167,202 @@ private slots:
             m.unmap(all.key, "");
             QCOMPARE(m.mappings().size(), size_t(1));
         }
+    }
+    void midiLearnPressureIncrementsAndSeveralTargets() {
+        using namespace montage::midimap;
+        Decoder decoder;
+        auto decode = [&](const std::vector<uint8_t>& bytes) {
+            std::vector<Event> events;
+            MidiParser parser;
+            parser.feed(bytes.data(), bytes.size(), [&](const MidiMessage& m) {
+                decoder.feed(m, [&](const Event& e) { events.push_back(e); });
+            });
+            return events;
+        };
+        // ---- Channel and polyphonic aftertouch: decoded, named and labelled.
+        auto events = decode({0xD3, 90, 0xA3, 60, 70, 0xA3, 61});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].key == (Key{Kind::Aftertouch, 3, 0}) && events[0].value == 90 && events[0].resolution == 128);
+        QVERIFY(events[1].key == (Key{Kind::PolyAftertouch, 3, 60}) && events[1].value == 70);
+        QCOMPARE(keyName({Kind::Aftertouch, 0, 0}), std::string("at:1:0"));
+        QCOMPARE(keyName({Kind::PolyAftertouch, 9, 36}), std::string("pat:10:36"));
+        QVERIFY(keyFromName("pat:4:60") == (Key{Kind::PolyAftertouch, 3, 60}));
+        QVERIFY(keyFromName("at:16:0") == (Key{Kind::Aftertouch, 15, 0}));
+        QVERIFY(!keyFromName("at:1:3") && !keyFromName("pat:1:128"));
+        QCOMPARE(keyLabel({Kind::Aftertouch, 0, 0}), std::string("Aftertouch (ch 1)"));
+        QCOMPARE(keyLabel({Kind::PolyAftertouch, 0, 60}), std::string("Aftertouch C4 (ch 1)"));
+        // Learnt from a key pressed into: the pressure, not the note.
+        {
+            Learner l;
+            l.add({{Kind::Note, 2, 48}, 100, 128});
+            for (int v : {20, 40, 60, 80}) l.add({{Kind::Aftertouch, 2, 0}, v, 128});
+            const auto got = l.finish();
+            QVERIFY(got && got->key == (Key{Kind::Aftertouch, 2, 0}) && got->encoding == Encoding::Absolute);
+            l.add({{Kind::Note, 2, 48}, 100, 128});
+            l.add({{Kind::PolyAftertouch, 2, 50}, 64, 128});  // another key's pressure: not this one's
+            QVERIFY(l.finish()->key == (Key{Kind::Note, 2, 48}));
+            l.add({{Kind::Note, 2, 48}, 100, 128});
+            l.add({{Kind::PolyAftertouch, 2, 48}, 64, 128});
+            l.add({{Kind::PolyAftertouch, 2, 48}, 70, 128});
+            QVERIFY(l.finish()->key == (Key{Kind::PolyAftertouch, 2, 48}));
+        }
+
+        std::map<std::string, double> values;
+        Targets targets{[&](const Mapping& m) { return values.count(m.target) ? values[m.target] : std::nan(""); },
+                        [&](const Mapping& m, const Change& c) { values[m.target] = c.value; }};
+        // Aftertouch drives its target over the mapping's range, and shows it back.
+        {
+            Mapper m;
+            Mapping pressure;
+            pressure.key = {Kind::PolyAftertouch, 3, 60};
+            pressure.target = "pressure";
+            pressure.pickup = false;
+            pressure.low = 0.25;
+            pressure.high = 0.75;
+            m.map(pressure);
+            values["pressure"] = 0;
+            m.handle(events[1], targets);
+            QVERIFY(std::fabs(values["pressure"] - (0.25 + 0.5 * 70 / 127.0)) < 1e-12);
+            m.handle({pressure.key, 127, 128}, targets);
+            QCOMPARE(values["pressure"], 0.75);
+            values["pressure"] = 0.5;
+            QCOMPARE(m.refresh(targets.get), (std::vector<MidiMessage>{{0xA3, 60, 64}}));
+            QCOMPARE(Mapper::feedback(Mapping{Key{Kind::Aftertouch, 1, 0}}, 1.0), (std::vector<MidiMessage>{{0xD1, 127}}));
+        }
+
+        // ---- NRPN data increment and decrement: steps of the mapping's own, from where the target is, in its range.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 96, 0, 0xB1, 96, 1, 0xB1, 96, 0, 0xB1, 97, 0});
+        const Key nrpn{Kind::Nrpn, 1, 3 << 7 | 4};
+        QCOMPARE(events.size(), size_t(4));
+        for (size_t i = 0; i < 4; ++i) QVERIFY(events[i].key == nrpn && events[i].steps == (i < 3 ? 1 : -1));
+        QVERIFY(decode({0xB2, 96, 0}).front().key == (Key{Kind::Cc, 2, 96}));  // with no parameter chosen: a controller
+        {
+            Mapper m;
+            Mapping inc;
+            inc.key = nrpn;
+            inc.target = "inc";
+            inc.low = 0.2;
+            inc.high = 0.6;
+            inc.step = 0.05;
+            m.map(inc);
+            values["inc"] = 0.3;
+            for (const Event& e : events) m.handle(e, targets);
+            QVERIFY(std::fabs(values["inc"] - (0.3 + 2 * 0.05 * 0.4)) < 1e-12);
+            for (int i = 0; i < 40; ++i) m.handle(events[0], targets);
+            QCOMPARE(values["inc"], 0.6);  // (stops at the range's end)
+            Mapping down = m.mappings()[0];
+            down.invert = true;
+            m.setMappingOptions(0, down);
+            m.handle(events[0], targets);
+            QVERIFY(std::fabs(values["inc"] - (0.6 - 0.05 * 0.4)) < 1e-12);
+            QVERIFY(m.refresh(targets.get).size() == 4);  // shown back on the control (NRPN: four messages)
+        }
+
+        // ---- One fader, three targets, each in its own range.
+        {
+            Mapper m;
+            Mapping a;
+            a.key = {Kind::Cc, 0, 7};
+            a.pickup = false;
+            a.target = "a";
+            Mapping b = a, c = a;
+            b.target = "b";
+            b.low = 0.5;
+            c.target = "c";
+            c.low = 0.2;
+            c.high = 0.4;
+            c.invert = true;
+            m.add(a);
+            m.add(b);
+            m.add(c);
+            QCOMPARE(m.mappings().size(), size_t(3));
+            values["a"] = values["b"] = values["c"] = 0;
+            auto cc = [](int v) { return Event{{Kind::Cc, 0, 7}, v, 128}; };
+            m.handle(cc(127), targets);
+            QVERIFY(values["a"] == 1 && values["b"] == 1 && values["c"] == 0.2);
+            m.handle(cc(0), targets);
+            QVERIFY(values["a"] == 0 && values["b"] == 0.5 && values["c"] == 0.4);
+            m.handle(cc(64), targets);
+            QVERIFY(std::fabs(values["a"] - 64 / 127.0) < 1e-12);
+            QVERIFY(std::fabs(values["b"] - (0.5 + 0.5 * 64 / 127.0)) < 1e-12);
+            QVERIFY(std::fabs(values["c"] - (0.4 - 0.2 * 64 / 127.0)) < 1e-12);
+            // Added again onto the same target: replaced, not doubled. Unmapped from one: the others stay.
+            Mapping b2 = b;
+            b2.high = 0.9;
+            m.add(b2);
+            QCOMPARE(m.mappings().size(), size_t(3));
+            QCOMPARE(m.mappings()[1].high, 0.9);
+            m.unmap(a.key, "", "b");
+            QCOMPARE(m.mappings().size(), size_t(2));
+            QVERIFY(m.mappings()[0].target == "a" && m.mappings()[1].target == "c");
+            // Settings moved onto a target another of the control's mappings has: that one gives way.
+            Mapping onto = m.mappings()[1];
+            onto.target = "a";
+            m.setMappingOptions(1, onto);
+            QCOMPARE(m.mappings().size(), size_t(1));
+            QVERIFY(m.mappings()[0].target == "a" && m.mappings()[0].invert);
+            // map() leaves the control one target again.
+            m.add(b);
+            m.add(c);
+            m.map(a);
+            QCOMPARE(m.mappings().size(), size_t(1));
+            QVERIFY(m.mappings()[0].target == "a" && !m.mappings()[0].invert);
+        }
+
+        // ---- Shown on another port: what automation does to the target is sent there, every move, in order; the
+        // controller's own port shows one of the control's mappings, and its own moves are not echoed to it.
+        {
+            Mapper m;
+            Mapping own;
+            own.key = {Kind::Cc, 0, 7};
+            own.pickup = false;
+            own.target = "level";
+            Mapping second = own;
+            second.target = "pan";
+            Mapping motor = own;
+            motor.target = "level";
+            motor.key = {Kind::Cc, 0, 8};
+            motor.output = "Motors";
+            m.add(own);
+            m.add(second);
+            m.add(motor);
+            values["level"] = 0;
+            values["pan"] = 0.5;
+            auto all = m.refreshAll(targets.get);
+            QCOMPARE(all.size(), size_t(2));
+            QVERIFY(all[0].port.empty() && all[0].message == (MidiMessage{0xB0, 7, 0}));
+            QVERIFY(all[1].port == "Motors" && all[1].message == (MidiMessage{0xB0, 8, 0}));
+            std::vector<MidiMessage> wanted, got;
+            for (int f = 1; f <= 60; ++f) {
+                values["level"] = std::min(1.0, f / 50.0);  // (a lane rising, then holding)
+                const auto q = uint8_t(std::lround(values["level"] * 127));
+                if (wanted.empty() || wanted.back()[2] != q) wanted.push_back({0xB0, 8, q});
+                for (const Mapper::Out& o : m.refreshAll(targets.get))
+                    if (o.port == "Motors") got.push_back(o.message);
+            }
+            QCOMPARE(got, wanted);
+            QCOMPARE(got.size(), size_t(50));
+            // The fader moved by hand: not echoed to itself, but the other port follows.
+            m.handle({own.key, 30, 128}, targets);
+            all = m.refreshAll(targets.get);
+            QCOMPARE(all.size(), size_t(1));
+            QVERIFY(all[0].port == "Motors" && all[0].message == (MidiMessage{0xB0, 8, 30}));
+            QVERIFY(m.refresh(targets.get).empty());
+        }
+
+        // ---- Saved and read again, with the output.
+        Mapping saved;
+        saved.key = {Kind::PolyAftertouch, 0, 60};
+        saved.target = "strip:1:volume";
+        saved.output = "Motors";
+        Mapping back;
+        QString error;
+        QVERIFY2(midimaps::fromJson(midimaps::toJson(saved), back, &error), qPrintable(error));
+        QVERIFY(back.key == saved.key && back.output == "Motors");
+        QJsonObject wrong = midimaps::toJson(saved);
+        wrong["control"] = "pressure:1";
+        QVERIFY(!midimaps::fromJson(wrong, back, &error) && error.contains("pat:1:60"));
     }
     void oscMessages() {
         using osc::Message;
@@ -5075,6 +5444,174 @@ private slots:
         const Sequence* nested = fx.p.findSequence(m->sequenceId);
         QCOMPARE(trackAt(*nested, V2)->clips[0].start, FrameTime(10));
         QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));  // nested audio gets its own clip
+    }
+
+    void nestInToOutAcrossTracks() {
+        Fixture fx;
+        const TrackRef V3{TrackKind::Video, 2};
+        // V1 0-60 with its sound on A1, V2 20-30 and 40-90, V3 70-80 (after Out: stays).
+        const Result r1 = placeMedia(fx.p, fx.s(), fx.media, 0, 0, 60, V1, A1, false);
+        QVERIFY(r1.ok && r1.created.size() == 2);
+        const Id v2a = fx.put(V2, 20, 10, 5), v2b = fx.put(V2, 40, 50, 100);
+        const Id v3 = fx.put(V3, 70, 10);
+        const Id seqId = fx.s().id;
+        const Result r = nestRange(fx.p, fx.s(), 10, 50, allTracks(fx.s()), "Range");
+        QVERIFY2(r.ok, r.error.c_str());
+        Sequence& outer = *fx.p.findSequence(seqId);
+        // V1: 0-10 left, the compound 10-50, 50-60 right; A1 the same, the compound's sound linked to its picture.
+        const Track& v1 = *trackAt(outer, V1);
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(v1.clips[0].end(), FrameTime(10));
+        QCOMPARE(v1.clips[1].start, FrameTime(10));
+        QCOMPARE(v1.clips[1].duration, FrameTime(40));
+        QCOMPARE(v1.clips[2].start, FrameTime(50));
+        QCOMPARE(v1.clips[2].sourceIn, 50.0);
+        const MediaItem* m = fx.p.findMedia(v1.clips[1].mediaId);
+        QVERIFY(m && m->kind == MediaKind::Sequence && m->name == "Range");
+        const Track& a1 = *trackAt(outer, A1);
+        QCOMPARE(a1.clips.size(), size_t(3));
+        QCOMPARE(a1.clips[1].mediaId, m->id);
+        QVERIFY(a1.clips[1].linkGroup && a1.clips[1].linkGroup == v1.clips[1].linkGroup);
+        // The pieces left outside stay linked to each other, not to the compound.
+        QVERIFY(v1.clips[0].linkGroup && v1.clips[0].linkGroup == a1.clips[0].linkGroup && v1.clips[0].linkGroup != v1.clips[1].linkGroup);
+        QVERIFY(v1.clips[2].linkGroup && v1.clips[2].linkGroup == a1.clips[2].linkGroup);
+        QVERIFY(v1.clips[2].linkGroup != v1.clips[0].linkGroup && v1.clips[2].linkGroup != v1.clips[1].linkGroup);
+        // V2: the clip inside went, the one across Out was cut there; V3 untouched.
+        const Track& v2 = *trackAt(outer, V2);
+        QCOMPARE(v2.clips.size(), size_t(1));
+        QCOMPARE(v2.clips[0].start, FrameTime(50));
+        QCOMPARE(v2.clips[0].sourceIn, 110.0);
+        QVERIFY(clipById(outer, v3));
+        QVERIFY(!clipById(outer, v2a));
+        // The nested sequence: the range from 0, on the same tracks, gaps kept.
+        const Sequence* nested = fx.p.findSequence(m->sequenceId);
+        QVERIFY(nested);
+        QCOMPARE(trackAt(*nested, V1)->clips.size(), size_t(1));
+        QCOMPARE(trackAt(*nested, V1)->clips[0].start, FrameTime(0));
+        QCOMPARE(trackAt(*nested, V1)->clips[0].sourceIn, 10.0);
+        QCOMPARE(trackAt(*nested, V2)->clips.size(), size_t(2));
+        QCOMPARE(trackAt(*nested, V2)->clips[0].start, FrameTime(10));
+        QCOMPARE(trackAt(*nested, V2)->clips[1].start, FrameTime(30));
+        QCOMPARE(trackAt(*nested, V2)->clips[1].duration, FrameTime(10));
+        QVERIFY(clipById(*nested, v2b));
+        QCOMPARE(trackAt(*nested, V2)->clips[1].sourceIn, 100.0);
+        QCOMPARE(trackAt(*nested, A1)->clips.size(), size_t(1));
+        // A track given twice is nested once.
+        Fixture fw;
+        fw.put(V1, 0, 30);
+        QVERIFY(nestRange(fw.p, *fw.p.active(), 5, 20, {V1, V1}, "Twice").ok);
+        const MediaItem* twice = fw.p.findMedia(trackAt(*fw.p.active(), V1)->clips[1].mediaId);
+        QCOMPARE(trackAt(*fw.p.findSequence(twice->sequenceId), V1)->clips.size(), size_t(1));
+        // A locked track is left as it is; nothing in the range fails.
+        Fixture fy;
+        fy.put(V1, 0, 30);
+        trackAt(fy.s(), V1)->locked = true;
+        QVERIFY(!nestRange(fy.p, fy.s(), 5, 20, allTracks(fy.s()), "N").ok);
+        QCOMPARE(trackAt(fy.s(), V1)->clips.size(), size_t(1));
+        QVERIFY(!nestRange(fy.p, fy.s(), 20, 20, allTracks(fy.s()), "N").ok);
+        // Sound alone nests as sound.
+        Fixture fz;
+        Clip snd = makeClip(fz.p, *fz.p.findMedia(fz.media), TrackKind::Audio, fz.s());
+        snd.start = 0;
+        snd.duration = 40;
+        QVERIFY(overwrite(fz.p, fz.s(), A1, snd).ok);
+        QVERIFY(nestRange(fz.p, fz.s(), 10, 20, allTracks(fz.s()), "Sound").ok);
+        QVERIFY(trackAt(*fz.p.active(), V1)->clips.empty());
+        QCOMPARE(trackAt(*fz.p.active(), A1)->clips.size(), size_t(3));
+    }
+
+    void replaceSourceOfSeveralClips() {
+        Fixture fx;
+        // A longer file of the same take (the online), starting two seconds earlier by timecode.
+        MediaItem online = *fx.p.findMedia(fx.media);
+        online.id = fx.p.newId();
+        online.name = "online.mov";
+        online.path = "/nonexistent/online.mov";
+        online.duration = 30;
+        online.timecode = 3600 - 2;
+        fx.p.media.push_back(online);
+        fx.p.findMedia(fx.media)->timecode = 3600;
+        std::vector<Id> clips;
+        for (int i = 0; i < 5; ++i) {
+            const Result r = placeMedia(fx.p, fx.s(), fx.media, i * 40, i * 30, i * 30 + 30, V1, A1, false);
+            QVERIFY(r.ok);
+            clips.push_back(r.created[0]);  // the picture (its sound follows)
+        }
+        Project before = fx.p;
+        Result r = replaceSources(fx.p, fx.s(), clips, online.id, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(10));
+        for (int i = 0; i < 5; ++i) {
+            const Clip& v = trackAt(fx.s(), V1)->clips[size_t(i)];
+            const Clip& a = trackAt(fx.s(), A1)->clips[size_t(i)];
+            QCOMPARE(v.mediaId, online.id);
+            QCOMPARE(a.mediaId, online.id);
+            QCOMPARE(v.sourceIn, double(i * 30));
+            QCOMPARE(v.start, FrameTime(i * 40));
+            QCOMPARE(v.duration, FrameTime(30));
+        }
+        // By timecode: two seconds (60 frames) later in the new file.
+        fx.p = before;
+        r = replaceSources(fx.p, fx.s(), clips, online.id, true);
+        QVERIFY2(r.ok, r.error.c_str());
+        for (int i = 0; i < 5; ++i) {
+            QCOMPARE(trackAt(fx.s(), V1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
+            QCOMPARE(trackAt(fx.s(), A1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
+        }
+        // An L-cut (the sound leading the picture by 12 frames) keeps its lead; a separate recorder's sound linked to
+        // the picture is left on its own file.
+        {
+            Fixture fl;
+            MediaItem on = online;
+            on.id = fl.p.newId();
+            fl.p.media.push_back(on);
+            MediaItem recorder = *fl.p.findMedia(fl.media);
+            recorder.id = fl.p.newId();
+            recorder.name = "recorder.wav";
+            recorder.hasVideo = false;
+            fl.p.media.push_back(recorder);
+            const Result placed = placeMedia(fl.p, fl.s(), fl.media, 40, 30, 90, V1, A1, false);
+            QVERIFY(placed.ok);
+            Clip* sound = clipById(fl.s(), placed.created[1]);
+            sound->start = 28;
+            sound->sourceIn = 18;
+            sound->duration = 72;
+            Clip rec = makeClip(fl.p, recorder, TrackKind::Audio, fl.s());
+            rec.start = 40;
+            rec.duration = 60;
+            rec.sourceIn = 200;
+            rec.linkGroup = clipById(fl.s(), placed.created[0])->linkGroup;
+            QVERIFY(overwrite(fl.p, fl.s(), {TrackKind::Audio, 1}, rec).ok);
+            QVERIFY(replaceSources(fl.p, fl.s(), {placed.created[0]}, on.id, false).ok);
+            QCOMPARE(clipById(fl.s(), placed.created[0])->sourceIn, 30.0);
+            QCOMPARE(clipById(fl.s(), placed.created[1])->sourceIn, 18.0);
+            QCOMPARE(clipById(fl.s(), placed.created[1])->mediaId, on.id);
+            QCOMPARE(trackAt(fl.s(), {TrackKind::Audio, 1})->clips[0].mediaId, recorder.id);
+            QCOMPARE(trackAt(fl.s(), {TrackKind::Audio, 1})->clips[0].sourceIn, 200.0);
+            // A sequence cannot be pointed at itself (or at a compound of it).
+            MediaItem self;
+            self.id = fl.p.newId();
+            self.kind = MediaKind::Sequence;
+            self.sequenceId = fl.s().id;
+            self.hasVideo = true;
+            fl.p.media.push_back(self);
+            QVERIFY(!replaceSources(fl.p, fl.s(), {placed.created[0]}, self.id, false).ok);
+        }
+        // All or nothing: a file too short for the last clip changes none, and names it.
+        fx.p = before;
+        MediaItem shorter = online;
+        shorter.id = fx.p.newId();
+        shorter.name = "short.mov";
+        shorter.duration = 4;  // 120 frames: the last clip (120-150) is past its end
+        fx.p.media.push_back(shorter);
+        const Sequence unchanged = fx.s();
+        r = replaceSources(fx.p, fx.s(), clips, shorter.id, false);
+        QVERIFY(!r.ok);
+        QVERIFY2(r.error.find("too short") != std::string::npos, r.error.c_str());
+        QVERIFY(fx.s() == unchanged);
+        // A file without timecode cannot be matched by it.
+        fx.p.findMedia(shorter.id)->timecode = -1;
+        QVERIFY(!replaceSources(fx.p, fx.s(), clips, shorter.id, true).ok);
     }
 
     void undoRedo() {
@@ -9215,6 +9752,65 @@ private slots:
         QVERIFY(overwrite(p, top, {TrackKind::Video, 2}, title).ok);
         m = matchSource(p, top, 160);
         QVERIFY(m && m->media == camB);
+    }
+
+    // Nightly 10 Nov: a track group and a take pass made on each side since the base got the same ids, so the two
+    // groups became one; their side's are given new ids, the tracks and lanes following.
+    void projectMergeTrackGroupsAndPasses() {
+        Project base = makeDefaultProject();
+        while (base.active()->audioTracks.size() < 4) {
+            Track t;
+            t.id = base.newId();
+            t.name = "A" + std::to_string(base.active()->audioTracks.size() + 1);
+            base.active()->audioTracks.push_back(t);
+        }
+        MediaItem take;
+        take.id = base.newId();
+        take.kind = MediaKind::Audio;
+        take.name = "take.wav";
+        take.path = "/nonexistent/take.wav";
+        take.duration = 10;
+        take.hasAudio = true;
+        base.media.push_back(take);
+        auto side = [&](const char* name, int first) {
+            Project p = base;
+            Sequence& s = *p.active();
+            const edit::Result made = edit::createTrackGroup(p, s, name, {{TrackKind::Audio, first}, {TrackKind::Audio, first + 1}});
+            const Id pass = p.newId();
+            for (int k = first; k < first + 2; ++k) {
+                TakeLane l;
+                l.id = p.newId();
+                l.name = "Take 1";
+                l.mediaId = take.id;
+                l.pass = pass;
+                l.number = 1;
+                s.audioTracks[size_t(k)].lanes.push_back(l);
+            }
+            return std::make_pair(p, made.ok ? made.created.front() : Id(0));
+        };
+        const auto [mine, mineGroup] = side("Drums", 0);
+        const auto [theirs, theirGroup] = side("Vox", 2);
+        QVERIFY(mineGroup && mineGroup == theirGroup);  // (the same id made on each side)
+        const MergeResult r = mergeProjects(base, mine, theirs);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Sequence& s = *r.project.active();
+        QCOMPARE(s.trackGroups.size(), size_t(2));
+        QVERIFY(s.trackGroups[0].id != s.trackGroups[1].id);
+        auto groupNamed = [&](const char* name) {
+            for (const TrackGroup& g : s.trackGroups)
+                if (g.name == name) return g.id;
+            return Id(0);
+        };
+        QVERIFY(groupNamed("Drums") && groupNamed("Vox"));
+        QCOMPARE(s.audioTracks[0].group, groupNamed("Drums"));
+        QCOMPARE(s.audioTracks[1].group, groupNamed("Drums"));
+        QCOMPARE(s.audioTracks[2].group, groupNamed("Vox"));
+        QCOMPARE(s.audioTracks[3].group, groupNamed("Vox"));
+        QVERIFY(s.audioTracks[0].lanes.size() == 1 && s.audioTracks[2].lanes.size() == 1);
+        QCOMPARE(s.audioTracks[0].lanes[0].pass, s.audioTracks[1].lanes[0].pass);
+        QCOMPARE(s.audioTracks[2].lanes[0].pass, s.audioTracks[3].lanes[0].pass);
+        QVERIFY(s.audioTracks[0].lanes[0].pass != s.audioTracks[2].lanes[0].pass);
+        QCOMPARE(groupMembers(s, groupNamed("Drums")).size(), size_t(2));
     }
 
     void projectMerge() {

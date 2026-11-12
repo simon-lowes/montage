@@ -20,8 +20,6 @@
 #include "media/Decoder.h"
 #include "media/SoundLibrary.h"
 
-class QAudioSink;
-class QBuffer;
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
@@ -34,6 +32,8 @@ class QTableWidget;
 class QTimer;
 
 namespace montage {
+
+class SoundOut;
 
 class EditorState;
 class SoundWaveView;
@@ -83,6 +83,7 @@ public:
     void play();
     void stop();
     bool playing() const;
+    const SoundOut* previewOutput() const { return out_; }  // (null until a sound was first played)
 
 protected:
     bool eventFilter(QObject* o, QEvent* e) override;
@@ -118,8 +119,12 @@ private:
     std::shared_ptr<std::atomic<int>> heard_, toHear_;
     bool scanning_ = false, listening_ = false;
     int run_ = 0;  // which rescan is the latest
-    QAudioSink* sink_ = nullptr;
-    QBuffer* playing_ = nullptr;
+    void topUp();
+    SoundOut* out_ = nullptr;  // the preview's output (the audio device's, or Qt Multimedia's)
+    QTimer* feed_ = nullptr;
+    std::vector<float> preview_;  // (48 kHz stereo)
+    qint64 sent_ = 0;
+    bool playing_ = false;
 };
 
 }  // namespace montage

@@ -33,6 +33,7 @@ class Host {
 public:
     ~Host();
     std::string key;
+    bool gpu = false;  // started with --gpu (OpenFX renders on the GPU): not shared with a host started without
     std::unique_ptr<ipc::Process> proc;
     Channel control;
     std::mutex controlM;
@@ -42,12 +43,18 @@ public:
     // What the host said as it crashed (signal or exception code; 0: it did not), told before the process ends.
     uint32_t crashCode() const;
     void kill();
+    // Whether Montage stopped it (kill: for a hang, memory, a failed attach), its failure recorded by whoever did.
+    bool stoppedByMontage() const { return killed_.load(std::memory_order_acquire); }
     std::atomic<int> instances{0};
     // Set by the first to report this host's end (renders on several threads see it end together; one failure).
     std::atomic<bool> failureTaken{false};
+    // The plug-in it was loading when it ended ("" when it was loading none): that one alone is to blame.
+    std::string loading() const;
+    // Whether the plug-in it notes is `id` (a long id is noted cut short, and matched as far as it goes).
+    bool wasLoading(const std::string& id) const;
 
 private:
-    std::atomic<bool> dead_{false};
+    std::atomic<bool> dead_{false}, killed_{false};
 };
 
 // The running host for a key, or a new one (null with why when none can start).
@@ -70,28 +77,33 @@ struct Attached {
     int latency = 0;
     std::string error;
 };
-Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json);
+// `id` is the plug-in's: a host that ends while loading it (as its control block says) is its doing, whatever else the
+// host held; one that ends while loading another plug-in is not.
+Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json, const std::string& id);
 
 // Puts `data` in the channel's payload, through PutBlob when longer (true when it fits or went).
 bool sendPayload(Channel& c, Host& host, const std::string& data, int64_t timeoutUs, Result* r);
 // Reads a reply's blob of `size` bytes (the first part already in the payload).
 bool receiveBlob(Channel& c, Host& host, int64_t size, std::string& out, int64_t timeoutUs, Result* r);
 
-// The host key for a plug-in under a grouping ("ofx:" in front for OpenFX: video plug-ins have hosts of their own).
-std::string hostKey(Isolation grouping, const std::string& id, const std::string& maker, bool ofx);
+// The host key for a plug-in under a grouping ("ofx:" in front for OpenFX: video plug-ins have hosts of their own);
+// `instance` names the instance for a host of its own (PerInstance).
+std::string hostKey(Isolation grouping, const std::string& id, const std::string& maker, bool ofx, const std::string& instance = {});
 Isolation currentIsolation();
 
 // Records a failure (any thread but the audio thread).
 // (`offlineNoted`: noteOfflineFailure already told the export.)
 void recordFailure(const std::string& id, const std::string& name, const std::string& vendor, const std::string& kind,
                    const std::string& reason, bool offline, bool countsAsNew = true, bool offlineNoted = false);
-// Tells an export running now that a plug-in failed, at once (the thread rendering it, not the audio thread).
+// Tells the export rendering on this thread that a plug-in failed, at once (not the audio thread). An offline render
+// that is no export's (no ExportScope on its thread) tells nobody.
 void noteOfflineFailure(const std::string& name, const std::string& why);
 void noteRestart(const std::string& id);
 bool pluginHeldBypassed(const std::string& id);  // disabled after failing
 int autoRestartsLeft(const std::string& id);
 void useAutoRestart(const std::string& id);
-// (OpenFX, which has no stand-in to hold) failed past its restarts: bypassed until Restart.
+// (OpenFX, which has no stand-in to hold) failed past its restarts: bypassed until Restart. `id` is the plug-in's, or
+// "<id>#<effect id>" for an instance in a host of its own (Restart of the plug-in brings those back too).
 void markExhausted(const std::string& id);
 bool exhausted(const std::string& id);
 
