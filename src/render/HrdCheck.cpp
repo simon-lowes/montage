@@ -1890,7 +1890,7 @@ double HrdSplicer::nextDelay() const {
     return nextRemoval - end;
 }
 
-void HrdSplicer::pad(Held& h, int64_t bytes) {
+void HrdSplicer::pad(Held& h, int64_t bytes, int64_t room) {
     if (bytes <= 0) return;
     if (codec_ == kMpeg2) {
         h.au.insert(h.au.end(), size_t(bytes), 0);  // (zero bytes before the next start code)
@@ -1899,9 +1899,14 @@ void HrdSplicer::pad(Held& h, int64_t bytes) {
     // Filler data NAL units (H.264 type 12, HEVC type 38) after the picture's own: start code, header, 0xFF..., 0x80.
     const int hb = headerBytes(codec_);
     const int64_t overhead = 4 + hb + 1;
-    // (fewer bytes than a filler unit's own: none, a few bytes short, rather than a whole unit's more than asked, which
-    // would overflow the buffer, or arrive after the picture's removal)
-    if (bytes < overhead) return;
+    // Fewer bytes than a filler unit's own: a whole unit where the picture still arrives by its removal with it (the
+    // buffer then stands a few bytes under what was asked, which nothing is harmed by; a few bytes over, with none
+    // added, is past full at a low rate, where five bytes are more than the two ticks kept free). None where it
+    // would not arrive in time.
+    if (bytes < overhead) {
+        if (room < overhead) return;
+        bytes = overhead;
+    }
     int64_t payload = bytes - overhead;
     Nals nals = splitNals(h.au.data(), h.au.size(), lengthSize_);
     int tid = 1;
@@ -1941,7 +1946,7 @@ void HrdSplicer::finalize(Held& h, double nextRemoval, double nextAsked) {
         const double room = h.removal - end;
         const double padSeconds = std::min(over, room);
         if (padSeconds > 0) {
-            pad(h, int64_t(std::floor(padSeconds * rate_ / 8)));
+            pad(h, int64_t(std::floor(padSeconds * rate_ / 8)), int64_t(std::floor(room * rate_ / 8)));
             bits = double(bitsOf(h.au));
         }
     }

@@ -23477,6 +23477,132 @@ if ui["pressed"] == "add":
         }
     }
 
+    // Nightly 15 Nov: padding at a low constant rate. Pictures encoded here whose sizes leave the buffer one to five
+    // bytes over where it should stand (less than a filler unit's own six) each get a whole unit: the buffer is never
+    // past full at any removal, and every picture has arrived by its own. With none added it stood up to five bytes
+    // over, which at 400 kb/s is more than the two ticks kept free.
+    void hrdPaddingAtLowRates() {
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+        // (a plain colour: every picture, keyframes too, far under a frame's share of the rate)
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "color", 120));
+        ExportSettings st;
+        st.videoCodec = "libx264";
+        st.audioCodec = "none";
+        st.preset = "veryfast";
+        st.gop = 25;
+        st.hrd = "cbr";
+        st.videoBitrate = 400000;
+        st.path = path("low-rate-src.mp4");
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        // Its access units without their filler data and SEI (the splicer writes its own), and its parameter sets.
+        using Unit = std::vector<uint8_t>;
+        std::vector<std::vector<Unit>> pictures;
+        std::vector<Unit> sets;
+        int lengthSize = 0;
+        {
+            AVFormatContext* in = nullptr;
+            QVERIFY(avformat_open_input(&in, st.path.c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(in, nullptr);
+            const AVCodecParameters* par = in->streams[0]->codecpar;
+            sets = hrd::parameterSets(AV_CODEC_ID_H264, par->extradata, size_t(par->extradata_size), lengthSize);
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(in, pkt) >= 0) {
+                std::vector<Unit> units;
+                for (int at = 0; at + 4 <= pkt->size;) {
+                    const int n = int(qFromBigEndian<quint32>(pkt->data + at));
+                    at += 4;
+                    if (n <= 0 || at + n > pkt->size) break;
+                    const int type = pkt->data[at] & 0x1f;
+                    if (type != 12 && type != 6) units.emplace_back(pkt->data + at, pkt->data + at + n);
+                    at += n;
+                }
+                pictures.push_back(std::move(units));
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&in);
+        }
+        QCOMPARE(lengthSize, 4);
+        QCOMPARE(pictures.size(), size_t(120));
+        auto joined = [](const std::vector<Unit>& units) {
+            Unit au;
+            for (const Unit& u : units) {
+                const uint32_t n = uint32_t(u.size());
+                au.insert(au.end(), {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)});
+                au.insert(au.end(), u.begin(), u.end());
+            }
+            return au;
+        };
+        // (what the splicer adds to each of its own: its SEI, the same wherever the picture's size is changed)
+        std::vector<int64_t> added;
+        {
+            HrdSplicer plain;
+            QVERIFY(plain.start(AV_CODEC_ID_H264, sets, lengthSize, 25, 2));
+            QVERIFY(plain.cbr() && plain.bitRate() == 400000.0);
+            for (size_t i = 0; i <= pictures.size(); ++i) {
+                const Unit out = i < pictures.size() ? plain.push(joined(pictures[i]), int64_t(i), true, false, nullptr) : plain.finish(nullptr);
+                if (i > 0) added.push_back(int64_t(out.size()) - int64_t(joined(pictures[i - 1]).size()));
+            }
+        }
+        // The first twenty go in as they are (small: the splicer fills the buffer and pads them whole). Each one after
+        // is made up with filler data of its encoder's to a frame's bytes less a few: 30 (a pad the splicer makes
+        // whole), then 1 to 9 in turn (under a unit's own six, and just over).
+        HrdSplicer splicer;
+        QVERIFY(splicer.start(AV_CODEC_ID_H264, sets, lengthSize, 25, 2));
+        const double rate = splicer.bitRate(), size = splicer.bufferBits();
+        const int64_t frameBytes = int64_t(rate / 25 / 8);
+        std::vector<Unit> made;
+        int shaped = 0;
+        for (size_t i = 0; i <= pictures.size(); ++i) {
+            Unit out;
+            if (i < pictures.size()) {
+                std::vector<Unit> units = pictures[i];
+                const int64_t now = int64_t(joined(units).size()) + added[i];
+                const int64_t under = i % 2 == 0 ? 30 : 1 + int64_t(i / 2) % 9;
+                const int64_t fill = frameBytes - under - now - 4 - 2;  // (a filler unit: its length, its header and its end)
+                if (i >= 20 && fill >= 1) {
+                    Unit f{12};
+                    f.insert(f.end(), size_t(fill), 0xff);
+                    f.push_back(0x80);
+                    units.push_back(std::move(f));
+                    ++shaped;
+                }
+                out = splicer.push(joined(units), int64_t(i), true, true, nullptr);
+            } else {
+                out = splicer.finish(nullptr);
+            }
+            if (i > 0) made.push_back(std::move(out));
+        }
+        QCOMPARE(made.size(), pictures.size());
+        QVERIFY2(shaped >= 90, qPrintable(QString::number(shaped)));
+        // The buffer run as the splicer keeps it: bits in at the rate from the start, the first picture taken after
+        // nine tenths of the buffer's time, one each frame after; four bytes of start code for each unit.
+        const double first = 0.9 * size / rate;
+        double taken = 0, highest = 0, latest = 0;
+        int smallest = 0;
+        for (size_t i = 0; i < made.size(); ++i) {
+            const double removal = first + double(i) / 25;
+            highest = std::max(highest, rate * removal - taken - size);
+            double bits = 0;
+            for (int at = 0; at + 4 <= int(made[i].size());) {
+                const int n = int(qFromBigEndian<quint32>(made[i].data() + at));
+                if ((made[i][size_t(at) + 4] & 0x1f) == 12 && n == 2) ++smallest;
+                bits += double(n + 4) * 8;
+                at += 4 + n;
+            }
+            taken += bits;
+            latest = std::max(latest, taken - rate * removal);
+        }
+        qInfo("padding at %.0f bits/s: fullest %.1f bits from full, latest %.1f bits from late, %d units of filler with nothing in them", rate, highest,
+              latest, smallest);
+        QVERIFY2(highest <= 1e-6, qPrintable(QString::number(highest)));
+        QVERIFY2(latest <= 1e-6, qPrintable(QString::number(latest)));
+        QVERIFY(smallest >= 5);
+    }
+
     // Nightly 15 Nov: a joined stream's pictures wait no longer between decoding and showing than their reordering
     // needs. Segments coded without B-pictures are shown as they are decoded (they waited two frames); segments and a
     // smart render's joins whose B-pictures reorder by two wait two (the smart render's waited three). Read from each
