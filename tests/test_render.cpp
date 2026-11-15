@@ -23859,6 +23859,197 @@ colorspaces:
 #endif
     }
 
+    void browserReviewRelaySecret_data() {
+        QTest::addColumn<bool>("coturn");
+        QTest::newRow("libjuice") << false;
+        QTest::newRow("coturn") << true;
+    }
+
+    // A review only through a relay that shares a secret with Montage. With coturn (the "coturn" row: turnserver on
+    // this computer's loopback with that secret, where there is one), the relay works each login out for itself;
+    // libjuice's relay (the other row) is told the review's login and forgets it when its time is up. A link with a
+    // fresh login plays in Chrome, and in Firefox where there is one, through the relay at both ends; a login whose
+    // time has passed is refused by the relay; and once the link's own time is up the page says so and the relay
+    // takes its login no more.
+    void browserReviewRelaySecret() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        QFETCH(bool, coturn);
+        const std::string secret = "a shared secret made up for this test";
+        QTemporaryDir dir;
+        QProcess server;
+        auto endServer = qScopeGuard([&] {
+            if (server.state() == QProcess::NotRunning) return;
+            server.terminate();
+            if (!server.waitForFinished(5000)) server.kill();
+            server.waitForFinished(3000);
+        });
+        auto serverLog = [&] {
+            QFile f(dir.path() + "/turnserver.log");
+            return f.open(QIODevice::ReadOnly) ? f.readAll().right(3000) : QByteArray();
+        };
+        int turnPort = 0;
+#ifdef MONTAGE_TEST_TURN
+        juice_server_t* turn = nullptr;
+        auto endTurn = qScopeGuard([&] {
+            if (turn) juice_server_destroy(turn);
+        });
+#endif
+        if (coturn) {
+#ifndef Q_OS_LINUX
+            QSKIP("coturn is run for this test on Linux only");
+#else
+            QString exe = QString::fromLocal8Bit(qgetenv("MONTAGE_TEST_TURNSERVER"));
+            if (exe.isEmpty()) exe = QStandardPaths::findExecutable(QStringLiteral("turnserver"));
+            if (exe.isEmpty()) QSKIP("Needs coturn's turnserver (MONTAGE_TEST_TURNSERVER, or turnserver on the PATH)");
+            if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+            // (a port free for UDP and for TCP: the relay listens on both)
+            for (int tries = 0; tries < 20 && !turnPort; ++tries) {
+                QUdpSocket udp;
+                QTcpServer tcp;
+                if (udp.bind(QHostAddress::LocalHost, 0) && tcp.listen(QHostAddress::LocalHost, udp.localPort())) turnPort = udp.localPort();
+            }
+            QVERIFY(turnPort != 0);
+            server.setProcessChannelMode(QProcess::MergedChannels);
+            server.setStandardOutputFile(dir.path() + "/turnserver.log");
+            server.start(exe, {"-n", "--log-file=stdout", "--no-cli", "--no-tls", "--no-dtls", "--listening-ip=127.0.0.1", "--relay-ip=127.0.0.1",
+                               "--listening-port=" + QString::number(turnPort), "--min-port=49160", "--max-port=49260", "--allow-loopback-peers",
+                               "--use-auth-secret", "--static-auth-secret=" + QString::fromStdString(secret), "--realm=montage-test",
+                               "--pidfile=" + dir.path() + "/turnserver.pid", "--userdb=" + dir.path() + "/turndb"});
+            QVERIFY2(server.waitForStarted(15000), qPrintable(server.errorString()));
+            // It is up once it answers a STUN binding request.
+            bool up = false;
+            QElapsedTimer waited;
+            waited.start();
+            QUdpSocket ask;
+            ask.setProxy(QNetworkProxy::NoProxy);
+            QVERIFY(ask.bind(QHostAddress::LocalHost, 0));
+            while (!up && waited.elapsed() < 30000 && server.state() != QProcess::NotRunning) {
+                ask.writeDatagram(QByteArray::fromHex("000100002112a442") + QByteArray(12, 'q'), QHostAddress::LocalHost, quint16(turnPort));
+                if (ask.waitForReadyRead(300)) {
+                    QByteArray d(int(ask.pendingDatagramSize()), 0);
+                    ask.readDatagram(d.data(), d.size());
+                    up = d.startsWith(QByteArray::fromHex("0101"));
+                }
+            }
+            QVERIFY2(up, serverLog().constData());
+#endif
+        } else {
+#ifndef MONTAGE_TEST_TURN
+            QSKIP("Needs libjuice's TURN server (a build with WebRTC)");
+#else
+            if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+            juice_server_config_t config{};
+            config.max_allocations = 16;
+            config.max_peers = 16;
+            config.bind_address = "127.0.0.1";
+            config.port = 0;
+            config.realm = "montage-test";
+            turn = juice_server_create(&config);
+            QVERIFY(turn);
+            turnPort = juice_server_get_port(turn);
+#endif
+        }
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        // The browsers are started first: the link's time runs from when the review starts.
+        const bool firefox = !GeckoBrowser::firefox().empty() && !GeckoBrowser::geckodriver().empty();
+        if (coturn && !firefox && qEnvironmentVariableIsSet("MONTAGE_REQUIRE_FIREFOX")) QFAIL("MONTAGE_REQUIRE_FIREFOX is set, and no Firefox and geckodriver were found");
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why, {"--allow-loopback-in-peer-connection"}), why.c_str());
+        GeckoBrowser fx;
+        if (firefox) QVERIFY2(fx.start(&why), why.c_str());
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.settings.turnServer = "turn:127.0.0.1:" + std::to_string(turnPort);
+        rig.settings.turnSecret = secret;
+        rig.settings.turnExpirySeconds = 60;
+        rig.settings.relayOnly = true;
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        rig.picture = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        const qint64 expires = rig.review->stats().linkExpires;
+        QVERIFY(expires > QDateTime::currentSecsSinceEpoch() + 50);
+        const TurnLogin login = turnRestLogin(secret, expires);
+#ifdef MONTAGE_TEST_TURN
+        if (turn) {
+            juice_server_credentials_t made{login.user.c_str(), login.password.c_str(), 0};
+            QCOMPARE(juice_server_add_credentials(turn, &made, (unsigned long)((expires - QDateTime::currentSecsSinceEpoch()) * 1000)), 0);
+        }
+#endif
+        // Chrome: given the login the secret makes (not the secret), it plays, both ends of the pair in use at the relay.
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        QCOMPARE(tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+        QVERIFY2(tab.until("__montage.stage === 'connected' && __montage.presented > 10", 30),
+                 (tab.js("__montage.stage").toString() + " " + QString::fromStdString(rig.review->stats().error) + " " + QString::fromUtf8(serverLog())).toUtf8().constData());
+        QCOMPARE(tab.js("__montage.pc.getConfiguration().iceServers.filter(s => s.username).map(s => s.username + ' ' + s.credential).join()").toString(),
+                 QString::fromStdString(login.user + " " + login.password));
+        QCOMPARE(tab.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
+        const QString pair = tab.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
+                                    "return p ? r.get(p.localCandidateId).candidateType + ' ' + r.get(p.remoteCandidateId).candidateType : ''; })")
+                                 .toString();
+        QCOMPARE(pair, QStringLiteral("relay relay"));
+        // Firefox the same.
+        if (firefox) {
+            auto until = [&](const QString& expression, int seconds) {
+                QElapsedTimer t;
+                t.start();
+                while (t.elapsed() < seconds * 1000) {
+                    if (fx.js(expression).toBool()) return true;
+                    QThread::msleep(100);
+                }
+                return false;
+            };
+            QVERIFY2(fx.navigate(rig.page(), &why), why.c_str());
+            QVERIFY2(until("document.readyState === 'complete' && !!window.__montage", 20), fx.log().right(2000).constData());
+            QCOMPARE(fx.js("__montage.join('Bo', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+            QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30),
+                     (fx.js("__montage.stage").toString() + " " + fx.js("__montage.pc.iceConnectionState").toString() + " " +
+                      QString::fromStdString(rig.review->stats().error) + " " + QString::fromUtf8(serverLog()))
+                         .toUtf8()
+                         .constData());
+            QCOMPARE(fx.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
+            // (the pair in use, where Firefox's statistics name it)
+            const QString types = fx.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'candidate-pair' && (s.selected || (s.nominated && s.state === 'succeeded'))) p = s; });"
+                                        "const l = p && r.get(p.localCandidateId), m = p && r.get(p.remoteCandidateId); return l && m ? l.candidateType + ' ' + m.candidateType : ''; })")
+                                      .toString();
+            qInfo("Firefox %s through the relay: %s", qPrintable(fx.version()), qPrintable(types));
+            if (!types.isEmpty()) QCOMPARE(types, QStringLiteral("relay relay"));
+            QCOMPARE(rig.review->stats().viewers, 2);
+        } else {
+            qInfo("No Firefox and geckodriver here: Chrome alone");
+        }
+        // A login made for a time already past: the relay refuses it.
+        {
+            RelayBridge past("127.0.0.1", uint16_t(turnPort), turnRestLogin(secret, QDateTime::currentSecsSinceEpoch() - 60));
+            const std::string refused = allocateAt(past);
+            QVERIFY2(QString::fromStdString(refused).contains("login"), (refused + " " + serverLog().toStdString()).c_str());
+        }
+        // The review's own login is still taken while its time lasts.
+        {
+            RelayBridge fresh("127.0.0.1", uint16_t(turnPort), login);
+            QCOMPARE(allocateAt(fresh), std::string());
+        }
+        // Once the link's time is up: the page tells a newcomer so, and the relay takes the review's login no more.
+        while (QDateTime::currentSecsSinceEpoch() < expires + 2) QThread::msleep(200);
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        QCOMPARE(tab.js("__montage.join('Cy', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("This review link has expired"));
+        {
+            RelayBridge late("127.0.0.1", uint16_t(turnPort), login);
+            const std::string refused = allocateAt(late);
+            QVERIFY2(QString::fromStdString(refused).contains("login"), (refused + " " + serverLog().toStdString()).c_str());
+        }
+    }
+
     void ndiOutput() {
         using namespace montage::output;
         // A stand-in NDI Runtime where the SDK says to look.
