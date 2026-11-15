@@ -1531,16 +1531,54 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
         obus(par->extradata, size_t(par->extradata_size), [&](int type, int, int, const uint8_t* p, size_t n, size_t) {
             if (type == 1 && !seq.valid) seq = parseAv1Sequence(p, n);
         });
-    struct Packet {
-        std::vector<uint8_t> data;
-        int64_t pts = AV_NOPTS_VALUE;
-        int64_t shown = 0;
+    // What the model needs of the stream, kept as it is read (never the stream itself: two hours of it are gigabytes):
+    // each OBU's kind, layer and size, a frame header's parse, and each temporal unit's time.
+    struct Obu {
+        uint8_t type = 0, tid = 0, sid = 0;
+        int32_t frame = -1;  // (a frame header's: its place in `headers`)
+        int64_t unit = 0;    // the temporal unit (packet) it is in
+        int64_t whole = 0;   // its bytes, header and all
     };
-    std::vector<Packet> packets;
+    std::vector<Obu> units;
+    std::vector<Av1Frame> headers;
+    std::vector<int64_t> ptsOf;
+    Av1Seq running = seq;  // (the sequence header in force as the stream is read)
+    bool modelStated = true;
+    auto states = [](const Av1Seq& q) {
+        bool any = false;
+        for (const Av1Op& op : q.ops) any = any || op.model;
+        return q.valid && q.timing && q.modelInfo && any && q.timeScale != 0 && q.decodingTick != 0;
+    };
     AVPacket* pkt = av_packet_alloc();
     while (pkt && av_read_frame(fmt, pkt) >= 0) {
         if (cancel && cancel->load()) break;
-        if (pkt->stream_index == v) packets.push_back({std::vector<uint8_t>(pkt->data, pkt->data + pkt->size), pkt->pts, 0});
+        if (pkt->stream_index == v) {
+            const int64_t k = int64_t(ptsOf.size());
+            ptsOf.push_back(pkt->pts);
+            obus(pkt->data, size_t(pkt->size), [&](int type, int tid, int sid, const uint8_t* p, size_t n, size_t whole) {
+                Obu o;
+                o.type = uint8_t(type), o.tid = uint8_t(tid), o.sid = uint8_t(sid);
+                o.unit = k, o.whole = int64_t(whole);
+                if (type == 1) {
+                    const Av1Seq q = parseAv1Sequence(p, n);
+                    if (q.valid) {
+                        running = q;
+                        // (the sequence header the stream starts with: its first packet's, else the container's)
+                        if (k == 0) seq = q;
+                    }
+                } else if ((type == 3 || type == 6) && headers.size() < size_t(INT32_MAX)) {
+                    o.frame = int32_t(headers.size());
+                    headers.push_back(parseAv1Frame(p, n, running, tid, sid));
+                }
+                units.push_back(o);
+            });
+            // (a stream that states no model is not read to its end)
+            if (k == 0 && !states(seq)) {
+                modelStated = false;
+                av_packet_unref(pkt);
+                break;
+            }
+        }
         av_packet_unref(pkt);
     }
     av_packet_free(&pkt);
@@ -1548,33 +1586,26 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
         r.note = "cancelled";
         return;
     }
-    if (packets.empty()) {
+    if (ptsOf.empty()) {
         r.note = "no pictures";
         return;
     }
-    {
-        std::vector<std::pair<int64_t, size_t>> order;
-        for (size_t k = 0; k < packets.size(); ++k) order.push_back({packets[k].pts == AV_NOPTS_VALUE ? int64_t(k) : packets[k].pts, k});
-        std::stable_sort(order.begin(), order.end());
-        for (size_t i = 0; i < order.size(); ++i) packets[order[i].second].shown = int64_t(i);
-    }
-    // The sequence header the stream starts with (its first packet's, else the container's).
-    obus(packets[0].data.data(), packets[0].data.size(), [&](int type, int, int, const uint8_t* p, size_t n, size_t) {
-        if (type == 1) {
-            const Av1Seq q = parseAv1Sequence(p, n);
-            if (q.valid) seq = q;
-        }
-    });
     if (!seq.valid) {
         r.note = "no sequence header";
         return;
     }
     r.model = "decoder model";
-    bool any = false;
-    for (const Av1Op& op : seq.ops) any = any || op.model;
-    if (!seq.timing || !seq.modelInfo || !any || seq.timeScale == 0 || seq.decodingTick == 0) {
+    if (!modelStated) {
         r.note = "the stream states no decoder model (AV1's is optional): nothing to check it against";
         return;
+    }
+    std::vector<int64_t> shownOf(ptsOf.size(), 0);
+    {
+        std::vector<std::pair<int64_t, size_t>> order;
+        order.reserve(ptsOf.size());
+        for (size_t k = 0; k < ptsOf.size(); ++k) order.push_back({ptsOf[k] == AV_NOPTS_VALUE ? int64_t(k) : ptsOf[k], k});
+        std::stable_sort(order.begin(), order.end());
+        for (size_t i = 0; i < order.size(); ++i) shownOf[order[i].second] = int64_t(i);
     }
     const double tick = double(seq.decodingTick) / double(seq.timeScale);
     for (size_t opIndex = 0; opIndex < seq.ops.size(); ++opIndex) {
@@ -1592,33 +1623,32 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
         std::vector<Av1Group> groups;
         Av1Group cur;
         bool inFrame = false, missing = false;
-        Av1Seq q = seq;
-        for (size_t k = 0; k < packets.size(); ++k) {
-            obus(packets[k].data.data(), packets[k].data.size(), [&](int type, int tid, int sid, const uint8_t* p, size_t n, size_t whole) {
-                if (op.idc != 0 && type != 1 && type != 2 && !(((op.idc >> tid) & 1) && ((op.idc >> (sid + 8)) & 1))) return;  // (not of this operating point)
-                // A frame ends with its last tile group (a repeated header among them is its own).
-                if (inFrame && type != 4 && type != 7) {
-                    groups.push_back(cur);
-                    cur = Av1Group{};
-                    inFrame = false;
+        for (const Obu& o : units) {
+            const int type = o.type, tid = o.tid, sid = o.sid;
+            if (op.idc != 0 && type != 1 && type != 2 && !(((op.idc >> tid) & 1) && ((op.idc >> (sid + 8)) & 1))) continue;  // (not of this operating point)
+            // A frame ends with its last tile group (a repeated header among them is its own).
+            if (inFrame && type != 4 && type != 7) {
+                groups.push_back(cur);
+                cur = Av1Group{};
+                inFrame = false;
+            }
+            cur.bits += o.whole * 8;
+            if ((type == 3 || type == 6) && !inFrame && o.frame >= 0) {
+                const Av1Frame& f = headers[size_t(o.frame)];
+                if (f.ok && !f.showExisting) {
+                    inFrame = true;
+                    cur.key = f.key;
+                    cur.removal = opIndex < f.removal.size() ? f.removal[opIndex] : -1;
+                    cur.unit = o.unit, cur.shown = shownOf[size_t(o.unit)];
+                    if (cur.removal < 0) missing = true;
                 }
-                cur.bits += int64_t(whole) * 8;
-                if (type == 1) {
-                    const Av1Seq s2 = parseAv1Sequence(p, n);
-                    if (s2.valid) q = s2;
-                } else if ((type == 3 || type == 6) && !inFrame) {
-                    const Av1Frame f = parseAv1Frame(p, n, q, tid, sid);
-                    if (f.ok && !f.showExisting) {
-                        inFrame = true;
-                        cur.key = f.key;
-                        cur.removal = opIndex < f.removal.size() ? f.removal[opIndex] : -1;
-                        cur.unit = int64_t(k), cur.shown = packets[k].shown;
-                        if (cur.removal < 0) missing = true;
-                    }
-                }
-            });
+            }
         }
         if (inFrame) groups.push_back(cur);
+        if (cancel && cancel->load()) {
+            r.note = "cancelled";
+            return;
+        }
         if (groups.empty()) continue;
         if (missing) {
             if (!r.note.empty()) r.note += "; ";
@@ -1651,8 +1681,12 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
                 first[i] = 0;
             } else {
                 // (buffer_removal_time counts modulo 2^length from the last random access point: the next such time)
+                // (worked out, not stepped to: a short counter far from its random access point wraps many times)
                 double t = scheduled[rap] + double(groups[i].removal) * tick;
-                while (t <= scheduled[i - 1] + 1e-9 && wrap < 1e6) t += wrap;
+                if (t <= scheduled[i - 1] + 1e-9 && wrap < 1e6 && wrap > 0) {
+                    t += std::floor((scheduled[i - 1] + 1e-9 - t) / wrap) * wrap;
+                    for (int more = 0; more < 4 && t <= scheduled[i - 1] + 1e-9; ++more) t += wrap;
+                }
                 scheduled[i] = t;
                 first[i] = std::max(last[i - 1], scheduled[i] - window);
             }
@@ -1674,10 +1708,20 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
             }
             if (groups[i].key) rap = i;
         }
-        // E.6.3: the bits in the buffer just before each removal.
+        // E.6.3: the bits in the buffer just before each removal: the groups from this one on whose first bits have
+        // arrived by then, all of each but (maybe) the last of them, which is still arriving. Groups arrive one after
+        // another, so those are a run found by its end (stated delays of hours would else make every group be counted
+        // for every other).
+        std::vector<double> before(n + 1, 0.0);  // (the bits of the groups before each: whole numbers, exact)
+        for (size_t i = 0; i < n; ++i) before[i + 1] = before[i] + double(groups[i].bits);
         for (size_t i = 0; i < n; ++i) {
+            if ((i & 0xffff) == 0 && cancel && cancel->load()) {
+                r.note = "cancelled";
+                return;
+            }
+            const size_t end = size_t(std::lower_bound(first.begin() + std::ptrdiff_t(i), first.end(), removal[i]) - first.begin());
             double full = 0;
-            for (size_t m = i; m < n && first[m] < removal[i]; ++m) full += std::min(double(groups[m].bits), (removal[i] - first[m]) * rate);
+            if (end > i) full = before[end - 1] - before[i] + std::min(double(groups[end - 1].bits), (removal[i] - first[end - 1]) * rate);
             if (full > size * (1 + 1e-9) + 8) issue(i, "overflow", format("the buffer would hold %.0f bits of its %.0f", full, size));
             sched.highest = std::max(sched.highest, full / size);
             if (i + 1 < n) sched.lowest = std::min(sched.lowest, std::max(0.0, full - double(groups[i].bits)) / size);
