@@ -22842,136 +22842,6 @@ colorspaces:
 #endif
     }
 
-    void ndiOutput() {
-        using namespace montage::output;
-        // A stand-in NDI Runtime where the SDK says to look.
-        qputenv("NDI_RUNTIME_DIR_V6", MONTAGE_TEST_NDI_DIR);
-        const auto ndi = findBackend("NDI");
-        QVERIFY(ndi);
-        std::string why;
-        QVERIFY2(ndi->available(&why), why.c_str());
-        const std::vector<Device> devices = ndi->devices();
-        QCOMPARE(devices.size(), size_t(1));
-        QVERIFY(devices[0].modes.empty());  // any size and rate
-        montage::plugins::DynLib fake;
-        QVERIFY2(fake.open(MONTAGE_TEST_NDI_LIBRARY, &why), why.c_str());
-        auto info = [&] {
-            auto fn = reinterpret_cast<int (*)(char*, int)>(fake.symbol("fake_ndi_info"));
-            char buf[1024] = {};
-            if (fn) fn(buf, sizeof buf);
-            return QString::fromUtf8(buf);
-        };
-        // An HDR (PQ) sequence: 16-bit P216 with its colour metadata, stereo sound as planar float, timecode in
-        // 100 ns units.
-        Project p = makeDefaultProject();
-        Sequence& s = *p.active();
-        s.width = 64, s.height = 36, s.fps = {25, 1}, s.sampleRate = 48000, s.colorSpace = "rec2100pq";
-        Scheduler sched(ndi);
-        const Mode mode{modeName(64, 36, {25, 1}, false), 64, 36, {25, 1}, false, 0};
-        Config cfg;
-        QVERIFY2(sched.start(devices[0], mode, s, cfg, &why), why.c_str());
-        sched.setAudioSource([](int64_t, int frames, int channels, float* out) {
-            for (int i = 0; i < frames; ++i) out[size_t(i) * size_t(channels)] = 0.5f, out[size_t(i) * size_t(channels) + 1] = -0.25f;
-        });
-        auto img = std::make_shared<Image>(64, 36);
-        img->fill(0, 0, 0, 1);
-        sched.submit(3, img);
-        sched.setPosition(3, 1);
-        QTRY_VERIFY_WITH_TIMEOUT(sched.stats().sent >= 6 && info().contains("audios=") && !info().contains("audios=0 "), 10000);
-        QCOMPARE(sched.stats().receivers, 1);
-        sched.stop();
-        const QString got = info();
-        for (const char* want : {"name=Montage clock=1", "fourcc=P216", "x=64 y=36 rate=25/1 stride=128",
-                                 "meta=<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2020\" primaries=\"bt_2020\"/>",
-                                 "arate=48000 ch=2 n=1920 cstride=7680 a0=0.5 a1=-0.25", "tc=1200000 "})
-            QVERIFY2(got.contains(QString::fromUtf8(want)), qPrintable(got + " lacks " + want));
-        // Black, limited range: Y 16 << 8 (4096, little-endian), then Y again.
-        QVERIFY2(got.contains("bytes=0,16,0,16"), qPrintable(got));
-        // 8-bit SDR: UYVY.
-        s.colorSpace = "rec709";
-        cfg.depth = 8;
-        QVERIFY2(sched.start(devices[0], mode, s, cfg, &why), why.c_str());
-        sched.submit(0, img);
-        QTRY_VERIFY_WITH_TIMEOUT(info().contains("fourcc=UYVY") && info().contains("bytes=128,16,128,16"), 10000);
-        QVERIFY(info().contains("transfer=\"bt_709\""));
-        sched.stop();
-    }
-
-    void lensCorrectionEffect() {
-        QFile file(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"));
-        QVERIFY(file.open(QIODevice::ReadOnly));
-        lens::Database db;
-        QVERIFY(db.addXml(file.readAll().toStdString()));
-        const lens::Lens* zoom = db.lens("FE 24-38mm f/2.8 Test");
-        QVERIFY(zoom);
-        Effect e = makeEffect("lens_correction", 1);
-        QVERIFY(findEffectInfo("lens_correction"));
-        const int W = 192, H = 108;
-        // A horizontal ramp (each pixel's x in linear light / W), opaque.
-        Image ramp(W, H);
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                float* p = ramp.at(x, y);
-                p[0] = p[1] = p[2] = float((x + 0.5) / W);
-                p[3] = 1;
-            }
-        // No profile chosen yet: nothing happens.
-        Image same = ramp;
-        applyVideoEffect(e, 0, same, 1.0);
-        QVERIFY(same.px == ramp.px);
-
-        e.strings["profile"] = lens::lensXml(*zoom);
-        e.params["focal"] = Param(27);
-        e.params["camera_crop"] = Param(1);
-        e.params["vignetting"] = Param(0);
-        // Each pixel comes from where the correction says (green), red and blue from their own places; filled to the
-        // frame's edges.
-        Image out = ramp;
-        applyVideoEffect(e, 0, out, 1.0);
-        lens::Settings s;
-        s.focal = 27;
-        s.cameraCrop = 1;
-        s.vignetting = false;
-        const lens::Correction c(*zoom, s, W, H);
-        QVERIFY(c.scale() > 1);  // edges pulled in by the correction, then the frame filled
-        for (const auto& [x, y] : {std::pair{0, 0}, {W - 1, H - 1}, {40, 70}, {W / 2, H / 2}}) {
-            double at[6];
-            c.source(x + 0.5, y + 0.5, at);
-            const float* p = out.at(x, y);
-            QVERIFY2(std::fabs(p[1] - std::clamp(at[2], 0.5, W - 0.5) / W) < 1e-4, qPrintable(QString("%1,%2: %3 vs %4").arg(x).arg(y).arg(p[1]).arg(at[2] / W)));
-            QVERIFY(std::fabs(p[0] - std::clamp(at[0], 0.5, W - 0.5) / W) < 1e-4);
-            QVERIFY(std::fabs(p[2] - std::clamp(at[4], 0.5, W - 0.5) / W) < 1e-4);
-            QVERIFY(std::fabs(p[3] - 1) < 1e-4);
-        }
-        // Made smaller without filling the frame, there is nothing beyond the picture.
-        Effect none = e;
-        none.params["fit"] = Param(2);
-        none.params["scale"] = Param(50);
-        Image bare = ramp;
-        applyVideoEffect(none, 0, bare, 1.0);
-        QVERIFY(bare.at(0, 0)[3] < 0.5);
-        QVERIFY(bare.at(W / 2, H / 2)[3] > 0.99);
-
-        // Vignetting: a flat grey brightened towards the corners in linear light (Rec.709 coded here), the middle kept.
-        Effect vig = makeEffect("lens_correction", 2);
-        vig.strings["profile"] = e.strings["profile"];
-        vig.params["focal"] = Param(30);
-        vig.params["aperture"] = Param(3.3);
-        vig.params["camera_crop"] = Param(1);
-        for (const char* off : {"distortion", "tca", "rectilinear"}) vig.params[off] = Param(0);
-        Image grey(W, H);
-        grey.fill(0.4f, 0.4f, 0.4f, 1);
-        applyVideoEffect(vig, 0, grey, 1.0);
-        lens::Settings vs;
-        vs.focal = 30;
-        vs.aperture = 3.3;
-        vs.cameraCrop = 1;
-        const lens::Correction vc(*zoom, vs, W, H);
-        const double corner = fromLinear(Transfer::Bt1886, toLinear(Transfer::Bt1886, 0.4) / vc.falloff(0.5, 0.5));
-        QVERIFY2(std::fabs(grey.at(0, 0)[1] - corner) < 2e-3, qPrintable(QString::number(grey.at(0, 0)[1])));
-        QVERIFY(grey.at(0, 0)[1] > 0.5f);
-        QVERIFY(std::fabs(grey.at(W / 2, H / 2)[1] - 0.4f) < 2e-3);
-        // Half-covered pixels keep their coverage; the colour is brightened as it is straight.
     // Live review's judgement of a viewer's link by delay: the arrival reports read, the packets numbered and padded,
     // the queue followed through a link that carries less than it is sent without dropping anything, and the ladder
     // steered by it.
@@ -23360,6 +23230,136 @@ colorspaces:
         QCOMPARE(relay.dropped.load(), int64_t(0));
     }
 
+    void ndiOutput() {
+        using namespace montage::output;
+        // A stand-in NDI Runtime where the SDK says to look.
+        qputenv("NDI_RUNTIME_DIR_V6", MONTAGE_TEST_NDI_DIR);
+        const auto ndi = findBackend("NDI");
+        QVERIFY(ndi);
+        std::string why;
+        QVERIFY2(ndi->available(&why), why.c_str());
+        const std::vector<Device> devices = ndi->devices();
+        QCOMPARE(devices.size(), size_t(1));
+        QVERIFY(devices[0].modes.empty());  // any size and rate
+        montage::plugins::DynLib fake;
+        QVERIFY2(fake.open(MONTAGE_TEST_NDI_LIBRARY, &why), why.c_str());
+        auto info = [&] {
+            auto fn = reinterpret_cast<int (*)(char*, int)>(fake.symbol("fake_ndi_info"));
+            char buf[1024] = {};
+            if (fn) fn(buf, sizeof buf);
+            return QString::fromUtf8(buf);
+        };
+        // An HDR (PQ) sequence: 16-bit P216 with its colour metadata, stereo sound as planar float, timecode in
+        // 100 ns units.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = {25, 1}, s.sampleRate = 48000, s.colorSpace = "rec2100pq";
+        Scheduler sched(ndi);
+        const Mode mode{modeName(64, 36, {25, 1}, false), 64, 36, {25, 1}, false, 0};
+        Config cfg;
+        QVERIFY2(sched.start(devices[0], mode, s, cfg, &why), why.c_str());
+        sched.setAudioSource([](int64_t, int frames, int channels, float* out) {
+            for (int i = 0; i < frames; ++i) out[size_t(i) * size_t(channels)] = 0.5f, out[size_t(i) * size_t(channels) + 1] = -0.25f;
+        });
+        auto img = std::make_shared<Image>(64, 36);
+        img->fill(0, 0, 0, 1);
+        sched.submit(3, img);
+        sched.setPosition(3, 1);
+        QTRY_VERIFY_WITH_TIMEOUT(sched.stats().sent >= 6 && info().contains("audios=") && !info().contains("audios=0 "), 10000);
+        QCOMPARE(sched.stats().receivers, 1);
+        sched.stop();
+        const QString got = info();
+        for (const char* want : {"name=Montage clock=1", "fourcc=P216", "x=64 y=36 rate=25/1 stride=128",
+                                 "meta=<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2020\" primaries=\"bt_2020\"/>",
+                                 "arate=48000 ch=2 n=1920 cstride=7680 a0=0.5 a1=-0.25", "tc=1200000 "})
+            QVERIFY2(got.contains(QString::fromUtf8(want)), qPrintable(got + " lacks " + want));
+        // Black, limited range: Y 16 << 8 (4096, little-endian), then Y again.
+        QVERIFY2(got.contains("bytes=0,16,0,16"), qPrintable(got));
+        // 8-bit SDR: UYVY.
+        s.colorSpace = "rec709";
+        cfg.depth = 8;
+        QVERIFY2(sched.start(devices[0], mode, s, cfg, &why), why.c_str());
+        sched.submit(0, img);
+        QTRY_VERIFY_WITH_TIMEOUT(info().contains("fourcc=UYVY") && info().contains("bytes=128,16,128,16"), 10000);
+        QVERIFY(info().contains("transfer=\"bt_709\""));
+        sched.stop();
+    }
+
+    void lensCorrectionEffect() {
+        QFile file(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        lens::Database db;
+        QVERIFY(db.addXml(file.readAll().toStdString()));
+        const lens::Lens* zoom = db.lens("FE 24-38mm f/2.8 Test");
+        QVERIFY(zoom);
+        Effect e = makeEffect("lens_correction", 1);
+        QVERIFY(findEffectInfo("lens_correction"));
+        const int W = 192, H = 108;
+        // A horizontal ramp (each pixel's x in linear light / W), opaque.
+        Image ramp(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = ramp.at(x, y);
+                p[0] = p[1] = p[2] = float((x + 0.5) / W);
+                p[3] = 1;
+            }
+        // No profile chosen yet: nothing happens.
+        Image same = ramp;
+        applyVideoEffect(e, 0, same, 1.0);
+        QVERIFY(same.px == ramp.px);
+
+        e.strings["profile"] = lens::lensXml(*zoom);
+        e.params["focal"] = Param(27);
+        e.params["camera_crop"] = Param(1);
+        e.params["vignetting"] = Param(0);
+        // Each pixel comes from where the correction says (green), red and blue from their own places; filled to the
+        // frame's edges.
+        Image out = ramp;
+        applyVideoEffect(e, 0, out, 1.0);
+        lens::Settings s;
+        s.focal = 27;
+        s.cameraCrop = 1;
+        s.vignetting = false;
+        const lens::Correction c(*zoom, s, W, H);
+        QVERIFY(c.scale() > 1);  // edges pulled in by the correction, then the frame filled
+        for (const auto& [x, y] : {std::pair{0, 0}, {W - 1, H - 1}, {40, 70}, {W / 2, H / 2}}) {
+            double at[6];
+            c.source(x + 0.5, y + 0.5, at);
+            const float* p = out.at(x, y);
+            QVERIFY2(std::fabs(p[1] - std::clamp(at[2], 0.5, W - 0.5) / W) < 1e-4, qPrintable(QString("%1,%2: %3 vs %4").arg(x).arg(y).arg(p[1]).arg(at[2] / W)));
+            QVERIFY(std::fabs(p[0] - std::clamp(at[0], 0.5, W - 0.5) / W) < 1e-4);
+            QVERIFY(std::fabs(p[2] - std::clamp(at[4], 0.5, W - 0.5) / W) < 1e-4);
+            QVERIFY(std::fabs(p[3] - 1) < 1e-4);
+        }
+        // Made smaller without filling the frame, there is nothing beyond the picture.
+        Effect none = e;
+        none.params["fit"] = Param(2);
+        none.params["scale"] = Param(50);
+        Image bare = ramp;
+        applyVideoEffect(none, 0, bare, 1.0);
+        QVERIFY(bare.at(0, 0)[3] < 0.5);
+        QVERIFY(bare.at(W / 2, H / 2)[3] > 0.99);
+
+        // Vignetting: a flat grey brightened towards the corners in linear light (Rec.709 coded here), the middle kept.
+        Effect vig = makeEffect("lens_correction", 2);
+        vig.strings["profile"] = e.strings["profile"];
+        vig.params["focal"] = Param(30);
+        vig.params["aperture"] = Param(3.3);
+        vig.params["camera_crop"] = Param(1);
+        for (const char* off : {"distortion", "tca", "rectilinear"}) vig.params[off] = Param(0);
+        Image grey(W, H);
+        grey.fill(0.4f, 0.4f, 0.4f, 1);
+        applyVideoEffect(vig, 0, grey, 1.0);
+        lens::Settings vs;
+        vs.focal = 30;
+        vs.aperture = 3.3;
+        vs.cameraCrop = 1;
+        const lens::Correction vc(*zoom, vs, W, H);
+        const double corner = fromLinear(Transfer::Bt1886, toLinear(Transfer::Bt1886, 0.4) / vc.falloff(0.5, 0.5));
+        QVERIFY2(std::fabs(grey.at(0, 0)[1] - corner) < 2e-3, qPrintable(QString::number(grey.at(0, 0)[1])));
+        QVERIFY(grey.at(0, 0)[1] > 0.5f);
+        QVERIFY(std::fabs(grey.at(W / 2, H / 2)[1] - 0.4f) < 2e-3);
+        // Half-covered pixels keep their coverage; the colour is brightened as it is straight.
         Image half(W, H);
         half.fill(0.4f, 0.4f, 0.4f, 0.5f);  // (premultiplied by fill)
         applyVideoEffect(vig, 0, half, 1.0);
