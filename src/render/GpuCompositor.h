@@ -192,6 +192,10 @@ struct Stats {
     // copied plane by plane on the GPU first, a device copy, no read-back), and copied back to memory (media/HwAccel's
     // hwFrameCopies: after decoding, for the CPU, or as the GPU could not map them), since resetStats.
     long hwMapped = 0, hwGpuCopies = 0, hwReadBacks = 0;
+    // Of those drawn from the device's memory, how many had to be imported into the compositor's API or copied on the
+    // GPU for that draw: once for a frame the frame cache keeps, however often it is drawn (what was made stays with
+    // the frame); a frame sampled where it is needs neither.
+    long hwImports = 0;
     std::string lastHwFallback;  // why the last hardware frame the GPU could not map was copied back
 };
 Stats stats();

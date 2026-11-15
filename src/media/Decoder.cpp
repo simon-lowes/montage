@@ -1943,6 +1943,7 @@ std::shared_ptr<const YcbcrPlanes> hwPlanesOf(const AVFrame* f, std::shared_ptr<
     p->hwType = av_hwdevice_get_type_name(fc->device_ctx->type);
     if (!p->hwType) p->hwType = "";
     p->copied = std::make_shared<YcbcrPlanes::Copied>();
+    p->gpuKept = std::make_shared<YcbcrPlanes::GpuKept>();
     return p;
 }
 

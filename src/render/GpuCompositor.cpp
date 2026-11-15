@@ -180,6 +180,7 @@ public:
     long shaderBuilds = 0;                 // (shader steps built, the last frame)
     long shapeLayers = 0;                  // (Shape layers drawn, the last frame)
     long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
+    long hwImports = 0;                    // (and imported or copied for this frame, not kept from an earlier draw)
     std::string hwFallback;                // (why the last of them that could not be mapped was copied back)
     std::atomic<bool> lose{false};         // (tests: the next frame finds the device lost)
     std::string mapped() const {
@@ -191,6 +192,7 @@ private:
     void loop();
     bool launch();  // the instance or surface backend_ needs, the GPU's thread and its device
     bool create();  // on the GPU's thread
+    void announceMapped();
     void destroy();
 
     struct Target {
@@ -653,16 +655,23 @@ bool Device::create() {
     }
     // Hardware frames: the decoders of the devices whose frames map into this one keep them in the device's memory.
     mapper_ = planes_ ? hw::Mapper::make(rhi_, shared_) : nullptr;
+    announceMapped();
+    return true;
+}
+
+// Tells the decoders which devices' frames this one takes as they are (again after a frame that could not be mapped:
+// a mapper may have given a kind up).
+void Device::announceMapped() {
     const std::vector<AVHWDeviceType> types = mapper_ ? mapper_->types() : std::vector<AVHWDeviceType>{};
     std::string names;
     for (AVHWDeviceType t : types)
         if (const char* n = av_hwdevice_get_type_name(t)) names += (names.empty() ? "" : ", ") + std::string(n);
     {
         std::lock_guard lock(brokenMutex_);
+        if (mappedNames_ == names && !names.empty()) return;
         mappedNames_ = names;
     }
     setHwFramesMapped(types);
-    return true;
 }
 
 bool Device::recover() {
@@ -1028,6 +1037,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             if (why.empty() && mapper_->map(*inMemory, cb_, mapped, &why)) {
                 ++hwMapped;
                 if (mapped.copied) ++hwGpuCopies;
+                if (mapped.imported) ++hwImports;
                 if (logFallbacks()) std::fprintf(stderr, "montage gpu: hardware frame %s\n", mapped.how.c_str());
             } else {
                 // Copied back, as before (and counted there: media/HwAccel). (What a mapping made before it failed
@@ -1035,6 +1045,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 mapped = {};
                 hwFallback = std::string("a hardware frame of ") + inMemory->hwType + " copied back: " + (why.empty() ? "it could not be mapped" : why);
                 if (logFallbacks()) std::fprintf(stderr, "montage gpu: %s\n", hwFallback.c_str());
+                if (mapper_) announceMapped();
                 if (!(inMemory = planesInMemory(*inMemory))) return nullptr;
             }
         }
@@ -1520,7 +1531,7 @@ void Device::endFrame() {
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
     filterPasses = mixPasses = shaderBuilds = shapeLayers = textureSteps = 0;
-    hwMapped = hwGpuCopies = 0;
+    hwMapped = hwGpuCopies = hwImports = 0;
     hwFallback.clear();
     if (!rhi_) return false;  // (lost, and not set up again)
     // A device lost (or, for tests, said to be): set up again on the same device, with what the frame cache holds still to
@@ -1841,12 +1852,12 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     DeviceLock lock;
     if (!gDevice || !gDevice->ready() || waitedFor(*gDevice)) return false;
     Device* d = gDevice.get();
-    long filters = 0, mixes = 0, mapped = 0, copied = 0, builds = 0, shapes = 0, steps = 0;
+    long filters = 0, mixes = 0, mapped = 0, copied = 0, imported = 0, builds = 0, shapes = 0, steps = 0;
     std::string hwFallback;
     const bool ok = d->serve([&] {
         const bool drawn = d->draw(frame, out, out8);
         filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds, shapes = d->shapeLayers;
-        mapped = d->hwMapped, copied = d->hwGpuCopies, hwFallback = d->hwFallback, steps = d->textureSteps;
+        mapped = d->hwMapped, copied = d->hwGpuCopies, imported = d->hwImports, hwFallback = d->hwFallback, steps = d->textureSteps;
         return drawn;
     });
     std::lock_guard statsLock(gStatsMutex);
@@ -1860,6 +1871,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     gStats.shaderBuilds += builds;
     gStats.hwMapped += mapped;
     gStats.hwGpuCopies += copied;
+    gStats.hwImports += imported;
     if (!hwFallback.empty()) gStats.lastHwFallback = hwFallback;
     return ok;
 }

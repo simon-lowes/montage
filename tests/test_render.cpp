@@ -26028,6 +26028,115 @@ colorspaces:
             QCOMPARE(gpu::mappedHardware().find("vulkan") != std::string::npos, mapped);
         }
     }
+
+    void gpuHardwareFramesImportedOnce() {
+        // A hardware frame the frame cache keeps is imported into the compositor's API, or copied on the GPU, once,
+        // however often it is drawn: what was made stays with the frame, as VA-API's frames imported into Vulkan or
+        // OpenGL do. Shown on the path that runs here: frames FFmpeg uploads into its Vulkan device as one image of
+        // all the planes, whose planes the compositor copies on the GPU. Drawn again, and as two layers of one
+        // frame, the frame is copied once; decoded again after the cache let it go, it is copied again; after the
+        // device is lost, once more on the new one; and a frame of an image a plane, sampled where it is, has nothing
+        // made for it at all. Every draw is the frame's own picture.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        if (!gpu::takesPlanes()) QSKIP("this GPU does not take 8 and 16-bit textures of one and two channels");
+        if (!hwDevice(AV_HWDEVICE_TYPE_VULKAN)) QSKIP("FFmpeg makes no Vulkan device here");
+        const bool mapped = gpu::mappedHardware().find("vulkan") != std::string::npos;
+        auto restore = qScopeGuard([] {
+            setHwUploadForTesting("");
+            MediaPool::instance().clear();
+        });
+        QTemporaryDir dir;
+        const int W = 96, H = 54;
+        const std::string path = dir.filePath("kept.mkv").toStdString();
+        QVERIFY(writeYcbcrVideo(path, AV_PIX_FMT_NV12, W, H, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, AVCHROMA_LOC_LEFT, [](int c, int x, int y) {
+            const double v = c == 0 ? 0.5 + 0.35 * std::sin(x * 0.045 + y * 0.03) : 0.5 + 0.18 * std::sin(x * (c == 1 ? 0.07 : 0.05) - y * 0.04);
+            return int(std::lround(16 + ((c ? 240 : 235) - 16) * v));
+        }, 24));
+        MediaItem m;
+        QVERIFY(probeMedia(path, m));
+        const double step = m.fps.valid() ? 1 / m.fps.toDouble() : 0.04;
+        auto frameAt = [&](int i) { return MediaPool::instance().videoFrame(path, i * step, 0, 0, false, true); };
+        // One frame drawn as `layers` layers, each filling the canvas: what the draw took, and how far the picture is
+        // from the frame's own.
+        struct Drawn {
+            bool ok = false;
+            gpu::Stats st;
+            double worst = 1;
+        };
+        auto draw = [&](const Frame16Ptr& f, int layers) {
+            gpu::Frame g;
+            g.width = W, g.height = H;
+            for (int i = 0; i < layers; ++i) {
+                g.items.emplace_back();
+                g.items.back().a.frame = f;
+                g.items.back().a.place.full = true;
+            }
+            Drawn d;
+            Image onGpu;
+            gpu::resetStats();
+            d.ok = gpu::execute(g, &onGpu);
+            d.st = gpu::stats();
+            const Image own = toImage(*f);
+            if (d.ok && own.px.size() == onGpu.px.size()) {
+                d.worst = 0;
+                for (size_t k = 0; k < own.px.size(); ++k) d.worst = std::max(d.worst, std::fabs(double(own.px[k]) - onGpu.px[k]));
+            }
+            return d;
+        };
+        // What a draw must have taken: frames drawn from the device's memory, and made for it (imported or copied).
+        auto took = [&](const char* what, const Drawn& d, long fromDevice, long made) {
+            const QString text = QStringLiteral("%1: drawn %2, off by %3; %4 from the device's memory, %5 made for it, %6 copied on the GPU, %7 read back (%8)")
+                                     .arg(what).arg(d.ok).arg(d.worst).arg(d.st.hwMapped).arg(d.st.hwImports).arg(d.st.hwGpuCopies).arg(d.st.hwReadBacks)
+                                     .arg(QString::fromStdString(d.st.lastHwFallback));
+            if (!d.ok || d.worst > 1.0 / 1023) return text;
+            if (!mapped) return d.st.hwMapped == 0 && d.st.hwImports == 0 ? QString() : text;
+            return d.st.hwMapped == fromDevice && d.st.hwImports == made && d.st.hwGpuCopies == made && d.st.hwReadBacks == 0 ? QString() : text;
+        };
+#define TOOK(what, drawn, fromDevice, made) \
+    do { \
+        const QString wrong = took(what, drawn, fromDevice, made); \
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong)); \
+    } while (false)
+        // One image of all the planes: copied on the GPU when first drawn, and not again.
+        setHwUploadForTesting("vulkan-multiplane");
+        MediaPool::instance().clear();
+        Frame16Ptr f = frameAt(3);
+        QVERIFY(f && f->planes);
+        if (mapped) QVERIFY(f->planes->hw != nullptr);
+        TOOK("first draw", draw(f, 1), 1, 1);
+        TOOK("second draw", draw(f, 1), 1, 0);
+        TOOK("third draw", draw(f, 1), 1, 0);
+        TOOK("as two layers, drawn before", draw(f, 2), 2, 0);
+        // (another frame, first drawn as two layers: the second layer uses what the first made)
+        Frame16Ptr other = frameAt(9);
+        QVERIFY(other && other->planes);
+        TOOK("two layers of a frame not drawn before", draw(other, 2), 2, 1);
+        TOOK("the first frame again", draw(f, 1), 1, 0);
+        // The cache lets the frame go, and what was kept with it; decoded again it is a new frame, copied once.
+        f.reset();
+        other.reset();
+        MediaPool::instance().clear();
+        f = frameAt(3);
+        QVERIFY(f && f->planes);
+        TOOK("decoded again", draw(f, 1), 1, 1);
+        TOOK("decoded again, second draw", draw(f, 1), 1, 0);
+        // The device lost: what the old one kept for the frame is not the new one's, which copies it once more.
+        gpu::loseDeviceForTesting();
+        TOOK("after the device was lost", draw(f, 1), 1, 1);
+        TOOK("after the device was lost, second draw", draw(f, 1), 1, 0);
+        // An image a plane is sampled where it is: nothing is made for it, the first time or later.
+        f.reset();
+        setHwUploadForTesting("vulkan");
+        MediaPool::instance().clear();
+        f = frameAt(3);
+        QVERIFY(f && f->planes);
+        TOOK("an image a plane", draw(f, 1), 1, 0);
+        TOOK("an image a plane, second draw", draw(f, 1), 1, 0);
+#undef TOOK
+        QCOMPARE(gpu::mappedHardware().find("vulkan") != std::string::npos, mapped);
+    }
+
     void chromaAlikeAtEverySize() {
         // Sharp chroma, each sample its own: a high-quality frame at 99 % is the one at 100 % resized, and nothing else
         // (one chroma filter at every size: the picture is converted at its own size, then resized).
