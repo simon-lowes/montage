@@ -93,10 +93,12 @@ inline QString decodedSizeScript(const QString& pc) {
 }
 
 // A UDP relay on this computer for one client: what it sends goes on to `to`, and what comes back is held to `kbps`
-// (0: passed at once) through a queue of a tenth of a second, the rest dropped, as a slow link's router does.
+// (0: passed at once) through a queue of a tenth of a second, the rest dropped, as a slow link's router does; or,
+// `lossless`, through a queue as long as it takes with nothing dropped, as a link with a deep buffer does.
 class ThrottledRelay {
 public:
     std::atomic<int> kbps{0};
+    std::atomic<bool> lossless{false};
     std::atomic<int64_t> dropped{0};
 
     ~ThrottledRelay() { stop(); }
@@ -149,7 +151,7 @@ private:
                 if (!clientPort) continue;
                 if (rate <= 0) {
                     front.writeDatagram(d, client, clientPort);
-                } else if (queued + d.size() <= qint64(rate) * 125 / 10) {
+                } else if (lossless || queued + d.size() <= qint64(rate) * 125 / 10) {
                     queued += d.size();
                     queue.push_back(std::move(d));
                 } else {
@@ -157,7 +159,9 @@ private:
                 }
             }
             const qint64 now = clock.nsecsElapsed();
-            if (rate > 0) tokens = std::min(6000.0, tokens + double(now - last) * 1e-9 * rate * 125);
+            // (what it may send at once: five packets, or with the deep buffer a twentieth of a second's worth, so a
+            // loaded machine that runs this loop late still passes the stated rate)
+            if (rate > 0) tokens = std::min(lossless ? std::max(6000.0, rate * 6.25) : 6000.0, tokens + double(now - last) * 1e-9 * rate * 125);
             last = now;
             while (!queue.empty() && (rate <= 0 || tokens >= queue.front().size())) {
                 if (rate > 0) tokens -= queue.front().size();

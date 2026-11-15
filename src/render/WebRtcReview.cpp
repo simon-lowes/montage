@@ -53,6 +53,7 @@
 #include "media/Image.h"
 #include "media/ThreadScheduling.h"
 #include "render/ColorSpace.h"
+#include "render/ReviewCongestion.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -79,6 +80,25 @@ std::vector<std::string> reviewCertificateHosts() {
     return out;
 }
 
+// Down to the rung that fits what got through (at least one down), or staying when none below works. A try or a
+// probe under way has failed, and the next waits twice as long.
+int RungSteering::down(int rung, int last, Clock::time_point now, const std::function<bool(int)>& tooBig,
+                       const std::function<bool(int)>& usable) {
+    if (trying || probing) hold = std::min(hold * 2, std::chrono::milliseconds(32000));
+    trying = probing = false;
+    int to = std::min(rung + 1, last);
+    while (to < last && tooBig(to)) ++to;
+    while (to > rung && !usable(to)) --to;
+    if (to > rung) {
+        movedAt = now;
+        nextTry = now + hold;
+        postponed = false;
+        return to;
+    }
+    nextTry = std::max(nextTry, now + hold);  // (the smallest already, or none below works)
+    return rung;
+}
+
 int RungSteering::report(int rung, int last, double loss, Clock::time_point at, Clock::time_point now,
                          const std::function<bool(int)>& tooBig, const std::function<bool(int)>& usable) {
     using std::chrono::milliseconds;
@@ -88,31 +108,49 @@ int RungSteering::report(int rung, int last, double loss, Clock::time_point at, 
         hold = milliseconds(8000);
     }
     if (at - movedAt < milliseconds(700)) return rung;  // (it counts the rung before's packets)
-    auto move = [&](int to) {
-        movedAt = now;
-        nextTry = now + hold;
-        postponed = false;
-        return to;
-    };
-    if (loss > 0.10) {
-        if (trying) hold = std::min(hold * 2, milliseconds(32000));
-        trying = false;
-        int to = std::min(rung + 1, last);
-        while (to < last && tooBig(to)) ++to;
-        while (to > rung && !usable(to)) --to;
-        if (to > rung) return move(to);
-        nextTry = std::max(nextTry, now + hold);  // (the smallest already, or none below works)
-        return rung;
-    }
+    if (loss > 0.10) return down(rung, last, now, tooBig, usable);
     if (loss >= 0.02 && !postponed) {
         nextTry = std::max(nextTry, now + hold);
         postponed = true;
     }
-    if (rung > 0 && now >= nextTry && usable(rung - 1)) {
+    if (rung > 0 && now >= nextTry && !probing && usable(rung - 1)) {
+        if (probes) {
+            probing = true;
+            return rung;
+        }
         trying = true;
         triedAt = now;
-        return move(rung - 1);
+        movedAt = now;
+        nextTry = now + hold;
+        postponed = false;
+        return rung - 1;
     }
+    return rung;
+}
+
+int RungSteering::delayed(int rung, int last, Clock::time_point now, const std::function<bool(int)>& tooBig,
+                          const std::function<bool(int)>& usable) {
+    if (trying && now - triedAt > std::chrono::seconds(20)) {
+        trying = false;
+        hold = std::chrono::milliseconds(8000);
+    }
+    if (now - movedAt < std::chrono::milliseconds(700)) return rung;
+    return down(rung, last, now, tooBig, usable);
+}
+
+int RungSteering::probed(int rung, bool arrived, Clock::time_point now, const std::function<bool(int)>& usable) {
+    if (!probing) return rung;
+    probing = false;
+    if (arrived && rung > 0 && usable(rung - 1)) {
+        trying = true;
+        triedAt = now;
+        movedAt = now;
+        nextTry = now + hold;
+        postponed = false;
+        return rung - 1;
+    }
+    hold = std::min(hold * 2, std::chrono::milliseconds(32000));
+    nextTry = now + hold;
     return rung;
 }
 
@@ -174,6 +212,7 @@ constexpr int kPointerRate = 30;
 constexpr size_t kMaxChannelBacklog = 256 * 1024;  // bytes queued on a viewer's data channel before more are dropped
 constexpr std::chrono::minutes kFailureMemory{15};
 constexpr std::chrono::seconds kPointerLife{4};
+constexpr std::chrono::milliseconds kProbeLength{700};  // how long padding is sent at the rung above's rate
 const char* const kPalette[] = {"#ff3b30", "#34c759", "#0a84ff", "#ff9f0a", "#bf5af2", "#64d2ff", "#ffd60a", "#ff375f"};
 
 std::string averr(int e) {
@@ -481,6 +520,35 @@ struct Viewer {
     RungSteering steering;
     int64_t lastPts = -1;
     std::deque<std::pair<Clock::time_point, size_t>> sent;
+    // The queue on the way to them, where their browser reports when packets arrive (a lock of its own: written by
+    // the connection's threads, read by send's), and the padding a probe adds after each picture.
+    std::mutex linkM;
+    LinkDelay link;
+    std::shared_ptr<class Padder> padder;
+    bool padding = false;  // (send's thread) a probe's padding goes after their pictures
+};
+
+// Padding after a picture's packets, for a probe: as many bytes as were asked for the next picture, in packets of the
+// same stream with nothing but padding, which a receiver counts and drops.
+class Padder final : public rtc::MediaHandler {
+public:
+    explicit Padder(std::shared_ptr<rtc::RtpPacketizationConfig> config) : config_(std::move(config)) {}
+    std::atomic<int> bytes{0};
+    void outgoing(rtc::message_vector& messages, const rtc::message_callback&) override {
+        const int wanted = bytes.exchange(0);
+        if (wanted <= 0 || messages.empty() || !messages.back() || messages.back()->type != rtc::Message::Binary) return;
+        const rtc::message_ptr last = messages.back();
+        uint16_t sequence = config_->sequenceNumber;
+        for (const std::vector<uint8_t>& p : paddingAfter(reinterpret_cast<const uint8_t*>(last->data()), last->size(), sequence, size_t(wanted))) {
+            auto m = rtc::make_message(reinterpret_cast<const std::byte*>(p.data()), reinterpret_cast<const std::byte*>(p.data()) + p.size());
+            m->dscp = last->dscp;
+            messages.push_back(std::move(m));
+        }
+        config_->sequenceNumber = sequence;
+    }
+
+private:
+    std::shared_ptr<rtc::RtpPacketizationConfig> config_;
 };
 
 // VP9 over RTP (RFC 9628) in flexible mode: one spatial and temporal layer, a 15-bit picture ID, each inter picture
@@ -537,10 +605,12 @@ private:
     uint16_t picture_;
 };
 
-// A viewer's receiver reports on their picture (in RTCP sender and receiver reports): the share of packets lost.
+// A viewer's reports on their picture: the share of packets lost (in RTCP sender and receiver reports) and, with the
+// transport-wide sequence number extension agreed (`wideId`, 0 without), when each packet arrived. Every picture packet
+// sent is numbered here on its way out, last in the chain, so one sent again on request goes as it first did.
 class FeedbackReader final : public rtc::MediaHandler {
 public:
-    FeedbackReader(std::weak_ptr<Viewer> viewer, uint32_t ssrc) : viewer_(std::move(viewer)), ssrc_(ssrc) {}
+    FeedbackReader(std::weak_ptr<Viewer> viewer, uint32_t ssrc, int wideId) : viewer_(std::move(viewer)), ssrc_(ssrc), wideId_(wideId) {}
     void incoming(rtc::message_vector& messages, const rtc::message_callback&) override {
         for (const auto& message : messages) {
             if (!message || message->type != rtc::Message::Control) continue;  // (RTCP only)
@@ -562,15 +632,40 @@ public:
                             ++v->reports;
                         }
                     }
+                } else if (type == 205 && count == 15 && wideId_) {
+                    ArrivalReport report;
+                    if (parseTransportFeedback(d + at, length, report))
+                        if (auto v = viewer_.lock()) {
+                            std::lock_guard lock(v->linkM);
+                            v->link.feedback(report, Clock::now());
+                        }
                 }
                 at += length;
             }
+        }
+    }
+    void outgoing(rtc::message_vector& messages, const rtc::message_callback&) override {
+        if (!wideId_) return;
+        auto v = viewer_.lock();
+        if (!v) return;
+        const auto now = Clock::now();  // (one moment for a picture's packets: they are judged together)
+        std::lock_guard lock(v->linkM);
+        for (rtc::message_ptr& message : messages) {
+            if (!message || message->type != rtc::Message::Binary) continue;
+            const auto* d = reinterpret_cast<const uint8_t*>(message->data());
+            const std::vector<uint8_t> numbered = withTransportSequence(d, message->size(), wideId_, v->link.nextSequence());
+            if (numbered.empty()) continue;  // (not a packet that can carry the number: sent as it is, uncounted)
+            v->link.sent(numbered.size(), now);
+            auto m = rtc::make_message(reinterpret_cast<const std::byte*>(numbered.data()), reinterpret_cast<const std::byte*>(numbered.data()) + numbered.size());
+            m->dscp = message->dscp;
+            message = std::move(m);
         }
     }
 
 private:
     std::weak_ptr<Viewer> viewer_;
     uint32_t ssrc_;
+    int wideId_;
 };
 
 // An encoder for one codec, rung and depth.
@@ -762,6 +857,7 @@ struct BrowserReviewBackend::Impl {
     Clock::time_point t0, next;
     int64_t vpts = -1, apts = 0;
     int64_t encoded = 0, skipped = 0;
+    std::atomic<int> probes{0}, queueMoves{0};  // probes begun, and moves down for a standing queue, since opened
     std::deque<std::pair<Clock::time_point, size_t>> bytes;
 
     // ---- The web server ----
@@ -1183,6 +1279,7 @@ struct BrowserReviewBackend::Impl {
             Choice pick;
             bool hdr = false;
             bool colourExtension = false;
+            int wideId = 0;  // the transport-wide sequence number extension's ID, when its feedback is offered too
             rtc::Description::Media offeredMedia = media;  // (extIds is not const)
             // (an ID of 1-14 only: libdatachannel writes this extension's element in the one-byte form whatever its
             // ID, so one above 14 would arrive malformed and the picture's transfer lost; such a viewer gets SDR)
@@ -1233,6 +1330,15 @@ struct BrowserReviewBackend::Impl {
                     cfg->colorMatrix = hdr ? 9 : 1;
                     cfg->colorChromaSitingHorz = 1;  // (co-sited on the left)
                     cfg->colorChromaSitingVert = 2;  // (half way)
+                } else if (isVideo && e->uri == kTransportWideExtension && id >= 1 && id <= 14 && !wideId) {
+                    // The picture's packets numbered over the whole connection, and the viewer's reports of when each
+                    // arrived: how a link that is slow without losing anything is noticed. (An ID of 1-14, as above.)
+                    const rtc::Description::Media::RtpMap* offeredMap = media.rtpMap(pick.pt);
+                    if (!offeredMap || std::find(offeredMap->rtcpFbs.begin(), offeredMap->rtcpFbs.end(), kTransportWideFeedback) == offeredMap->rtcpFbs.end())
+                        continue;
+                    answer->addExtMap(rtc::Description::Media::ExtMap(id, e->uri));
+                    if (rtc::Description::Media::RtpMap* map = answer->rtpMap(pick.pt)) map->addFeedback(kTransportWideFeedback);
+                    wideId = id;
                 }
             }
             std::shared_ptr<rtc::Track> track = v->pc->addTrack(*answer);
@@ -1245,7 +1351,14 @@ struct BrowserReviewBackend::Impl {
             else if (codec == "vp9") packetizer = v->vp9 = std::make_shared<Vp9Packetizer>(cfg);
             else packetizer = std::make_shared<rtc::OpusRtpPacketizer>(cfg);
             packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(cfg));
-            packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+            if (isVideo && wideId) {
+                // (after the sender reports, which count pictures only; before what is kept for sending again, so
+                // padding a viewer misses can be asked for like any packet and leaves no gap in their numbering)
+                v->padder = std::make_shared<Padder>(cfg);
+                packetizer->addToChain(v->padder);
+            }
+            // (a probe's padding is many small packets: room for them beside the pictures')
+            packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(isVideo ? 2048 : rtc::RtcpNackResponder::DefaultMaxSize));
             if (isVideo) {
                 // (the viewer's own flag only: the next picture sent starts a key frame for them, whoever else
                 // watches on the same encoder)
@@ -1258,7 +1371,7 @@ struct BrowserReviewBackend::Impl {
                     if (now - last < 1000 || !v->lastKeyAsk.compare_exchange_strong(last, now)) return;
                     v->needKey = true;
                 }));
-                packetizer->addToChain(std::make_shared<FeedbackReader>(wv, ssrc));
+                packetizer->addToChain(std::make_shared<FeedbackReader>(wv, ssrc, wideId));
                 track->onOpen([wv] {
                     if (auto v = wv.lock()) v->needKey = true;
                 });
@@ -1640,10 +1753,45 @@ struct BrowserReviewBackend::Impl {
         while (!v.sent.empty() && now - v.sent.front().first > std::chrono::seconds(3)) v.sent.pop_front();
     }
 
-    // Moves a viewer on the ladder by their receiver reports (RungSteering).
+    // Moves a viewer on the ladder by their receiver reports and, where their browser reports arrivals, by the queue on
+    // the way to them (RungSteering): down when it stands, and up only after a probe at the higher rate arrived
+    // without queueing.
     void steer(Viewer& v, Clock::time_point now) {
         const int last = int(ladder.size()) - 1;
-        if (last <= 0 || v.wantRung != v.rung) return;
+        if (last <= 0) return;
+        const auto usable = [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); };
+        bool active = false, standing = false, sending = false;
+        double arrived = 0;
+        LinkDelay::Probe verdict = LinkDelay::Probe::None;
+        if (v.padder) {
+            std::lock_guard lock(v.linkM);
+            active = v.link.active(now);
+            standing = v.link.standing();
+            arrived = v.link.receivedKbps();
+            verdict = v.link.probe(now);
+            sending = v.link.probeSending(now);
+        }
+        v.steering.probes = active;
+        v.padding = v.steering.probing && sending;
+        if (v.wantRung != v.rung) return;
+        if (v.steering.probing) {
+            if (!active || verdict == LinkDelay::Probe::Arrived || verdict == LinkDelay::Probe::Delayed) {
+                v.padding = false;
+                v.wantRung = v.steering.probed(v.rung, active && verdict == LinkDelay::Probe::Arrived, now, usable);
+                std::lock_guard lock(v.linkM);
+                v.link.restart(now);  // (the probe's own queue is not the pictures')
+                return;
+            }
+        } else if (active && standing) {
+            // (what arrived is what the link carries: the rung under 85% of it)
+            const int to = v.steering.delayed(
+                v.rung, last, now, [&](int i) { return arrived > 0 && double(ladder[size_t(i)].bitrate) / 1000 > 0.85 * arrived; }, usable);
+            if (to != v.rung) {
+                v.wantRung = to;
+                ++queueMoves;
+                return;
+            }
+        }
         uint64_t reports;
         double loss;
         Clock::time_point at;
@@ -1656,10 +1804,16 @@ struct BrowserReviewBackend::Impl {
         if (reports == v.seenReports) return;
         v.seenReports = reports;
         const double through = sentKbps(v, now) * (1 - loss);
+        const bool wasProbing = v.steering.probing;
         v.wantRung = v.steering.report(
             v.rung, last, loss, at, now,
-            [&](int i) { return double(ladder[size_t(i)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through; },
-            [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); });
+            [&](int i) { return double(ladder[size_t(i)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through; }, usable);
+        if (v.steering.probing && !wasProbing) {
+            std::lock_guard lock(v.linkM);
+            v.link.beginProbe(now, kProbeLength);
+            v.padding = true;
+            ++probes;
+        }
     }
 
     // A picture to each viewer: from the encoder for their codec, rung and depth (each one's tag first: its RTP
@@ -1681,6 +1835,11 @@ struct BrowserReviewBackend::Impl {
                     v->vp9->width = c.width;
                     v->vp9->height = c.height;
                 }
+                // (a probe: padding after the picture up to the rung above's rate)
+                if (v->padder)
+                    v->padder->bytes = v->padding && cur > 0 && c.key.rung == cur
+                                           ? int(std::clamp(double(ladder[size_t(cur - 1)].bitrate) / 8 / fps - double(c.data.size()), 0.0, 1e6))
+                                           : 0;
                 try {
                     v->video->sendFrame(c.data.data(), c.data.size(), rtc::FrameInfo(rtp));
                     v->lastPts = c.pts;
@@ -1702,6 +1861,11 @@ struct BrowserReviewBackend::Impl {
                 v->needKey = false;
                 // (reports and tries count from the switch, not from when it was asked for)
                 v->steering.switched(now);
+                {
+                    // (from just after the key frame that begins the new size: its burst is no sign of the link)
+                    std::lock_guard lock(v->linkM);
+                    v->link.restart(now + std::chrono::milliseconds(100));
+                }
                 rungMessage(*v);
                 continue;
             }
@@ -2078,6 +2242,7 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
         d.vpts = -1;
         d.apts = 0;
         d.encoded = d.skipped = 0;
+        d.probes = d.queueMoves = 0;
         d.bytes.clear();
     }
     std::promise<std::string> started;
@@ -2188,6 +2353,8 @@ ReviewStats BrowserReviewBackend::stats() const {
             ++s.rungViewers[size_t(std::clamp(v->rung.load(), 0, int(d_->ladder.size()) - 1))];
             s.hdrViewers += v->hdr;
         }
+    s.probes = d_->probes;
+    s.queueMoves = d_->queueMoves;
     s.error = d_->lastError;
     s.markers = d_->markerCount;
     return s;

@@ -122,6 +122,8 @@ struct ReviewStats {
     int markers = 0;           // received since opened
     std::vector<int> rungViewers;  // a browser review's viewers on each rung, full size first
     int hdrViewers = 0;            // and of them, those sent HDR
+    int probes = 0;                // a browser review: padding bursts sent to see whether a viewer's link takes the size above
+    int queueMoves = 0;            // and viewers moved down a size because their link queued, before it lost anything
 };
 
 // Where a reviewer in a browser points, in 0..1 of the picture.

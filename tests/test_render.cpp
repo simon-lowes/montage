@@ -115,6 +115,7 @@
 #include "render/RemoteGrade.h"
 #include "render/RemoteReview.h"
 #include "render/WebRtcReview.h"
+#include "render/ReviewCongestion.h"
 #include "render/HeadlessBrowser.h"
 #include "render/OGraf.h"
 #include "ReviewBrowsers.h"
@@ -22841,6 +22842,394 @@ colorspaces:
         QVERIFY(grey.at(0, 0)[1] > 0.5f);
         QVERIFY(std::fabs(grey.at(W / 2, H / 2)[1] - 0.4f) < 2e-3);
         // Half-covered pixels keep their coverage; the colour is brightened as it is straight.
+    // Live review's judgement of a viewer's link by delay: the arrival reports read, the packets numbered and padded,
+    // the queue followed through a link that carries less than it is sent without dropping anything, and the ladder
+    // steered by it.
+    void reviewLinkDelay() {
+        using namespace montage::output;
+        using namespace std::chrono_literals;
+        using Clock = LinkDelay::Clock;
+        // A report as a browser writes it, with each kind of chunk: a run of three small deltas, fourteen one-bit
+        // symbols and three two-bit ones (a large negative delta, a packet missing, a small delta), from sequence
+        // number 65534 on, with four bytes of padding.
+        const std::vector<uint8_t> written = {0xaf, 205,  0,    9,    0,    0,    0,    1,    0,    0,    0,    2,    0xff, 0xfe,
+                                              0,    20,   0x00, 0x01, 0x02, 7,    0x20, 0x03, 0xac, 0x01, 0xe1, 0x00, 4,    8,
+                                              0,    1,    2,    3,    200,  0xff, 0xf8, 255,  0,    0,    0,    4};
+        ArrivalReport report;
+        QVERIFY(parseTransportFeedback(written.data(), written.size(), report));
+        QCOMPARE(report.base, uint16_t(65534));
+        QCOMPARE(report.referenceTime, uint32_t(0x000102));
+        QCOMPARE(report.packets.size(), size_t(20));
+        const std::map<int, int> deltas = {{0, 4}, {1, 8}, {2, 0}, {3, 1}, {5, 2}, {6, 3}, {16, 200}, {17, -8}, {19, 255}};
+        for (int i = 0; i < 20; ++i) {
+            QCOMPARE(report.packets[size_t(i)].received, deltas.count(i) > 0);
+            if (deltas.count(i)) QCOMPARE(report.packets[size_t(i)].delta, deltas.at(i));
+        }
+        // One cut short, and feedback of another kind, are not read.
+        QVERIFY(!parseTransportFeedback(written.data(), written.size() - 8, report));
+        std::vector<uint8_t> other = written;
+        other[0] = 0xa1;
+        QVERIFY(!parseTransportFeedback(other.data(), other.size(), report));
+        std::vector<uint8_t> shorter = written;
+        shorter[3] = 6;  // (its length says it ends inside the deltas)
+        QVERIFY(!parseTransportFeedback(shorter.data(), 28, report));
+
+        // The sequence number goes into a packet with no header extension, into one with the one-byte form and into
+        // one with the two-byte form; the payload follows untouched.
+        const std::vector<uint8_t> plain = {0x80, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0xaa, 0xbb, 0xcc};
+        std::vector<uint8_t> got = withTransportSequence(plain.data(), plain.size(), 5, 0xbeef);
+        QCOMPARE(got, (std::vector<uint8_t>{0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0xbe, 0xde, 0, 1, 0x51, 0xbe, 0xef, 0, 0xaa, 0xbb, 0xcc}));
+        const std::vector<uint8_t> oneByte = {0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0xbe, 0xde, 0, 1, 0x30, 'A', 0, 0, 0xaa, 0xbb};
+        got = withTransportSequence(oneByte.data(), oneByte.size(), 5, 0x0102);
+        QCOMPARE(got, (std::vector<uint8_t>{0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0xbe, 0xde, 0, 2, 0x30, 'A', 0, 0, 0x51, 1, 2, 0, 0xaa, 0xbb}));
+        const std::vector<uint8_t> twoByte = {0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0x10, 0x00, 0, 1, 3, 1, 'A', 0, 0xaa, 0xbb};
+        got = withTransportSequence(twoByte.data(), twoByte.size(), 5, 0x0102);
+        QCOMPARE(got, (std::vector<uint8_t>{0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0x10, 0x00, 0, 2, 3, 1, 'A', 0, 5, 2, 1, 2, 0xaa, 0xbb}));
+        QVERIFY(withTransportSequence(plain.data(), plain.size(), 15, 1).empty());
+        QVERIFY(withTransportSequence(plain.data(), 8, 5, 1).empty());
+        const std::vector<uint8_t> unknown = {0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0x12, 0x34, 0, 0, 0xaa};
+        QVERIFY(withTransportSequence(unknown.data(), unknown.size(), 5, 1).empty());
+
+        // Padding after a picture's last packet: 600 bytes as three packets of the same stream and timestamp with no
+        // payload and no header extension, numbered on from the picture's; none after a packet that ends no picture.
+        uint16_t next = 0xffff;
+        const auto padding = paddingAfter(oneByte.data(), oneByte.size(), next, 600);
+        QCOMPARE(padding.size(), size_t(3));
+        QCOMPARE(next, uint16_t(2));
+        const size_t sizes[3] = {267, 267, 66};
+        for (size_t i = 0; i < 3; ++i) {
+            const std::vector<uint8_t>& p = padding[i];
+            QCOMPARE(p.size(), sizes[i]);
+            QCOMPARE(p[0], uint8_t(0xa0));
+            QCOMPARE(p[1], uint8_t(0x60));
+            QCOMPARE(uint16_t((p[2] << 8) | p[3]), uint16_t(0xffff + i));
+            QVERIFY(std::equal(p.begin() + 4, p.begin() + 12, oneByte.begin() + 4));
+            QCOMPARE(size_t(p.back()), sizes[i] - 12);
+        }
+        std::vector<uint8_t> middle = oneByte;
+        middle[1] = 0x60;
+        QVERIFY(paddingAfter(middle.data(), middle.size(), next, 600).empty());
+
+        // A viewer's link as a queue that drops nothing: pictures 25 times a second in packets of 1,200 bytes, each
+        // leaving once those before it have at the link's rate and arriving 20 ms later; a report every 100 ms,
+        // written as a browser writes them (two-bit symbols) on a clock of its own whose 24-bit reference time wraps
+        // three seconds in.
+        struct Link {
+            LinkDelay delay;
+            Clock::time_point t0 = Clock::now();
+            int64_t now = 0;          // µs
+            double capacity = 100e6;  // bits a second
+            double lost = 0;          // the share of packets that never arrive
+            int64_t free = 0;         // when what is queued will have left
+            int64_t count = 0;        // packets sent
+            uint32_t seed = 1;
+            std::deque<std::pair<int64_t, int64_t>> arrived;  // when (the receiver's clock) and which, not yet reported
+            int64_t reported = 0;                             // packets before this one have been
+            int64_t nextReport = 100000;
+            bool ok = true;
+            const int64_t offset = int64_t(16777216) * 64000 - 3000000;
+            Clock::time_point at() const { return t0 + std::chrono::microseconds(now); }
+            void picture(size_t bytes) {
+                for (size_t left = bytes; left > 0;) {
+                    const size_t n = std::min<size_t>(1200, left);
+                    left -= n;
+                    ok = ok && delay.sent(n, at()) == uint16_t(count & 0xffff);
+                    seed = seed * 1664525u + 1013904223u;
+                    if (double(seed >> 8) / double(1 << 24) >= lost) {
+                        free = std::max(now, free) + int64_t(double(n) * 8e6 / capacity);
+                        arrived.emplace_back(free + 20000 + offset, count);
+                    }
+                    ++count;
+                }
+                now += 40000;
+                while (nextReport <= now) {
+                    tell(nextReport);
+                    nextReport += 100000;
+                }
+            }
+            void tell(int64_t when) {
+                std::map<int64_t, int64_t> in;
+                while (!arrived.empty() && arrived.front().first <= when + offset) {
+                    in[arrived.front().second] = arrived.front().first;
+                    arrived.pop_front();
+                }
+                if (in.empty()) return;
+                const int64_t last = in.rbegin()->first, first = in.begin()->second;
+                std::vector<uint8_t> p = {0x8f, 205, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2};
+                auto put16 = [&](int64_t v) {
+                    p.push_back(uint8_t((v >> 8) & 0xff));
+                    p.push_back(uint8_t(v & 0xff));
+                };
+                put16(reported & 0xffff);
+                put16(last - reported + 1);
+                const int64_t reference = first / 64000;
+                p.push_back(uint8_t((reference >> 16) & 0xff));
+                put16(reference & 0xffff);
+                p.push_back(0);
+                std::vector<int> symbols;
+                std::vector<uint8_t> deltas;
+                int64_t before = reference * 64000;
+                for (int64_t n = reported; n <= last; ++n) {
+                    if (!in.count(n)) {
+                        symbols.push_back(0);
+                        continue;
+                    }
+                    const int64_t delta = (in[n] - before) / 250;
+                    before += delta * 250;
+                    symbols.push_back(delta >= 0 && delta <= 255 ? 1 : 2);
+                    if (symbols.back() == 2) deltas.push_back(uint8_t((delta >> 8) & 0xff));
+                    deltas.push_back(uint8_t(delta & 0xff));
+                }
+                for (size_t i = 0; i < symbols.size(); i += 7) {
+                    int chunk = 0xc000;
+                    for (size_t k = 0; k < 7 && i + k < symbols.size(); ++k) chunk |= symbols[i + k] << (12 - 2 * int(k));
+                    put16(chunk);
+                }
+                p.insert(p.end(), deltas.begin(), deltas.end());
+                while (p.size() % 4) p.push_back(0);
+                p[2] = uint8_t(((p.size() / 4 - 1) >> 8) & 0xff);
+                p[3] = uint8_t((p.size() / 4 - 1) & 0xff);
+                reported = last + 1;
+                ArrivalReport r;
+                ok = ok && parseTransportFeedback(p.data(), p.size(), r);
+                delay.feedback(r, t0 + std::chrono::microseconds(when));
+            }
+        };
+        {
+            // 4 Mb/s over a link that takes it: no queue, and what arrived is what was sent.
+            Link l;
+            QVERIFY(!l.delay.active(l.at()));
+            for (int k = 0; k < 125; ++k) {
+                l.picture(20000);
+                QVERIFY2(!l.delay.standing(), std::to_string(k).c_str());
+            }
+            QVERIFY(l.ok && l.delay.active(l.at()));
+            QVERIFY2(std::abs(l.delay.queueMs()) < 2, std::to_string(l.delay.queueMs()).c_str());
+            QVERIFY2(std::abs(l.delay.receivedKbps() - 4000) < 300, std::to_string(l.delay.receivedKbps()).c_str());
+            // The link now carries 2 Mb/s: the queue is seen to stand within 2.5 s, and what arrives is 2 Mb/s.
+            l.capacity = 2e6;
+            int frames = 0;
+            while (!l.delay.standing() && frames < 200) l.picture(20000), ++frames;
+            qInfo("A queue at 2 Mb/s is seen to stand after %d ms, %.0f ms long; %.0f kb/s arrive", frames * 40, l.delay.queueMs(), l.delay.receivedKbps());
+            QVERIFY2(frames * 40 <= 2500, std::to_string(frames * 40).c_str());
+            QVERIFY(l.delay.queueMs() > 50);
+            QVERIFY2(std::abs(l.delay.receivedKbps() - 2000) < 200, std::to_string(l.delay.receivedKbps()).c_str());
+            // Sent 1.5 Mb/s from here on: the queue drains, which is not standing, and is gone in 15 s.
+            l.delay.restart(l.at());
+            for (int k = 0; k < 375; ++k) {
+                l.picture(7500);
+                QVERIFY2(!l.delay.standing(), std::to_string(k).c_str());
+            }
+            QVERIFY2(l.delay.queueMs() < 10, std::to_string(l.delay.queueMs()).c_str());
+            // A probe at 4 Mb/s on this link is delayed, and known to be within 600 ms; its padding then stops.
+            QCOMPARE(l.delay.probe(l.at()), LinkDelay::Probe::None);
+            l.delay.beginProbe(l.at(), 700ms);
+            QVERIFY(l.delay.probeSending(l.at()));
+            frames = 0;
+            while (l.delay.probe(l.at()) == LinkDelay::Probe::Running && frames < 50) l.picture(20000), ++frames;
+            QCOMPARE(l.delay.probe(l.at()), LinkDelay::Probe::Delayed);
+            QVERIFY(!l.delay.probeSending(l.at()));
+            QVERIFY2(frames * 40 <= 600, std::to_string(frames * 40).c_str());
+            // The probe's own queue drains and is not taken for the pictures'.
+            l.delay.restart(l.at());
+            for (int k = 0; k < 125; ++k) {
+                l.picture(7500);
+                QVERIFY2(!l.delay.standing(), std::to_string(k).c_str());
+            }
+            // The link released: the same probe arrives, known within a second of its beginning.
+            l.capacity = 100e6;
+            l.delay.beginProbe(l.at(), 700ms);
+            for (frames = 0; l.delay.probe(l.at()) == LinkDelay::Probe::Running && frames < 50; ++frames) {
+                QCOMPARE(l.delay.probeSending(l.at()), frames * 40 < 700);
+                l.picture(20000);
+            }
+            QCOMPARE(l.delay.probe(l.at()), LinkDelay::Probe::Arrived);
+            QVERIFY2(frames * 40 <= 1000, std::to_string(frames * 40).c_str());
+            // A probe that loses three packets in ten is delayed too.
+            l.lost = 0.3;
+            l.delay.beginProbe(l.at(), 700ms);
+            for (frames = 0; l.delay.probe(l.at()) == LinkDelay::Probe::Running && frames < 60; ++frames) l.picture(20000);
+            QCOMPARE(l.delay.probe(l.at()), LinkDelay::Probe::Delayed);
+            QVERIFY(l.ok);
+        }
+        {
+            // A key frame ten times the usual size on a link with a quarter to spare queues and drains: not standing.
+            Link l;
+            l.capacity = 5e6;
+            for (int k = 0; k < 250; ++k) {
+                l.picture(k % 100 == 50 ? 200000 : 20000);
+                QVERIFY2(!l.delay.standing(), std::to_string(k).c_str());
+            }
+            QVERIFY(l.ok);
+        }
+        {
+            // Past the sequence numbers' wrap (65,536 packets), the reports are still matched to what was sent.
+            Link l;
+            for (int k = 0; k < 4500; ++k) l.picture(20000);
+            QVERIFY(l.count > 70000 && !l.delay.standing());
+            l.capacity = 2e6;
+            int frames = 0;
+            while (!l.delay.standing() && frames < 200) l.picture(20000), ++frames;
+            QVERIFY2(frames * 40 <= 2500, std::to_string(frames * 40).c_str());
+            QVERIFY(l.ok);
+        }
+
+        // The ladder steered by it. With arrival reports, a try due is a probe first: delayed, the viewer stays and
+        // the next is twice as far off; arrived, they move up.
+        auto never = [](int) { return false; };
+        auto always = [](int) { return true; };
+        const auto t0 = RungSteering::Clock::now();
+        RungSteering s;
+        s.movedAt = t0 - 10s;
+        s.nextTry = t0;
+        s.probes = true;
+        QCOMPARE(s.report(1, 2, 0.0, t0, t0, never, always), 1);
+        QVERIFY(s.probing && !s.trying);
+        QCOMPARE(s.probed(1, false, t0 + 1s, always), 1);
+        QVERIFY(!s.probing);
+        QVERIFY(s.hold == 16000ms);
+        for (int k = 2; k < 17; ++k) {
+            QCOMPARE(s.report(1, 2, 0.0, t0 + std::chrono::seconds(k), t0 + std::chrono::seconds(k), never, always), 1);
+            QVERIFY2(!s.probing, std::to_string(k).c_str());
+        }
+        QCOMPARE(s.report(1, 2, 0.0, t0 + 18s, t0 + 18s, never, always), 1);
+        QVERIFY(s.probing);
+        QCOMPARE(s.probed(1, true, t0 + 19s, always), 0);
+        QVERIFY(s.trying && !s.probing);
+        s.switched(t0 + 19s);
+        // A queue standing 5 s after the move: the try failed, so down again and the wait doubled once more.
+        QCOMPARE(s.delayed(0, 2, t0 + 24s, never, always), 1);
+        QVERIFY(!s.trying);
+        QVERIFY(s.hold == 32000ms);
+        s.switched(t0 + 24s);
+        // A standing queue moves to the rung that fits what arrived, and not at all within 0.7 s of a move.
+        QCOMPARE(s.delayed(1, 2, t0 + 24s + 500ms, never, always), 1);
+        RungSteering fits;
+        fits.movedAt = t0 - 10s;
+        QCOMPARE(fits.delayed(0, 2, t0, [](int i) { return i == 1; }, always), 2);
+        // Heavy loss while a probe is out ends it as delayed.
+        RungSteering lossy;
+        lossy.movedAt = t0 - 10s;
+        lossy.nextTry = t0;
+        lossy.probes = true;
+        QCOMPARE(lossy.report(1, 2, 0.0, t0, t0, never, always), 1);
+        QVERIFY(lossy.probing);
+        QCOMPARE(lossy.report(1, 2, 0.30, t0 + 1s, t0 + 1s, never, always), 2);
+        QVERIFY(!lossy.probing);
+        QVERIFY(lossy.hold == 16000ms);
+        // Without arrival reports a try moves at once, as before.
+        RungSteering blind;
+        blind.movedAt = t0 - 10s;
+        blind.nextTry = t0;
+        QCOMPARE(blind.report(1, 2, 0.0, t0, t0, never, always), 0);
+        QVERIFY(blind.trying && !blind.probing);
+    }
+
+    // A viewer whose link carries 2 Mb/s and queues the rest without dropping anything: moved down a size by the
+    // delay alone, kept from the full size while probes at its rate arrive late, and moved back once the link is
+    // released; another viewer keeps the full picture throughout.
+    void browserReviewQueueingLink() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        // Noise, so each rung's encoder spends its whole bit rate (full 4 Mb/s, half 1.5, quarter 0.5).
+        ReviewRig rig;
+        rig.settings.codec = "h264";  // (or AV1 or VP9, where the browser has no H.264)
+        rig.settings.bitrateKbps = 4000;
+        rig.settings.audioBitrateKbps = 64;
+        rig.settings.rungs = 3;
+        rig.picture = [](FrameTime f) {
+            auto img = std::make_shared<Image>(640, 360);
+            uint32_t seed = uint32_t(f) * 2654435761u + 1;
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x) {
+                    seed = seed * 1664525u + 1013904223u;
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(seed >> 24) / 255.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(640, 360, "rec709", &why), why.c_str());
+        rig.playing = true;  // (new noise each frame)
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why), why.c_str());
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        // One viewer on the page, as a reviewer joins; another through a relay that can be slowed, which queues
+        // whatever does not fit and drops nothing.
+        QCOMPARE(tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+        ThrottledRelay relay;
+        relay.lossless = true;
+        QVERIFY(relay.start(quint16(rig.port())));
+        QCOMPARE(tab.js(whepPlayerScript("slow", rig.passphrase(), "/whep", rig.port(), relay.port())).toString(), QStringLiteral("ok"));
+        const QString full = decodedSizeScript("__montage.pc"), slow = decodedSizeScript("slow");
+        QVERIFY2(tab.until(full + ".then(s => s === '640x360')", 20), qPrintable(tab.js(full).toString()));
+        QVERIFY2(tab.until(slow + ".then(s => s === '640x360')", 20), qPrintable(tab.js(slow).toString()));
+        QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{2, 0, 0}));
+        qInfo("Codec: %s", rig.review->stats().encoder.c_str());
+        // The browser reports when packets arrive (the answer took up the extension and its feedback).
+        QVERIFY(tab.js("slow.remoteDescription.sdp.includes('transport-wide-cc-extensions-01') && slow.remoteDescription.sdp.includes('transport-cc')").toBool());
+        QCOMPARE(rig.review->stats().queueMoves, 0);
+
+        // The relay held to 2 Mb/s: off the full size within 5 s by Montage's count, with nothing dropped; the page's
+        // own viewer stays at full size.
+        const auto onRungs = [&] {
+            const ReviewStats st = rig.review->stats();
+            QStringList on;
+            for (int n : st.rungViewers) on << QString::number(n);
+            return QString("viewers on each rung %1; %2 probes, %3 moves for a queue; the slow viewer decodes %4; %5 packets dropped")
+                .arg(on.join('/'))
+                .arg(st.probes)
+                .arg(st.queueMoves)
+                .arg(tab.js(slow).toString())
+                .arg(relay.dropped.load());
+        };
+        std::vector<QString> fullSizes;
+        QElapsedTimer t;
+        t.start();
+        relay.kbps = 2000;
+        qint64 down = -1;
+        // (the aim is 5 s, as printed; a loaded runner is given 8)
+        while (t.elapsed() < 8000 && down < 0) {
+            if (rig.review->stats().rungViewers[0] == 1) down = t.elapsed();
+            else QThread::msleep(20);
+        }
+        qInfo("At 2 Mb/s, nothing dropped: moved down after %lld ms (%s)", (long long)down, qPrintable(onRungs()));
+        QVERIFY2(down >= 0, qPrintable(onRungs()));
+        QCOMPARE(relay.dropped.load(), int64_t(0));
+        QVERIFY(rig.review->stats().queueMoves >= 1);
+        QVERIFY2(tab.until(slow + ".then(s => s !== '' && s !== '640x360')", 15), qPrintable(onRungs()));
+        qInfo("The slow viewer shows the smaller size %lld ms after the link slowed", (long long)t.elapsed());
+        // Held there for 20 s: probes go out and are delayed, so the viewer is never moved to the full size.
+        const int probesBefore = rig.review->stats().probes;
+        t.restart();
+        while (t.elapsed() < 20000) {
+            QVERIFY2(rig.review->stats().rungViewers[0] == 1, qPrintable(onRungs()));
+            fullSizes.push_back(tab.js(full).toString());
+            QThread::msleep(200);
+        }
+        const int probesHeld = rig.review->stats().probes;
+        qInfo("Held at 2 Mb/s for 20 s: %s", qPrintable(onRungs()));
+        QVERIFY2(probesHeld > probesBefore, qPrintable(onRungs()));
+        // Released: a probe arrives, and the viewer is back at full size.
+        relay.kbps = 0;
+        t.restart();
+        qint64 up = -1;
+        while (t.elapsed() < 70000 && up < 0) {
+            fullSizes.push_back(tab.js(full).toString());
+            if (tab.js(slow).toString() == "640x360") up = t.elapsed();
+            else QThread::msleep(100);
+        }
+        qInfo("Released: full size again after %lld ms (%s)", (long long)up, qPrintable(onRungs()));
+        QVERIFY2(up >= 0, qPrintable(onRungs()));
+        QVERIFY(rig.review->stats().probes > probesHeld);
+        for (const QString& s : fullSizes) QCOMPARE(s, QStringLiteral("640x360"));
+        QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{2, 0, 0}));
+        QCOMPARE(relay.dropped.load(), int64_t(0));
+    }
+
         Image half(W, H);
         half.fill(0.4f, 0.4f, 0.4f, 0.5f);  // (premultiplied by fill)
         applyVideoEffect(vig, 0, half, 1.0);

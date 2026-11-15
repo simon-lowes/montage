@@ -28,11 +28,15 @@ bool makeReviewCertificate(const std::vector<std::string>& hosts, std::string& c
 // This computer's names and addresses, for such a certificate.
 std::vector<std::string> reviewCertificateHosts();
 
-// How one viewer is steered on the simulcast ladder (rung 0 the largest) from their receiver reports. More than a
-// tenth of the packets lost moves them down (to the rung that fits what got through, at least one down); after a while
-// without much loss they try the rung above. A try fails when heavy loss comes within 20 s of it, however late the
-// reports bring it, and is then not made again for twice as long (8 s at first, at most 32 s). Some loss (2-10%)
-// puts the next try off once, not for good: a link that always loses a little still climbs back.
+// How one viewer is steered on the simulcast ladder (rung 0 the largest) from their receiver reports and, where their
+// browser reports when packets arrive, from the queue on the way to them (render/ReviewCongestion.h). More than a tenth
+// of the packets lost, or a queue that stands and does not drain, moves them down (to the rung that fits what got
+// through, at least one down); after a while without much loss they try the rung above. With arrival reports a try is
+// first a probe: a short burst of padding at the rung above's rate, and the move is made only when that arrived
+// without queueing. A try fails when heavy loss or a standing queue comes within 20 s of it, however late the reports
+// bring it, and a probe when it is delayed; either is then not made again for twice as long (8 s at first, at most
+// 32 s). Some loss (2-10%) puts the next try off once, not for good: a link that always loses a little still climbs
+// back.
 struct RungSteering {
     using Clock = std::chrono::steady_clock;
     Clock::time_point movedAt = Clock::now(), nextTry = Clock::now() + std::chrono::seconds(3);
@@ -40,12 +44,23 @@ struct RungSteering {
     std::chrono::milliseconds hold{8000};
     bool trying = false;         // moved up a rung lately, to see whether it fits
     bool postponed = false;      // the next try already put off by some loss
-    // A receiver report (made at `at`, read at `now`) with this share lost: the rung to go to (`rung` to stay).
+    bool probes = false;         // arrival reports are coming: a try begins as a probe
+    bool probing = false;        // a probe is being sent and judged
+    // A receiver report (made at `at`, read at `now`) with this share lost: the rung to go to (`rung` to stay; with
+    // `probes`, a try due sets `probing` instead of moving).
     // tooBig(i): rung i's rate is more than what got through; usable(i): rung i has a working encoder.
     int report(int rung, int last, double loss, Clock::time_point at, Clock::time_point now,
                const std::function<bool(int)>& tooBig, const std::function<bool(int)>& usable);
+    // The queue to the viewer stands (seen at `now`): the rung to go to, as for heavy loss.
+    int delayed(int rung, int last, Clock::time_point now, const std::function<bool(int)>& tooBig,
+                const std::function<bool(int)>& usable);
+    // The probe's verdict: the rung to go to (the one above when it arrived without queueing).
+    int probed(int rung, bool arrived, Clock::time_point now, const std::function<bool(int)>& usable);
     // The viewer is on the new rung now (reports and tries count from here, not from when it was asked for).
     void switched(Clock::time_point now);
+
+private:
+    int down(int rung, int last, Clock::time_point now, const std::function<bool(int)>& tooBig, const std::function<bool(int)>& usable);
 };
 
 class BrowserReviewBackend : public ReviewBackend {
