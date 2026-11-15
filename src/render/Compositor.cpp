@@ -3004,6 +3004,8 @@ std::string cpuEffectReason(const Clip& c, FrameTime lt) {
     for (const Effect& e : c.effects) {
         std::vector<gpu::ColorOp> ops;
         if (e.enabled && !runOnSource(e) && !gpuColorOps(e, lt, ops, 0, 0, 1)) {
+            // (an OpenFX effect by its plug-in's name)
+            if (ofx::PluginDesc d; e.type == "ofx" && ofx::Registry::instance().lookUp(e, d) && !d.label.empty()) return "its effect " + d.label;
             const EffectInfo* info = findEffectInfo(e.type);
             return "its effect " + (info ? info->displayName : e.type);
         }
