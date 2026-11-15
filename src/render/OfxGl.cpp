@@ -864,8 +864,9 @@ bool receiveDmaBuf(int post, long long pid, bool fence, int waitMs, DmaBuf& buf,
     long long from = -1;
     bool whole = false;
     // The newest message is the one waited for (it was sent before the reply that said so); older ones were never
-    // taken, and go.
-    for (int wait = waitMs; takeMessage(post, wait, fds, from); wait = 0) {
+    // taken, and go. (No more than a socket holds at once are looked through, whoever keeps sending.)
+    int taken = 0;
+    for (int wait = waitMs; taken < 64 && takeMessage(post, wait, fds, from); wait = 0, ++taken) {
         if (from == pid && fds.size() == (fence ? 2u : 1u)) {
             closeDmaBuf(buf);
             whole = true;
