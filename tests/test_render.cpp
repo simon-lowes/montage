@@ -18927,7 +18927,6 @@ colorspaces:
         QVERIFY(cs == status);
     }
 
-    // ST 2110-22's JPEG XS (RFC 9134), in both packetization modes: packets as the RFC lays them out (a constant number
     // Nightly 15 Nov: what a JPEG XS sender, or a crafted file, may have set aside is bounded. Runs without the
     // library: the packets and the codestream's header are made by hand.
     void jpegXsBoundedAgainstCraftedStreams() {
@@ -19058,6 +19057,7 @@ colorspaces:
         if (montage::jpegXsAvailable()) QVERIFY2(why.find("larger") != std::string::npos, why.c_str());
     }
 
+    // ST 2110-22's JPEG XS (RFC 9134), in both packetization modes: packets as the RFC lays them out (a constant number
     // each frame, every payload of a unit as long but its last, the marker on the frame's last), rebuilt to the very
     // codestream; one lost packet damages only its slices' lines (taken from the frame before); and over the loopback
     // interface, on two paths each losing packets the other has, frames identical to decoding the codestream directly.
