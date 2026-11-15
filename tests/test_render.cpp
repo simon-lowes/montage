@@ -22939,8 +22939,10 @@ colorspaces:
 #endif
     }
 
-    // Guessers from 64 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
-    // from elsewhere is tried every time, when right and when wrong, while they guess.
+    // Guessers from 48 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
+    // from elsewhere is tried every time, when right and when wrong, while they guess. The networks are fewer than the
+    // 64 connections the review keeps open at once: on a computer too busy to answer quickly every guesser's
+    // connection is open together, and with every place taken a newcomer's would be turned away before it is read.
     void browserReviewGuessersFromManyNetworks() {
         using namespace montage::output;
         using namespace montage::reviewtest;
@@ -22956,8 +22958,9 @@ colorspaces:
         const int port = rig.port();
         std::atomic<bool> guessing{true};
         std::atomic<int> first{0}, wrong{0}, refused{0}, dropped{0};
+        const int networks = 48;
         std::vector<std::thread> guessers;
-        for (int n = 0; n < 64; ++n)
+        for (int n = 0; n < networks; ++n)
             guessers.emplace_back([&, n] {
                 const QString from = QStringLiteral("127.1.%1.9").arg(n);
                 for (bool begun = false; guessing; begun = true) {
@@ -22977,7 +22980,7 @@ colorspaces:
         QCOMPARE(httpsStatus("127.2.0.5", port, "/config", pass, 8000), 200);
         QCOMPARE(httpsStatus("127.2.1.5", port, "/config", "mistyped", 8000), 401);
         QCOMPARE(httpsStatus("127.2.1.5", port, "/config", pass, 8000), 200);
-        QTRY_COMPARE_WITH_TIMEOUT(first.load(), 64, 20000);
+        QTRY_COMPARE_WITH_TIMEOUT(first.load(), networks, 20000);
         // After every network's first wrong guess, for some seconds of their guessing: newcomers from eight more
         // networks, each wrong twice and then right, and none of their tries is refused untried.
         QElapsedTimer storm;
@@ -22992,11 +22995,11 @@ colorspaces:
         }
         const double seconds = double(storm.elapsed()) / 1000.0;
         const int wrongMeanwhile = wrong - wrongBefore;
-        qInfo("Guessers from 64 networks: %d told wrong and %d refused untried in all, %d told wrong in the last %.1f s",
-              wrong.load(), refused.load(), wrongMeanwhile, seconds);
+        qInfo("Guessers from %d networks: %d told wrong and %d refused untried in all, %d told wrong in the last %.1f s",
+              networks, wrong.load(), refused.load(), wrongMeanwhile, seconds);
         QVERIFY(refused > 0);
         // The guessers together: what each network may try at once, and five a second between them after that.
-        QVERIFY2(wrongMeanwhile <= 64 * 3 + int(5 * seconds) + 16, std::to_string(wrongMeanwhile).c_str());
+        QVERIFY2(wrongMeanwhile <= networks * 3 + int(5 * seconds) + 16, std::to_string(wrongMeanwhile).c_str());
 #endif
     }
 
