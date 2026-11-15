@@ -5,6 +5,10 @@
 #ifdef Q_OS_UNIX
 #include <sys/stat.h>
 #endif
+#ifdef Q_OS_LINUX
+#include <sys/resource.h>
+#include <csignal>
+#endif
 #include <QCryptographicHash>
 #include <QtEndian>
 #include <QPainter>
@@ -2159,8 +2163,8 @@ private slots:
     // without its caller calling again. Each file starts with the picture after the one before it ended on, its
     // timecode the feed's own there (counted on from the last picture that carried one: files begin between a
     // transport stream's groups), every picture the one its timecode names, and its sound the feed's from its first
-    // samples (the sound a decoder's held pictures let run ahead goes in at the start). A file that cannot be written
-    // is said and the feed watched on.
+    // samples (the sound a decoder's held pictures let run ahead goes in at the start). A file that cannot be begun,
+    // or cannot be written on once begun, is said and the feed watched on.
     void captureFromTheSameReception() {
         const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
         if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
@@ -2268,6 +2272,37 @@ private slots:
             QVERIFY(std::get<0>(ended[2]) == path("no-such-folder/same.mov") && !std::get<1>(ended[2]) && !std::get<2>(ended[2]).empty());
         }
         QVERIFY(waitFor([&] { return r.status().path.empty() && cs.live->look().frame >= 5; }));  // (watched on)
+        // A file that is begun and then cannot be written on (a full disk: here the process's file size limit, lowered
+        // while it records) is said the same way, and the feed is watched on.
+        size_t failed = 0;
+#ifdef Q_OS_LINUX
+        {
+            failed = 1;
+            struct rlimit was {};
+            QVERIFY(getrlimit(RLIMIT_FSIZE, &was) == 0);
+            const auto before = std::signal(SIGXFSZ, SIG_IGN);
+            struct rlimit low = was;
+            low.rlim_cur = 150000;
+            QVERIFY(setrlimit(RLIMIT_FSIZE, &low) == 0);
+            const bool asked = r.recordTo({path("same-full.mov"), "prores_proxy"}, &err);
+            const bool told = asked && waitFor([&] {
+                std::lock_guard lock(said);
+                return ended.size() >= 4;
+            });
+            setrlimit(RLIMIT_FSIZE, &was);
+            std::signal(SIGXFSZ, before);
+            QVERIFY2(asked, err.c_str());
+            QVERIFY2(told, r.status().error.c_str());
+            {
+                std::lock_guard lock(said);
+                QVERIFY2(std::get<0>(ended[3]) == path("same-full.mov") && !std::get<1>(ended[3]) && std::get<2>(ended[3]).rfind("Cannot write ", 0) == 0,
+                         std::get<2>(ended[3]).c_str());
+            }
+            const int64_t then = cs.live->look().pictures;
+            QVERIFY(waitFor([&] { return r.status().path.empty() && cs.live->look().pictures >= then + 10; }));
+            QVERIFY2(r.recording() && r.status().error.empty(), r.status().error.c_str());
+        }
+#endif
         QVERIFY2(record(files[2]), err.c_str());
         // The sender's one call still stands (its stream opened once), and stopping ends the last file as ever.
         QCOMPARE(sender.state(), QProcess::Running);
@@ -2278,7 +2313,7 @@ private slots:
         QVERIFY(!cs.live->look().running);
         {
             std::lock_guard lock(said);
-            QCOMPARE(ended.size(), size_t(3));  // (the last is onFinished's)
+            QCOMPARE(ended.size(), size_t(3) + failed);  // (the last is onFinished's)
         }
         // Each file: as long as the recorder said, its timecode the feed's at its first picture, every picture the one
         // that names (its grey 8 codes a frame within the second), its sound there from the start.
