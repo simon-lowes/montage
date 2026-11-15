@@ -14032,6 +14032,25 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(deck.chaseSamplesFromDevice(), int64_t(-1));
         feed.close();
         engine.removeInput(tap);
+        // A device chosen that is not there (a host no build opens): scrubbing's output is opened once for it, not at
+        // every seek (nightly 15 Nov: each seek asked for the device again and cut the snippet before short), and goes
+        // back to the device once that is open.
+        audiodev::DeviceSettings gone = ds;
+        gone.host = audiodev::Host::Asio;
+        engine.setSettings(gone);
+        QVERIFY(engine.active() && !engine.isOpen());
+        const int opened = program->scrubOutput()->opens();
+        for (int f = 20; f < 28; ++f) {
+            program->seek(f);
+            QTest::qWait(30);
+        }
+        QVERIFY(!program->scrubOutput()->onDevice());
+        QCOMPARE(program->scrubOutput()->opens() - opened, 1);
+        engine.setSettings(ds);
+        QVERIFY(engine.isOpen());
+        program->seek(30);
+        QVERIFY(program->scrubOutput()->onDevice());
+        QCOMPARE(program->scrubOutput()->opens() - opened, 2);
         engine.setSettings(before);
         state()->newProject();
     }

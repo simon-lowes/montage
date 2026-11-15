@@ -14,6 +14,7 @@ SoundOut::~SoundOut() { close(); }
 
 bool SoundOut::open(int rate, int channels, double seconds) {
     close();
+    ++opens_;
     rate_ = rate > 0 ? rate : 48000;
     channels_ = std::clamp(channels, 1, 64);
     written_ = 0;
