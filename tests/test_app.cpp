@@ -13795,6 +13795,37 @@ const auto seq = [this] { return state()->sequence(); };
         size_t after = 0;
         for (int t = 0; t < 3; ++t) after += state()->sequence()->audioTracks[size_t(t)].clips.size();
         QCOMPARE(after, before);
+        // An input with two channels (nightly 15 Nov): the group's first two tracks record, A2 then A1, a channel each;
+        // A3, with no channel of its own, records nothing (it was given the first channel again).
+        rec.setFeedChannels(2);
+        QVERIFY(rec.start(300, 1, 330, {}, false, 48000, 1));
+        std::vector<float> two(4800 * 2);
+        at = 0;
+        for (int b = 0; b < 15; ++b, at += 4800) {
+            for (qint64 i = 0; i < 4800; ++i)
+                for (int ch = 0; ch < 2; ++ch) two[size_t(i * 2 + ch)] = value(at + i, ch);
+            rec.feed(two.data(), 4800);
+        }
+        QTRY_VERIFY(!rec.isRecording());
+        rec.setFeedChannels(0);
+        {
+            const Sequence& now = *state()->sequence();
+            QVERIFY(!edit::clipAt(now, {TrackKind::Audio, 2}, 310));
+            const int channelOfTwo[2] = {1, 0};
+            for (int t = 0; t < 2; ++t) {
+                const Clip* c = edit::clipAt(now, {TrackKind::Audio, t}, 310);
+                QVERIFY2(c, qPrintable(QStringLiteral("no clip on A%1").arg(t + 1)));
+                const MediaItem* m = state()->project().findMedia(c->mediaId);
+                QVERIFY(m);
+                QFile f(QString::fromStdString(m->path));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                f.seek(44);
+                const QByteArray data = f.readAll();
+                QCOMPARE(qint64(data.size() / 4), qint64(48000));
+                const float* x = reinterpret_cast<const float*>(data.constData());
+                for (qint64 i : {qint64(0), qint64(1), qint64(24000), qint64(47999)}) QCOMPARE(x[i], value(i, channelOfTwo[t]));
+            }
+        }
         // A track out of the group records alone.
         QVERIFY(state()->apply("Ungroup", [](Project&, Sequence& s) {
             s.audioTracks[2].group = 0;
