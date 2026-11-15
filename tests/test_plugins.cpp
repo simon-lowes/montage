@@ -3445,6 +3445,23 @@ private slots:
         const int64_t played = std::llround(double(clicker.pos.load()) * 1e9 / double(std::max<qint64>(1, t.nsecsElapsed())));
         e.removeOutput(id);
         QVERIFY2(played > 40000 && played < 58000, qPrintable(QString::number(played)));
+        // What an output has been heard to play is time, whatever rates the device ran at while it played (nightly
+        // 15 Nov: frames sent at 48 kHz were counted as 96 kHz's after the change, and the picture left the sound's
+        // clock): a second at 96 kHz, then a second at 48 kHz, is two seconds heard.
+        Clicker steady;
+        const int out = e.addOutput(&steady, 48000, 2, [&](float* o, int ch, int n) { return steady.render(o, ch, n); });
+        QVERIFY(out >= 0);
+        QTRY_VERIFY(e.heardSeconds(out) > 0);
+        QElapsedTimer heard;
+        heard.start();
+        const double from = e.heardSeconds(out);
+        QTest::qWait(1000);
+        audiodev::loopbackChangeRate(48000);
+        QTRY_COMPARE(e.status().rate, 48000);
+        QTest::qWait(1000);
+        const double wall = double(heard.nsecsElapsed()) / 1e9, said = e.heardSeconds(out) - from;
+        e.removeOutput(out);
+        QVERIFY2(std::fabs(said - wall) < 0.2, qPrintable(QString("%1 s heard in %2 s").arg(said).arg(wall)));
         audiodev::setLoopbackOptions({});
     }
 
