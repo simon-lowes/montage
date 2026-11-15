@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -97,6 +98,30 @@ std::filesystem::path cacheFolder(const StreamOptions& o) {
     return dir;
 }
 
+// The cache files this process's kits play from (by path): tidying never takes one of them, and a file asked for
+// again while a kit still plays from it is that kit's.
+std::mutex gCacheM;
+std::map<std::string, std::weak_ptr<const DiskSound>> gCacheInUse;
+
+// A cache folder kept small: the cache files of earlier versions of one source (`sourcePrefix`: their names' start;
+// `keep` the one for the source as it is now), and whatever has not been used for a week (cache files, parts a crash
+// left, kits' own files), are removed; what this process plays from stays.
+void tidyCache(const std::filesystem::path& dir, const std::string& sourcePrefix, const std::filesystem::path& keep) {
+    std::error_code ec;
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::lock_guard<std::mutex> lock(gCacheM);
+    for (auto it = gCacheInUse.begin(); it != gCacheInUse.end();) it = it->second.expired() ? gCacheInUse.erase(it) : std::next(it);
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("sound-", 0) != 0 && name.rfind("kit-", 0) != 0) continue;
+        if (entry.path() == keep || gCacheInUse.count(entry.path().string())) continue;
+        std::error_code e2;
+        const auto used = std::filesystem::last_write_time(entry.path(), e2);
+        const bool earlier = !sourcePrefix.empty() && name.rfind(sourcePrefix, 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".f32") == 0;
+        if (earlier || (!e2 && now - used > std::chrono::hours(24 * 7))) std::filesystem::remove(entry.path(), e2);
+    }
+}
+
 bool writeFloats(std::FILE* f, const float* x, size_t n) { return std::fwrite(x, sizeof(float), n, f) == n; }
 
 bool seekFrame(std::FILE* f, int64_t frame) {  // (64-bit offsets everywhere: long is 32 bits on Windows)
@@ -121,7 +146,8 @@ AudioBufferPtr readHead(const DiskSound& d, int64_t from, int64_t frames, int ra
     return ok ? head : nullptr;
 }
 
-// A long file decoded in blocks straight into its cache file (kept to be used again while the file is unchanged).
+// A long file decoded in blocks straight into its cache file (kept to be used again while the file is unchanged: named
+// for the source and rate, then for the file as it is, so a changed file's earlier cache file is known and removed).
 std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate, const StreamOptions& o, std::string* why) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
@@ -130,12 +156,32 @@ std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate,
         return nullptr;
     }
     const auto stamp = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-    const std::string id = path + "|" + std::to_string(size) + "|" + std::to_string(static_cast<long long>(stamp)) + "|" + std::to_string(rate);
-    const std::filesystem::path file = cacheFolder(o) / ("sound-" + std::to_string(std::hash<std::string>{}(id)) + ".f32");
+    const std::string source = "sound-" + std::to_string(std::hash<std::string>{}(path + "|" + std::to_string(rate))) + "-";
+    const std::string version = std::to_string(std::hash<std::string>{}(std::to_string(size) + "|" + std::to_string(static_cast<long long>(stamp))));
+    const std::filesystem::path dir = cacheFolder(o), file = dir / (source + version + ".f32");
+    // (kept in use for as long as a kit plays from it)
+    auto inUse = [&](const std::shared_ptr<const DiskSound>& d) {
+        std::lock_guard<std::mutex> lock(gCacheM);
+        gCacheInUse[d->file] = d;
+        return d;
+    };
+    std::shared_ptr<const DiskSound> live;
+    {
+        std::lock_guard<std::mutex> lock(gCacheM);
+        if (const auto it = gCacheInUse.find(file.string()); it != gCacheInUse.end()) live = it->second.lock();
+    }
+    if (live) {
+        std::filesystem::last_write_time(file, std::filesystem::file_time_type::clock::now(), ec);  // (used now)
+        tidyCache(dir, source, file);
+        return live;
+    }
     auto d = std::make_shared<DiskSound>();
     d->file = file.string();
     if (const auto have = std::filesystem::file_size(file, ec); !ec && have > 0 && have % 8 == 0) {
         d->frames = int64_t(have / 8);
+        std::filesystem::last_write_time(file, std::filesystem::file_time_type::clock::now(), ec);  // (used now)
+        inUse(d);
+        tidyCache(dir, source, file);
         return d;
     }
     const std::string part = d->file + ".part" + std::to_string(gCacheSerial++);
@@ -162,6 +208,8 @@ std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate,
         return nullptr;
     }
     d->frames = frames;
+    inUse(d);
+    tidyCache(dir, source, file);
     return d;
 }
 

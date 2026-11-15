@@ -11467,7 +11467,7 @@ private slots:
         streamed.cacheDir = cache.path().toStdString();
         sampler::StreamOptions whole;
         whole.longerThan = 0;
-        const sampler::KitPtr disk = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        sampler::KitPtr disk = sampler::loadKit(st, rate, nullptr, {}, streamed);
         const sampler::KitPtr memory = sampler::loadKit(st, rate, nullptr, {}, whole);
         QVERIFY(disk->pads[0].sounds[0].disk && !memory->pads[0].sounds[0].disk);
         QCOMPARE(disk->pads[0].sounds[0].end - disk->pads[0].sounds[0].start, memory->pads[0].sounds[0].end - memory->pads[0].sounds[0].start);
@@ -11479,6 +11479,40 @@ private slots:
         double energy = 0;
         for (float x : a) energy += double(x) * x;
         QVERIFY(energy > 1000);
+
+        // The cache folder is kept small (nightly 15 Nov: nothing was ever removed from it). The sound changed while
+        // a kit plays from its cache file: a new one is made and the earlier one stays for that kit; once no kit
+        // plays from it, the next load removes it. Files not used for a week go too, newer ones of other sounds stay.
+        auto cached = [&] { return QDir(cache.path()).entryList({"sound-*.f32", "kit-*.f32", "*.part*"}, QDir::Files); };
+        QCOMPARE(cached().size(), 1);
+        const QString first = cached().front();
+        longSound.resize(size_t(26) * rate, 0.1f);
+        QVERIFY(writeMonoWav(longFile, longSound, rate));
+        sampler::KitPtr changed = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QVERIFY(changed->pads[0].sounds[0].disk && changed->pads[0].sounds[0].disk->file != disk->pads[0].sounds[0].disk->file);
+        QCOMPARE(cached().size(), 2);
+        QVERIFY(cached().contains(first));
+        {
+            const std::vector<float> still = sampler::renderNotes(disk, held, 1, 0, int64_t(26) * rate);
+            QVERIFY(still.size() == a.size() && std::memcmp(still.data(), a.data(), a.size() * sizeof(float)) == 0);
+        }
+        const QString second = QFileInfo(QString::fromStdString(changed->pads[0].sounds[0].disk->file)).fileName();
+        for (const char* name : {"sound-123-456.f32", "kit-1-2.f32", "sound-9.f32.part3", "sound-777-888.f32"}) {
+            QFile f(cache.filePath(name));
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write("12345678") == 8);
+            f.close();
+            if (std::strcmp(name, "sound-777-888.f32") != 0)
+                std::filesystem::last_write_time(std::filesystem::path(f.fileName().toStdString()),
+                                                 std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 8));
+        }
+        const sampler::KitPtr again = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QCOMPARE(again->pads[0].sounds[0].disk.get(), changed->pads[0].sounds[0].disk.get());  // (the one file, shared)
+        QCOMPARE(cached().size(), 3);  // (the earlier version still played from, the new one, and the other sound's)
+        QVERIFY(cached().contains(first) && cached().contains(second) && cached().contains("sound-777-888.f32"));
+        disk.reset();
+        const sampler::KitPtr last = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QCOMPARE(cached().size(), 2);
+        QVERIFY(!cached().contains(first) && cached().contains(second) && cached().contains("sound-777-888.f32"));
     }
 
     void mcpMidiMap() {
