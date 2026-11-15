@@ -18927,6 +18927,136 @@ colorspaces:
     }
 
     // ST 2110-22's JPEG XS (RFC 9134), in both packetization modes: packets as the RFC lays them out (a constant number
+    // Nightly 15 Nov: what a JPEG XS sender, or a crafted file, may have set aside is bounded. Runs without the
+    // library: the packets and the codestream's header are made by hand.
+    void jpegXsBoundedAgainstCraftedStreams() {
+        namespace st = montage::st2110;
+        // A codestream of four slices, as far as the assembler reads one: its header, each slice's header and index,
+        // bytes that are no marker, and the end marker.
+        std::vector<uint8_t> cs = {0xFF, 0x10, 0xFF, 0x12, 0x00, 0x1A};
+        cs.resize(cs.size() + 24, 0);
+        auto be16 = [&](size_t at, int v) { cs[at] = uint8_t(v >> 8), cs[at + 1] = uint8_t(v); };
+        be16(6 + 8, 64), be16(6 + 10, 64), be16(6 + 14, 1);  // (64 x 64, a slice one precinct high)
+        cs[6 + 16] = 3, cs[6 + 22] = 4;                       // (three components, a precinct 16 lines)
+        for (int b : {0xFF, 0x13, 0x00, 0x08, 0x0A, 0x11, 0x0A, 0x21, 0x0A, 0x21}) cs.push_back(uint8_t(b));
+        for (int slice = 0; slice < 4; ++slice) {
+            for (int b : {0xFF, 0x20, 0x00, 0x04, 0x00, slice}) cs.push_back(uint8_t(b));
+            for (int i = 0; i < 122; ++i) cs.push_back(uint8_t(1 + (slice * 31 + i) % 200));
+        }
+        cs.push_back(0xFF), cs.push_back(0x11);
+        cs[6] = 0, cs[7] = 0, be16(8, int(cs.size()));  // (its bytes, stated)
+        montage::JxsHeader header;
+        QVERIFY(montage::readJxsHeader(cs.data(), cs.size(), header) && header.width == 64 && header.sliceLines() == 16);
+        // The codestream as packets of `unit` bytes in the codestream mode, numbered from `seq`; `joined` sends the
+        // first two as one long packet.
+        std::vector<std::vector<uint8_t>> payloads;
+        auto packets = [&](uint32_t timestamp, uint16_t& seq, size_t unit, bool joined) {
+            std::vector<st::RtpPacket> out;
+            size_t at = 0;
+            int counter = 0;
+            while (at < cs.size()) {
+                const size_t n = std::min(cs.size() - at, joined && at == 0 ? unit * 2 : unit);
+                const bool last = at + n == cs.size();
+                const uint32_t h = 0x80000000u | (last ? 0x20000000u : 0) | uint32_t(counter / 2048) << 11 | uint32_t(counter % 2048);
+                std::vector<uint8_t> d = {uint8_t(h >> 24), uint8_t(h >> 16), uint8_t(h >> 8), uint8_t(h)};
+                d.insert(d.end(), cs.begin() + ptrdiff_t(at), cs.begin() + ptrdiff_t(at + n));
+                payloads.push_back(std::move(d));
+                st::RtpPacket p;
+                p.sequence = seq++;
+                p.timestamp = timestamp;
+                p.marker = last;
+                out.push_back(p);
+                at += n;
+                counter += n == unit * 2 ? 2 : 1;
+            }
+            // (the payloads are pointed at once none is added any more)
+            for (size_t i = 0; i < out.size(); ++i) {
+                const std::vector<uint8_t>& d = payloads[payloads.size() - out.size() + i];
+                out[i].payload = d.data(), out[i].size = d.size();
+            }
+            return out;
+        };
+        payloads.reserve(4096);
+        {
+            // A sender that never ends its frame: its packets are kept only up to the frame's limit, then let go, and
+            // the frame is passed over when another timestamp comes. The frame after is rebuilt whole.
+            st::JxsvAssembler as;
+            as.setFrameLimit(8192);
+            QCOMPARE(as.frameLimit(), size_t(8192));
+            const std::vector<uint8_t> big(4 + 1400, 0x55);
+            uint16_t seq = 100;
+            size_t most = 0;
+            for (int i = 0; i < 2000; ++i) {
+                st::RtpPacket p;
+                p.sequence = seq++;
+                p.timestamp = 500;
+                p.payload = big.data(), p.size = big.size();
+                QVERIFY(!as.add(p));
+                most = std::max(most, as.heldBytes());
+            }
+            QVERIFY2(most <= 8192, qPrintable(QString::number(most)));
+            QCOMPARE(as.heldBytes(), size_t(0));
+            int done = 0;
+            for (const st::RtpPacket& p : packets(1000, seq, 64, false)) done += as.add(p);
+            QCOMPARE(done, 1);
+            QCOMPARE(as.passedOver(), int64_t(1));
+            QCOMPARE(as.codestream(), cs);
+            // A frame ended by its marker but larger than the limit is passed over too.
+            for (int i = 0; i < 10; ++i) {
+                st::RtpPacket p;
+                p.sequence = seq++;
+                p.timestamp = 2000;
+                p.marker = i == 9;
+                p.payload = big.data(), p.size = big.size();
+                QVERIFY(!as.add(p));
+            }
+            QCOMPARE(as.passedOver(), int64_t(2));
+            // The default limit is the largest picture taken, and no limit asked for goes past it.
+            st::JxsvAssembler other;
+            QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
+            other.setFrameLimit(size_t(1) << 40);
+            QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
+        }
+        {
+            // One whole frame with an odd long packet does not stay the measure of the frames after: once a frame of
+            // ordinary packets has come whole, a frame missing a packet is still put together from the one before.
+            st::JxsvAssembler as;
+            uint16_t seq = 7;
+            int done = 0;
+            for (const st::RtpPacket& p : packets(1000, seq, 64, false)) done += as.add(p);
+            for (const st::RtpPacket& p : packets(2000, seq, 64, true)) done += as.add(p);
+            for (const st::RtpPacket& p : packets(3000, seq, 64, false)) done += as.add(p);
+            QCOMPARE(done, 3);
+            const std::vector<st::RtpPacket> lossy = packets(4000, seq, 64, false);
+            for (size_t i = 0; i < lossy.size(); ++i)
+                if (i != 4) done += as.add(lossy[i]);
+            QCOMPARE(done, 4);
+            QVERIFY(as.lostInFrame() == 1 && as.concealedSlices() >= 1 && as.timestamp() == 4000);
+            QCOMPARE(as.codestream(), cs);
+            QCOMPARE(as.passedOver(), int64_t(0));
+        }
+        // A header naming the largest picture its fields can (65,535 a side) is not one to decode: refused by its
+        // header alone, and by the decoder before it sets anything aside when the library is built in.
+        std::vector<uint8_t> huge = cs;
+        huge[6 + 8] = 0xFF, huge[6 + 9] = 0xFF, huge[6 + 10] = 0xFF, huge[6 + 11] = 0xFF;
+        montage::JxsHeader hugeHeader;
+        std::string why;
+        QVERIFY(montage::readJxsHeader(huge.data(), huge.size(), hugeHeader) && hugeHeader.width == 65535 && hugeHeader.height == 65535);
+        QVERIFY(!montage::jxsPictureFits(hugeHeader, &why) && !why.empty());
+        QVERIFY(montage::jxsPictureFits(header));
+        montage::JxsHeader wide = header;
+        wide.width = 16384, wide.height = 4000;  // (64 million pixels and a few more)
+        QVERIFY(!montage::jxsPictureFits(wide));
+        wide.width = 10240, wide.height = 5400;
+        QVERIFY(montage::jxsPictureFits(wide));
+        montage::JxsDecoder decoder;
+        montage::JxsPicture picture;
+        why.clear();
+        QVERIFY(!decoder.decode(huge.data(), huge.size(), picture, &why));
+        QVERIFY(picture.planes[0].empty());
+        if (montage::jpegXsAvailable()) QVERIFY2(why.find("larger") != std::string::npos, why.c_str());
+    }
+
     // each frame, every payload of a unit as long but its last, the marker on the frame's last), rebuilt to the very
     // codestream; one lost packet damages only its slices' lines (taken from the frame before); and over the loopback
     // interface, on two paths each losing packets the other has, frames identical to decoding the codestream directly.
