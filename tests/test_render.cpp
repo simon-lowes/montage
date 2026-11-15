@@ -13097,6 +13097,43 @@ colorspaces:
             all.push_back(otherSigner.certificates.front());
             QVERIFY(takeFlm(none, again, all, &err, nullptr, &changes) && changes.size() == 1 && changes[0].find("signed by another") != std::string::npos);
         }
+        // A signature that leaves its root out (nightly 15 Nov): the FLM is read, its signer's chain as far as it
+        // goes. It is taken once the root that made the signer is among the trusted ones, the chain then kept whole;
+        // with the devices' roots alone it is refused, and no root is offered to trust (there is none in it).
+        {
+            dcp::CertificateChain rootless = facility;
+            rootless.certificates.erase(rootless.certificates.begin());
+            QVERIFY(!rootless.certificates.empty());
+            std::string left = etm(false);
+            QVERIFY2(dcp::signXml(left, rootless, &err), err.c_str());
+            Facility lakeLeft;
+            QVERIFY2(readFlm(left, lakeLeft, &err), err.c_str());
+            QCOMPARE(lakeLeft.signer, rootless.certificates);
+            const std::vector<std::string> devices{cinemas[0].screens[0].server.certificates.front(), cinemas[0].screens[0].projector.certificates.front()};
+            std::vector<Facility> none;
+            std::vector<std::string> untrusted;
+            QVERIFY(!takeFlm(none, lakeLeft, devices, &err, &untrusted));
+            QVERIFY2(untrusted.empty() && err.find("leaves out its root") != std::string::npos, err.c_str());
+            // (another maker's root does not end it)
+            dcp::CertificateChain stranger;
+            QVERIFY(dcp::makeCertificateChain("Not Lakeside Either", stranger, &err));
+            std::vector<std::string> all = devices;
+            all.push_back(stranger.certificates.front());
+            QVERIFY(!takeFlm(none, lakeLeft, all, &err, &untrusted) && untrusted.empty() && none.empty());
+            all.push_back(facility.certificates.front());
+            QVERIFY2(takeFlm(none, lakeLeft, all, &err), err.c_str());
+            QVERIFY(none.size() == 1 && none[0].signer == facility.certificates);
+            // (and the cinema's next FLM signed the same way is taken by its signer, already held)
+            std::string next = etm(false);
+            QVERIFY(dcp::signXml(next, rootless, &err));
+            Facility lakeNext;
+            QVERIFY(readFlm(next, lakeNext, &err));
+            QVERIFY2(takeFlm(none, lakeNext, devices, &err) && none[0].signer == facility.certificates, err.c_str());
+            // A signature changed after signing is still refused, root or no root.
+            std::string forged = left;
+            forged.replace(forged.find("Lakeside Screens"), 16, "Lakeside Cinemas");
+            QVERIFY(!readFlm(forged, lakeLeft, &err));
+        }
         // A second ds:Signature (whose references would be read with the first's) is refused.
         {
             std::string twice = old;

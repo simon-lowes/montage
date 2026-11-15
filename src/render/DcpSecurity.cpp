@@ -704,6 +704,8 @@ bool verifyXmlSignature(const std::string& xml, std::string* error, SignatureChe
     for (size_t i = 0; i < parts.certificates.size(); ++i) {
         Ptr<X509> c = certificateFrom(parts.certificates[i]);
         const bool last = i + 1 == parts.certificates.size();
+        // (a signature that leaves its root out, where the caller takes one: its chain checked as far as it goes)
+        if (last && check && check->rootMayBeLeftOut && c && X509_check_issued(c.get(), c.get()) != X509_V_OK) break;
         Ptr<X509> by = certificateFrom(parts.certificates[last ? i : i + 1]);
         if (!c || !by || X509_verify(c.get(), X509_get0_pubkey(by.get())) != 1 || X509_check_issued(by.get(), c.get()) != X509_V_OK ||
             (parts.certificates.size() > 1 && X509_check_ca(by.get()) == 0))

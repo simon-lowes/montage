@@ -7,8 +7,9 @@
 //
 // Every certificate chain is checked as it is read (render/DcpSecurity.h checkCertificateChain): a changed
 // certificate, or one whose issuer is not given, is refused, and with it the FLM. An ST 430-7 FLM's signature must hold
-// and cover its public part, and its signer's chain must check too; an Extended FLM is not signed (ST 430-16 leaves the
-// signature out), so only its chains are checked.
+// and cover its public part, and its signer's chain must check too (a signature that leaves its root out is ended by
+// takeFlm with the trusted root that made it); an Extended FLM is not signed (ST 430-16 leaves the signature out), so
+// only its chains are checked.
 //
 // A chain that checks proves only that its root made it, and anyone can make a root: so an FLM is taken into the list
 // (takeFlm) only when each of its chains, and an ST 430-7 FLM's signer's, goes up to a root the user has trusted (kept
@@ -53,7 +54,7 @@ struct Facility {
     // kept here, out of KDMs.
     std::vector<FacilityDevice> otherDevices;
     std::vector<std::string> notes;  // what reading it noticed that did not stop it
-    std::vector<std::string> signer;  // an ST 430-7 FLM's signer's chain (PEM, root first); empty for an Extended FLM
+    std::vector<std::string> signer;  // an ST 430-7 FLM's signer's chain (PEM, root first; as read, without its root when the signature left it out); empty for an Extended FLM
 };
 
 // Reads an Extended FLM (ST 430-16) or an FLM (ST 430-7); false (and why) when it is neither, a chain does not check,
@@ -80,7 +81,8 @@ bool trustRoots(const std::vector<std::string>& pems, std::string* error = nullp
 // already holds for `f`'s cinema: PEM, each once, in the order found.
 std::vector<std::string> untrustedRoots(const Facility& f, const std::vector<Facility>& list, const std::vector<std::string>& trusted);
 // An FLM read by readFlm put in the list (mergeFacility) once it is trusted; false, the list unchanged and `untrusted`
-// given the roots in the way, when it is not.
+// given the roots in the way, when it is not (none when its signer's chain stops below a root nobody trusts: there
+// is no root to ask about).
 bool takeFlm(std::vector<Facility>& list, Facility f, const std::vector<std::string>& trusted, std::string* error = nullptr,
              std::vector<std::string>* untrusted = nullptr, std::vector<std::string>* changes = nullptr);
 // A root as the user is asked to check it: "<common name> (<organisation>), thumbprint <base64 SHA-1>".
