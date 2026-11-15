@@ -41,8 +41,9 @@ struct StreamSettings {
     std::vector<std::string> iceServers;   // "stun:host:3478", "turn:user:password@host:3478", "turns:…" (none by default)
     // A TURN relay the user runs (RFC 8656: "turn:host:3478", "turns:host:5349"), with its user name and password;
     // viewers' pages are given it with the passphrase. With relayOnly every viewer's media goes through it, never
-    // directly: browsers use only the relay, and Montage offers only its own address there (it may still send from
-    // this computer to a browser's address at the relay, which passes that on).
+    // directly: browsers use only the relay, Montage offers only its own address there, and Montage sends nothing to
+    // any address but the relay's, whatever addresses a viewer offers (render/TurnRelay.h's bridge; its ICE is then
+    // told of no STUN or TURN server either).
     std::string turnServer, turnUser, turnPassword;
     bool relayOnly = false;
     // In place of the user name and password, the secret the relay shares with Montage (coturn's use-auth-secret):

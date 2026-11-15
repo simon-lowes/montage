@@ -22652,8 +22652,8 @@ colorspaces:
         if (!hdr) QCOMPARE(rig.review->stats().hdrViewers, 0);
     }
 
-    // Through a TURN relay the user runs (libjuice's own server here, on this computer), with ICE on both sides set
-    // to the relay only; VP9 this time.
+    // Through a TURN relay the user runs (libjuice's own server here, on this computer), only through it: the browser's
+    // ICE set to the relay alone and Montage's end behind its bridge to the relay; VP9 this time.
     void browserReviewThroughTurn() {
         using namespace montage::output;
         using namespace montage::reviewtest;
@@ -22704,18 +22704,19 @@ colorspaces:
                  (tab.js("__montage.stage").toString() + " " + QString::fromStdString(rig.review->stats().error)).toUtf8().constData());
         QCOMPARE(tab.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
         QCOMPARE(tab.js("__montage.codec").toString(), QStringLiteral("vp9"));
-        // The browser's end of the pair in use is the relay's, so everything goes through it (Montage's end is its
-        // address at the relay, or this computer's own sending to the browser's there: "prflx").
+        // Both ends of the pair in use are addresses at the relay, Montage's the one its answer offered, so everything
+        // goes through it.
         const QJsonObject pair = tab.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
                                         "return p ? { local: r.get(p.localCandidateId).candidateType, remote: r.get(p.remoteCandidateId).candidateType,"
                                         "localAt: r.get(p.localCandidateId).address + ':' + r.get(p.localCandidateId).port, remoteAt: r.get(p.remoteCandidateId).address + ':' + r.get(p.remoteCandidateId).port,"
                                         "offered: __montage.pc.remoteDescription.sdp.split('\\r\\n').filter(l => l.startsWith('a=candidate')).join(' | ') } : null; })")
                                      .toObject();
         qInfo("Candidates: %s", QJsonDocument(pair).toJson(QJsonDocument::Compact).constData());
-        QCOMPARE(pair.value("local").toString(), QStringLiteral("relay"));
-        QVERIFY2(pair.value("remote").toString() == "relay" || pair.value("remote").toString() == "prflx", qPrintable(pair.value("remote").toString()));
+        QCOMPARE(pair.value("local").toString(), QStringLiteral("relay"));  // (not "prflx": Montage's answers name the browser's own address)
+        QCOMPARE(pair.value("remote").toString(), QStringLiteral("relay"));
+        QCOMPARE(pair.value("offered").toString().count("a=candidate"), 1);
         QVERIFY(pair.value("offered").toString().contains(" typ relay "));
-        QVERIFY(!pair.value("offered").toString().contains(" typ host "));
+        QVERIFY(pair.value("offered").toString().contains(" " + pair.value("remoteAt").toString().replace(':', ' ') + " typ relay "));
         // Frame-accurate as directly: parked on 500, every picture is 500's; playing, each within 2 of its tag.
         rig.playhead = 500;
         QVERIFY(tab.until("__montage.checks.length > 0 && __montage.checks[__montage.checks.length - 1].tag === 500", 10));
@@ -23416,6 +23417,446 @@ colorspaces:
         QCOMPARE(httpStatusOf(offer), 410);
         QCOMPARE(httpStatusOf(httpsRequest({}, rig.port(), "GET", "/config", "not the passphrase")), 401);
         QCOMPARE(rig.review->stats().linkExpires, int64_t(expires));
+    }
+
+    // Montage's own way through a TURN relay (libjuice's server here): an offer's addresses are moved onto the bridge's
+    // loopback ports and the answer's onto the relay; what Montage's end sends a viewer's address reaches it from
+    // the relay and what the viewer sends back arrives from that address's port; nobody else's packets are passed
+    // on; and a wrong login or a relay that is not there is said so.
+    void reviewRelayBridge() {
+        using namespace montage::output;
+        // The offer: UDP candidates with IPv4 addresses become host candidates on loopback, the rest are left out.
+        const std::string offer = "v=0\r\na=ice-ufrag:abcd\r\n"
+                                  "a=candidate:1 1 udp 2122260223 192.0.2.7 50001 typ host generation 0\r\n"
+                                  "a=candidate:2 1 UDP 1686052607 198.51.100.9 50002 typ srflx raddr 192.0.2.7 rport 50001\r\n"
+                                  "a=candidate:3 1 udp 41885439 203.0.113.5 50003 typ relay raddr 0.0.0.0 rport 0\r\n"
+                                  "a=candidate:4 1 tcp 1518280447 192.0.2.7 9 typ host tcptype active\r\n"
+                                  "a=candidate:5 1 udp 2122262783 2001:db8::7 50005 typ host\r\n"
+                                  "a=candidate:6 1 udp 2122260223 4f0c2b1e-0d5a-4d6e-9a54-1c9f6d1b2a3c.local 50006 typ host\r\n"
+                                  "a=candidate:7 1 udp 2122260223 192.0.2.8 50007 typ host\r\n"
+                                  "a=end-of-candidates\r\na=mid:0\r\n";
+        std::vector<std::string> asked;
+        const std::string moved = offerThroughRelay(offer, [&](const std::string& ip, uint16_t port) {
+            asked.push_back(ip + ":" + std::to_string(port));
+            return uint16_t(ip == "192.0.2.8" ? 0 : 40000 + asked.size());
+        });
+        QCOMPARE(asked, (std::vector<std::string>{"192.0.2.7:50001", "198.51.100.9:50002", "203.0.113.5:50003", "192.0.2.8:50007"}));
+        QCOMPARE(moved, std::string("v=0\r\na=ice-ufrag:abcd\r\n"
+                                    "a=candidate:1 1 UDP 2122260223 127.0.0.1 40001 typ host\r\n"
+                                    "a=candidate:2 1 UDP 1686052607 127.0.0.1 40002 typ host\r\n"
+                                    "a=candidate:3 1 UDP 41885439 127.0.0.1 40003 typ host\r\n"
+                                    "a=end-of-candidates\r\na=mid:0\r\n"));
+        // The answer: Montage's loopback candidate becomes its address at the relay, and nothing else is offered.
+        uint16_t local = 0;
+        const std::string answer = answerThroughRelay("v=0\r\na=candidate:1 1 UDP 2122317823 127.0.0.1 51234 typ host\r\n"
+                                                      "a=candidate:2 1 UDP 2122317567 10.1.2.3 51234 typ host\r\na=end-of-candidates\r\n",
+                                                      "203.0.113.20", 49160, &local);
+        QCOMPARE(local, uint16_t(51234));
+        QCOMPARE(answer, std::string("v=0\r\na=candidate:1 1 UDP 2122317823 203.0.113.20 49160 typ relay raddr 0.0.0.0 rport 0\r\na=end-of-candidates\r\n"));
+        QVERIFY(answerThroughRelay("v=0\r\na=candidate:2 1 UDP 2122317567 10.1.2.3 51234 typ host\r\n", "203.0.113.20", 49160, &local) == "v=0\r\n");
+        QCOMPARE(local, uint16_t(0));
+#ifndef MONTAGE_TEST_TURN
+        QSKIP("The rest needs libjuice's TURN server (a build with WebRTC)");
+#else
+        juice_server_credentials_t user{"reviewer", "relay-password-2", 0};
+        juice_server_config_t config{};
+        config.credentials = &user;
+        config.credentials_count = 1;
+        config.max_allocations = 16;
+        config.max_peers = 16;
+        config.bind_address = "127.0.0.1";
+        config.port = 0;
+        config.realm = "montage-test";
+        juice_server_t* turn = juice_server_create(&config);
+        QVERIFY(turn);
+        auto endTurn = qScopeGuard([&] { juice_server_destroy(turn); });
+        const uint16_t turnPort = juice_server_get_port(turn);
+        // A relay of the test's own that speaks as relays did before RFC 8489 (it names no password algorithms, as
+        // coturn does not): it calls the first nonce stale once, checks each request's signature for itself
+        // (HMAC-SHA1 under the MD5 of user:realm:password), and passes packets both ways.
+        struct OldRelay {
+            std::atomic<bool> stop{false};
+            std::atomic<int> port{0}, relayed{0}, signedRight{0}, signedWrong{0}, stale{0}, newStyle{0}, permissions{0};
+            std::thread thread;
+            static void attribute(QByteArray& b, quint16 type, const QByteArray& value) {
+                b.append(char(type >> 8)).append(char(type & 0xff)).append(char(value.size() >> 8)).append(char(value.size() & 0xff)).append(value);
+                while (b.size() % 4) b.append('\0');
+            }
+            static QByteArray message(quint16 type, const QByteArray& id, const QByteArray& attributes) {
+                QByteArray b;
+                b.append(char(type >> 8)).append(char(type & 0xff)).append(char(attributes.size() >> 8)).append(char(attributes.size() & 0xff));
+                return b + QByteArray::fromHex("2112a442") + id + attributes;
+            }
+            static QByteArray address(quint16 port) {  // (XOR-…-ADDRESS of 127.0.0.1 and a port)
+                QByteArray v = QByteArray::fromHex("0001");
+                const quint16 p = port ^ 0x2112;
+                v.append(char(p >> 8)).append(char(p & 0xff));
+                return v + QByteArray::fromHex("5e12a443");
+            }
+            void run() {
+                QUdpSocket front, back;
+                front.setProxy(QNetworkProxy::NoProxy);
+                back.setProxy(QNetworkProxy::NoProxy);
+                front.bind(QHostAddress::LocalHost, 0);
+                back.bind(QHostAddress::LocalHost, 0);
+                relayed = back.localPort();
+                port = front.localPort();
+                quint16 client = 0;
+                const QByteArray key = QCryptographicHash::hash("reviewer:old-relay:relay-password-2", QCryptographicHash::Md5);
+                while (!stop) {
+                    front.waitForReadyRead(2);
+                    while (front.hasPendingDatagrams()) {
+                        QByteArray d(int(front.pendingDatagramSize()), 0);
+                        front.readDatagram(d.data(), d.size(), nullptr, &client);
+                        if (d.size() < 20) continue;
+                        const quint16 type = quint16(quint8(d[0]) << 8 | quint8(d[1]));
+                        const QByteArray id = d.mid(8, 12);
+                        QByteArray nonce, data;
+                        quint16 peer = 0;
+                        qsizetype integrityAt = -1;
+                        for (qsizetype at = 20; at + 4 <= d.size();) {
+                            const quint16 t = quint16(quint8(d[at]) << 8 | quint8(d[at + 1]));
+                            const qsizetype n = quint8(d[at + 2]) << 8 | quint8(d[at + 3]);
+                            const QByteArray value = d.mid(at + 4, n);
+                            if (t == 0x0015) nonce = value;
+                            if (t == 0x0013) data = value;
+                            if (t == 0x0012 && n >= 4) peer = quint16((quint8(value[2]) << 8 | quint8(value[3])) ^ 0x2112);
+                            if (t == 0x0008) integrityAt = at;
+                            if (t == 0x001C || t == 0x001D || t == 0x8002) ++newStyle;
+                            at += 4 + ((n + 3) & ~qsizetype(3));
+                        }
+                        if (type == 0x0016) {  // a Send indication: on to the peer from the relayed port
+                            if (peer) back.writeDatagram(data, QHostAddress::LocalHost, peer);
+                            continue;
+                        }
+                        QByteArray challenge;
+                        attribute(challenge, 0x0014, "old-relay");
+                        if (integrityAt < 0 || nonce == "first") {
+                            QByteArray error = QByteArray::fromHex(integrityAt < 0 ? "00000401" : "00000426");  // 401, or 438 stale nonce
+                            stale += integrityAt >= 0;
+                            QByteArray a;
+                            attribute(a, 0x0009, error + "No");
+                            attribute(a, 0x0015, integrityAt < 0 ? "first" : "second");
+                            front.writeDatagram(message(type | 0x0110, id, a + challenge), QHostAddress::LocalHost, client);
+                            continue;
+                        }
+                        QByteArray covered = d.left(integrityAt);
+                        const qsizetype length = integrityAt - 20 + 24;
+                        covered[2] = char(length >> 8), covered[3] = char(length & 0xff);
+                        const bool right = nonce == "second" && QMessageAuthenticationCode::hash(covered, key, QCryptographicHash::Sha1) == d.mid(integrityAt + 4, 20);
+                        ++(right ? signedRight : signedWrong);
+                        QByteArray a;
+                        if (!right) {
+                            attribute(a, 0x0009, QByteArray::fromHex("00000401") + "No");
+                            attribute(a, 0x0015, "second");
+                            a += challenge;
+                        } else if (type == 0x0003) {
+                            attribute(a, 0x0016, address(back.localPort()));
+                            attribute(a, 0x000D, QByteArray::fromHex("00000258"));
+                        } else if (type == 0x0008) {
+                            ++permissions;
+                        }
+                        front.writeDatagram(message(type | (right ? 0x0100 : 0x0110), id, a), QHostAddress::LocalHost, client);
+                    }
+                    back.waitForReadyRead(2);
+                    while (back.hasPendingDatagrams()) {  // from a peer: a Data indication to the client
+                        QByteArray d(int(back.pendingDatagramSize()), 0);
+                        quint16 from = 0;
+                        back.readDatagram(d.data(), d.size(), nullptr, &from);
+                        QByteArray a;
+                        attribute(a, 0x0012, address(from));
+                        attribute(a, 0x0013, d);
+                        if (client) front.writeDatagram(message(0x0017, QByteArray(12, 'i'), a), QHostAddress::LocalHost, client);
+                    }
+                }
+            }
+        } old;
+        auto allocate = [](RelayBridge& b) { return montage::reviewtest::allocateAt(b); };
+        auto socket = [] {
+            auto s = std::make_unique<QUdpSocket>();
+            s->setProxy(QNetworkProxy::NoProxy);
+            s->bind(QHostAddress::LocalHost, 0);
+            return s;
+        };
+        // One datagram read with where it came from, waited for; an empty one for none in time.
+        struct Got {
+            QByteArray data;
+            quint16 from = 0;
+        };
+        auto read = [](QUdpSocket& s, int ms) {
+            Got g;
+            if (!s.hasPendingDatagrams() && !s.waitForReadyRead(ms)) return g;
+            g.data.resize(int(s.pendingDatagramSize()));
+            s.readDatagram(g.data.data(), g.data.size(), nullptr, &g.from);
+            return g;
+        };
+        {
+            RelayBridge bridge("127.0.0.1", turnPort, {"reviewer", "relay-password-2"});
+            QCOMPARE(bridge.relayedPort(), uint16_t(0));
+            QCOMPARE(allocate(bridge), std::string());
+            QCOMPARE(bridge.relayedAddress(), std::string("127.0.0.1"));
+            const uint16_t relayed = bridge.relayedPort();
+            QVERIFY(relayed != 0 && relayed != turnPort);
+            auto viewer = socket(), end = socket(), stranger = socket(), second = socket();
+            const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+            QVERIFY(alias != 0 && alias != relayed);
+            QCOMPARE(bridge.peer("127.0.0.1", viewer->localPort()), alias);  // (the same address, the same port)
+            QCOMPARE(bridge.peer("::1", 5000), uint16_t(0));
+            QCOMPARE(bridge.peer("viewer.example", 5000), uint16_t(0));
+            QCOMPARE(bridge.peer("127.0.0.1", 0), uint16_t(0));
+            // Montage's end to the viewer: it arrives from Montage's address at the relay (sent again until the
+            // relay has let the viewer's address in).
+            Got got;
+            for (int i = 0; i < 50 && got.data.isEmpty(); ++i) {
+                end->writeDatagram("to the viewer", QHostAddress::LocalHost, alias);
+                got = read(*viewer, 100);
+            }
+            QCOMPARE(got.data, QByteArray("to the viewer"));
+            QCOMPARE(got.from, quint16(relayed));
+            while (!read(*viewer, 200).data.isEmpty()) {}
+            // The viewer back: it arrives at Montage's end from the port that stands for the viewer.
+            viewer->writeDatagram("to Montage", QHostAddress::LocalHost, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("to Montage"));
+            QCOMPARE(got.from, quint16(alias));
+            QCOMPARE(bridge.fromRelay(), uint64_t(1));
+            QVERIFY(bridge.toRelay() >= 1);
+            // Montage's end answering a viewer's connectivity check names where the check came from, which behind the
+            // bridge is the port that stands for the viewer: the answer reaches the viewer naming the viewer's own
+            // address instead, signed with the ICE password and fingerprinted again as if it had been made so. One
+            // that names another address goes on as it is.
+            auto crc = [](const QByteArray& b) {
+                quint32 c = 0xFFFFFFFFu;
+                for (const char ch : b) {
+                    c ^= quint8(ch);
+                    for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+                }
+                return ~c;
+            };
+            const QByteArray icePassword = "an ICE password of the test";
+            auto checkAnswer = [&](quint16 names) {
+                QByteArray a;
+                OldRelay::attribute(a, 0x0020, OldRelay::address(names));
+                QByteArray m = OldRelay::message(0x0101, QByteArray(12, 't'), a);
+                m[3] = char(a.size() + 24);
+                OldRelay::attribute(m, 0x0008, QMessageAuthenticationCode::hash(m, icePassword, QCryptographicHash::Sha1));
+                m[3] = char(m.size() - 20 + 8);
+                const quint32 f = crc(m) ^ 0x5354554Eu;
+                QByteArray print;
+                for (int k = 3; k >= 0; --k) print.append(char(f >> (8 * k)));
+                OldRelay::attribute(m, 0x8028, print);
+                return m;
+            };
+            bridge.setLocal(end->localPort(), icePassword.toStdString());
+            QThread::msleep(100);
+            end->writeDatagram(checkAnswer(alias), QHostAddress::LocalHost, alias);
+            got = read(*viewer, 3000);
+            QCOMPARE(got.data.toHex(), checkAnswer(viewer->localPort()).toHex());
+            end->writeDatagram(checkAnswer(4242), QHostAddress::LocalHost, alias);
+            got = read(*viewer, 3000);
+            QCOMPARE(got.data.toHex(), checkAnswer(4242).toHex());
+            // Another socket of this computer's sending to the viewer's port is not Montage's end: nothing goes on.
+            const uint64_t before = bridge.toRelay();
+            stranger->writeDatagram("not from Montage", QHostAddress::LocalHost, alias);
+            QVERIFY(read(*viewer, 500).data.isEmpty());
+            QCOMPARE(bridge.toRelay(), before);
+            // A sender the offer did not name, at an address the relay lets in, gets a port of its own.
+            second->writeDatagram("from elsewhere", QHostAddress::LocalHost, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("from elsewhere"));
+            QVERIFY(got.from != 0 && got.from != alias);
+            end->writeDatagram("and back", QHostAddress::LocalHost, got.from);
+            got = read(*second, 3000);
+            QCOMPARE(got.data, QByteArray("and back"));
+            QCOMPARE(got.from, quint16(relayed));
+            QCOMPARE(bridge.lastError(), std::string());
+        }
+        // A login the relay does not know is said to be that; a relay that is not there, that it did not answer.
+        {
+            RelayBridge wrong("127.0.0.1", turnPort, {"reviewer", "not the password"});
+            const std::string why = allocate(wrong);
+            QVERIFY2(QString::fromStdString(why).contains("login"), why.c_str());
+            QCOMPARE(wrong.relayedPort(), uint16_t(0));
+            QCOMPARE(wrong.lastError(), why);
+        }
+        {
+            auto nobody = socket();
+            const uint16_t unused = nobody->localPort();
+            nobody.reset();
+            RelayBridge absent("127.0.0.1", unused, {"reviewer", "relay-password-2"});
+            QElapsedTimer waited;
+            waited.start();
+            const std::string why = allocate(absent);
+            QVERIFY2(QString::fromStdString(why).contains("did not answer"), why.c_str());
+            QVERIFY2(waited.elapsed() >= 4000 && waited.elapsed() < 12000, std::to_string(waited.elapsed()).c_str());
+        }
+        {
+            RelayBridge nowhere("relay.invalid", 3478, {"reviewer", "relay-password-2"});
+            const std::string why = allocate(nowhere);
+            QVERIFY2(QString::fromStdString(why).contains("not found"), why.c_str());
+        }
+        old.thread = std::thread([&] { old.run(); });
+        auto endOld = qScopeGuard([&] {
+            old.stop = true;
+            old.thread.join();
+        });
+        QTRY_VERIFY(old.port != 0);
+        {
+            RelayBridge bridge("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+            QCOMPARE(allocate(bridge), std::string());
+            QCOMPARE(int(bridge.relayedPort()), old.relayed.load());
+            QCOMPARE(old.stale.load(), 1);
+            auto viewer = socket(), end = socket();
+            const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+            QVERIFY(alias != 0);
+            Got got;
+            for (int i = 0; i < 50 && got.data.isEmpty(); ++i) {
+                end->writeDatagram("the older way", QHostAddress::LocalHost, alias);
+                got = read(*viewer, 100);
+            }
+            QCOMPARE(got.data, QByteArray("the older way"));
+            QCOMPARE(int(got.from), old.relayed.load());
+            viewer->writeDatagram("and back again", QHostAddress::LocalHost, quint16(old.relayed));
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("and back again"));
+            QCOMPARE(got.from, quint16(alias));
+            QTRY_VERIFY(old.permissions >= 1);
+            QCOMPARE(old.signedWrong.load(), 0);
+            QVERIFY(old.signedRight >= 2);
+            QCOMPARE(old.newStyle.load(), 0);
+        }
+        {
+            RelayBridge wrong("127.0.0.1", uint16_t(old.port), {"reviewer", "not the password"});
+            const std::string why = allocate(wrong);
+            QVERIFY2(QString::fromStdString(why).contains("login"), why.c_str());
+            QVERIFY(old.signedWrong >= 1);
+        }
+#endif
+    }
+
+    // Only through the relay, with a capture of what reaches a viewer's addresses: a viewer of the test's own offers
+    // three addresses (sockets the test holds) as host, server-reflexive and relay candidates. Montage answers with
+    // its address at the relay alone; every packet that reaches those sockets comes from that address, none comes
+    // while the way from Montage to the relay is cut, and they come again once it is mended.
+    void browserReviewOnlyThroughRelay() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+#ifndef MONTAGE_TEST_TURN
+        QSKIP("Needs libjuice's TURN server (a build with WebRTC)");
+#else
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        juice_server_credentials_t user{"reviewer", "relay-password-3", 0};
+        juice_server_config_t config{};
+        config.credentials = &user;
+        config.credentials_count = 1;
+        config.max_allocations = 16;
+        config.max_peers = 16;
+        config.bind_address = "127.0.0.1";
+        config.port = 0;
+        config.realm = "montage-test";
+        juice_server_t* turn = juice_server_create(&config);
+        QVERIFY(turn);
+        auto endTurn = qScopeGuard([&] { juice_server_destroy(turn); });
+        // Montage reaches the relay through a tap that counts, and can be cut.
+        ThrottledRelay tap;
+        QVERIFY(tap.start(juice_server_get_port(turn)));
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.settings.turnServer = "turn:127.0.0.1:" + std::to_string(tap.port());
+        rig.settings.turnUser = "reviewer";
+        rig.settings.turnPassword = "relay-password-3";
+        rig.settings.relayOnly = true;
+        // (a STUN server in the settings is the browsers' alone: Montage asks it nothing, as the sockets below show)
+        QUdpSocket stun;
+        stun.setProxy(QNetworkProxy::NoProxy);
+        QVERIFY(stun.bind(QHostAddress::LocalHost, 0));
+        rig.settings.iceServers = {"stun:127.0.0.1:" + std::to_string(stun.localPort())};
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        rig.picture = [](FrameTime) { return std::make_shared<const Image>(320, 180); };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        std::vector<std::unique_ptr<QUdpSocket>> viewer;
+        for (int i = 0; i < 3; ++i) {
+            viewer.push_back(std::make_unique<QUdpSocket>());
+            viewer.back()->setProxy(QNetworkProxy::NoProxy);
+            QVERIFY(viewer.back()->bind(QHostAddress::LocalHost, 0));
+        }
+        const QByteArray offer = QByteArray("v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n"
+                                            "m=video 9 UDP/TLS/RTP/SAVPF 98\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\n"
+                                            "a=ice-ufrag:tEsT\r\na=ice-pwd:a0b1c2d3e4f5a6b7c8d9e0f1\r\n"
+                                            "a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n"
+                                            "a=setup:actpass\r\na=mid:0\r\na=recvonly\r\na=rtcp-mux\r\n"
+                                            "a=rtpmap:98 VP9/90000\r\na=rtcp-fb:98 nack\r\na=rtcp-fb:98 nack pli\r\na=fmtp:98 profile-id=0\r\n") +
+                                 "a=candidate:1 1 udp 2122260223 127.0.0.1 " + QByteArray::number(viewer[0]->localPort()) + " typ host generation 0\r\n" +
+                                 "a=candidate:2 1 udp 1686052607 127.0.0.1 " + QByteArray::number(viewer[1]->localPort()) + " typ srflx raddr 10.0.0.2 rport 50000\r\n" +
+                                 "a=candidate:3 1 udp 41885439 127.0.0.1 " + QByteArray::number(viewer[2]->localPort()) + " typ relay raddr 0.0.0.0 rport 0\r\n" +
+                                 "a=candidate:4 1 tcp 1518280447 127.0.0.1 9 typ host tcptype active\r\n"
+                                 "a=candidate:5 1 udp 2122262783 ::1 50005 typ host\r\na=end-of-candidates\r\n";
+        const QByteArray response = httpsRequest({}, rig.port(), "POST", "/whep", QByteArray::fromStdString(rig.settings.passphrase), offer, "application/sdp", 20000);
+        QVERIFY2(httpStatusOf(response) == 201, response.left(400).constData());
+        // The answer offers one candidate: Montage's address at the relay.
+        QList<QByteArray> offered;
+        for (const QByteArray& line : httpBodyOf(response).split('\n'))
+            if (line.startsWith("a=candidate:")) offered.push_back(line.trimmed());
+        QCOMPARE(offered.size(), qsizetype(1));
+        QVERIFY2(offered[0].contains(" typ relay "), offered[0].constData());
+        const QList<QByteArray> parts = offered[0].split(' ');
+        QCOMPARE(parts[4], QByteArray("127.0.0.1"));
+        const quint16 relayed = parts[5].toUShort();
+        QVERIFY(relayed != 0);
+        // What reaches the viewer's sockets, for a while: connectivity checks (STUN binding requests), and where from.
+        struct Seen {
+            int packets = 0, checks = 0, elsewhere = 0;
+        };
+        auto watch = [&](int ms, bool untilAll) {
+            std::vector<Seen> seen(viewer.size());
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) {
+                bool all = true;
+                for (size_t i = 0; i < viewer.size(); ++i) {
+                    viewer[i]->waitForReadyRead(10);
+                    while (viewer[i]->hasPendingDatagrams()) {
+                        QByteArray d(int(viewer[i]->pendingDatagramSize()), 0);
+                        quint16 from = 0;
+                        viewer[i]->readDatagram(d.data(), d.size(), nullptr, &from);
+                        ++seen[i].packets;
+                        seen[i].checks += d.size() >= 20 && d[0] == 0 && d[1] == 1 && d.mid(4, 4) == QByteArray::fromHex("2112a442");
+                        seen[i].elsewhere += from != relayed;
+                    }
+                    all = all && seen[i].packets > 0;
+                }
+                if (untilAll && all) break;
+            }
+            return seen;
+        };
+        const std::vector<Seen> first = watch(10000, true);
+        for (size_t i = 0; i < first.size(); ++i) {
+            qInfo("Viewer address %d: %d packets, %d of them checks, %d not from the relay", int(i), first[i].packets, first[i].checks, first[i].elsewhere);
+            QVERIFY(first[i].packets > 0);
+            QCOMPARE(first[i].checks, first[i].packets);
+            QCOMPARE(first[i].elsewhere, 0);
+        }
+        QVERIFY(tap.forwarded > 0);
+        // The way to the relay cut: nothing at all reaches the viewer's addresses (what was on its way is let pass).
+        tap.blocked = true;
+        watch(300, false);
+        const int64_t forwarded = tap.forwarded;
+        const std::vector<Seen> cut = watch(2500, false);
+        for (const Seen& s : cut) QCOMPARE(s.packets, 0);
+        QCOMPARE(tap.forwarded.load(), forwarded);
+        // Mended: the checks come again, from the relay as before.
+        tap.blocked = false;
+        int again = 0;
+        for (const Seen& s : watch(20000, true)) {
+            again += s.packets;
+            QCOMPARE(s.elsewhere, 0);
+        }
+        QVERIFY(again > 0);
+        // The STUN server of the settings was never asked anything by Montage.
+        QVERIFY(!stun.hasPendingDatagrams());
+        qInfo("Through the tap: %lld packets to the relay, %lld back", (long long)tap.forwarded.load(), (long long)tap.returned.load());
+#endif
     }
 
     void ndiOutput() {

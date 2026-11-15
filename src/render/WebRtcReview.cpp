@@ -526,6 +526,8 @@ struct Viewer {
     std::mutex linkM;
     LinkDelay link;
     std::shared_ptr<class Padder> padder;
+    // Only through the relay: this viewer's way there (render/TurnRelay.h), which outlives the connection.
+    std::shared_ptr<RelayBridge> bridge;
     bool padding = false;  // (send's thread) a probe's padding goes after their pictures
 };
 
@@ -816,6 +818,11 @@ struct BrowserReviewBackend::Impl {
     QSslKey key;
     std::vector<rtc::IceServer> iceServers;
     bool relayInUse = false;  // a TURN relay among them, which Montage reaches too
+    // Only through the relay: where it is, for the bridge each viewer is given (Montage's ICE is then given no server
+    // at all), and the bridges of offers still waiting for the relay's answer.
+    std::string relayHost;
+    uint16_t relayPort = 0;
+    std::set<std::shared_ptr<RelayBridge>> bridging;
     // The relay's login for this review: the settings' own, or one made from the shared secret that runs out at
     // `expires` (seconds since 1970; 0: none), when the link stops letting viewers in too.
     TurnLogin relayLogin;
@@ -1190,16 +1197,54 @@ struct BrowserReviewBackend::Impl {
         return out;
     }
 
-    // A viewer's offer: their connection made, answered once its candidates are gathered.
+    // A viewer's offer: their connection made, answered once its candidates are gathered. Only through the relay,
+    // the relay is first asked for an address for this viewer, and the offer answered from behind that bridge.
     void offer(QSslSocket* c, const QByteArray& sdp, bool hdr) {
         {
             std::lock_guard lock(m);
             if (int(viewers.size()) >= settings.maxViewers) return respond(c, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
         }
+        if (!settings.relayOnly) return answerOffer(c, sdp, hdr, nullptr);
+        auto bridge = std::make_shared<RelayBridge>(relayHost, relayPort, relayLogin);
+        {
+            std::lock_guard lock(m);
+            bridging.insert(bridge);
+        }
+        QPointer<QSslSocket> sock(c);
+        std::weak_ptr<RelayBridge> wb = bridge;
+        // (the bridge calls back on its own thread, where it must not be let go of: the rest is done here, at home)
+        bridge->allocate([this, sock, wb, sdp, hdr](const std::string& error) {
+            std::lock_guard lock(m);
+            if (!home) return;
+            QMetaObject::invokeMethod(
+                home,
+                [this, sock, wb, sdp, hdr, error] {
+                    std::shared_ptr<RelayBridge> bridge = wb.lock();
+                    bool full = false;
+                    {
+                        std::lock_guard lock(m);
+                        bridging.erase(bridge);
+                        full = int(viewers.size()) >= settings.maxViewers;
+                    }
+                    if (!bridge || !sock) return;
+                    if (!error.empty()) return respond(sock, "502 Bad Gateway", {}, QByteArray::fromStdString(error));
+                    if (full) return respond(sock, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
+                    answerOffer(sock, sdp, hdr, bridge);
+                },
+                Qt::QueuedConnection);
+        });
+    }
+
+    void answerOffer(QSslSocket* c, const QByteArray& offered, bool hdr, const std::shared_ptr<RelayBridge>& bridge) {
+        // (behind a bridge, each address the viewer offers is a loopback port of the bridge's)
+        const QByteArray sdp = !bridge ? offered
+                                       : QByteArray::fromStdString(offerThroughRelay(offered.toStdString(), [&](const std::string& ip, uint16_t p) {
+                                             return bridge->peer(ip, p);
+                                         }));
         std::shared_ptr<Viewer> v;
         std::string why;
         try {
-            v = makeViewer(sdp.toStdString(), c->peerAddress().toString(), hdr, why);
+            v = makeViewer(sdp.toStdString(), c->peerAddress().toString(), hdr, why, bridge);
         } catch (const std::exception& e) {
             why = std::string("The offer is not one Montage can answer: ") + e.what();
         }
@@ -1220,7 +1265,15 @@ struct BrowserReviewBackend::Impl {
                             "\"; credential-type=\"password\"";
                 headers.emplace_back("Link", link);
             }
-            respond(sock, "201 Created", headers, QByteArray::fromStdString(std::string(*local)), "application/sdp");
+            std::string answer = std::string(*local);
+            if (v->bridge) {
+                // (Montage's end is given as its address at the relay, and the bridge told where that end is)
+                uint16_t localPort = 0;
+                answer = answerThroughRelay(answer, v->bridge->relayedAddress(), v->bridge->relayedPort(), &localPort);
+                if (!localPort) return respond(sock, "500 Internal Server Error", {}, "No answer");
+                v->bridge->setLocal(localPort, local->icePwd().value_or(std::string()));
+            }
+            respond(sock, "201 Created", headers, QByteArray::fromStdString(answer), "application/sdp");
         };
         auto later = [this, done, finish] {
             if (done->exchange(true)) return;
@@ -1248,24 +1301,29 @@ struct BrowserReviewBackend::Impl {
         QTimer::singleShot(3000, c, [later] { later(); });  // (what was gathered by then)
     }
 
-    std::shared_ptr<Viewer> makeViewer(const std::string& sdp, const QString& address, bool wantsHdr, std::string& why) {
+    std::shared_ptr<Viewer> makeViewer(const std::string& sdp, const QString& address, bool wantsHdr, std::string& why,
+                                       const std::shared_ptr<RelayBridge>& bridge) {
         const rtc::Description offered(sdp, rtc::Description::Type::Offer);
         auto v = std::make_shared<Viewer>();
         v->id = randomHex(16).toStdString();
         v->address = address;
+        v->bridge = bridge;
         rtc::Configuration conf;
         conf.iceServers = iceServers;
-        if (settings.relayOnly) conf.iceTransportPolicy = rtc::TransportPolicy::Relay;
         // Media on the same port number as the page (UDP), all viewers together: one port to open in a firewall. With
         // a TURN relay, each viewer's connection has a port of its own instead (libjuice's shared socket cannot reach
         // a relay), which only goes out to the relay and to the viewer.
-        if (!relayInUse) {
+        // Only through the relay, this end is on this computer's loopback alone, a port of its own, where the bridge
+        // carries what it sends to the relay and it can reach nothing else.
+        if (bridge) {
+            conf.bindAddress = "127.0.0.1";
+        } else if (!relayInUse) {
             conf.enableIceUdpMux = true;
             conf.portRangeBegin = conf.portRangeEnd = uint16_t(port);
         }
         // (bound to the review's own address; when that is this computer's loopback and a relay elsewhere must be
         // reached, unbound but through the relay only, so no other interface's address is offered)
-        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4) {
+        if (!bridge && host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4) {
             if (!relayInUse || !host.isLoopback()) conf.bindAddress = host.toString().toStdString();
             else conf.iceTransportPolicy = rtc::TransportPolicy::Relay;
         }
@@ -2217,11 +2275,18 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
         uint16_t relayPort = 0;
         bool tls = false;
         if (!parseRelay(d.settings.turnServer, relayHost, relayPort, tls)) return fail("The TURN relay's address is turn:host:port");
-        if (!tls) {
+        if (tls && d.settings.relayOnly)
+            return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)");
+        if (d.settings.relayOnly) {
+            // Only through the relay: Montage's end of each connection stays on this computer's loopback behind a
+            // bridge to the relay, and its ICE is told of no server, so nothing leaves for anywhere but the relay.
+            d.relayHost = relayHost;
+            d.relayPort = relayPort;
+            d.iceServers.clear();
+            d.relayInUse = false;
+        } else if (!tls) {
             d.iceServers.emplace_back(relayHost, relayPort, d.relayLogin.user, d.relayLogin.password, rtc::IceServer::RelayType::TurnUdp);
             d.relayInUse = true;
-        } else if (d.settings.relayOnly) {
-            return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)");
         }
     }
     d.mode = mode;
@@ -2331,11 +2396,14 @@ void BrowserReviewBackend::close() {
     }
     for (const auto& [id, v] : viewers) d.closeViewer(v);
     std::deque<std::pair<Clock::time_point, std::shared_ptr<Viewer>>> retired;
+    std::set<std::shared_ptr<RelayBridge>> bridging;
     {
         std::lock_guard lock(d.m);
         retired.swap(d.retired);
+        bridging.swap(d.bridging);
     }
     retired.clear();
+    bridging.clear();
     d.freeEncoders();
 }
 
