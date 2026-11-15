@@ -9907,6 +9907,40 @@ private slots:
         state()->newProject();
     }
 
+    // Nightly 15 Nov: two background exports naming one file both claim it as written, however the file is spelt.
+    void mcpExportsClaimTheFileTheyWrite() {
+        const QString folder = dir_.filePath("claims");
+        QVERIFY(QDir().mkpath(folder + "/out"));
+        const QString wav = folder + "/out/master.wav";
+        // An export tool that leaves the project as it is still writes its path: two such calls overlap.
+        for (const char* tool : {"montage_export_adm", "montage_export_iamf", "montage_export_lut", "montage_export_markers"}) {
+            const McpCallPaths a = mcpCallPaths(tool, {{"project", folder + "/p.montage"}, {"path", wav}}, true);
+            QVERIFY2(a.writes.size() == 1 && a.reads.isEmpty(), tool);
+            const McpCallPaths b = mcpCallPaths(tool, {{"path", folder + "/out/../out/master.wav"}}, true);
+            QCOMPARE(b.writes, a.writes);
+        }
+        // A tool that only reads its path still reads it, so two of them run together.
+        const McpCallPaths probe = mcpCallPaths("montage_probe_media", {{"path", wav}}, true);
+        QVERIFY(probe.writes.isEmpty() && probe.reads.size() == 1);
+        const McpCallPaths written = mcpCallPaths("montage_export_adm", {{"path", wav}}, true);
+        QVERIFY(mcpPathsOverlap(probe.reads.front(), written.writes.front()));
+        // A file inside a folder another call writes overlaps it; a neighbour whose name only starts the same does not.
+        const McpCallPaths render = mcpCallPaths("montage_export_dcp", {{"folder", folder + "/out"}}, false);
+        QCOMPARE(render.writes.size(), 1);
+        QVERIFY(mcpPathsOverlap(written.writes.front(), render.writes.front()));
+        QVERIFY(mcpPathsOverlap(render.writes.front(), written.writes.front()));
+        QVERIFY(!mcpPathsOverlap(mcpCallPaths("montage_export_adm", {{"path", folder + "/outer.wav"}}, true).writes.front(), render.writes.front()));
+        // The same file reached through a symbolic link to its folder is the same file, before it exists too.
+#ifndef Q_OS_WIN
+        if (QFile::link(folder + "/out", folder + "/link")) {
+            const McpCallPaths linked = mcpCallPaths("montage_export_adm", {{"path", folder + "/link/master.wav"}}, true);
+            QCOMPARE(linked.writes, written.writes);
+            const McpCallPaths deeper = mcpCallPaths("montage_export_adm", {{"path", folder + "/link/new/deep.wav"}}, true);
+            QVERIFY(mcpPathsOverlap(deeper.writes.front(), render.writes.front()));
+        }
+#endif
+    }
+
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
     void kdmsForScreensFromAnFlm() {
         if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");

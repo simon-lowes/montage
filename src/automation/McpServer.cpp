@@ -804,6 +804,65 @@ QString json(const QJsonObject& o) { return QString::fromUtf8(QJsonDocument(o).t
 
 // ---- Tools ------------------------------------------------------------------------------
 
+// A path as one name for the file it is: symbolic links followed as far as the path exists, and letter case folded
+// where the file system ignores it, so two spellings of one file are seen as one.
+static QString oneNameFor(const QString& path) {
+    QString clean = QDir::cleanPath(absolute(path));
+    QString rest;
+    QFileInfo at(clean);
+    // (what does not exist yet, an output and perhaps its folders, is kept as written under the part that does)
+    while (!at.exists() && !at.isRoot()) {
+        const QString parent = at.path();
+        if (parent == at.filePath()) break;
+        rest = rest.isEmpty() ? at.fileName() : at.fileName() + QLatin1Char('/') + rest;
+        at = QFileInfo(parent);
+    }
+    QString base = at.exists() ? at.canonicalFilePath() : at.filePath();
+    if (base.isEmpty()) base = at.filePath();
+    if (!rest.isEmpty()) base = base.endsWith(QLatin1Char('/')) ? base + rest : base + QLatin1Char('/') + rest;
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    base = base.toLower();
+#endif
+    return base;
+}
+
+McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOnly) {
+    McpCallPaths out;
+    // (an export tool's path or file is where it writes, whether or not it leaves the project as it is)
+    const bool exports = tool.startsWith(QLatin1String("montage_export_"));
+    const auto kind = [readOnly, exports](const QString& k) {
+        const auto named = [&k](const char* n) { return k == QLatin1String(n) || k.endsWith(QLatin1Char('_') + QLatin1String(n)); };
+        for (const char* w : {"output", "report"})
+            if (named(w)) return 2;
+        for (const char* f : {"folder", "dir"})
+            if (named(f)) return readOnly ? 1 : 2;
+        for (const char* r : {"path", "file"})
+            if (named(r)) return exports ? 2 : 1;
+        for (const char* r : {"files", "paths"})
+            if (named(r)) return 1;
+        return 0;
+    };
+    for (auto it = a.begin(); it != a.end(); ++it) {
+        const int k = kind(it.key());
+        if (!k) continue;
+        const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
+        for (const QJsonValue& v : list)
+            if (v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << oneNameFor(v.toString());
+    }
+    out.writes.removeDuplicates();
+    out.reads.removeDuplicates();
+    for (const QString& w : out.writes) out.reads.removeAll(w);
+    return out;
+}
+
+bool mcpPathsOverlap(const QString& a, const QString& b) {
+    if (a == b) return true;
+    const auto inside = [](const QString& in, const QString& folder) {
+        return in.size() > folder.size() && in.startsWith(folder) && (folder.endsWith(QLatin1Char('/')) || in.at(folder.size()) == QLatin1Char('/'));
+    };
+    return inside(a, b) || inside(b, a);
+}
+
 struct McpServer::Impl {
     struct Tool {
         QString name, title, description;
@@ -899,37 +958,8 @@ struct McpServer::Impl {
         int readers = 0, writers = 0;
     };
     std::map<QString, PathUse> pathsInUse;
-    // The paths a call's arguments name: what it writes (output, report, any *_output or *_report, and of a tool that
-    // is not read-only the folders too: folder, dir, any *_folder or *_dir, where exports write) and what it reads (path,
-    // file, files, paths, any *_path or *_file, and a read-only tool's folders; lists of them too). A path it both reads
-    // and writes counts as written.
-    struct CallPaths {
-        QStringList writes, reads;
-    };
-    static CallPaths pathsOf(const QJsonObject& a, bool readOnly) {
-        CallPaths out;
-        const auto kind = [readOnly](const QString& k) {
-            const auto named = [&k](const char* n) { return k == QLatin1String(n) || k.endsWith(QLatin1Char('_') + QLatin1String(n)); };
-            for (const char* w : {"output", "report"})
-                if (named(w)) return 2;
-            for (const char* f : {"folder", "dir"})
-                if (named(f)) return readOnly ? 1 : 2;
-            for (const char* r : {"path", "file", "files", "paths"})
-                if (named(r)) return 1;
-            return 0;
-        };
-        for (auto it = a.begin(); it != a.end(); ++it) {
-            const int k = kind(it.key());
-            if (!k) continue;
-            const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
-            for (const QJsonValue& v : list)
-                if (v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << QDir::cleanPath(absolute(v.toString()));
-        }
-        out.writes.removeDuplicates();
-        out.reads.removeDuplicates();
-        for (const QString& w : out.writes) out.reads.removeAll(w);
-        return out;
-    }
+    // The paths a call's arguments name (mcpCallPaths): what it writes and what it reads.
+    using CallPaths = McpCallPaths;
     struct OutputClaim {
         Impl* d = nullptr;
         CallPaths paths;
@@ -953,11 +983,14 @@ struct McpServer::Impl {
     // uses, or uses one it writes; false when the call is cancelled or the server stops meanwhile.
     bool claimOutputs(OutputClaim& claim, const CallPaths& paths, const std::atomic<bool>& cancel) {
         std::unique_lock l(outputsMutex);
+        // (a path in use stands for all inside it too: an output inside a folder another call writes waits for it)
         const auto free = [&] {
-            for (const QString& p : paths.writes)
-                if (auto it = pathsInUse.find(p); it != pathsInUse.end() && (it->second.readers > 0 || it->second.writers > 0)) return false;
-            for (const QString& p : paths.reads)
-                if (auto it = pathsInUse.find(p); it != pathsInUse.end() && it->second.writers > 0) return false;
+            for (const auto& [used, use] : pathsInUse) {
+                for (const QString& p : paths.writes)
+                    if ((use.readers > 0 || use.writers > 0) && mcpPathsOverlap(p, used)) return false;
+                for (const QString& p : paths.reads)
+                    if (use.writers > 0 && mcpPathsOverlap(p, used)) return false;
+            }
             return true;
         };
         while (!free()) {
@@ -1170,7 +1203,7 @@ struct McpServer::Impl {
             else alone.lock();
             OutputClaim outputs;
             const bool claimed = !job->sideBySide || tool == tools.end() ||
-                                 claimOutputs(outputs, pathsOf(job->args, tool->readOnly), job->cancel);
+                                 claimOutputs(outputs, mcpCallPaths(tool->name, job->args, tool->readOnly), job->cancel);
             {
                 std::lock_guard jl(job->m);
                 if (!claimed || job->cancel || tool == tools.end()) {
