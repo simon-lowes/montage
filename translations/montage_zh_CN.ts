@@ -33038,6 +33038,12 @@ so the jump in the picture morphs across instead of cutting</source>
         <source>Some tracks of the grouped take could not be imported</source>
         <translation type="unfinished"></translation>
     </message>
+    <message numerus="yes">
+        <source>The input has %n channel(s): only that many of the group&apos;s tracks record</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
+    </message>
 </context>
 <context>
     <name>montage::keymap::Dialog</name>
