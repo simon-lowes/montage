@@ -1538,6 +1538,67 @@ private slots:
         QVERIFY2(worstSample < 1e-5f, qPrintable(QString::number(worstSample)));
     }
 
+    // Nightly 15 Nov: with a muted audio track, a video track turned off and faders that differ, the range nested
+    // In to Out still looks and sounds as it did.
+    void nestInToOutKeepsMutesAndFaders() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90, s.fps = {25, 1};
+        while (s.audioTracks.size() < 3) edit::addTrack(p, s, TrackKind::Audio);
+        MediaItem m;
+        std::string err;
+        QVERIFY2(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", m, &err), err.c_str());
+        m.id = p.newId();
+        p.media.push_back(m);
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.2f, 0.1f, 0, 40));
+        s.videoTracks[1].clips.push_back(colorClip(p, 0.1f, 0.9f, 0.3f, 0, 40));
+        s.videoTracks[1].muted = true;
+        for (int k = 0; k < 3; ++k)
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 25.0 * k, 25.0 * k + 40, {TrackKind::Video, 0}, {TrackKind::Audio, k}, false, false, true).ok);
+        s.audioTracks[0].volumeDb = -3;
+        s.audioTracks[1].volumeDb = -12;
+        s.audioTracks[2].muted = true;
+        const Id seqId = s.id;
+        const FrameTime a = 10, b = 30;
+        const size_t spf = 48000 / 25;
+        RenderOptions ro;
+        auto frames = [&](const Sequence& q) {
+            std::vector<Image> out;
+            for (FrameTime t = a - 2; t < b + 2; t += 5) out.push_back(renderProgramFrame(p, q, t, ro));
+            return out;
+        };
+        auto sound = [&](const Sequence& q) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(b - a + 4) * spf * 2);
+            mixer.mix(p, q, int64_t(a - 2) * int64_t(spf), int((b - a + 4) * FrameTime(spf)), out.data());
+            return out;
+        };
+        const std::vector<Image> before = frames(s);
+        const std::vector<float> heard = sound(s);
+        const edit::Result r = edit::nestRange(p, *p.findSequence(seqId), a, b, allTracks(*p.findSequence(seqId)), "Range");
+        QVERIFY2(r.ok, r.error.c_str());
+        const Sequence& after = *p.findSequence(seqId);
+        // (the muted tracks' clips are where they were, whole)
+        QCOMPARE(after.videoTracks[1].clips.size(), size_t(1));
+        QCOMPARE(after.audioTracks[2].clips.size(), size_t(1));
+        QCOMPARE(after.audioTracks[1].clips.size(), size_t(2));
+        const std::vector<Image> now = frames(after);
+        float worst = 0;
+        for (size_t f = 0; f < now.size(); ++f) {
+            QCOMPARE(now[f].px.size(), before[f].px.size());
+            for (size_t i = 0; i < now[f].px.size(); ++i) worst = std::max(worst, std::fabs(now[f].px[i] - before[f].px[i]));
+        }
+        QVERIFY2(worst < 1e-4f, qPrintable(QString::number(worst)));
+        const std::vector<float> nowHeard = sound(after);
+        float worstSample = 0, loud = 0;
+        for (size_t i = 0; i < heard.size(); ++i) {
+            worstSample = std::max(worstSample, std::fabs(nowHeard[i] - heard[i]));
+            loud = std::max(loud, std::fabs(heard[i]));
+        }
+        QVERIFY(loud > 0.02f);
+        QVERIFY2(worstSample < 1e-5f, qPrintable(QString::number(worstSample)));
+    }
+
     void losslessExportComparesExactly() {
         QTemporaryDir dir;
         Project p = makeDefaultProject();

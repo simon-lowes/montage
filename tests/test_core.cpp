@@ -5520,6 +5520,128 @@ private slots:
         QCOMPARE(trackAt(*fz.p.active(), A1)->clips.size(), size_t(3));
     }
 
+    // Nightly 15 Nov: Nest In to Out leaves what is seen and heard as it was, or refuses before cutting anything.
+    void nestInToOutKeepsWhatIsSeenAndHeard() {
+        const TrackRef V3{TrackKind::Video, 2}, A2{TrackKind::Audio, 1};
+        auto sound = [](Fixture& f, TrackRef t, FrameTime start, FrameTime len) {
+            Clip c = makeClip(f.p, *f.p.findMedia(f.media), TrackKind::Audio, f.s());
+            c.start = start;
+            c.duration = len;
+            return overwrite(f.p, f.s(), t, c).created.at(0);
+        };
+        auto compoundOn = [](const Project& p, const Track& t) -> const Sequence* {
+            for (const Clip& c : t.clips)
+                if (const MediaItem* m = p.findMedia(c.mediaId); m && m->kind == MediaKind::Sequence) return p.findSequence(m->sequenceId);
+            return nullptr;
+        };
+        {
+            // A muted audio track and a video track turned off take no part: their clips stay, whole and uncut.
+            Fixture f;
+            f.put(V1, 0, 60);
+            const Id hidden = f.put(V2, 0, 60);
+            sound(f, A1, 0, 60);
+            const Id muted = sound(f, A2, 0, 60);
+            trackAt(f.s(), V2)->muted = true;
+            trackAt(f.s(), A2)->muted = true;
+            const Id seq = f.s().id;
+            const Result r = nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range");
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& outer = *f.p.findSequence(seq);
+            QCOMPARE(trackAt(outer, V2)->clips.size(), size_t(1));
+            QVERIFY(trackAt(outer, V2)->clips[0].id == hidden && trackAt(outer, V2)->clips[0].duration == 60);
+            QCOMPARE(trackAt(outer, A2)->clips.size(), size_t(1));
+            QVERIFY(trackAt(outer, A2)->clips[0].id == muted && trackAt(outer, A2)->clips[0].duration == 60);
+            const Sequence* nested = compoundOn(f.p, *trackAt(outer, V1));
+            QVERIFY(nested);
+            QVERIFY(trackAt(*nested, V2)->clips.empty() && trackAt(*nested, A2)->clips.empty());
+            QCOMPARE(trackAt(*nested, A1)->clips.size(), size_t(1));
+        }
+        {
+            // With a track soloed, the others are not heard: only the soloed one's sound is nested.
+            Fixture f;
+            sound(f, A1, 0, 60);
+            sound(f, A2, 0, 60);
+            trackAt(f.s(), A2)->solo = true;
+            const Id seq = f.s().id;
+            QVERIFY(nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range").ok);
+            const Sequence& outer = *f.p.findSequence(seq);
+            QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));
+            QCOMPARE(trackAt(outer, A2)->clips.size(), size_t(3));
+            QVERIFY(compoundOn(f.p, *trackAt(outer, A2)));
+        }
+        {
+            // Two audio tracks whose faders differ: the compound plays through the lower track's fader, and the other
+            // track's difference from it is kept on its track inside the nested sequence.
+            Fixture f;
+            sound(f, A1, 0, 60);
+            sound(f, A2, 0, 60);
+            trackAt(f.s(), A1)->volumeDb = -3;
+            trackAt(f.s(), A2)->volumeDb = -12;
+            const Id seq = f.s().id;
+            const Result r = nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range");
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& outer = *f.p.findSequence(seq);
+            QCOMPARE(trackAt(outer, A1)->volumeDb, -3.0);
+            const Sequence* nested = compoundOn(f.p, *trackAt(outer, A1));
+            QVERIFY(nested);
+            QCOMPARE(trackAt(*nested, A1)->volumeDb, 0.0);
+            QCOMPARE(trackAt(*nested, A2)->volumeDb, -9.0);
+        }
+        // What cannot be kept is refused, and the sequence is left exactly as it was (no cut made).
+        auto refused = [&](Fixture& f, FrameTime a, FrameTime b, const char* word) {
+            const Sequence was = f.s();
+            const size_t sequences = f.p.sequences.size(), media = f.p.media.size();
+            const Result r = nestRange(f.p, f.s(), a, b, allTracks(f.s()), "Range");
+            return !r.ok && r.error.find(word) != std::string::npos && f.s() == was && f.p.sequences.size() == sequences && f.p.media.size() == media;
+        };
+        {
+            // Audio tracks mixed differently: an insert on one, another pan, or automation on one.
+            Fixture f;
+            sound(f, A1, 0, 60);
+            sound(f, A2, 0, 60);
+            trackAt(f.s(), A2)->pan = 0.5;
+            QVERIFY(refused(f, 10, 50, "mixed differently"));
+            trackAt(f.s(), A2)->pan = 0;
+            trackAt(f.s(), A2)->effects.push_back(makeEffect(f.p, "compressor"));
+            QVERIFY(refused(f, 10, 50, "mixed differently"));
+            trackAt(f.s(), A2)->effects.clear();
+            trackAt(f.s(), A1)->volumeAuto.keys = {{0, -6.0}, {60, 0.0}};
+            QVERIFY(refused(f, 10, 50, "mixed differently"));
+            // One of them alone nests, its track's automation playing on as before.
+            const Id seq = f.s().id;
+            QVERIFY(nestRange(f.p, f.s(), 10, 50, {A1}, "Range").ok);
+            QCOMPARE(trackAt(*f.p.findSequence(seq), A1)->volumeAuto.keys.size(), size_t(2));
+        }
+        {
+            // A locked track with a picture in the range, between two that are nested.
+            Fixture f;
+            f.put(V1, 0, 60);
+            f.put(V2, 0, 60);
+            f.put(V3, 0, 60);
+            trackAt(f.s(), V2)->locked = true;
+            QVERIFY(refused(f, 10, 50, "between tracks"));
+            // Turned off as well, it is not seen, so nothing ends up on the wrong side of it.
+            trackAt(f.s(), V2)->muted = true;
+            QVERIFY(nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range").ok);
+        }
+        {
+            // A dissolve across In, and a fade that Out would cut through.
+            Fixture f;
+            const Id first = f.put(V1, 0, 30, 20);
+            f.put(V1, 30, 30, 20);
+            const Result tr = addTransition(f.p, f.s(), first, Edge::Out, "cross_dissolve", 10);
+            QVERIFY2(tr.ok, tr.error.c_str());
+            QVERIFY(refused(f, 30, 50, "crosses In"));
+            QVERIFY(refused(f, 5, 28, "crosses Out"));
+            // Clear of it on both sides, the dissolve goes into the compound with its two clips.
+            const Id seq = f.s().id;
+            QVERIFY(nestRange(f.p, f.s(), 20, 40, allTracks(f.s()), "Range").ok);
+            const Sequence* nested = compoundOn(f.p, *trackAt(*f.p.findSequence(seq), V1));
+            QVERIFY(nested);
+            QCOMPARE(trackAt(*nested, V1)->transitions.size(), size_t(1));
+        }
+    }
+
     void replaceSourceOfSeveralClips() {
         Fixture fx;
         // A longer file of the same take (the online), starting two seconds earlier by timecode.

@@ -406,7 +406,12 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
 // Nest In to Out: each unlocked track of `tracks` cut at frames `a` and `b`, and what lies between (linked sound with
 // its picture) moved into a new sequence of the same tracks, gaps kept, and replaced by one compound clip from `a`
 // on the lowest video and audio tracks that had any (a range of sound alone nests as sound). Its picture and sound
-// are the range's as they were.
+// are the range's as they were, or it is refused before anything is cut:
+//  - a muted track, or an audio track silenced by another's solo, takes no part (its clips would be seen or heard
+//    inside the compound), as a locked one takes none;
+//  - a transition across In or Out, or a video track that stays between two that are nested, is refused;
+//  - several audio tracks are nested together only when they are mixed alike (no inserts or sends, the same pan,
+//    output and automation); their faders may differ, each track's difference going into the nested sequence.
 Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks, const std::string& name);
 
 // ---- Sound to the sample ------------------------------------------------------------------
