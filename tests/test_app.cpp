@@ -3187,6 +3187,9 @@ private slots:
                 if (std::abs(got - greyOf(first + in + k - j)) <= 6) return true;
             return false;
         };
+        // (pictures read before the file held a frame show its last one until the growing file is read again, every
+        // growingRefreshMs: the wait covers two of those readings, one of which may find the file mid-write)
+        const qint64 untilReadAgain = 2 * qint64(state()->growingRefreshMs()) + 20000;
         for (FrameTime k : {FrameTime(0), FrameTime(1), (out - in) / 2, out - in - 1, out - in}) {
             int got = -1;
             QElapsedTimer wait;
@@ -3195,7 +3198,7 @@ private slots:
                 if (got >= 0) QTest::qWait(200);
                 const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), k, {});
                 got = f.width > 0 ? int(std::lround(f.at(f.width / 2, f.height / 2)[1] * 255)) : 0;
-            } while (!matches(got, k) && wait.elapsed() < 15000);
+            } while (!matches(got, k) && wait.elapsed() < untilReadAgain);
             QVERIFY2(matches(got, k), qPrintable(QStringLiteral("frame %1: %2, sent %3 (sender %4 slots behind, %5 repeated)")
                                                      .arg(k).arg(got).arg(greyOf(first + in + k)).arg(tx[0].slotsSkipped())
                                                      .arg(mv->tile(0).repeated)));
