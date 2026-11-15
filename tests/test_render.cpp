@@ -116,6 +116,7 @@
 #include "render/RemoteReview.h"
 #include "render/WebRtcReview.h"
 #include "render/ReviewCongestion.h"
+#include "render/ReviewGate.h"
 #include "render/TurnRelay.h"
 #include "render/HeadlessBrowser.h"
 #include "render/OGraf.h"
@@ -23001,6 +23002,98 @@ colorspaces:
         // The guessers together: what each network may try at once, and five a second between them after that.
         QVERIFY2(wrongMeanwhile <= networks * 3 + int(5 * seconds) + 16, std::to_string(wrongMeanwhile).c_str());
 #endif
+    }
+
+    // Nightly 15 Nov: who may have a passphrase tried, run against a clock of the test's. A right passphrase uses up
+    // no try of its network's (reviewers behind one network where one had mistyped were refused untried after the
+    // third). With more networks guessing than the gate lists, a newcomer from elsewhere is still tried (the ration
+    // the networks not listed share gained a try in a quarter of an hour), and what the guessers together may try
+    // stays a few a second.
+    void reviewPassphraseGate() {
+        using namespace montage::output;
+        using namespace std::chrono_literals;
+        using Gate = PassphraseGate;
+        const Gate::Clock::time_point start = Gate::Clock::time_point() + 24h;
+        auto address = [](int n, int host) { return QStringLiteral("10.%1.%2.%3").arg(n / 256).arg(n % 256).arg(host); };
+        auto network = [](int n) { return QStringLiteral("10.%1.%2.0/24").arg(n / 256).arg(n % 256); };
+        {
+            // One behind a network mistypes: the network is listed, with three tries at once. Six more behind it give
+            // the right passphrase in the same moment and are all tried; wrong ones after them still have only three.
+            Gate gate;
+            Gate::Verdict v = gate.ask(address(1, 1), network(1), start);
+            QCOMPARE(int(v.answer), int(Gate::Answer::Try));
+            QCOMPARE(gate.wrong(address(1, 1), network(1), start), 1000);
+            QCOMPARE(gate.networksListed(), size_t(1));
+            for (int host = 2; host < 8; ++host) {
+                v = gate.ask(address(1, host), network(1), start);
+                QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString::number(host)));
+                gate.right(address(1, host), network(1), start, v);
+                QVERIFY(gate.trusted(address(1, host)));
+            }
+            int tried = 0;
+            for (int host = 20; host < 30; ++host) {
+                v = gate.ask(address(1, host), network(1), start);
+                if (v.answer != Gate::Answer::Try) {
+                    QCOMPARE(int(v.answer), int(Gate::Answer::NetworkBusy));
+                    QVERIFY(v.retryAfter >= 1);
+                    continue;
+                }
+                ++tried;
+                gate.wrong(address(1, host), network(1), start);
+            }
+            QCOMPARE(tried, 3);
+            // One let in is tried whatever its network has left.
+            QCOMPARE(int(gate.ask(address(1, 2), network(1), start).answer), int(Gate::Answer::Try));
+        }
+        {
+            // 5,000 networks guess wrong once each, a hundred a second: the gate lists 4,096, each tried once, and
+            // the rest share a ration (three at once, five a second).
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            int tried = 0;
+            for (int n = 0; n < 5000; ++n) {
+                now += 10ms;
+                if (gate.ask(address(n, 9), network(n), now).answer != Gate::Answer::Try) continue;
+                ++tried;
+                gate.wrong(address(n, 9), network(n), now);
+            }
+            QCOMPARE(gate.networksListed(), Gate::kListed);
+            QVERIFY2(tried >= 4096 + 3 && tried <= 4096 + 3 + 5 * 10 + 2, qPrintable(QString::number(tried)));
+            // A second after the guessers from networks not listed let up, a newcomer from another such network is
+            // tried, and let in with the right passphrase.
+            now += 1s;
+            Gate::Verdict v = gate.ask(address(6000, 5), network(6000), now);
+            QCOMPARE(int(v.answer), int(Gate::Answer::Try));
+            gate.right(address(6000, 5), network(6000), now, v);
+            // For a minute, networks not listed go on guessing two a second, and networks listed forty a second:
+            // every newcomer from elsewhere (one every five seconds, right at once) is tried, and the guessers
+            // together are tried no more than ten a second and what the listed networks had at once.
+            int newcomers = 0, wrong = 0;
+            for (int step = 0; step < 2400; ++step) {
+                now += 25ms;
+                const int listed = step % 4096;
+                if (gate.ask(address(listed, 9), network(listed), now).answer == Gate::Answer::Try) {
+                    ++wrong;
+                    gate.wrong(address(listed, 9), network(listed), now);
+                }
+                if (step % 20 == 0) {
+                    const int other = 7000 + step;
+                    if (gate.ask(address(other, 9), network(other), now).answer == Gate::Answer::Try) {
+                        ++wrong;
+                        gate.wrong(address(other, 9), network(other), now);
+                    }
+                }
+                if (step % 200 == 100) {
+                    const int fresh = 20000 + step;
+                    v = gate.ask(address(fresh, 5), network(fresh), now);
+                    QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString("the newcomer at %1 s").arg(step * 0.025)));
+                    gate.right(address(fresh, 5), network(fresh), now, v);
+                    ++newcomers;
+                }
+            }
+            QCOMPARE(newcomers, 12);
+            QVERIFY2(wrong >= 100 && wrong <= 10 * 60 + 600, qPrintable(QString::number(wrong)));
+        }
     }
 
     // Live review's judgement of a viewer's link by delay: the arrival reports read, the packets numbered and padded,
