@@ -2257,7 +2257,39 @@ private slots:
             m.handle(events[0], targets);
             QVERIFY(std::fabs(values["inc"] - (0.6 - 0.05 * 0.4)) < 1e-12);
             QVERIFY(m.refresh(targets.get).size() == 4);  // shown back on the control (NRPN: four messages)
+            // A range written the other way round (0.6 down to 0.2): an increment goes towards its far end, down
+            // (nightly 15 Nov: it went up).
+            Mapper r;
+            Mapping rev = inc;
+            rev.target = "rev";
+            rev.low = 0.6;
+            rev.high = 0.2;
+            r.map(rev);
+            values["rev"] = 0.4;
+            r.handle(events[0], targets);
+            QVERIFY2(std::fabs(values["rev"] - (0.4 - 0.05 * 0.4)) < 1e-12, qPrintable(QString::number(values["rev"])));
+            r.handle(events[3], targets);
+            QVERIFY(std::fabs(values["rev"] - 0.4) < 1e-12);
         }
+        // ---- NRPN data entry with the fine half first (nightly 15 Nov: each value came out with the coarse half
+        // of the one before). The first pair shows the order; from then on the value is given whole, once, when its
+        // coarse half arrives; a fine half alone goes out when the parameter is next chosen.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 20, 0xB1, 6, 10});
+        QVERIFY(!events.empty() && events.back().key == nrpn && events.back().value == (10 << 7 | 20) && events.back().resolution == 16384);
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 0, 0xB1, 6, 11});
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (11 << 7 | 0));
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 127, 0xB1, 6, 10, 0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 5});
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].value == (10 << 7 | 127));
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 6, 0xB1, 6, 10});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].value == (10 << 7 | 5) && events[1].value == (10 << 7 | 6));
+        // (a parameter that sends the coarse half first is read as it was)
+        events = decode({0xB1, 99, 3, 0xB1, 98, 5, 0xB1, 6, 1, 0xB1, 38, 2, 0xB1, 99, 3, 0xB1, 98, 5, 0xB1, 6, 1, 0xB1, 38, 3});
+        QCOMPARE(events.size(), size_t(3));
+        QVERIFY(events[1].value == (1 << 7 | 2) && events[2].value == (1 << 7 | 3));
 
         // ---- One fader, three targets, each in its own range.
         {
