@@ -22765,6 +22765,8 @@ colorspaces:
         tab.js("__montage.checks.length = 0");
         rig.playing = true;
         QThread::msleep(3000);
+        // (a slow runner shows fewer pictures a second: played on until 30 have been read)
+        tab.until("__montage.checks.filter(c => c.code >= 0 && c.tag >= 0).length >= 30", 20);
         rig.playing = false;
         int worst = 0, read = 0;
         for (const QJsonValue& c : tab.js("__montage.checks.slice()").toArray()) {
