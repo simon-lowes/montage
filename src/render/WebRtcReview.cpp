@@ -54,6 +54,7 @@
 #include "media/ThreadScheduling.h"
 #include "render/ColorSpace.h"
 #include "render/ReviewCongestion.h"
+#include "render/TurnRelay.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -815,6 +816,10 @@ struct BrowserReviewBackend::Impl {
     QSslKey key;
     std::vector<rtc::IceServer> iceServers;
     bool relayInUse = false;  // a TURN relay among them, which Montage reaches too
+    // The relay's login for this review: the settings' own, or one made from the shared secret that runs out at
+    // `expires` (seconds since 1970; 0: none), when the link stops letting viewers in too.
+    TurnLogin relayLogin;
+    std::atomic<int64_t> expires{0};
 
     // The web server's thread, its loop and the object queued work runs on.
     std::thread http;
@@ -1122,6 +1127,7 @@ struct BrowserReviewBackend::Impl {
         if (r.method == "GET" && path == "/review.js") return respond(c, "200 OK", {}, browserReviewScript(), "text/javascript; charset=utf-8");
         if (path == "/config" && r.method == "GET") {
             if (!authorised(c, r)) return;
+            if (expired()) return respond(c, "410 Gone", {}, "This review link has expired");
             QJsonArray ice;
             for (const QJsonObject& s : browserIceServers()) ice.append(s);
             QJsonArray rungs;
@@ -1136,6 +1142,7 @@ struct BrowserReviewBackend::Impl {
         if (path == "/whep") {
             if (r.method != "POST") return respond(c, "405 Method Not Allowed", {{"Allow", "POST, OPTIONS"}}, {});
             if (!authorised(c, r)) return;
+            if (expired()) return respond(c, "410 Gone", {}, "This review link has expired");
             if (!r.header("content-type").toLower().startsWith("application/sdp")) return respond(c, "415 Unsupported Media Type", {}, "An SDP offer, please");
             // (?hdr=1: the player decodes 10-bit HDR and wants it)
             const QByteArray query = r.path.mid(path.size() + 1);
@@ -1164,14 +1171,22 @@ struct BrowserReviewBackend::Impl {
         respond(c, "404 Not Found", {}, "Not found");
     }
 
-    // The STUN and TURN servers as browsers are given them: the settings' own, then the TURN relay.
+    // The review link's time is up (only one with a relay's shared secret has a time): nobody new is let in, as the
+    // relay lets no login from it in.
+    bool expired() const {
+        const int64_t at = expires;
+        return at > 0 && std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() >= at;
+    }
+
+    // The STUN and TURN servers as browsers are given them: the settings' own, then the TURN relay with this review's
+    // login (never the shared secret).
     std::vector<QJsonObject> browserIceServers() const {
         std::vector<QJsonObject> out;
         for (const std::string& s : settings.iceServers) out.push_back(browserIceServer(s));
         if (!settings.turnServer.empty())
             out.push_back({{"urls", QString::fromStdString(settings.turnServer)},
-                           {"username", QString::fromStdString(settings.turnUser)},
-                           {"credential", QString::fromStdString(settings.turnPassword)}});
+                           {"username", QString::fromStdString(relayLogin.user)},
+                           {"credential", QString::fromStdString(relayLogin.password)}});
         return out;
     }
 
@@ -2189,14 +2204,21 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
             return fail(std::string("ICE server ") + s + ": " + e.what());
         }
     }
+    d.expires = 0;
+    d.relayLogin = {d.settings.turnUser, d.settings.turnPassword};
     if (!d.settings.turnServer.empty()) {
+        // With the relay's shared secret, a login for this review that the relay takes until the link's time is up.
+        if (!d.settings.turnSecret.empty()) {
+            d.expires = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() + d.settings.turnExpirySeconds;
+            d.relayLogin = turnRestLogin(d.settings.turnSecret, d.expires);
+        }
         // (Montage reaches the relay over UDP; one over TLS only, turns:, is the browsers' alone)
         std::string relayHost;
         uint16_t relayPort = 0;
         bool tls = false;
         if (!parseRelay(d.settings.turnServer, relayHost, relayPort, tls)) return fail("The TURN relay's address is turn:host:port");
         if (!tls) {
-            d.iceServers.emplace_back(relayHost, relayPort, d.settings.turnUser, d.settings.turnPassword, rtc::IceServer::RelayType::TurnUdp);
+            d.iceServers.emplace_back(relayHost, relayPort, d.relayLogin.user, d.relayLogin.password, rtc::IceServer::RelayType::TurnUdp);
             d.relayInUse = true;
         } else if (d.settings.relayOnly) {
             return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)");
@@ -2355,6 +2377,7 @@ ReviewStats BrowserReviewBackend::stats() const {
         }
     s.probes = d_->probes;
     s.queueMoves = d_->queueMoves;
+    s.linkExpires = d_->open ? d_->expires.load() : 0;
     s.error = d_->lastError;
     s.markers = d_->markerCount;
     return s;

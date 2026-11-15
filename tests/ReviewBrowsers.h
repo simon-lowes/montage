@@ -177,8 +177,41 @@ private:
     std::atomic<quint16> port_{0};
 };
 
-// An HTTPS GET to Montage on this computer from one of its addresses (`from`: "127.0.0.2"; on Linux every 127.x
-// address is this computer's), the passphrase as the bearer token: the response's status, or 0 for none in time.
+// An HTTPS request to Montage on this computer from one of its addresses (`from`: "127.0.0.2"; on Linux every 127.x
+// address is this computer's; "" for any), the passphrase as the bearer token: the whole response, or "" for none in
+// time.
+inline QByteArray httpsRequest(const QString& from, int port, const QByteArray& method, const QByteArray& path, const QByteArray& bearer,
+                               const QByteArray& body = {}, const QByteArray& contentType = {}, int ms = 10000) {
+    QSslSocket s;
+    s.setProxy(QNetworkProxy::NoProxy);
+    s.setPeerVerifyMode(QSslSocket::VerifyNone);
+    if (!from.isEmpty() && !s.bind(QHostAddress(from))) return {};
+    s.connectToHostEncrypted(QStringLiteral("127.0.0.1"), quint16(port));
+    if (!s.waitForEncrypted(ms)) return {};
+    QByteArray head = method + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer " + bearer + "\r\nConnection: close\r\n";
+    if (!contentType.isEmpty()) head += "Content-Type: " + contentType + "\r\n";
+    if (method != "GET") head += "Content-Length: " + QByteArray::number(body.size()) + "\r\n";
+    s.write(head + "\r\n" + body);
+    QByteArray in;
+    QDeadlineTimer deadline(ms);
+    while (!deadline.hasExpired() && s.state() == QAbstractSocket::ConnectedState)
+        if (s.waitForReadyRead(int(std::max<qint64>(1, deadline.remainingTime())))) in += s.readAll();
+    in += s.readAll();
+    return in;
+}
+
+// The status of a response from httpsRequest (0 for none), and its body.
+inline int httpStatusOf(const QByteArray& response) {
+    const QList<QByteArray> first = response.left(response.indexOf("\r\n")).split(' ');
+    return first.size() >= 2 ? first[1].toInt() : 0;
+}
+inline QByteArray httpBodyOf(const QByteArray& response) {
+    const qsizetype at = response.indexOf("\r\n\r\n");
+    return at < 0 ? QByteArray() : response.mid(at + 4);
+}
+
+// An HTTPS GET to Montage on this computer from one of its addresses, the passphrase as the bearer token: the
+// response's status, -1 when the address is not this computer's, or 0 for none in time.
 inline int httpsStatus(const QString& from, int port, const QByteArray& path, const QByteArray& bearer, int ms = 10000) {
     QSslSocket s;
     s.setProxy(QNetworkProxy::NoProxy);
@@ -192,8 +225,7 @@ inline int httpsStatus(const QString& from, int port, const QByteArray& path, co
     while (!in.contains("\r\n") && !deadline.hasExpired() && s.state() == QAbstractSocket::ConnectedState)
         if (s.waitForReadyRead(int(std::max<qint64>(1, deadline.remainingTime())))) in += s.readAll();
     in += s.readAll();
-    const QList<QByteArray> first = in.left(in.indexOf("\r\n")).split(' ');
-    return first.size() >= 2 ? first[1].toInt() : 0;
+    return httpStatusOf(in);
 }
 
 // Firefox (MONTAGE_FIREFOX, else firefox on the PATH) headless, through geckodriver (MONTAGE_GECKODRIVER, the runner

@@ -45,6 +45,12 @@ struct StreamSettings {
     // this computer to a browser's address at the relay, which passes that on).
     std::string turnServer, turnUser, turnPassword;
     bool relayOnly = false;
+    // In place of the user name and password, the secret the relay shares with Montage (coturn's use-auth-secret):
+    // each review then has a login of its own that the relay takes for turnExpirySeconds from when the review starts
+    // (render/TurnRelay.h), and once that has passed the review link lets nobody new in either. Viewers' pages are
+    // given that login, never the secret.
+    std::string turnSecret;
+    int turnExpirySeconds = 86400;
     int maxViewers = 8;
     // Simulcast: the picture at 1 (one size for everyone), 2 (full and half size) or 3 rungs (and quarter size) at once,
     // each viewer moved between them by their own connection's loss.
@@ -124,6 +130,7 @@ struct ReviewStats {
     int hdrViewers = 0;            // and of them, those sent HDR
     int probes = 0;                // a browser review: padding bursts sent to see whether a viewer's link takes the size above
     int queueMoves = 0;            // and viewers moved down a size because their link queued, before it lost anything
+    int64_t linkExpires = 0;       // when the review link stops letting viewers in (seconds since 1970, UTC; 0: it does not)
 };
 
 // Where a reviewer in a browser points, in 0..1 of the picture.

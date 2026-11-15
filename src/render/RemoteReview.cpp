@@ -143,7 +143,14 @@ std::string checkStreamSettings(const StreamSettings& s) {
             if (s.turnServer.rfind("turn:", 0) != 0 && s.turnServer.rfind("turns:", 0) != 0)
                 return "A TURN relay's address starts turn: or turns: (such as turn:relay.example.com:3478)";
             if (s.turnServer.find('@') != std::string::npos) return "The TURN relay's user name and password go in their own fields";
-            if (s.turnUser.empty() || s.turnPassword.empty()) return "A TURN relay needs its user name and password";
+            if (s.turnSecret.empty() && (s.turnUser.empty() || s.turnPassword.empty()))
+                return "A TURN relay needs its shared secret, or its user name and password";
+            if (!s.turnSecret.empty() && (!s.turnUser.empty() || !s.turnPassword.empty()))
+                return "A TURN relay takes its shared secret or its user name and password, not both";
+            if (!s.turnSecret.empty() && (s.turnExpirySeconds < 30 || s.turnExpirySeconds > 30 * 86400))
+                return "A review link with a relay's shared secret lasts 30 seconds to 30 days";
+        } else if (!s.turnSecret.empty()) {
+            return "A shared secret needs the TURN relay it is for";
         }
         if (s.relayOnly && s.turnServer.empty()) return "Only through a relay needs a TURN relay";
         if (s.relayOnly && !s.turnServer.empty() &&

@@ -305,7 +305,7 @@ add_library(montage_engine STATIC
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   render/St2110.h render/St2110.cpp render/St2110Jxs.cpp render/St2110Receive.h render/St2110Receive.cpp render/Nmos.h render/Nmos.cpp
   render/RemoteReview.h render/RemoteReview.cpp render/WebRtcReview.h render/WebRtcReview.cpp render/WebRtcReviewPage.cpp
-  render/ReviewCongestion.h render/ReviewCongestion.cpp
+  render/ReviewCongestion.h render/ReviewCongestion.cpp render/TurnRelay.h render/TurnRelay.cpp
   render/HeadlessBrowser.h
   render/RemoteGrade.h render/RemoteGrade.cpp
   render/SkyReplace.h render/SkyReplace.cpp

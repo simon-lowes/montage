@@ -116,6 +116,7 @@
 #include "render/RemoteReview.h"
 #include "render/WebRtcReview.h"
 #include "render/ReviewCongestion.h"
+#include "render/TurnRelay.h"
 #include "render/HeadlessBrowser.h"
 #include "render/OGraf.h"
 #include "ReviewBrowsers.h"
@@ -23228,6 +23229,74 @@ colorspaces:
         for (const QString& s : fullSizes) QCOMPARE(s, QStringLiteral("640x360"));
         QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{2, 0, 0}));
         QCOMPARE(relay.dropped.load(), int64_t(0));
+    }
+
+    // A relay's shared secret: the login made from it is the one the REST scheme for TURN gives (checked against
+    // values worked out with OpenSSL), the settings take a secret or a user name and password, and a review started
+    // with a secret gives its page that login and never the secret, and lets nobody new in once its time is up.
+    void reviewRelayLogin() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        const std::string secret = "a secret made up for this test";
+        const TurnLogin made = turnRestLogin(secret, 1700003600);
+        QCOMPARE(made.user, std::string("1700003600:montage"));
+        QCOMPARE(made.password, std::string("frH/rlW08jUIAVKW4ZbvwiuQ7Eg="));
+        QCOMPARE(turnRestLogin(secret, 1700003600, "Ana").user, std::string("1700003600:Ana"));
+        QCOMPARE(turnRestLogin(secret, 1700003600, "Ana").password, std::string("OpzEJvMOQl1MsepUJ5kVUOJiLmI="));
+        QVERIFY(turnRestLogin("another secret", 1700003600).password != made.password);
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        ReviewRig rig;
+        rig.settings.turnServer = "turn:127.0.0.1:3478";
+        rig.settings.turnSecret = secret;
+        rig.settings.turnExpirySeconds = 30;
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        // A secret or a user name and password, not both and not neither; a secret needs its relay; a link lasts 30
+        // seconds to 30 days.
+        StreamSettings bad = rig.settings;
+        bad.turnUser = "reviewer", bad.turnPassword = "a password";
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("not both"));
+        bad = rig.settings;
+        bad.turnSecret.clear();
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("shared secret, or"));
+        bad = rig.settings;
+        bad.turnServer.clear();
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("needs the TURN relay"));
+        bad = rig.settings;
+        bad.turnExpirySeconds = 29;
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("30 seconds to 30 days"));
+        bad.turnExpirySeconds = 30 * 86400 + 1;
+        QVERIFY(!checkStreamSettings(bad).empty());
+        bad.turnExpirySeconds = 30 * 86400;
+        QVERIFY(checkStreamSettings(bad).empty());
+        rig.picture = [](FrameTime) { return std::make_shared<const Image>(320, 180); };
+        const qint64 before = QDateTime::currentSecsSinceEpoch();
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        const qint64 expires = rig.review->stats().linkExpires;
+        QVERIFY2(expires >= before + 30 && expires <= QDateTime::currentSecsSinceEpoch() + 30, std::to_string(expires - before).c_str());
+        // The page's configuration names the relay with the login the secret makes for that time, and the secret is
+        // nowhere in it.
+        const QByteArray pass = QByteArray::fromStdString(rig.settings.passphrase);
+        const QByteArray config = httpsRequest({}, rig.port(), "GET", "/config", pass);
+        QCOMPARE(httpStatusOf(config), 200);
+        QVERIFY(!config.contains(QByteArray::fromStdString(secret)));
+        const TurnLogin login = turnRestLogin(secret, expires);
+        QJsonObject relay;
+        for (const QJsonValue& v : QJsonDocument::fromJson(httpBodyOf(config)).object().value("iceServers").toArray())
+            if (v.toObject().value("urls").toString().startsWith("turn:")) relay = v.toObject();
+        QCOMPARE(relay.value("urls").toString(), QStringLiteral("turn:127.0.0.1:3478"));
+        QCOMPARE(relay.value("username").toString(), QString::fromStdString(login.user));
+        QCOMPARE(relay.value("credential").toString(), QString::fromStdString(login.password));
+        // Once the time is up, the configuration and an offer are both answered 410 with the reason, even with the
+        // passphrase; without it, 401 as ever.
+        while (QDateTime::currentSecsSinceEpoch() < expires) QThread::msleep(200);
+        const QByteArray late = httpsRequest({}, rig.port(), "GET", "/config", pass);
+        QCOMPARE(httpStatusOf(late), 410);
+        QCOMPARE(httpBodyOf(late), QByteArray("This review link has expired"));
+        const QByteArray offer = httpsRequest({}, rig.port(), "POST", "/whep", pass, "v=0\r\n", "application/sdp");
+        QCOMPARE(httpStatusOf(offer), 410);
+        QCOMPARE(httpStatusOf(httpsRequest({}, rig.port(), "GET", "/config", "not the passphrase")), 401);
+        QCOMPARE(rig.review->stats().linkExpires, int64_t(expires));
     }
 
     void ndiOutput() {
