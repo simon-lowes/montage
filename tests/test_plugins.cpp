@@ -2837,6 +2837,73 @@ private slots:
         QVERIFY2(r.first && std::fabs(r.second - 0.8f) < 1e-5f, err.c_str());
     }
 
+    // Nightly 15 Nov: an export whose picture would lose an OpenFX plug-in stops and names it. One bypassed since it
+    // failed past its restarts was left out of every frame of an export that said it went well; one that fails while
+    // the export renders stops it too. A failure met by a render that is no export's stops no export (it stopped
+    // every export running at the time).
+    void exportStopsAtABypassedOpenFxPlugin() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-export-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+        Clip clip = makeGeneratorClip(p, "color", 10);
+        clip.effects.push_back(ofx::makeEffect(p, invert));
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, clip).ok);
+        const Effect e = s.videoTracks[0].clips[0].effects[0];
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& h) {
+            h.autoRestarts = 0;
+            h.exportTimeoutMs = 2000;
+        });
+        ExportSettings st;
+        st.path = path("ofx-export.mkv").toStdString();
+        st.videoCodec = "ffv1";
+        st.audioCodec = "none";
+        std::string err;
+        auto hostsGone = [] {
+            ofx::remote::releaseIdle();
+            return eventually([] { return runningHosts().empty(); }, 20000);
+        };
+        // As it is, the export goes through with the effect.
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(hostsGone());
+        // It crashes in a render that is no export's (a thumbnail's, an on-screen control's host): with no restarts
+        // left it is bypassed, and no export is told to stop.
+        const uint64_t before = offlineFailureSerial();
+        {
+            Fault f("crash:render:0");
+            Image img(8, 8);
+            img.fill(0.2f, 0.4f, 0.6f, 1.0f);
+            QVERIFY(!ofx::applyEffect(e, 0, img, 1.0, {}, &err));
+        }
+        QVERIFY(failureOf(invert.id).has_value() && failureOf(invert.id)->bypassedNow >= 1);
+        QCOMPARE(offlineFailureSerial(), before);
+        QVERIFY(hostsGone());
+        // Bypassed, it would be left out of the export: the export stops and names it.
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in ") && err.find("Test Invert") != std::string::npos &&
+                     err.find("bypassed") != std::string::npos,
+                 err.c_str());
+        // Started again, the export goes through.
+        QVERIFY(restartPlugin(invert.id));
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(hostsGone());
+        // One that crashes while the export renders (its fourth picture) stops that export, named.
+        bool ok = true;
+        {
+            Fault f("crash:render:3");
+            ok = exportSequence(p, s, st, nullptr, nullptr, &err);
+        }
+        QVERIFY(!ok);
+        QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in ") && err.find("Test Invert") != std::string::npos, err.c_str());
+        QVERIFY(hostsGone());
+    }
+
     // Phase 15 #2: OpenFX on-screen controls drawn by the plug-in's host. The host draws them (the Draw Suite and
     // OpenGL alike) into one premultiplied picture at the monitor's size and pixel ratio; it is the drawing Montage
     // makes in its own process, within 1/255, and a drag sets what it sets there. No instance is made in Montage.

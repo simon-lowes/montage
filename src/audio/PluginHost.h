@@ -84,9 +84,10 @@ private:
 bool renderingRealtime();
 
 // An export marks its thread with this for as long as it renders. A plug-in that fails in its host, or is found
-// bypassed, by an offline render on a thread so marked stops that export (offlineFailureSerial() goes up). Met by any
-// other offline render, such as a background analysis with a mixer of its own, it is recorded for the main window's
-// bar and nothing more: an export running beside it carries on, as its own mixer has lost nothing.
+// bypassed, by an offline render on a thread so marked stops that export (offlineFailureSerial() goes up): an audio
+// plug-in in its mix, or an OpenFX plug-in whose picture came back without it. Met by any other offline render, such
+// as a background analysis with a mixer of its own or an OpenFX plug-in's on-screen controls, it is recorded for the
+// main window's bar and nothing more: an export running beside it carries on, as its own render has lost nothing.
 class ExportScope {
 public:
     ExportScope();
@@ -121,8 +122,8 @@ struct HostFailure {
 std::vector<HostFailure> hostFailures();
 // Goes up with each failure, restart or change of the list (the main window's bar watches it).
 uint64_t hostFailureSerial();
-// Goes up with each failure during an export's render (ExportScope; an OpenFX plug-in's during any offline render);
-// lastOfflineFailure() says what it was.
+// Goes up with each failure during an export's render (ExportScope), and when an export's render finds a plug-in
+// bypassed; lastOfflineFailure() says what it was.
 uint64_t offlineFailureSerial();
 std::string lastOfflineFailure();
 // Starts the plug-in's bypassed instances again, in fresh hosts, with their last saved states (false: none bypassed).

@@ -148,7 +148,9 @@ bool bypassedNow(const Effect& e, const PluginDesc& d) { return pluginHeldBypass
 
 // A host that crashed or did not answer while working for plug-in `d`: ended, the failure recorded once (renders on
 // several threads lose a host together) against the plug-in to blame, and a restart used (bypassed past them). What
-// happened, in words, after the plug-in's name.
+// happened, in words, after the plug-in's name. Recording it stops no export: an export is told by its own render
+// that came back without the effect (render), so a failure met elsewhere (on-screen controls, a thumbnail) leaves the
+// exports running beside it alone.
 std::string hostFailed(Host& host, const PluginDesc& d, const std::string& bypass, Result r, int64_t timeoutUs) {
     const bool hung = r == Result::Timeout;
     std::string how = hung ? "did not answer within " + std::to_string(std::max<int64_t>(1, timeoutUs / 1'000'000)) + " s and was stopped"
@@ -164,14 +166,14 @@ std::string hostFailed(Host& host, const PluginDesc& d, const std::string& bypas
     if (host.failureTaken.exchange(true)) return words;
     if (!loading.empty()) {
         if (!blamed.binary.empty()) ofx::Registry::instance().blockAfterCrash(blamed.binary, "Crashed its plug-in host while loading");
-        recordFailure(blamed.id, blamed.label, std::string(), "load", how + " while loading it; blocked", !renderingRealtime());
+        recordFailure(blamed.id, blamed.label, std::string(), "load", how + " while loading it; blocked", !renderingRealtime(), true, true);
         return words;
     }
     const bool restart = autoRestartsLeft(d.id) > 0;
     if (restart) useAutoRestart(d.id);
     else markExhausted(bypass);
     const std::string kindName = hung ? "hang" : how.rfind("used more memory", 0) == 0 ? "memory" : "crash";
-    recordFailure(d.id, d.label, std::string(), kindName, how + "; bypassed", !renderingRealtime());
+    recordFailure(d.id, d.label, std::string(), kindName, how + "; bypassed", !renderingRealtime(), true, true);
     if (restart) noteRestart(d.id);
     return words;
 }
@@ -273,8 +275,29 @@ void releaseIdle() {
     }
 }
 
+namespace {
+bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
+                  const Image* b, Image& out, const FrameFetch* fetch, std::string* error, const ColorSpace* working);
+}
+
 bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
             const Image* b, Image& out, const FrameFetch* fetch, std::string* error, const ColorSpace* working) {
+    std::string why;
+    if (renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, &why, working)) return true;
+    // An export's picture would go on without the effect, and the export would say it went well: the export is told
+    // and stops, naming the plug-in. Whatever the reason: bypassed since it failed in playback, failed now, or its
+    // host would not start. (One the user turned off after it failed is left out knowingly, as an audio plug-in is.)
+    if (renderingForExport() && !pluginHeldBypassed(d.id)) {
+        const std::string named = d.label + " ";
+        noteOfflineFailure(d.label, why.rfind(named, 0) == 0 ? why.substr(named.size()) : "could not render: " + why);
+    }
+    if (error) *error = std::move(why);
+    return false;
+}
+
+namespace {
+bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
+                  const Image* b, Image& out, const FrameFetch* fetch, std::string* error, const ColorSpace* working) {
     if (bypassedNow(e, d)) {
         if (error) *error = d.label + " is bypassed after failing in its plug-in host (Restart brings it back)";
         return false;
@@ -415,6 +438,7 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
     if (error) *error = d.label + " " + how;
     return false;
 }
+}  // namespace
 
 // ---- On-screen controls ----
 
