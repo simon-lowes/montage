@@ -5493,6 +5493,17 @@ private slots:
         // The next Montage (here, the window asked as at its start) takes it up by itself and writes the file again.
         QString said;
         connect(dialogs, &DialogJobs::finished, this, [&](const QString&, bool, const QString& text) { said = text; });
+        // While another Montage started with this one is taking it up (the job's lock is held), this one leaves it
+        // (nightly 15 Nov: both found it interrupted, and both wrote the files).
+        {
+            QLockFile other(jobs::jobFolder(r.id) + "/resume.lock");
+            QVERIFY(other.tryLock(0));
+            QCOMPARE(dialogs->resume(), 0);
+            QVERIFY(!dialogs->running());
+            QVERIFY(jobs::load(r.id, r));
+            QCOMPARE(r.status, QStringLiteral("interrupted"));
+            QCOMPARE(r.data.value("tries").toInt(), 0);
+        }
         QCOMPARE(dialogs->resume(), 1);
         QVERIFY(dialogs->running());
         QTRY_VERIFY_WITH_TIMEOUT(!dialogs->running(), 300000);
