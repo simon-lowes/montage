@@ -15585,6 +15585,46 @@ const auto seq = [this] { return state()->sequence(); };
         // A press away from the square is left to the monitor (no step).
         QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.1, 0.1));
         QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(1));
+        // An answer that comes late from a control in a host (nightly 15 Nov) writes only what is still as it was when
+        // the control was asked. What the user has set since stays, an undo is not undone by it, and an answer that
+        // leaves nothing to change makes no undo step. (It wrote all it set over whatever was there.)
+        {
+            Effect asked;
+            asked.params["x"] = Param(0.5), asked.params["y"] = Param(0.25);
+            asked.strings["mode"] = "a";
+            Effect changes;
+            changes.params["x"] = Param(0.6), changes.params["y"] = Param(0.3);
+            changes.strings["mode"] = "b";
+            Effect edited;
+            // (nothing changed since: all of it)
+            QVERIFY(OfxOverlay::lateAnswer(asked, asked, changes, edited));
+            QVERIFY(edited.params.at("x").value == 0.6 && edited.params.at("y").value == 0.3 && edited.strings.at("mode") == "b");
+            // (x and the mode set since: they stay, y is written)
+            Effect now = asked;
+            now.params["x"] = Param(0.9);
+            now.strings["mode"] = "c";
+            QVERIFY(OfxOverlay::lateAnswer(asked, now, changes, edited));
+            QVERIFY(edited.params.at("x").value == 0.9 && edited.params.at("y").value == 0.3 && edited.strings.at("mode") == "c");
+            // (x keyed since, at the same value: still the newer one)
+            now = asked;
+            now.params["x"].addKey(0, 0.5);
+            QVERIFY(OfxOverlay::lateAnswer(asked, now, changes, edited));
+            QVERIFY(edited.params.at("x").keys.size() == 1 && edited.params.at("y").value == 0.3);
+            // (everything put back by an undo to before the drag: nothing written)
+            Effect undone;
+            undone.params["x"] = Param(0.4), undone.params["y"] = Param(0.2);
+            undone.strings["mode"] = "z";
+            QVERIFY(!OfxOverlay::lateAnswer(asked, undone, changes, edited));
+            QVERIFY(edited.params.at("x").value == 0.4 && edited.strings.at("mode") == "z");
+            // (a parameter taken away since is not put back; one the answer adds, absent then and now, is added)
+            now = asked;
+            now.params.erase("y");
+            changes.params["z"] = Param(1.0);
+            QVERIFY(OfxOverlay::lateAnswer(asked, now, changes, edited));
+            QVERIFY(!edited.params.count("y") && edited.params.at("z").value == 1.0 && edited.params.at("x").value == 0.6);
+            // (what it sets is there already: no step)
+            QVERIFY(!OfxOverlay::lateAnswer(asked, asked, asked, edited));
+        }
         // With plug-ins in hosts of their own the control runs in the probe's host, which draws it there: the same
         // drag is the same one undo step, and one undo puts it back.
         {

@@ -165,7 +165,7 @@ void OfxOverlay::paint(QPainter& p, const QRectF&) {
         if (!shown && !(down_ && pressed_.clip == it->first.first && pressed_.effect == it->first.second)) {
             // (what a late answer set is still written, if it has come)
             Effect late;
-            if (it->second.interact && it->second.interact->lateEdits(late)) applyLate(it->second.target, late);
+            if (it->second.interact && it->second.interact->lateEdits(late)) applyLate(it->second.target, late, it->second.asked);
             it = open_.erase(it);
         } else {
             ++it;
@@ -187,7 +187,7 @@ void OfxOverlay::paint(QPainter& p, const QRectF&) {
         if (drew || !o.gl.isNull()) ofx::paintOverlay(p, o, v);
         // What a late reply set once the pen was up: written as its own step (not while a drag is going on).
         Effect late;
-        if (!down_ && !state_->inGesture() && in->lateEdits(late)) applyLate(t, late);
+        if (!down_ && !state_->inGesture() && in->lateEdits(late)) applyLate(t, late, askedAs(t, *e));
         if (in->waiting() && !poll_->isActive()) poll_->start();
         if (!drew) {
             const std::string why = in->failure();
@@ -229,19 +229,61 @@ void OfxOverlay::apply(const Target& t, const Effect& edited, bool gesture) {
     else state_->edit(tr("Change %1").arg(QString::fromStdString(edited.s("ofx_name"))), fn);
 }
 
-void OfxOverlay::applyLate(const Target& t, const Effect& changes) {
+namespace {
+
+bool sameParam(const Param& a, const Param& b) {
+    return a.value == b.value && a.keys == b.keys && a.repeat == b.repeat && a.expr == b.expr && a.exprFrom == b.exprFrom && a.exprSeed == b.exprSeed;
+}
+
+}  // namespace
+
+bool OfxOverlay::lateAnswer(const Effect& asked, const Effect& now, const Effect& changes, Effect& edited) {
+    edited = now;
+    bool any = false;
+    for (const auto& [key, param] : changes.params) {
+        const auto was = asked.params.find(key), is = now.params.find(key);
+        // (changed since the control was asked: by the user, an undo, or a later answer. The newer value stays.)
+        if ((was == asked.params.end()) != (is == now.params.end()) || (is != now.params.end() && !sameParam(was->second, is->second))) continue;
+        if (is != now.params.end() && sameParam(is->second, param)) continue;  // (as it is already)
+        edited.params[key] = param;
+        any = true;
+    }
+    for (const auto& [key, value] : changes.strings) {
+        const auto was = asked.strings.find(key), is = now.strings.find(key);
+        if ((was == asked.strings.end()) != (is == now.strings.end()) || (is != now.strings.end() && was->second != is->second)) continue;
+        if (is != now.strings.end() && is->second == value) continue;
+        edited.strings[key] = value;
+        any = true;
+    }
+    return any;
+}
+
+Effect OfxOverlay::askedAs(const Target& t, const Effect& now) const {
+    const auto it = open_.find({t.clip, t.effect});
+    return it != open_.end() && it->second.hasAsked ? it->second.asked : now;
+}
+
+void OfxOverlay::noteAsked(const Target& t, const Effect& e, const ofx::Interact& in) {
+    // (with an answer still out, a late one answers the event before: what the effect was then is kept)
+    const auto it = open_.find({t.clip, t.effect});
+    if (it == open_.end() || (it->second.hasAsked && in.waiting())) return;
+    it->second.asked = e;
+    it->second.hasAsked = true;
+}
+
+void OfxOverlay::applyLate(const Target& t, const Effect& changes, const Effect& asked) {
     // (after the paint it was found in, and after any drag going on then)
-    QTimer::singleShot(state_->inGesture() ? 100 : 0, this, [this, t, changes] {
+    QTimer::singleShot(state_->inGesture() ? 100 : 0, this, [this, t, changes, asked] {
         if (state_->inGesture()) {
-            applyLate(t, changes);
+            applyLate(t, changes, asked);
             return;
         }
         const Effect* now = effectOf(t);
         if (!now) return;
-        Effect edited = *now;
-        for (const auto& [key, param] : changes.params) edited.params[key] = param;
-        for (const auto& [key, value] : changes.strings) edited.strings[key] = value;
-        apply(t, edited, false);
+        // Only what is still as it was when the control was asked: a parameter the user has set since, or an undo
+        // has put back, is not overwritten by an answer that old, and an answer that changes nothing is no step.
+        Effect edited;
+        if (lateAnswer(asked, *now, changes, edited)) apply(t, edited, false);
     });
 }
 
@@ -269,6 +311,7 @@ bool OfxOverlay::pen(ofx::Interact::Pen kind, QEvent* ev) {
         if (!in) continue;
         Effect edited = *e;
         bool changed = false;
+        noteAsked(t, *e, *in);
         const bool took = in->pen(kind, *e, double(t.lt), v, pos.x(), pos.y(), pressure, edited, changed);
         if (kind == ofx::Interact::Pen::Down && took) {
             pressed_ = t;
@@ -346,6 +389,7 @@ bool OfxOverlay::eventFilter(QObject* obj, QEvent* e) {
             if (!in) continue;
             Effect edited = *ef;
             bool changed = false;
+            noteAsked(t, *ef, *in);
             const bool took = in->key(e->type() == QEvent::KeyPress, sym, k->text().toStdString(), *ef, double(t.lt), v, edited, changed);
             if (changed) apply(t, edited, false);  // (what a late answer set comes with a key not taken too)
             if (took) {
