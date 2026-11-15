@@ -31,6 +31,7 @@
 #include "core/ProjectIO.h"
 #include "render/ColorSpace.h"
 #include "render/Ofx.h"
+#include "render/OfxGl.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -592,6 +593,58 @@ struct OfxChannel {
     float* at(size_t offsetBytes) const { return reinterpret_cast<float*>(static_cast<char*>(arena->data()) + offsetBytes); }
 };
 
+// A clip effect's picture drawn into a texture and shared with Montage from the GPU's memory, as a DMA-BUF whose
+// descriptors go to Montage's socket `post` (render/OfxGl.h, render/OfxRemote.h). False where it cannot be: `why`
+// says why, and the picture is rendered as usual and goes through shared memory; or, `failed`, the plug-in failed
+// (`error`).
+bool renderToHandle(const Effect& e, double t, const Image& in, double scale, const ofx::FrameFetch& fetch, const ColorSpace* space,
+                    const std::string& post, wire::PictureHandle& handle, std::string& why, bool& failed, std::string& error) {
+    failed = false;
+    if (post.empty()) {
+        why = "Montage named no socket for the picture's descriptors";
+        return false;
+    }
+    if (!ofx::gl::exportsDmaBuf(&why) || !ofx::rendersTextures(e, &why)) return false;
+    const int w = in.width, h = in.height;
+    unsigned from = 0, to = 0;
+    ofx::gl::run([&] {
+        from = ofx::gl::makeTexture(w, h);
+        to = ofx::gl::makeTexture(w, h, true);
+        if (from) ofx::gl::writeTexture(from, in);
+    });
+    ofx::gl::DmaBuf buf;
+    bool shared = false;
+    if (!from || !to) {
+        why = "no texture could be made for the picture";
+    } else if (!ofx::applyEffectTexture(e, t, ofx::GlPicture{from, w, h}, ofx::GlPicture{to, w, h}, scale, fetch, &error, space)) {
+        failed = true;
+    } else {
+        ofx::gl::run([&] { shared = ofx::gl::exportDmaBuf(to, w, h, buf, &why); });
+        if (shared && !ofx::gl::sendDmaBuf(post, buf)) {
+            shared = false;
+            why = "the picture's descriptors could not be sent to Montage";
+        }
+    }
+    // (The DMA-BUF keeps the picture's memory; Montage has its own descriptors for it now.)
+    ofx::gl::run([&] {
+        ofx::gl::destroyTexture(from);
+        ofx::gl::destroyTexture(to);
+    });
+    if (shared) {
+        handle = wire::PictureHandle{};
+        handle.kind = 1;
+        handle.fourcc = buf.fourcc;
+        handle.stride = buf.stride;
+        handle.offset = buf.offset;
+        handle.modifier = buf.modifier;
+        handle.width = w;
+        handle.height = h;
+        handle.fence = buf.fence >= 0 ? 1 : 0;
+    }
+    ofx::gl::closeDmaBuf(buf);
+    return shared;
+}
+
 // Asks Montage for a picture (a frame at another time, or what an input shows) in the middle of a render.
 bool ask(OfxChannel& o, int32_t kind, double t, const std::string& connection, Image& out) {
     std::lock_guard lock(o.questions);
@@ -781,6 +834,10 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
         bool ok = false;
         Image out;
         Effect e;
+        bool handled = false;  // (the picture went as a handle, not through the arena)
+        wire::PictureHandle handle{};
+        std::string noHandle;  // (asked for a handle: why the picture is in the arena instead)
+        h->resultFlags = 0;
         if (b == std::string::npos || !effectFromJsonString(msg.substr(0, a), e)) {
             error = "the effect did not come through";
         } else if (!o->mapArena()) {
@@ -788,7 +845,10 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
         } else {
             const auto descs = ofx::descriptionsFromJson(msg.substr(a + 1, b - a - 1));
             for (const ofx::PluginDesc& d : descs) ofx::Registry::instance().adopt(d);
-            const std::string spaceId = msg.substr(b + 1);
+            // (after the colour space, where Montage asks for a handle: the socket for its descriptors)
+            const size_t c3 = msg.find('\0', b + 1);
+            const std::string spaceId = msg.substr(b + 1, c3 == std::string::npos ? c3 : c3 - b - 1);
+            const std::string post = c3 == std::string::npos ? std::string() : msg.substr(c3 + 1);
             const ColorSpace* space = spaceId.empty() ? nullptr : findColorSpace(spaceId);
             const size_t slot = size_t(std::max(0, w)) * size_t(std::max(0, hh)) * 16;
             const int images = kind == 1 ? 2 : kind == 0 ? 1 : 0;
@@ -811,7 +871,12 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
             ofx::OwnMaskScope ownMask((flags & wire::kHasMask) ? &mask : nullptr);
             if (kind == 0) {
                 out = picture(0);
-                ok = ofx::applyEffect(e, t, out, scale, fetch, &error, space);
+                // Shared from the GPU's memory where Montage asks and it can be; else rendered as ever, and why said.
+                bool failed = false;
+                if ((flags & wire::kWantsHandle) && !(flags & wire::kHasMask))
+                    handled = renderToHandle(e, t, out, scale, fetch, space, post, handle, noHandle, failed, error);
+                else if (flags & wire::kWantsHandle) noHandle = "an effect with a mask of its own is not shared as a handle";
+                ok = handled || (!failed && ofx::applyEffect(e, t, out, scale, fetch, &error, space));
             } else if (kind == 1) {
                 const Image from = (empties & 1) ? Image() : picture(0);
                 const Image to = (empties & 2) ? Image() : picture(1);
@@ -820,7 +885,7 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
                 ok = ofx::renderGenerator(e, t, w, hh, scale, out, &error, space);
             }
             // The picture back, after the inputs (and the mask).
-            if (ok) {
+            if (ok && !handled) {
                 const size_t outOff = size_t(images) * slot + ((flags & wire::kHasMask) ? size_t(w) * size_t(hh) * sizeof(float) : 0);
                 const size_t bytes = size_t(out.width) * size_t(out.height) * 16;
                 if (!o->mapArena() || outOff + bytes > o->arena->size()) {
@@ -834,7 +899,17 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
             }
         }
         checkMemory();
-        c.replyText(ok, error);
+        if (ok && handled) {
+            std::memcpy(c.payload(), &handle, sizeof handle);
+            h->payloadBytes = sizeof handle;
+            h->resultI = handle.width;
+            h->resultI2 = handle.height;
+            h->resultFlags = wire::kPictureHandle;
+            h->status = 1;
+            c.reply();
+            continue;
+        }
+        c.replyText(ok, ok ? noHandle : error);
     }
 }
 

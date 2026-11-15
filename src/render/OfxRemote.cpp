@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -10,6 +12,7 @@
 #include "audio/PluginHostInternal.h"
 #include "core/ProjectIO.h"
 #include "render/ColorSpace.h"
+#include "render/OfxGl.h"
 
 namespace montage::ofx::remote {
 
@@ -27,7 +30,12 @@ struct Link {
     bool attached = false;
     bool hung = false;  // (a message still out that will not be answered: no Destroy is waited for)
     bool rendered = false;  // (it has given a picture: its host has the plug-in loaded)
+    // Where the host sends the descriptors of a picture it shares from the GPU's memory (render/OfxGl.h; made when one
+    // is first asked for).
+    int post = -1;
+    std::string postName;
     ~Link() {
+        gl::closeDmaBufPost(post);
         if (attached && host && host->alive() && !hung) {
             chan.h->command = wire::Destroy;
             call(chan, *host, 1'000'000);
@@ -168,9 +176,93 @@ std::string hostFailed(Host& host, const PluginDesc& d, const std::string& bypas
     return words;
 }
 
+// ---- How a picture comes back: a handle to the GPU's memory, or shared memory ----
+
+std::mutex gPicturesM;
+PictureStats gPictures;
+std::string gHandlesOff;  // (gPicturesM) why handles are no longer asked for: one could not be taken
+
+bool logsPictures() {
+    static const bool on = [] {
+        const char* v = std::getenv("MONTAGE_GPU_LOG");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+void notePicture(const PluginDesc& d, bool handle, const std::string& why) {
+    std::string line = d.label + "'s picture came from its plug-in host " + (handle ? "as a DMA-BUF" : "through shared memory");
+    if (!why.empty()) line += ": " + why;
+    if (logsPictures()) std::fprintf(stderr, "montage gpu: %s\n", line.c_str());
+    std::lock_guard lock(gPicturesM);
+    ++(handle ? gPictures.handles : gPictures.sharedMemory);
+    gPictures.last = std::move(line);
+}
+
+// Whether the host is asked for a handle; why not, otherwise.
+bool asksForHandle(Kind kind, bool withMask, const Host& host, std::string& why) {
+    auto no = [&](const std::string& reason) {
+        why = reason;
+        return false;
+    };
+    const char* v = std::getenv("MONTAGE_GPU_HANDLES");
+    const std::string asked = v ? v : "";
+    if (asked != "1" && asked != "on") return no("handles are not asked for (MONTAGE_GPU_HANDLES=1 asks)");
+    {
+        std::lock_guard lock(gPicturesM);
+        if (!gHandlesOff.empty()) return no(gHandlesOff);
+    }
+    if (kind != Kind::Effect || withMask) return no("only a clip effect's picture, without a mask of its own, is shared as a handle");
+    if (!host.gpu) return no("its plug-in host renders without OpenGL");
+    if (gl::servingOpenGl()) return no("OpenGL is busy with the render this picture is for");
+    std::string cannot;
+    if (!gl::importsDmaBuf(&cannot)) return no(cannot);
+    return true;
+}
+
+// The picture a host shares, read from the texture it is imported as: its descriptors are at `post`, sent before the
+// reply. False, with why, when it cannot be taken.
+bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w, int h, Image& out, std::string& why) {
+    if (ph.kind != 1 || ph.width != w || ph.height != h || !host.proc) {
+        why = "the plug-in host's handle is not one Montage takes";
+        return false;
+    }
+    gl::DmaBuf buf;
+    if (!gl::receiveDmaBuf(post, host.proc->pid(), ph.fence != 0, 2000, buf, &why)) return false;
+    buf.fourcc = ph.fourcc;
+    buf.stride = ph.stride;
+    buf.offset = ph.offset;
+    buf.modifier = ph.modifier;
+    buf.width = w;
+    buf.height = h;
+    bool ok = false;
+    const bool ran = gl::run([&] {
+        const unsigned texture = gl::importDmaBuf(buf, &why);
+        if (!texture) return;
+        gl::readTexture(texture, w, h, true, out);
+        gl::destroyTexture(texture);
+        ok = !out.empty();
+        if (!ok) why = "the shared picture could not be read";
+    });
+    gl::closeDmaBuf(buf);
+    if (!ran) why = "OpenGL for plugins is not running";
+    return ran && ok;
+}
+
 }  // namespace
 
 bool isolated() { return plugins::isolating(); }
+
+PictureStats pictureStats() {
+    std::lock_guard lock(gPicturesM);
+    return gPictures;
+}
+
+void resetPictureStats() {
+    std::lock_guard lock(gPicturesM);
+    gPictures = {};
+    gHandlesOff.clear();
+}
 
 void releaseIdle() {
     drainClosedControls();
@@ -222,13 +314,24 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
     const int64_t timeout = !renderingRealtime() ? exportUs : link->rendered ? playbackWaitUs(d.id, pixels, playbackUs) : playbackUs;
     const int64_t began = ipc::nowUs();
     Result r = Result::Ok;
-    if (sendPayload(c, *link->host, msg, timeout, &r)) {
+    // The picture back as a handle to the GPU's memory where that is asked for and both sides can; through the shared
+    // block otherwise, and `viaMemory` says why.
+    std::string viaMemory;
+    bool asked = asksForHandle(kind, withMask, *link->host, viaMemory);
+    if (asked && link->post < 0) {
+        link->postName = ipc::uniqueName("h");
+        link->post = gl::openDmaBufPost(link->postName, &viaMemory);
+        asked = link->post >= 0;
+    }
+    if (sendPayload(c, *link->host, asked ? msg + std::string(1, '\0') + link->postName : msg, timeout, &r)) {
         const InputResolver& inputs = currentInputs();
         uint32_t flags = hd->flags & wire::kPayloadInBlob;
         if (fetch && *fetch) flags |= wire::kHasFetch;
         if (inputs) flags |= wire::kHasInputs;
         if (withMask) flags |= wire::kHasMask;
+        if (asked) flags |= wire::kWantsHandle;
         hd->flags = flags;
+        hd->resultFlags = 0;
         hd->argI = int64_t(kind);
         hd->argI2 = w;
         hd->argI3 = h;
@@ -269,6 +372,29 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
             giveBack(key, std::move(link));
             return false;
         }
+        // (a handle only when one was asked for: what the host says is not trusted to send this round again and again)
+        if (asked && (hd->resultFlags & wire::kPictureHandle)) {
+            wire::PictureHandle ph{};
+            std::string why = "the plug-in host's handle did not come through";
+            const bool described = hd->payloadBytes >= sizeof ph;
+            if (described) std::memcpy(&ph, wire::payload(c.base()), sizeof ph);
+            const bool taken = described && takeHandle(*link->host, link->post, ph, w, h, out, why);
+            giveBack(key, std::move(link));
+            if (taken) {
+                notePicture(d, true, {});
+                return true;
+            }
+            // Not taken: no handle is asked for from now on, and this picture is rendered again, through shared memory.
+            {
+                std::lock_guard lock(gPicturesM);
+                gHandlesOff = why.empty() ? std::string("a handle could not be taken") : why;
+            }
+            return render(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
+        }
+        if (asked) {
+            viaMemory.assign(wire::payload(c.base()), size_t(std::min<uint64_t>(hd->payloadBytes, wire::kPayload)));
+            if (viaMemory.empty()) viaMemory = "its plug-in host shared no handle";
+        }
         // (the size the host gives is not trusted: negative or past 64K a side is refused before anything is made)
         const int64_t rw = hd->resultI, rh = hd->resultI2;
         const bool sane = rw >= 0 && rh >= 0 && rw <= 65536 && rh <= 65536;
@@ -281,6 +407,7 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
         out = Image(ow, oh, Image::Uninitialized{});
         if (bytes) std::memcpy(out.px.data(), link->at(outOff), bytes);
         giveBack(key, std::move(link));
+        notePicture(d, false, viaMemory);
         return true;
     }
     // It crashed or did not answer: bypassed this time, named, and started again for the next render (a few times).

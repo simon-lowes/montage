@@ -25,6 +25,11 @@
 #include <optional>
 #include <thread>
 
+#ifdef __linux__
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include "audio/AraHost.h"
 #include "audio/AudioDevice.h"
 #include "audio/PluginEffect.h"
@@ -39,6 +44,7 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Ofx.h"
+#include "render/OfxGl.h"
 #include "render/OfxRemote.h"
 #include "render/Exporter.h"
 #include "media/ImageSequence.h"
@@ -2642,6 +2648,134 @@ private slots:
                      qPrintable(QString("frame %1 differs: %2 / %3").arg(frames[i]).arg(here[i].at(10, 18)[0]).arg(there[i].at(10, 18)[0])));
         }
         QVERIFY(std::fabs(here[1].at(10, 18)[0] - here[2].at(10, 18)[0]) > 0.01f);  // (the keyframes did something)
+    }
+
+    void openFxPicturesFallBackToSharedMemory() {
+        // A plug-in host gives its plug-in's picture back through shared memory unless it can share it from the GPU's
+        // memory. With no handle asked for, and, asked for one with MONTAGE_GPU_HANDLES=1, wherever one of the two
+        // sides cannot share it, the picture comes through shared memory, bit for bit the one made in Montage's
+        // process, and what was taken is counted and said, with why, as MONTAGE_GPU_LOG says it.
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-handles-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert));
+        Project p = makeDefaultProject();
+        Effect fx = ofx::makeEffect(p, invert);
+        fx.params["param.amount"] = Param(0.6);
+        fx.params["param.tint.g"] = Param(0.3);
+        Image picture(64, 36);
+        for (int y = 0; y < picture.height; ++y)
+            for (int x = 0; x < picture.width; ++x) {
+                float* px = picture.at(x, y);
+                px[0] = float(x) / picture.width, px[1] = float(y) / picture.height, px[2] = 0.25f, px[3] = 1.0f;
+            }
+        std::string err;
+        Image here = picture;
+        {
+            Hosting h(Isolation::InProcess);
+            QVERIFY2(ofx::applyEffect(fx, 3, here, 1.0, {}, &err), err.c_str());
+        }
+        QVERIFY(std::fabs(here.at(40, 10)[0] - picture.at(40, 10)[0]) > 0.05f);  // (the plug-in did something)
+        // (the environment as it was, when the test ends)
+        struct Asking {
+            const QByteArray before = qgetenv("MONTAGE_GPU_HANDLES");
+            const bool set = qEnvironmentVariableIsSet("MONTAGE_GPU_HANDLES");
+            ~Asking() {
+                if (set) qputenv("MONTAGE_GPU_HANDLES", before);
+                else qunsetenv("MONTAGE_GPU_HANDLES");
+            }
+        } asking;
+        auto same = [&](const Image& there) {
+            return there.width == here.width && there.height == here.height &&
+                   std::memcmp(here.px.data(), there.px.data(), here.px.size() * sizeof(float)) == 0;
+        };
+        Hosting h(Isolation::PerPlugin);
+        // Not asked for: shared memory, and it says how to ask.
+        qunsetenv("MONTAGE_GPU_HANDLES");
+        ofx::remote::resetPictureStats();
+        Image there = picture;
+        QVERIFY2(ofx::applyEffect(fx, 3, there, 1.0, {}, &err), err.c_str());
+        QVERIFY(!runningHosts().empty());
+        ofx::remote::PictureStats took = ofx::remote::pictureStats();
+        QCOMPARE(took.handles, 0L);
+        QCOMPARE(took.sharedMemory, 1L);
+        QCOMPARE(QString::fromStdString(took.last),
+                 QString("Test Invert's picture came from its plug-in host through shared memory: handles are not asked for "
+                         "(MONTAGE_GPU_HANDLES=1 asks)"));
+        QVERIFY(same(there));
+        // Asked for: a handle only where both sides can share one. Where one cannot (here: no OpenGL in a test without
+        // a display, a driver without the extensions, anything but Linux), shared memory again, with that reason.
+        qputenv("MONTAGE_GPU_HANDLES", "1");
+        there = picture;
+        QVERIFY2(ofx::applyEffect(fx, 3, there, 1.0, {}, &err), err.c_str());
+        took = ofx::remote::pictureStats();
+        const QString last = QString::fromStdString(took.last);
+        if (took.handles == 0) {
+            const QString start = "Test Invert's picture came from its plug-in host through shared memory: ";
+            QCOMPARE(took.sharedMemory, 2L);
+            QVERIFY2(last.startsWith(start) && last.size() > start.size() && !last.contains("not asked for"), qPrintable(last));
+            QVERIFY(same(there));
+        } else {
+            // (A machine where the picture is shared: the same picture, as 16-bit floats carry it.)
+            QCOMPARE(took.handles, 1L);
+            QCOMPARE(took.sharedMemory, 1L);
+            QCOMPARE(last, QString("Test Invert's picture came from its plug-in host as a DMA-BUF"));
+            QCOMPARE(there.px.size(), here.px.size());
+            double worst = 0;
+            for (size_t k = 0; k < here.px.size(); ++k) worst = std::max(worst, std::fabs(double(here.px[k]) - there.px[k]));
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString::number(worst)));
+        }
+        qInfo("%s", took.last.c_str());
+#ifdef __linux__
+        // How a shared picture's descriptors cross between processes, shown with a file's: sent to a socket of the
+        // taker's, they arrive as descriptors of the same file; what another process sent, or less than was said,
+        // is not taken, and nothing is left waiting.
+        {
+            const std::string name = ipc::uniqueName("t");
+            std::string why;
+            const int post = ofx::gl::openDmaBufPost(name, &why);
+            QVERIFY2(post >= 0, why.c_str());
+            QFile file(path("handle.bin"));
+            QVERIFY(file.open(QIODevice::ReadWrite));
+            ofx::gl::DmaBuf sent, got;
+            sent.fd = file.handle();
+            auto sameFile = [](int a, int b) {
+                struct stat sa {}, sb {};
+                return a >= 0 && b >= 0 && a != b && fstat(a, &sa) == 0 && fstat(b, &sb) == 0 && sa.st_ino == sb.st_ino && sa.st_dev == sb.st_dev;
+            };
+            QVERIFY(ofx::gl::sendDmaBuf(name, sent));
+            QVERIFY2(ofx::gl::receiveDmaBuf(post, getpid(), false, 2000, got, &why), why.c_str());
+            QVERIFY(sameFile(got.fd, sent.fd) && got.fence < 0);
+            ofx::gl::closeDmaBuf(got);
+            // (with a fence: two descriptors, in order)
+            sent.fence = file.handle();
+            QVERIFY(ofx::gl::sendDmaBuf(name, sent));
+            QVERIFY2(ofx::gl::receiveDmaBuf(post, getpid(), true, 2000, got, &why), why.c_str());
+            QVERIFY(sameFile(got.fd, sent.fd) && sameFile(got.fence, sent.fd) && got.fd != got.fence);
+            ofx::gl::closeDmaBuf(got);
+            // (one where two were said to come; then one from a process that is not the host)
+            sent.fence = -1;
+            QVERIFY(ofx::gl::sendDmaBuf(name, sent));
+            QVERIFY(!ofx::gl::receiveDmaBuf(post, getpid(), true, 200, got, &why) && got.fd < 0 && !why.empty());
+            QVERIFY(ofx::gl::sendDmaBuf(name, sent));
+            QVERIFY(!ofx::gl::receiveDmaBuf(post, qint64(getpid()) + 1, false, 200, got, &why) && got.fd < 0);
+            QVERIFY(!ofx::gl::receiveDmaBuf(post, getpid(), false, 0, got, &why));  // (nothing left)
+            // (an older message never taken does not stand in for the newest)
+            QFile other(path("handle-other.bin"));
+            QVERIFY(other.open(QIODevice::ReadWrite));
+            QVERIFY(ofx::gl::sendDmaBuf(name, sent));
+            sent.fd = other.handle();
+            QVERIFY(ofx::gl::sendDmaBuf(name, sent));
+            QVERIFY(ofx::gl::receiveDmaBuf(post, getpid(), false, 2000, got, &why));
+            QVERIFY(sameFile(got.fd, other.handle()));
+            ofx::gl::closeDmaBuf(got);
+            ofx::gl::closeDmaBufPost(post);
+            QVERIFY(!ofx::gl::sendDmaBuf(name, sent));  // (the post is gone with its socket)
+        }
+#endif
     }
 
     void failingOpenFxPluginsAreBypassed() {

@@ -23,6 +23,18 @@ enum class Kind { Effect = 0, Transition = 1, Generator = 2 };
 bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
             const Image* b, Image& out, const FrameFetch* fetch, std::string* error, const ColorSpace* working);
 
+// How pictures came back from plug-in hosts. A host can give its plug-in's picture as a handle to the GPU's memory (a
+// Linux DMA-BUF with a fence, read here from the imported texture) instead of copying it through shared memory: asked
+// for with MONTAGE_GPU_HANDLES=1 in the environment, for a clip effect that renders with OpenGL in a host started for
+// GPU rendering, where both sides' OpenGL is EGL's with the extensions for it. Everything else, and every picture
+// while it is not asked for, comes through shared memory. MONTAGE_GPU_LOG=1 says which each picture took, and why.
+struct PictureStats {
+    long handles = 0, sharedMemory = 0;
+    std::string last;  // the last picture's, as MONTAGE_GPU_LOG says it ("... through shared memory: <why>")
+};
+PictureStats pictureStats();
+void resetPictureStats();  // (and handles are asked for again, after one that could not be taken stopped them)
+
 // Lets go of the channels kept for the next render, so hosts with nothing else in them end (and new ones start with
 // the settings as they are then).
 void releaseIdle();

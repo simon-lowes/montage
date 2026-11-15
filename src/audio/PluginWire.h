@@ -46,7 +46,7 @@ enum Command : uint32_t {
     SetEditorSize,  // argI width, argI2 height
     Destroy,
     // On an OpenFX channel.
-    OfxRender,      // payload "<effect JSON>\0<plug-in JSON>\0<colour space id>"; images in the arena
+    OfxRender,      // payload "<effect JSON>\0<plug-in JSON>\0<colour space id>[\0<socket for a handle>]"; images in the arena
     CallbackReply,  // Montage's answer to the host's question (a frame at another time, an input)
     // An OpenFX channel's on-screen controls (overlay interact): payload an OverlayArgs, then "<effect JSON>\0<plug-in
     // JSON>\0<key text>". Draw's reply: the overlay as premultiplied RGBA (8 bits a channel, top row first) at the
@@ -72,11 +72,15 @@ enum : uint32_t {
     kHasFetch = 8,       // (OpenFX) Montage can give frames at other times
     kHasInputs = 16,     // (OpenFX) and connected inputs
     kHasMask = 32,       // (OpenFX) the effect's own mask follows the pictures in the arena
+    kWantsHandle = 64,   // (OpenFX) Montage takes the picture back as a GPU buffer's handle, where the host shares one
 };
 
 // Bits of `resultFlags` (Attach; kEdited: an overlay's Pen or Key set parameters; kControlFailed: the overlay said it
 // failed, and is closed).
-enum : uint32_t { kHasSidechain = 1, kHasEditor = 2, kEditorResizable = 4, kOwnWindow = 8, kEdited = 16, kControlFailed = 32 };
+// (kPictureHandle: an OpenFX render's picture is not in the arena but in a GPU buffer the host shares, described by a
+// PictureHandle in the payload. Asked for a handle it cannot share, the host puts the picture in the arena and why in
+// the payload.)
+enum : uint32_t { kHasSidechain = 1, kHasEditor = 2, kEditorResizable = 4, kOwnWindow = 8, kEdited = 16, kControlFailed = 32, kPictureHandle = 64 };
 
 // What an overlay message says beyond the effect: the view (render/Ofx.h View), the clip frame, the pen or key.
 struct OverlayArgs {
@@ -100,6 +104,19 @@ struct ParamChange {
     uint32_t id;
     uint32_t pad;
     double value;
+};
+
+// (OpenFX) A picture the host shares from the GPU's memory: a Linux DMA-BUF of one plane, RGBA 16-bit float,
+// premultiplied, the picture's top row first. Its descriptor, and its fence's when it has one, are sent to the socket
+// Montage named in the request (the payload's fourth part) before the reply.
+struct PictureHandle {
+    uint32_t kind;    // 1: a DMA-BUF
+    uint32_t fourcc;  // its DRM format
+    uint32_t stride, offset;
+    uint64_t modifier;
+    int32_t width, height;
+    int32_t fence;    // 1: a sync file came with it, signalled once the picture is drawn (0: it is drawn already)
+    int32_t pad;
 };
 
 struct Header {
