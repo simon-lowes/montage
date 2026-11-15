@@ -40425,6 +40425,56 @@ private slots:
             QVERIFY2(importSvgShapes(path("big.svg"), e, w, h, &notes, &err), err.c_str());
             QVERIFY2(took.elapsed() < 10000, qPrintable(QString::number(took.elapsed())));
             QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("2000 rules") != std::string::npos; }));
+            // One rule whose selector list is 30,000 selectors long, over 3,000 declarations (nightly 15 Nov): as
+            // many rules as its selectors, so it is read to the 2,000 too, its declarations held once (each selector
+            // had a copy of them: gigabytes from under 100 KB).
+            std::string list = "<style>rect";
+            for (int i = 0; i < 30000; ++i) list += ",a";
+            list += "{";
+            for (int i = 0; i < 3000; ++i) list += "p" + std::to_string(i) + ":1;";
+            list += "fill:#00ff00}</style><rect x=\"0\" y=\"0\" width=\"10\" height=\"10\"/>";
+            {
+                std::ofstream f(path("list.svg"));
+                f << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">" << list << "</svg>";
+            }
+            QVERIFY(QFileInfo(QString::fromStdString(path("list.svg"))).size() < 100000);
+            notes.clear();
+            took.restart();
+            Effect listed = makeEffect(p, "shape");
+            QVERIFY2(importSvgShapes(path("list.svg"), listed, w, h, &notes, &err), err.c_str());
+            QVERIFY2(took.elapsed() < 5000, qPrintable(QString::number(took.elapsed())));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("2000 rules") != std::string::npos; }));
+            // Rules of long compounds that every element and its ancestors match, on thousands of elements copied by
+            // <use> (hours of comparing names): the sheets are tried until that has taken long enough, the elements
+            // after go without them, and the import says so.
+            std::string every;
+            for (int i = 0; i < 30; ++i) every += ".n" + std::to_string(i);
+            std::string names;
+            for (int i = 0; i < 30; ++i) names += (i ? " n" : "n") + std::to_string(i);
+            std::string deep = "<style>";
+            for (int i = 0; i < 1500; ++i) {
+                for (int k = 0; k < 12; ++k) deep += every + " ";
+                deep += "rect" + every + " { fill: #0000ff }\n";
+            }
+            deep += "</style><defs><g id=\"ten\">";
+            for (int i = 0; i < 10; ++i) deep += "<rect class=\"" + names + "\" x=\"" + std::to_string(i) + "\" y=\"0\" width=\"1\" height=\"1\"/>";
+            deep += "</g><g id=\"hundred\">";
+            for (int i = 0; i < 10; ++i) deep += "<use href=\"#ten\" y=\"" + std::to_string(i) + "\"/>";
+            deep += "</g></defs>";
+            for (int k = 0; k < 12; ++k) deep += "<g class=\"" + names + "\">";
+            for (int i = 0; i < 20; ++i) deep += "<use href=\"#hundred\"/>";
+            for (int k = 0; k < 12; ++k) deep += "</g>";
+            {
+                std::ofstream f(path("deep.svg"));
+                f << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">" << deep << "</svg>";
+            }
+            notes.clear();
+            took.restart();
+            Effect matched = makeEffect(p, "shape");
+            QVERIFY2(importSvgShapes(path("deep.svg"), matched, w, h, &notes, &err), err.c_str());
+            qInfo("a sheet of long compounds on copied elements: %lld ms", static_cast<long long>(took.elapsed()));
+            QVERIFY2(took.elapsed() < 60000, qPrintable(QString::number(took.elapsed())));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("too many rules to try") != std::string::npos; }));
         }
         // Text: read out (where it is, its font, size and colour) to be made titles, which a layer imported into a
         // sequence gets on the track above it, drawn where the SVG has it.
