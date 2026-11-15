@@ -3072,6 +3072,8 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         return runOnSource(e) || &e == cs.sourceCdl || &e == cs.sourceRgc ||
                std::find(cs.sourceLooks.begin(), cs.sourceLooks.end(), &e) != cs.sourceLooks.end();
     };
+    // (An OpenFX plug-in drawn there takes the clip's other frames as clipLayer gives them.)
+    ofx::FetchScope fetchScope(cs.ofxFetch);
     if (!gpuChainOps(seq, c, cs.lt, ranAlready, out.ops, w, h, pixelScale)) return cpu(cpuEffectReason(c, cs.lt));
     // A picture wider or taller than the GPU takes is made on the CPU at the canvas's size instead.
     const int maxSize = gpu::maxTextureSize();
@@ -3119,11 +3121,13 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     return GpuLayerResult::Drawn;
 }
 
-// Whether the GPU mixes a transition itself: not an OpenFX one, nor one with a clip turned as a 3D Layer as it mixes,
-// nor a Smooth Cut from or to an adjustment layer (those are the CPU's).
+// Whether the GPU mixes a transition itself: an OpenFX one only where its plug-in draws from and into the compositor's
+// textures (render/Ofx.h's applyTransitionTexture) and neither side is an adjustment layer; not one with a clip turned
+// as a 3D Layer as it mixes, nor a Smooth Cut from or to an adjustment layer (those are the CPU's).
 bool gpuMixesTransition(const Sequence& seq, const Track& track, const Transition& tr) {
-    if (tr.type == "ofx") return false;
+    if (tr.type == "ofx" && (!gpu::sharesOpenGl() || !ofx::rendersTextures(tr.params, nullptr, true))) return false;
     for (const Clip* c : {findClip(track, tr.clipA), findClip(track, tr.clipB)}) {
+        if (c && tr.type == "ofx" && c->isGenerator() && c->generator.type == "adjustment") return false;
         if (c && c->enabled && !(c->isGenerator() && c->generator.type == "model3d") && enabledEffect(seq, *c, "layer_3d")) return false;
         if (c && tr.type == "smooth_cut" && c->isGenerator() && c->generator.type == "adjustment") return false;
     }
@@ -3260,7 +3264,25 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 if (A && A->enabled) drawn |= layerOf(*A, item.a);
                 if (B && B->enabled) drawn |= layerOf(*B, *item.b);
                 item.dissolve = float(std::clamp(u, 0.0, 1.0));
-                if (active->type != "cross_dissolve") item.transition = kind;
+                if (active->type == "ofx") {
+                    // Mixed by its plug-in, from the two sides placed on the canvas into another of the compositor's
+                    // textures, at the transition's frame and scale as transitionLayer gives them.
+                    auto step = std::make_shared<gpu::TextureStep>();
+                    ofx::PluginDesc plugin;
+                    step->name = ofx::Registry::instance().lookUp(active->params, plugin, nullptr) ? plugin.label : std::string("an OpenFX transition");
+                    step->run = [effect = active->params, at = double(t - from), u, scale = double(W) / std::max(1, seq.width),
+                                 working = &currentWorkingSpace(), where = currentExpressionContext()](
+                                    const unsigned* sides, int count, unsigned to, int w, int h, std::string* why) {
+                        if (count != 2) return false;
+                        ExpressionScope expressions(where.project, where.sequence, where.clip, where.cancel);
+                        const WorkingSpaceScope space(working);
+                        return ofx::applyTransitionTexture(effect, at, u, ofx::GlPicture{sides[0], w, h}, ofx::GlPicture{sides[1], w, h},
+                                                           ofx::GlPicture{to, w, h}, scale, why, working);
+                    };
+                    item.transitionStep = std::move(step);
+                } else if (active->type != "cross_dissolve") {
+                    item.transition = kind;
+                }
             } else {
                 // Mixed on the CPU; from or to an adjustment layer, over the canvas beneath it, drawn here so far and read
                 // back, which then goes on from there.

@@ -220,8 +220,9 @@ struct GlPicture {
     unsigned texture = 0;
     int width = 0, height = 0;
 };
-// Whether `e`'s plug-in is given textures (it renders with OpenGL, in this process); `why` says why not.
-bool rendersTextures(const Effect& e, std::string* why = nullptr);
+// Whether `e`'s plug-in, a clip effect's (or, `transition`, a transition's), is given textures (it renders with OpenGL,
+// in this process); `why` says why not.
+bool rendersTextures(const Effect& e, std::string* why = nullptr, bool transition = false);
 // applyEffect from `from` into `to` (two textures of one size, in a context sharing with the plug-ins'; what was drawn
 // into `from` finished first). Called from the thread that renders the frame, with its scopes, not the compositor's
 // own. A plug-in that after all does not render them with OpenGL has `from` read back and its picture written into

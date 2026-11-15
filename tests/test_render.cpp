@@ -24461,7 +24461,8 @@ colorspaces:
         ofx::setGpuRendering(true);
         QVERIFY(std::fabs(mixed.at(10, 40)[0] - (0.75f * picture.at(10, 40)[0] + 0.25f * second.at(10, 40)[0])) < 1e-5f);
         const ofx::GlPicture to = texture(&second), mix = texture(nullptr);
-        QVERIFY2(ofx::rendersTextures(tr, &why), why.c_str());
+        QVERIFY2(ofx::rendersTextures(tr, &why, true), why.c_str());
+        QVERIFY(!ofx::rendersTextures(tr) && !ofx::rendersTextures(e, nullptr, true));  // (each as what it is)
         readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
         QVERIFY2(ofx::applyTransitionTexture(tr, 3, 0.25, in, to, mix, 1.0, &err), err.c_str());
         QCOMPARE(ofx::gpuReadBacks(), readBacks);
@@ -24498,6 +24499,140 @@ colorspaces:
         QVERIFY(!ofx::applyEffectTexture(e, 0, in, ofx::GlPicture{out.texture, W, H - 2}, 1.0, {}, &err));
         f->glDeleteTextures(GLsizei(textures.size()), textures.data());
         other.doneCurrent();
+    }
+
+    // An OpenFX plug-in that renders with OpenGL, chained with a GPU blur on a clip, and an OpenFX transition, in frames
+    // the GPU draws. Where the compositor draws with OpenGL its textures are the plug-ins' context's too: the plug-in
+    // draws from and into them, with no read-back and no layer made on the CPU, whichever of the two contexts was made
+    // first and after the device was lost. On another backend the layer is made on the CPU, as before. Either way the
+    // frames match the CPU's within 1/1023.
+    void gpuOfxTextures() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath((dir.path() + "/ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.dissolve/1", dissolve));
+        if (!ofx::initializeGpu(&why)) QSKIP(why.c_str());
+        if (invert.openGL != "true" || dissolve.openGL != "true") QSKIP("The test plug-ins were built without OpenGL");
+        const QByteArray backend = qgetenv("MONTAGE_GPU").toLower();
+        const QString device = QString::fromStdString(gpu::deviceName());
+        // (Asked for OpenGL, the two contexts must share: the test is not to pass by drawing on the CPU.)
+        if (backend == "opengl") QVERIFY2(gpu::sharesOpenGl(), qPrintable("not shared on " + device));
+        if (backend == "vulkan") QVERIFY2(!gpu::sharesOpenGl(), qPrintable("shared on " + device));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        auto addPicture = [&](const char* name, int w, int h, float phase) {
+            QImage q(w, h, QImage::Format_RGBA64);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.21f + phase), float(y) / h,
+                                                           0.5f + 0.4f * std::sin(x * 0.07f - y * 0.13f + phase), 1.0f));
+            const QString path = dir.filePath(name);
+            if (!q.save(path)) return Id{};
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id wide = addPicture("wide.png", 160, 90, 0), other = addPicture("other.png", 160, 90, 1.7f), small = addPicture("small.png", 120, 80, 0.6f);
+        QVERIFY(wide && other && small);
+        // The frame on the CPU and on the GPU, and what the GPU frame took: texture steps, layers made on the CPU, and
+        // OpenGL renders read back.
+        struct Took {
+            long steps = 0, cpuLayers = 0, gpuFrames = 0;
+            int readBacks = 0, direct = 0;
+            double worst = 0;
+            std::string cpuLayer, fallback;
+        };
+        auto frame = [&](FrameTime t) {
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats before = gpu::stats();
+            const int readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            Took took;
+            took.steps = after.textureSteps - before.textureSteps, took.cpuLayers = after.cpuLayers - before.cpuLayers;
+            took.gpuFrames = after.gpuFrames - before.gpuFrames;
+            took.readBacks = ofx::gpuReadBacks() - readBacks, took.direct = ofx::gpuTextureRenders() - direct;
+            took.cpuLayer = after.lastCpuLayer, took.fallback = after.lastFallback;
+            took.worst = cpu.px.size() == onGpu.px.size() && !cpu.empty() ? 0 : 1e9;
+            for (size_t k = 0; k < cpu.px.size() && k < onGpu.px.size(); ++k) took.worst = std::max(took.worst, std::fabs(double(cpu.px[k]) - onGpu.px[k]));
+            return took;
+        };
+        auto said = [&](const char* what, const Took& t) {
+            return QString("%1 on %2: off by %3; %4 GPU frames (%5), %6 texture steps, %7 into textures, %8 read back, %9 CPU layers (%10)")
+                .arg(what, device).arg(t.worst).arg(t.gpuFrames).arg(QString::fromStdString(t.fallback)).arg(t.steps).arg(t.direct).arg(t.readBacks)
+                .arg(t.cpuLayers).arg(QString::fromStdString(t.cpuLayer));
+        };
+        // What each frame must have taken, shared or not.
+        auto check = [&](const char* what, const Took& t, const char* cpuLayerNames) {
+            const QString text = said(what, t);
+            if (t.worst > 1.0 / 1023 || t.gpuFrames != 1) return text;
+            if (gpu::sharesOpenGl()) return t.steps == 1 && t.direct == 1 && t.readBacks == 0 && t.cpuLayers == 0 ? QString() : text;
+            return t.steps == 0 && t.direct == 0 && t.cpuLayers >= 1 && t.cpuLayer.find(cpuLayerNames) != std::string::npos ? QString() : text;
+        };
+        // V1 a full-frame picture; V2 a smaller one, scaled and moved, through the plug-in (which leaves its lower half
+        // alone, so a picture handed over upside down would show) and then a blur the GPU draws.
+        QVERIFY(edit::placeMedia(p, s, wide, 0, 0, 20, {TrackKind::Video, 0}, {}, false).ok);
+        const auto placed = edit::placeMedia(p, s, small, 0, 0, 20, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(placed.ok);
+        {
+            Clip* top = edit::clipById(s, placed.created[0]);
+            top->motion.params["scale"] = 90.0;
+            top->motion.params["pos_x"] = 7.0;
+            Effect fx = ofx::makeEffect(p, invert);
+            fx.params["param.amount"] = Param(0.7);
+            fx.params["param.tint.g"] = Param(0.5);
+            fx.params["param.mode"] = Param(2.0);
+            top->effects.push_back(fx);
+            Effect blur = makeEffect(p, "gaussian_blur");
+            blur.params["radius"] = Param(3.0);
+            top->effects.push_back(blur);
+        }
+        QString wrong = check("effect and blur", frame(5), "Test Invert");
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        // (and the plug-in did change the frame: without it the picture differs)
+        {
+            RenderOptions o;
+            o.gpu = true;
+            const Image with = renderProgramFrame(p, s, 5, o);
+            edit::clipById(s, placed.created[0])->effects[0].enabled = false;
+            const Image without = renderProgramFrame(p, s, 5, o);
+            edit::clipById(s, placed.created[0])->effects[0].enabled = true;
+            double changed = 0;
+            for (size_t k = 0; k < with.px.size() && k < without.px.size(); ++k) changed = std::max(changed, std::fabs(double(with.px[k]) - without.px[k]));
+            QVERIFY2(changed > 0.05, qPrintable(QString::number(changed)));
+        }
+        // An OpenFX transition between two pictures on V1, later in the sequence.
+        const auto first = edit::placeMedia(p, s, wide, 30, 0, 20, {TrackKind::Video, 0}, {}, false);
+        const auto second = edit::placeMedia(p, s, other, 50, 0, 20, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(first.ok && second.ok);
+        const edit::Result added = edit::addTransition(p, s, first.created[0], edit::Edge::Out, "ofx:org.montage.test.dissolve/1", 8);
+        QVERIFY2(added.ok, added.error.c_str());
+        wrong = check("transition", frame(49), "ofx transition");
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        if (!gpu::sharesOpenGl()) return;
+        // The device lost and set up again: its new context is made sharing with the plug-ins', which is there already.
+        gpu::loseDeviceForTesting();
+        wrong = check("effect after the device was lost", frame(6), "Test Invert");
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        // And the compositor shut down and set up again.
+        gpu::shutdown();
+        QVERIFY2(gpu::initialize(&why), why.c_str());
+        QVERIFY(gpu::sharesOpenGl());
+        wrong = check("transition after a new start", frame(50), "ofx transition");
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
     }
 
     void gpuFallback() {

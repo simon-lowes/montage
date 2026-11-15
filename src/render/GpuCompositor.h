@@ -8,8 +8,11 @@
 //
 // Built where Qt is 6.6 or later (MONTAGE_WITH_GPU); elsewhere available() says why not. MONTAGE_GPU in the
 // environment picks the backend (auto, off, opengl, vulkan, metal, d3d11, d3d12; software for WARP or lavapipe),
-// MONTAGE_GPU_LOG=1 prints why frames fall back and how each layer was drawn.
+// MONTAGE_GPU_LOG=1 prints why frames fall back and how each layer was drawn. Where it draws with OpenGL its context
+// shares its textures with the OpenFX plug-ins' (render/OfxGl.h), so that a plug-in rendering with OpenGL draws from
+// and into the compositor's own textures (TextureStep); MONTAGE_GPU_SHARE=off keeps the two apart.
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +36,7 @@ std::string deviceName();  // e.g. "OpenGL 4.5, llvmpipe (LLVM 20.1.2, 256 bits)
 int maxTextureSize();      // the widest picture it takes (0 without a GPU)
 bool takesPlanes();        // it converts decoded Y′CbCr planes itself (Frame16::planes)
 bool takesShaders(const std::string& key = {});  // it compiles shader steps (ShaderStep) while running (that one, too)
+bool sharesOpenGl();       // it runs texture steps (TextureStep): its OpenGL textures are the OpenFX plug-ins' context's too
 void shutdown();           // (before the application goes; initialize() again is allowed)
 
 // A colour step written in GLSL at run time (render/Ocio's OpenColorIO transforms, from OCIO's own GPU shaders):
@@ -53,6 +57,17 @@ struct ShaderStep {
     std::vector<std::string> uniforms;
 };
 
+// A step drawn by something else that shares the compositor's textures (an OpenFX plug-in rendering with OpenGL:
+// render/Ofx.h's applyEffectTexture and applyTransitionTexture). `run` is given the OpenGL names of the textures it
+// reads (`count` of them: a layer's picture, or a transition's two sides) and of the one it draws into, all `width` x
+// `height`, RGBA 32-bit float, premultiplied, the picture's top row first; what the compositor drew into the ones it
+// reads is finished by then. It is called on the thread that asked for the frame (execute()'s caller), which holds what
+// `run` captured, while the compositor's own thread waits. False (with why): the frame is not drawn on the GPU.
+struct TextureStep {
+    std::string name;  // (what MONTAGE_GPU_LOG calls it)
+    std::function<bool(const unsigned* from, int count, unsigned to, int width, int height, std::string* why)> run;
+};
+
 // One colour step on a layer at its source size (render/Processing's colour effects, as they run there).
 struct ColorOp {
     // (Mark keeps the picture as it is, for a Mix later to mix what the steps between made with it, through its mask:
@@ -62,11 +77,11 @@ struct ColorOp {
     // (ChromaKey, LumaKey and ScreenKey change the alpha too: render/Processing's keyers, gpucolor.frag's 18 to 20;
     // a ScreenKey whose params[10] or [11] are set has its matte shrunk or grown and blurred by passes of its own, and
     // one with a clean plate, made on the CPU, reads it from `plate`.)
-    // (Shader runs `shader` on the picture, without a mask.)
+    // (Shader runs `shader` on the picture, without a mask; Texture runs `textureStep` from the picture into the next.)
     // (Filter runs gpufilter.frag's `passes` in turn, each on the picture the one before made, with the picture the
     // filter began with beside it: the blurs, Sharpen, Glow and the other effects that read beyond their own pixel. A
     // filter with a mask is marked before and mixed after, as a grade node is.)
-    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass, ChromaKey, LumaKey, ScreenKey, Shader, Filter } kind = Lut;
+    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass, ChromaKey, LumaKey, ScreenKey, Shader, Filter, Texture } kind = Lut;
     struct FilterPass {
         int mode = 0;           // gpufilter.frag's
         float params[60] = {};  // its p[1..15]
@@ -84,6 +99,7 @@ struct ColorOp {
     std::vector<FilterPass> passes;  // Filter
     std::shared_ptr<const ShaderStep> shader;  // Shader
     std::vector<float> values;                 // Shader: its uniforms' values
+    std::shared_ptr<const TextureStep> textureStep;  // Texture
     int slot = 0;                // Store, Load
     int passMode = 0;            // Pass
     int in[3] = {-1, -1, -1};    // Pass
@@ -134,6 +150,9 @@ struct Item {
     // (Smooth Cut, 18: its flow, a grid of moves in RGBA rows of transitionTableWidth, read as gpumix.frag's table)
     std::vector<float> transitionTable;
     int transitionTableWidth = 0;
+    // Or a transition drawn by a texture step (an OpenFX transition): both clips placed on the canvas first, then given
+    // to it as its two textures.
+    std::shared_ptr<const TextureStep> transitionStep;
     // A track matte: the clip seen through another track's picture (placed at the canvas's size), by its alpha or
     // luma, or the reverse (render/Compositor's applyTrackMatte).
     std::optional<Layer> matte;
@@ -166,6 +185,7 @@ struct Stats {
     long filterPasses = 0, mixPasses = 0;  // passes of filters (gpufilter.frag) and of transitions and mattes (gpumix.frag)
     long shaderBuilds = 0;                 // shader steps built (ShaderStep, once a key), since resetStats
     long shapeLayers = 0;                  // Shape layers drawn on the GPU (Layer::shapes)
+    long textureSteps = 0;                 // texture steps run (TextureStep: plug-ins drawing into the compositor's textures)
     std::string lastFallback;
     std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
     // Hardware-decoded frames (render/GpuHardware): drawn from the decoding device's memory (hwGpuCopies of them

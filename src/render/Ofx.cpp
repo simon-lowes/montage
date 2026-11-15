@@ -2857,7 +2857,7 @@ bool renderGenerator(const Effect& e, double t, int w, int h, double scale, Imag
     return runRender(d, l, inst.inst, job, out, error, working);
 }
 
-bool rendersTextures(const Effect& e, std::string* why) {
+bool rendersTextures(const Effect& e, std::string* why, bool transition) {
     auto no = [&](const std::string& reason) {
         if (why) *why = reason;
         return false;
@@ -2868,6 +2868,7 @@ bool rendersTextures(const Effect& e, std::string* why) {
     PluginDesc d;
     if (!Registry::instance().lookUp(e, d, why)) return false;
     if (d.openGL == "false") return no(d.label + " does not render with OpenGL");
+    if (d.generator() || d.transition() != transition) return no(d.label + (transition ? " is not a transition" : " is not a clip effect"));
     std::lock_guard<std::mutex> lock(gNoTexturesMutex);
     if (auto it = gNoTextures.find(d.id); it != gNoTextures.end()) return no(d.label + ": " + it->second);
     return true;

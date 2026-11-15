@@ -76,6 +76,7 @@ std::string deviceName() { return {}; }
 int maxTextureSize() { return 0; }
 bool takesPlanes() { return false; }
 bool takesShaders(const std::string&) { return false; }
+bool sharesOpenGl() { return false; }
 void shutdown() {}
 bool execute(const Frame&, Image*, QImage*) { return false; }
 std::string mappedHardware() { return {}; }
@@ -88,6 +89,8 @@ void refuseHardwareFramesForTesting(bool) {}
 
 #include <QGuiApplication>
 #include <QOffscreenSurface>
+#include <QOpenGLContext>
+#include <QOpenGLFunctions>
 #include <qfloat16.h>
 #include <QThread>
 // (A Qt built with Vulkan declares QVulkanInstance only where the Vulkan headers are found when Montage is built; Homebrew's
@@ -110,6 +113,7 @@ void refuseHardwareFramesForTesting(bool) {}
 #include <thread>
 
 #include "GpuHardware.h"
+#include "OfxGl.h"
 
 namespace montage::gpu {
 
@@ -118,6 +122,10 @@ namespace {
 #include "shaders/GpuShaders.inc"
 
 std::atomic<bool> gRefuseHw{false};  // (tests: refuseHardwareFramesForTesting)
+
+// Set while this thread runs a texture step for the GPU's thread (Device::callBack), which waits for it: the thread
+// holds the device (execute()'s lock) and must not ask the GPU for another frame meanwhile.
+thread_local bool tServingDevice = false;
 
 QShader shader(const unsigned char* data, size_t size) {
     return QShader::fromSerialized(QByteArray::fromRawData(reinterpret_cast<const char*>(data), qsizetype(size)));
@@ -157,8 +165,18 @@ public:
         return result.get();
     }
 
+    // fn run on the GPU's thread, waited for by doing what it hands back to this thread meanwhile (callBack: the
+    // frame's texture steps, which run with the scopes of the thread that asked for the frame).
+    bool serve(const std::function<bool()>& fn);
+    // Whether its OpenGL textures are the OpenFX plug-ins' context's too (texture steps can run).
+    bool sharesOpenGl() const {
+        std::lock_guard lock(brokenMutex_);
+        return glContext_ && ofx::gl::sharesWith(glContext_);
+    }
+
     bool draw(const Frame& frame, Image* out, QImage* out8);
     long filterPasses = 0, mixPasses = 0;  // (the last frame's)
+    long textureSteps = 0;                 // (texture steps run, the last frame)
     long shaderBuilds = 0;                 // (shader steps built, the last frame)
     long shapeLayers = 0;                  // (Shape layers drawn, the last frame)
     long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
@@ -200,6 +218,9 @@ private:
     Program* program(const ShaderStep& step, QRhiResourceUpdateBatch* u);
     void dropProgram(Program& prog, bool later = false);
     QRhiTexture* layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiTexture* canvas = nullptr);
+    // A texture step run from `from` into `into` (false, the frame failed, when it could not be).
+    bool external(const TextureStep* step, const std::vector<QRhiTexture*>& from, QRhiTexture* into, QRhiResourceUpdateBatch*& u);
+    void callBack(const std::function<void()>& fn);  // (on the GPU's thread: fn run by the thread waiting in serve())
     void endFrame();
     bool recover();  // (the device lost: everything made again, on FFmpeg's device again when shared, else on a new one)
 
@@ -208,6 +229,14 @@ private:
     std::condition_variable queueCv_;
     std::deque<std::function<void()>> queue_;
     bool quit_ = false;
+    // The thread waiting in serve() for the job the GPU's thread is doing, and what that job asks it to do meanwhile.
+    struct Asker {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::deque<std::function<void()>*> asks;
+        bool done = false;
+    };
+    Asker* asker_ = nullptr;  // (the GPU's thread's, while it does a serve() job)
 
     QOffscreenSurface* fallback_ = nullptr;  // (OpenGL; made on the GUI thread)
 #ifdef MONTAGE_GPU_VULKAN
@@ -236,6 +265,9 @@ private:
 #endif
     std::unique_ptr<hw::Mapper> mapper_;
     std::string mappedNames_;  // (brokenMutex_)
+    // The RHI's OpenGL context while it shares, or may come to share, its textures with the OpenFX plug-ins' context
+    // (render/OfxGl.h; brokenMutex_): null on other backends and with MONTAGE_GPU_SHARE=off.
+    QOpenGLContext* glContext_ = nullptr;
     QRhiSampler* sampler_ = nullptr;
     QRhiSampler* linear_ = nullptr;  // (shader steps' textures sampled between texels)
     std::map<std::string, Program> programs_;
@@ -429,6 +461,59 @@ void Device::loop() {
     }
 }
 
+bool Device::serve(const std::function<bool()>& fn) {
+    // Neither side leaves early: the job ends (and says so) whatever it threw, and what it handed back stays here.
+    Asker asker;
+    bool result = false;
+    {
+        std::lock_guard lock(queueMutex_);
+        queue_.push_back([&] {
+            asker_ = &asker;
+            try {
+                result = fn();
+            } catch (...) {
+                result = false;
+            }
+            asker_ = nullptr;
+            std::lock_guard done(asker.mutex);
+            asker.done = true;
+            asker.wake.notify_all();
+        });
+    }
+    queueCv_.notify_one();
+    std::unique_lock lock(asker.mutex);
+    for (;;) {
+        asker.wake.wait(lock, [&] { return asker.done || !asker.asks.empty(); });
+        if (asker.asks.empty()) break;
+        std::function<void()>* ask = asker.asks.front();
+        lock.unlock();
+        const bool serving = tServingDevice;
+        tServingDevice = true;
+        try {
+            (*ask)();
+        } catch (...) {
+        }
+        tServingDevice = serving;
+        lock.lock();
+        asker.asks.pop_front();
+        asker.wake.notify_all();
+    }
+    return result;
+}
+
+void Device::callBack(const std::function<void()>& fn) {
+    Asker* a = asker_;
+    if (!a) {
+        fn();
+        return;
+    }
+    std::function<void()> ask = fn;
+    std::unique_lock lock(a->mutex);
+    a->asks.push_back(&ask);
+    a->wake.notify_all();
+    a->wake.wait(lock, [&] { return std::find(a->asks.begin(), a->asks.end(), &ask) == a->asks.end(); });
+}
+
 bool Device::create() {
     const QRhi::Flags flags = software_ ? QRhi::PreferSoftwareRenderer : QRhi::Flags();
     switch (backend_) {
@@ -436,7 +521,23 @@ bool Device::create() {
             QRhiGles2InitParams params;
             params.fallbackSurface = fallback_;
             params.format = glFormat_;
+            // Its textures shared with the OpenFX plug-ins' context (render/OfxGl.h): made sharing with that one where
+            // it exists already (on its own, as before, where the two cannot share), and offered to it otherwise.
+            const bool share = qgetenv("MONTAGE_GPU_SHARE").toLower() != "off";
+            params.shareContext = share ? ofx::gl::context() : nullptr;
             rhi_ = QRhi::create(QRhi::OpenGLES2, &params, flags);
+            if (!rhi_ && params.shareContext) {
+                params.shareContext = nullptr;
+                rhi_ = QRhi::create(QRhi::OpenGLES2, &params, flags);
+            }
+            if (const auto* native = rhi_ && share ? static_cast<const QRhiGles2NativeHandles*>(rhi_->nativeHandles()) : nullptr;
+                native && native->context) {
+                {
+                    std::lock_guard lock(brokenMutex_);
+                    glContext_ = native->context;
+                }
+                ofx::gl::shareWith(native->context);
+            }
             break;
         }
 #ifdef MONTAGE_GPU_VULKAN
@@ -603,6 +704,14 @@ void Device::destroy() {
     delete dummy2d_, delete dummy3d_, delete dummy16_, delete dummyR_, delete rpFloatTex_, delete rp8Tex_;
     dummy2d_ = dummy3d_ = dummy16_ = dummyR_ = rpFloatTex_ = rp8Tex_ = nullptr;
     delete sampler_, sampler_ = nullptr;
+    {
+        // (The plug-ins' context is not made sharing with one that is going.)
+        std::unique_lock lock(brokenMutex_);
+        const bool offered = glContext_ != nullptr;
+        glContext_ = nullptr;
+        lock.unlock();
+        if (offered) ofx::gl::shareWith(nullptr);
+    }
     {
         // (On a shared device its queues are FFmpeg's too.)
         std::unique_lock<std::recursive_mutex> queues;
@@ -1120,6 +1229,17 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             continue;
         }
         const QSize size = cur->pixelSize();
+        if (op.kind == ColorOp::Texture) {
+            QRhiTexture* made = texture(T::RGBA32F, size.width(), size.height(), true);
+            if (!made) return nullptr;
+            if (!external(op.textureStep.get(), {cur}, made, u)) {
+                release(made);
+                return nullptr;
+            }
+            if (!keep(cur)) release(cur);
+            cur = made;
+            continue;
+        }
         if (op.kind == ColorOp::Filter) {
             // Each pass on what the one before made, beside the picture the filter began with (and what earlier passes
             // kept in the filter's slots).
@@ -1328,6 +1448,40 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
     return cur;
 }
 
+bool Device::external(const TextureStep* step, const std::vector<QRhiTexture*>& from, QRhiTexture* into, QRhiResourceUpdateBatch*& u) {
+    auto fail = [&](const std::string& why) {
+        if (logFallbacks()) std::fprintf(stderr, "montage gpu: %s: %s\n", step ? step->name.c_str() : "a texture step", why.c_str());
+        failed_ = true;
+        return false;
+    };
+    if (!step || !step->run) return fail("nothing to run");
+    if (backend_ != QRhi::OpenGLES2 || !sharesOpenGl()) return fail("the compositor's textures are not shared with it");
+    // What is recorded so far (uploads and passes) is run and finished in the RHI's context, so that the other context
+    // reads the pictures as drawn; what the RHI remembers of that context's state is forgotten afterwards, so the texture
+    // drawn into is bound again when it is next read.
+    cb_->resourceUpdate(u);
+    u = nullptr;
+    cb_->beginExternal();
+    std::vector<unsigned> names;
+    for (QRhiTexture* t : from) names.push_back(unsigned(t->nativeTexture().object));
+    const unsigned to = unsigned(into->nativeTexture().object);
+    const QSize size = into->pixelSize();
+    QOpenGLContext* current = QOpenGLContext::currentContext();
+    bool ok = current != nullptr && to != 0 && std::find(names.begin(), names.end(), 0u) == names.end();
+    std::string why = ok ? std::string() : "its textures have no OpenGL names";
+    if (ok) {
+        current->functions()->glFinish();
+        ok = false;
+        callBack([&] { ok = step->run(names.data(), int(names.size()), to, size.width(), size.height(), &why); });
+    }
+    cb_->endExternal();
+    u = rhi_->nextResourceUpdateBatch();
+    if (!ok) return fail(why.empty() ? "it could not be drawn" : why);
+    ++textureSteps;
+    if (logFallbacks()) std::fprintf(stderr, "montage gpu: %s drawn from and into the compositor's textures\n", step->name.c_str());
+    return true;
+}
+
 void Device::endFrame() {
     for (QRhiShaderResourceBindings* s : frameSrbs_) delete s;
     frameSrbs_.clear();
@@ -1365,7 +1519,7 @@ void Device::endFrame() {
 
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
-    filterPasses = mixPasses = shaderBuilds = shapeLayers = 0;
+    filterPasses = mixPasses = shaderBuilds = shapeLayers = textureSteps = 0;
     hwMapped = hwGpuCopies = 0;
     hwFallback.clear();
     if (!rhi_) return false;  // (lost, and not set up again)
@@ -1464,12 +1618,23 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
             break;
         }
         const Layer* la = &it.a;
-        if ((it.b && it.transition >= 0) || it.matte || it.displace) {
+        const bool stepped = it.b && it.transitionStep && (a || b);  // (a transition drawn by a texture step, of something)
+        if ((it.b && it.transition >= 0) || stepped || it.matte || it.displace) {
             // Placed on the canvas, then mixed: a transition, then a displacement, then a track matte.
             QRhiTexture* m = placed(&it.a, a);
             QRhiTexture* self = it.displace && it.displaceSelf ? placed(&it.a, a) : nullptr;  // (its own map, as it was)
             if (a && a != canvas) release(a);
-            if (m && it.b && it.transition >= 0) {
+            if (m && stepped) {
+                QRhiTexture* mb = placed(&*it.b, b);
+                if (b && b != canvas) release(b);
+                b = nullptr;
+                QRhiTexture* to = mb ? texture(T::RGBA32F, W, H, true) : nullptr;
+                const bool run = to && external(it.transitionStep.get(), {m, mb}, to, u);
+                release(m);
+                if (mb) release(mb);
+                if (to && !run) release(to);
+                m = run ? to : nullptr;
+            } else if (m && it.b && it.transition >= 0) {
                 QRhiTexture* mb = placed(&*it.b, b);
                 if (b && b != canvas) release(b);
                 b = nullptr;
@@ -1601,6 +1766,20 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
 std::shared_mutex gDeviceMutex;
 std::unique_ptr<Device> gDevice;
 
+// The device held shared. (A thread running a texture step for the GPU's thread holds it already, in execute(): what it
+// asks meanwhile does not wait for the lock a second time, behind a shutdown that waits for the frame.)
+struct DeviceLock {
+    std::shared_lock<std::shared_mutex> lock;
+    DeviceLock() {
+        if (!tServingDevice) lock = std::shared_lock(gDeviceMutex);
+    }
+};
+
+// Whether asking the GPU for a frame from this thread now could leave it waiting for itself: the GPU's thread waits for
+// this thread (a texture step), or the plug-ins' OpenGL thread does (a plug-in's render asked this thread for a
+// picture) while a texture step of another frame may be waiting for that thread in turn.
+bool waitedFor(const Device& d) { return tServingDevice || (ofx::gl::servingOpenGl() && d.sharesOpenGl()); }
+
 }  // namespace
 
 bool initialize(std::string* why) {
@@ -1618,30 +1797,39 @@ bool initialize(std::string* why) {
 }
 
 bool available(std::string* why) {
-    std::shared_lock lock(gDeviceMutex);
-    if (gDevice && gDevice->ready()) return true;
+    DeviceLock lock;
+    if (gDevice && gDevice->ready()) {
+        if (!waitedFor(*gDevice)) return true;
+        if (why) *why = "busy with the frame this picture is for";
+        return false;
+    }
     if (why) *why = gDevice && !gDevice->problem().empty() ? gDevice->problem() : "not set up";
     return false;
 }
 
 std::string deviceName() {
-    std::shared_lock lock(gDeviceMutex);
+    DeviceLock lock;
     return gDevice && gDevice->ready() ? gDevice->name() : std::string();
 }
 
 int maxTextureSize() {
-    std::shared_lock lock(gDeviceMutex);
+    DeviceLock lock;
     return gDevice && gDevice->ready() ? gDevice->maxTextureSize() : 0;
 }
 
 bool takesPlanes() {
-    std::shared_lock lock(gDeviceMutex);
+    DeviceLock lock;
     return gDevice && gDevice->ready() && gDevice->takesPlanes();
 }
 
 bool takesShaders(const std::string& key) {
-    std::shared_lock lock(gDeviceMutex);
+    DeviceLock lock;
     return gDevice && gDevice->ready() && gDevice->takesShaders(key);
+}
+
+bool sharesOpenGl() {
+    DeviceLock lock;
+    return gDevice && gDevice->ready() && gDevice->sharesOpenGl();
 }
 
 void shutdown() {
@@ -1650,15 +1838,15 @@ void shutdown() {
 }
 
 bool execute(const Frame& frame, Image* out, QImage* out8) {
-    std::shared_lock lock(gDeviceMutex);
-    if (!gDevice || !gDevice->ready()) return false;
+    DeviceLock lock;
+    if (!gDevice || !gDevice->ready() || waitedFor(*gDevice)) return false;
     Device* d = gDevice.get();
-    long filters = 0, mixes = 0, mapped = 0, copied = 0, builds = 0, shapes = 0;
+    long filters = 0, mixes = 0, mapped = 0, copied = 0, builds = 0, shapes = 0, steps = 0;
     std::string hwFallback;
-    const bool ok = d->run([&] {
+    const bool ok = d->serve([&] {
         const bool drawn = d->draw(frame, out, out8);
         filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds, shapes = d->shapeLayers;
-        mapped = d->hwMapped, copied = d->hwGpuCopies, hwFallback = d->hwFallback;
+        mapped = d->hwMapped, copied = d->hwGpuCopies, hwFallback = d->hwFallback, steps = d->textureSteps;
         return drawn;
     });
     std::lock_guard statsLock(gStatsMutex);
@@ -1667,6 +1855,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
         gStats.filterPasses += filters;
         gStats.mixPasses += mixes;
         gStats.shapeLayers += shapes;
+        gStats.textureSteps += steps;
     }
     gStats.shaderBuilds += builds;
     gStats.hwMapped += mapped;
@@ -1676,12 +1865,12 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
 }
 
 std::string mappedHardware() {
-    std::shared_lock lock(gDeviceMutex);
+    DeviceLock lock;
     return gDevice && gDevice->ready() ? gDevice->mapped() : std::string();
 }
 
 void loseDeviceForTesting() {
-    std::shared_lock lock(gDeviceMutex);
+    DeviceLock lock;
     if (gDevice) gDevice->lose = true;
 }
 
