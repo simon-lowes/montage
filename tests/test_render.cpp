@@ -16006,6 +16006,64 @@ colorspaces:
         QVERIFY(renderGenerator(t, 0, 800, 600, 1.0, 30, 30).px != renderGenerator(flat, 0, 800, 600, 1.0, 30, 30).px);
     }
 
+    // Nightly 15 Nov: a title a crafted project makes costly. Path data of 100,000 curves is taken to its first
+    // kTitlePathMostSegments, as a title's path and as an SVG text's; and an SVG text whose every letter is a chunk
+    // of its own (an x for each) is anchored in a pass over its letters, so centring it costs about what leaving it
+    // at its start does (it was letters squared: minutes at the 65,536 a layout holds).
+    void titleCraftedTextStaysQuick() {
+        std::string d = "M 0 0";
+        for (int i = 0; i < 100000; ++i) d += " c 1 1 2 -1 3 0";
+        QCOMPARE(int(svgPathCurve(d).segments.size()), kTitlePathMostSegments);
+        QCOMPARE(int(svgPathCurve("M 0 0 L 10 0 L 10 10 Z").segments.size()), 3);
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 12.0;
+        t.strings["text"] = "along";
+        t.params["path_shape"] = 3.0;
+        t.strings["path_data"] = d;
+        QElapsedTimer timer;
+        timer.start();
+        QCOMPARE(int(titleGlyphs(t, 0, 800, 600, 1.0, 30, 30).size()), 5);
+        QVERIFY2(timer.elapsed() < 20000, qPrintable(QString::number(timer.elapsed())));
+        // 40,000 letters, each with an x: anchored at the start, then in the middle.
+        const int n = 40000;
+        Effect s = makeEffect(p, "title");
+        s.strings["font"] = "DejaVu Sans";
+        s.params["size"] = 12.0;
+        s.strings["text"] = std::string(size_t(n), 'i');
+        SvgTextLayout lay;
+        for (int i = 0; i < n; ++i) lay.x.push_back(double(i % 700));
+        s.strings["svg_text"] = svgTextLayoutJson(lay);
+        timer.restart();
+        const std::vector<TitleGlyph> atStart = titleGlyphs(s, 0, 800, 600, 1.0, 30, 30);
+        const qint64 plain = timer.elapsed();
+        QCOMPARE(int(atStart.size()), n);
+        lay.anchor = 1;
+        s.strings["svg_text"] = svgTextLayoutJson(lay);
+        timer.restart();
+        const std::vector<TitleGlyph> centred = titleGlyphs(s, 0, 800, 600, 1.0, 30, 30);
+        const qint64 anchored = timer.elapsed();
+        QCOMPARE(int(centred.size()), n);
+        QVERIFY2(anchored < plain * 2 + 1500, qPrintable(QString("%1 ms at the start, %2 ms centred").arg(plain).arg(anchored)));
+        // (each letter moved back by half its own advance)
+        for (int i : {0, 1, 699, 700, n - 1}) {
+            const double by = atStart[size_t(i)].baselineMid.x() - centred[size_t(i)].baselineMid.x();
+            QVERIFY2(by > 0.5 && by < 6 && std::fabs(by - (atStart[0].baselineMid.x() - centred[0].baselineMid.x())) < 1e-6, qPrintable(QString::number(by)));
+        }
+        // An SVG text on a path of 100,000 curves is laid along its first ones.
+        Effect on = makeEffect(p, "title");
+        on.strings["font"] = "DejaVu Sans";
+        on.params["size"] = 12.0;
+        on.strings["text"] = "along";
+        SvgTextLayout onPath;
+        onPath.path = d;
+        on.strings["svg_text"] = svgTextLayoutJson(onPath);
+        timer.restart();
+        QCOMPARE(int(titleGlyphs(on, 0, 800, 600, 1.0, 30, 30).size()), 5);
+        QVERIFY2(timer.elapsed() < 20000, qPrintable(QString::number(timer.elapsed())));
+    }
+
     void textOnMasksAndShapePaths() {
         // A title set on one of its clip's masks: an ellipse mask drawn as a circle of radius 200 round the middle of
         // an 800 x 600 frame. Every letter's baseline middle on the circle (0.1 px) and its baseline along the circle's

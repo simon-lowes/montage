@@ -98,7 +98,9 @@ using TitlePathFn = std::function<std::optional<TitlePathCurve>(double t)>;
 // `seq` and `c`, which must outlive it.
 TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h);
 // SVG path data (M L H V C S Q T A Z, absolute and relative) as a curve: its first subpath, quadratics raised to
-// cubics, arcs as arcs.
+// cubics, arcs as arcs; its first kTitlePathMostSegments segments (a title's build walks each one finely, at every
+// frame).
+constexpr int kTitlePathMostSegments = 4096;
 TitlePathCurve svgPathCurve(const std::string& d);
 // A curve through an affine map (exactly: arcs stay arcs of the mapped ellipse).
 TitlePathCurve mappedCurve(TitlePathCurve c, const QTransform& m);
