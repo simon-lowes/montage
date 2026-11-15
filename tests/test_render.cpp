@@ -26184,6 +26184,16 @@ colorspaces:
         const std::string layer = gpu::stats().lastCpuLayer;
         QVERIFY2(layer.find("\"" + masked.name + "\"") == 0 && layer.find("Color Correct") != std::string::npos, layer.c_str());
         QVERIFY(edit::clipById(s, maskedId));
+        // With less kept between frames than the frame uses, the frame drawn again still makes no texture anew.
+        gpu::setTextureBudgetForTesting(4096);
+        o.gpu = true;
+        renderProgramFrame(p, s, 5, o);
+        const gpu::Stats once = gpu::stats();
+        renderProgramFrame(p, s, 5, o);
+        const gpu::Stats twice = gpu::stats();
+        gpu::setTextureBudgetForTesting(0);
+        QCOMPARE(twice.gpuFrames, once.gpuFrames + 1);
+        QCOMPARE(twice.texturesMade, once.texturesMade);
         // An adjustment layer with an effect only the CPU draws needs the canvas beneath it there: the frame falls back.
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
         adj.effects.push_back(makeEffect(p, "texture_pop"));
