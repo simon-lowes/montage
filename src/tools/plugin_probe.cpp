@@ -6,11 +6,27 @@
 #include <cstdio>
 #include <string>
 
+#ifndef _WIN32
+#include <sys/resource.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+#endif
+
 #include "audio/Plugins.h"
 #include "render/Ofx.h"
 
 int main(int argc, char** argv) {
     using namespace montage::plugins;
+#ifndef _WIN32
+    // No core dumps: a plug-in that crashes while loading is reported by the scan, and writing a dump (or handing
+    // one to a collector) can keep the process from ending until the scan has given it up as hung.
+    rlimit none{0, 0};
+    setrlimit(RLIMIT_CORE, &none);
+#if defined(__linux__)
+    prctl(PR_SET_DUMPABLE, 0);  // (a core_pattern piped to a collector does not heed RLIMIT_CORE)
+#endif
+#endif
     if (argc != 3) {
         std::fprintf(stderr, "usage: montage-plugin-probe <CLAP|VST3|LV2|AU|OFX> <path>\n");
         return 2;
