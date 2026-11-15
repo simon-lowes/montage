@@ -23610,6 +23610,18 @@ print("added " + ui["name"])
         QVERIFY(relayOnly->isEnabled());
         dlg->findChild<QLineEdit*>("reviewStreamTurnUser")->setText(QStringLiteral("ana"));
         dlg->findChild<QLineEdit*>("reviewStreamTurnPassword")->setText(QStringLiteral("relay-secret"));
+        // A relay's shared secret, in place of the login, is not shown either; how long the link works is chosen
+        // only with one.
+        auto* secret = dlg->findChild<QLineEdit*>("reviewStreamTurnSecret");
+        auto* expiry = dlg->findChild<QComboBox*>("reviewStreamTurnExpiry");
+        QVERIFY(secret && expiry && secret->isVisibleTo(dlg) && expiry->isVisibleTo(dlg));
+        QCOMPARE(secret->echoMode(), QLineEdit::Password);
+        secret->clear();
+        QVERIFY(!expiry->isEnabled());
+        secret->setText(QStringLiteral("a secret made up for this test"));
+        QVERIFY(expiry->isEnabled());
+        QCOMPARE(expiry->currentData().toInt(), 86400);
+        secret->clear();
         rungs->setCurrentIndex(rungs->findData(2));
         hdr->setChecked(true);
         viewers->setCurrentIndex(viewers->findData(false));
@@ -23717,6 +23729,40 @@ print("added " + ui["name"])
         QCOMPARE(st.value("turn").toObject().value("url").toString(), QStringLiteral("turn:relay.example.com:3478"));
         QVERIFY(st.value("turn").toObject().value("relay_only").toBool());
         QVERIFY(!QJsonDocument(r).toJson().contains("another-secret"));  // (never the relay's password)
+        QVERIFY(!st.value("turn").toObject().contains("expires"));         // (a login that lasts: the link has no time)
+        call({{"action", "stop"}});
+        // The relay's shared secret from an agent in place of the login, with how long the link lasts: the status
+        // says when its time is up, and never the secret.
+        const QString relaySecret = QStringLiteral("a secret made up for this test");
+        const QJsonObject withSecret{{"url", "turn:relay.example.com:3478"}, {"secret", relaySecret}, {"expiry", 600}};
+        const qint64 startedAt = QDateTime::currentSecsSinceEpoch();
+        r = call({{"action", "start"}, {"turn", withSecret}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(controller->settings().turnSecret, relaySecret.toStdString());
+        QCOMPARE(controller->settings().turnExpirySeconds, 600);
+        QVERIFY(controller->settings().turnUser.empty() && controller->settings().turnPassword.empty());  // (the login kept from before is gone)
+        QVERIFY(controller->settings().relayOnly);                                                         // (as it was)
+        r = call({{"action", "status"}});
+        const QJsonObject timed = r.value("structuredContent").toObject().value("turn").toObject();
+        const qint64 until = QDateTime::fromString(timed.value("expires").toString(), Qt::ISODate).toSecsSinceEpoch();
+        QVERIFY2(until >= startedAt + 600 && until <= QDateTime::currentSecsSinceEpoch() + 600, qPrintable(timed.value("expires").toString()));
+        QVERIFY(timed.value("expires_in").toDouble() > 590 && timed.value("expires_in").toDouble() <= 600);
+        QVERIFY(!QJsonDocument(r).toJson().contains(relaySecret.toUtf8()));
+        QVERIFY2(controller->status().contains(QStringLiteral("the link works until")), qPrintable(controller->status()));
+        call({{"action", "stop"}});
+        // Refused: a time outside 30 seconds to 30 days, a time without a secret, and a secret together with a login.
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"expiry", 10}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"username", "bo"}, {"password", "another-secret"}, {"expiry", 600}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"secret", relaySecret}, {"username", "bo"}, {"password", "another-secret"}}}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(!controller->running());
+        // A login given afterwards takes the secret's place.
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"username", "bo"}, {"password", "another-secret"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(controller->settings().turnSecret.empty());
+        QCOMPARE(controller->settings().turnUser, std::string("bo"));
         call({{"action", "stop"}});
         // Refused: another relay without its own login (the last one's is not sent to it), more sizes than three, and
         // only through a relay with none.
