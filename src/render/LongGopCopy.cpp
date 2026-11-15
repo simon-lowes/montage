@@ -1395,7 +1395,8 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     }
     lg->joinBframes_ = footage == 0 ? 0 : 3;
     lg->joinPyramid_ = footage >= 2;
-    const int joins = codec == kMpeg2 ? std::max(0, m->max_b_frames) : codec == kAv1 || codec == kVp9 ? 0 : footage == 0 ? 0 : footage == 1 ? 1 : 3;
+    // (three B-pictures in a row reorder by one; nested, as x264 and x265 nest them, by two: never by three)
+    const int joins = codec == kMpeg2 ? std::max(0, m->max_b_frames) : codec == kAv1 || codec == kVp9 ? 0 : std::min(footage, 2);
     lg->depth_ = std::max(joins, footage);
     // H.264: the encoder's parameter sets under an id no source's has.
     if (codec == kH264) {

@@ -23443,6 +23443,144 @@ if ui["pressed"] == "add":
         }
     }
 
+    // Nightly 15 Nov: a joined stream's pictures wait no longer between decoding and showing than their reordering
+    // needs. Segments coded without B-pictures are shown as they are decoded (they waited two frames); segments and a
+    // smart render's joins whose B-pictures reorder by two wait two (the smart render's waited three). Read from each
+    // picture's timing SEI: the least any picture waits is nothing.
+    void joinsWaitNoLongerThanTheirReordering() {
+        struct Waits {
+            int64_t pictures = 0, least = -1, most = -1;
+            int early = 0;  // packets to be shown before they are decoded
+        };
+        auto waits = [](const std::string& file) {
+            Waits w;
+            AVFormatContext* in = nullptr;
+            if (avformat_open_input(&in, file.c_str(), nullptr, nullptr) < 0) return w;
+            avformat_find_stream_info(in, nullptr);
+            const AVCodecParameters* par = in->streams[0]->codecpar;
+            int lengthSize = 0;
+            std::map<int, hrd::Sps> sps;
+            std::map<int, hrd::Pps> pps;
+            hrd::AccessUnit u;
+            // (the parameter sets its decoder configuration holds, read as an access unit of them)
+            std::vector<uint8_t> sets;
+            for (const std::vector<uint8_t>& s : hrd::parameterSets(par->codec_id, par->extradata, size_t(std::max(0, par->extradata_size)), lengthSize)) {
+                const uint32_t n = uint32_t(s.size());
+                sets.insert(sets.end(), {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)});
+                sets.insert(sets.end(), s.begin(), s.end());
+            }
+            if (!sets.empty()) hrd::readAccessUnit(par->codec_id, sets.data(), sets.size(), 4, sps, pps, u);
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(in, pkt) >= 0) {
+                hrd::AccessUnit au;
+                if (pkt->stream_index == 0 && pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE && pkt->pts < pkt->dts) ++w.early;
+                if (pkt->stream_index == 0 && hrd::readAccessUnit(par->codec_id, pkt->data, size_t(pkt->size), lengthSize, sps, pps, au) && au.pt.present) {
+                    ++w.pictures;
+                    w.least = w.least < 0 ? au.pt.dpbOutputDelay : std::min(w.least, au.pt.dpbOutputDelay);
+                    w.most = std::max(w.most, au.pt.dpbOutputDelay);
+                }
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&in);
+            return w;
+        };
+        auto footage = [](Project& gen, int frames) {
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+            Clip grad = makeGeneratorClip(gen, "gradient", frames);
+            grad.generator.params["angle"].addKey(0, 0.0);
+            grad.generator.params["angle"].addKey(frames - 1, 140.0);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, grad);
+            edit::addTrack(gen, gs, TrackKind::Video);
+            Clip ball = makeGeneratorClip(gen, "shape", frames);
+            ball.generator.params["shape"] = 1.0;
+            ball.generator.params["width"] = 40.0;
+            ball.generator.params["height"] = 40.0;
+            ball.generator.params["pos_x"].addKey(0, -140.0);
+            ball.generator.params["pos_x"].addKey(frames - 1, 140.0);
+            edit::overwrite(gen, gs, {TrackKind::Video, 1}, ball);
+        };
+        std::string err;
+        // ---- Two segments joined: without B-pictures every picture is shown as it is decoded; with x264's own
+        // (reordered by two) some wait nothing and none more than a few frames.
+        for (const char* preset : {"ultrafast", "veryfast"}) {
+            Project p = makeDefaultProject();
+            footage(p, 48);
+            Sequence& seq = *p.active();
+            ExportSettings base;
+            base.videoCodec = "libx264";
+            base.audioCodec = "none";
+            base.preset = preset;
+            base.gop = 12;
+            base.hrd = "cbr";
+            base.videoBitrate = 600000;
+            base.path = path((std::string("waits-") + preset + ".mp4").c_str());
+            QVERIFY2(exportSplits(base, &err), err.c_str());
+            const std::vector<ExportSegment> halves{{0, 24}, {24, 48}};
+            ExportSettings whole = base;
+            whole.in = 0, whole.out = 48;
+            std::vector<std::string> files;
+            for (int k = 0; k < 2; ++k) {
+                const std::string file = path((std::string("waits-") + preset + "-" + std::to_string(k) + ".mp4").c_str());
+                const ExportSettings x = segmentExportSettings(base, halves[size_t(k)], file, seq.fps);
+                QVERIFY2(exportSequence(p, seq, x, {}, nullptr, &err), err.c_str());
+                files.push_back(file);
+            }
+            HrdReport report;
+            QVERIFY2(joinExportSegments(p, seq, whole, 0, files, halves, {}, nullptr, &err, &report), err.c_str());
+            QVERIFY2(report.checked && report.signalled, report.summary().c_str());
+            const Waits w = waits(whole.path);
+            qInfo("%s segments joined: %lld pictures wait %lld to %lld ticks", preset, static_cast<long long>(w.pictures), static_cast<long long>(w.least),
+                  static_cast<long long>(w.most));
+            QCOMPARE(w.pictures, int64_t(48));
+            QCOMPARE(w.least, int64_t(0));
+            if (std::string(preset) == "ultrafast") QCOMPARE(w.most, int64_t(0));
+            else QVERIFY(w.most > 0);
+            QCOMPARE(w.early, 0);
+        }
+        // ---- A smart render of footage whose B-pictures reorder by two: its joins' do too, and the whole waits two
+        // frames, not three.
+        for (const char* codec : {"libx264", "libx265"}) {
+            Project gen = makeDefaultProject();
+            footage(gen, 100);
+            ExportSettings st;
+            st.videoCodec = codec;
+            st.audioCodec = "none";
+            st.preset = std::string(codec) == "libx264" ? "veryfast" : "ultrafast";
+            st.gop = 12;
+            st.hrd = "cbr";
+            st.videoBitrate = 700000;
+            st.path = path((std::string("waits-src-") + codec + ".mp4").c_str());
+            QVERIFY2(exportSequence(gen, *gen.active(), st, nullptr, nullptr, &err), err.c_str());
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+            MediaItem m = probeOrFail(p, st.path);
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 5, 45, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(edit::placeMedia(p, s, m.id, 40, 58, 98, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 60).ok);
+            QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 66).ok);
+            for (Clip& c : s.videoTracks[0].clips)
+                if (c.start == 60) c.effects.push_back(makeEffect(p, "invert"));
+            ExportSettings ex = st;
+            ex.path = path((std::string("waits-smart-") + codec + ".mp4").c_str());
+            ex.smartRenderInBandHevc = true;
+            int copied = -1;
+            HrdReport r;
+            QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied, nullptr, nullptr, &r), err.c_str());
+            QVERIFY2(copied > 0, codec);
+            QVERIFY2(r.checked && r.conforms(), (std::string(codec) + ": " + r.summary()).c_str());
+            const Waits w = waits(ex.path);
+            qInfo("%s smart render: %lld pictures wait %lld to %lld ticks", codec, static_cast<long long>(w.pictures), static_cast<long long>(w.least),
+                  static_cast<long long>(w.most));
+            QCOMPARE(w.pictures, int64_t(80));
+            QCOMPARE(w.least, int64_t(0));
+            QCOMPARE(w.early, 0);
+        }
+    }
+
     void longGopBufferModel() {
         // Video packets in decode order: their bytes and the frame each shows.
         struct Coded {
