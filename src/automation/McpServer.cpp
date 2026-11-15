@@ -12858,15 +12858,14 @@ void McpServer::Impl::addTools() {
         "devices in AuthorizedDeviceInfo, a folder and a zip for each cinema. `flm` reads Facility List Messages (Extended "
         "FLMs, SMPTE ST 430-16, or ST 430-7 FLMs) into the facility list first, every certificate chain checked; with "
         "`flm` alone (no dkdm) it only reads them. An FLM is read only when each chain in it goes up to a root the user "
-        "trusts, or ends in a certificate the list already holds for that cinema: `trust_roots` adds roots (a root "
-        "certificate file, or the thumbprint of a root in the FLM that the user has confirmed with its maker or the "
-        "cinema; an FLM refused names its roots' thumbprints). A cinema's changed server certificates are returned in "
-        "`changes`. The window must sit inside the DKDM's and each server certificate's. "
+        "trusts, or ends in a certificate the list already holds for that cinema. Only the user trusts a root, in "
+        "Montage itself (File > Make KDMs > Read FLMs shows each root's thumbprint to check with its maker or the "
+        "cinema): this tool cannot, and an FLM it refuses is for the user to read there. A cinema's changed server "
+        "certificates are returned in `changes`. The window must sit inside the DKDM's and each server certificate's. "
         "Returns the KDM files, the cinemas' zips, and the cinemas and screens read.",
         R"json({"type":"object","properties":{"dkdm":{"type":"string","description":"The DCP's DKDM (montage_export_dcp returns it)"},
             "servers":{"type":"array","items":{"type":"string"},"description":"The servers' certificate files (PEM)"},
             "flm":{"type":"array","items":{"type":"string"},"description":"FLM files to read into the facility list (kept for later bookings)"},
-            "trust_roots":{"type":"array","items":{"type":"string"},"description":"Roots to trust: root certificate files (PEM), or thumbprints (base64 SHA-1) of roots in the FLMs, confirmed by the user"},
             "screens":{"type":"array","items":{"type":"string"},"description":"Screens from the facility list: \"Cinema/Screen\", or \"Cinema\" for all its screens"},
             "from":{"type":"string","description":"ISO 8601 date and time; default now"},
             "until":{"type":"string","description":"ISO 8601 date and time; default a week after from"},
@@ -12882,32 +12881,15 @@ void McpServer::Impl::addTools() {
             }
             QJsonArray changed;
             if (reading) {
-                // The roots trusted: the user's, with the files and thumbprints given added.
-                std::vector<std::string> trusted, files;
-                QStringList thumbprints;
-                for (const QJsonValue& v : a.value("trust_roots").toArray()) {
-                    const QString t = v.toString().trimmed();
-                    if (QRegularExpression(QStringLiteral("^[A-Za-z0-9+/]{27}=$")).match(t).hasMatch()) thumbprints << t;
-                    else {
-                        QFile c(absolute(t));
-                        if (!c.open(QIODevice::ReadOnly)) throw ArgError{QStringLiteral("Cannot read the root certificate %1").arg(t)};
-                        files.push_back(c.readAll().toStdString());
-                    }
-                }
-                if (!files.empty() && !trustRoots(files, &err)) return fail(QString::fromStdString(err));
+                // The roots trusted are the user's own, and only the user adds to them: a caller that could would
+                // get a forged list read by naming the roots the refusal told it of, and its KDMs would go to the forger.
+                if (a.contains("trust_roots"))
+                    throw ArgError{"trust_roots is no longer taken: only the user trusts a root, in Montage (File > Make KDMs > Read FLMs)"};
+                std::vector<std::string> trusted;
                 if (!loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
                 for (const QJsonValue& v : a.value("flm").toArray()) {
                     Facility f;
                     if (!readFlmFile(absolute(v.toString()).toStdString(), f, &err)) return fail(QString::fromStdString(err));
-                    // (a thumbprint given trusts the root of the FLM that has it)
-                    std::vector<std::string> confirmed;
-                    for (const std::string& root : untrustedRoots(f, facilities, trusted)) {
-                        dcp::CertificateInfo info;
-                        if (dcp::readCertificate(root, info) && thumbprints.contains(QString::fromStdString(info.thumbprint))) confirmed.push_back(root);
-                    }
-                    if (!confirmed.empty()) {
-                        if (!trustRoots(confirmed, &err) || !loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
-                    }
                     QJsonArray screens, notes;
                     for (const FacilityScreen& sc : f.screens) {
                         QJsonArray devices;
@@ -12924,7 +12906,8 @@ void McpServer::Impl::addTools() {
                                             {"source", QString::fromStdString(f.source)}, {"screens", screens}, {"notes", notes}});
                     std::vector<std::string> changes;
                     if (!takeFlm(facilities, std::move(f), trusted, &err, nullptr, &changes))
-                        return fail(QString::fromStdString(err) + QStringLiteral(" (then pass its thumbprint in trust_roots)"));
+                        return fail(QString::fromStdString(err) +
+                                    QStringLiteral(". This tool cannot trust a root: ask the user to read the FLM in Montage (File > Make KDMs > Read FLMs)"));
                     for (const std::string& c : changes) changed.append(QString::fromStdString(c));
                 }
                 if (!saveFacilities(facilities, &err)) return fail(QString::fromStdString(err));

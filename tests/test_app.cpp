@@ -132,6 +132,7 @@
 #include "render/VfxShots.h"
 #include "render/ProRes.h"
 #include "render/Titles.h"
+#include "render/DcpFacilities.h"
 #include "render/DcpSecurity.h"
 #include "render/Ofx.h"
 #include "render/OfxRemote.h"
@@ -9962,21 +9963,34 @@ private slots:
             return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         };
         // Read into the facility list (no DKDM: only read): refused while its roots are not trusted, naming their
-        // thumbprints; taken once they are given, as the user confirmed them.
+        // thumbprints. The refusal does not tell the caller how to trust them.
         QJsonObject r = call({{"flm", QJsonArray{flmFile}}});
         QVERIFY(r.value("isError").toBool());
+        QVERIFY2(!QJsonDocument(r).toJson().contains("trust_roots"), QJsonDocument(r).toJson().constData());
         QJsonArray thumbprints;
+        std::vector<std::string> roots;
         for (const dcp::CertificateChain* c : {&servers[0], &servers[1], &projectors[0], &projectors[1]}) {
             dcp::CertificateInfo root;
             QVERIFY(dcp::readCertificate(c->certificates.front(), root));
             QVERIFY2(QJsonDocument(r).toJson().contains(root.thumbprint.c_str()), QJsonDocument(r).toJson().constData());
-            if (c != &projectors[1]) thumbprints.append(QString::fromStdString(root.thumbprint));
+            thumbprints.append(QString::fromStdString(root.thumbprint));
+            roots.push_back(c->certificates.front());
         }
+        // A caller that passes the thumbprints back, or the roots as files, trusts nothing: the call is refused, no
+        // root is kept, and the list is still not read.
+        std::vector<std::string> kept;
         r = call({{"flm", QJsonArray{flmFile}}, {"trust_roots", thumbprints}});
-        QVERIFY(r.value("isError").toBool());  // (one still missing)
+        QVERIFY(r.value("isError").toBool());
         const QString rootFile = dir_.filePath("projector-root.pem");
         QVERIFY(dcp::writeWholeFile(rootFile.toStdString(), projectors[1].certificates.front()));
         r = call({{"flm", QJsonArray{flmFile}}, {"trust_roots", QJsonArray{rootFile}}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY2(loadTrustedRoots(kept, &err), err.c_str());
+        QVERIFY(kept.empty());
+        QVERIFY(call({{"flm", QJsonArray{flmFile}}}).value("isError").toBool());
+        // Once the user has trusted the roots (as File > Make KDMs > Read FLMs does), the list is read.
+        QVERIFY2(trustRoots(roots, &err), err.c_str());
+        r = call({{"flm", QJsonArray{flmFile}}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonArray cinemas = r.value("structuredContent").toObject().value("cinemas").toArray();
         QVERIFY(cinemas.size() == 1 && cinemas.at(0).toObject().value("cinema").toString() == "Park Screens");
