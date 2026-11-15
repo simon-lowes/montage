@@ -1522,6 +1522,27 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
     return QJsonDocument(root).toJson(QJsonDocument::Indented).toStdString();
 }
 
+// Untagged 4:2:2 was read co-sited for some days before projects began to say so (their chromaSiting mark). A project
+// saved in those days showed it co-sited, and must not be taken for an older one whose footage was centred. Nothing
+// in a project says when it was saved, so it is known only by what no earlier build wrote: a track's group, colour,
+// pin or sampler, a sequence's track groups or downmix levels, an ad-break marker.
+static bool savedReadingCoSited(const QJsonObject& root) {
+    for (const auto& sv : root.value("sequences").toArray()) {
+        const QJsonObject s = sv.toObject();
+        for (const char* key : {"trackGroups", "groupsSuspended", "downmixCentreDb", "downmixSurroundDb", "preferredDownmix", "mixingLevel", "roomType"})
+            if (s.contains(QLatin1String(key))) return true;
+        for (const auto& m : s.value("markers").toArray())
+            if (m.toObject().contains(QLatin1String("ad_break"))) return true;
+        for (const char* kind : {"video", "audio"})
+            for (const auto& tv : s.value(QLatin1String(kind)).toArray()) {
+                const QJsonObject t = tv.toObject();
+                for (const char* key : {"pinned", "group", "color", "colorClips", "sampler"})
+                    if (t.contains(QLatin1String(key))) return true;
+            }
+    }
+    return false;
+}
+
 bool projectFromJson(const std::string& json, Project& out, std::string* error, const std::string& projectPath) {
     QJsonParseError perr;
     QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(json), &perr);
@@ -1544,8 +1565,9 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     p.activeSequence = Id(i64(root.value("activeSequence")));
     p.nextId = Id(i64(root.value("nextId"), 1));
     p.stereoChecked = root.value("mediaStereo").toInt() >= 2;
-    // (saved before untagged 4:2:2 was read co-sited: before the camera-lens marker, which came after that)
-    p.chromaChecked = root.value("chromaSiting").toInt() >= 1 || root.value("cameraLens").toInt() >= 1;
+    // (saved before untagged 4:2:2 was read co-sited: before the camera-lens marker, which came after that, and
+    // holding nothing that only a build reading it co-sited wrote)
+    p.chromaChecked = root.value("chromaSiting").toInt() >= 1 || root.value("cameraLens").toInt() >= 1 || savedReadingCoSited(root);
     if (root.value("mergeBase").isObject())
         p.mergeBase = std::make_shared<const std::string>(QJsonDocument(root.value("mergeBase").toObject()).toJson(QJsonDocument::Compact).toStdString());
     const QJsonObject mergeIds = root.value("mergeIds").toObject();
@@ -1778,35 +1800,9 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     // A compositing node shared between clips (saved so) given a fresh owner id.
     for (Sequence& s : p.sequences) separateCompositeIds(p, s);
-    // Depth of field through the scene's camera is the Camera clip's (its lens's): in a project saved before that, a card
-    // seen through it with its own on gives the camera its settings (when the camera's is not on already) and leaves its
-    // own off.
-    const bool cardLenses = root.value("cameraLens").toInt() < 1;
-    for (Sequence& s : p.sequences)
-        for (Track& t : s.videoTracks)
-            for (Clip& c : t.clips)
-                for (Effect& e : c.effects) {
-                    if (!cardLenses || e.type != "layer_3d" || std::lround(e.p("camera", 0, 3)) != 3 || e.p("depth_of_field", 0, 0) <= 0.5) continue;
-                    auto cameraOn = [&](Track& k) -> Clip* {
-                        if (k.muted) return nullptr;  // (as the renderer finds it)
-                        for (Clip& x : k.clips)
-                            if (x.enabled && x.isGenerator() && x.generator.type == "camera3d" && c.start >= x.start && c.start < x.end()) return &x;
-                        return nullptr;
-                    };
-                    const long named = std::lround(e.p("camera_track", 0, 0)) - 1;
-                    Clip* camera = named >= 0 && size_t(named) < s.videoTracks.size() ? cameraOn(s.videoTracks[size_t(named)]) : nullptr;
-                    for (size_t k = s.videoTracks.size(); !camera && k-- > 0;) camera = cameraOn(s.videoTracks[k]);
-                    if (!camera) continue;
-                    Effect& g = camera->generator;
-                    if (g.p("dof", 0, 0) <= 0.5) {
-                        const double units = e.p("units_m", 0, 0);
-                        g.params["dof"] = 1.0;
-                        g.params["fstop"] = e.p("fstop", 0, 2.8);
-                        g.params["focus_distance"] = e.p("focus_distance", 0, 0);
-                        g.params["units_m"] = units > 0 ? units : 1000.0;
-                    }
-                    e.params["depth_of_field"] = 0.0;
-                }
+    // (A card's own depth of field in a project saved before the Camera clip had a lens stays the card's: it is
+    // still drawn by the card's lens while the camera's is off, its keyframes and all, so the project looks as it
+    // did. Read into the camera, it blurred every card and model seen through that camera.)
     out = std::move(p);
     return true;
 }

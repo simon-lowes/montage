@@ -25052,6 +25052,48 @@ private slots:
         QCOMPARE(interpretationOf(again.media[0]).chroma, std::string());
         const std::vector<double> taken = blueOf(again);
         for (size_t x = 0; x < 256; ++x) QCOMPARE(taken[x], now[x]);
+
+        // A project saved in the days between untagged 4:2:2 being read co-sited and projects saying so showed it
+        // co-sited. The fixture is one as a build of 9 November wrote it: neither mark, and a track with a colour, which
+        // no build that read the footage centred wrote. Opened, its footage is left as the file's own and its frames
+        // come out as a new project's do.
+        const QString fixturePath = QString(MONTAGE_TEST_DATA_DIR) + "/projects/coloured-track-9-nov.montage";
+        {
+            QFile fixture(fixturePath);
+            QVERIFY(fixture.open(QIODevice::ReadOnly));
+            QJsonObject between = QJsonDocument::fromJson(fixture.readAll()).object();
+            QVERIFY(!between.contains("chromaSiting") && !between.contains("cameraLens"));
+            // (its footage is the file made above)
+            QJsonArray media = between.value("media").toArray();
+            QCOMPARE(media.size(), 1);
+            QJsonObject item = media.at(0).toObject();
+            item["path"] = QString::fromStdString(footage);
+            media[0] = item;
+            between["media"] = media;
+            Project opened;
+            QVERIFY2(projectFromJson(QJsonDocument(between).toJson().toStdString(), opened, &err), err.c_str());
+            QVERIFY(opened.chromaChecked);
+            QCOMPARE(opened.active()->videoTracks[0].color, std::string("#3a7bd5"));
+            checkStereoMedia(opened);
+            QCOMPARE(opened.media[0].path, footage);
+            const std::vector<double> asBetween = blueOf(opened);
+            QCOMPARE(asBetween.size(), size_t(256));
+            for (size_t x = 0; x < 256; ++x) QCOMPARE(asBetween[x], now[x]);
+            // The same project without the track's colour is one an earlier build could have written: centred.
+            QJsonArray sequences = between.value("sequences").toArray();
+            QJsonObject sequence = sequences.at(0).toObject();
+            QJsonArray tracks = sequence.value("video").toArray();
+            QJsonObject track = tracks.at(0).toObject();
+            QVERIFY(track.contains("color"));
+            track.remove("color");
+            tracks[0] = track;
+            sequence["video"] = tracks;
+            sequences[0] = sequence;
+            between["sequences"] = sequences;
+            Project earlier;
+            QVERIFY2(projectFromJson(QJsonDocument(between).toJson().toStdString(), earlier, &err), err.c_str());
+            QVERIFY(!earlier.chromaChecked);
+        }
     }
 
     void smartRenderingLimits() {
@@ -40072,27 +40114,49 @@ private slots:
                     QVERIFY(std::fabs(across - cornerToCorner) <= 1);
                 }
             }
-            // Its own depth of field on a card seen through the camera is read into the camera when opened.
-            Project q = p;
-            Sequence& qs = *q.active();
-            qs.videoTracks[1].clips[0].generator.params["dof"] = 0.0;
-            Effect& own = qs.videoTracks[0].clips[0].effects[0];
-            own.params["depth_of_field"] = 1.0, own.params["fstop"] = 4.0, own.params["focus_distance"] = 900.0;
-            // (saved before the camera's lens took it: without the project's mark)
-            QJsonObject saved = QJsonDocument::fromJson(QByteArray::fromStdString(projectToJson(q))).object();
-            saved.remove("cameraLens");
-            Project back;
+        }
+
+        // ---- A project saved before the Camera clip had a lens keeps each card's own depth of field. The fixture is
+        // one as a build before 10 November wrote it: two cards seen through the scene's camera, twice as far as the
+        // first's focus, the first with its own depth of field and its f-stop keyframed from 1.4 to 22. Opened, the
+        // first card's depth of field is still its own with its keyframes, the camera's lens stays off, the second
+        // card is as sharp as it was, and the first is blurred less as its lens closes.
+        {
+            const QString fixturePath = QString(MONTAGE_TEST_DATA_DIR) + "/projects/card-lens-before-10-nov.montage";
+            Project opened;
             std::string err;
-            QVERIFY2(projectFromJson(QJsonDocument(saved).toJson().toStdString(), back, &err), err.c_str());
-            const Effect& bg = back.active()->videoTracks[1].clips[0].generator;
-            const Effect& be = back.active()->videoTracks[0].clips[0].effects[0];
-            QVERIFY(bg.p("dof", 0, 0) == 1.0 && bg.p("fstop", 0, 0) == 4.0 && bg.p("focus_distance", 0, 0) == 900.0 && bg.p("units_m", 0, 0) == 1000.0);
-            QVERIFY(be.p("depth_of_field", 0, 1) == 0.0);
-            // Saved since, a card's own is kept as it is.
-            Project kept;
-            QVERIFY2(projectFromJson(projectToJson(q), kept, &err), err.c_str());
-            QVERIFY(kept.active()->videoTracks[1].clips[0].generator.p("dof", 0, 1) == 0.0);
-            QVERIFY(kept.active()->videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
+            QVERIFY2(loadProject(fixturePath.toStdString(), opened, &err), err.c_str());
+            Sequence& os = *opened.active();
+            QVERIFY(os.videoTracks.size() >= 3);
+            const Effect& lens = os.videoTracks[0].clips[0].effects[0];
+            QVERIFY(lens.p("depth_of_field", 0, 0) == 1.0);
+            QCOMPARE(lens.params.at("fstop").keys.size(), size_t(2));
+            QVERIFY(lens.p("fstop", 0, 0) == 1.4 && lens.p("fstop", 9, 0) == 22.0);
+            QVERIFY(os.videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+            QVERIFY(os.videoTracks[2].clips[0].effects[0].p("depth_of_field", 0, 0) <= 0.5);
+            // (the same with no lens anywhere, to tell blur by: the left half is the first card's, and from five
+            // eighths across is the second's, clear of the first's widest blur)
+            Project sharp = opened;
+            sharp.active()->videoTracks[0].clips[0].effects[0].params["depth_of_field"] = 0.0;
+            RenderOptions ro = o;
+            auto blur = [&](FrameTime t, bool right) {
+                const Image a = renderSequenceFrame(opened, os, t, ro), b = renderSequenceFrame(sharp, *sharp.active(), t, ro);
+                double sum = 0;
+                for (int y = 0; y < a.height; ++y)
+                    for (int x = right ? a.width * 5 / 8 : 0; x < (right ? a.width : a.width / 2); ++x) sum += std::fabs(double(a.at(x, y)[3]) - b.at(x, y)[3]);
+                return sum;
+            };
+            const double firstOpen = blur(0, false), firstClosed = blur(9, false);
+            qInfo("a card's own lens kept: blur %.2f at f/1.4, %.2f at f/22", firstOpen, firstClosed);
+            QVERIFY(firstOpen > 20);
+            QVERIFY(firstClosed < firstOpen / 4);
+            QCOMPARE(blur(0, true), 0.0);
+            QCOMPARE(blur(9, true), 0.0);
+            // Saved now and opened again, it is the same.
+            Project again;
+            QVERIFY2(projectFromJson(projectToJson(opened), again, &err), err.c_str());
+            QVERIFY(again.active()->videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+            QVERIFY(again.active()->videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
         }
 
         // ---- A moving card in a solved scene's USD and USDZ exports: its picture byte for byte and its transform at
