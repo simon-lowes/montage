@@ -33,7 +33,7 @@ struct LiveSettings {
     double segmentSeconds = 2;          // 1 to 6 (a whole number of parts, and of frames)
     int window = 6;                     // segments the playlists and the MPD's time-shift buffer hold, 3 to 100
     bool lowLatency = false;            // segments in parts of partSeconds, each sent as soon as it is made
-    double partSeconds = 0.5;           // 0.1 to 1
+    double partSeconds = 0.5;           // 0.1 to 1 (with sound, 13 of its coded frames at least: livePartPlan)
     bool hls = true, dash = true;
     std::string segmentFormat = "cmaf";  // or "ts": HLS in MPEG-TS segments (DASH stays CMAF; not with low latency)
     std::string preset = "veryfast";    // the encoders' speed
@@ -98,6 +98,24 @@ struct LiveStatus {
     std::string error;                  // why it stopped
 };
 
+// How a low latency package is cut into parts. Pictures' parts are all as long; a part of sound holds the coded
+// frames that begin in it, so it is up to a coded frame longer or shorter. HLS wants every part but a segment's last
+// to be 85% of its playlist's PART-TARGET at least, so with sound a part is 13 of its coded frames or more (0.28 s
+// for AAC, 0.26 s for Opus, 0.42 s for the AC-3 family; a shorter one asked for is made that long) and the sound's
+// playlists state a part target of their own.
+struct LivePartPlan {
+    int64_t partFrames = 1, segmentFrames = 1;   // pictures in a part, and in a segment (a whole number of parts)
+    double partTarget = 0, soundPartTarget = 0;  // PART-TARGET of the pictures' playlists and of the sound's (seconds)
+};
+LivePartPlan livePartPlan(double partSeconds, double segmentSeconds, double fps, const std::string& audioCodec);
+// The part an LL-HLS playlist hints at (EXT-X-PRELOAD-HINT) when `partsMade` of segment `segment` are listed: the
+// next of it, or the next segment's first once it has all `partsPerSegment`.
+std::string livePreloadHint(int64_t segment, int partsMade, int partsPerSegment);
+// A blocking playlist reload (_HLS_msn, and _HLS_part or -1) against the playlist as it is: 200 it has what is asked
+// for, 0 not yet (held), 400 what is asked for is further ahead than a player may ask (a segment more than two past
+// the last, or a part past the last by more than the advance part limit).
+int liveBlockingReload(const std::string& playlist, int64_t msn, int part);
+
 class LivePackager {
 public:
     LivePackager();
@@ -144,13 +162,15 @@ private:
 
 // An HTTP origin for a package's folder, on a thread of its own: GET and HEAD of its files (no others: nothing
 // outside, nothing hidden), with CORS for players on other pages. HLS playlist requests asking for a part or segment
-// not yet made (_HLS_msn, _HLS_part) are held until it is (or three target durations, then 503); a delta update
+// not yet made (_HLS_msn, _HLS_part) are held until it is (or three target durations, then 503), and answered 400
+// when they ask for what is too far ahead or for a part without a segment (liveBlockingReload); a delta update
 // (_HLS_skip=YES, of a playlist stating CAN-SKIP-UNTIL) has the segments before its skip boundary replaced by
 // EXT-X-SKIP (playlistDeltaUpdate); a file not yet there
-// is waited for (up to `waitSeconds`, when it is a playlist, segment or MPD in a folder there); a file still growing is
+// is waited for (up to `waitSeconds`, when it is a playlist or MPD in a folder there, or a segment or part numbered
+// from the newest in its folder to two past it: older ones and gaps are 404 at once); a file still growing is
 // sent as it grows (chunked); an MPD's UTCTiming (urn:mpeg:dash:utc:direct:2014) is the time it is sent; /time is the
 // time (ISO 8601). A connection that has not sent its whole request in 10 s is closed, and with 256 open the oldest
-// still sending one makes room for the next.
+// still sending one makes room for the next, else the one held longest (answered 503).
 // A playlist delta update (HLS 6.2.5.1) of a media playlist: the segments wholly before its skip boundary
 // (CAN-SKIP-UNTIL seconds from its end) replaced by EXT-X-SKIP:SKIPPED-SEGMENTS, their date ranges kept; the playlist
 // as it is when it states no CAN-SKIP-UNTIL or nothing is that old. `skipped` gets the count.

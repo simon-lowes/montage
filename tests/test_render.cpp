@@ -28483,6 +28483,215 @@ colorspaces:
         QVERIFY(t.elapsed() < 15000);
     }
 
+    // Nightly 15 Nov: low latency HLS as a player is promised it. The preload hint after a segment's last part
+    // names the next segment's first; every part but a segment's last is 85% of its playlist's PART-TARGET at least
+    // (with sound, a part asked shorter than 13 coded frames is made that long); a blocking reload for what is too
+    // far ahead, or for a part without a segment, is answered 400; a segment older than the folder's newest or
+    // further on than two past it is 404 at once, the next ones are waited for; and 256 requests held for what is
+    // not made yet do not keep the next player out.
+    void liveLowLatencyPartsAndOrigin() {
+        QCOMPARE(QString::fromStdString(livePreloadHint(12, 0, 4)), QString("seg00012.1.m4s"));
+        QCOMPARE(QString::fromStdString(livePreloadHint(12, 2, 4)), QString("seg00012.3.m4s"));
+        QCOMPARE(QString::fromStdString(livePreloadHint(12, 4, 4)), QString("seg00013.1.m4s"));
+        for (double fps : {24.0, 25.0, 30000.0 / 1001, 30.0, 50.0, 60.0})
+            for (double asked : {0.1, 0.15, 0.2, 0.33, 0.5, 1.0})
+                for (const char* codec : {"none", "aac", "libopus", "ac3", "eac3"}) {
+                    const LivePartPlan plan = livePartPlan(asked, 2, fps, codec);
+                    const double part = double(plan.partFrames) / fps;
+                    const double coded = std::strcmp(codec, "none") == 0 ? 0 : std::strcmp(codec, "libopus") == 0 ? 0.02 : codec[0] == 'a' && codec[1] == 'a' ? 1024.0 / 48000 : 0.032;
+                    const QByteArray what = QByteArray(codec) + " " + QByteArray::number(fps) + " " + QByteArray::number(asked);
+                    QVERIFY2(plan.segmentFrames % plan.partFrames == 0, what.constData());
+                    QVERIFY2(part <= plan.partTarget + 1e-9 && part >= 0.85 * plan.partTarget, what.constData());
+                    QVERIFY2(part + coded <= plan.soundPartTarget + 1e-9 && part - coded >= 0.85 * plan.soundPartTarget, what.constData());
+                    if (coded == 0) QCOMPARE(plan.partFrames, int64_t(std::llround(asked * fps)));
+                    else QVERIFY2(part >= asked - 0.5 / fps - 1e-9 && part < std::max(asked, coded * 13) + 1 / fps, what.constData());
+                }
+        const std::string listed = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:1\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.5\n"
+                                   "#EXT-X-PART-INF:PART-TARGET=0.5\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:1.0,\nseg00010.m4s\n#EXTINF:1.0,\nseg00011.m4s\n"
+                                   "#EXTINF:1.0,\nseg00012.m4s\n#EXT-X-PART:DURATION=0.5,URI=\"seg00013.1.m4s\"\n";
+        QCOMPARE(liveBlockingReload(listed, 12, -1), 200);
+        QCOMPARE(liveBlockingReload(listed, 13, 0), 200);
+        QCOMPARE(liveBlockingReload(listed, 13, 1), 0);
+        QCOMPARE(liveBlockingReload(listed, 13, -1), 0);
+        QCOMPARE(liveBlockingReload(listed, 14, 0), 0);
+        QCOMPARE(liveBlockingReload(listed, 15, -1), 400);
+        QCOMPARE(liveBlockingReload(listed, 13, 6), 0);  // (the advance part limit of half second parts: six past the last)
+        QCOMPARE(liveBlockingReload(listed, 13, 7), 400);
+        QCOMPARE(liveBlockingReload(listed + "#EXT-X-ENDLIST\n", 99, -1), 200);
+
+        // A package made with sound and parts asked a tenth of a second long, its playlists read as they change.
+        if (avcodec_find_encoder_by_name("libx264")) {
+            QTemporaryDir dir;
+            LiveSettings ls;
+            ls.folder = dir.filePath("live").toStdString();
+            ls.rungs = {{320, 180, 300000, "libx264"}};
+            ls.segmentSeconds = 1;
+            ls.window = 6;
+            ls.lowLatency = true;
+            ls.partSeconds = 0.1;
+            ls.audioCodec = "aac";
+            ls.preset = "ultrafast";
+            const LivePartPlan plan = livePartPlan(ls.partSeconds, ls.segmentSeconds, 30, ls.audioCodec);
+            const int perSegment = int(plan.segmentFrames / plan.partFrames);
+            QCOMPARE(plan.partFrames, int64_t(9));
+            QCOMPARE(perSegment, 3);
+            std::string err;
+            LivePackager packager;
+            QVERIFY2(packager.start(ls, &err), err.c_str());
+            AVFrame* pic = av_frame_alloc();
+            pic->format = AV_PIX_FMT_YUV420P, pic->width = 320, pic->height = 180;
+            QVERIFY(av_frame_get_buffer(pic, 0) >= 0);
+            AVFrame* snd = av_frame_alloc();
+            snd->format = AV_SAMPLE_FMT_FLTP, snd->sample_rate = 48000, snd->nb_samples = 1600;
+            av_channel_layout_default(&snd->ch_layout, 2);
+            QVERIFY(av_frame_get_buffer(snd, 0) >= 0);
+            QSet<QString> seen;
+            int boundaries = 0, soundParts = 0, pictureParts = 0;
+            QString wrong;
+            // Reads the playlists as they are: each part against its playlist's target, and the hint against the
+            // parts listed.
+            auto look = [&] {
+                for (const QString& name : QDir(dir.filePath("live")).entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+                    QFile f(dir.filePath("live/" + name + "/playlist.m3u8"));
+                    if (!f.open(QIODevice::ReadOnly)) continue;
+                    const QString text = QString::fromUtf8(f.readAll());
+                    if (seen.contains(name + text)) continue;
+                    seen.insert(name + text);
+                    double target = 0;
+                    int64_t number = 0;
+                    QList<QList<double>> segments{{}};  // (each segment's parts, the last the one being made)
+                    QString hint;
+                    for (const QString& l : text.split('\n')) {
+                        if (l.startsWith("#EXT-X-PART-INF:PART-TARGET=")) target = l.mid(28).toDouble();
+                        else if (l.startsWith("#EXT-X-MEDIA-SEQUENCE:")) number = l.mid(22).toLongLong();
+                        else if (l.startsWith("#EXT-X-PART:DURATION=")) segments.last() << l.mid(21).section(',', 0, 0).toDouble();
+                        else if (l.startsWith("#EXT-X-PRELOAD-HINT:")) hint = l.section("URI=\"", 1).section('"', 0, 0);
+                        else if (!l.isEmpty() && !l.startsWith('#')) segments << QList<double>(), ++number;
+                    }
+                    if (text.contains("#EXT-X-ENDLIST") || target <= 0) continue;
+                    for (const QList<double>& parts : segments)
+                        for (int j = 0; j < parts.size(); ++j) {
+                            (name.startsWith('a') ? soundParts : pictureParts)++;
+                            if (parts[j] > target + 1e-4 || (j + 1 < perSegment && parts[j] < 0.85 * target))
+                                wrong = QString("%1: a part of %2 s against a target of %3\n%4").arg(name).arg(parts[j]).arg(target).arg(text);
+                            if (j >= perSegment) wrong = name + ": more parts than a segment has\n" + text;
+                        }
+                    const int made = int(segments.last().size());
+                    const QString expected = QString::fromStdString(livePreloadHint(number, made, perSegment));
+                    if (hint != expected) wrong = QString("%1: hints at %2, not %3\n%4").arg(name, hint, expected, text);
+                    if (made == perSegment) ++boundaries;
+                }
+            };
+            const int frames = 30 * 5;
+            for (int f = 0; f < frames; ++f) {
+                QVERIFY(av_frame_make_writable(pic) >= 0);
+                for (int y = 0; y < 180; ++y) memset(pic->data[0] + y * pic->linesize[0], (f * 7 + y) & 0xff, 320);
+                for (int c = 1; c < 3; ++c)
+                    for (int y = 0; y < 90; ++y) memset(pic->data[c] + y * pic->linesize[c], 128, 160);
+                pic->pts = f;
+                packager.picture(pic, 30, 1);
+                QVERIFY(av_frame_make_writable(snd) >= 0);
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < 1600; ++i) reinterpret_cast<float*>(snd->data[c])[i] = 0.2f * float(std::sin((f * 1600 + i) * 0.05));
+                snd->pts = int64_t(f) * 1600;
+                packager.sound(snd);
+                QElapsedTimer t;
+                t.start();
+                do {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    look();
+                } while (packager.status().behind > 0.2 && t.elapsed() < 10000);
+            }
+            QElapsedTimer t;
+            t.start();
+            while (packager.status().segments < 4 && t.elapsed() < 60000) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                look();
+            }
+            av_frame_free(&pic);
+            av_frame_free(&snd);
+            packager.finish();
+            QVERIFY2(packager.status().error.empty(), packager.status().error.c_str());
+            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+            QVERIFY2(boundaries >= 2 && soundParts >= 6 && pictureParts >= 6,
+                     qPrintable(QString("%1 %2 %3").arg(boundaries).arg(soundParts).arg(pictureParts)));
+        }
+
+        // The origin, on a folder with segments 10 to 12 and the first part of 13.
+        QTemporaryDir dir;
+        QVERIFY(QDir(dir.path()).mkpath("v1"));
+        auto put = [&](const QString& name, const QByteArray& bytes) {
+            QSaveFile f(dir.filePath("v1/" + name));
+            return f.open(QIODevice::WriteOnly) && f.write(bytes) == bytes.size() && f.commit();
+        };
+        QVERIFY(put("playlist.m3u8", QByteArray::fromStdString(listed)));
+        for (const char* name : {"seg00010.m4s", "seg00011.m4s", "seg00012.m4s", "seg00013.m4s", "seg00013.1.m4s"}) QVERIFY(put(name, "x"));
+        LiveOrigin origin;
+        std::string err;
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, nullptr, &err, "127.0.0.1", 30), err.c_str());
+        auto ask = [&](const QByteArray& path) {
+            auto s = std::make_unique<QTcpSocket>();
+            s->connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            if (s->waitForConnected(5000)) {
+                s->write("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n");
+                s->flush();
+            }
+            return s;
+        };
+        // The answer's status within `ms` (0 when none came).
+        auto status = [](QTcpSocket& s, int ms) {
+            QByteArray in = s.readAll();
+            QElapsedTimer t;
+            t.start();
+            while (!in.contains("\r\n") && t.elapsed() < ms && (s.state() == QAbstractSocket::ConnectedState || s.bytesAvailable() > 0)) {
+                s.waitForReadyRead(50);
+                in += s.readAll();
+            }
+            return in.contains("\r\n") ? in.left(in.indexOf("\r\n")).split(' ').value(1).toInt() : 0;
+        };
+        auto get = [&](const QByteArray& path) { return status(*ask(path), 3000); };
+        QCOMPARE(get("/v1/playlist.m3u8"), 200);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=12"), 200);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=13&_HLS_part=0"), 200);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_part=0"), 400);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=soon"), 400);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=15"), 400);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=13&_HLS_part=7"), 400);
+        // A part not yet listed is held, and answered once it is.
+        {
+            auto held = ask("/v1/playlist.m3u8?_HLS_msn=13&_HLS_part=1");
+            QCOMPARE(status(*held, 400), 0);
+            QVERIFY(put("playlist.m3u8", QByteArray::fromStdString(listed) + "#EXT-X-PART:DURATION=0.5,URI=\"seg00013.2.m4s\"\n"));
+            QCOMPARE(status(*held, 3000), 200);
+        }
+        // A segment gone from the window (or a gap's, never made) and one a player has no cause to ask for yet are
+        // not waited for; the next one is.
+        QCOMPARE(get("/v1/seg00009.m4s"), 404);
+        QCOMPARE(get("/v1/seg00016.m4s"), 404);
+        QCOMPARE(get("/v1/seg00012.2.m4s"), 404);
+        {
+            auto held = ask("/v1/seg00014.m4s");
+            QCOMPARE(status(*held, 400), 0);
+            QVERIFY(put("seg00014.m4s", "x"));
+            QCOMPARE(status(*held, 3000), 200);
+        }
+        // 256 requests for the segment after next, each held: the next request is answered all the same, the one
+        // held longest told to come back.
+        std::vector<std::unique_ptr<QTcpSocket>> waiting;
+        QTest::qWait(300);  // (the origin has seen that 14 is the newest)
+        for (int i = 0; i < 256; ++i) {
+            waiting.push_back(ask("/v1/seg00016.m4s"));
+            QVERIFY(waiting.back()->state() == QAbstractSocket::ConnectedState);
+        }
+        QTest::qWait(300);
+        QCOMPARE(status(*waiting.back(), 100), 0);
+        QCOMPARE(get("/v1/seg00010.m4s"), 200);
+        QCOMPARE(status(*waiting.front(), 3000), 503);
+        QCOMPARE(get("/v1/playlist.m3u8"), 200);
+        waiting.clear();
+        origin.stop();
+    }
+
     void livePackageCarries() {
         // What a channel carries, packaged live: FFmpeg-encoded H.264 with CEA-608 captions in its user data, two AAC
         // sound streams (eng, fra) and a SCTE 35 splice_insert three seconds ahead of its splice, sent as MPEG-TS over
@@ -28571,6 +28780,8 @@ colorspaces:
         ls.partSeconds = 0.2;
         ls.preset = "ultrafast";
         ls.captionLanguage = "en";
+        // (a segment's frames: a whole number of parts, each long enough for its sound's coded frames)
+        const int64_t segFrames = livePartPlan(ls.partSeconds, ls.segmentSeconds, 25, ls.audioCodec).segmentFrames;
         LivePackager packager;
         QVERIFY2(packager.start(ls, &err), err.c_str());
         LiveOrigin origin;
@@ -28700,12 +28911,12 @@ colorspaces:
         }
 
         // The rungs' segments: a keyframe at each splice (decoded from the segment that holds it).
-        QTRY_VERIFY_WITH_TIMEOUT(packager.status().segments > manual.frame / 25 + 1, 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(packager.status().segments > manual.frame / segFrames + 1, 20000);
         const LiveStatus mid = packager.status();
         for (const LiveCueStatus& c : {fed, manual})
             for (int rung = 0; rung < 2; ++rung) {
                 const QString rdir = folder + "/" + QString::fromStdString(mid.renditions[size_t(rung)]);
-                const QString seg = rdir + QStringLiteral("/seg%1.m4s").arg(c.frame / 25 + 1, 5, 10, QChar('0'));
+                const QString seg = rdir + QStringLiteral("/seg%1.m4s").arg(c.frame / segFrames + 1, 5, 10, QChar('0'));
                 QFile init(rdir + "/init.mp4"), media(seg);
                 QVERIFY(init.open(QIODevice::ReadOnly) && media.open(QIODevice::ReadOnly));
                 const QString joined = dir.filePath(QStringLiteral("probe%1.mp4").arg(rung));
@@ -28718,7 +28929,7 @@ colorspaces:
                 // (the cue's event message, in the chunk made when it was asked for: the feed's three seconds ahead,
                 // the one by hand with its picture)
                 bool told = false;
-                const int64_t at = c.frame / 25 + 1;
+                const int64_t at = c.frame / segFrames + 1;
                 for (int64_t k = c.fromFeed ? at - 4 : at - 1; k <= at && !told; ++k) {
                     QFile g(rdir + QStringLiteral("/seg%1.m4s").arg(k, 5, 10, QChar('0')));
                     if (!g.open(QIODevice::ReadOnly)) continue;

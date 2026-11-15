@@ -13328,7 +13328,7 @@ void McpServer::Impl::addTools() {
                     "record":{"type":"string","description":"The recording made alongside (.mov or .mxf; default the folder's name with .mov, beside it)"},
                     "capture_codec":{"type":"string","default":"prores_proxy","description":"The recording's codec (prores_proxy ... dnxhr_hqx)"},
                     "window":{"type":"integer","minimum":3,"maximum":100,"default":6,"description":"Segments the playlists and the MPD's time-shift buffer hold"},
-                    "part_seconds":{"type":"number","minimum":0.1,"maximum":1,"default":0.5},
+                    "part_seconds":{"type":"number","minimum":0.1,"maximum":1,"default":0.5,"description":"With low_latency: a part's length (with sound, 13 of its coded frames at least: 0.28 for AAC, 0.26 for Opus, 0.42 for AC-3 and E-AC-3; a shorter one is made that long)"},
                     "serve":{"type":"boolean","default":false,"description":"Serve the package over HTTP while it records (blocking playlist reloads, growing segments sent as they grow)"},
                     "port":{"type":"integer","minimum":0,"maximum":65535,"default":0,"description":"serve: the port (0 any free one)"},
                     "address":{"type":"string","enum":["127.0.0.1","0.0.0.0"],"default":"127.0.0.1","description":"serve: this computer only, or the network's"},

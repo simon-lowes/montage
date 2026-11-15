@@ -21,12 +21,14 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <future>
 #include <map>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <thread>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -472,7 +474,7 @@ struct LivePackager::State {
     int64_t encodedSegment = -1;  // the segment (from 0) of the last picture encoded
     int64_t firstPicture = 0;         // its number in the recording
     int64_t segFrames = 50, partFrames = 50;
-    double segSeconds = 2, partSeconds = 2, partTarget = 2;
+    double segSeconds = 2, partSeconds = 2, partTarget = 2, soundPartTarget = 2;
     bool parts = false, ts = false, cmaf = true;
     std::vector<float> interleaved;
     std::vector<LiveSoundTrack> tracks;  // (soundTracks: the feed's; empty, one; under m)
@@ -756,14 +758,16 @@ struct LivePackager::State {
         ts = set.segmentFormat == "ts" && set.hls;
         cmaf = !ts || set.dash;
         parts = set.lowLatency && !ts;
-        partFrames = std::max<int64_t>(1, std::llround(std::clamp(set.partSeconds, 0.1, 1.0) * rate));
+        const LivePartPlan plan = livePartPlan(set.partSeconds, set.segmentSeconds, rate, parts ? set.audioCodec : "none");
+        partFrames = plan.partFrames;
         segFrames = std::max<int64_t>(1, std::llround(std::clamp(set.segmentSeconds, 1.0, 6.0) * rate));
-        if (parts) segFrames = std::max<int64_t>(1, std::llround(double(segFrames) / double(partFrames))) * partFrames;
+        if (parts) segFrames = plan.segmentFrames;
         else partFrames = segFrames;
         segSeconds = double(segFrames) / rate;
         partSeconds = double(partFrames) / rate;
-        // (a part of sound runs on to the end of the packet across its end: a coded frame longer at most)
-        partTarget = std::ceil((partSeconds + 0.033) * 1000) / 1000;
+        // (pictures' parts are all as long; a part of sound runs on to the end of the packet across its end)
+        partTarget = parts ? plan.partTarget : std::ceil(partSeconds * 1000) / 1000;
+        soundPartTarget = parts ? plan.soundPartTarget : partTarget;
         ast = wallMs();
         {
             std::lock_guard lock(m);
@@ -836,7 +840,8 @@ struct LivePackager::State {
                 for (int64_t k = std::max(listed.back()->number + 1, upTo - set.window); k < upTo; ++k) {
                     Segment g;
                     g.number = k;
-                    g.start = double(k - 1) * segSeconds;
+                    // (after the one listed before it, whatever lengths the segments so far had)
+                    g.start = listed.back()->start + listed.back()->seconds;
                     g.seconds = segSeconds;
                     gaps.push_back(g);
                     listed.push_back(&gaps.back());
@@ -856,12 +861,14 @@ struct LivePackager::State {
         const long long target = std::max<long long>(1, std::llround(longest));
         std::string m = "#EXTM3U\n#EXT-X-VERSION:" + std::string(parts ? "9" : gap ? "8" : tsList ? "3" : "7") + "\n#EXT-X-TARGETDURATION:" +
                         std::to_string(target) + "\n";
+        // (each playlist's own part target: the pictures' parts are exactly as long, sound's a coded frame more or less)
+        const double ownTarget = r.video || r.text ? partTarget : soundPartTarget;
         if (parts) {
             // (blocking reloads, and delta updates skipping what is more than six target durations old: the origin
             // makes both)
             m += "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=" + fmt("%.1f", double(target) * 6) +
-                 (withParts ? ",PART-HOLD-BACK=" + fmt("%.3f", partTarget * 3) : std::string()) + "\n";
-            if (withParts) m += "#EXT-X-PART-INF:PART-TARGET=" + fmt("%.3f", partTarget) + "\n";
+                 (withParts ? ",PART-HOLD-BACK=" + fmt("%.3f", ownTarget * 3) : std::string()) + "\n";
+            if (withParts) m += "#EXT-X-PART-INF:PART-TARGET=" + fmt("%.3f", ownTarget) + "\n";
         }
         const int64_t first = !done.empty() ? done.front()->number : making ? making->number : 1;
         m += "#EXT-X-MEDIA-SEQUENCE:" + std::to_string(first) + "\n";
@@ -895,7 +902,7 @@ struct LivePackager::State {
             }
             const int64_t k = making ? making->number : (done.empty() ? 1 : done.back()->number + 1);
             const int j = making ? int(making->parts.size()) : 0;
-            m += "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"" + partName(k, j) + "\"\n";
+            m += "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"" + livePreloadHint(k, j, int(segFrames / std::max<int64_t>(1, partFrames))) + "\"\n";
             // Where the other renditions have got to: a player switching to one asks for its next part at once.
             auto report = [&](const Rendition& o) {
                 int64_t msn = 0;
@@ -950,10 +957,10 @@ struct LivePackager::State {
         if (ended) x += " mediaPresentationDuration=\"PT" + fmt("%.3f", duration) + "S\"";
         else x += " minimumUpdatePeriod=\"PT" + fmt("%.3f", segSeconds) + "S\"";
         x += " timeShiftBufferDepth=\"PT" + fmt("%.3f", depth) + "S\" maxSegmentDuration=\"PT" + fmt("%.3f", segSeconds) + "S\" minBufferTime=\"PT" +
-             fmt("%.3f", parts ? partSeconds : segSeconds) + "S\" suggestedPresentationDelay=\"PT" + fmt("%.3f", parts ? partTarget * 3 : segSeconds * 3) +
+             fmt("%.3f", parts ? partSeconds : segSeconds) + "S\" suggestedPresentationDelay=\"PT" + fmt("%.3f", parts ? soundPartTarget * 3 : segSeconds * 3) +
              "S\">\n";
         if (parts) {
-            const int target = int(std::lround(partTarget * 3 * 1000));
+            const int target = int(std::lround(soundPartTarget * 3 * 1000));
             x += "<ServiceDescription id=\"0\"><Latency referenceId=\"0\" target=\"" + std::to_string(target) + "\" min=\"" + std::to_string(target / 2) +
                  "\" max=\"" + std::to_string(target * 2) + "\"/><PlaybackRate min=\"0.96\" max=\"1.04\"/></ServiceDescription>\n";
         }
@@ -1838,6 +1845,65 @@ bool LivePackager::growing(const std::string& rel) const {
     return s_->growingFiles.count(rel) > 0;
 }
 
+LivePartPlan livePartPlan(double partSeconds, double segmentSeconds, double fps, const std::string& audioCodec) {
+    LivePartPlan plan;
+    if (!(fps > 0)) fps = 25;
+    if (!(partSeconds == partSeconds)) partSeconds = 0.5;
+    if (!(segmentSeconds == segmentSeconds)) segmentSeconds = 2;
+    // (a coded frame of the sound, at the 48 kHz it is encoded at)
+    const double coded = audioCodec.empty() || audioCodec == "none" ? 0
+                         : audioCodec == "libopus" ? 960.0 / 48000
+                         : audioCodec == "ac3" || audioCodec == "eac3" ? 1536.0 / 48000
+                         : 1024.0 / 48000;
+    plan.partFrames = std::max<int64_t>(1, std::llround(std::clamp(partSeconds, 0.1, 1.0) * fps));
+    // (a part of sound is its length less a coded frame at the shortest and its target is a coded frame more: 13
+    // frames keep the shortest at 85% of the target, the target's rounding to a millisecond counted)
+    if (coded > 0) plan.partFrames = std::max(plan.partFrames, int64_t(std::ceil(coded * 13 * fps - 1e-9)));
+    const int64_t segment = std::max<int64_t>(1, std::llround(std::clamp(segmentSeconds, 1.0, 6.0) * fps));
+    plan.segmentFrames = std::max<int64_t>(1, std::llround(double(segment) / double(plan.partFrames))) * plan.partFrames;
+    const double part = double(plan.partFrames) / fps;
+    plan.partTarget = std::ceil(part * 1000 - 1e-6) / 1000;
+    plan.soundPartTarget = std::ceil((part + coded) * 1000 - 1e-6) / 1000;
+    return plan;
+}
+
+std::string livePreloadHint(int64_t segment, int partsMade, int partsPerSegment) {
+    return partsPerSegment > 0 && partsMade >= partsPerSegment ? partName(segment + 1, 0) : partName(segment, std::max(0, partsMade));
+}
+
+int liveBlockingReload(const std::string& playlist, int64_t msn, int part) {
+    int64_t sequence = 0, complete = 0;
+    int partsAfter = 0;
+    double partTarget = 0;
+    size_t at = 0;
+    while (at <= playlist.size()) {
+        size_t end = playlist.find('\n', at);
+        if (end == std::string::npos) end = playlist.size();
+        std::string_view line(playlist.data() + at, end - at);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.remove_suffix(1);
+        at = end + 1;
+        if (line.rfind("#EXT-X-MEDIA-SEQUENCE:", 0) == 0) sequence = std::atoll(std::string(line.substr(22)).c_str());
+        else if (line == "#EXT-X-ENDLIST") return 200;
+        else if (line.rfind("#EXT-X-PART-INF:", 0) == 0) {
+            const size_t t = line.find("PART-TARGET=");
+            if (t != std::string_view::npos) partTarget = std::atof(std::string(line.substr(t + 12)).c_str());
+        } else if (line.rfind("#EXT-X-PART:", 0) == 0) ++partsAfter;
+        else if (!line.empty() && line[0] != '#') ++complete, partsAfter = 0;
+    }
+    if (msn < 0) return 400;
+    const int64_t last = sequence + complete - 1;
+    if (msn <= last) return 200;
+    if (msn > last + 2) return 400;
+    if (part >= 0) {
+        // (the advance part limit: three, or with parts of under a second three seconds of them)
+        const int limit = partTarget > 0 && partTarget < 1 ? int(std::ceil(3 / partTarget)) : 3;
+        if (msn == last + 1 && partsAfter > part) return 200;
+        // (of the segment after the one being made, counted from its first)
+        if (part > (msn == last + 1 ? partsAfter - 1 : -1) + limit) return 400;
+    }
+    return 0;
+}
+
 // ---- The origin ----
 
 std::string playlistDeltaUpdate(const std::string& playlist, int* skipped) {
@@ -1899,22 +1965,6 @@ public:
 protected:
     void incomingConnection(qintptr fd) override { incoming(fd); }
 };
-
-// Whether an HLS media playlist has segment `msn` (with `part` >= 0: that part of it, or the whole segment).
-bool playlistHas(const QByteArray& text, int64_t msn, int part) {
-    int64_t sequence = 0, complete = 0;
-    int partsAfter = 0;
-    for (const QByteArray& raw : text.split('\n')) {
-        const QByteArray line = raw.trimmed();
-        if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) sequence = line.mid(22).toLongLong();
-        else if (line == "#EXT-X-ENDLIST") return true;
-        else if (line.startsWith("#EXT-X-PART:")) ++partsAfter;
-        else if (!line.isEmpty() && !line.startsWith('#')) ++complete, partsAfter = 0;
-    }
-    const int64_t last = sequence + complete - 1;
-    if (msn <= last) return true;
-    return part >= 0 && msn == last + 1 && partsAfter > part;
-}
 
 double targetDuration(const QByteArray& text) {
     const int at = text.indexOf("#EXT-X-TARGETDURATION:");
@@ -1986,7 +2036,7 @@ struct LiveOrigin::State {
     bool after(const Request& r, double seconds) const { return Clock::now() > r.came + std::chrono::milliseconds(int64_t(seconds * 1000)); }
 
     // A blocking reload (_HLS_msn, _HLS_part): whether the playlist has what was asked for (else held, answered 503
-    // after three target durations).
+    // after three target durations; 400 at once when it is further ahead than a player may ask).
     bool playlistCanAnswer(Request& r, QFile& f) {
         const QFileInfo fi(f);
         const qint64 size = fi.size(), modified = fi.lastModified().toMSecsSinceEpoch();
@@ -2000,11 +2050,58 @@ struct LiveOrigin::State {
         r.seenSize = size, r.seenModified = modified, r.seenAt = Clock::now();
         // (held for three target durations at most)
         r.holdFor = targetDuration(text) * 3;
-        if (!playlistHas(text, r.msn, r.part)) {
+        const int can = liveBlockingReload(text.toStdString(), r.msn, r.part);
+        if (can == 400) {
+            answer(r, 400, "text/plain", "Too far ahead");
+            return false;
+        }
+        if (can != 200) {
             if (after(r, r.holdFor)) answer(r, 503, "text/plain", "Not yet");
             return false;
         }
         return true;
+    }
+
+    // The newest segment in a folder of the package (the largest number among its seg files, parts too; 0 none),
+    // looked up again a tenth of a second after it last was.
+    struct Newest {
+        int64_t number = 0;
+        Clock::time_point at;
+    };
+    std::map<QString, Newest> newest;
+    static bool segmentNumber(const QString& name, int64_t* number) {
+        if (!name.startsWith("seg")) return false;
+        int digits = 0;
+        while (3 + digits < name.size() && name[3 + digits].isDigit()) ++digits;
+        if (digits < 1 || digits > 15 || 3 + digits >= name.size() || name[3 + digits] != '.') return false;
+        *number = name.mid(3, digits).toLongLong();
+        return true;
+    }
+    int64_t newestSegment(const QDir& dir) {
+        Newest& n = newest[dir.absolutePath()];
+        const auto now = Clock::now();
+        if (n.at != Clock::time_point() && now - n.at < std::chrono::milliseconds(100)) return n.number;
+        n.at = now;
+        n.number = 0;
+        for (const QString& name : dir.entryList({"seg*"}, QDir::Files)) {
+            int64_t k = 0;
+            if (!name.endsWith(".tmp") && segmentNumber(name, &k)) n.number = std::max(n.number, k);
+        }
+        return n.number;
+    }
+    // Whether a file not there is one the packager is about to write: a playlist, an MPD or an init segment in a
+    // folder there, or a segment or part numbered from the folder's newest to two past it (one before that is gone
+    // or was never made, as a gap's; one further on is not asked for by a player of this package).
+    bool coming(const QString& rel, const QFile& f) {
+        const QFileInfo fi(f);
+        if (!fi.dir().exists()) return false;
+        int64_t k = 0;
+        if (segmentNumber(fi.fileName(), &k)) {
+            if (!rel.endsWith(".m4s") && !rel.endsWith(".ts")) return false;
+            const int64_t n = newestSegment(fi.dir());
+            return k >= n && k <= n + 2;
+        }
+        return rel.endsWith(".m3u8") || rel.endsWith(".mp4") || rel.endsWith(".mpd");
     }
 
     // Answers what can be answered now, else leaves it waiting (the timer asks again).
@@ -2034,9 +2131,14 @@ struct LiveOrigin::State {
             for (const QString& part : r.rel.split('/'))
                 if (part.isEmpty() || part.startsWith('.')) return answer(r, 404, "text/plain", "Not found");
             const QUrlQuery q(url);
-            if (q.hasQueryItem("_HLS_msn")) {
-                r.msn = q.queryItemValue("_HLS_msn").toLongLong();
-                r.part = q.hasQueryItem("_HLS_part") ? q.queryItemValue("_HLS_part").toInt() : -1;
+            if (q.hasQueryItem("_HLS_msn") || q.hasQueryItem("_HLS_part")) {
+                // (a part is asked for with its segment, and both are numbers: else a bad request)
+                bool msnOk = false, partOk = true;
+                r.msn = q.queryItemValue("_HLS_msn").toLongLong(&msnOk);
+                r.part = q.hasQueryItem("_HLS_part") ? q.queryItemValue("_HLS_part").toInt(&partOk) : -1;
+                if (r.rel.endsWith(".m3u8") && (!msnOk || !partOk || r.msn < 0 || (q.hasQueryItem("_HLS_part") && r.part < 0)))
+                    return answer(r, 400, "text/plain", "_HLS_msn and _HLS_part are a segment's number and a part of it");
+                if (!msnOk || !partOk) r.msn = -1, r.part = -1;
             }
             r.skip = q.queryItemValue("_HLS_skip") == "YES" || q.queryItemValue("_HLS_skip") == "v2";
         }
@@ -2060,10 +2162,7 @@ struct LiveOrigin::State {
         }
         if (!f.exists()) {
             // (waited for only when it is a name the packager is about to write, in a folder it writes)
-            const bool coming = (r.rel.endsWith(".m4s") || r.rel.endsWith(".ts") || r.rel.endsWith(".m3u8") || r.rel.endsWith(".mp4") ||
-                                 r.rel.endsWith(".mpd")) &&
-                                QFileInfo(f).dir().exists();
-            if (!coming || after(r, waitSeconds)) answer(r, 404, "text/plain", "Not found");
+            if (!coming(r.rel, f) || after(r, waitSeconds)) answer(r, 404, "text/plain", "Not found");
             return;
         }
         if (r.skip && r.rel.endsWith(".m3u8")) {
@@ -2118,6 +2217,15 @@ struct LiveOrigin::State {
                     oldest->socket->abort();  // (its request goes with the socket, once control is back in the loop)
                     oldest->socket->deleteLater();
                     --open;
+                } else {
+                    // (all whole requests: the one held longest for something not yet made is told to come back, so
+                    // requests for what is not there cannot keep players out either)
+                    for (auto& q : requests)
+                        if (q->parsed && !q->done && !q->streaming && (!oldest || q->came < oldest->came)) oldest = q.get();
+                    if (oldest) {
+                        answer(*oldest, 503, "text/plain", "Busy");
+                        --open;
+                    }
                 }
             }
             if (!socket->setSocketDescriptor(fd) || open >= 256 || requests.size() >= 512) {
