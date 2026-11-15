@@ -1201,8 +1201,10 @@ struct BrowserReviewBackend::Impl {
     // the relay is first asked for an address for this viewer, and the offer answered from behind that bridge.
     void offer(QSslSocket* c, const QByteArray& sdp, bool hdr) {
         {
+            // (offers still waiting for the relay count too: each holds a bridge and an address at the relay)
             std::lock_guard lock(m);
-            if (int(viewers.size()) >= settings.maxViewers) return respond(c, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
+            if (int(viewers.size() + bridging.size()) >= settings.maxViewers)
+                return respond(c, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
         }
         if (!settings.relayOnly) return answerOffer(c, sdp, hdr, nullptr);
         auto bridge = std::make_shared<RelayBridge>(relayHost, relayPort, relayLogin);

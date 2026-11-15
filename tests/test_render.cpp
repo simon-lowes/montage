@@ -23477,6 +23477,7 @@ colorspaces:
         struct OldRelay {
             std::atomic<bool> stop{false};
             std::atomic<int> port{0}, relayed{0}, signedRight{0}, signedWrong{0}, stale{0}, newStyle{0}, permissions{0};
+            std::atomic<int> lifetime{600}, refreshes{0}, released{0};  // seconds an address is given for; Refresh requests for more, and for none
             std::thread thread;
             static void attribute(QByteArray& b, quint16 type, const QByteArray& value) {
                 b.append(char(type >> 8)).append(char(type & 0xff)).append(char(value.size() >> 8)).append(char(value.size() & 0xff)).append(value);
@@ -23513,6 +23514,7 @@ colorspaces:
                         const QByteArray id = d.mid(8, 12);
                         QByteArray nonce, data;
                         quint16 peer = 0;
+                        quint32 asked = 0;
                         qsizetype integrityAt = -1;
                         for (qsizetype at = 20; at + 4 <= d.size();) {
                             const quint16 t = quint16(quint8(d[at]) << 8 | quint8(d[at + 1]));
@@ -23522,6 +23524,7 @@ colorspaces:
                             if (t == 0x0013) data = value;
                             if (t == 0x0012 && n >= 4) peer = quint16((quint8(value[2]) << 8 | quint8(value[3])) ^ 0x2112);
                             if (t == 0x0008) integrityAt = at;
+                            if (t == 0x000D && n == 4) asked = qFromBigEndian<quint32>(value.constData());
                             if (t == 0x001C || t == 0x001D || t == 0x8002) ++newStyle;
                             at += 4 + ((n + 3) & ~qsizetype(3));
                         }
@@ -23552,7 +23555,10 @@ colorspaces:
                             a += challenge;
                         } else if (type == 0x0003) {
                             attribute(a, 0x0016, address(back.localPort()));
-                            attribute(a, 0x000D, QByteArray::fromHex("00000258"));
+                            attribute(a, 0x000D, QByteArray::fromHex("0000") + char(lifetime >> 8) + char(lifetime & 0xff));
+                        } else if (type == 0x0004) {
+                            ++(asked ? refreshes : released);
+                            attribute(a, 0x000D, asked ? QByteArray::fromHex("0000") + char(lifetime >> 8) + char(lifetime & 0xff) : QByteArray(4, '\0'));
                         } else if (type == 0x0008) {
                             ++permissions;
                         }
@@ -23731,6 +23737,33 @@ colorspaces:
             QVERIFY2(QString::fromStdString(why).contains("login"), why.c_str());
             QVERIFY(old.signedWrong >= 1);
         }
+        // A relay that gives its address for 20 seconds is asked to keep it half way through that, with the login,
+        // and the address still carries afterwards; a bridge that ends gives its address back.
+        {
+            old.lifetime = 20;
+            const int wrongBefore = old.signedWrong, releasedBefore = old.released;
+            QCOMPARE(old.refreshes.load(), 0);
+            QElapsedTimer waited;
+            {
+                RelayBridge bridge("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+                QCOMPARE(allocate(bridge), std::string());
+                waited.start();
+                QTRY_VERIFY_WITH_TIMEOUT(old.refreshes >= 1, 30000);
+                QVERIFY2(waited.elapsed() >= 8000 && waited.elapsed() < 19000, std::to_string(waited.elapsed()).c_str());
+                auto viewer = socket(), end = socket();
+                const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+                Got got;
+                for (int i = 0; i < 50 && got.data.isEmpty(); ++i) {
+                    end->writeDatagram("kept", QHostAddress::LocalHost, alias);
+                    got = read(*viewer, 100);
+                }
+                QCOMPARE(got.data, QByteArray("kept"));
+                QCOMPARE(bridge.lastError(), std::string());
+                QCOMPARE(old.released.load(), releasedBefore);
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(old.released > releasedBefore, 5000);
+            QCOMPARE(old.signedWrong.load(), wrongBefore);
+        }
 #endif
     }
 
@@ -23867,10 +23900,9 @@ colorspaces:
 
     // A review only through a relay that shares a secret with Montage. With coturn (the "coturn" row: turnserver on
     // this computer's loopback with that secret, where there is one), the relay works each login out for itself;
-    // libjuice's relay (the other row) is told the review's login and forgets it when its time is up. A link with a
-    // fresh login plays in Chrome, and in Firefox where there is one, through the relay at both ends; a login whose
-    // time has passed is refused by the relay; and once the link's own time is up the page says so and the relay
-    // takes its login no more.
+    // libjuice's relay (the other row) is told the review's login and knows no other. A link with a fresh login plays
+    // in Chrome, and in Firefox where there is one, through the relay at both ends; a login whose time has passed is
+    // refused by the relay; and once the link's own time is up the page says so, and coturn takes its login no more.
     void browserReviewRelaySecret() {
         using namespace montage::output;
         using namespace montage::reviewtest;
@@ -23982,8 +24014,10 @@ colorspaces:
         const TurnLogin login = turnRestLogin(secret, expires);
 #ifdef MONTAGE_TEST_TURN
         if (turn) {
+            // (kept for as long as the relay runs: libjuice's relay lets go of a login given a time while addresses
+            // made with it still point at it, so the time running out at the relay is left to the coturn row)
             juice_server_credentials_t made{login.user.c_str(), login.password.c_str(), 0};
-            QCOMPARE(juice_server_add_credentials(turn, &made, (unsigned long)((expires - QDateTime::currentSecsSinceEpoch()) * 1000)), 0);
+            QCOMPARE(juice_server_add_credentials(turn, &made, 0), 0);
         }
 #endif
         // Chrome: given the login the secret makes (not the secret), it plays, both ends of the pair in use at the relay.
@@ -24039,11 +24073,11 @@ colorspaces:
             RelayBridge fresh("127.0.0.1", uint16_t(turnPort), login);
             QCOMPARE(allocateAt(fresh), std::string());
         }
-        // Once the link's time is up: the page tells a newcomer so, and the relay takes the review's login no more.
+        // Once the link's time is up: the page tells a newcomer so, and coturn takes the review's login no more.
         while (QDateTime::currentSecsSinceEpoch() < expires + 2) QThread::msleep(200);
         QVERIFY2(tab.open(rig.page(), &why), why.c_str());
         QCOMPARE(tab.js("__montage.join('Cy', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("This review link has expired"));
-        {
+        if (coturn) {
             RelayBridge late("127.0.0.1", uint16_t(turnPort), login);
             const std::string refused = allocateAt(late);
             QVERIFY2(QString::fromStdString(refused).contains("login"), (refused + " " + serverLog().toStdString()).c_str());

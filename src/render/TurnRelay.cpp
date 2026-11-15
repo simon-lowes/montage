@@ -289,11 +289,17 @@ struct RelayBridge::Impl {
     quint16 algorithm = 0;  // (0: none named, the key is MD5's)
     QByteArray icePassword;  // Montage's end's, once said
     bool allocated = false, asked = false;
+    int lifetime = kLifetimeAsked;  // seconds, as the relay last gave it
     qint64 refreshAt = 0, permitAt = 0;
     std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
     std::function<void(const std::string&)> allocateDone;
 
     qint64 now() const { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began).count(); }
+    // The relay's LIFETIME in an answer, kept, and when to ask again: half way through it.
+    void lifetimeFrom(const Message& answer) {
+        if (const QByteArray* l = answer.find(kLifetime); l && l->size() == 4) lifetime = int(std::clamp<quint32>(get32(*l, 0), 20, 3600));
+        refreshAt = now() + qint64(lifetime) * 500;
+    }
 
     void run() {
         QEventLoop l;
@@ -337,9 +343,9 @@ struct RelayBridge::Impl {
     }
 
     static QByteArray randomId() {
-        QByteArray id(12, '\0');
-        QRandomGenerator::system()->fillRange(reinterpret_cast<quint32*>(id.data()), 3);
-        return id;
+        quint32 words[3];
+        QRandomGenerator::system()->fillRange(words);
+        return QByteArray(reinterpret_cast<const char*>(words), 12);
     }
 
     // A request's bytes: its attributes, then the login once the relay has named its realm, signed.
@@ -405,14 +411,16 @@ struct RelayBridge::Impl {
             if (r.done) r.done(nullptr);
         }
         if (allocated && at >= refreshAt) {
-            refreshAt = at + kLifetimeAsked * 500;
+            refreshAt = at + qint64(lifetime) * 500;
             Request r;
             r.method = kRefresh;
             QByteArray life;
             put32(life, kLifetimeAsked);
             r.attributes.emplace_back(kLifetime, life);
             r.done = [this](const Message* answer) {
-                if (answer && (answer->type & 0x0110) == kError) fail(answer);
+                if (!answer) return;
+                if ((answer->type & 0x0110) == kError) return fail(answer);
+                lifetimeFrom(*answer);
             };
             send(std::move(r));
         }
@@ -475,18 +483,18 @@ struct RelayBridge::Impl {
     }
 
     void allocate() {
-        // The relay's address (its first IPv4 one), and the one socket to the outside connected to it.
-        QHostAddress address;
+        // The relay's address (its first IPv4 one). A name is looked up without holding this thread, so a bridge
+        // let go of meanwhile ends at once.
         quint32 literal = 0;
-        if (isIpv4(QString::fromStdString(host), literal)) {
-            address = QHostAddress(literal);
-        } else {
-            for (const QHostAddress& a : QHostInfo::fromName(QString::fromStdString(host)).addresses())
-                if (a.protocol() == QAbstractSocket::IPv4Protocol) {
-                    address = a;
-                    break;
-                }
-        }
+        if (isIpv4(QString::fromStdString(host), literal)) return allocateAt(QHostAddress(literal));
+        QHostInfo::lookupHost(QString::fromStdString(host), home, [this](const QHostInfo& found) {
+            for (const QHostAddress& a : found.addresses())
+                if (a.protocol() == QAbstractSocket::IPv4Protocol) return allocateAt(a);
+            allocateAt({});
+        });
+    }
+    // The one socket to the outside, connected to the relay, and the relay asked for an address.
+    void allocateAt(const QHostAddress& address) {
         if (address.isNull()) return allocated_("The TURN relay's address (" + host + ") was not found, or is not IPv4");
         // (bound first: a UDP socket only connected has no port of its own on every system until it sends)
         if (!outer->bind(QHostAddress(QHostAddress::AnyIPv4), 0)) return allocated_("No UDP port to reach the TURN relay from");
@@ -506,15 +514,13 @@ struct RelayBridge::Impl {
             quint16 p = 0;
             const QByteArray* relayed = answer->find(kXorRelayedAddress);
             if (!relayed || !readXorAddress(*relayed, ip, p)) return allocated_("The TURN relay gave no IPv4 address");
-            int life = kLifetimeAsked;
-            if (const QByteArray* l = answer->find(kLifetime); l && l->size() == 4) life = int(std::min<quint32>(get32(*l, 0), 3600));
             {
                 std::lock_guard lock(m);
                 relayedIp = QHostAddress(ip).toString().toStdString();
             }
             relayedPort = p;
             allocated = true;
-            refreshAt = now() + std::max(30, life / 2) * 1000;
+            lifetimeFrom(*answer);
             permitAt = now() + kPermissionEveryMs;
             for (const auto& [k, a] : aliases) permit(a.ip, a.port, true);
             allocated_({});
@@ -581,7 +587,11 @@ struct RelayBridge::Impl {
             putAttribute(b, kDataAttribute, d);
             const quint16 length = qToBigEndian(quint16(b.size() - 20));
             memcpy(b.data() + 2, &length, 2);
-            if (allocated && outer->write(b) > 0) ++toRelay;
+            // (counted before it goes, so whoever sees a packet arrive finds it counted)
+            if (allocated) {
+                ++toRelay;
+                outer->write(b);
+            }
         }
     }
 
@@ -603,8 +613,8 @@ struct RelayBridge::Impl {
                 const quint16 to = localPort;
                 if (!peerAddress || !data || !readXorAddress(*peerAddress, ip, peerPort) || !to) continue;
                 if (Alias* a = aliasFor(ip, peerPort)) {
-                    a->socket->writeDatagram(*data, QHostAddress(QHostAddress::LocalHost), to);
                     ++fromRelay;
+                    a->socket->writeDatagram(*data, QHostAddress(QHostAddress::LocalHost), to);
                 }
             } else if (msg.type & 0x0100) {
                 answered(msg);
