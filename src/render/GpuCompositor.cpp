@@ -82,6 +82,7 @@ bool execute(const Frame&, Image*, QImage*) { return false; }
 std::string mappedHardware() { return {}; }
 void loseDeviceForTesting() {}
 void refuseHardwareFramesForTesting(bool) {}
+void setTextureBudgetForTesting(size_t) {}
 
 }  // namespace montage::gpu
 
@@ -177,12 +178,14 @@ public:
     bool draw(const Frame& frame, Image* out, QImage* out8);
     long filterPasses = 0, mixPasses = 0;  // (the last frame's)
     long textureSteps = 0;                 // (texture steps run, the last frame)
+    long texturesMade = 0;                 // (textures made, the last frame)
     long shaderBuilds = 0;                 // (shader steps built, the last frame)
     long shapeLayers = 0;                  // (Shape layers drawn, the last frame)
     long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
     long hwImports = 0;                    // (and imported or copied for this frame, not kept from an earlier draw)
     std::string hwFallback;                // (why the last of them that could not be mapped was copied back)
     std::atomic<bool> lose{false};         // (tests: the next frame finds the device lost)
+    std::atomic<size_t> budget{0};         // (tests: the bytes of textures kept that the last frame did not use; 0 for kBudget)
     std::string mapped() const {
         std::lock_guard lock(brokenMutex_);
         return mappedNames_;
@@ -223,7 +226,7 @@ private:
     // A texture step run from `from` into `into` (false, the frame failed, when it could not be).
     bool external(const TextureStep* step, const std::vector<QRhiTexture*>& from, QRhiTexture* into, QRhiResourceUpdateBatch*& u);
     void callBack(const std::function<void()>& fn);  // (on the GPU's thread: fn run by the thread waiting in serve())
-    void endFrame();
+    void endFrame(bool drawn);
     bool recover();  // (the device lost: everything made again, on FFmpeg's device again when shared, else on a new one)
 
     std::thread thread_;
@@ -746,6 +749,7 @@ QRhiTexture* Device::texture(QRhiTexture::Format format, int w, int h, bool isTa
         return nullptr;
     }
     const size_t texel = format == QRhiTexture::RGBA32F ? 16 : 4;  // (RGBA8, RG16 and R32F alike)
+    ++texturesMade;
     pool_.push_back({t, isTarget, true, frameNo_, size_t(w) * size_t(h) * texel});
     return t;
 }
@@ -1493,15 +1497,19 @@ bool Device::external(const TextureStep* step, const std::vector<QRhiTexture*>& 
     return true;
 }
 
-void Device::endFrame() {
+void Device::endFrame(bool drawn) {
     for (QRhiShaderResourceBindings* s : frameSrbs_) delete s;
     frameSrbs_.clear();
     for (Pooled& p : pool_) p.used = false;
     ubufUsed_ = 0;
     // The frame is finished (offscreen frames wait for the GPU), so textures can go now: those not used for a few
-    // frames, then the least recently used while the pool holds more than its budget.
+    // frames, then the least recently used while the pool holds more than its budget. What this frame used stays
+    // however much it is (a 4K layer through Lens Blur (Depth) uses over a gigabyte): the next frame would make the
+    // same textures again, each frame, and the device held them a moment ago. A frame that could not be drawn keeps
+    // nothing past the budget.
     constexpr long kIdleFrames = 8;
     constexpr size_t kBudget = size_t(768) << 20;
+    const size_t most = budget.load() ? budget.load() : kBudget;
     auto drop = [&](std::vector<Pooled>::iterator it) {
         if (auto tg = targets_.find(it->tex); tg != targets_.end()) {
             delete tg->second.rt, delete tg->second.rp;
@@ -1513,8 +1521,11 @@ void Device::endFrame() {
     for (auto it = pool_.begin(); it != pool_.end();) it = frameNo_ - it->lastFrame > kIdleFrames ? drop(it) : it + 1;
     size_t bytes = 0;
     for (const Pooled& p : pool_) bytes += p.bytes;
-    while (bytes > kBudget && !pool_.empty()) {
-        auto oldest = std::min_element(pool_.begin(), pool_.end(), [](const Pooled& a, const Pooled& b) { return a.lastFrame < b.lastFrame; });
+    while (bytes > most) {
+        auto oldest = pool_.end();
+        for (auto it = pool_.begin(); it != pool_.end(); ++it)
+            if ((!drawn || it->lastFrame < frameNo_) && (oldest == pool_.end() || it->lastFrame < oldest->lastFrame)) oldest = it;
+        if (oldest == pool_.end()) break;
         bytes -= oldest->bytes;
         drop(oldest);
     }
@@ -1530,7 +1541,7 @@ void Device::endFrame() {
 
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
-    filterPasses = mixPasses = shaderBuilds = shapeLayers = textureSteps = 0;
+    filterPasses = mixPasses = shaderBuilds = shapeLayers = textureSteps = texturesMade = 0;
     hwMapped = hwGpuCopies = hwImports = 0;
     hwFallback.clear();
     if (!rhi_) return false;  // (lost, and not set up again)
@@ -1759,7 +1770,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
                 programs_.erase(it);
             }
     programsNew_.clear();
-    endFrame();
+    endFrame(ok);
     if (!ok) return false;
     const size_t bytes = size_t(W) * H * (out8 ? 4 : 16);
     if (size_t(result.data.size()) < bytes) return false;
@@ -1852,12 +1863,13 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     DeviceLock lock;
     if (!gDevice || !gDevice->ready() || waitedFor(*gDevice)) return false;
     Device* d = gDevice.get();
-    long filters = 0, mixes = 0, mapped = 0, copied = 0, imported = 0, builds = 0, shapes = 0, steps = 0;
+    long filters = 0, mixes = 0, mapped = 0, copied = 0, imported = 0, builds = 0, shapes = 0, steps = 0, made = 0;
     std::string hwFallback;
     const bool ok = d->serve([&] {
         const bool drawn = d->draw(frame, out, out8);
         filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds, shapes = d->shapeLayers;
         mapped = d->hwMapped, copied = d->hwGpuCopies, imported = d->hwImports, hwFallback = d->hwFallback, steps = d->textureSteps;
+        made = d->texturesMade;
         return drawn;
     });
     std::lock_guard statsLock(gStatsMutex);
@@ -1869,6 +1881,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
         gStats.textureSteps += steps;
     }
     gStats.shaderBuilds += builds;
+    gStats.texturesMade += made;
     gStats.hwMapped += mapped;
     gStats.hwGpuCopies += copied;
     gStats.hwImports += imported;
@@ -1887,6 +1900,11 @@ void loseDeviceForTesting() {
 }
 
 void refuseHardwareFramesForTesting(bool refuse) { gRefuseHw = refuse; }
+
+void setTextureBudgetForTesting(size_t bytes) {
+    DeviceLock lock;
+    if (gDevice) gDevice->budget = bytes;
+}
 
 }  // namespace montage::gpu
 

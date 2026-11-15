@@ -186,6 +186,7 @@ struct Stats {
     long shaderBuilds = 0;                 // shader steps built (ShaderStep, once a key), since resetStats
     long shapeLayers = 0;                  // Shape layers drawn on the GPU (Layer::shapes)
     long textureSteps = 0;                 // texture steps run (TextureStep: plug-ins drawing into the compositor's textures)
+    long texturesMade = 0;                 // textures made for frames, since resetStats (one kept from an earlier frame and lent again is not made)
     std::string lastFallback;
     std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
     // Hardware-decoded frames (render/GpuHardware): drawn from the decoding device's memory (hwGpuCopies of them
@@ -206,6 +207,9 @@ std::string mappedHardware();
 // (each copied back, as a mapping that fails is).
 void loseDeviceForTesting();
 void refuseHardwareFramesForTesting(bool refuse);
+// Tests: how many bytes of textures the last frame did not use are kept for later ones (0: the compositor's own
+// budget).
+void setTextureBudgetForTesting(size_t bytes);
 void countFallback(const std::string& why);  // (render/Compositor's bookkeeping)
 void countLayer(bool onGpu, const std::string& how = {});  // (and with MONTAGE_GPU_LOG, says how it was drawn)
 

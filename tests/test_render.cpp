@@ -26651,6 +26651,21 @@ colorspaces:
             const long passes = gpu::stats().filterPasses;
             compare(3 + FrameTime(k), what);
             if (k >= 11) QVERIFY2(gpu::stats().filterPasses > passes + 5, qPrintable(what + ": not drawn in passes"));
+            if (k >= 11) {
+                // Lens Blur's textures are more than the compositor keeps between frames (a 4K layer's are, against its
+                // own budget; the budget is set low here): the frame drawn again makes none of them anew.
+                RenderOptions again;
+                again.gpu = true;
+                gpu::setTextureBudgetForTesting(1 << 20);
+                renderProgramFrame(p, s, 3 + FrameTime(k), again);
+                const gpu::Stats once = gpu::stats();
+                renderProgramFrame(p, s, 3 + FrameTime(k), again);
+                const gpu::Stats twice = gpu::stats();
+                gpu::setTextureBudgetForTesting(0);
+                QVERIFY2(twice.gpuFrames == once.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(twice.lastFallback)));
+                QVERIFY2(twice.texturesMade == once.texturesMade,
+                         qPrintable(QString("%1: %2 textures made again").arg(what).arg(twice.texturesMade - once.texturesMade)));
+            }
             // (it did something: the depth and the object were there)
             if (k == 0 || k == 6 || k == 8 || k >= 11) QVERIFY2(renderProgramFrame(p, s, 5, plain).px != untouched.px, qPrintable(what));
         }
