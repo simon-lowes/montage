@@ -2060,6 +2060,9 @@ Result replaceSources(Project& p, Sequence& s, const std::vector<Id>& ids, Id me
             if (c.mediaId != mediaId) c.channels = fresh.channels;  // another file's channels
             c.mediaId = mediaId;
             c.name = fresh.name;
+            // (its markers are on source frames: moved as its source is, so each stays on the moment it marked)
+            if (const FrameTime moved = FrameTime(std::llround(std::max(0.0, sourceIn) - c.sourceIn)); moved != 0)
+                for (Marker& k : c.markers) k.t += moved;
             c.sourceIn = std::max(0.0, sourceIn);
             c.unrendered.clear();
             const FrameTime limit = sourceLimit(p, work, c);

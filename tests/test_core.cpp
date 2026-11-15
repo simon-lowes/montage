@@ -5552,11 +5552,35 @@ private slots:
         }
         // By timecode: two seconds (60 frames) later in the new file.
         fx.p = before;
+        // (a marker on the second clip's picture, ten frames in: it stays on that moment, so where it was on the
+        // timeline; kept on its old source frame it would have marked a moment two seconds before the clip)
+        {
+            Marker k;
+            k.t = 30 + 10;
+            k.name = "Look";
+            clipById(fx.s(), clips[1])->markers.push_back(k);
+            QCOMPARE(clipById(fx.s(), clips[1])->markerFrame(k), FrameTime(50));
+        }
         r = replaceSources(fx.p, fx.s(), clips, online.id, true);
         QVERIFY2(r.ok, r.error.c_str());
         for (int i = 0; i < 5; ++i) {
             QCOMPARE(trackAt(fx.s(), V1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
             QCOMPARE(trackAt(fx.s(), A1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
+        }
+        {
+            const Clip& marked = *clipById(fx.s(), clips[1]);
+            QCOMPARE(marked.markers.size(), size_t(1));
+            QCOMPARE(marked.markers[0].t, FrameTime(100));
+            QCOMPARE(marked.markerFrame(marked.markers[0]), FrameTime(50));
+        }
+        // (not by timecode the source frames are the same ones, and the marker with them)
+        {
+            Project plain = before;
+            Marker k;
+            k.t = 40;
+            clipById(*plain.active(), clips[1])->markers.push_back(k);
+            QVERIFY(replaceSources(plain, *plain.active(), clips, online.id, false).ok);
+            QCOMPARE(clipById(*plain.active(), clips[1])->markers[0].t, FrameTime(40));
         }
         // An L-cut (the sound leading the picture by 12 frames) keeps its lead; a separate recorder's sound linked to
         // the picture is left on its own file.
