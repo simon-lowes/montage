@@ -113,7 +113,7 @@ private:
     QToolButton* smoothBtn_;
     QToolButton* paperAddBtn_;
     QToolButton* paperBuildBtn_;
-    QListWidget* paperList_;
+    QListWidget* paperList_ = nullptr;  // (null until made: the event filter runs before it is)
     std::vector<TranscriptWord> words_;
     std::string language_;   // of the words' transcripts, "" when unknown or mixed
     bool discourse_ = false;  // "like", "you know"... count as fillers too
