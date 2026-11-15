@@ -40207,6 +40207,53 @@ private slots:
                 return std::array<double, 16>{pl.axisU[0], pl.axisU[1], pl.axisU[2], 0, pl.axisV[0], pl.axisV[1], pl.axisV[2], 0,
                                               pl.normal[0], pl.normal[1], pl.normal[2], 0, pl.origin[0], pl.origin[1], pl.origin[2], 1};
             };
+            // A card whose Width is keyed (nightly 15 Nov): each frame's matrix puts the plane's corners where the
+            // card's are then, twice as far apart at the end as at the start.
+            {
+                Sequence grown = s;
+                Effect& ge = grown.videoTracks[1].clips[0].effects[0];
+                ge.params["width"] = Param();
+                ge.params["width"].keys = {{0, 1.5}, {9, 3.0}};
+                const std::vector<SolvedSceneMesh> g = solvedSceneModels(p, grown, 0, grown.videoTracks[0].clips[0]);
+                QVERIFY(g.size() == 1 && g[0].motion.size() == 10 && g[0].positions.size() >= 12);
+                for (int i = 0; i < 10; ++i) {
+                    const Layer3DPlace pl = layer3dPlace(ge, i, W, H);
+                    const std::array<double, 16>& m = g[0].motion[size_t(i)].second;
+                    double across = 0, up = 0, off = 0;
+                    for (size_t v = 0; v + 2 < g[0].positions.size(); v += 3) {
+                        double q[3];
+                        for (int a = 0; a < 3; ++a)
+                            q[a] = g[0].positions[v] * m[size_t(a)] + g[0].positions[v + 1] * m[size_t(4 + a)] + g[0].positions[v + 2] * m[size_t(8 + a)] +
+                                   m[size_t(12 + a)] - pl.origin[size_t(a)];
+                        across = std::max(across, std::fabs(q[0] * pl.axisU[0] + q[1] * pl.axisU[1] + q[2] * pl.axisU[2]));
+                        up = std::max(up, std::fabs(q[0] * pl.axisV[0] + q[1] * pl.axisV[1] + q[2] * pl.axisV[2]));
+                        off = std::max(off, std::fabs(q[0] * pl.normal[0] + q[1] * pl.normal[1] + q[2] * pl.normal[2]));
+                    }
+                    QVERIFY2(std::fabs(across - W * pl.unit / 2) < 1e-5 && std::fabs(up - H * pl.unit / 2) < 1e-5 && off < 1e-5,
+                             qPrintable(QString("frame %1: %2 across, %3 up, %4 off its plane").arg(i).arg(across * 2).arg(up * 2).arg(off)));
+                }
+            }
+            // A card in an HDR sequence (nightly 15 Nov): its picture is brought to SDR, so it reads as the one a
+            // Rec.709 sequence makes, where the sequence's own code values would be far darker.
+            {
+                Sequence hdr = s;
+                hdr.colorSpace = "rec2100pq";
+                const std::vector<SolvedSceneMesh> h = solvedSceneModels(p, hdr, 0, hdr.videoTracks[0].clips[0]);
+                QVERIFY(h.size() == 1 && !h[0].picture.empty());
+                QImage sdr;
+                QVERIFY(sdr.loadFromData(QByteArray::fromStdString(h[0].picture), "PNG"));
+                sdr = sdr.convertToFormat(QImage::Format_RGBA8888);
+                QVERIFY(sdr.size() == png.size());
+                int worst = 0, brightest = 0;
+                for (int y = H / 4; y < H * 3 / 4; y += 3)
+                    for (int x = W / 4; x < W * 3 / 4; x += 3) {
+                        const QColor a = png.pixelColor(x, y), b = sdr.pixelColor(x, y);
+                        if (a.alpha() != 255) continue;
+                        worst = std::max({worst, std::abs(a.red() - b.red()), std::abs(a.green() - b.green()), std::abs(a.blue() - b.blue())});
+                        brightest = std::max({brightest, a.red(), a.green(), a.blue()});
+                    }
+                QVERIFY2(brightest > 100 && worst <= 10, qPrintable(QString("%1 off, brightest %2").arg(worst).arg(brightest)));
+            }
             const QByteArray tinyusdz = qgetenv("MONTAGE_TEST_TINYUSDZ");
             if (tinyusdz.isEmpty()) qInfo("MONTAGE_TEST_TINYUSDZ is not set: tinyusdz's read-back is left out");
             for (const char* name : {"moving.usda", "moving.usdz"}) {
