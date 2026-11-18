@@ -76,6 +76,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -132,6 +133,7 @@
 #include "render/VfxShots.h"
 #include "render/ProRes.h"
 #include "render/Titles.h"
+#include "render/DcpFacilities.h"
 #include "render/DcpSecurity.h"
 #include "render/Ofx.h"
 #include "render/OfxRemote.h"
@@ -3073,20 +3075,7 @@ private slots:
         Multiviewer* mv = win_->multiviewer();
         QCOMPARE(mv->inputCount(), 4);
         std::vector<std::unique_ptr<QProcess>> streams;
-        for (int k = 0; k < (omtOk ? 1 : 2); ++k) {
-            auto p = std::make_unique<QProcess>();
-            const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
-                                   : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(streamPorts[k]);
-            p->start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128",
-                              "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
-                              "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
-                              "-c:a", "mp2", "-f", "mpegts", to});
-            // (a busy Mac runner once took more than ten seconds to start the command: wait longer, and say what the
-            // process reports when it does not start)
-            QVERIFY2(p->waitForStarted(60000),
-                     qPrintable(QString("state %1, error %2: %3").arg(int(p->state())).arg(int(p->error())).arg(p->errorString())));
-            streams.push_back(std::move(p));
-        }
+        // (made before the streams start: one that does not start leaves no inputs behind for the tests after)
         auto finish = qScopeGuard([&] {
             stop = true;
             for (auto& p : streams) p->kill(), p->waitForFinished(5000);
@@ -3102,6 +3091,26 @@ private slots:
             for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
                 if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
         });
+        for (int k = 0; k < (omtOk ? 1 : 2); ++k) {
+            auto p = std::make_unique<QProcess>();
+            const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
+                                   : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(streamPorts[k]);
+            p->start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128",
+                              "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
+                              "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
+                              "-c:a", "mp2", "-f", "mpegts", to});
+            // (a busy Mac runner once took more than ten seconds to start the command, and once more than a minute:
+            // wait longer, and say what the process reports and how busy the machine is when it does not start)
+            streams.push_back(std::move(p));
+            double load[3] = {-1, -1, -1};
+            const bool started = streams.back()->waitForStarted(180000);
+#ifndef _WIN32
+            if (!started) (void)getloadavg(load, 3);
+#endif
+            QVERIFY2(started, qPrintable(QString("state %1, error %2: %3; load %4 %5 %6")
+                                             .arg(int(streams.back()->state())).arg(int(streams.back()->error())).arg(streams.back()->errorString())
+                                             .arg(load[0]).arg(load[1]).arg(load[2])));
+        }
         // (waiting on pictures, not the clock: a busy machine is slow)
         QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, 60000);
         // Each tile's picture the one its timecode names, its hour the source's, close behind what was sent.
@@ -3186,6 +3195,9 @@ private slots:
                 if (std::abs(got - greyOf(first + in + k - j)) <= 6) return true;
             return false;
         };
+        // (pictures read before the file held a frame show its last one until the growing file is read again, every
+        // growingRefreshMs: the wait covers two of those readings, one of which may find the file mid-write)
+        const qint64 untilReadAgain = 2 * qint64(state()->growingRefreshMs()) + 20000;
         for (FrameTime k : {FrameTime(0), FrameTime(1), (out - in) / 2, out - in - 1, out - in}) {
             int got = -1;
             QElapsedTimer wait;
@@ -3194,7 +3206,7 @@ private slots:
                 if (got >= 0) QTest::qWait(200);
                 const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), k, {});
                 got = f.width > 0 ? int(std::lround(f.at(f.width / 2, f.height / 2)[1] * 255)) : 0;
-            } while (!matches(got, k) && wait.elapsed() < 15000);
+            } while (!matches(got, k) && wait.elapsed() < untilReadAgain);
             QVERIFY2(matches(got, k), qPrintable(QStringLiteral("frame %1: %2, sent %3 (sender %4 slots behind, %5 repeated)")
                                                      .arg(k).arg(got).arg(greyOf(first + in + k)).arg(tx[0].slotsSkipped())
                                                      .arg(mv->tile(0).repeated)));
@@ -5492,6 +5504,17 @@ private slots:
         // The next Montage (here, the window asked as at its start) takes it up by itself and writes the file again.
         QString said;
         connect(dialogs, &DialogJobs::finished, this, [&](const QString&, bool, const QString& text) { said = text; });
+        // While another Montage started with this one is taking it up (the job's lock is held), this one leaves it
+        // (nightly 15 Nov: both found it interrupted, and both wrote the files).
+        {
+            QLockFile other(jobs::jobFolder(r.id) + "/resume.lock");
+            QVERIFY(other.tryLock(0));
+            QCOMPARE(dialogs->resume(), 0);
+            QVERIFY(!dialogs->running());
+            QVERIFY(jobs::load(r.id, r));
+            QCOMPARE(r.status, QStringLiteral("interrupted"));
+            QCOMPARE(r.data.value("tries").toInt(), 0);
+        }
         QCOMPARE(dialogs->resume(), 1);
         QVERIFY(dialogs->running());
         QTRY_VERIFY_WITH_TIMEOUT(!dialogs->running(), 300000);
@@ -9906,6 +9929,40 @@ private slots:
         state()->newProject();
     }
 
+    // Nightly 15 Nov: two background exports naming one file both claim it as written, however the file is spelt.
+    void mcpExportsClaimTheFileTheyWrite() {
+        const QString folder = dir_.filePath("claims");
+        QVERIFY(QDir().mkpath(folder + "/out"));
+        const QString wav = folder + "/out/master.wav";
+        // An export tool that leaves the project as it is still writes its path: two such calls overlap.
+        for (const char* tool : {"montage_export_adm", "montage_export_iamf", "montage_export_lut", "montage_export_markers"}) {
+            const McpCallPaths a = mcpCallPaths(tool, {{"project", folder + "/p.montage"}, {"path", wav}}, true);
+            QVERIFY2(a.writes.size() == 1 && a.reads.isEmpty(), tool);
+            const McpCallPaths b = mcpCallPaths(tool, {{"path", folder + "/out/../out/master.wav"}}, true);
+            QCOMPARE(b.writes, a.writes);
+        }
+        // A tool that only reads its path still reads it, so two of them run together.
+        const McpCallPaths probe = mcpCallPaths("montage_probe_media", {{"path", wav}}, true);
+        QVERIFY(probe.writes.isEmpty() && probe.reads.size() == 1);
+        const McpCallPaths written = mcpCallPaths("montage_export_adm", {{"path", wav}}, true);
+        QVERIFY(mcpPathsOverlap(probe.reads.front(), written.writes.front()));
+        // A file inside a folder another call writes overlaps it; a neighbour whose name only starts the same does not.
+        const McpCallPaths render = mcpCallPaths("montage_export_dcp", {{"folder", folder + "/out"}}, false);
+        QCOMPARE(render.writes.size(), 1);
+        QVERIFY(mcpPathsOverlap(written.writes.front(), render.writes.front()));
+        QVERIFY(mcpPathsOverlap(render.writes.front(), written.writes.front()));
+        QVERIFY(!mcpPathsOverlap(mcpCallPaths("montage_export_adm", {{"path", folder + "/outer.wav"}}, true).writes.front(), render.writes.front()));
+        // The same file reached through a symbolic link to its folder is the same file, before it exists too.
+#ifndef Q_OS_WIN
+        if (QFile::link(folder + "/out", folder + "/link")) {
+            const McpCallPaths linked = mcpCallPaths("montage_export_adm", {{"path", folder + "/link/master.wav"}}, true);
+            QCOMPARE(linked.writes, written.writes);
+            const McpCallPaths deeper = mcpCallPaths("montage_export_adm", {{"path", folder + "/link/new/deep.wav"}}, true);
+            QVERIFY(mcpPathsOverlap(deeper.writes.front(), render.writes.front()));
+        }
+#endif
+    }
+
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
     void kdmsForScreensFromAnFlm() {
         if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");
@@ -9962,21 +10019,34 @@ private slots:
             return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         };
         // Read into the facility list (no DKDM: only read): refused while its roots are not trusted, naming their
-        // thumbprints; taken once they are given, as the user confirmed them.
+        // thumbprints. The refusal does not tell the caller how to trust them.
         QJsonObject r = call({{"flm", QJsonArray{flmFile}}});
         QVERIFY(r.value("isError").toBool());
+        QVERIFY2(!QJsonDocument(r).toJson().contains("trust_roots"), QJsonDocument(r).toJson().constData());
         QJsonArray thumbprints;
+        std::vector<std::string> roots;
         for (const dcp::CertificateChain* c : {&servers[0], &servers[1], &projectors[0], &projectors[1]}) {
             dcp::CertificateInfo root;
             QVERIFY(dcp::readCertificate(c->certificates.front(), root));
             QVERIFY2(QJsonDocument(r).toJson().contains(root.thumbprint.c_str()), QJsonDocument(r).toJson().constData());
-            if (c != &projectors[1]) thumbprints.append(QString::fromStdString(root.thumbprint));
+            thumbprints.append(QString::fromStdString(root.thumbprint));
+            roots.push_back(c->certificates.front());
         }
+        // A caller that passes the thumbprints back, or the roots as files, trusts nothing: the call is refused, no
+        // root is kept, and the list is still not read.
+        std::vector<std::string> kept;
         r = call({{"flm", QJsonArray{flmFile}}, {"trust_roots", thumbprints}});
-        QVERIFY(r.value("isError").toBool());  // (one still missing)
+        QVERIFY(r.value("isError").toBool());
         const QString rootFile = dir_.filePath("projector-root.pem");
         QVERIFY(dcp::writeWholeFile(rootFile.toStdString(), projectors[1].certificates.front()));
         r = call({{"flm", QJsonArray{flmFile}}, {"trust_roots", QJsonArray{rootFile}}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY2(loadTrustedRoots(kept, &err), err.c_str());
+        QVERIFY(kept.empty());
+        QVERIFY(call({{"flm", QJsonArray{flmFile}}}).value("isError").toBool());
+        // Once the user has trusted the roots (as File > Make KDMs > Read FLMs does), the list is read.
+        QVERIFY2(trustRoots(roots, &err), err.c_str());
+        r = call({{"flm", QJsonArray{flmFile}}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonArray cinemas = r.value("structuredContent").toObject().value("cinemas").toArray();
         QVERIFY(cinemas.size() == 1 && cinemas.at(0).toObject().value("cinema").toString() == "Park Screens");
@@ -13736,6 +13806,37 @@ const auto seq = [this] { return state()->sequence(); };
         size_t after = 0;
         for (int t = 0; t < 3; ++t) after += state()->sequence()->audioTracks[size_t(t)].clips.size();
         QCOMPARE(after, before);
+        // An input with two channels (nightly 15 Nov): the group's first two tracks record, A2 then A1, a channel each;
+        // A3, with no channel of its own, records nothing (it was given the first channel again).
+        rec.setFeedChannels(2);
+        QVERIFY(rec.start(300, 1, 330, {}, false, 48000, 1));
+        std::vector<float> two(4800 * 2);
+        at = 0;
+        for (int b = 0; b < 15; ++b, at += 4800) {
+            for (qint64 i = 0; i < 4800; ++i)
+                for (int ch = 0; ch < 2; ++ch) two[size_t(i * 2 + ch)] = value(at + i, ch);
+            rec.feed(two.data(), 4800);
+        }
+        QTRY_VERIFY(!rec.isRecording());
+        rec.setFeedChannels(0);
+        {
+            const Sequence& now = *state()->sequence();
+            QVERIFY(!edit::clipAt(now, {TrackKind::Audio, 2}, 310));
+            const int channelOfTwo[2] = {1, 0};
+            for (int t = 0; t < 2; ++t) {
+                const Clip* c = edit::clipAt(now, {TrackKind::Audio, t}, 310);
+                QVERIFY2(c, qPrintable(QStringLiteral("no clip on A%1").arg(t + 1)));
+                const MediaItem* m = state()->project().findMedia(c->mediaId);
+                QVERIFY(m);
+                QFile f(QString::fromStdString(m->path));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                f.seek(44);
+                const QByteArray data = f.readAll();
+                QCOMPARE(qint64(data.size() / 4), qint64(48000));
+                const float* x = reinterpret_cast<const float*>(data.constData());
+                for (qint64 i : {qint64(0), qint64(1), qint64(24000), qint64(47999)}) QCOMPARE(x[i], value(i, channelOfTwo[t]));
+            }
+        }
         // A track out of the group records alone.
         QVERIFY(state()->apply("Ungroup", [](Project&, Sequence& s) {
             s.audioTracks[2].group = 0;
@@ -13984,6 +14085,25 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(deck.chaseSamplesFromDevice(), int64_t(-1));
         feed.close();
         engine.removeInput(tap);
+        // A device chosen that is not there (a host no build opens): scrubbing's output is opened once for it, not at
+        // every seek (nightly 15 Nov: each seek asked for the device again and cut the snippet before short), and goes
+        // back to the device once that is open.
+        audiodev::DeviceSettings gone = ds;
+        gone.host = audiodev::Host::Asio;
+        engine.setSettings(gone);
+        QVERIFY(engine.active() && !engine.isOpen());
+        const int opened = program->scrubOutput()->opens();
+        for (int f = 20; f < 28; ++f) {
+            program->seek(f);
+            QTest::qWait(30);
+        }
+        QVERIFY(!program->scrubOutput()->onDevice());
+        QCOMPARE(program->scrubOutput()->opens() - opened, 1);
+        engine.setSettings(ds);
+        QVERIFY(engine.isOpen());
+        program->seek(30);
+        QVERIFY(program->scrubOutput()->onDevice());
+        QCOMPARE(program->scrubOutput()->opens() - opened, 2);
         engine.setSettings(before);
         state()->newProject();
     }
@@ -15476,6 +15596,46 @@ const auto seq = [this] { return state()->sequence(); };
         // A press away from the square is left to the monitor (no step).
         QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.1, 0.1));
         QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(1));
+        // An answer that comes late from a control in a host (nightly 15 Nov) writes only what is still as it was when
+        // the control was asked. What the user has set since stays, an undo is not undone by it, and an answer that
+        // leaves nothing to change makes no undo step. (It wrote all it set over whatever was there.)
+        {
+            Effect asked;
+            asked.params["x"] = Param(0.5), asked.params["y"] = Param(0.25);
+            asked.strings["mode"] = "a";
+            Effect changes;
+            changes.params["x"] = Param(0.6), changes.params["y"] = Param(0.3);
+            changes.strings["mode"] = "b";
+            Effect edited;
+            // (nothing changed since: all of it)
+            QVERIFY(OfxOverlay::lateAnswer(asked, asked, changes, edited));
+            QVERIFY(edited.params.at("x").value == 0.6 && edited.params.at("y").value == 0.3 && edited.strings.at("mode") == "b");
+            // (x and the mode set since: they stay, y is written)
+            Effect now = asked;
+            now.params["x"] = Param(0.9);
+            now.strings["mode"] = "c";
+            QVERIFY(OfxOverlay::lateAnswer(asked, now, changes, edited));
+            QVERIFY(edited.params.at("x").value == 0.9 && edited.params.at("y").value == 0.3 && edited.strings.at("mode") == "c");
+            // (x keyed since, at the same value: still the newer one)
+            now = asked;
+            now.params["x"].addKey(0, 0.5);
+            QVERIFY(OfxOverlay::lateAnswer(asked, now, changes, edited));
+            QVERIFY(edited.params.at("x").keys.size() == 1 && edited.params.at("y").value == 0.3);
+            // (everything put back by an undo to before the drag: nothing written)
+            Effect undone;
+            undone.params["x"] = Param(0.4), undone.params["y"] = Param(0.2);
+            undone.strings["mode"] = "z";
+            QVERIFY(!OfxOverlay::lateAnswer(asked, undone, changes, edited));
+            QVERIFY(edited.params.at("x").value == 0.4 && edited.strings.at("mode") == "z");
+            // (a parameter taken away since is not put back; one the answer adds, absent then and now, is added)
+            now = asked;
+            now.params.erase("y");
+            changes.params["z"] = Param(1.0);
+            QVERIFY(OfxOverlay::lateAnswer(asked, now, changes, edited));
+            QVERIFY(!edited.params.count("y") && edited.params.at("z").value == 1.0 && edited.params.at("x").value == 0.6);
+            // (what it sets is there already: no step)
+            QVERIFY(!OfxOverlay::lateAnswer(asked, asked, asked, edited));
+        }
         // With plug-ins in hosts of their own the control runs in the probe's host, which draws it there: the same
         // drag is the same one undo step, and one undo puts it back.
         {
@@ -23562,6 +23722,18 @@ print("added " + ui["name"])
         QVERIFY(relayOnly->isEnabled());
         dlg->findChild<QLineEdit*>("reviewStreamTurnUser")->setText(QStringLiteral("ana"));
         dlg->findChild<QLineEdit*>("reviewStreamTurnPassword")->setText(QStringLiteral("relay-secret"));
+        // A relay's shared secret, in place of the login, is not shown either; how long the link works is chosen
+        // only with one.
+        auto* secret = dlg->findChild<QLineEdit*>("reviewStreamTurnSecret");
+        auto* expiry = dlg->findChild<QComboBox*>("reviewStreamTurnExpiry");
+        QVERIFY(secret && expiry && secret->isVisibleTo(dlg) && expiry->isVisibleTo(dlg));
+        QCOMPARE(secret->echoMode(), QLineEdit::Password);
+        secret->clear();
+        QVERIFY(!expiry->isEnabled());
+        secret->setText(QStringLiteral("a secret made up for this test"));
+        QVERIFY(expiry->isEnabled());
+        QCOMPARE(expiry->currentData().toInt(), 86400);
+        secret->clear();
         rungs->setCurrentIndex(rungs->findData(2));
         hdr->setChecked(true);
         viewers->setCurrentIndex(viewers->findData(false));
@@ -23669,6 +23841,40 @@ print("added " + ui["name"])
         QCOMPARE(st.value("turn").toObject().value("url").toString(), QStringLiteral("turn:relay.example.com:3478"));
         QVERIFY(st.value("turn").toObject().value("relay_only").toBool());
         QVERIFY(!QJsonDocument(r).toJson().contains("another-secret"));  // (never the relay's password)
+        QVERIFY(!st.value("turn").toObject().contains("expires"));         // (a login that lasts: the link has no time)
+        call({{"action", "stop"}});
+        // The relay's shared secret from an agent in place of the login, with how long the link lasts: the status
+        // says when its time is up, and never the secret.
+        const QString relaySecret = QStringLiteral("a secret made up for this test");
+        const QJsonObject withSecret{{"url", "turn:relay.example.com:3478"}, {"secret", relaySecret}, {"expiry", 600}};
+        const qint64 startedAt = QDateTime::currentSecsSinceEpoch();
+        r = call({{"action", "start"}, {"turn", withSecret}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(controller->settings().turnSecret, relaySecret.toStdString());
+        QCOMPARE(controller->settings().turnExpirySeconds, 600);
+        QVERIFY(controller->settings().turnUser.empty() && controller->settings().turnPassword.empty());  // (the login kept from before is gone)
+        QVERIFY(controller->settings().relayOnly);                                                         // (as it was)
+        r = call({{"action", "status"}});
+        const QJsonObject timed = r.value("structuredContent").toObject().value("turn").toObject();
+        const qint64 until = QDateTime::fromString(timed.value("expires").toString(), Qt::ISODate).toSecsSinceEpoch();
+        QVERIFY2(until >= startedAt + 600 && until <= QDateTime::currentSecsSinceEpoch() + 600, qPrintable(timed.value("expires").toString()));
+        QVERIFY(timed.value("expires_in").toDouble() > 590 && timed.value("expires_in").toDouble() <= 600);
+        QVERIFY(!QJsonDocument(r).toJson().contains(relaySecret.toUtf8()));
+        QVERIFY2(controller->status().contains(QStringLiteral("the link works until")), qPrintable(controller->status()));
+        call({{"action", "stop"}});
+        // Refused: a time outside 30 seconds to 30 days, a time without a secret, and a secret together with a login.
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"expiry", 10}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"username", "bo"}, {"password", "another-secret"}, {"expiry", 600}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"secret", relaySecret}, {"username", "bo"}, {"password", "another-secret"}}}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(!controller->running());
+        // A login given afterwards takes the secret's place.
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"username", "bo"}, {"password", "another-secret"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(controller->settings().turnSecret.empty());
+        QCOMPARE(controller->settings().turnUser, std::string("bo"));
         call({{"action", "stop"}});
         // Refused: another relay without its own login (the last one's is not sent to it), more sizes than three, and
         // only through a relay with none.

@@ -717,7 +717,11 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
             if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_HEVC) {
                 int lengthSize = 0;
                 const auto sets = hrd::parameterSets(par->codec_id, par->extradata, size_t(std::max(0, par->extradata_size)), lengthSize);
-                splicer.start(par->codec_id, sets, lengthSize, fps, par->video_delay > 0 ? par->video_delay : 2);
+                // (how far its pictures are reordered: the deepest any segment's stream states, none when none does,
+                // so pictures coded in the order shown are shown as they are decoded)
+                int depth = 0;
+                for (const auto& seg : segs) depth = std::max(depth, seg->fmt->streams[seg->v]->codecpar->video_delay);
+                splicer.start(par->codec_id, sets, lengthSize, fps, depth);
             }
             keptHrd = splicer.active();
         }

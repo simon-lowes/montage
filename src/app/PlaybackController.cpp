@@ -988,15 +988,19 @@ void PlaybackController::scrubAudio(FrameTime t) {
     if (!scrubbing_ || !s || s->audioTracks.empty() || globalMute_ || (monitoring_.on && monitoring_.mute)) return;
     // Through the audio device chosen (its ports, as playback's), else Qt Multimedia's output; opened again when the
     // sequence's rate or the device chosen changes.
-    const bool device = audiodev::Engine::shared().active();
+    audiodev::Engine& engine = audiodev::Engine::shared();
+    const bool device = engine.active();
     if (!scrubOut_) scrubOut_ = new SoundOut(this);
-    if (!scrubOut_->isOpen() || scrubOut_->rate() != s->sampleRate || scrubOut_->onDevice() != device) {
-        if (scrubNoOutput_ && scrubTriedDevice_ == device && scrubTriedRate_ == s->sampleRate) return;
+    // (a device chosen but not there now leaves the snippets on Qt Multimedia's output: it is asked for again once it
+    // is open, not at every frame, which held the window up and cut each snippet short)
+    const bool asTried = scrubTriedDevice_ == device && scrubTriedRate_ == s->sampleRate;
+    const bool deviceMoved = asTried && device && scrubOut_->onDevice() != engine.isOpen();  // (gone, or back)
+    if (!asTried || deviceMoved || (!scrubNoOutput_ && !scrubOut_->isOpen())) {
         scrubTriedDevice_ = device;
         scrubTriedRate_ = s->sampleRate;
         scrubNoOutput_ = !scrubOut_->open(s->sampleRate, 2, 0.15);
-        if (scrubNoOutput_) return;  // (nothing to play on: not tried again until that changes)
     }
+    if (scrubNoOutput_) return;  // (nothing to play on: not tried again until that changes)
     // One frame of audio (at least 40 ms), faded at both ends to avoid clicks.
     const int frames = std::max(int(s->sampleRate / s->fpsValue()), s->sampleRate / 25);
     if (scrubOut_->room() < frames) return;  // still playing the previous snippet

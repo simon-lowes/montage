@@ -69,8 +69,10 @@ EOF
     --backend=headless --fake-seat --renderer=gl --width=1280 --height=720 --shell=kiosk --socket="$socket" \
     --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto,gl-renderer-paint-nodes,color-lcms-transformations &
   weston=$!
+  # (Up to a minute: the first Weston of a run loads Mesa and its LLVM from a cold disk, which has taken 17 s on a
+  # busy runner.)
   local i
-  for i in $(seq 100); do
+  for i in $(seq 600); do
     [ -S "$XDG_RUNTIME_DIR/$socket" ] && break
     kill -0 "$weston" 2> /dev/null || break
     sleep 0.1

@@ -133,6 +133,8 @@ private:
     QLineEdit* turn_;
     QLineEdit* turnUser_;
     QLineEdit* turnPassword_;
+    QLineEdit* turnSecret_;
+    QComboBox* turnExpiry_;
     QCheckBox* relayOnly_;
     QComboBox* rungs_;
     QCheckBox* hdr_;

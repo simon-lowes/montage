@@ -2242,6 +2242,16 @@ void Recorder::run() {
             }
             ok = decode(item, false);
             av_packet_free(&item.packet);
+            if (!ok && switched && !watchOnly && headerWritten && fatal.rfind("Cannot write ", 0) == 0) {
+                // A file begun while the feed was received (recordTo) that can no longer be written (a full disk, a
+                // drive gone): ended with what it holds, said, and the feed watched on.
+                const std::string path = file.path, why = fatal;
+                endFile();
+                fatal.clear();
+                if (onFileFinished) onFileFinished(path, false, why);
+                setFile({});
+                ok = true;
+            }
         }
         // Stopped: the sound already read up to the picture's end kept.
         s->stopping = true;

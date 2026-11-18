@@ -13,6 +13,15 @@
 // - Direct3D 11 (Windows): the compositor runs on FFmpeg's D3D11VA device (sharedD3D11Device); each frame's slice of
 //   the decoder's texture array is copied on the GPU into a texture the shaders can read, a view a plane.
 // A frame that cannot be mapped is copied back by the caller (YcbcrPlanes' planesInMemory), as before.
+//
+// What takes work to make of a frame is made once and kept with the frame while the frame cache holds it
+// (YcbcrPlanes::gpuKept), so a frame drawn again is not imported or copied again: VA-API's frame as a Vulkan frame or as
+// EGL images, a CUDA frame copied by FFmpeg into a Vulkan frame (through memory Vulkan exports to CUDA), the planes of a
+// one-image Vulkan frame copied on the GPU, a D3D11VA frame's slice copied on the GPU. Not done, as Qt's RHI gives no
+// way to: a view of one plane of a multiplane image or of one slice of the decoder's texture array (those are still
+// copied on the GPU, once a cached frame), and the decoder's semaphore waited for in the compositor's own submission
+// (it is waited for before the frame is drawn, or in the copy's submission). D3D12VA's frames are not taken: FFmpeg
+// does not make them shareable with another device.
 
 #include <memory>
 #include <string>
@@ -40,7 +49,8 @@ void lockSharedD3D11(bool lock);
 
 struct Planes {
     QRhiTexture* tex[3] = {};  // Y, then CbCr (or Cb and Cr): the formats the compositor uploads planes in
-    bool copied = false;       // copied on the GPU (a device copy, not a read-back)
+    bool copied = false;       // copied on the GPU for this draw (a device copy, not a read-back)
+    bool imported = false;     // made for this draw (an import or a copy), not kept from an earlier draw of the frame
     std::string how;           // e.g. "mapped from vulkan, no copy"
 };
 

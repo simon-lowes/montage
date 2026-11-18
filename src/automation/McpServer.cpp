@@ -804,6 +804,65 @@ QString json(const QJsonObject& o) { return QString::fromUtf8(QJsonDocument(o).t
 
 // ---- Tools ------------------------------------------------------------------------------
 
+// A path as one name for the file it is: symbolic links followed as far as the path exists, and letter case folded
+// where the file system ignores it, so two spellings of one file are seen as one.
+static QString oneNameFor(const QString& path) {
+    QString clean = QDir::cleanPath(absolute(path));
+    QString rest;
+    QFileInfo at(clean);
+    // (what does not exist yet, an output and perhaps its folders, is kept as written under the part that does)
+    while (!at.exists() && !at.isRoot()) {
+        const QString parent = at.path();
+        if (parent == at.filePath()) break;
+        rest = rest.isEmpty() ? at.fileName() : at.fileName() + QLatin1Char('/') + rest;
+        at = QFileInfo(parent);
+    }
+    QString base = at.exists() ? at.canonicalFilePath() : at.filePath();
+    if (base.isEmpty()) base = at.filePath();
+    if (!rest.isEmpty()) base = base.endsWith(QLatin1Char('/')) ? base + rest : base + QLatin1Char('/') + rest;
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    base = base.toLower();
+#endif
+    return base;
+}
+
+McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOnly) {
+    McpCallPaths out;
+    // (an export tool's path or file is where it writes, whether or not it leaves the project as it is)
+    const bool exports = tool.startsWith(QLatin1String("montage_export_"));
+    const auto kind = [readOnly, exports](const QString& k) {
+        const auto named = [&k](const char* n) { return k == QLatin1String(n) || k.endsWith(QLatin1Char('_') + QLatin1String(n)); };
+        for (const char* w : {"output", "report"})
+            if (named(w)) return 2;
+        for (const char* f : {"folder", "dir"})
+            if (named(f)) return readOnly ? 1 : 2;
+        for (const char* r : {"path", "file"})
+            if (named(r)) return exports ? 2 : 1;
+        for (const char* r : {"files", "paths"})
+            if (named(r)) return 1;
+        return 0;
+    };
+    for (auto it = a.begin(); it != a.end(); ++it) {
+        const int k = kind(it.key());
+        if (!k) continue;
+        const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
+        for (const QJsonValue& v : list)
+            if (v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << oneNameFor(v.toString());
+    }
+    out.writes.removeDuplicates();
+    out.reads.removeDuplicates();
+    for (const QString& w : out.writes) out.reads.removeAll(w);
+    return out;
+}
+
+bool mcpPathsOverlap(const QString& a, const QString& b) {
+    if (a == b) return true;
+    const auto inside = [](const QString& in, const QString& folder) {
+        return in.size() > folder.size() && in.startsWith(folder) && (folder.endsWith(QLatin1Char('/')) || in.at(folder.size()) == QLatin1Char('/'));
+    };
+    return inside(a, b) || inside(b, a);
+}
+
 struct McpServer::Impl {
     struct Tool {
         QString name, title, description;
@@ -899,37 +958,8 @@ struct McpServer::Impl {
         int readers = 0, writers = 0;
     };
     std::map<QString, PathUse> pathsInUse;
-    // The paths a call's arguments name: what it writes (output, report, any *_output or *_report, and of a tool that
-    // is not read-only the folders too: folder, dir, any *_folder or *_dir, where exports write) and what it reads (path,
-    // file, files, paths, any *_path or *_file, and a read-only tool's folders; lists of them too). A path it both reads
-    // and writes counts as written.
-    struct CallPaths {
-        QStringList writes, reads;
-    };
-    static CallPaths pathsOf(const QJsonObject& a, bool readOnly) {
-        CallPaths out;
-        const auto kind = [readOnly](const QString& k) {
-            const auto named = [&k](const char* n) { return k == QLatin1String(n) || k.endsWith(QLatin1Char('_') + QLatin1String(n)); };
-            for (const char* w : {"output", "report"})
-                if (named(w)) return 2;
-            for (const char* f : {"folder", "dir"})
-                if (named(f)) return readOnly ? 1 : 2;
-            for (const char* r : {"path", "file", "files", "paths"})
-                if (named(r)) return 1;
-            return 0;
-        };
-        for (auto it = a.begin(); it != a.end(); ++it) {
-            const int k = kind(it.key());
-            if (!k) continue;
-            const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
-            for (const QJsonValue& v : list)
-                if (v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << QDir::cleanPath(absolute(v.toString()));
-        }
-        out.writes.removeDuplicates();
-        out.reads.removeDuplicates();
-        for (const QString& w : out.writes) out.reads.removeAll(w);
-        return out;
-    }
+    // The paths a call's arguments name (mcpCallPaths): what it writes and what it reads.
+    using CallPaths = McpCallPaths;
     struct OutputClaim {
         Impl* d = nullptr;
         CallPaths paths;
@@ -953,11 +983,14 @@ struct McpServer::Impl {
     // uses, or uses one it writes; false when the call is cancelled or the server stops meanwhile.
     bool claimOutputs(OutputClaim& claim, const CallPaths& paths, const std::atomic<bool>& cancel) {
         std::unique_lock l(outputsMutex);
+        // (a path in use stands for all inside it too: an output inside a folder another call writes waits for it)
         const auto free = [&] {
-            for (const QString& p : paths.writes)
-                if (auto it = pathsInUse.find(p); it != pathsInUse.end() && (it->second.readers > 0 || it->second.writers > 0)) return false;
-            for (const QString& p : paths.reads)
-                if (auto it = pathsInUse.find(p); it != pathsInUse.end() && it->second.writers > 0) return false;
+            for (const auto& [used, use] : pathsInUse) {
+                for (const QString& p : paths.writes)
+                    if ((use.readers > 0 || use.writers > 0) && mcpPathsOverlap(p, used)) return false;
+                for (const QString& p : paths.reads)
+                    if (use.writers > 0 && mcpPathsOverlap(p, used)) return false;
+            }
             return true;
         };
         while (!free()) {
@@ -1170,7 +1203,7 @@ struct McpServer::Impl {
             else alone.lock();
             OutputClaim outputs;
             const bool claimed = !job->sideBySide || tool == tools.end() ||
-                                 claimOutputs(outputs, pathsOf(job->args, tool->readOnly), job->cancel);
+                                 claimOutputs(outputs, mcpCallPaths(tool->name, job->args, tool->readOnly), job->cancel);
             {
                 std::lock_guard jl(job->m);
                 if (!claimed || job->cancel || tool == tools.end()) {
@@ -12858,15 +12891,14 @@ void McpServer::Impl::addTools() {
         "devices in AuthorizedDeviceInfo, a folder and a zip for each cinema. `flm` reads Facility List Messages (Extended "
         "FLMs, SMPTE ST 430-16, or ST 430-7 FLMs) into the facility list first, every certificate chain checked; with "
         "`flm` alone (no dkdm) it only reads them. An FLM is read only when each chain in it goes up to a root the user "
-        "trusts, or ends in a certificate the list already holds for that cinema: `trust_roots` adds roots (a root "
-        "certificate file, or the thumbprint of a root in the FLM that the user has confirmed with its maker or the "
-        "cinema; an FLM refused names its roots' thumbprints). A cinema's changed server certificates are returned in "
-        "`changes`. The window must sit inside the DKDM's and each server certificate's. "
+        "trusts, or ends in a certificate the list already holds for that cinema. Only the user trusts a root, in "
+        "Montage itself (File > Make KDMs > Read FLMs shows each root's thumbprint to check with its maker or the "
+        "cinema): this tool cannot, and an FLM it refuses is for the user to read there. A cinema's changed server "
+        "certificates are returned in `changes`. The window must sit inside the DKDM's and each server certificate's. "
         "Returns the KDM files, the cinemas' zips, and the cinemas and screens read.",
         R"json({"type":"object","properties":{"dkdm":{"type":"string","description":"The DCP's DKDM (montage_export_dcp returns it)"},
             "servers":{"type":"array","items":{"type":"string"},"description":"The servers' certificate files (PEM)"},
             "flm":{"type":"array","items":{"type":"string"},"description":"FLM files to read into the facility list (kept for later bookings)"},
-            "trust_roots":{"type":"array","items":{"type":"string"},"description":"Roots to trust: root certificate files (PEM), or thumbprints (base64 SHA-1) of roots in the FLMs, confirmed by the user"},
             "screens":{"type":"array","items":{"type":"string"},"description":"Screens from the facility list: \"Cinema/Screen\", or \"Cinema\" for all its screens"},
             "from":{"type":"string","description":"ISO 8601 date and time; default now"},
             "until":{"type":"string","description":"ISO 8601 date and time; default a week after from"},
@@ -12882,32 +12914,15 @@ void McpServer::Impl::addTools() {
             }
             QJsonArray changed;
             if (reading) {
-                // The roots trusted: the user's, with the files and thumbprints given added.
-                std::vector<std::string> trusted, files;
-                QStringList thumbprints;
-                for (const QJsonValue& v : a.value("trust_roots").toArray()) {
-                    const QString t = v.toString().trimmed();
-                    if (QRegularExpression(QStringLiteral("^[A-Za-z0-9+/]{27}=$")).match(t).hasMatch()) thumbprints << t;
-                    else {
-                        QFile c(absolute(t));
-                        if (!c.open(QIODevice::ReadOnly)) throw ArgError{QStringLiteral("Cannot read the root certificate %1").arg(t)};
-                        files.push_back(c.readAll().toStdString());
-                    }
-                }
-                if (!files.empty() && !trustRoots(files, &err)) return fail(QString::fromStdString(err));
+                // The roots trusted are the user's own, and only the user adds to them: a caller that could would
+                // get a forged list read by naming the roots the refusal told it of, and its KDMs would go to the forger.
+                if (a.contains("trust_roots"))
+                    throw ArgError{"trust_roots is no longer taken: only the user trusts a root, in Montage (File > Make KDMs > Read FLMs)"};
+                std::vector<std::string> trusted;
                 if (!loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
                 for (const QJsonValue& v : a.value("flm").toArray()) {
                     Facility f;
                     if (!readFlmFile(absolute(v.toString()).toStdString(), f, &err)) return fail(QString::fromStdString(err));
-                    // (a thumbprint given trusts the root of the FLM that has it)
-                    std::vector<std::string> confirmed;
-                    for (const std::string& root : untrustedRoots(f, facilities, trusted)) {
-                        dcp::CertificateInfo info;
-                        if (dcp::readCertificate(root, info) && thumbprints.contains(QString::fromStdString(info.thumbprint))) confirmed.push_back(root);
-                    }
-                    if (!confirmed.empty()) {
-                        if (!trustRoots(confirmed, &err) || !loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
-                    }
                     QJsonArray screens, notes;
                     for (const FacilityScreen& sc : f.screens) {
                         QJsonArray devices;
@@ -12924,7 +12939,8 @@ void McpServer::Impl::addTools() {
                                             {"source", QString::fromStdString(f.source)}, {"screens", screens}, {"notes", notes}});
                     std::vector<std::string> changes;
                     if (!takeFlm(facilities, std::move(f), trusted, &err, nullptr, &changes))
-                        return fail(QString::fromStdString(err) + QStringLiteral(" (then pass its thumbprint in trust_roots)"));
+                        return fail(QString::fromStdString(err) +
+                                    QStringLiteral(". This tool cannot trust a root: ask the user to read the FLM in Montage (File > Make KDMs > Read FLMs)"));
                     for (const std::string& c : changes) changed.append(QString::fromStdString(c));
                 }
                 if (!saveFacilities(facilities, &err)) return fail(QString::fromStdString(err));
@@ -13312,7 +13328,7 @@ void McpServer::Impl::addTools() {
                     "record":{"type":"string","description":"The recording made alongside (.mov or .mxf; default the folder's name with .mov, beside it)"},
                     "capture_codec":{"type":"string","default":"prores_proxy","description":"The recording's codec (prores_proxy ... dnxhr_hqx)"},
                     "window":{"type":"integer","minimum":3,"maximum":100,"default":6,"description":"Segments the playlists and the MPD's time-shift buffer hold"},
-                    "part_seconds":{"type":"number","minimum":0.1,"maximum":1,"default":0.5},
+                    "part_seconds":{"type":"number","minimum":0.1,"maximum":1,"default":0.5,"description":"With low_latency: a part's length (with sound, 13 of its coded frames at least: 0.28 for AAC, 0.26 for Opus, 0.42 for AC-3 and E-AC-3; a shorter one is made that long)"},
                     "serve":{"type":"boolean","default":false,"description":"Serve the package over HTTP while it records (blocking playlist reloads, growing segments sent as they grow)"},
                     "port":{"type":"integer","minimum":0,"maximum":65535,"default":0,"description":"serve: the port (0 any free one)"},
                     "address":{"type":"string","enum":["127.0.0.1","0.0.0.0"],"default":"127.0.0.1","description":"serve: this computer only, or the network's"},

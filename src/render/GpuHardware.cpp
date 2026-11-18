@@ -3,8 +3,10 @@
 #include <QtGlobal>
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <type_traits>
 
 #include "media/HwAccel.h"
@@ -128,6 +130,120 @@ void lockSharedD3D11(bool lock) {
 namespace {
 
 // ---------------------------------------------------------------------------------------------------------------------
+// What a mapper made of hardware frames, kept with each frame while the frame is (YcbcrPlanes::gpuKept): a frame drawn
+// again uses what its first draw made. The part only the compositor's thread may let go (textures, and what they stand
+// on) stays here under a number; the frame holds a note of that number, and when the frame goes, on whatever thread,
+// the note lists the number as gone: the mapper lets it go at its next prune(), or with everything else when it goes
+// itself (before its RHI does). The frame as another API's frame (FFmpeg's mapping of it) is the note's own and goes
+// with the frame at once, so that the decoder's surface is not held past its frame.
+
+struct KeptTextures {
+    QRhiTexture* tex[3] = {};
+    std::function<void()> release;  // (after the textures: what they stand on)
+    std::string how;                // (what MONTAGE_GPU_LOG says of a later draw)
+};
+
+class Keeper {
+public:
+    Keeper() : book_(std::make_shared<Book>()) {}
+    ~Keeper() {
+        clear();
+        std::lock_guard lock(book_->mutex);
+        book_->open = false;
+    }
+    Keeper(const Keeper&) = delete;
+    Keeper& operator=(const Keeper&) = delete;
+
+    struct Found {
+        const KeptTextures* textures = nullptr;
+        std::shared_ptr<const AVFrame> mapped;
+    };
+    // What this mapper keeps for the frame.
+    Found find(const YcbcrPlanes& yc) const {
+        Found f;
+        if (!yc.gpuKept) return f;
+        std::shared_ptr<void> made;
+        {
+            std::lock_guard lock(yc.gpuKept->mutex);
+            made = yc.gpuKept->made;
+        }
+        const auto note = std::static_pointer_cast<Note>(made);  // (only notes are ever put there)
+        if (!note || note->book != book_) return f;              // (nothing, or another mapper's, from before the device was lost)
+        f.mapped = note->mapped;
+        if (const auto it = kept_.find(note->id); it != kept_.end()) f.textures = &it->second;
+        return f;
+    }
+    // Keeps the frame as another API's frame, and textures made of it, with the frame (in place of what was kept for it
+    // before). False when the frame has no place for them: they stay the caller's, for this draw.
+    bool keep(const YcbcrPlanes& yc, std::shared_ptr<const AVFrame> mapped, KeptTextures* textures) {
+        if (!yc.gpuKept) return false;
+        auto note = std::make_shared<Note>();
+        note->book = book_;
+        note->id = ++last_;
+        note->mapped = std::move(mapped);
+        if (textures) kept_[note->id] = std::move(*textures);
+        std::shared_ptr<void> before = note;
+        {
+            std::lock_guard lock(yc.gpuKept->mutex);
+            before.swap(yc.gpuKept->made);
+        }
+        return true;  // (what was kept before goes here, outside the frame's lock)
+    }
+    // What was kept for frames that have gone, let go (on the compositor's thread, with its context where it needs one).
+    void prune() {
+        std::vector<uint64_t> gone;
+        {
+            std::lock_guard lock(book_->mutex);
+            gone.swap(book_->gone);
+        }
+        for (uint64_t id : gone)
+            if (const auto it = kept_.find(id); it != kept_.end()) {
+                letGo(it->second);
+                kept_.erase(it);
+            }
+    }
+    void clear() {
+        for (auto& [id, t] : kept_) letGo(t);
+        kept_.clear();
+    }
+    bool empty() const { return kept_.empty(); }
+
+private:
+    struct Book {
+        std::mutex mutex;
+        bool open = true;  // (its mapper lives)
+        std::vector<uint64_t> gone;
+    };
+    struct Note {
+        std::shared_ptr<Book> book;
+        uint64_t id = 0;
+        std::shared_ptr<const AVFrame> mapped;
+        ~Note() {
+            std::lock_guard lock(book->mutex);
+            if (book->open) book->gone.push_back(id);
+        }
+    };
+    static void letGo(KeptTextures& t) {
+        for (QRhiTexture*& x : t.tex) delete x, x = nullptr;
+        if (t.release) t.release();
+        t.release = nullptr;
+    }
+    std::shared_ptr<Book> book_;
+    std::map<uint64_t, KeptTextures> kept_;
+    uint64_t last_ = 0;
+};
+
+#if defined(MONTAGE_GPU_HW_VULKAN) || defined(MONTAGE_GPU_HW_EGL)
+// (FFmpeg's frame, freed with its last holder.)
+std::shared_ptr<const AVFrame> owned(AVFrame* frame) {
+    return std::shared_ptr<const AVFrame>(frame, [](const AVFrame* f) {
+        AVFrame* g = const_cast<AVFrame*>(f);
+        av_frame_free(&g);
+    });
+}
+#endif
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Vulkan: on FFmpeg's own device.
 
 #ifdef MONTAGE_GPU_HW_VULKAN
@@ -174,10 +290,25 @@ public:
         ok_ = allocateCommandBuffers_(vk_->act_dev, &ai, &cmd_) == VK_SUCCESS;
         // (VA-API's frames come over through DMA-BUF, which FFmpeg imports where the device has both extensions.)
         dmabuf_ = hasExtension(vk_, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) && hasExtension(vk_, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+        // (CUDA's frames are copied by FFmpeg into memory this device exports to it: where FFmpeg knows CUDA and the
+        // device has the extensions FFmpeg's copy asks for.)
+#ifdef _WIN32
+        const char* const memory = "VK_KHR_external_memory_win32";
+        const char* const semaphore = "VK_KHR_external_semaphore_win32";
+#else
+        const char* const memory = "VK_KHR_external_memory_fd";
+        const char* const semaphore = "VK_KHR_external_semaphore_fd";
+#endif
+        bool known = false;
+        for (AVHWDeviceType t = av_hwdevice_iterate_types(AV_HWDEVICE_TYPE_NONE); t != AV_HWDEVICE_TYPE_NONE; t = av_hwdevice_iterate_types(t))
+            if (t == AV_HWDEVICE_TYPE_CUDA) known = true;
+        cuda_ = known && hasExtension(vk_, memory) && hasExtension(vk_, semaphore);
     }
     ~VulkanMapper() override {
         endFrame();
+        keeper_.clear();
         for (auto& [key, d] : derived_) av_buffer_unref(&d.source), av_buffer_unref(&d.vulkan);
+        for (auto& [key, frames] : uploads_) av_buffer_unref(&frames);
         if (fence_) destroyFence_(vk_->act_dev, fence_, vk_->alloc);
         if (pool_) destroyCommandPool_(vk_->act_dev, pool_, vk_->alloc);
         av_buffer_unref(&device_);
@@ -185,23 +316,39 @@ public:
     bool ok() const { return ok_; }
 
     std::vector<AVHWDeviceType> types() const override {
-        if (dmabuf_) return {AV_HWDEVICE_TYPE_VULKAN, AV_HWDEVICE_TYPE_VAAPI};
-        return {AV_HWDEVICE_TYPE_VULKAN};
+        // (CUDA's until a copy of one onto this device has failed: the compositor asks again after a frame it could not
+        // map, and decoders go back to copying theirs to memory.)
+        std::vector<AVHWDeviceType> t = {AV_HWDEVICE_TYPE_VULKAN};
+        if (cuda_ && !cudaFailed_) t.push_back(AV_HWDEVICE_TYPE_CUDA);
+        if (dmabuf_) t.push_back(AV_HWDEVICE_TYPE_VAAPI);
+        return t;
     }
 
     bool map(const YcbcrPlanes& yc, QRhiCommandBuffer*, Planes& out, std::string* why) override {
+        // What an earlier draw of this frame made is used again: its planes' copies, or the frame as this device's.
+        const Keeper::Found kept = keeper_.find(yc);
+        if (kept.textures) {
+            std::copy(kept.textures->tex, kept.textures->tex + 3, out.tex);
+            out.how = kept.textures->how;
+            return true;
+        }
         std::shared_ptr<const AVFrame> frame = yc.hw;
-        if (frame->format == AV_PIX_FMT_VAAPI) {
-            // VA-API's surface onto this device, through DMA-BUF (FFmpeg's import).
-            AVFrame* mapped = dmabuf_ ? mapOnto(frame.get()) : nullptr;
-            if (!mapped) {
-                *why = dmabuf_ ? "its VA-API surface could not be imported into Vulkan" : "this Vulkan device does not import DMA-BUF";
-                return false;
+        std::shared_ptr<const AVFrame> onDevice = kept.mapped;  // (another API's frame as a frame of this device)
+        bool imported = false;
+        if (frame->format == AV_PIX_FMT_VAAPI || frame->format == AV_PIX_FMT_CUDA) {
+            if (!onDevice) {
+                // VA-API's surface onto this device through DMA-BUF (FFmpeg's import); CUDA's copied on the GPU.
+                AVFrame* made = nullptr;
+                if (frame->format == AV_PIX_FMT_CUDA) {
+                    if (!(made = transferOnto(frame.get()))) *why = "its CUDA frame could not be copied into Vulkan on the GPU";
+                } else if (!(made = dmabuf_ ? mapOnto(frame.get()) : nullptr)) {
+                    *why = dmabuf_ ? "its VA-API surface could not be imported into Vulkan" : "this Vulkan device does not import DMA-BUF";
+                }
+                if (!made) return false;
+                onDevice = owned(made);
+                imported = true;
             }
-            frame = std::shared_ptr<const AVFrame>(mapped, [](const AVFrame* f) {
-                AVFrame* g = const_cast<AVFrame*>(f);
-                av_frame_free(&g);
-            });
+            frame = onDevice;
         }
         if (frame->format != AV_PIX_FMT_VULKAN) {
             *why = std::string("frames of ") + yc.hwType + " are not mapped into Vulkan";
@@ -217,8 +364,25 @@ public:
         const int n = yc.interleaved ? 2 : 3;
         int images = 0;
         while (images < AV_NUM_DATA_POINTERS && vkf->img[images]) ++images;
-        if (images == n) return wrap(yc, frame, fc, vkfc, vkf, out, why);
-        if (images == 1) return copy(yc, frame, fc, vkfc, vkf, out, why);
+        if (images == n) {
+            if (!wrap(yc, frame, fc, vkfc, vkf, out, why)) return false;
+            // (the frame as this device's kept with the frame it was made of: imported once however often it is drawn)
+            if (imported) keeper_.keep(yc, onDevice, nullptr);
+            out.imported = imported;
+            return true;
+        }
+        if (images == 1) {
+            if (!copy(yc, frame, fc, vkfc, vkf, out, why)) return false;
+            // The copies kept with the frame (they stand on nothing of it: what was mapped for them can go); a frame
+            // with no place for them has them for this draw only.
+            KeptTextures made;
+            std::copy(out.tex, out.tex + 3, made.tex);
+            made.how = std::string("drawn from the copy made on the GPU of ") + yc.hwType + "'s Vulkan image when it was first drawn";
+            if (!keeper_.keep(yc, nullptr, &made))
+                for (int i = 0; i < n; ++i) copies_.push_back(out.tex[i]);
+            out.imported = true;
+            return true;
+        }
         *why = "a Vulkan frame of " + std::to_string(images) + " images for " + std::to_string(n) + " planes";
         return false;
     }
@@ -239,6 +403,7 @@ public:
         wrapped_.clear();
         for (QRhiTexture* t : copies_) delete t;
         copies_.clear();
+        keeper_.prune();
         // (VA-API's frames let go once their decoder has, and none of its frames mapped here is left: the derived
         // frames hold the only other reference.)
         for (auto it = derived_.begin(); it != derived_.end();)
@@ -381,8 +546,7 @@ private:
         resetFences_(vk_->act_dev, 1, &fence_);
         for (int i = 0; i < n; ++i) {
             made[i]->setNativeLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            copies_.push_back(made[i]);
-            out.tex[i] = made[i];
+            out.tex[i] = made[i];  // (map()'s to keep)
         }
         (void)frame;
         out.copied = true;
@@ -413,10 +577,36 @@ private:
         return dst;
     }
 
+    // A CUDA frame copied by FFmpeg into a frame of this device, an image a plane, on the GPU: through memory Vulkan
+    // exports to CUDA (null where FFmpeg's build or the driver cannot, after which it is not tried again).
+    AVFrame* transferOnto(const AVFrame* src) {
+        if (cudaFailed_) return nullptr;
+        const auto* fc = reinterpret_cast<const AVHWFramesContext*>(src->hw_frames_ctx->data);
+        AVBufferRef*& frames = uploads_[std::make_tuple(int(fc->sw_format), fc->width, fc->height)];
+        if (!frames) {
+            frames = av_hwframe_ctx_alloc(device_);
+            if (frames) {
+                auto* to = reinterpret_cast<AVHWFramesContext*>(frames->data);
+                to->format = AV_PIX_FMT_VULKAN;
+                to->sw_format = fc->sw_format;
+                to->width = fc->width;
+                to->height = fc->height;
+                static_cast<AVVulkanFramesContext*>(to->hwctx)->flags = AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE;
+                if (av_hwframe_ctx_init(frames) < 0) av_buffer_unref(&frames);
+            }
+        }
+        AVFrame* dst = frames ? av_frame_alloc() : nullptr;
+        if (dst && (av_hwframe_get_buffer(frames, dst, 0) < 0 || av_hwframe_transfer_data(dst, src, 0) < 0)) av_frame_free(&dst);
+        if (!dst) cudaFailed_ = true;
+        return dst;
+    }
+
     QRhi* rhi_;
     AVBufferRef* device_;
     AVVulkanDeviceContext* vk_ = nullptr;
-    bool ok_ = false, dmabuf_ = false;
+    bool ok_ = false, dmabuf_ = false, cuda_ = false, cudaFailed_ = false;
+    Keeper keeper_;
+    std::map<std::tuple<int, int, int>, AVBufferRef*> uploads_;  // (frames of this device CUDA's are copied into, by format and size)
     uint32_t family_ = 0;
     VkQueue queue_ = VK_NULL_HANDLE;
     VkCommandPool pool_ = VK_NULL_HANDLE;
@@ -461,7 +651,8 @@ public:
         return m->ok_ ? std::move(m) : nullptr;
     }
     ~EglMapper() override {
-        endFrame();
+        endFrame();  // (with the context current, where anything is left to let go)
+        keeper_.clear();
         dlclose(lib_);
     }
 
@@ -479,6 +670,12 @@ public:
     }
 
     bool map(const YcbcrPlanes& yc, QRhiCommandBuffer*, Planes& out, std::string* why) override {
+        // What an earlier draw of this frame imported is used again.
+        if (const Keeper::Found kept = keeper_.find(yc); kept.textures) {
+            std::copy(kept.textures->tex, kept.textures->tex + 3, out.tex);
+            out.how = kept.textures->how;
+            return true;
+        }
         AVFrame* drm = av_frame_alloc();
         if (!drm) return false;
         drm->format = AV_PIX_FMT_DRM_PRIME;
@@ -548,19 +745,36 @@ public:
             if (!t->createFrom({quint64(tex), 0})) ok = false;
             out.tex[i] = t;
         }
-        frames_.push_back(std::move(f));
         if (!ok) {
+            frames_.push_back(std::move(f));  // (let go with the frame drawn)
             *why = "its DMA-BUF planes could not be imported into OpenGL";
             for (QRhiTexture*& t : out.tex) t = nullptr;
             return false;
         }
+        out.imported = true;
         out.how = std::string("mapped from ") + yc.hwType + " through DMA-BUF into OpenGL, no copy";
+        if (!yc.gpuKept) {
+            frames_.push_back(std::move(f));  // (a frame with no place to keep it: imported for this draw only)
+            return true;
+        }
+        // Kept with the frame: its textures and EGL images here, let go on this thread once the frame has gone; the
+        // DMA-BUF's descriptors with the frame itself.
+        KeptTextures made;
+        std::copy(out.tex, out.tex + 3, made.tex);
+        made.how = std::string("drawn from ") + yc.hwType + "'s DMA-BUF as imported into OpenGL when it was first drawn";
+        made.release = [this, images = f.images, names = f.gl] {
+            if (QOpenGLContext* c = QOpenGLContext::currentContext(); c && !names.empty())
+                c->functions()->glDeleteTextures(GLsizei(names.size()), names.data());
+            for (EGLImageKHR image : images) destroyImage_(display_, image);
+        };
+        keeper_.keep(yc, owned(f.drm), &made);
         return true;
     }
 
     void endFrame() override {
-        if (frames_.empty()) return;
+        if (frames_.empty() && keeper_.empty()) return;
         rhi_->makeThreadLocalNativeContextCurrent();
+        keeper_.prune();
         QOpenGLFunctions* gl = QOpenGLContext::currentContext() ? QOpenGLContext::currentContext()->functions() : nullptr;
         for (Frame& f : frames_) {
             for (QRhiTexture* t : f.tex) delete t;
@@ -597,6 +811,7 @@ private:
     QRhi* rhi_;
     void* lib_;
     bool ok_ = false, modifiers_ = false;
+    Keeper keeper_;
     EGLDisplay display_ = EGL_NO_DISPLAY;
     PFNEGLCREATEIMAGEKHRPROC createImage_ = nullptr;
     PFNEGLDESTROYIMAGEKHRPROC destroyImage_ = nullptr;
@@ -689,6 +904,7 @@ public:
     }
     ~D3D11Mapper() override {
         endFrame();
+        keeper_.clear();
         av_buffer_unref(&device_);
     }
     std::vector<AVHWDeviceType> types() const override { return {AV_HWDEVICE_TYPE_D3D11VA}; }
@@ -702,6 +918,12 @@ public:
         if (fc->device_ctx != reinterpret_cast<AVHWDeviceContext*>(device_->data)) {
             *why = "a Direct3D 11 frame of another device";
             return false;
+        }
+        // The copy an earlier draw of this frame made is used again.
+        if (const Keeper::Found kept = keeper_.find(yc); kept.textures) {
+            std::copy(kept.textures->tex, kept.textures->tex + 3, out.tex);
+            out.how = kept.textures->how;
+            return true;
         }
         auto* src = reinterpret_cast<ID3D11Texture2D*>(yc.hw->data[0]);
         const UINT index = UINT(reinterpret_cast<intptr_t>(yc.hw->data[1]));
@@ -729,7 +951,17 @@ public:
             out.tex[i] = t;
         }
         out.copied = true;
+        out.imported = true;
         out.how = "copied on the GPU from d3d11va's texture array, a view a plane";
+        // The copy kept with the frame (a frame with no place for it has it for this draw only).
+        KeptTextures made;
+        std::copy(out.tex, out.tex + 3, made.tex);
+        made.how = "drawn from the copy made on the GPU of d3d11va's texture when it was first drawn";
+        made.release = [own] { own->Release(); };
+        if (keeper_.keep(yc, nullptr, &made)) {
+            tex_.resize(tex_.size() - 2);
+            owned_.pop_back();
+        }
         return true;
     }
 
@@ -738,12 +970,14 @@ public:
         tex_.clear();
         for (ID3D11Texture2D* t : owned_) t->Release();
         owned_.clear();
+        keeper_.prune();
     }
 
 private:
     QRhi* rhi_;
     AVBufferRef* device_;
     AVD3D11VADeviceContext* d3d_ = nullptr;
+    Keeper keeper_;
     std::vector<QRhiTexture*> tex_;
     std::vector<ID3D11Texture2D*> owned_;
 };

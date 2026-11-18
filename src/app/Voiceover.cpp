@@ -153,6 +153,18 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
     else groupTracks_.clear();
     format_ = 0;
     sampleBytes_ = 4;
+    // An input with fewer channels than the group has tracks: the group's first tracks record, a channel each, and
+    // the others nothing (not another track's sound again).
+    auto fitGroup = [&] {
+        if (groupTracks_.size() <= size_t(channels_)) return;
+        state_->message(tr("The input has %n channel(s): only that many of the group's tracks record", nullptr, channels_), 6000);
+        groupTracks_.resize(size_t(channels_));
+        if (groupTracks_.size() < 2) groupTracks_.clear();
+    };
+    if (!openDevice && feedChannels_ > 0) {
+        channels_ = std::min(channels_, feedChannels_);
+        fitGroup();
+    }
     audiodev::Engine& engine = audiodev::Engine::shared();
     const bool onDevice = openDevice && engine.active();
     if (onDevice) {
@@ -176,6 +188,7 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         if (!device.isFormatSupported(fmt)) fmt = device.preferredFormat();
         rate_ = fmt.sampleRate();
         channels_ = std::max(1, fmt.channelCount());
+        fitGroup();
         format_ = fmt.sampleFormat() == QAudioFormat::Int16 ? 1 : fmt.sampleFormat() == QAudioFormat::Int32 ? 2 : 0;
         sampleBytes_ = format_ == 1 ? 2 : 4;
         source_ = new QAudioSource(device, fmt, this);
@@ -402,28 +415,39 @@ Id VoiceoverRecorder::stop() {
 QStringList VoiceoverRecorder::splitGroupTake(const std::vector<int>& grouped) {
     const Sequence* s = state_->sequence();
     QFile whole(path_);
-    if (!s || !whole.open(QIODevice::ReadOnly)) return {};
+    if (!s || !whole.open(QIODevice::ReadOnly) || grouped.size() > size_t(channels_)) return {};
     whole.seek(44);  // (as written: a 44-byte header, then floats)
-    const QByteArray data = whole.readAll();
-    whole.close();
-    const qint64 frames = data.size() / qint64(sizeof(float) * size_t(channels_));
-    const float* samples = reinterpret_cast<const float*>(data.constData());
     const QString stem = path_.chopped(4) + ' ';
     QStringList files;
-    std::vector<float> mono(size_t(std::max<qint64>(0, frames)));
+    // Every track's file written as the take is read, a block at a time (an hour of eight tracks is gigabytes).
+    std::vector<std::unique_ptr<WavWriter>> writers;
+    auto giveUp = [&] {
+        writers.clear();  // (closed before they are removed)
+        for (const QString& f : files) QFile::remove(f);
+        return QStringList();
+    };
     for (size_t t = 0; t < grouped.size(); ++t) {
-        const int ch = int(t) % channels_;
         // (by the track's place, "A2": unique, and safe in a file name whatever the track is called)
-        const QString file = stem + QStringLiteral("A%1").arg(grouped[t] + 1) + QStringLiteral(".wav");
-        for (qint64 i = 0; i < frames; ++i) mono[size_t(i)] = samples[i * channels_ + ch];
-        WavWriter w;
-        if (!w.open(file, rate_, 1) || (w.write(mono.data(), frames), !w.close())) {
-            QFile::remove(file);
-            for (const QString& f : files) QFile::remove(f);
-            return {};
-        }
-        files << file;
+        files << stem + QStringLiteral("A%1").arg(grouped[t] + 1) + QStringLiteral(".wav");
+        writers.push_back(std::make_unique<WavWriter>());
+        if (!writers.back()->open(files.back(), rate_, 1)) return giveUp();
     }
+    const qint64 frameBytes = qint64(sizeof(float) * size_t(channels_));
+    QByteArray block;
+    std::vector<float> mono;
+    for (;;) {
+        block = whole.read(frameBytes * 65536);
+        const qint64 frames = block.size() / frameBytes;
+        if (frames <= 0) break;
+        const float* samples = reinterpret_cast<const float*>(block.constData());
+        mono.resize(size_t(frames));
+        for (size_t t = 0; t < grouped.size(); ++t) {
+            for (qint64 i = 0; i < frames; ++i) mono[size_t(i)] = samples[i * channels_ + qint64(t)];
+            if (!writers[t]->write(mono.data(), frames)) return giveUp();
+        }
+    }
+    for (auto& w : writers)
+        if (!w->close()) return giveUp();
     return files;
 }
 
@@ -454,7 +478,7 @@ Id VoiceoverRecorder::stopLoop() {
         // A grouped recording: each track's channel of each pass, a mono file of its own (track by track).
         std::vector<float> mono;
         for (size_t t = 0; t < grouped.size() && written; ++t) {
-            const int ch = int(t) % channels_;
+            const int ch = int(t) % channels_;  // (never past the input's channels: the group was fitted to them)
             const QString name = grouped[t] < int(s->audioTracks.size()) ? QString::fromStdString(s->audioTracks[size_t(grouped[t])].name) : QString();
             for (size_t k = 0; k < passes.size(); ++k) {
                 const QString file = takeFolder() + '/' + stem + QString::number(k + 1) + ' ' + (name.isEmpty() ? QString::number(t + 1) : name) +

@@ -1,0 +1,142 @@
+{
+    "activeSequence": 1,
+    "format": "montage-project",
+    "media": [
+        {
+            "audioCodec": "",
+            "channels": 0,
+            "duration": 0.2,
+            "fps": [
+                25,
+                1
+            ],
+            "hasAudio": false,
+            "hasVideo": true,
+            "height": 64,
+            "id": 8,
+            "kind": "video",
+            "name": "untagged422.mkv",
+            "path": "untagged422.mkv",
+            "sampleRate": 0,
+            "videoCodec": "ffv1",
+            "width": 256
+        }
+    ],
+    "mediaStereo": 2,
+    "name": "Untitled",
+    "nextId": 14,
+    "sequences": [
+        {
+            "audio": [
+                {
+                    "clips": [
+                    ],
+                    "id": 5,
+                    "name": "A1",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                    ],
+                    "id": 6,
+                    "name": "A2",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                    ],
+                    "id": 7,
+                    "name": "A3",
+                    "surround": null
+                }
+            ],
+            "fps": [
+                25,
+                1
+            ],
+            "height": 64,
+            "id": 1,
+            "in": -1,
+            "markers": [
+            ],
+            "name": "Sequence 1",
+            "out": -1,
+            "playhead": 0,
+            "sampleRate": 48000,
+            "video": [
+                {
+                    "clips": [
+                        {
+                            "audio": {
+                                "id": 11,
+                                "params": {
+                                    "gain_db": 0,
+                                    "pan": 0
+                                },
+                                "type": "volume"
+                            },
+                            "duration": 5,
+                            "id": 13,
+                            "media": 8,
+                            "motion": {
+                                "id": 10,
+                                "params": {
+                                    "anchor_x": 0,
+                                    "anchor_y": 0,
+                                    "crop_bottom": 0,
+                                    "crop_left": 0,
+                                    "crop_right": 0,
+                                    "crop_top": 0,
+                                    "fit": 0,
+                                    "flip_h": 0,
+                                    "flip_v": 0,
+                                    "opacity": 100,
+                                    "pos_x": 0,
+                                    "pos_y": 0,
+                                    "rotation": 0,
+                                    "scale": 100,
+                                    "scale_x": 100,
+                                    "scale_y": 100
+                                },
+                                "type": "transform"
+                            },
+                            "name": "untagged422.mkv",
+                            "sourceIn": 0,
+                            "speed": 1,
+                            "start": 0,
+                            "timing": {
+                                "id": 12,
+                                "params": {
+                                    "maintain_pitch": 0,
+                                    "sampling": 0,
+                                    "speed": 100
+                                },
+                                "type": "time"
+                            }
+                        }
+                    ],
+                    "color": "#3a7bd5",
+                    "id": 2,
+                    "name": "V1",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                    ],
+                    "id": 3,
+                    "name": "V2",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                    ],
+                    "id": 4,
+                    "name": "V3",
+                    "surround": null
+                }
+            ],
+            "width": 256
+        }
+    ],
+    "version": 1
+}

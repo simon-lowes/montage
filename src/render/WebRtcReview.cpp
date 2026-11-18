@@ -53,6 +53,9 @@
 #include "media/Image.h"
 #include "media/ThreadScheduling.h"
 #include "render/ColorSpace.h"
+#include "render/ReviewCongestion.h"
+#include "render/ReviewGate.h"
+#include "render/TurnRelay.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -79,6 +82,25 @@ std::vector<std::string> reviewCertificateHosts() {
     return out;
 }
 
+// Down to the rung that fits what got through (at least one down), or staying when none below works. A try or a
+// probe under way has failed, and the next waits twice as long.
+int RungSteering::down(int rung, int last, Clock::time_point now, const std::function<bool(int)>& tooBig,
+                       const std::function<bool(int)>& usable) {
+    if (trying || probing) hold = std::min(hold * 2, std::chrono::milliseconds(32000));
+    trying = probing = false;
+    int to = std::min(rung + 1, last);
+    while (to < last && tooBig(to)) ++to;
+    while (to > rung && !usable(to)) --to;
+    if (to > rung) {
+        movedAt = now;
+        nextTry = now + hold;
+        postponed = false;
+        return to;
+    }
+    nextTry = std::max(nextTry, now + hold);  // (the smallest already, or none below works)
+    return rung;
+}
+
 int RungSteering::report(int rung, int last, double loss, Clock::time_point at, Clock::time_point now,
                          const std::function<bool(int)>& tooBig, const std::function<bool(int)>& usable) {
     using std::chrono::milliseconds;
@@ -88,31 +110,49 @@ int RungSteering::report(int rung, int last, double loss, Clock::time_point at, 
         hold = milliseconds(8000);
     }
     if (at - movedAt < milliseconds(700)) return rung;  // (it counts the rung before's packets)
-    auto move = [&](int to) {
-        movedAt = now;
-        nextTry = now + hold;
-        postponed = false;
-        return to;
-    };
-    if (loss > 0.10) {
-        if (trying) hold = std::min(hold * 2, milliseconds(32000));
-        trying = false;
-        int to = std::min(rung + 1, last);
-        while (to < last && tooBig(to)) ++to;
-        while (to > rung && !usable(to)) --to;
-        if (to > rung) return move(to);
-        nextTry = std::max(nextTry, now + hold);  // (the smallest already, or none below works)
-        return rung;
-    }
+    if (loss > 0.10) return down(rung, last, now, tooBig, usable);
     if (loss >= 0.02 && !postponed) {
         nextTry = std::max(nextTry, now + hold);
         postponed = true;
     }
-    if (rung > 0 && now >= nextTry && usable(rung - 1)) {
+    if (rung > 0 && now >= nextTry && !probing && usable(rung - 1)) {
+        if (probes) {
+            probing = true;
+            return rung;
+        }
         trying = true;
         triedAt = now;
-        return move(rung - 1);
+        movedAt = now;
+        nextTry = now + hold;
+        postponed = false;
+        return rung - 1;
     }
+    return rung;
+}
+
+int RungSteering::delayed(int rung, int last, Clock::time_point now, const std::function<bool(int)>& tooBig,
+                          const std::function<bool(int)>& usable) {
+    if (trying && now - triedAt > std::chrono::seconds(20)) {
+        trying = false;
+        hold = std::chrono::milliseconds(8000);
+    }
+    if (now - movedAt < std::chrono::milliseconds(700)) return rung;
+    return down(rung, last, now, tooBig, usable);
+}
+
+int RungSteering::probed(int rung, bool arrived, Clock::time_point now, const std::function<bool(int)>& usable) {
+    if (!probing) return rung;
+    probing = false;
+    if (arrived && rung > 0 && usable(rung - 1)) {
+        trying = true;
+        triedAt = now;
+        movedAt = now;
+        nextTry = now + hold;
+        postponed = false;
+        return rung - 1;
+    }
+    hold = std::min(hold * 2, std::chrono::milliseconds(32000));
+    nextTry = now + hold;
     return rung;
 }
 
@@ -162,18 +202,13 @@ using Clock = std::chrono::steady_clock;
 
 constexpr qsizetype kMaxHeader = 16 * 1024, kMaxBody = 256 * 1024;  // (an offer is a few kilobytes)
 constexpr int kMaxConnections = 64, kMaxConnectionsFrom = 8;  // (all, and from one address or IPv6 /64)
-constexpr double kGuessRate = 5;                               // passphrases tried a second by all who guessed wrong lately
-constexpr double kNetworkBurst = 3;                           // and at once from one network that has
-constexpr double kListedBurst = 256;                          // (fewer once the networks listed are more than a third of this)
-constexpr double kPeerRate = 1, kPeerBurst = 8;               // and from one address or IPv6 /64 not yet let in
-constexpr std::chrono::hours kTrustedMemory{1};               // how long a right passphrase lets its address past the rest
 constexpr int kHandshakeMs = 5000;                            // a TLS handshake not done by then is dropped
 constexpr int kMarkerRate = 10, kMarkerBurst = 50;  // as the marker channel's (render/RemoteReview.cpp)
 constexpr qsizetype kDrawingRate = 256 * 1024, kDrawingBurst = 4 * 1024 * 1024;
 constexpr int kPointerRate = 30;
 constexpr size_t kMaxChannelBacklog = 256 * 1024;  // bytes queued on a viewer's data channel before more are dropped
-constexpr std::chrono::minutes kFailureMemory{15};
 constexpr std::chrono::seconds kPointerLife{4};
+constexpr std::chrono::milliseconds kProbeLength{700};  // how long padding is sent at the rung above's rate
 const char* const kPalette[] = {"#ff3b30", "#34c759", "#0a84ff", "#ff9f0a", "#bf5af2", "#64d2ff", "#ffd60a", "#ff375f"};
 
 std::string averr(int e) {
@@ -369,26 +404,6 @@ Choice choose(const rtc::Description::Media& m, const std::vector<std::string>& 
     return {};
 }
 
-struct Failures {
-    int count = 0;
-    Clock::time_point last;
-    Clock::time_point nextRefusal;  // (each wrong one from here told a second after the one before)
-};
-
-// A token bucket for one address's requests.
-struct PeerBucket {
-    double tokens = kPeerBurst;
-    Clock::time_point at = Clock::now();
-};
-
-// A network that has guessed wrong lately, and the passphrases it may still try: a ration of its own, so that no
-// network's guessing uses up another's tries.
-struct NetworkRation {
-    Clock::time_point last;  // when one there last guessed wrong
-    double tokens = kNetworkBurst;
-    Clock::time_point at = Clock::now();
-};
-
 }  // namespace
 
 bool makeReviewCertificate(const std::vector<std::string>& hosts, std::string& certificatePem, std::string& keyPem, std::string* error) {
@@ -481,6 +496,37 @@ struct Viewer {
     RungSteering steering;
     int64_t lastPts = -1;
     std::deque<std::pair<Clock::time_point, size_t>> sent;
+    // The queue on the way to them, where their browser reports when packets arrive (a lock of its own: written by
+    // the connection's threads, read by send's), and the padding a probe adds after each picture.
+    std::mutex linkM;
+    LinkDelay link;
+    std::shared_ptr<class Padder> padder;
+    // Only through the relay: this viewer's way there (render/TurnRelay.h), which outlives the connection.
+    std::shared_ptr<RelayBridge> bridge;
+    bool padding = false;  // (send's thread) a probe's padding goes after their pictures
+};
+
+// Padding after a picture's packets, for a probe: as many bytes as were asked for the next picture, in packets of the
+// same stream with nothing but padding, which a receiver counts and drops.
+class Padder final : public rtc::MediaHandler {
+public:
+    explicit Padder(std::shared_ptr<rtc::RtpPacketizationConfig> config) : config_(std::move(config)) {}
+    std::atomic<int> bytes{0};
+    void outgoing(rtc::message_vector& messages, const rtc::message_callback&) override {
+        const int wanted = bytes.exchange(0);
+        if (wanted <= 0 || messages.empty() || !messages.back() || messages.back()->type != rtc::Message::Binary) return;
+        const rtc::message_ptr last = messages.back();
+        uint16_t sequence = config_->sequenceNumber;
+        for (const std::vector<uint8_t>& p : paddingAfter(reinterpret_cast<const uint8_t*>(last->data()), last->size(), sequence, size_t(wanted))) {
+            auto m = rtc::make_message(reinterpret_cast<const std::byte*>(p.data()), reinterpret_cast<const std::byte*>(p.data()) + p.size());
+            m->dscp = last->dscp;
+            messages.push_back(std::move(m));
+        }
+        config_->sequenceNumber = sequence;
+    }
+
+private:
+    std::shared_ptr<rtc::RtpPacketizationConfig> config_;
 };
 
 // VP9 over RTP (RFC 9628) in flexible mode: one spatial and temporal layer, a 15-bit picture ID, each inter picture
@@ -537,10 +583,12 @@ private:
     uint16_t picture_;
 };
 
-// A viewer's receiver reports on their picture (in RTCP sender and receiver reports): the share of packets lost.
+// A viewer's reports on their picture: the share of packets lost (in RTCP sender and receiver reports) and, with the
+// transport-wide sequence number extension agreed (`wideId`, 0 without), when each packet arrived. Every picture packet
+// sent is numbered here on its way out, last in the chain, so one sent again on request goes as it first did.
 class FeedbackReader final : public rtc::MediaHandler {
 public:
-    FeedbackReader(std::weak_ptr<Viewer> viewer, uint32_t ssrc) : viewer_(std::move(viewer)), ssrc_(ssrc) {}
+    FeedbackReader(std::weak_ptr<Viewer> viewer, uint32_t ssrc, int wideId) : viewer_(std::move(viewer)), ssrc_(ssrc), wideId_(wideId) {}
     void incoming(rtc::message_vector& messages, const rtc::message_callback&) override {
         for (const auto& message : messages) {
             if (!message || message->type != rtc::Message::Control) continue;  // (RTCP only)
@@ -562,15 +610,40 @@ public:
                             ++v->reports;
                         }
                     }
+                } else if (type == 205 && count == 15 && wideId_) {
+                    ArrivalReport report;
+                    if (parseTransportFeedback(d + at, length, report))
+                        if (auto v = viewer_.lock()) {
+                            std::lock_guard lock(v->linkM);
+                            v->link.feedback(report, Clock::now());
+                        }
                 }
                 at += length;
             }
+        }
+    }
+    void outgoing(rtc::message_vector& messages, const rtc::message_callback&) override {
+        if (!wideId_) return;
+        auto v = viewer_.lock();
+        if (!v) return;
+        const auto now = Clock::now();  // (one moment for a picture's packets: they are judged together)
+        std::lock_guard lock(v->linkM);
+        for (rtc::message_ptr& message : messages) {
+            if (!message || message->type != rtc::Message::Binary) continue;
+            const auto* d = reinterpret_cast<const uint8_t*>(message->data());
+            const std::vector<uint8_t> numbered = withTransportSequence(d, message->size(), wideId_, v->link.nextSequence());
+            if (numbered.empty()) continue;  // (not a packet that can carry the number: sent as it is, uncounted)
+            v->link.sent(numbered.size(), now);
+            auto m = rtc::make_message(reinterpret_cast<const std::byte*>(numbered.data()), reinterpret_cast<const std::byte*>(numbered.data()) + numbered.size());
+            m->dscp = message->dscp;
+            message = std::move(m);
         }
     }
 
 private:
     std::weak_ptr<Viewer> viewer_;
     uint32_t ssrc_;
+    int wideId_;
 };
 
 // An encoder for one codec, rung and depth.
@@ -720,16 +793,21 @@ struct BrowserReviewBackend::Impl {
     QSslKey key;
     std::vector<rtc::IceServer> iceServers;
     bool relayInUse = false;  // a TURN relay among them, which Montage reaches too
+    // Only through the relay: where it is, for the bridge each viewer is given (Montage's ICE is then given no server
+    // at all), and the bridges of offers still waiting for the relay's answer.
+    std::string relayHost;
+    uint16_t relayPort = 0;
+    std::set<std::shared_ptr<RelayBridge>> bridging;
+    // The relay's login for this review: the settings' own, or one made from the shared secret that runs out at
+    // `expires` (seconds since 1970; 0: none), when the link stops letting viewers in too.
+    TurnLogin relayLogin;
+    std::atomic<int64_t> expires{0};
 
     // The web server's thread, its loop and the object queued work runs on.
     std::thread http;
     QObject* home = nullptr;
     QEventLoop* loop = nullptr;
-    std::map<QString, Failures> failures;  // (that thread's)
-    std::map<QString, PeerBucket> peerBuckets;          // (that thread's) by guesser()
-    std::map<QString, Clock::time_point> trusted;       // (that thread's) addresses that gave the right passphrase lately
-    std::map<QString, NetworkRation> guessingNetworks;  // (that thread's) by network(): those that guessed wrong lately
-    NetworkRation elsewhere;  // (that thread's) every network not listed, once the list is full
+    PassphraseGate gate;  // (that thread's) who may have a passphrase tried now, by guesser() and network()
 
     std::map<std::string, std::shared_ptr<Viewer>> viewers;
     // Viewers let go, kept a few seconds more: a callback of theirs still running is never the last to hold one (a
@@ -762,6 +840,7 @@ struct BrowserReviewBackend::Impl {
     Clock::time_point t0, next;
     int64_t vpts = -1, apts = 0;
     int64_t encoded = 0, skipped = 0;
+    std::atomic<int> probes{0}, queueMoves{0};  // probes begun, and moves down for a standing queue, since opened
     std::deque<std::pair<Clock::time_point, size_t>> bytes;
 
     // ---- The web server ----
@@ -823,11 +902,10 @@ struct BrowserReviewBackend::Impl {
             // oldest connection waiting from the address (IPv6 /64) holding the most, when that holds more than
             // theirs, so that a few addresses holding every place cannot keep a newcomer out.
             QSslSocket* oldest = nullptr;
-            const auto now = Clock::now();  // (trust that has run out counts for nothing here either)
-            for (auto it = trusted.begin(); it != trusted.end();) it = now - it->second > kTrustedMemory ? trusted.erase(it) : std::next(it);
-            if (trusted.count(from)) {
+            gate.tidy(Clock::now());  // (trust that has run out counts for nothing here either)
+            if (gate.trusted(from)) {
                 for (QSslSocket* o : open)
-                    if (o != c && !o->property("answered").toBool() && !trusted.count(guesser(o->peerAddress()))) {
+                    if (o != c && !o->property("answered").toBool() && !gate.trusted(guesser(o->peerAddress()))) {
                         oldest = o;
                         break;  // (children are listed oldest first)
                     }
@@ -843,7 +921,7 @@ struct BrowserReviewBackend::Impl {
                 QString most;
                 int mostHeld = 0;
                 for (const auto& [who, n] : held)
-                    if (n > mostHeld && waiting.count(who) && !trusted.count(who)) most = who, mostHeld = n;
+                    if (n > mostHeld && waiting.count(who) && !gate.trusted(who)) most = who, mostHeld = n;
                 if (mostHeld > held[from] + 1)
                     for (QSslSocket* o : open)
                         if (o != c && !o->property("answered").toBool() && guesser(o->peerAddress()) == most) {
@@ -910,87 +988,36 @@ struct BrowserReviewBackend::Impl {
         c->disconnectFromHost();
     }
 
-    // The passphrase as a bearer token. An address that has guessed wrong too often lately is refused at once; each
-    // address (IPv6 /64) may try only so many a second (the rest refused untried), except addresses that gave the
-    // right one lately, so that guessing elsewhere never shuts reviewers already in out. A network (IPv4 /24, IPv6
-    // /48) is rationed from its first wrong guess: it has a few tries at once (fewer when very many networks are
-    // guessing) and then its share of the few a second that all the networks which guessed wrong lately have
-    // between them, split evenly. A network's guessing
-    // therefore uses up nobody else's tries: a newcomer from elsewhere is tried at once however many networks are
-    // guessing, and one who mistypes has a ration of their own. Wrong ones are told a second after the one before
-    // from the same address.
+    // The passphrase as a bearer token, compared only when the gate lets it be tried (render/ReviewGate.h: an address
+    // that guessed wrong too often is refused at once, each address and each guessing network may try only so often,
+    // and a right passphrase uses up nobody's tries). Wrong ones are told a second after the one before from the same
+    // address.
     bool authorised(QSslSocket* c, const Request& r) {
         const QString peer = guesser(c->peerAddress());
-        const auto now = Clock::now();
-        auto forget = [&](auto& map, auto old) {
-            for (auto it = map.begin(); it != map.end();) it = old(it->second) ? map.erase(it) : std::next(it);
-        };
-        forget(failures, [&](const Failures& f) { return now - f.last > kFailureMemory; });
-        forget(trusted, [&](Clock::time_point t) { return now - t > kTrustedMemory; });
-        forget(peerBuckets, [&](const PeerBucket& b) { return now - b.at > std::chrono::minutes(1); });
-        while (failures.size() > 4096)
-            failures.erase(std::min_element(failures.begin(), failures.end(), [](const auto& a, const auto& b) { return a.second.last < b.second.last; }));
-        const bool known = trusted.count(peer) > 0;
-        // (the network around it, if one there has guessed wrong lately. With the list of networks full, every
-        // network not in it shares one ration: guessing from more networks than the list holds gains nothing)
         const QString around = network(c->peerAddress());
-        forget(guessingNetworks, [&](const NetworkRation& n) { return now - n.last > kFailureMemory; });
-        const bool full = guessingNetworks.size() >= 4096;
-        auto listed = guessingNetworks.find(around);
-        NetworkRation* ration = listed != guessingNetworks.end() ? &listed->second : full ? &elsewhere : nullptr;
-        // (an address a reviewer is in lately, as a shared network's, is blocked only after many more)
-        auto blocked = failures.find(peer);
-        if (blocked != failures.end() && blocked->second.count >= (known ? 100 : 10)) {
+        const auto now = Clock::now();
+        const PassphraseGate::Verdict may = gate.ask(peer, around, now);
+        if (may.answer == PassphraseGate::Answer::Blocked) {
             respond(c, "429 Too Many Requests", {}, "Too many wrong passphrases from this address: try again later");
             return false;
         }
-        if (!known) {
-            if (peerBuckets.size() > 4096) peerBuckets.clear();  // (a flood of addresses: they start full again)
-            PeerBucket& mine = peerBuckets[peer];
-            mine.tokens = std::min(kPeerBurst, mine.tokens + std::chrono::duration<double>(now - mine.at).count() * kPeerRate);
-            mine.at = now;
-            if (mine.tokens < 1) {
-                respond(c, "429 Too Many Requests", {{"Retry-After", "2"}}, "Too many requests from this address: try again shortly");
-                return false;
-            }
-            mine.tokens -= 1;
-            if (ration) {
-                const double rate = kGuessRate / double(guessingNetworks.size() + (full ? 1 : 0));
-                ration->tokens = std::min(kNetworkBurst, ration->tokens + std::chrono::duration<double>(now - ration->at).count() * rate);
-                ration->at = now;
-                if (ration->tokens < 1) {
-                    const int wait = int(std::clamp(std::ceil((1 - ration->tokens) / rate), 1.0, 600.0));
-                    respond(c, "429 Too Many Requests", {{"Retry-After", QByteArray::number(wait)}},
-                            "Too many wrong passphrases from this network: try again shortly");
-                    return false;
-                }
-                ration->tokens -= 1;
-            }
+        if (may.answer == PassphraseGate::Answer::AddressBusy) {
+            respond(c, "429 Too Many Requests", {{"Retry-After", QByteArray::number(may.retryAfter)}}, "Too many requests from this address: try again shortly");
+            return false;
+        }
+        if (may.answer == PassphraseGate::Answer::NetworkBusy) {
+            respond(c, "429 Too Many Requests", {{"Retry-After", QByteArray::number(may.retryAfter)}},
+                    "Too many wrong passphrases from this network: try again shortly");
+            return false;
         }
         QByteArray given = r.header("authorization");
         if (given.toLower().startsWith("bearer ")) given = given.mid(7).trimmed();
         else given.clear();
         if (sameBytes(given, QByteArray::fromStdString(settings.passphrase))) {
-            if (trusted.size() < 4096 || known) trusted[peer] = now;
+            gate.right(peer, around, now, may);
             return true;
         }
-        Failures& f = failures[peer];
-        ++f.count;
-        f.last = now;
-        // (the network's first wrong guess lists it, with the tries it has at once still to use: three while few
-        // networks are guessing, fewer and then none as they become many, so that guessing from very many networks
-        // gains little more than each one's first try)
-        if (listed != guessingNetworks.end()) {
-            listed->second.last = now;
-        } else if (!full) {
-            NetworkRation& n = guessingNetworks[around];
-            n.last = now;
-            n.tokens = std::clamp(std::floor(kListedBurst / double(guessingNetworks.size())), 0.0, kNetworkBurst);
-        }
-        // (per address: wrong guesses from elsewhere never hold back anyone's answer, the rations above bound how
-        // fast all of them together may guess)
-        f.nextRefusal = std::max(now, f.nextRefusal) + std::chrono::seconds(1);
-        const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(f.nextRefusal - now).count());
+        const int ms = gate.wrong(peer, around, now);
         // (only waiting to be told so, and holding no place meanwhile. No more than a set number wait at once: past
         // that, the one that has waited longest is told now.)
         c->setProperty("refusing", true);
@@ -1026,6 +1053,7 @@ struct BrowserReviewBackend::Impl {
         if (r.method == "GET" && path == "/review.js") return respond(c, "200 OK", {}, browserReviewScript(), "text/javascript; charset=utf-8");
         if (path == "/config" && r.method == "GET") {
             if (!authorised(c, r)) return;
+            if (expired()) return respond(c, "410 Gone", {}, "This review link has expired");
             QJsonArray ice;
             for (const QJsonObject& s : browserIceServers()) ice.append(s);
             QJsonArray rungs;
@@ -1040,6 +1068,7 @@ struct BrowserReviewBackend::Impl {
         if (path == "/whep") {
             if (r.method != "POST") return respond(c, "405 Method Not Allowed", {{"Allow", "POST, OPTIONS"}}, {});
             if (!authorised(c, r)) return;
+            if (expired()) return respond(c, "410 Gone", {}, "This review link has expired");
             if (!r.header("content-type").toLower().startsWith("application/sdp")) return respond(c, "415 Unsupported Media Type", {}, "An SDP offer, please");
             // (?hdr=1: the player decodes 10-bit HDR and wants it)
             const QByteArray query = r.path.mid(path.size() + 1);
@@ -1068,27 +1097,75 @@ struct BrowserReviewBackend::Impl {
         respond(c, "404 Not Found", {}, "Not found");
     }
 
-    // The STUN and TURN servers as browsers are given them: the settings' own, then the TURN relay.
+    // The review link's time is up (only one with a relay's shared secret has a time): nobody new is let in, as the
+    // relay lets no login from it in.
+    bool expired() const {
+        const int64_t at = expires;
+        return at > 0 && std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() >= at;
+    }
+
+    // The STUN and TURN servers as browsers are given them: the settings' own, then the TURN relay with this review's
+    // login (never the shared secret).
     std::vector<QJsonObject> browserIceServers() const {
         std::vector<QJsonObject> out;
         for (const std::string& s : settings.iceServers) out.push_back(browserIceServer(s));
         if (!settings.turnServer.empty())
             out.push_back({{"urls", QString::fromStdString(settings.turnServer)},
-                           {"username", QString::fromStdString(settings.turnUser)},
-                           {"credential", QString::fromStdString(settings.turnPassword)}});
+                           {"username", QString::fromStdString(relayLogin.user)},
+                           {"credential", QString::fromStdString(relayLogin.password)}});
         return out;
     }
 
-    // A viewer's offer: their connection made, answered once its candidates are gathered.
+    // A viewer's offer: their connection made, answered once its candidates are gathered. Only through the relay,
+    // the relay is first asked for an address for this viewer, and the offer answered from behind that bridge.
     void offer(QSslSocket* c, const QByteArray& sdp, bool hdr) {
         {
+            // (offers still waiting for the relay count too: each holds a bridge and an address at the relay)
             std::lock_guard lock(m);
-            if (int(viewers.size()) >= settings.maxViewers) return respond(c, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
+            if (int(viewers.size() + bridging.size()) >= settings.maxViewers)
+                return respond(c, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
         }
+        if (!settings.relayOnly) return answerOffer(c, sdp, hdr, nullptr);
+        auto bridge = std::make_shared<RelayBridge>(relayHost, relayPort, relayLogin);
+        {
+            std::lock_guard lock(m);
+            bridging.insert(bridge);
+        }
+        QPointer<QSslSocket> sock(c);
+        std::weak_ptr<RelayBridge> wb = bridge;
+        // (the bridge calls back on its own thread, where it must not be let go of: the rest is done here, at home)
+        bridge->allocate([this, sock, wb, sdp, hdr](const std::string& error) {
+            std::lock_guard lock(m);
+            if (!home) return;
+            QMetaObject::invokeMethod(
+                home,
+                [this, sock, wb, sdp, hdr, error] {
+                    std::shared_ptr<RelayBridge> bridge = wb.lock();
+                    bool full = false;
+                    {
+                        std::lock_guard lock(m);
+                        bridging.erase(bridge);
+                        full = int(viewers.size()) >= settings.maxViewers;
+                    }
+                    if (!bridge || !sock) return;
+                    if (!error.empty()) return respond(sock, "502 Bad Gateway", {}, QByteArray::fromStdString(error));
+                    if (full) return respond(sock, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
+                    answerOffer(sock, sdp, hdr, bridge);
+                },
+                Qt::QueuedConnection);
+        });
+    }
+
+    void answerOffer(QSslSocket* c, const QByteArray& offered, bool hdr, const std::shared_ptr<RelayBridge>& bridge) {
+        // (behind a bridge, each address the viewer offers is a loopback port of the bridge's)
+        const QByteArray sdp = !bridge ? offered
+                                       : QByteArray::fromStdString(offerThroughRelay(offered.toStdString(), [&](const std::string& ip, uint16_t p) {
+                                             return bridge->peer(ip, p);
+                                         }));
         std::shared_ptr<Viewer> v;
         std::string why;
         try {
-            v = makeViewer(sdp.toStdString(), c->peerAddress().toString(), hdr, why);
+            v = makeViewer(sdp.toStdString(), c->peerAddress().toString(), hdr, why, bridge);
         } catch (const std::exception& e) {
             why = std::string("The offer is not one Montage can answer: ") + e.what();
         }
@@ -1109,7 +1186,15 @@ struct BrowserReviewBackend::Impl {
                             "\"; credential-type=\"password\"";
                 headers.emplace_back("Link", link);
             }
-            respond(sock, "201 Created", headers, QByteArray::fromStdString(std::string(*local)), "application/sdp");
+            std::string answer = std::string(*local);
+            if (v->bridge) {
+                // (Montage's end is given as its address at the relay, and the bridge told where that end is)
+                uint16_t localPort = 0;
+                answer = answerThroughRelay(answer, v->bridge->relayedAddress(), v->bridge->relayedPort(), &localPort);
+                if (!localPort) return respond(sock, "500 Internal Server Error", {}, "No answer");
+                v->bridge->setLocal(localPort, local->icePwd().value_or(std::string()));
+            }
+            respond(sock, "201 Created", headers, QByteArray::fromStdString(answer), "application/sdp");
         };
         auto later = [this, done, finish] {
             if (done->exchange(true)) return;
@@ -1137,24 +1222,29 @@ struct BrowserReviewBackend::Impl {
         QTimer::singleShot(3000, c, [later] { later(); });  // (what was gathered by then)
     }
 
-    std::shared_ptr<Viewer> makeViewer(const std::string& sdp, const QString& address, bool wantsHdr, std::string& why) {
+    std::shared_ptr<Viewer> makeViewer(const std::string& sdp, const QString& address, bool wantsHdr, std::string& why,
+                                       const std::shared_ptr<RelayBridge>& bridge) {
         const rtc::Description offered(sdp, rtc::Description::Type::Offer);
         auto v = std::make_shared<Viewer>();
         v->id = randomHex(16).toStdString();
         v->address = address;
+        v->bridge = bridge;
         rtc::Configuration conf;
         conf.iceServers = iceServers;
-        if (settings.relayOnly) conf.iceTransportPolicy = rtc::TransportPolicy::Relay;
         // Media on the same port number as the page (UDP), all viewers together: one port to open in a firewall. With
         // a TURN relay, each viewer's connection has a port of its own instead (libjuice's shared socket cannot reach
         // a relay), which only goes out to the relay and to the viewer.
-        if (!relayInUse) {
+        // Only through the relay, this end is on this computer's loopback alone, a port of its own, where the bridge
+        // carries what it sends to the relay and it can reach nothing else.
+        if (bridge) {
+            conf.bindAddress = "127.0.0.1";
+        } else if (!relayInUse) {
             conf.enableIceUdpMux = true;
             conf.portRangeBegin = conf.portRangeEnd = uint16_t(port);
         }
         // (bound to the review's own address; when that is this computer's loopback and a relay elsewhere must be
         // reached, unbound but through the relay only, so no other interface's address is offered)
-        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4) {
+        if (!bridge && host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4) {
             if (!relayInUse || !host.isLoopback()) conf.bindAddress = host.toString().toStdString();
             else conf.iceTransportPolicy = rtc::TransportPolicy::Relay;
         }
@@ -1183,6 +1273,7 @@ struct BrowserReviewBackend::Impl {
             Choice pick;
             bool hdr = false;
             bool colourExtension = false;
+            int wideId = 0;  // the transport-wide sequence number extension's ID, when its feedback is offered too
             rtc::Description::Media offeredMedia = media;  // (extIds is not const)
             // (an ID of 1-14 only: libdatachannel writes this extension's element in the one-byte form whatever its
             // ID, so one above 14 would arrive malformed and the picture's transfer lost; such a viewer gets SDR)
@@ -1233,6 +1324,15 @@ struct BrowserReviewBackend::Impl {
                     cfg->colorMatrix = hdr ? 9 : 1;
                     cfg->colorChromaSitingHorz = 1;  // (co-sited on the left)
                     cfg->colorChromaSitingVert = 2;  // (half way)
+                } else if (isVideo && e->uri == kTransportWideExtension && id >= 1 && id <= 14 && !wideId) {
+                    // The picture's packets numbered over the whole connection, and the viewer's reports of when each
+                    // arrived: how a link that is slow without losing anything is noticed. (An ID of 1-14, as above.)
+                    const rtc::Description::Media::RtpMap* offeredMap = media.rtpMap(pick.pt);
+                    if (!offeredMap || std::find(offeredMap->rtcpFbs.begin(), offeredMap->rtcpFbs.end(), kTransportWideFeedback) == offeredMap->rtcpFbs.end())
+                        continue;
+                    answer->addExtMap(rtc::Description::Media::ExtMap(id, e->uri));
+                    if (rtc::Description::Media::RtpMap* map = answer->rtpMap(pick.pt)) map->addFeedback(kTransportWideFeedback);
+                    wideId = id;
                 }
             }
             std::shared_ptr<rtc::Track> track = v->pc->addTrack(*answer);
@@ -1245,7 +1345,14 @@ struct BrowserReviewBackend::Impl {
             else if (codec == "vp9") packetizer = v->vp9 = std::make_shared<Vp9Packetizer>(cfg);
             else packetizer = std::make_shared<rtc::OpusRtpPacketizer>(cfg);
             packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(cfg));
-            packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+            if (isVideo && wideId) {
+                // (after the sender reports, which count pictures only; before what is kept for sending again, so
+                // padding a viewer misses can be asked for like any packet and leaves no gap in their numbering)
+                v->padder = std::make_shared<Padder>(cfg);
+                packetizer->addToChain(v->padder);
+            }
+            // (a probe's padding is many small packets: room for them beside the pictures')
+            packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(isVideo ? 2048 : rtc::RtcpNackResponder::DefaultMaxSize));
             if (isVideo) {
                 // (the viewer's own flag only: the next picture sent starts a key frame for them, whoever else
                 // watches on the same encoder)
@@ -1258,7 +1365,7 @@ struct BrowserReviewBackend::Impl {
                     if (now - last < 1000 || !v->lastKeyAsk.compare_exchange_strong(last, now)) return;
                     v->needKey = true;
                 }));
-                packetizer->addToChain(std::make_shared<FeedbackReader>(wv, ssrc));
+                packetizer->addToChain(std::make_shared<FeedbackReader>(wv, ssrc, wideId));
                 track->onOpen([wv] {
                     if (auto v = wv.lock()) v->needKey = true;
                 });
@@ -1640,10 +1747,45 @@ struct BrowserReviewBackend::Impl {
         while (!v.sent.empty() && now - v.sent.front().first > std::chrono::seconds(3)) v.sent.pop_front();
     }
 
-    // Moves a viewer on the ladder by their receiver reports (RungSteering).
+    // Moves a viewer on the ladder by their receiver reports and, where their browser reports arrivals, by the queue on
+    // the way to them (RungSteering): down when it stands, and up only after a probe at the higher rate arrived
+    // without queueing.
     void steer(Viewer& v, Clock::time_point now) {
         const int last = int(ladder.size()) - 1;
-        if (last <= 0 || v.wantRung != v.rung) return;
+        if (last <= 0) return;
+        const auto usable = [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); };
+        bool active = false, standing = false, sending = false;
+        double arrived = 0;
+        LinkDelay::Probe verdict = LinkDelay::Probe::None;
+        if (v.padder) {
+            std::lock_guard lock(v.linkM);
+            active = v.link.active(now);
+            standing = v.link.standing();
+            arrived = v.link.receivedKbps();
+            verdict = v.link.probe(now);
+            sending = v.link.probeSending(now);
+        }
+        v.steering.probes = active;
+        v.padding = v.steering.probing && sending;
+        if (v.wantRung != v.rung) return;
+        if (v.steering.probing) {
+            if (!active || verdict == LinkDelay::Probe::Arrived || verdict == LinkDelay::Probe::Delayed) {
+                v.padding = false;
+                v.wantRung = v.steering.probed(v.rung, active && verdict == LinkDelay::Probe::Arrived, now, usable);
+                std::lock_guard lock(v.linkM);
+                v.link.restart(now);  // (the probe's own queue is not the pictures')
+                return;
+            }
+        } else if (active && standing) {
+            // (what arrived is what the link carries: the rung under 85% of it)
+            const int to = v.steering.delayed(
+                v.rung, last, now, [&](int i) { return arrived > 0 && double(ladder[size_t(i)].bitrate) / 1000 > 0.85 * arrived; }, usable);
+            if (to != v.rung) {
+                v.wantRung = to;
+                ++queueMoves;
+                return;
+            }
+        }
         uint64_t reports;
         double loss;
         Clock::time_point at;
@@ -1656,10 +1798,16 @@ struct BrowserReviewBackend::Impl {
         if (reports == v.seenReports) return;
         v.seenReports = reports;
         const double through = sentKbps(v, now) * (1 - loss);
+        const bool wasProbing = v.steering.probing;
         v.wantRung = v.steering.report(
             v.rung, last, loss, at, now,
-            [&](int i) { return double(ladder[size_t(i)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through; },
-            [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); });
+            [&](int i) { return double(ladder[size_t(i)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through; }, usable);
+        if (v.steering.probing && !wasProbing) {
+            std::lock_guard lock(v.linkM);
+            v.link.beginProbe(now, kProbeLength);
+            v.padding = true;
+            ++probes;
+        }
     }
 
     // A picture to each viewer: from the encoder for their codec, rung and depth (each one's tag first: its RTP
@@ -1681,6 +1829,11 @@ struct BrowserReviewBackend::Impl {
                     v->vp9->width = c.width;
                     v->vp9->height = c.height;
                 }
+                // (a probe: padding after the picture up to the rung above's rate)
+                if (v->padder)
+                    v->padder->bytes = v->padding && cur > 0 && c.key.rung == cur
+                                           ? int(std::clamp(double(ladder[size_t(cur - 1)].bitrate) / 8 / fps - double(c.data.size()), 0.0, 1e6))
+                                           : 0;
                 try {
                     v->video->sendFrame(c.data.data(), c.data.size(), rtc::FrameInfo(rtp));
                     v->lastPts = c.pts;
@@ -1702,6 +1855,11 @@ struct BrowserReviewBackend::Impl {
                 v->needKey = false;
                 // (reports and tries count from the switch, not from when it was asked for)
                 v->steering.switched(now);
+                {
+                    // (from just after the key frame that begins the new size: its burst is no sign of the link)
+                    std::lock_guard lock(v->linkM);
+                    v->link.restart(now + std::chrono::milliseconds(100));
+                }
                 rungMessage(*v);
                 continue;
             }
@@ -2025,17 +2183,31 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
             return fail(std::string("ICE server ") + s + ": " + e.what());
         }
     }
+    d.expires = 0;
+    d.relayLogin = {d.settings.turnUser, d.settings.turnPassword};
     if (!d.settings.turnServer.empty()) {
+        // With the relay's shared secret, a login for this review that the relay takes until the link's time is up.
+        if (!d.settings.turnSecret.empty()) {
+            d.expires = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() + d.settings.turnExpirySeconds;
+            d.relayLogin = turnRestLogin(d.settings.turnSecret, d.expires);
+        }
         // (Montage reaches the relay over UDP; one over TLS only, turns:, is the browsers' alone)
         std::string relayHost;
         uint16_t relayPort = 0;
         bool tls = false;
         if (!parseRelay(d.settings.turnServer, relayHost, relayPort, tls)) return fail("The TURN relay's address is turn:host:port");
-        if (!tls) {
-            d.iceServers.emplace_back(relayHost, relayPort, d.settings.turnUser, d.settings.turnPassword, rtc::IceServer::RelayType::TurnUdp);
-            d.relayInUse = true;
-        } else if (d.settings.relayOnly) {
+        if (tls && d.settings.relayOnly)
             return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)");
+        if (d.settings.relayOnly) {
+            // Only through the relay: Montage's end of each connection stays on this computer's loopback behind a
+            // bridge to the relay, and its ICE is told of no server, so nothing leaves for anywhere but the relay.
+            d.relayHost = relayHost;
+            d.relayPort = relayPort;
+            d.iceServers.clear();
+            d.relayInUse = false;
+        } else if (!tls) {
+            d.iceServers.emplace_back(relayHost, relayPort, d.relayLogin.user, d.relayLogin.password, rtc::IceServer::RelayType::TurnUdp);
+            d.relayInUse = true;
         }
     }
     d.mode = mode;
@@ -2078,6 +2250,7 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
         d.vpts = -1;
         d.apts = 0;
         d.encoded = d.skipped = 0;
+        d.probes = d.queueMoves = 0;
         d.bytes.clear();
     }
     std::promise<std::string> started;
@@ -2144,11 +2317,14 @@ void BrowserReviewBackend::close() {
     }
     for (const auto& [id, v] : viewers) d.closeViewer(v);
     std::deque<std::pair<Clock::time_point, std::shared_ptr<Viewer>>> retired;
+    std::set<std::shared_ptr<RelayBridge>> bridging;
     {
         std::lock_guard lock(d.m);
         retired.swap(d.retired);
+        bridging.swap(d.bridging);
     }
     retired.clear();
+    bridging.clear();
     d.freeEncoders();
 }
 
@@ -2188,6 +2364,9 @@ ReviewStats BrowserReviewBackend::stats() const {
             ++s.rungViewers[size_t(std::clamp(v->rung.load(), 0, int(d_->ladder.size()) - 1))];
             s.hdrViewers += v->hdr;
         }
+    s.probes = d_->probes;
+    s.queueMoves = d_->queueMoves;
+    s.linkExpires = d_->open ? d_->expires.load() : 0;
     s.error = d_->lastError;
     s.markers = d_->markerCount;
     return s;

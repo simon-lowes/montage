@@ -2257,7 +2257,39 @@ private slots:
             m.handle(events[0], targets);
             QVERIFY(std::fabs(values["inc"] - (0.6 - 0.05 * 0.4)) < 1e-12);
             QVERIFY(m.refresh(targets.get).size() == 4);  // shown back on the control (NRPN: four messages)
+            // A range written the other way round (0.6 down to 0.2): an increment goes towards its far end, down
+            // (nightly 15 Nov: it went up).
+            Mapper r;
+            Mapping rev = inc;
+            rev.target = "rev";
+            rev.low = 0.6;
+            rev.high = 0.2;
+            r.map(rev);
+            values["rev"] = 0.4;
+            r.handle(events[0], targets);
+            QVERIFY2(std::fabs(values["rev"] - (0.4 - 0.05 * 0.4)) < 1e-12, qPrintable(QString::number(values["rev"])));
+            r.handle(events[3], targets);
+            QVERIFY(std::fabs(values["rev"] - 0.4) < 1e-12);
         }
+        // ---- NRPN data entry with the fine half first (nightly 15 Nov: each value came out with the coarse half
+        // of the one before). The first pair shows the order; from then on the value is given whole, once, when its
+        // coarse half arrives; a fine half alone goes out when the parameter is next chosen.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 20, 0xB1, 6, 10});
+        QVERIFY(!events.empty() && events.back().key == nrpn && events.back().value == (10 << 7 | 20) && events.back().resolution == 16384);
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 0, 0xB1, 6, 11});
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (11 << 7 | 0));
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 127, 0xB1, 6, 10, 0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 5});
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].value == (10 << 7 | 127));
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 6, 0xB1, 6, 10});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].value == (10 << 7 | 5) && events[1].value == (10 << 7 | 6));
+        // (a parameter that sends the coarse half first is read as it was)
+        events = decode({0xB1, 99, 3, 0xB1, 98, 5, 0xB1, 6, 1, 0xB1, 38, 2, 0xB1, 99, 3, 0xB1, 98, 5, 0xB1, 6, 1, 0xB1, 38, 3});
+        QCOMPARE(events.size(), size_t(3));
+        QVERIFY(events[1].value == (1 << 7 | 2) && events[2].value == (1 << 7 | 3));
 
         // ---- One fader, three targets, each in its own range.
         {
@@ -5520,6 +5552,128 @@ private slots:
         QCOMPARE(trackAt(*fz.p.active(), A1)->clips.size(), size_t(3));
     }
 
+    // Nightly 15 Nov: Nest In to Out leaves what is seen and heard as it was, or refuses before cutting anything.
+    void nestInToOutKeepsWhatIsSeenAndHeard() {
+        const TrackRef V3{TrackKind::Video, 2}, A2{TrackKind::Audio, 1};
+        auto sound = [](Fixture& f, TrackRef t, FrameTime start, FrameTime len) {
+            Clip c = makeClip(f.p, *f.p.findMedia(f.media), TrackKind::Audio, f.s());
+            c.start = start;
+            c.duration = len;
+            return overwrite(f.p, f.s(), t, c).created.at(0);
+        };
+        auto compoundOn = [](const Project& p, const Track& t) -> const Sequence* {
+            for (const Clip& c : t.clips)
+                if (const MediaItem* m = p.findMedia(c.mediaId); m && m->kind == MediaKind::Sequence) return p.findSequence(m->sequenceId);
+            return nullptr;
+        };
+        {
+            // A muted audio track and a video track turned off take no part: their clips stay, whole and uncut.
+            Fixture f;
+            f.put(V1, 0, 60);
+            const Id hidden = f.put(V2, 0, 60);
+            sound(f, A1, 0, 60);
+            const Id muted = sound(f, A2, 0, 60);
+            trackAt(f.s(), V2)->muted = true;
+            trackAt(f.s(), A2)->muted = true;
+            const Id seq = f.s().id;
+            const Result r = nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range");
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& outer = *f.p.findSequence(seq);
+            QCOMPARE(trackAt(outer, V2)->clips.size(), size_t(1));
+            QVERIFY(trackAt(outer, V2)->clips[0].id == hidden && trackAt(outer, V2)->clips[0].duration == 60);
+            QCOMPARE(trackAt(outer, A2)->clips.size(), size_t(1));
+            QVERIFY(trackAt(outer, A2)->clips[0].id == muted && trackAt(outer, A2)->clips[0].duration == 60);
+            const Sequence* nested = compoundOn(f.p, *trackAt(outer, V1));
+            QVERIFY(nested);
+            QVERIFY(trackAt(*nested, V2)->clips.empty() && trackAt(*nested, A2)->clips.empty());
+            QCOMPARE(trackAt(*nested, A1)->clips.size(), size_t(1));
+        }
+        {
+            // With a track soloed, the others are not heard: only the soloed one's sound is nested.
+            Fixture f;
+            sound(f, A1, 0, 60);
+            sound(f, A2, 0, 60);
+            trackAt(f.s(), A2)->solo = true;
+            const Id seq = f.s().id;
+            QVERIFY(nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range").ok);
+            const Sequence& outer = *f.p.findSequence(seq);
+            QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));
+            QCOMPARE(trackAt(outer, A2)->clips.size(), size_t(3));
+            QVERIFY(compoundOn(f.p, *trackAt(outer, A2)));
+        }
+        {
+            // Two audio tracks whose faders differ: the compound plays through the lower track's fader, and the other
+            // track's difference from it is kept on its track inside the nested sequence.
+            Fixture f;
+            sound(f, A1, 0, 60);
+            sound(f, A2, 0, 60);
+            trackAt(f.s(), A1)->volumeDb = -3;
+            trackAt(f.s(), A2)->volumeDb = -12;
+            const Id seq = f.s().id;
+            const Result r = nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range");
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& outer = *f.p.findSequence(seq);
+            QCOMPARE(trackAt(outer, A1)->volumeDb, -3.0);
+            const Sequence* nested = compoundOn(f.p, *trackAt(outer, A1));
+            QVERIFY(nested);
+            QCOMPARE(trackAt(*nested, A1)->volumeDb, 0.0);
+            QCOMPARE(trackAt(*nested, A2)->volumeDb, -9.0);
+        }
+        // What cannot be kept is refused, and the sequence is left exactly as it was (no cut made).
+        auto refused = [&](Fixture& f, FrameTime a, FrameTime b, const char* word) {
+            const Sequence was = f.s();
+            const size_t sequences = f.p.sequences.size(), media = f.p.media.size();
+            const Result r = nestRange(f.p, f.s(), a, b, allTracks(f.s()), "Range");
+            return !r.ok && r.error.find(word) != std::string::npos && f.s() == was && f.p.sequences.size() == sequences && f.p.media.size() == media;
+        };
+        {
+            // Audio tracks mixed differently: an insert on one, another pan, or automation on one.
+            Fixture f;
+            sound(f, A1, 0, 60);
+            sound(f, A2, 0, 60);
+            trackAt(f.s(), A2)->pan = 0.5;
+            QVERIFY(refused(f, 10, 50, "mixed differently"));
+            trackAt(f.s(), A2)->pan = 0;
+            trackAt(f.s(), A2)->effects.push_back(makeEffect(f.p, "compressor"));
+            QVERIFY(refused(f, 10, 50, "mixed differently"));
+            trackAt(f.s(), A2)->effects.clear();
+            trackAt(f.s(), A1)->volumeAuto.keys = {{0, -6.0}, {60, 0.0}};
+            QVERIFY(refused(f, 10, 50, "mixed differently"));
+            // One of them alone nests, its track's automation playing on as before.
+            const Id seq = f.s().id;
+            QVERIFY(nestRange(f.p, f.s(), 10, 50, {A1}, "Range").ok);
+            QCOMPARE(trackAt(*f.p.findSequence(seq), A1)->volumeAuto.keys.size(), size_t(2));
+        }
+        {
+            // A locked track with a picture in the range, between two that are nested.
+            Fixture f;
+            f.put(V1, 0, 60);
+            f.put(V2, 0, 60);
+            f.put(V3, 0, 60);
+            trackAt(f.s(), V2)->locked = true;
+            QVERIFY(refused(f, 10, 50, "between tracks"));
+            // Turned off as well, it is not seen, so nothing ends up on the wrong side of it.
+            trackAt(f.s(), V2)->muted = true;
+            QVERIFY(nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range").ok);
+        }
+        {
+            // A dissolve across In, and a fade that Out would cut through.
+            Fixture f;
+            const Id first = f.put(V1, 0, 30, 20);
+            f.put(V1, 30, 30, 20);
+            const Result tr = addTransition(f.p, f.s(), first, Edge::Out, "cross_dissolve", 10);
+            QVERIFY2(tr.ok, tr.error.c_str());
+            QVERIFY(refused(f, 30, 50, "crosses In"));
+            QVERIFY(refused(f, 5, 28, "crosses Out"));
+            // Clear of it on both sides, the dissolve goes into the compound with its two clips.
+            const Id seq = f.s().id;
+            QVERIFY(nestRange(f.p, f.s(), 20, 40, allTracks(f.s()), "Range").ok);
+            const Sequence* nested = compoundOn(f.p, *trackAt(*f.p.findSequence(seq), V1));
+            QVERIFY(nested);
+            QCOMPARE(trackAt(*nested, V1)->transitions.size(), size_t(1));
+        }
+    }
+
     void replaceSourceOfSeveralClips() {
         Fixture fx;
         // A longer file of the same take (the online), starting two seconds earlier by timecode.
@@ -5552,11 +5706,35 @@ private slots:
         }
         // By timecode: two seconds (60 frames) later in the new file.
         fx.p = before;
+        // (a marker on the second clip's picture, ten frames in: it stays on that moment, so where it was on the
+        // timeline; kept on its old source frame it would have marked a moment two seconds before the clip)
+        {
+            Marker k;
+            k.t = 30 + 10;
+            k.name = "Look";
+            clipById(fx.s(), clips[1])->markers.push_back(k);
+            QCOMPARE(clipById(fx.s(), clips[1])->markerFrame(k), FrameTime(50));
+        }
         r = replaceSources(fx.p, fx.s(), clips, online.id, true);
         QVERIFY2(r.ok, r.error.c_str());
         for (int i = 0; i < 5; ++i) {
             QCOMPARE(trackAt(fx.s(), V1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
             QCOMPARE(trackAt(fx.s(), A1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
+        }
+        {
+            const Clip& marked = *clipById(fx.s(), clips[1]);
+            QCOMPARE(marked.markers.size(), size_t(1));
+            QCOMPARE(marked.markers[0].t, FrameTime(100));
+            QCOMPARE(marked.markerFrame(marked.markers[0]), FrameTime(50));
+        }
+        // (not by timecode the source frames are the same ones, and the marker with them)
+        {
+            Project plain = before;
+            Marker k;
+            k.t = 40;
+            clipById(*plain.active(), clips[1])->markers.push_back(k);
+            QVERIFY(replaceSources(plain, *plain.active(), clips, online.id, false).ok);
+            QCOMPARE(clipById(*plain.active(), clips[1])->markers[0].t, FrameTime(40));
         }
         // An L-cut (the sound leading the picture by 12 frames) keeps its lead; a separate recorder's sound linked to
         // the picture is left on its own file.

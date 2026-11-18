@@ -63,6 +63,10 @@ constexpr Named kLevels[] = {{0x0000, "Unrestricted"}, {0x01, "1k-1"}, {0x04, "2
 constexpr Named kSublevels[] = {{0x00, "Unrestricted"}, {0x10, "Sublev12bpp"}, {0x0C, "Sublev9bpp"}, {0x08, "Sublev6bpp"},
                                 {0x06, "Sublev4bpp"},   {0x04, "Sublev3bpp"},  {0x03, "Sublev2bpp"}};
 
+// The largest picture decoded: 16,384 samples a side and 64 million pixels in all.
+constexpr int kJxsLargestSide = 16384;
+constexpr int64_t kJxsMostPixels = 64000000;
+
 template <size_t N>
 std::string named(const Named (&table)[N], uint16_t v) {
     for (const Named& n : table)
@@ -137,6 +141,14 @@ bool readJxsHeader(const uint8_t* data, size_t size, JxsHeader& out) {
         at += 2 + len;
     }
     return false;
+}
+
+bool jxsPictureFits(const JxsHeader& h, std::string* why) {
+    if (h.components != 3) return fail(why, "JPEG XS with " + std::to_string(h.components) + " components is not read here (three are)");
+    if (h.width < 1 || h.height < 1) return fail(why, "The JPEG XS codestream names no picture size");
+    if (h.width > kJxsLargestSide || h.height > kJxsLargestSide || int64_t(h.width) * h.height > kJxsMostPixels)
+        return fail(why, "A JPEG XS picture of " + std::to_string(h.width) + " x " + std::to_string(h.height) + " is larger than is read here");
+    return true;
 }
 
 std::string jxsProfileName(uint16_t ppih) { return named(kProfiles, ppih); }
@@ -328,7 +340,8 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
     quietSvt();
     JxsHeader h;
     if (!readJxsHeader(data, size, h)) return fail(error, "Not a JPEG XS codestream");
-    if (h.components != 3) return fail(error, "JPEG XS with " + std::to_string(h.components) + " components is not read here (three are)");
+    // (a header may name 65,535 x 65,535: checked before the library or any plane is set up for it)
+    if (!jxsPictureFits(h, error)) return false;
     // (the decoder is set up for one header: another one, even of another rate alone, starts it again)
     const bool same = st.open && st.headerBytes.size() == h.headerBytes && std::equal(data, data + h.headerBytes, st.headerBytes.begin());
     if (!same) {
@@ -348,6 +361,18 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
         if (st.config.components_num != 3) {
             close();
             return fail(error, "JPEG XS with other than three components is not read here");
+        }
+        // (and what the library asks for is held to the same bound: 16-bit samples of the largest picture)
+        for (int c = 0; c < 3; ++c)
+            if (uint64_t(st.config.components[c].byte_size) > uint64_t(kJxsMostPixels) * 2 ||
+                uint64_t(st.config.components[c].width) * st.config.components[c].height > uint64_t(kJxsMostPixels)) {
+                close();
+                return fail(error, "The JPEG XS picture is larger than is read here");
+            }
+        if (st.config.width > uint32_t(kJxsLargestSide) || st.config.height > uint32_t(kJxsLargestSide) ||
+            uint64_t(st.config.width) * st.config.height > uint64_t(kJxsMostPixels)) {
+            close();
+            return fail(error, "The JPEG XS picture is larger than is read here");
         }
         for (int c = 0; c < 3; ++c) st.planes[c].resize(st.config.components[c].byte_size);
     }

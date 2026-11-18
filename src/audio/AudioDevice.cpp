@@ -343,9 +343,12 @@ struct OutputClient {
     int fifoFrames = 0;
     double head = -1;            // the timeline sample at the fifo's start
     int64_t blockSample = -1;    // this block's first frame on the timeline (client rate)
-    std::atomic<int64_t> delivered{0};  // device frames sent
+    // (the sound sent, in time: frames at whatever rate the device ran at when they went, so the clock holds when
+    // its rate changes)
+    std::atomic<int64_t> deliveredNs{0};
+    int64_t deliveredRem = 0;  // (what the division left, for the next block: the audio thread's)
     std::atomic<int64_t> lastNs{0};
-    std::atomic<int> lastBlock{0};
+    std::atomic<int64_t> lastBlockNs{0};
     ~OutputClient() { swr_free(&swr); }
 };
 
@@ -476,9 +479,13 @@ void Engine::Impl::process(const float* in, int inCh, float* out, int outCh, int
             const int n = std::min(c->channels, outCh);
             for (int i = 0; i < frames; ++i)
                 for (int k = 0; k < n; ++k) out[size_t(i) * size_t(outCh) + size_t(k)] += mixBuf[size_t(i) * size_t(c->channels) + size_t(k)];
-            c->lastBlock = frames;
-            c->lastNs = now;
-            c->delivered += frames;
+            if (rate > 0) {
+                const int64_t ns = int64_t(frames) * 1000000000 + c->deliveredRem;
+                c->lastBlockNs = int64_t(frames) * 1000000000 / rate;
+                c->lastNs = now;
+                c->deliveredNs += ns / rate;
+                c->deliveredRem = ns % rate;
+            }
         }
         // A loopback measurement: a click out, then what comes back.
         int state = measureState.load();
@@ -715,12 +722,12 @@ double Engine::heardSeconds(int id) const {
     }
     const int rate = d_->devRate.load();
     if (!c || rate <= 0) return -1;
-    const int64_t delivered = c->delivered.load();
+    const int64_t delivered = c->deliveredNs.load();
     if (delivered <= 0) return -1;
-    const int block = c->lastBlock.load();
-    const double since = double(nowNs() - c->lastNs.load()) / 1e9 * rate;
-    const double heard = double(delivered - block) + std::clamp(since, 0.0, double(block)) - d_->outLatency.load();
-    return heard / rate;
+    // (the last block as far as the time since it was asked for says it has played)
+    const int64_t block = c->lastBlockNs.load();
+    const int64_t since = nowNs() - c->lastNs.load();
+    return double(delivered - block + std::clamp<int64_t>(since, 0, block)) / 1e9 - double(d_->outLatency.load()) / rate;
 }
 
 int Engine::addInput(const void* clockOwner, int rate, Tap tap, std::string* error) {

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <future>
@@ -16,8 +17,21 @@
 #include <thread>
 #include <vector>
 
+#ifdef __linux__
+#include <dlfcn.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstddef>
+#endif
+
 #ifndef GL_RGBA32F
 #define GL_RGBA32F 0x8814
+#endif
+#ifndef GL_RGBA16F
+#define GL_RGBA16F 0x881A
 #endif
 #ifndef GL_FRAMEBUFFER
 #define GL_FRAMEBUFFER 0x8D40
@@ -39,6 +53,18 @@
 #endif
 #ifndef GL_TEXTURE0
 #define GL_TEXTURE0 0x84C0
+#endif
+#ifndef GL_READ_FRAMEBUFFER
+#define GL_READ_FRAMEBUFFER 0x8CA8
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER
+#define GL_DRAW_FRAMEBUFFER 0x8CA9
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER_BINDING
+#define GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
+#endif
+#ifndef GL_READ_FRAMEBUFFER_BINDING
+#define GL_READ_FRAMEBUFFER_BINDING 0x8CAA
 #endif
 
 namespace montage::ofx::gl {
@@ -66,6 +92,13 @@ struct Worker {
     LoadMatrixd loadMatrix = nullptr;
     std::atomic<bool> ok{false};
     std::string why = "OpenGL for plugins was not started";  // (set before ok, read after it)
+    // Textures shared with the GPU compositor's context: the compositor's context while it lives (shareMutex; this one
+    // is made sharing with it when it is made later), whether this context copies between framebuffers (flip()), and
+    // the two framebuffers it copies with.
+    std::mutex shareMutex;
+    QOpenGLContext* compositor = nullptr;
+    std::atomic<bool> blits{false};
+    unsigned copyFbo[2] = {0, 0};
 };
 
 // The thread waiting in run() for the job on the OpenGL thread, and what that job asks it to do meanwhile.
@@ -106,11 +139,23 @@ void start(Worker* w) {
     }
     w->context = new QOpenGLContext;
     w->context->setFormat(w->surface->format());
-    if (!w->context->create() || !w->context->makeCurrent(w->surface)) {
+    bool created = false;
+    {
+        // (The compositor's context, where it was made first, stays while this one is made from it.)
+        std::lock_guard<std::mutex> lock(w->shareMutex);
+        if (w->compositor) w->context->setShareContext(w->compositor);
+        created = w->context->create();
+        if (!created && w->compositor) {  // (a context of its own, as before, where the two cannot share)
+            w->context->setShareContext(nullptr);
+            created = w->context->create();
+        }
+    }
+    if (!created || !w->context->makeCurrent(w->surface)) {
         w->why = "No OpenGL context could be made for plugins";
         return;
     }
     w->f = w->context->extraFunctions();
+    w->blits = w->context->format().majorVersion() >= 3;  // (glBlitFramebuffer)
     auto proc = [w](const char* name) { return w->context->getProcAddress(name); };
     w->matrixMode = reinterpret_cast<MatrixMode>(proc("glMatrixMode"));
     w->loadIdentity = reinterpret_cast<LoadIdentity>(proc("glLoadIdentity"));
@@ -177,6 +222,22 @@ bool available(std::string* why) {
 bool onThread() {
     Worker& w = worker();
     return w.ok && std::this_thread::get_id() == w.id;
+}
+
+QOpenGLContext* context() {
+    Worker& w = worker();
+    return w.ok ? w.context : nullptr;
+}
+
+void shareWith(QOpenGLContext* compositor) {
+    Worker& w = worker();
+    std::lock_guard<std::mutex> lock(w.shareMutex);
+    w.compositor = compositor;
+}
+
+bool sharesWith(QOpenGLContext* other) {
+    Worker& w = worker();
+    return w.ok && w.blits && other && QOpenGLContext::areSharing(w.context, other);
 }
 
 namespace {
@@ -274,6 +335,103 @@ unsigned upload(const Image& img) {
     f->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, img.width, img.height, 0, GL_RGBA, GL_FLOAT, rows.data());
     f->glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
+}
+
+unsigned makeTexture(int width, int height, bool half) {
+    QOpenGLExtraFunctions* f = worker().f;
+    if (!f || width <= 0 || height <= 0) return 0;
+    GLuint tex = 0;
+    f->glGenTextures(1, &tex);
+    f->glBindTexture(GL_TEXTURE_2D, tex);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    f->glTexImage2D(GL_TEXTURE_2D, 0, half ? GL_RGBA16F : GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
+    f->glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
+namespace {
+
+// `texture` as framebuffer `which`'s (0: read from, 1: drawn into) only colour attachment (0: none); whether it is
+// complete then.
+bool attach(Worker& w, int which, unsigned texture) {
+    QOpenGLExtraFunctions* f = w.f;
+    if (!w.copyFbo[0]) f->glGenFramebuffers(2, w.copyFbo);
+    const GLenum target = which ? GL_DRAW_FRAMEBUFFER : GL_READ_FRAMEBUFFER;
+    f->glBindFramebuffer(target, w.copyFbo[which]);
+    f->glFramebufferTexture2D(target, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    return texture && f->glCheckFramebufferStatus(target) == GL_FRAMEBUFFER_COMPLETE;
+}
+
+// The framebuffers bound before a copy, bound again after it (a plug-in may ask for its input's texture with its
+// output's framebuffer bound); neither texture stays held by the copy's framebuffers (the compositor's are its own to
+// delete).
+struct Bound {
+    Worker& w;
+    GLint read = 0, draw = 0;
+    explicit Bound(Worker& worker) : w(worker) {
+        w.f->glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+        w.f->glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    }
+    ~Bound() {
+        attach(w, 0, 0);
+        attach(w, 1, 0);
+        w.f->glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(read));
+        w.f->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(draw));
+    }
+};
+
+}  // namespace
+
+bool flip(unsigned from, unsigned to, int width, int height) {
+    Worker& w = worker();
+    QOpenGLExtraFunctions* f = w.f;
+    if (!f || !w.blits || !from || !to || width <= 0 || height <= 0) return false;
+    while (f->glGetError() != GL_NO_ERROR) {
+    }
+    bool complete = false;
+    {
+        Bound bound(w);
+        complete = attach(w, 0, from) && attach(w, 1, to);
+        if (complete) {
+            const bool scissor = f->glIsEnabled(GL_SCISSOR_TEST);
+            f->glDisable(GL_SCISSOR_TEST);
+            f->glBlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            if (scissor) f->glEnable(GL_SCISSOR_TEST);
+        }
+    }
+    return complete && f->glGetError() == GL_NO_ERROR;
+}
+
+void readTexture(unsigned texture, int width, int height, bool topFirst, Image& out) {
+    Worker& w = worker();
+    QOpenGLExtraFunctions* f = w.f;
+    out = Image();
+    if (!f || !w.blits || !texture || width <= 0 || height <= 0) return;
+    Bound bound(w);
+    if (!attach(w, 0, texture)) return;
+    out = Image(width, height);
+    const size_t row = size_t(width) * 4;
+    std::vector<float> rows(topFirst ? 0 : out.px.size());
+    f->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    f->glReadPixels(0, 0, width, height, GL_RGBA, GL_FLOAT, topFirst ? out.px.data() : rows.data());
+    if (!topFirst)
+        for (int y = 0; y < height; ++y) std::memcpy(out.row(height - 1 - y), rows.data() + size_t(y) * row, row * sizeof(float));
+}
+
+void writeTexture(unsigned texture, const Image& img) {
+    QOpenGLExtraFunctions* f = worker().f;
+    if (!f || !texture || img.empty()) return;
+    f->glBindTexture(GL_TEXTURE_2D, texture);
+    f->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    f->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.width, img.height, GL_RGBA, GL_FLOAT, img.px.data());
+    f->glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void finish() {
+    if (QOpenGLExtraFunctions* f = worker().f) f->glFinish();
 }
 
 void destroyTexture(unsigned texture) {
@@ -383,5 +541,380 @@ void overlayProjection(int width, int height, const double m[6]) {
     const double mv[16] = {m[0], m[3], 0, 0, m[1], m[4], 0, 0, 0, 0, 1, 0, m[2], m[5], 0, 1};  // (column-major)
     w.loadMatrix(mv);
 }
+
+// ---- Pictures shared between processes -------------------------------------------------------------------------------
+
+#ifdef __linux__
+
+namespace {
+
+// EGL, as far as sharing a picture needs it, found in the running process: the context is EGL's where Qt's platform made
+// it so (Wayland; X11 when asked), and then its library is loaded already. (No EGL header is needed to build this.)
+using EglDisplay = void*;
+using EglImage = void*;
+using EglSync = void*;
+constexpr int kEglExtensions = 0x3055, kEglNone = 0x3038, kEglWidth = 0x3057, kEglHeight = 0x3056;
+constexpr unsigned kEglGlTexture2d = 0x30B1, kEglLinuxDmaBuf = 0x3270, kEglSyncNativeFence = 0x3144;
+constexpr int kEglGlTextureLevel = 0x30BC, kEglFourcc = 0x3271, kEglPlane0Fd = 0x3272, kEglPlane0Offset = 0x3273, kEglPlane0Pitch = 0x3274;
+constexpr int kEglPlane0ModifierLo = 0x3443, kEglPlane0ModifierHi = 0x3444;
+constexpr unsigned long long kNoModifier = 0x00ffffffffffffffull;  // (DRM's "invalid": the driver's own layout)
+constexpr int kFenceWaitMs = 5000;
+
+struct Egl {
+    bool probed = false;
+    EglDisplay display = nullptr;
+    void* (*currentContext)() = nullptr;
+    int (*error)() = nullptr;
+    EglImage (*createImage)(EglDisplay, void* context, unsigned target, void* buffer, const int* attributes) = nullptr;
+    unsigned (*destroyImage)(EglDisplay, EglImage) = nullptr;
+    unsigned (*exportQuery)(EglDisplay, EglImage, int* fourcc, int* planes, unsigned long long* modifiers) = nullptr;
+    unsigned (*exportImage)(EglDisplay, EglImage, int* fds, int* strides, int* offsets) = nullptr;
+    EglSync (*createSync)(EglDisplay, unsigned type, const int* attributes) = nullptr;
+    unsigned (*destroySync)(EglDisplay, EglSync) = nullptr;
+    int (*dupFence)(EglDisplay, EglSync) = nullptr;
+    void (*imageTargetTexture)(unsigned target, void* image) = nullptr;
+    bool modifiers = false;  // (an import may name the buffer's layout)
+    bool exports = false, imports = false;
+    std::string whyNoExport, whyNoImport;
+};
+
+std::mutex gEglMutex;
+Egl gEgl;
+
+// Looked up once, on the OpenGL thread with the context current.
+void probeEgl(Egl& e) {
+    e.probed = true;
+    Worker& w = worker();
+    const std::string notEgl = "OpenGL here is not through EGL";
+    e.whyNoExport = e.whyNoImport = notEgl;
+    using GetDisplay = EglDisplay (*)();
+    using QueryString = const char* (*)(EglDisplay, int);
+    using GetProc = void* (*)(const char*);
+    const auto getDisplay = reinterpret_cast<GetDisplay>(dlsym(RTLD_DEFAULT, "eglGetCurrentDisplay"));
+    const auto queryString = reinterpret_cast<QueryString>(dlsym(RTLD_DEFAULT, "eglQueryString"));
+    const auto getProc = reinterpret_cast<GetProc>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
+    e.currentContext = reinterpret_cast<void* (*)()>(dlsym(RTLD_DEFAULT, "eglGetCurrentContext"));
+    e.error = reinterpret_cast<int (*)()>(dlsym(RTLD_DEFAULT, "eglGetError"));
+    if (!getDisplay || !queryString || !getProc || !e.currentContext || !e.error) return;
+    e.display = getDisplay();
+    if (!e.display || !e.currentContext()) return;
+    const char* list = queryString(e.display, kEglExtensions);
+    const std::string extensions = std::string(" ") + (list ? list : "") + " ";
+    auto has = [&](const char* name) { return extensions.find(std::string(" ") + name + " ") != std::string::npos; };
+    auto proc = [&](const char* name) { return getProc(name); };
+    e.createImage = reinterpret_cast<decltype(e.createImage)>(proc("eglCreateImageKHR"));
+    e.destroyImage = reinterpret_cast<decltype(e.destroyImage)>(proc("eglDestroyImageKHR"));
+    if (!has("EGL_KHR_image_base") || !e.createImage || !e.destroyImage) {
+        e.whyNoExport = e.whyNoImport = "EGL here makes no images of buffers (EGL_KHR_image_base)";
+        return;
+    }
+    // Out: a texture's storage as a DMA-BUF, with a fence where the driver gives one.
+    e.exportQuery = reinterpret_cast<decltype(e.exportQuery)>(proc("eglExportDMABUFImageQueryMESA"));
+    e.exportImage = reinterpret_cast<decltype(e.exportImage)>(proc("eglExportDMABUFImageMESA"));
+    if (!has("EGL_KHR_gl_texture_2D_image")) e.whyNoExport = "EGL here makes no images of textures (EGL_KHR_gl_texture_2D_image)";
+    else if (!has("EGL_MESA_image_dma_buf_export") || !e.exportQuery || !e.exportImage)
+        e.whyNoExport = "the OpenGL driver does not export DMA-BUFs (EGL_MESA_image_dma_buf_export)";
+    else e.exports = true, e.whyNoExport.clear();
+    if (has("EGL_ANDROID_native_fence_sync") && has("EGL_KHR_fence_sync")) {
+        e.createSync = reinterpret_cast<decltype(e.createSync)>(proc("eglCreateSyncKHR"));
+        e.destroySync = reinterpret_cast<decltype(e.destroySync)>(proc("eglDestroySyncKHR"));
+        e.dupFence = reinterpret_cast<decltype(e.dupFence)>(proc("eglDupNativeFenceFDANDROID"));
+        if (!e.createSync || !e.destroySync || !e.dupFence) e.createSync = nullptr;
+    }
+    // In: a DMA-BUF as a texture.
+    e.modifiers = has("EGL_EXT_image_dma_buf_import_modifiers");
+    e.imageTargetTexture = reinterpret_cast<decltype(e.imageTargetTexture)>(w.context->getProcAddress("glEGLImageTargetTexture2DOES"));
+    if (!has("EGL_EXT_image_dma_buf_import")) e.whyNoImport = "the OpenGL driver does not import DMA-BUFs (EGL_EXT_image_dma_buf_import)";
+    else if (!w.context->hasExtension("GL_OES_EGL_image") || !e.imageTargetTexture)
+        e.whyNoImport = "OpenGL here makes no textures of EGL's images (GL_OES_EGL_image)";
+    else if (!w.blits) e.whyNoImport = "OpenGL here cannot read such a texture back";
+    else e.imports = true, e.whyNoImport.clear();
+}
+
+// The probe's answers (made on the first call, on the OpenGL thread).
+Egl eglNow() {
+    {
+        std::lock_guard<std::mutex> lock(gEglMutex);
+        if (gEgl.probed) return gEgl;
+    }
+    Egl probe;
+    // (Not from a thread the OpenGL thread waits for: asked again later.)
+    const bool ran = !(servingOpenGl() && !onThread()) && run([&] { probeEgl(probe); });
+    std::lock_guard<std::mutex> lock(gEglMutex);
+    if (ran && probe.probed && !gEgl.probed) gEgl = probe;
+    if (gEgl.probed) return gEgl;
+    Egl none;
+    none.whyNoExport = none.whyNoImport = "OpenGL for plugins is not running";
+    return none;
+}
+
+}  // namespace
+
+bool exportsDmaBuf(std::string* why) {
+    const Egl e = eglNow();
+    if (why) *why = e.whyNoExport;
+    return e.exports;
+}
+
+bool importsDmaBuf(std::string* why) {
+    const Egl e = eglNow();
+    if (why) *why = e.whyNoImport;
+    return e.imports;
+}
+
+bool exportDmaBuf(unsigned texture, int width, int height, DmaBuf& out, std::string* why) {
+    auto no = [&](const std::string& reason) {
+        if (why) *why = reason;
+        return false;
+    };
+    const Egl e = eglNow();
+    QOpenGLExtraFunctions* f = worker().f;
+    if (!e.exports || !f) return no(e.whyNoExport);
+    if (!texture || width <= 0 || height <= 0) return no("there is no picture to share");
+    const int level[] = {kEglGlTextureLevel, 0, kEglNone};
+    const EglImage image = e.createImage(e.display, e.currentContext(), kEglGlTexture2d, reinterpret_cast<void*>(uintptr_t(texture)), level);
+    if (!image) return no("EGL made no image of the picture's texture (error " + std::to_string(e.error()) + ")");
+    int fourcc = 0, planes = 0, fd = -1, stride = 0, offset = 0;
+    unsigned long long modifier = kNoModifier;
+    bool ok = e.exportQuery(e.display, image, &fourcc, &planes, &modifier) && planes == 1 && fourcc != 0;
+    ok = ok && e.exportImage(e.display, image, &fd, &stride, &offset) && fd >= 0 && stride > 0 && offset >= 0;
+    e.destroyImage(e.display, image);  // (the DMA-BUF keeps the storage)
+    if (!ok) {
+        if (fd >= 0) ::close(fd);
+        return no("the OpenGL driver did not export the picture's texture as a DMA-BUF of one plane");
+    }
+    // A fence for what is still being drawn into it, where the driver gives one; drawn to the end here where not.
+    int fence = -1;
+    if (e.createSync) {
+        const int attributes[] = {kEglNone};
+        if (const EglSync sync = e.createSync(e.display, kEglSyncNativeFence, attributes)) {
+            f->glFlush();
+            fence = e.dupFence(e.display, sync);
+            e.destroySync(e.display, sync);
+        }
+    }
+    if (fence < 0) {
+        fence = -1;
+        f->glFinish();
+    }
+    out = DmaBuf{};
+    out.fd = fd;
+    out.fence = fence;
+    out.fourcc = unsigned(fourcc);
+    out.stride = unsigned(stride);
+    out.offset = unsigned(offset);
+    out.modifier = modifier;
+    out.width = width;
+    out.height = height;
+    return true;
+}
+
+unsigned importDmaBuf(const DmaBuf& buf, std::string* why) {
+    auto no = [&](const std::string& reason) {
+        if (why) *why = reason;
+        return 0u;
+    };
+    const Egl e = eglNow();
+    QOpenGLExtraFunctions* f = worker().f;
+    if (!e.imports || !f) return no(e.whyNoImport);
+    if (buf.fd < 0 || buf.width <= 0 || buf.height <= 0 || !buf.fourcc || !buf.stride) return no("the shared picture is not described");
+    if (buf.fence >= 0) {
+        pollfd p{buf.fence, POLLIN, 0};
+        int r = 0;
+        do {
+            r = ::poll(&p, 1, kFenceWaitMs);
+        } while (r < 0 && errno == EINTR);
+        if (r <= 0) return no("the shared picture was not drawn within " + std::to_string(kFenceWaitMs / 1000) + " s");
+    }
+    std::vector<int> a = {kEglWidth, buf.width, kEglHeight, buf.height, kEglFourcc, int(buf.fourcc), kEglPlane0Fd, buf.fd,
+                          kEglPlane0Offset, int(buf.offset), kEglPlane0Pitch, int(buf.stride)};
+    if (e.modifiers && buf.modifier != kNoModifier) {
+        a.insert(a.end(), {kEglPlane0ModifierLo, int(unsigned(buf.modifier & 0xffffffffull)), kEglPlane0ModifierHi, int(unsigned(buf.modifier >> 32))});
+    }
+    a.push_back(kEglNone);
+    const EglImage image = e.createImage(e.display, nullptr, kEglLinuxDmaBuf, nullptr, a.data());
+    if (!image) return no("EGL did not take the shared picture (error " + std::to_string(e.error()) + ")");
+    while (f->glGetError() != GL_NO_ERROR) {
+    }
+    GLuint tex = 0;
+    f->glGenTextures(1, &tex);
+    f->glBindTexture(GL_TEXTURE_2D, tex);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    e.imageTargetTexture(GL_TEXTURE_2D, image);
+    const bool bound = f->glGetError() == GL_NO_ERROR;
+    f->glBindTexture(GL_TEXTURE_2D, 0);
+    e.destroyImage(e.display, image);  // (the texture keeps the buffer)
+    if (!bound) {
+        f->glDeleteTextures(1, &tex);
+        return no("OpenGL made no texture of the shared picture");
+    }
+    return tex;
+}
+
+void closeDmaBuf(DmaBuf& buf) {
+    if (buf.fd >= 0) ::close(buf.fd);
+    if (buf.fence >= 0) ::close(buf.fence);
+    buf.fd = buf.fence = -1;
+}
+
+namespace {
+
+// The address of the socket under abstract name `name` (no file: it goes with its socket).
+socklen_t postAddress(const std::string& name, sockaddr_un& a) {
+    a = sockaddr_un{};
+    a.sun_family = AF_UNIX;
+    const size_t n = std::min(name.size(), sizeof a.sun_path - 2);
+    std::memcpy(a.sun_path + 1, name.data(), n);
+    return socklen_t(offsetof(sockaddr_un, sun_path) + 1 + n);
+}
+
+// One message taken from `post` (false: none within `waitMs`): the descriptors it carried, and who sent it.
+bool takeMessage(int post, int waitMs, std::vector<int>& fds, long long& from) {
+    fds.clear();
+    from = -1;
+    pollfd p{post, POLLIN, 0};
+    int r = 0;
+    do {
+        r = ::poll(&p, 1, waitMs);
+    } while (r < 0 && errno == EINTR);
+    if (r <= 0) return false;
+    char byte = 0;
+    iovec io{&byte, 1};
+    alignas(cmsghdr) char control[CMSG_SPACE(4 * sizeof(int)) + CMSG_SPACE(sizeof(ucred))] = {};
+    msghdr m{};
+    m.msg_iov = &io;
+    m.msg_iovlen = 1;
+    m.msg_control = control;
+    m.msg_controllen = sizeof control;
+    if (::recvmsg(post, &m, MSG_CMSG_CLOEXEC | MSG_DONTWAIT) < 0) return false;
+    for (cmsghdr* c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+        if (c->cmsg_level != SOL_SOCKET) continue;
+        if (c->cmsg_type == SCM_RIGHTS) {
+            const size_t n = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            for (size_t i = 0; i < n; ++i) {
+                int fd = -1;
+                std::memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof fd);
+                fds.push_back(fd);
+            }
+        } else if (c->cmsg_type == SCM_CREDENTIALS) {
+            ucred who{};
+            std::memcpy(&who, CMSG_DATA(c), sizeof who);
+            from = who.pid;
+        }
+    }
+    if (m.msg_flags & MSG_CTRUNC) from = -1;  // (more came than is taken: not whole)
+    return true;
+}
+
+}  // namespace
+
+int openDmaBufPost(const std::string& name, std::string* why) {
+    auto no = [&](int s) {
+        if (why) *why = std::string("no socket for the shared picture's descriptors (") + std::strerror(errno) + ")";
+        if (s >= 0) ::close(s);
+        return -1;
+    };
+    const int s = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return no(s);
+    sockaddr_un a;
+    const socklen_t length = postAddress(name, a);
+    const int on = 1;  // (each message says which process sent it)
+    if (::bind(s, reinterpret_cast<const sockaddr*>(&a), length) != 0 || ::setsockopt(s, SOL_SOCKET, SO_PASSCRED, &on, sizeof on) != 0) return no(s);
+    return s;
+}
+
+void closeDmaBufPost(int post) {
+    if (post < 0) return;
+    // (descriptors sent and never taken go with their messages)
+    ::close(post);
+}
+
+bool sendDmaBuf(const std::string& post, const DmaBuf& buf) {
+    if (buf.fd < 0) return false;
+    const int s = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return false;
+    sockaddr_un a;
+    const socklen_t length = postAddress(post, a);
+    const int fds[2] = {buf.fd, buf.fence};
+    const size_t n = buf.fence >= 0 ? 2 : 1;
+    char byte = 1;
+    iovec io{&byte, 1};
+    alignas(cmsghdr) char control[CMSG_SPACE(2 * sizeof(int))] = {};
+    msghdr m{};
+    m.msg_name = &a;
+    m.msg_namelen = length;
+    m.msg_iov = &io;
+    m.msg_iovlen = 1;
+    m.msg_control = control;
+    m.msg_controllen = CMSG_SPACE(n * sizeof(int));
+    cmsghdr* c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(n * sizeof(int));
+    std::memcpy(CMSG_DATA(c), fds, n * sizeof(int));
+    const bool sent = ::sendmsg(s, &m, MSG_NOSIGNAL) == 1;
+    ::close(s);
+    return sent;
+}
+
+bool receiveDmaBuf(int post, long long pid, bool fence, int waitMs, DmaBuf& buf, std::string* why) {
+    buf.fd = buf.fence = -1;
+    std::vector<int> fds;
+    long long from = -1;
+    bool whole = false;
+    // The newest message is the one waited for (it was sent before the reply that said so); older ones were never
+    // taken, and go. (No more than a socket holds at once are looked through, whoever keeps sending.)
+    int taken = 0;
+    for (int wait = waitMs; taken < 64 && takeMessage(post, wait, fds, from); wait = 0, ++taken) {
+        if (from == pid && fds.size() == (fence ? 2u : 1u)) {
+            closeDmaBuf(buf);
+            whole = true;
+            buf.fd = fds[0];
+            buf.fence = fence ? fds[1] : -1;
+        } else {
+            for (int fd : fds) ::close(fd);
+        }
+    }
+    if (!whole && why) *why = "the shared picture's descriptors did not come whole";
+    return whole;
+}
+
+#else  // (elsewhere a picture is shared through memory: IOSurface and DXGI handles are not written)
+
+namespace {
+const char* const kLinuxOnly = "pictures are shared from the GPU's memory on Linux only";
+}
+
+bool exportsDmaBuf(std::string* why) {
+    if (why) *why = kLinuxOnly;
+    return false;
+}
+bool importsDmaBuf(std::string* why) {
+    if (why) *why = kLinuxOnly;
+    return false;
+}
+bool exportDmaBuf(unsigned, int, int, DmaBuf&, std::string* why) {
+    if (why) *why = kLinuxOnly;
+    return false;
+}
+unsigned importDmaBuf(const DmaBuf&, std::string* why) {
+    if (why) *why = kLinuxOnly;
+    return 0;
+}
+void closeDmaBuf(DmaBuf& buf) { buf.fd = buf.fence = -1; }
+int openDmaBufPost(const std::string&, std::string* why) {
+    if (why) *why = kLinuxOnly;
+    return -1;
+}
+void closeDmaBufPost(int) {}
+bool sendDmaBuf(const std::string&, const DmaBuf&) { return false; }
+bool receiveDmaBuf(int, long long, bool, int, DmaBuf& buf, std::string* why) {
+    buf.fd = buf.fence = -1;
+    if (why) *why = kLinuxOnly;
+    return false;
+}
+
+#endif
 
 }  // namespace montage::ofx::gl

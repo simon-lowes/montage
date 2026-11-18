@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 #include "media/JpegXs.h"
 
@@ -265,6 +266,8 @@ bool JxsvAssembler::add(const RtpPacket& p) {
         timestamp_ = p.timestamp;
         parts_.clear();
         frameLost_ = 0;
+        bytes_ = 0;
+        over_ = false;
     }
     frameLost_ += gap;
     const uint32_t h = get32(p.payload);
@@ -273,8 +276,19 @@ bool JxsvAssembler::add(const RtpPacket& p) {
     part.sep = int((h >> 11) & 0x7FF);
     part.p = int(h & 0x7FF);
     part.last = (h >> 29) & 1;
-    part.data.assign(p.payload + 4, p.payload + p.size);
-    if (parts_.size() < 1000000) parts_.push_back(std::move(part));
+    // What one timestamp may hold is bounded (a sender, or anyone who can send to the group, could otherwise have
+    // packets kept without end): a frame past it is let go at once and passed over when it ends.
+    const size_t data = p.size - 4;
+    if (!over_ && (data > limit_ - bytes_ || parts_.size() >= kMostParts)) {
+        over_ = true;
+        bytes_ = 0;
+        std::vector<Part>().swap(parts_);
+    }
+    if (!over_) {
+        part.data.assign(p.payload + 4, p.payload + p.size);
+        bytes_ += data;
+        parts_.push_back(std::move(part));
+    }
     if (p.marker) completed = finish() || completed;
     return completed;
 }
@@ -285,9 +299,14 @@ bool JxsvAssembler::finish() {
     parts_.clear();
     int64_t lost = frameLost_;
     frameLost_ = 0;
+    bytes_ = 0;
+    if (std::exchange(over_, false)) return ++passedOver_, false;
     if (parts.empty()) return false;
+    // A full packet's payload, as this frame has it: a whole frame sets it anew (one odd long packet does not stay
+    // the measure of every frame after), a frame missing packets is placed by the last whole frame's.
+    size_t frameUnit = 0;
     for (const Part& q : parts)
-        if (!q.last) unit_ = std::max(unit_, q.data.size());
+        if (!q.last) frameUnit = std::max(frameUnit, q.data.size());
     const bool slices = mode_ == 1;
     // (slice indices counted on past SEP's 2047, in the order they came)
     std::vector<int> sliceOf(parts.size(), -1);
@@ -305,11 +324,16 @@ bool JxsvAssembler::finish() {
     if (lost == 0 && startsWhole && parts.back().last) {
         // Whole: its units in turn, the boxes taken off the front.
         std::vector<uint8_t> unit;
+        size_t total = 0;
+        for (const Part& q : parts) total += q.data.size();
+        unit.reserve(total);
         for (const Part& q : parts) unit.insert(unit.end(), q.data.begin(), q.data.end());
         const size_t boxes = boxBytes(unit.data(), unit.size());
         JxsHeader h;
         if (boxes == 0 && !(unit.size() >= 2 && unit[0] == 0xFF && unit[1] == 0x10)) return ++passedOver_, false;
-        std::vector<uint8_t> cs(unit.begin() + ptrdiff_t(boxes), unit.end());
+        // (the boxes taken off in place: no second copy of the frame)
+        unit.erase(unit.begin(), unit.begin() + ptrdiff_t(boxes));
+        std::vector<uint8_t> cs = std::move(unit);
         if (!readJxsHeader(cs.data(), cs.size(), h)) return ++passedOver_, false;
         // Where its slices start, for a frame after that misses some: as its units say, or found in the codestream.
         std::vector<size_t> starts;
@@ -326,6 +350,7 @@ bool JxsvAssembler::finish() {
         } else {
             starts = sliceStarts(cs);
         }
+        if (frameUnit) unit_ = frameUnit;
         prev_ = cs;
         prevSlices_ = starts;
         prevBoxes_ = boxes;
@@ -337,6 +362,7 @@ bool JxsvAssembler::finish() {
     }
     // Missing packets: what came put in its place in the frame before's layout, the slices with anything missing taken
     // whole from that frame.
+    if (unit_ == 0) unit_ = frameUnit;
     if (prev_.empty() || prevSlices_.size() < 2 || unit_ == 0) return ++passedOver_, false;
     const size_t size = prev_.size();
     std::vector<uint8_t> cs(size, 0), known(size, 0);

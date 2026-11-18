@@ -751,7 +751,9 @@ bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
 namespace {
 
 // A card's picture at t as a PNG (sRGB, straight alpha, 8 bits): its clip's picture on the sequence's frame as its own
-// transform leaves it, before its 3D layer (drawn alone, the 3D layers on it turned off).
+// transform leaves it, before its 3D layer (drawn alone, the 3D layers on it turned off). An HDR or wide gamut
+// sequence's picture is brought to SDR in Rec.709's primaries first (tone mapped as an SDR delivery is), so the file
+// holds what it says; a Rec.709 or sRGB sequence's values go in as they are.
 std::string cardPicturePng(const Project& p, const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
     Sequence alone = seq;
     if (track >= alone.videoTracks.size()) return {};
@@ -762,8 +764,10 @@ std::string cardPicturePng(const Project& p, const Sequence& seq, size_t track, 
     RenderOptions o;
     o.highQuality = true;
     o.soloVideoTrack = int(track);
-    const Image img = renderSequenceFrame(p, alone, t, o);
+    Image img = renderSequenceFrame(p, alone, t, o);
     if (img.empty()) return {};
+    if (const ColorSpace& space = sequenceColorSpace(alone); space.hdr() || space.primaries != Primaries::Bt709)
+        convertColor(img, space, rec709Space(), std::clamp(alone.hdrPeakNits, 100.0, 10000.0));
     QImage q(img.width, img.height, QImage::Format_RGBA8888);
     for (int y = 0; y < img.height; ++y) {
         uchar* row = q.scanLine(y);
@@ -831,21 +835,24 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             if (!e || std::lround(e->p("camera", 0, 3)) != 1) continue;
             if (cameraTrackOf(seq, ti, *e, 0, c.start) != int(track) || clipOn(seq.videoTracks[track], c.start) != &footage) continue;
             // Where it stands at each of the solve's frames it plays over (its matrix's rows its axes and middle), its
-            // plane then in its own space.
+            // plane then in its own space, as large as the card is at the first of them: the axes are as much longer
+            // or shorter as its Width is at each frame.
             SolvedSceneMesh m;
             const std::shared_ptr<const CameraSolve> solve = parsedSolve(footage);
             const FrameTime from = std::max(c.start, footage.start), to = std::min(c.end(), footage.end());
+            const double firstUnit = layer3dPlace(*e, from - c.start, seq.width, seq.height).unit;
             for (FrameTime t = from; solve && t < to; ++t) {
                 const int frame = cameraSolveFrame(seq, footage, *solve, t - footage.start);
                 if (frame < 0 || (!m.motion.empty() && m.motion.back().first >= frame)) continue;
                 const Layer3DPlace at = layer3dPlace(*e, t - c.start, seq.width, seq.height);
-                m.motion.push_back({double(frame), {at.axisU[0], at.axisU[1], at.axisU[2], 0, at.axisV[0], at.axisV[1], at.axisV[2], 0,
-                                                    at.normal[0], at.normal[1], at.normal[2], 0, at.origin[0], at.origin[1], at.origin[2], 1}});
+                const double k = firstUnit > 0 ? at.unit / firstUnit : 1;
+                m.motion.push_back({double(frame), {at.axisU[0] * k, at.axisU[1] * k, at.axisU[2] * k, 0, at.axisV[0] * k, at.axisV[1] * k, at.axisV[2] * k, 0,
+                                                    at.normal[0] * k, at.normal[1] * k, at.normal[2] * k, 0, at.origin[0], at.origin[1], at.origin[2], 1}});
             }
             Layer3DPlace place = layer3dPlace(*e, 0, seq.width, seq.height);
             if (!m.motion.empty()) {
                 place.origin = {0, 0, 0}, place.axisU = {1, 0, 0}, place.axisV = {0, 1, 0}, place.normal = {0, 0, 1};
-                place.unit = layer3dPlace(*e, from - c.start, seq.width, seq.height).unit;
+                place.unit = firstUnit;
             }
             std::shared_ptr<const Model> plane;
             const PosedTriangles tr = layer3dTriangles(place, plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));

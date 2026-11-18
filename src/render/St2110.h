@@ -20,6 +20,7 @@
 // the leap seconds. Packets go through the operating system's UDP sockets, unicast or multicast.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -161,10 +162,17 @@ bool packJxsv(const std::vector<uint8_t>& boxes, const uint8_t* codestream, size
 int jxsvPacketCount(size_t boxBytes, size_t size, const std::vector<uint32_t>& units, int packetMode, int maxPayload = 1200);
 // Rebuilds codestreams from RFC 9134 packets. A frame missing packets keeps what came: the slices they carried are
 // taken from the frame before (the same bytes each frame, at a constant bit rate), so a lost packet damages only the
-// lines of its slices; without a frame before to take them from, the frame is passed over.
+// lines of its slices; without a frame before to take them from, the frame is passed over. A frame is held to
+// `frameLimit` bytes of packets (by default the largest picture taken here at 24 bits a pixel): what a sender puts
+// under one timestamp past that is dropped as it comes, and the frame passed over.
 class JxsvAssembler {
 public:
     JxsvAssembler() = default;
+    static constexpr size_t kLargestFrame = size_t(8192) * 4320 * 3 + 65536;
+    static constexpr size_t kMostParts = 300000;  // (packets a frame: the largest in packets of 512 bytes, and more)
+    void setFrameLimit(size_t bytes) { limit_ = std::clamp<size_t>(bytes, 4096, kLargestFrame); }
+    size_t frameLimit() const { return limit_; }
+    size_t heldBytes() const { return bytes_; }  // of the frame being built
     // A packet; true when it completed a frame (`codestream()` then holds it, `timestamp()` its timestamp).
     bool add(const RtpPacket& p);
     const std::vector<uint8_t>& codestream() const { return done_; }
@@ -182,6 +190,8 @@ private:
         std::vector<uint8_t> data;
     };
     std::vector<Part> parts_;
+    size_t limit_ = kLargestFrame, bytes_ = 0;  // (the frame being built: its packets' bytes, and the most it may hold)
+    bool over_ = false;                         // (it went past that: nothing more of it is kept)
     uint32_t timestamp_ = 0, doneTimestamp_ = 0;
     bool started_ = false;
     int mode_ = 0;

@@ -41,10 +41,17 @@ struct StreamSettings {
     std::vector<std::string> iceServers;   // "stun:host:3478", "turn:user:password@host:3478", "turns:…" (none by default)
     // A TURN relay the user runs (RFC 8656: "turn:host:3478", "turns:host:5349"), with its user name and password;
     // viewers' pages are given it with the passphrase. With relayOnly every viewer's media goes through it, never
-    // directly: browsers use only the relay, and Montage offers only its own address there (it may still send from
-    // this computer to a browser's address at the relay, which passes that on).
+    // directly: browsers use only the relay, Montage offers only its own address there, and Montage sends nothing to
+    // any address but the relay's, whatever addresses a viewer offers (render/TurnRelay.h's bridge; its ICE is then
+    // told of no STUN or TURN server either).
     std::string turnServer, turnUser, turnPassword;
     bool relayOnly = false;
+    // In place of the user name and password, the secret the relay shares with Montage (coturn's use-auth-secret):
+    // each review then has a login of its own that the relay takes for turnExpirySeconds from when the review starts
+    // (render/TurnRelay.h), and once that has passed the review link lets nobody new in either. Viewers' pages are
+    // given that login, never the secret.
+    std::string turnSecret;
+    int turnExpirySeconds = 86400;
     int maxViewers = 8;
     // Simulcast: the picture at 1 (one size for everyone), 2 (full and half size) or 3 rungs (and quarter size) at once,
     // each viewer moved between them by their own connection's loss.
@@ -122,6 +129,9 @@ struct ReviewStats {
     int markers = 0;           // received since opened
     std::vector<int> rungViewers;  // a browser review's viewers on each rung, full size first
     int hdrViewers = 0;            // and of them, those sent HDR
+    int probes = 0;                // a browser review: padding bursts sent to see whether a viewer's link takes the size above
+    int queueMoves = 0;            // and viewers moved down a size because their link queued, before it lost anything
+    int64_t linkExpires = 0;       // when the review link stops letting viewers in (seconds since 1970, UTC; 0: it does not)
 };
 
 // Where a reviewer in a browser points, in 0..1 of the picture.

@@ -4,6 +4,7 @@
 // Punch-in stops by itself at the sequence's Out point.
 #pragma once
 
+#include <algorithm>
 #include <QDialog>
 #include <QFile>
 #include <QObject>
@@ -87,6 +88,10 @@ public:
     int passes() const;  // whole passes recorded so far
     // Sound for the take (float, interleaved); the device's sound arrives here too.
     void feed(const float* interleaved, qint64 frames);
+    // With `openDevice` false: the sound fed has this many channels at most (0: as many as the take asks for), as an
+    // input with that many has. An input with fewer channels than a group has tracks records the group's first
+    // tracks, a channel each; the others record nothing.
+    void setFeedChannels(int most) { feedChannels_ = std::max(0, most); }
     // Ends the take: the file is finished, imported and placed. Returns the new
     // clip (0 if nothing was recorded or it was cancelled).
     Id stop();
@@ -125,6 +130,7 @@ private:
     std::vector<float> pending_;
     QTimer drain_;
     int rate_ = 48000, channels_ = 1, sampleBytes_ = 4;
+    int feedChannels_ = 0;
     int format_ = 0;  // 0 float, 1 int16, 2 int32
     FrameTime at_ = 0, stopAt_ = -1;
     int track_ = 0;

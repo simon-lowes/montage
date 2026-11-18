@@ -242,7 +242,7 @@ private:
     };
     void finalize(Held& h, double nextRemoval, double nextAsked);
     bool rewrite(Held& h, int64_t k);
-    void pad(Held& h, int64_t bytes);
+    void pad(Held& h, int64_t bytes, int64_t room);
     int64_t bitsOf(const std::vector<uint8_t>& au) const;
     // The initial delay (seconds) the first access unit gets when it is ours: 90 % of the buffer.
     double firstDelay() const { return 0.9 * size_ / std::max(1.0, rate_); }

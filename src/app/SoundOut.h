@@ -34,9 +34,11 @@ public:
     qint64 queued() const;
     qint64 played() const;  // frames played since open (the device layer's own count; Qt's: written less queued)
     void clear();           // what is queued let go
+    int opens() const { return opens_; }  // times open was asked for (what cuts off the sound queued)
 
 private:
     std::unique_ptr<audiodev::Feed> feed_;
+    int opens_ = 0;
     QAudioSink* sink_ = nullptr;
     QIODevice* io_ = nullptr;
     int rate_ = 0, channels_ = 0;

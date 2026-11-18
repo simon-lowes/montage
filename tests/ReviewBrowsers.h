@@ -22,9 +22,12 @@
 #include <QThread>
 #include <QUdpSocket>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #ifndef _WIN32
@@ -37,6 +40,7 @@
 #include "render/OGraf.h"
 #include "render/ReferenceOutput.h"
 #include "render/RemoteReview.h"
+#include "render/TurnRelay.h"
 #include "render/WebRtcReview.h"
 
 namespace montage::reviewtest {
@@ -45,6 +49,25 @@ inline int freeTcpPort() {
     QTcpServer s;
     s.listen(QHostAddress::LocalHost, 0);
     return int(s.serverPort());
+}
+
+// What a relay bridge says of its asking the relay for an address, waited for (15 s at most): "" when it has one.
+inline std::string allocateAt(output::RelayBridge& bridge) {
+    struct Said {
+        std::mutex m;
+        std::condition_variable cv;
+        bool done = false;
+        std::string error;
+    };
+    auto said = std::make_shared<Said>();
+    bridge.allocate([said](const std::string& error) {
+        std::lock_guard lock(said->m);
+        said->done = true;
+        said->error = error;
+        said->cv.notify_all();
+    });
+    std::unique_lock lock(said->m);
+    return said->cv.wait_for(lock, std::chrono::seconds(15), [&] { return said->done; }) ? said->error : std::string("nothing said");
 }
 
 // A script for the review page that reads the frame code burnt into each picture shown (from a canvas) and keeps it
@@ -93,11 +116,15 @@ inline QString decodedSizeScript(const QString& pc) {
 }
 
 // A UDP relay on this computer for one client: what it sends goes on to `to`, and what comes back is held to `kbps`
-// (0: passed at once) through a queue of a tenth of a second, the rest dropped, as a slow link's router does.
+// (0: passed at once) through a queue of a tenth of a second, the rest dropped, as a slow link's router does; or,
+// `lossless`, through a queue as long as it takes with nothing dropped, as a link with a deep buffer does. It counts
+// what it passes each way, and `blocked` passes nothing on from the client (a cut cable).
 class ThrottledRelay {
 public:
     std::atomic<int> kbps{0};
-    std::atomic<int64_t> dropped{0};
+    std::atomic<bool> lossless{false};
+    std::atomic<bool> blocked{false};
+    std::atomic<int64_t> dropped{0}, forwarded{0}, returned{0};
 
     ~ThrottledRelay() { stop(); }
     bool start(quint16 to) {
@@ -139,7 +166,9 @@ private:
                 quint16 fromPort = 0;
                 front.readDatagram(d.data(), d.size(), &from, &fromPort);
                 client = from, clientPort = fromPort;
+                if (blocked) continue;
                 back.writeDatagram(d, QHostAddress::LocalHost, to);
+                ++forwarded;
             }
             back.waitForReadyRead(1);
             const int rate = kbps;
@@ -147,9 +176,10 @@ private:
                 QByteArray d(int(back.pendingDatagramSize()), 0);
                 back.readDatagram(d.data(), d.size());
                 if (!clientPort) continue;
+                ++returned;
                 if (rate <= 0) {
                     front.writeDatagram(d, client, clientPort);
-                } else if (queued + d.size() <= qint64(rate) * 125 / 10) {
+                } else if (lossless || queued + d.size() <= qint64(rate) * 125 / 10) {
                     queued += d.size();
                     queue.push_back(std::move(d));
                 } else {
@@ -157,7 +187,9 @@ private:
                 }
             }
             const qint64 now = clock.nsecsElapsed();
-            if (rate > 0) tokens = std::min(6000.0, tokens + double(now - last) * 1e-9 * rate * 125);
+            // (what it may send at once: five packets, or with the deep buffer a twentieth of a second's worth, so a
+            // loaded machine that runs this loop late still passes the stated rate)
+            if (rate > 0) tokens = std::min(lossless ? std::max(6000.0, rate * 6.25) : 6000.0, tokens + double(now - last) * 1e-9 * rate * 125);
             last = now;
             while (!queue.empty() && (rate <= 0 || tokens >= queue.front().size())) {
                 if (rate > 0) tokens -= queue.front().size();
@@ -173,8 +205,41 @@ private:
     std::atomic<quint16> port_{0};
 };
 
-// An HTTPS GET to Montage on this computer from one of its addresses (`from`: "127.0.0.2"; on Linux every 127.x
-// address is this computer's), the passphrase as the bearer token: the response's status, or 0 for none in time.
+// An HTTPS request to Montage on this computer from one of its addresses (`from`: "127.0.0.2"; on Linux every 127.x
+// address is this computer's; "" for any), the passphrase as the bearer token: the whole response, or "" for none in
+// time.
+inline QByteArray httpsRequest(const QString& from, int port, const QByteArray& method, const QByteArray& path, const QByteArray& bearer,
+                               const QByteArray& body = {}, const QByteArray& contentType = {}, int ms = 10000) {
+    QSslSocket s;
+    s.setProxy(QNetworkProxy::NoProxy);
+    s.setPeerVerifyMode(QSslSocket::VerifyNone);
+    if (!from.isEmpty() && !s.bind(QHostAddress(from))) return {};
+    s.connectToHostEncrypted(QStringLiteral("127.0.0.1"), quint16(port));
+    if (!s.waitForEncrypted(ms)) return {};
+    QByteArray head = method + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer " + bearer + "\r\nConnection: close\r\n";
+    if (!contentType.isEmpty()) head += "Content-Type: " + contentType + "\r\n";
+    if (method != "GET") head += "Content-Length: " + QByteArray::number(body.size()) + "\r\n";
+    s.write(head + "\r\n" + body);
+    QByteArray in;
+    QDeadlineTimer deadline(ms);
+    while (!deadline.hasExpired() && s.state() == QAbstractSocket::ConnectedState)
+        if (s.waitForReadyRead(int(std::max<qint64>(1, deadline.remainingTime())))) in += s.readAll();
+    in += s.readAll();
+    return in;
+}
+
+// The status of a response from httpsRequest (0 for none), and its body.
+inline int httpStatusOf(const QByteArray& response) {
+    const QList<QByteArray> first = response.left(response.indexOf("\r\n")).split(' ');
+    return first.size() >= 2 ? first[1].toInt() : 0;
+}
+inline QByteArray httpBodyOf(const QByteArray& response) {
+    const qsizetype at = response.indexOf("\r\n\r\n");
+    return at < 0 ? QByteArray() : response.mid(at + 4);
+}
+
+// An HTTPS GET to Montage on this computer from one of its addresses, the passphrase as the bearer token: the
+// response's status, -1 when the address is not this computer's, or 0 for none in time.
 inline int httpsStatus(const QString& from, int port, const QByteArray& path, const QByteArray& bearer, int ms = 10000) {
     QSslSocket s;
     s.setProxy(QNetworkProxy::NoProxy);
@@ -188,8 +253,7 @@ inline int httpsStatus(const QString& from, int port, const QByteArray& path, co
     while (!in.contains("\r\n") && !deadline.hasExpired() && s.state() == QAbstractSocket::ConnectedState)
         if (s.waitForReadyRead(int(std::max<qint64>(1, deadline.remainingTime())))) in += s.readAll();
     in += s.readAll();
-    const QList<QByteArray> first = in.left(in.indexOf("\r\n")).split(' ');
-    return first.size() >= 2 ? first[1].toInt() : 0;
+    return httpStatusOf(in);
 }
 
 // Firefox (MONTAGE_FIREFOX, else firefox on the PATH) headless, through geckodriver (MONTAGE_GECKODRIVER, the runner

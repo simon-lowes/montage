@@ -28,7 +28,8 @@ if(MONTAGE_HAVE_WEBRTC AND TARGET juice)
 endif()
 # (The DCP tests alone take minutes on a slow container: 317 s in the nightly build's in October 2026.) Qt 6.4's
 # watchdog stops a run 300 s after it starts, whichever function it is in, so the run is given as long as ctest gives it.
-set_tests_properties(test_render PROPERTIES TIMEOUT 900 ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=900000")
+# (In CI in November 2026 the run took 641 s on Linux, with the browser review tests through a relay, and 614 s on macOS.)
+set_tests_properties(test_render PROPERTIES TIMEOUT 1500 ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=1500000")
 montage_test(test_media)
 target_link_libraries(test_media PRIVATE Qt6::Network)  # (a free port for the capture tests)
 target_sources(test_media PRIVATE FileAge.cpp)  # (makeOlder: folders' times set back, Windows too)
@@ -108,7 +109,7 @@ if(MONTAGE_BUILD_APP)
   montage_copy_runtime(test_app)
   montage_test_command(test_app command)
   add_test(NAME test_app COMMAND ${command})
-  set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 600)
+  set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 900)  # (414 s on a macOS runner in November 2026)
   add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe montage-pluginhost)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"

@@ -17,6 +17,7 @@
 #include "VideoFx.h"
 #include "core/Cdl.h"
 #include "core/Effects.h"
+#include "core/Expression.h"
 #include "core/ColorWarp.h"
 #include "core/MaskPath.h"
 #include "media/SuperScale.h"
@@ -4506,6 +4507,31 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         gpuMask(e, t, op, width, height, pixelScale);
         out.push_back(std::move(op));
         return true;
+    } else if (e.type == "ofx") {
+        // An OpenFX plug-in that renders with OpenGL draws from the compositor's own texture into the next one, where
+        // the compositor's OpenGL context shares them with the plug-ins' (render/Ofx.h's applyEffectTexture): nothing
+        // is read back. Not through a mask, nor with further inputs connected (those are pictures made on the CPU).
+        if (op.masked || ofx::usesOwnMask(e) || !gpu::sharesOpenGl() || !ofx::rendersTextures(e)) return false;
+        if (std::any_of(e.strings.begin(), e.strings.end(), [](const auto& kv) { return kv.first.rfind("input.", 0) == 0 && !kv.second.empty(); }))
+            return false;
+        op.kind = gpu::ColorOp::Texture;
+        if (width > 0 && height > 0) {
+            // Run later, by the thread that asked for the frame, with what the effect is given here: its frame, the
+            // clip's other frames, the working space and where its expressions belong.
+            auto step = std::make_shared<gpu::TextureStep>();
+            ofx::PluginDesc plugin;
+            step->name = ofx::Registry::instance().lookUp(e, plugin, nullptr) ? plugin.label : std::string("an OpenFX effect");
+            const ExpressionContext where = currentExpressionContext();
+            const ColorSpace* working = &currentWorkingSpace();
+            step->run = [effect = e, at = double(t), pixelScale, fetch = ofx::currentFetch(), working, where](
+                            const unsigned* from, int count, unsigned to, int w, int h, std::string* why) {
+                if (count != 1) return false;
+                ExpressionScope expressions(where.project, where.sequence, where.clip, where.cancel);
+                const WorkingSpaceScope space(working);
+                return ofx::applyEffectTexture(effect, at, ofx::GlPicture{from[0], w, h}, ofx::GlPicture{to, w, h}, pixelScale, fetch, why, working);
+            };
+            op.textureStep = std::move(step);
+        }
     } else if (e.type == "levels") {
         op.kind = gpu::ColorOp::Levels;
         const float inB = float(e.p("in_black", t, 0)), inW = float(e.p("in_white", t, 1));

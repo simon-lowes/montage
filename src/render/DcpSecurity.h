@@ -110,6 +110,9 @@ struct SignatureCheck {
     std::vector<std::string> references;
     std::string signerThumbprint;           // base64 SHA-1, as CertificateInfo::thumbprint
     std::vector<std::string> certificates;  // the signer's chain as KeyInfo lists it (PEM, leaf first, a root last)
+    // Set by the caller: a KeyInfo whose last certificate is not a root (the signature left it out) is taken, each
+    // certificate still issued and signed by the next; the caller then ends the chain with a root it trusts.
+    bool rootMayBeLeftOut = false;
 };
 bool verifyXmlSignature(const std::string& xml, std::string* error = nullptr, SignatureCheck* check = nullptr);
 

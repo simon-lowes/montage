@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 
 #include "ShapeRaster.h"
@@ -911,11 +912,14 @@ struct CssCompound {
 struct CssRule {
     std::vector<CssCompound> chain;
     int specificity = 0, order = 0;
-    Style decls;
+    std::shared_ptr<const Style> decls;  // (one block's, shared by every selector of its list)
 };
 
 // (a drawing's style sheets read to this many rules, each of this many compound selectors at most: every rule is
-// tried on every element, so a crafted sheet cannot hold the import up)
+// tried on every element, so a crafted sheet cannot hold the import up. A list of selectors is so many rules, its
+// declarations held once. And the trying itself is counted, in names compared: past kMaxCssWork the sheets are left
+// off the elements that remain, since long compounds on elements copied by <use> would still take hours.)
+constexpr long kMaxCssWork = 400000000;
 constexpr size_t kMaxCssRules = 2000;
 constexpr qsizetype kMaxCssCompounds = 16;
 
@@ -946,11 +950,12 @@ std::vector<CssRule> parseCss(QString text, int& order) {
         }
         if (close >= text.size()) break;
         const QString selectors = text.mid(at, open - at).trimmed();
-        Style decls;
-        declarations(text.mid(open + 1, close - open - 1), decls);
         at = close + 1;
         if (selectors.startsWith('@')) continue;  // (@media, @font-face: not read)
+        const auto decls = std::make_shared<Style>();
+        declarations(text.mid(open + 1, close - open - 1), *decls);
         for (const QString& sel0 : selectors.split(',', Qt::SkipEmptyParts)) {
+            if (out.size() > kMaxCssRules) break;  // (a list of selectors is as many rules)
             QString sel = sel0.trimmed();
             sel.replace(QLatin1String(">"), QLatin1String(" > "));
             CssRule r;
@@ -988,7 +993,8 @@ std::vector<CssRule> parseCss(QString text, int& order) {
     return out;
 }
 
-bool compoundMatches(const CssCompound& c, const SvgNode& n) {
+bool compoundMatches(const CssCompound& c, const SvgNode& n, long* work) {
+    if (work) *work += 1 + long(c.classes.size()) * long(std::max<qsizetype>(1, n.classes.size()));
     if (!c.type.isEmpty() && c.type != n.name) return false;
     if (!c.id.isEmpty() && (!n.attrs.count("id") || n.attrs.at("id") != c.id)) return false;
     for (const QString& k : c.classes)
@@ -997,17 +1003,17 @@ bool compoundMatches(const CssCompound& c, const SvgNode& n) {
 }
 
 // Whether a rule picks `n`, its ancestors outermost first.
-bool ruleMatches(const CssRule& r, const SvgNode& n, const std::vector<const SvgNode*>& ancestors) {
-    if (!compoundMatches(r.chain.back(), n)) return false;
+bool ruleMatches(const CssRule& r, const SvgNode& n, const std::vector<const SvgNode*>& ancestors, long* work) {
+    if (!compoundMatches(r.chain.back(), n, work)) return false;
     long a = long(ancestors.size()) - 1;
     for (long i = long(r.chain.size()) - 2; i >= 0; --i) {
         const CssCompound& c = r.chain[size_t(i)];
         if (c.child) {
-            if (a < 0 || !compoundMatches(c, *ancestors[size_t(a)])) return false;
+            if (a < 0 || !compoundMatches(c, *ancestors[size_t(a)], work)) return false;
             --a;
             continue;
         }
-        while (a >= 0 && !compoundMatches(c, *ancestors[size_t(a)])) --a;
+        while (a >= 0 && !compoundMatches(c, *ancestors[size_t(a)], work)) --a;
         if (a < 0) return false;
         --a;
     }
@@ -1015,8 +1021,9 @@ bool ruleMatches(const CssRule& r, const SvgNode& n, const std::vector<const Svg
 }
 
 // An element's own style: its presentation attributes, then the style sheets' rules that pick it (the least specific
-// first, then in order), then its style attribute.
-Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, const std::vector<const SvgNode*>* ancestors = nullptr) {
+// first, then in order), then its style attribute. `work` counts what trying the rules took (kMaxCssWork: past it
+// the sheets are not tried).
+Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, const std::vector<const SvgNode*>* ancestors = nullptr, long* work = nullptr) {
     Style s;
     static const char* const props[] = {"fill", "stroke", "fill-opacity", "stroke-opacity", "stroke-width", "stroke-linecap", "stroke-linejoin",
                                         "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "fill-rule", "opacity", "display",
@@ -1024,16 +1031,16 @@ Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, con
                                         "font-size", "font-weight", "font-style", "text-anchor"};
     for (const char* p : props)
         if (auto it = n.attrs.find(p); it != n.attrs.end()) s[p] = it->second.trimmed();
-    if (sheet && !sheet->empty()) {
+    if (sheet && !sheet->empty() && (!work || *work <= kMaxCssWork)) {
         static const std::vector<const SvgNode*> none;
         std::vector<const CssRule*> picked;
         for (const CssRule& r : *sheet)
-            if (ruleMatches(r, n, ancestors ? *ancestors : none)) picked.push_back(&r);
+            if (ruleMatches(r, n, ancestors ? *ancestors : none, work)) picked.push_back(&r);
         std::stable_sort(picked.begin(), picked.end(), [](const CssRule* a, const CssRule* b) {
             return a->specificity != b->specificity ? a->specificity < b->specificity : a->order < b->order;
         });
         for (const CssRule* r : picked)
-            for (const auto& [k, v] : r->decls) s[k] = v;
+            for (const auto& [k, v] : *r->decls) s[k] = v;
     }
     if (auto it = n.attrs.find("style"); it != n.attrs.end()) declarations(it->second, s);
     return s;
@@ -1271,7 +1278,7 @@ public:
         const std::vector<const SvgNode*> inGradient{&n};  // (so "#g stop" and "linearGradient > stop" match)
         for (const SvgNode& s : n.children) {
             if (s.name != "stop") continue;
-            const Style st = styleOf(s, &sheet_, &inGradient);
+            const Style st = styleOf(s, &sheet_, &inGradient, &cssWork_);
             const QString off = s.attrs.count("offset") ? s.attrs.at("offset") : QString("0");
             double o = numbersIn(off).empty() ? 0 : numbersIn(off)[0];
             if (off.contains('%')) o /= 100;
@@ -1379,7 +1386,8 @@ public:
             return;
         }
         Style st = inherited;
-        const Style own = styleOf(n, &sheet_, &ancestors_);
+        const Style own = styleOf(n, &sheet_, &ancestors_, &cssWork_);
+        if (cssWork_ > kMaxCssWork) note("Style sheets on every element (too many rules to try on so many: left off the later ones)");
         for (const auto& [k, v] : own)
             if (k != "opacity" && k != "display") st[k] = v;
         if (own.count("display") && own.at("display") == "none") return;
@@ -1702,6 +1710,7 @@ private:
     double alpha_ = 1;
     std::set<const SvgNode*> using_;
     long elements_ = 0;
+    long cssWork_ = 0;  // names compared trying the sheets' rules on elements
     double points_ = 0;
     Effect& g_;
     std::vector<std::string>* notes_;

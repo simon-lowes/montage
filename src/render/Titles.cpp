@@ -423,7 +423,7 @@ TitlePathCurve svgPathCurve(const std::string& d) {
     bool begun = false;
     while (true) {
         skip();
-        if (i >= d.size()) break;
+        if (i >= d.size() || out.segments.size() >= size_t(kTitlePathMostSegments)) break;
         if (std::isalpha(static_cast<unsigned char>(d[i]))) cmd = d[i++];
         else if (!cmd) break;
         const bool rel = std::islower(static_cast<unsigned char>(cmd));
@@ -1083,16 +1083,18 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     chunk[q] = chunks;
                     pen.rx() += adv[q];
                 }
-            if (svg->anchor != 0)
-                for (int ch = 0; ch <= chunks; ++ch) {
-                    double lo = 1e300, hi = -1e300;
-                    for (int q = 0; q < n; ++q)
-                        if (chunk[size_t(q)] == ch) lo = std::min(lo, pos[size_t(q)].x()), hi = std::max(hi, pos[size_t(q)].x() + adv[size_t(q)]);
-                    if (hi < lo) continue;
-                    const double by = -(hi - lo) * (svg->anchor == 1 ? 0.5 : 1.0);
-                    for (int q = 0; q < n; ++q)
-                        if (chunk[size_t(q)] == ch) pos[size_t(q)].rx() += by;
+            if (svg->anchor != 0) {
+                // (each chunk's extent in one pass over the letters: every letter can be a chunk of its own)
+                std::vector<double> lo(size_t(chunks) + 1, 1e300), hi(size_t(chunks) + 1, -1e300);
+                for (int q = 0; q < n; ++q) {
+                    const size_t ch = size_t(chunk[size_t(q)]);
+                    lo[ch] = std::min(lo[ch], pos[size_t(q)].x()), hi[ch] = std::max(hi[ch], pos[size_t(q)].x() + adv[size_t(q)]);
                 }
+                for (int q = 0; q < n; ++q) {
+                    const size_t ch = size_t(chunk[size_t(q)]);
+                    if (hi[ch] >= lo[ch]) pos[size_t(q)].rx() -= (hi[ch] - lo[ch]) * (svg->anchor == 1 ? 0.5 : 1.0);
+                }
+            }
             const double startAt = alongPath ? (svg->startPercent ? svg->start / 100 * along.length() : svg->start) : 0.0;
             svgPlace.assign(size_t(n), QTransform());
             svgShown.assign(size_t(n), 1);

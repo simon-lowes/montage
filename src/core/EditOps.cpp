@@ -14,6 +14,7 @@
 #include <sstream>
 
 #include "AudioChannels.h"
+#include "Automation.h"
 #include "CompositeGraph.h"
 #include "Effects.h"
 #include "GradeGraph.h"
@@ -2060,6 +2061,9 @@ Result replaceSources(Project& p, Sequence& s, const std::vector<Id>& ids, Id me
             if (c.mediaId != mediaId) c.channels = fresh.channels;  // another file's channels
             c.mediaId = mediaId;
             c.name = fresh.name;
+            // (its markers are on source frames: moved as its source is, so each stays on the moment it marked)
+            if (const FrameTime moved = FrameTime(std::llround(std::max(0.0, sourceIn) - c.sourceIn)); moved != 0)
+                for (Marker& k : c.markers) k.t += moved;
             c.sourceIn = std::max(0.0, sourceIn);
             c.unrendered.clear();
             const FrameTime limit = sourceLimit(p, work, c);
@@ -2638,7 +2642,7 @@ namespace {
 // and replaced by one compound clip of it from `lo` to `hi`; with `pictureIfAny`, the compound has a picture only
 // when one of them has (a range of sound alone nests as sound).
 Result nestClips(Project& p, Sequence& s, const std::vector<Id>& all, const std::string& name, FrameTime lo, FrameTime hi,
-                 bool pictureIfAny) {
+                 bool pictureIfAny, const std::map<int, double>* audioFaderDb = nullptr) {
     const Id outerId = s.id;  // `s` lives in p.sequences, which we append to below
     Sequence nested = makeSequence(p, name, s.width, s.height, s.fps, int(s.videoTracks.size()),
                                    int(s.audioTracks.size()));
@@ -2671,6 +2675,10 @@ Result nestClips(Project& p, Sequence& s, const std::vector<Id>& all, const std:
     }
     for (auto* list : {&nested.videoTracks, &nested.audioTracks})
         for (auto& t : *list) normalize(t);
+    // (each audio track's fader as far as it differs from the track the compound will play through)
+    if (audioFaderDb)
+        for (const auto& [index, db] : *audioFaderDb)
+            if (index >= 0 && size_t(index) < nested.audioTracks.size()) nested.audioTracks[size_t(index)].volumeDb = db;
 
     // Lowest video / audio track used by the selection.
     int vIdx = int(s.videoTracks.size()), aIdx = int(s.audioTracks.size());
@@ -2715,8 +2723,97 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
     return nestClips(p, s, all, name, lo, hi, false);
 }
 
-Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks, const std::string& name) {
+namespace {
+// "V2" or "A1", and the track's own name when it has one.
+std::string trackWords(const Sequence& s, TrackRef r) {
+    const Track* t = trackAt(s, r);
+    std::string w = (r.kind == TrackKind::Video ? "V" : "A") + std::to_string(r.index + 1);
+    if (t && !t->name.empty() && t->name != w) w += " (" + t->name + ")";
+    return w;
+}
+
+// Whether a track's clips are seen or heard at all: a muted track's are not, nor an audio track's while another is
+// soloed.
+bool trackPlays(const Sequence& s, TrackRef r) {
+    const Track* t = trackAt(s, r);
+    if (!t) return false;
+    if (r.kind == TrackKind::Video) return !t->muted;
+    const bool anySolo = std::any_of(s.audioTracks.begin(), s.audioTracks.end(), [](const Track& k) { return k.solo; });
+    return anySolo ? t->solo : !t->muted;
+}
+
+bool overlapsRange(const Track& t, FrameTime a, FrameTime b) {
+    return std::any_of(t.clips.begin(), t.clips.end(), [&](const Clip& c) { return c.start < b && c.end() > a; });
+}
+
+// Two audio tracks whose sound may be summed before their mix instead of after it: the same pan, output, automation
+// and no inserts or sends on either (a fader's level alone may differ: it is carried into the nested sequence).
+bool mixedAlike(const Track& x, const Track& y) {
+    return x.effects.empty() && y.effects.empty() && x.sends.empty() && y.sends.empty() && x.pan == y.pan && x.output == y.output &&
+           x.surround == y.surround && x.volumeAuto == y.volumeAuto && x.panAuto == y.panAuto && x.volumeTrim == y.volumeTrim &&
+           x.surroundXAuto == y.surroundXAuto && x.surroundYAuto == y.surroundYAuto && x.surroundZAuto == y.surroundZAuto &&
+           x.muteAuto == y.muteAuto && x.automation == y.automation;
+}
+}  // namespace
+
+Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& given, const std::string& name) {
     if (b <= a) return Result::fail("Set In and Out points first");
+    // The tracks taking part: unlocked, and seen or heard (a muted track's clips, or those silenced by another track's
+    // solo, would be seen or heard once inside the compound: they stay where they are, as a locked track's do).
+    std::vector<TrackRef> tracks;
+    for (TrackRef r : given) {
+        const Track* t = trackAt(s, r);
+        if (!editable(t) || !trackPlays(s, r) || std::find(tracks.begin(), tracks.end(), r) != tracks.end()) continue;
+        if (overlapsRange(*t, a, b)) tracks.push_back(r);
+    }
+    if (tracks.empty()) return Result::fail("Nothing between In and Out to nest");
+    // Everything that would change the picture or the sound is refused before anything is cut.
+    // A transition across In or Out would lose a side.
+    for (TrackRef r : tracks) {
+        const Track& t = *trackAt(s, r);
+        for (const Transition& tr : t.transitions) {
+            FrameTime from = 0, to = 0;
+            if (!transitionRange(t, tr, from, to)) continue;
+            for (FrameTime at : {a, b})
+                if (from < at && to > at)
+                    return Result::fail("A transition on " + trackWords(s, r) + " crosses " + (at == a ? "In" : "Out") +
+                                        ": move the point clear of it, or remove the transition");
+        }
+    }
+    // A video track with a picture in the range that stays, between two that go: the compound sits on the lowest, so
+    // what was above that track would come out below it.
+    {
+        int lowest = int(s.videoTracks.size()), highest = -1;
+        for (TrackRef r : tracks)
+            if (r.kind == TrackKind::Video) lowest = std::min(lowest, r.index), highest = std::max(highest, r.index);
+        for (int k = lowest + 1; k < highest; ++k) {
+            const TrackRef r{TrackKind::Video, k};
+            if (std::find(tracks.begin(), tracks.end(), r) != tracks.end()) continue;
+            if (trackPlays(s, r) && overlapsRange(s.videoTracks[size_t(k)], a, b))
+                return Result::fail(trackWords(s, r) + " stays as it is (it is locked or left out) between tracks that are nested: what is above it "
+                                    "would end up below it. Unlock it, or nest the tracks above and below it apart");
+        }
+    }
+    // Sound: the compound plays through the lowest audio track's mix. One track's sound stays as it was; several are
+    // summed first, which is the same only when they are mixed alike. Their faders' levels may differ: the difference
+    // goes with each track into the nested sequence.
+    std::map<int, double> nestedFaderDb;
+    {
+        int holder = -1;
+        for (TrackRef r : tracks)
+            if (r.kind == TrackKind::Audio && (holder < 0 || r.index < holder)) holder = r.index;
+        for (TrackRef r : tracks) {
+            if (r.kind != TrackKind::Audio || r.index == holder) continue;
+            const Track& h = s.audioTracks[size_t(holder)];
+            const Track& t = s.audioTracks[size_t(r.index)];
+            if (!mixedAlike(h, t))
+                return Result::fail(trackWords(s, {TrackKind::Audio, holder}) + " and " + trackWords(s, r) +
+                                    " are mixed differently (pan, inserts, sends, output or automation): as one clip they would not sound "
+                                    "as they do. Nest them one track at a time");
+            // (alike in automation, so by the same amount at every frame)
+            if (const double more = trackVolumeAt(t, double(a)) - trackVolumeAt(h, double(a)); more != 0) nestedFaderDb[r.index] = more;
+        }
+    }
     // Cut at In and Out on each track taking part; the pieces between get link groups of their own (so the clips
     // left outside are not pulled in with them).
     // The pieces after Out get theirs too, so they are not linked to those before In across the compound.
@@ -2752,7 +2849,7 @@ Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::v
         }
     }
     if (inside.empty()) return Result::fail("Nothing between In and Out to nest");
-    return nestClips(p, s, inside, name, a, b, true);
+    return nestClips(p, s, inside, name, a, b, true, &nestedFaderDb);
 }
 
 // ---- Duplicate frames -------------------------------------------------------------

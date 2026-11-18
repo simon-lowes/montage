@@ -115,6 +115,9 @@
 #include "render/RemoteGrade.h"
 #include "render/RemoteReview.h"
 #include "render/WebRtcReview.h"
+#include "render/ReviewCongestion.h"
+#include "render/ReviewGate.h"
+#include "render/TurnRelay.h"
 #include "render/HeadlessBrowser.h"
 #include "render/OGraf.h"
 #include "ReviewBrowsers.h"
@@ -159,6 +162,10 @@
 #include "render/Ocio.h"
 #include "media/Tracking.h"
 #include "render/Ofx.h"
+#include "render/OfxGl.h"
+#include <QOffscreenSurface>
+#include <QOpenGLContext>
+#include <QOpenGLExtraFunctions>
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
@@ -1529,6 +1536,67 @@ private slots:
             loud = std::max(loud, std::fabs(heard[i]));
         }
         QVERIFY(loud > 0.05f);
+        QVERIFY2(worstSample < 1e-5f, qPrintable(QString::number(worstSample)));
+    }
+
+    // Nightly 15 Nov: with a muted audio track, a video track turned off and faders that differ, the range nested
+    // In to Out still looks and sounds as it did.
+    void nestInToOutKeepsMutesAndFaders() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90, s.fps = {25, 1};
+        while (s.audioTracks.size() < 3) edit::addTrack(p, s, TrackKind::Audio);
+        MediaItem m;
+        std::string err;
+        QVERIFY2(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", m, &err), err.c_str());
+        m.id = p.newId();
+        p.media.push_back(m);
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.2f, 0.1f, 0, 40));
+        s.videoTracks[1].clips.push_back(colorClip(p, 0.1f, 0.9f, 0.3f, 0, 40));
+        s.videoTracks[1].muted = true;
+        for (int k = 0; k < 3; ++k)
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 25.0 * k, 25.0 * k + 40, {TrackKind::Video, 0}, {TrackKind::Audio, k}, false, false, true).ok);
+        s.audioTracks[0].volumeDb = -3;
+        s.audioTracks[1].volumeDb = -12;
+        s.audioTracks[2].muted = true;
+        const Id seqId = s.id;
+        const FrameTime a = 10, b = 30;
+        const size_t spf = 48000 / 25;
+        RenderOptions ro;
+        auto frames = [&](const Sequence& q) {
+            std::vector<Image> out;
+            for (FrameTime t = a - 2; t < b + 2; t += 5) out.push_back(renderProgramFrame(p, q, t, ro));
+            return out;
+        };
+        auto sound = [&](const Sequence& q) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(b - a + 4) * spf * 2);
+            mixer.mix(p, q, int64_t(a - 2) * int64_t(spf), int((b - a + 4) * FrameTime(spf)), out.data());
+            return out;
+        };
+        const std::vector<Image> before = frames(s);
+        const std::vector<float> heard = sound(s);
+        const edit::Result r = edit::nestRange(p, *p.findSequence(seqId), a, b, allTracks(*p.findSequence(seqId)), "Range");
+        QVERIFY2(r.ok, r.error.c_str());
+        const Sequence& after = *p.findSequence(seqId);
+        // (the muted tracks' clips are where they were, whole)
+        QCOMPARE(after.videoTracks[1].clips.size(), size_t(1));
+        QCOMPARE(after.audioTracks[2].clips.size(), size_t(1));
+        QCOMPARE(after.audioTracks[1].clips.size(), size_t(2));
+        const std::vector<Image> now = frames(after);
+        float worst = 0;
+        for (size_t f = 0; f < now.size(); ++f) {
+            QCOMPARE(now[f].px.size(), before[f].px.size());
+            for (size_t i = 0; i < now[f].px.size(); ++i) worst = std::max(worst, std::fabs(now[f].px[i] - before[f].px[i]));
+        }
+        QVERIFY2(worst < 1e-4f, qPrintable(QString::number(worst)));
+        const std::vector<float> nowHeard = sound(after);
+        float worstSample = 0, loud = 0;
+        for (size_t i = 0; i < heard.size(); ++i) {
+            worstSample = std::max(worstSample, std::fabs(nowHeard[i] - heard[i]));
+            loud = std::max(loud, std::fabs(heard[i]));
+        }
+        QVERIFY(loud > 0.02f);
         QVERIFY2(worstSample < 1e-5f, qPrintable(QString::number(worstSample)));
     }
 
@@ -13030,6 +13098,43 @@ colorspaces:
             all.push_back(otherSigner.certificates.front());
             QVERIFY(takeFlm(none, again, all, &err, nullptr, &changes) && changes.size() == 1 && changes[0].find("signed by another") != std::string::npos);
         }
+        // A signature that leaves its root out (nightly 15 Nov): the FLM is read, its signer's chain as far as it
+        // goes. It is taken once the root that made the signer is among the trusted ones, the chain then kept whole;
+        // with the devices' roots alone it is refused, and no root is offered to trust (there is none in it).
+        {
+            dcp::CertificateChain rootless = facility;
+            rootless.certificates.erase(rootless.certificates.begin());
+            QVERIFY(!rootless.certificates.empty());
+            std::string left = etm(false);
+            QVERIFY2(dcp::signXml(left, rootless, &err), err.c_str());
+            Facility lakeLeft;
+            QVERIFY2(readFlm(left, lakeLeft, &err), err.c_str());
+            QCOMPARE(lakeLeft.signer, rootless.certificates);
+            const std::vector<std::string> devices{cinemas[0].screens[0].server.certificates.front(), cinemas[0].screens[0].projector.certificates.front()};
+            std::vector<Facility> none;
+            std::vector<std::string> untrusted;
+            QVERIFY(!takeFlm(none, lakeLeft, devices, &err, &untrusted));
+            QVERIFY2(untrusted.empty() && err.find("leaves out its root") != std::string::npos, err.c_str());
+            // (another maker's root does not end it)
+            dcp::CertificateChain stranger;
+            QVERIFY(dcp::makeCertificateChain("Not Lakeside Either", stranger, &err));
+            std::vector<std::string> all = devices;
+            all.push_back(stranger.certificates.front());
+            QVERIFY(!takeFlm(none, lakeLeft, all, &err, &untrusted) && untrusted.empty() && none.empty());
+            all.push_back(facility.certificates.front());
+            QVERIFY2(takeFlm(none, lakeLeft, all, &err), err.c_str());
+            QVERIFY(none.size() == 1 && none[0].signer == facility.certificates);
+            // (and the cinema's next FLM signed the same way is taken by its signer, already held)
+            std::string next = etm(false);
+            QVERIFY(dcp::signXml(next, rootless, &err));
+            Facility lakeNext;
+            QVERIFY(readFlm(next, lakeNext, &err));
+            QVERIFY2(takeFlm(none, lakeNext, devices, &err) && none[0].signer == facility.certificates, err.c_str());
+            // A signature changed after signing is still refused, root or no root.
+            std::string forged = left;
+            forged.replace(forged.find("Lakeside Screens"), 16, "Lakeside Cinemas");
+            QVERIFY(!readFlm(forged, lakeLeft, &err));
+        }
         // A second ds:Signature (whose references would be read with the first's) is refused.
         {
             std::string twice = old;
@@ -15937,6 +16042,64 @@ colorspaces:
         QVERIFY(std::abs(wv[1].path.boundingRect().height() - on[1].path.boundingRect().height()) < 1e-6);
         QVERIFY(std::abs(wv[1].baselineMid.y() - wv[8].baselineMid.y()) > 5);  // up and down the wave
         QVERIFY(renderGenerator(t, 0, 800, 600, 1.0, 30, 30).px != renderGenerator(flat, 0, 800, 600, 1.0, 30, 30).px);
+    }
+
+    // Nightly 15 Nov: a title a crafted project makes costly. Path data of 100,000 curves is taken to its first
+    // kTitlePathMostSegments, as a title's path and as an SVG text's; and an SVG text whose every letter is a chunk
+    // of its own (an x for each) is anchored in a pass over its letters, so centring it costs about what leaving it
+    // at its start does (it was letters squared: minutes at the 65,536 a layout holds).
+    void titleCraftedTextStaysQuick() {
+        std::string d = "M 0 0";
+        for (int i = 0; i < 100000; ++i) d += " c 1 1 2 -1 3 0";
+        QCOMPARE(int(svgPathCurve(d).segments.size()), kTitlePathMostSegments);
+        QCOMPARE(int(svgPathCurve("M 0 0 L 10 0 L 10 10 Z").segments.size()), 3);
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 12.0;
+        t.strings["text"] = "along";
+        t.params["path_shape"] = 3.0;
+        t.strings["path_data"] = d;
+        QElapsedTimer timer;
+        timer.start();
+        QCOMPARE(int(titleGlyphs(t, 0, 800, 600, 1.0, 30, 30).size()), 5);
+        QVERIFY2(timer.elapsed() < 20000, qPrintable(QString::number(timer.elapsed())));
+        // 40,000 letters, each with an x: anchored at the start, then in the middle.
+        const int n = 40000;
+        Effect s = makeEffect(p, "title");
+        s.strings["font"] = "DejaVu Sans";
+        s.params["size"] = 12.0;
+        s.strings["text"] = std::string(size_t(n), 'i');
+        SvgTextLayout lay;
+        for (int i = 0; i < n; ++i) lay.x.push_back(double(i % 700));
+        s.strings["svg_text"] = svgTextLayoutJson(lay);
+        timer.restart();
+        const std::vector<TitleGlyph> atStart = titleGlyphs(s, 0, 800, 600, 1.0, 30, 30);
+        const qint64 plain = timer.elapsed();
+        QCOMPARE(int(atStart.size()), n);
+        lay.anchor = 1;
+        s.strings["svg_text"] = svgTextLayoutJson(lay);
+        timer.restart();
+        const std::vector<TitleGlyph> centred = titleGlyphs(s, 0, 800, 600, 1.0, 30, 30);
+        const qint64 anchored = timer.elapsed();
+        QCOMPARE(int(centred.size()), n);
+        QVERIFY2(anchored < plain * 2 + 1500, qPrintable(QString("%1 ms at the start, %2 ms centred").arg(plain).arg(anchored)));
+        // (each letter moved back by half its own advance)
+        for (int i : {0, 1, 699, 700, n - 1}) {
+            const double by = atStart[size_t(i)].baselineMid.x() - centred[size_t(i)].baselineMid.x();
+            QVERIFY2(by > 0.5 && by < 6 && std::fabs(by - (atStart[0].baselineMid.x() - centred[0].baselineMid.x())) < 1e-6, qPrintable(QString::number(by)));
+        }
+        // An SVG text on a path of 100,000 curves is laid along its first ones.
+        Effect on = makeEffect(p, "title");
+        on.strings["font"] = "DejaVu Sans";
+        on.params["size"] = 12.0;
+        on.strings["text"] = "along";
+        SvgTextLayout onPath;
+        onPath.path = d;
+        on.strings["svg_text"] = svgTextLayoutJson(onPath);
+        timer.restart();
+        QCOMPARE(int(titleGlyphs(on, 0, 800, 600, 1.0, 30, 30).size()), 5);
+        QVERIFY2(timer.elapsed() < 20000, qPrintable(QString::number(timer.elapsed())));
     }
 
     void textOnMasksAndShapePaths() {
@@ -18919,6 +19082,136 @@ colorspaces:
         std::array<uint8_t, 24> cs{};
         QVERIFY(st::aes3ReadChannelStatus(received.data(), received.size() / 2, 2, 1, cs));
         QVERIFY(cs == status);
+    }
+
+    // Nightly 15 Nov: what a JPEG XS sender, or a crafted file, may have set aside is bounded. Runs without the
+    // library: the packets and the codestream's header are made by hand.
+    void jpegXsBoundedAgainstCraftedStreams() {
+        namespace st = montage::st2110;
+        // A codestream of four slices, as far as the assembler reads one: its header, each slice's header and index,
+        // bytes that are no marker, and the end marker.
+        std::vector<uint8_t> cs = {0xFF, 0x10, 0xFF, 0x12, 0x00, 0x1A};
+        cs.resize(cs.size() + 24, 0);
+        auto be16 = [&](size_t at, int v) { cs[at] = uint8_t(v >> 8), cs[at + 1] = uint8_t(v); };
+        be16(6 + 8, 64), be16(6 + 10, 64), be16(6 + 14, 1);  // (64 x 64, a slice one precinct high)
+        cs[6 + 16] = 3, cs[6 + 22] = 4;                       // (three components, a precinct 16 lines)
+        for (int b : {0xFF, 0x13, 0x00, 0x08, 0x0A, 0x11, 0x0A, 0x21, 0x0A, 0x21}) cs.push_back(uint8_t(b));
+        for (int slice = 0; slice < 4; ++slice) {
+            for (int b : {0xFF, 0x20, 0x00, 0x04, 0x00, slice}) cs.push_back(uint8_t(b));
+            for (int i = 0; i < 122; ++i) cs.push_back(uint8_t(1 + (slice * 31 + i) % 200));
+        }
+        cs.push_back(0xFF), cs.push_back(0x11);
+        cs[6] = 0, cs[7] = 0, be16(8, int(cs.size()));  // (its bytes, stated)
+        montage::JxsHeader header;
+        QVERIFY(montage::readJxsHeader(cs.data(), cs.size(), header) && header.width == 64 && header.sliceLines() == 16);
+        // The codestream as packets of `unit` bytes in the codestream mode, numbered from `seq`; `joined` sends the
+        // first two as one long packet.
+        std::vector<std::vector<uint8_t>> payloads;
+        auto packets = [&](uint32_t timestamp, uint16_t& seq, size_t unit, bool joined) {
+            std::vector<st::RtpPacket> out;
+            size_t at = 0;
+            int counter = 0;
+            while (at < cs.size()) {
+                const size_t n = std::min(cs.size() - at, joined && at == 0 ? unit * 2 : unit);
+                const bool last = at + n == cs.size();
+                const uint32_t h = 0x80000000u | (last ? 0x20000000u : 0) | uint32_t(counter / 2048) << 11 | uint32_t(counter % 2048);
+                std::vector<uint8_t> d = {uint8_t(h >> 24), uint8_t(h >> 16), uint8_t(h >> 8), uint8_t(h)};
+                d.insert(d.end(), cs.begin() + ptrdiff_t(at), cs.begin() + ptrdiff_t(at + n));
+                payloads.push_back(std::move(d));
+                st::RtpPacket p;
+                p.sequence = seq++;
+                p.timestamp = timestamp;
+                p.marker = last;
+                out.push_back(p);
+                at += n;
+                counter += n == unit * 2 ? 2 : 1;
+            }
+            // (the payloads are pointed at once none is added any more)
+            for (size_t i = 0; i < out.size(); ++i) {
+                const std::vector<uint8_t>& d = payloads[payloads.size() - out.size() + i];
+                out[i].payload = d.data(), out[i].size = d.size();
+            }
+            return out;
+        };
+        payloads.reserve(4096);
+        {
+            // A sender that never ends its frame: its packets are kept only up to the frame's limit, then let go, and
+            // the frame is passed over when another timestamp comes. The frame after is rebuilt whole.
+            st::JxsvAssembler as;
+            as.setFrameLimit(8192);
+            QCOMPARE(as.frameLimit(), size_t(8192));
+            const std::vector<uint8_t> big(4 + 1400, 0x55);
+            uint16_t seq = 100;
+            size_t most = 0;
+            for (int i = 0; i < 2000; ++i) {
+                st::RtpPacket p;
+                p.sequence = seq++;
+                p.timestamp = 500;
+                p.payload = big.data(), p.size = big.size();
+                QVERIFY(!as.add(p));
+                most = std::max(most, as.heldBytes());
+            }
+            QVERIFY2(most <= 8192, qPrintable(QString::number(most)));
+            QCOMPARE(as.heldBytes(), size_t(0));
+            int done = 0;
+            for (const st::RtpPacket& p : packets(1000, seq, 64, false)) done += as.add(p);
+            QCOMPARE(done, 1);
+            QCOMPARE(as.passedOver(), int64_t(1));
+            QCOMPARE(as.codestream(), cs);
+            // A frame ended by its marker but larger than the limit is passed over too.
+            for (int i = 0; i < 10; ++i) {
+                st::RtpPacket p;
+                p.sequence = seq++;
+                p.timestamp = 2000;
+                p.marker = i == 9;
+                p.payload = big.data(), p.size = big.size();
+                QVERIFY(!as.add(p));
+            }
+            QCOMPARE(as.passedOver(), int64_t(2));
+            // The default limit is the largest picture taken, and no limit asked for goes past it.
+            st::JxsvAssembler other;
+            QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
+            other.setFrameLimit(size_t(1) << 40);
+            QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
+        }
+        {
+            // One whole frame with an odd long packet does not stay the measure of the frames after: once a frame of
+            // ordinary packets has come whole, a frame missing a packet is still put together from the one before.
+            st::JxsvAssembler as;
+            uint16_t seq = 7;
+            int done = 0;
+            for (const st::RtpPacket& p : packets(1000, seq, 64, false)) done += as.add(p);
+            for (const st::RtpPacket& p : packets(2000, seq, 64, true)) done += as.add(p);
+            for (const st::RtpPacket& p : packets(3000, seq, 64, false)) done += as.add(p);
+            QCOMPARE(done, 3);
+            const std::vector<st::RtpPacket> lossy = packets(4000, seq, 64, false);
+            for (size_t i = 0; i < lossy.size(); ++i)
+                if (i != 4) done += as.add(lossy[i]);
+            QCOMPARE(done, 4);
+            QVERIFY(as.lostInFrame() == 1 && as.concealedSlices() >= 1 && as.timestamp() == 4000);
+            QCOMPARE(as.codestream(), cs);
+            QCOMPARE(as.passedOver(), int64_t(0));
+        }
+        // A header naming the largest picture its fields can (65,535 a side) is not one to decode: refused by its
+        // header alone, and by the decoder before it sets anything aside when the library is built in.
+        std::vector<uint8_t> huge = cs;
+        huge[6 + 8] = 0xFF, huge[6 + 9] = 0xFF, huge[6 + 10] = 0xFF, huge[6 + 11] = 0xFF;
+        montage::JxsHeader hugeHeader;
+        std::string why;
+        QVERIFY(montage::readJxsHeader(huge.data(), huge.size(), hugeHeader) && hugeHeader.width == 65535 && hugeHeader.height == 65535);
+        QVERIFY(!montage::jxsPictureFits(hugeHeader, &why) && !why.empty());
+        QVERIFY(montage::jxsPictureFits(header));
+        montage::JxsHeader wide = header;
+        wide.width = 16384, wide.height = 4000;  // (64 million pixels and a few more)
+        QVERIFY(!montage::jxsPictureFits(wide));
+        wide.width = 10240, wide.height = 5400;
+        QVERIFY(montage::jxsPictureFits(wide));
+        montage::JxsDecoder decoder;
+        montage::JxsPicture picture;
+        why.clear();
+        QVERIFY(!decoder.decode(huge.data(), huge.size(), picture, &why));
+        QVERIFY(picture.planes[0].empty());
+        if (montage::jpegXsAvailable()) QVERIFY2(why.find("larger") != std::string::npos, why.c_str());
     }
 
     // ST 2110-22's JPEG XS (RFC 9134), in both packetization modes: packets as the RFC lays them out (a constant number
@@ -22397,8 +22690,8 @@ colorspaces:
         if (!hdr) QCOMPARE(rig.review->stats().hdrViewers, 0);
     }
 
-    // Through a TURN relay the user runs (libjuice's own server here, on this computer), with ICE on both sides set
-    // to the relay only; VP9 this time.
+    // Through a TURN relay the user runs (libjuice's own server here, on this computer), only through it: the browser's
+    // ICE set to the relay alone and Montage's end behind its bridge to the relay; VP9 this time.
     void browserReviewThroughTurn() {
         using namespace montage::output;
         using namespace montage::reviewtest;
@@ -22449,18 +22742,19 @@ colorspaces:
                  (tab.js("__montage.stage").toString() + " " + QString::fromStdString(rig.review->stats().error)).toUtf8().constData());
         QCOMPARE(tab.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
         QCOMPARE(tab.js("__montage.codec").toString(), QStringLiteral("vp9"));
-        // The browser's end of the pair in use is the relay's, so everything goes through it (Montage's end is its
-        // address at the relay, or this computer's own sending to the browser's there: "prflx").
+        // Both ends of the pair in use are addresses at the relay, Montage's the one its answer offered, so everything
+        // goes through it.
         const QJsonObject pair = tab.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
                                         "return p ? { local: r.get(p.localCandidateId).candidateType, remote: r.get(p.remoteCandidateId).candidateType,"
                                         "localAt: r.get(p.localCandidateId).address + ':' + r.get(p.localCandidateId).port, remoteAt: r.get(p.remoteCandidateId).address + ':' + r.get(p.remoteCandidateId).port,"
                                         "offered: __montage.pc.remoteDescription.sdp.split('\\r\\n').filter(l => l.startsWith('a=candidate')).join(' | ') } : null; })")
                                      .toObject();
         qInfo("Candidates: %s", QJsonDocument(pair).toJson(QJsonDocument::Compact).constData());
-        QCOMPARE(pair.value("local").toString(), QStringLiteral("relay"));
-        QVERIFY2(pair.value("remote").toString() == "relay" || pair.value("remote").toString() == "prflx", qPrintable(pair.value("remote").toString()));
+        QCOMPARE(pair.value("local").toString(), QStringLiteral("relay"));  // (not "prflx": Montage's answers name the browser's own address)
+        QCOMPARE(pair.value("remote").toString(), QStringLiteral("relay"));
+        QCOMPARE(pair.value("offered").toString().count("a=candidate"), 1);
         QVERIFY(pair.value("offered").toString().contains(" typ relay "));
-        QVERIFY(!pair.value("offered").toString().contains(" typ host "));
+        QVERIFY(pair.value("offered").toString().contains(" " + pair.value("remoteAt").toString().replace(':', ' ') + " typ relay "));
         // Frame-accurate as directly: parked on 500, every picture is 500's; playing, each within 2 of its tag.
         rig.playhead = 500;
         QVERIFY(tab.until("__montage.checks.length > 0 && __montage.checks[__montage.checks.length - 1].tag === 500", 10));
@@ -22471,6 +22765,8 @@ colorspaces:
         tab.js("__montage.checks.length = 0");
         rig.playing = true;
         QThread::msleep(3000);
+        // (a slow runner shows fewer pictures a second: played on until 30 have been read)
+        tab.until("__montage.checks.filter(c => c.code >= 0 && c.tag >= 0).length >= 30", 20);
         rig.playing = false;
         int worst = 0, read = 0;
         for (const QJsonValue& c : tab.js("__montage.checks.slice()").toArray()) {
@@ -22646,8 +22942,10 @@ colorspaces:
 #endif
     }
 
-    // Guessers from 64 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
-    // from elsewhere is tried every time, when right and when wrong, while they guess.
+    // Guessers from 48 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
+    // from elsewhere is tried every time, when right and when wrong, while they guess. The networks are fewer than the
+    // 64 connections the review keeps open at once: on a computer too busy to answer quickly every guesser's
+    // connection is open together, and with every place taken a newcomer's would be turned away before it is read.
     void browserReviewGuessersFromManyNetworks() {
         using namespace montage::output;
         using namespace montage::reviewtest;
@@ -22663,8 +22961,9 @@ colorspaces:
         const int port = rig.port();
         std::atomic<bool> guessing{true};
         std::atomic<int> first{0}, wrong{0}, refused{0}, dropped{0};
+        const int networks = 48;
         std::vector<std::thread> guessers;
-        for (int n = 0; n < 64; ++n)
+        for (int n = 0; n < networks; ++n)
             guessers.emplace_back([&, n] {
                 const QString from = QStringLiteral("127.1.%1.9").arg(n);
                 for (bool begun = false; guessing; begun = true) {
@@ -22684,7 +22983,7 @@ colorspaces:
         QCOMPARE(httpsStatus("127.2.0.5", port, "/config", pass, 8000), 200);
         QCOMPARE(httpsStatus("127.2.1.5", port, "/config", "mistyped", 8000), 401);
         QCOMPARE(httpsStatus("127.2.1.5", port, "/config", pass, 8000), 200);
-        QTRY_COMPARE_WITH_TIMEOUT(first.load(), 64, 20000);
+        QTRY_COMPARE_WITH_TIMEOUT(first.load(), networks, 20000);
         // After every network's first wrong guess, for some seconds of their guessing: newcomers from eight more
         // networks, each wrong twice and then right, and none of their tries is refused untried.
         QElapsedTimer storm;
@@ -22699,12 +22998,1225 @@ colorspaces:
         }
         const double seconds = double(storm.elapsed()) / 1000.0;
         const int wrongMeanwhile = wrong - wrongBefore;
-        qInfo("Guessers from 64 networks: %d told wrong and %d refused untried in all, %d told wrong in the last %.1f s",
-              wrong.load(), refused.load(), wrongMeanwhile, seconds);
+        qInfo("Guessers from %d networks: %d told wrong and %d refused untried in all, %d told wrong in the last %.1f s",
+              networks, wrong.load(), refused.load(), wrongMeanwhile, seconds);
         QVERIFY(refused > 0);
         // The guessers together: what each network may try at once, and five a second between them after that.
-        QVERIFY2(wrongMeanwhile <= 64 * 3 + int(5 * seconds) + 16, std::to_string(wrongMeanwhile).c_str());
+        QVERIFY2(wrongMeanwhile <= networks * 3 + int(5 * seconds) + 16, std::to_string(wrongMeanwhile).c_str());
 #endif
+    }
+
+    // Nightly 15 Nov: who may have a passphrase tried, run against a clock of the test's. A right passphrase uses up
+    // no try of its network's (reviewers behind one network where one had mistyped were refused untried after the
+    // third). With more networks guessing than the gate lists, a newcomer from elsewhere is still tried (the ration
+    // the networks not listed share gained a try in a quarter of an hour), and what the guessers together may try
+    // stays a few a second.
+    void reviewPassphraseGate() {
+        using namespace montage::output;
+        using namespace std::chrono_literals;
+        using Gate = PassphraseGate;
+        const Gate::Clock::time_point start = Gate::Clock::time_point() + 24h;
+        auto address = [](int n, int host) { return QStringLiteral("10.%1.%2.%3").arg(n / 256).arg(n % 256).arg(host); };
+        auto network = [](int n) { return QStringLiteral("10.%1.%2.0/24").arg(n / 256).arg(n % 256); };
+        {
+            // One behind a network mistypes: the network is listed, with three tries at once. Six more behind it give
+            // the right passphrase in the same moment and are all tried; wrong ones after them still have only three.
+            Gate gate;
+            Gate::Verdict v = gate.ask(address(1, 1), network(1), start);
+            QCOMPARE(int(v.answer), int(Gate::Answer::Try));
+            QCOMPARE(gate.wrong(address(1, 1), network(1), start), 1000);
+            QCOMPARE(gate.networksListed(), size_t(1));
+            for (int host = 2; host < 8; ++host) {
+                v = gate.ask(address(1, host), network(1), start);
+                QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString::number(host)));
+                gate.right(address(1, host), network(1), start, v);
+                QVERIFY(gate.trusted(address(1, host)));
+            }
+            int tried = 0;
+            for (int host = 20; host < 30; ++host) {
+                v = gate.ask(address(1, host), network(1), start);
+                if (v.answer != Gate::Answer::Try) {
+                    QCOMPARE(int(v.answer), int(Gate::Answer::NetworkBusy));
+                    QVERIFY(v.retryAfter >= 1);
+                    continue;
+                }
+                ++tried;
+                gate.wrong(address(1, host), network(1), start);
+            }
+            QCOMPARE(tried, 3);
+            // One let in is tried whatever its network has left.
+            QCOMPARE(int(gate.ask(address(1, 2), network(1), start).answer), int(Gate::Answer::Try));
+        }
+        {
+            // 5,000 networks guess wrong once each, a hundred a second: the gate lists 4,096, each tried once, and
+            // the rest share a ration (three at once, five a second).
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            int tried = 0;
+            for (int n = 0; n < 5000; ++n) {
+                now += 10ms;
+                if (gate.ask(address(n, 9), network(n), now).answer != Gate::Answer::Try) continue;
+                ++tried;
+                gate.wrong(address(n, 9), network(n), now);
+            }
+            QCOMPARE(gate.networksListed(), Gate::kListed);
+            QVERIFY2(tried >= 4096 + 3 && tried <= 4096 + 3 + 5 * 10 + 2, qPrintable(QString::number(tried)));
+            // A second after the guessers from networks not listed let up, a newcomer from another such network is
+            // tried, and let in with the right passphrase.
+            now += 1s;
+            Gate::Verdict v = gate.ask(address(6000, 5), network(6000), now);
+            QCOMPARE(int(v.answer), int(Gate::Answer::Try));
+            gate.right(address(6000, 5), network(6000), now, v);
+            // For a minute, networks not listed go on guessing two a second, and networks listed forty a second:
+            // every newcomer from elsewhere (one every five seconds, right at once) is tried, and the guessers
+            // together are tried no more than ten a second and what the listed networks had at once.
+            int newcomers = 0, wrong = 0;
+            for (int step = 0; step < 2400; ++step) {
+                now += 25ms;
+                const int listed = step % 4096;
+                if (gate.ask(address(listed, 9), network(listed), now).answer == Gate::Answer::Try) {
+                    ++wrong;
+                    gate.wrong(address(listed, 9), network(listed), now);
+                }
+                if (step % 20 == 0) {
+                    const int other = 7000 + step;
+                    if (gate.ask(address(other, 9), network(other), now).answer == Gate::Answer::Try) {
+                        ++wrong;
+                        gate.wrong(address(other, 9), network(other), now);
+                    }
+                }
+                if (step % 200 == 100) {
+                    const int fresh = 20000 + step;
+                    v = gate.ask(address(fresh, 5), network(fresh), now);
+                    QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString("the newcomer at %1 s").arg(step * 0.025)));
+                    gate.right(address(fresh, 5), network(fresh), now, v);
+                    ++newcomers;
+                }
+            }
+            QCOMPARE(newcomers, 12);
+            QVERIFY2(wrong >= 100 && wrong <= 10 * 60 + 600, qPrintable(QString::number(wrong)));
+        }
+    }
+
+    // Live review's judgement of a viewer's link by delay: the arrival reports read, the packets numbered and padded,
+    // the queue followed through a link that carries less than it is sent without dropping anything, and the ladder
+    // steered by it.
+    void reviewLinkDelay() {
+        using namespace montage::output;
+        using namespace std::chrono_literals;
+        using Clock = LinkDelay::Clock;
+        // A report as a browser writes it, with each kind of chunk: a run of three small deltas, fourteen one-bit
+        // symbols and three two-bit ones (a large negative delta, a packet missing, a small delta), from sequence
+        // number 65534 on, with four bytes of padding.
+        const std::vector<uint8_t> written = {0xaf, 205,  0,    9,    0,    0,    0,    1,    0,    0,    0,    2,    0xff, 0xfe,
+                                              0,    20,   0x00, 0x01, 0x02, 7,    0x20, 0x03, 0xac, 0x01, 0xe1, 0x00, 4,    8,
+                                              0,    1,    2,    3,    200,  0xff, 0xf8, 255,  0,    0,    0,    4};
+        ArrivalReport report;
+        QVERIFY(parseTransportFeedback(written.data(), written.size(), report));
+        QCOMPARE(report.base, uint16_t(65534));
+        QCOMPARE(report.referenceTime, uint32_t(0x000102));
+        QCOMPARE(report.packets.size(), size_t(20));
+        const std::map<int, int> deltas = {{0, 4}, {1, 8}, {2, 0}, {3, 1}, {5, 2}, {6, 3}, {16, 200}, {17, -8}, {19, 255}};
+        for (int i = 0; i < 20; ++i) {
+            QCOMPARE(report.packets[size_t(i)].received, deltas.count(i) > 0);
+            if (deltas.count(i)) QCOMPARE(report.packets[size_t(i)].delta, deltas.at(i));
+        }
+        // One cut short, and feedback of another kind, are not read.
+        QVERIFY(!parseTransportFeedback(written.data(), written.size() - 8, report));
+        std::vector<uint8_t> other = written;
+        other[0] = 0xa1;
+        QVERIFY(!parseTransportFeedback(other.data(), other.size(), report));
+        std::vector<uint8_t> shorter = written;
+        shorter[3] = 6;  // (its length says it ends inside the deltas)
+        QVERIFY(!parseTransportFeedback(shorter.data(), 28, report));
+
+        // The sequence number goes into a packet with no header extension, into one with the one-byte form and into
+        // one with the two-byte form; the payload follows untouched.
+        const std::vector<uint8_t> plain = {0x80, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0xaa, 0xbb, 0xcc};
+        std::vector<uint8_t> got = withTransportSequence(plain.data(), plain.size(), 5, 0xbeef);
+        QCOMPARE(got, (std::vector<uint8_t>{0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0xbe, 0xde, 0, 1, 0x51, 0xbe, 0xef, 0, 0xaa, 0xbb, 0xcc}));
+        const std::vector<uint8_t> oneByte = {0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0xbe, 0xde, 0, 1, 0x30, 'A', 0, 0, 0xaa, 0xbb};
+        got = withTransportSequence(oneByte.data(), oneByte.size(), 5, 0x0102);
+        QCOMPARE(got, (std::vector<uint8_t>{0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0xbe, 0xde, 0, 2, 0x30, 'A', 0, 0, 0x51, 1, 2, 0, 0xaa, 0xbb}));
+        const std::vector<uint8_t> twoByte = {0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0x10, 0x00, 0, 1, 3, 1, 'A', 0, 0xaa, 0xbb};
+        got = withTransportSequence(twoByte.data(), twoByte.size(), 5, 0x0102);
+        QCOMPARE(got, (std::vector<uint8_t>{0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0x10, 0x00, 0, 2, 3, 1, 'A', 0, 5, 2, 1, 2, 0xaa, 0xbb}));
+        QVERIFY(withTransportSequence(plain.data(), plain.size(), 15, 1).empty());
+        QVERIFY(withTransportSequence(plain.data(), 8, 5, 1).empty());
+        const std::vector<uint8_t> unknown = {0x90, 0xe0, 0x12, 0x34, 0, 0, 0, 9, 0, 0, 0, 7, 0x12, 0x34, 0, 0, 0xaa};
+        QVERIFY(withTransportSequence(unknown.data(), unknown.size(), 5, 1).empty());
+
+        // Padding after a picture's last packet: 600 bytes as three packets of the same stream and timestamp with no
+        // payload and no header extension, numbered on from the picture's; none after a packet that ends no picture.
+        uint16_t next = 0xffff;
+        const auto padding = paddingAfter(oneByte.data(), oneByte.size(), next, 600);
+        QCOMPARE(padding.size(), size_t(3));
+        QCOMPARE(next, uint16_t(2));
+        const size_t sizes[3] = {267, 267, 66};
+        for (size_t i = 0; i < 3; ++i) {
+            const std::vector<uint8_t>& p = padding[i];
+            QCOMPARE(p.size(), sizes[i]);
+            QCOMPARE(p[0], uint8_t(0xa0));
+            QCOMPARE(p[1], uint8_t(0x60));
+            QCOMPARE(uint16_t((p[2] << 8) | p[3]), uint16_t(0xffff + i));
+            QVERIFY(std::equal(p.begin() + 4, p.begin() + 12, oneByte.begin() + 4));
+            QCOMPARE(size_t(p.back()), sizes[i] - 12);
+        }
+        std::vector<uint8_t> middle = oneByte;
+        middle[1] = 0x60;
+        QVERIFY(paddingAfter(middle.data(), middle.size(), next, 600).empty());
+
+        // A viewer's link as a queue that drops nothing: pictures 25 times a second in packets of 1,200 bytes, each
+        // leaving once those before it have at the link's rate and arriving 20 ms later; a report every 100 ms,
+        // written as a browser writes them (two-bit symbols) on a clock of its own whose 24-bit reference time wraps
+        // three seconds in.
+        struct Link {
+            LinkDelay delay;
+            Clock::time_point t0 = Clock::now();
+            int64_t now = 0;          // µs
+            double capacity = 100e6;  // bits a second
+            double lost = 0;          // the share of packets that never arrive
+            int64_t free = 0;         // when what is queued will have left
+            int64_t count = 0;        // packets sent
+            uint32_t seed = 1;
+            std::deque<std::pair<int64_t, int64_t>> arrived;  // when (the receiver's clock) and which, not yet reported
+            int64_t reported = 0;                             // packets before this one have been
+            int64_t nextReport = 100000;
+            bool ok = true;
+            const int64_t offset = int64_t(16777216) * 64000 - 3000000;
+            Clock::time_point at() const { return t0 + std::chrono::microseconds(now); }
+            void picture(size_t bytes) {
+                for (size_t left = bytes; left > 0;) {
+                    const size_t n = std::min<size_t>(1200, left);
+                    left -= n;
+                    ok = ok && delay.sent(n, at()) == uint16_t(count & 0xffff);
+                    seed = seed * 1664525u + 1013904223u;
+                    if (double(seed >> 8) / double(1 << 24) >= lost) {
+                        free = std::max(now, free) + int64_t(double(n) * 8e6 / capacity);
+                        arrived.emplace_back(free + 20000 + offset, count);
+                    }
+                    ++count;
+                }
+                now += 40000;
+                while (nextReport <= now) {
+                    tell(nextReport);
+                    nextReport += 100000;
+                }
+            }
+            void tell(int64_t when) {
+                std::map<int64_t, int64_t> in;
+                while (!arrived.empty() && arrived.front().first <= when + offset) {
+                    in[arrived.front().second] = arrived.front().first;
+                    arrived.pop_front();
+                }
+                if (in.empty()) return;
+                const int64_t last = in.rbegin()->first, first = in.begin()->second;
+                std::vector<uint8_t> p = {0x8f, 205, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2};
+                auto put16 = [&](int64_t v) {
+                    p.push_back(uint8_t((v >> 8) & 0xff));
+                    p.push_back(uint8_t(v & 0xff));
+                };
+                put16(reported & 0xffff);
+                put16(last - reported + 1);
+                const int64_t reference = first / 64000;
+                p.push_back(uint8_t((reference >> 16) & 0xff));
+                put16(reference & 0xffff);
+                p.push_back(0);
+                std::vector<int> symbols;
+                std::vector<uint8_t> deltas;
+                int64_t before = reference * 64000;
+                for (int64_t n = reported; n <= last; ++n) {
+                    if (!in.count(n)) {
+                        symbols.push_back(0);
+                        continue;
+                    }
+                    const int64_t delta = (in[n] - before) / 250;
+                    before += delta * 250;
+                    symbols.push_back(delta >= 0 && delta <= 255 ? 1 : 2);
+                    if (symbols.back() == 2) deltas.push_back(uint8_t((delta >> 8) & 0xff));
+                    deltas.push_back(uint8_t(delta & 0xff));
+                }
+                for (size_t i = 0; i < symbols.size(); i += 7) {
+                    int chunk = 0xc000;
+                    for (size_t k = 0; k < 7 && i + k < symbols.size(); ++k) chunk |= symbols[i + k] << (12 - 2 * int(k));
+                    put16(chunk);
+                }
+                p.insert(p.end(), deltas.begin(), deltas.end());
+                while (p.size() % 4) p.push_back(0);
+                p[2] = uint8_t(((p.size() / 4 - 1) >> 8) & 0xff);
+                p[3] = uint8_t((p.size() / 4 - 1) & 0xff);
+                reported = last + 1;
+                ArrivalReport r;
+                ok = ok && parseTransportFeedback(p.data(), p.size(), r);
+                delay.feedback(r, t0 + std::chrono::microseconds(when));
+            }
+        };
+        {
+            // 4 Mb/s over a link that takes it: no queue, and what arrived is what was sent.
+            Link l;
+            QVERIFY(!l.delay.active(l.at()));
+            for (int k = 0; k < 125; ++k) {
+                l.picture(20000);
+                QVERIFY2(!l.delay.standing(), std::to_string(k).c_str());
+            }
+            QVERIFY(l.ok && l.delay.active(l.at()));
+            QVERIFY2(std::abs(l.delay.queueMs()) < 2, std::to_string(l.delay.queueMs()).c_str());
+            QVERIFY2(std::abs(l.delay.receivedKbps() - 4000) < 300, std::to_string(l.delay.receivedKbps()).c_str());
+            // The link now carries 2 Mb/s: the queue is seen to stand within 2.5 s, and what arrives is 2 Mb/s.
+            l.capacity = 2e6;
+            int frames = 0;
+            while (!l.delay.standing() && frames < 200) l.picture(20000), ++frames;
+            qInfo("A queue at 2 Mb/s is seen to stand after %d ms, %.0f ms long; %.0f kb/s arrive", frames * 40, l.delay.queueMs(), l.delay.receivedKbps());
+            QVERIFY2(frames * 40 <= 2500, std::to_string(frames * 40).c_str());
+            QVERIFY(l.delay.queueMs() > 50);
+            QVERIFY2(std::abs(l.delay.receivedKbps() - 2000) < 200, std::to_string(l.delay.receivedKbps()).c_str());
+            // Sent 1.5 Mb/s from here on: the queue drains, which is not standing, and is gone in 15 s.
+            l.delay.restart(l.at());
+            for (int k = 0; k < 375; ++k) {
+                l.picture(7500);
+                QVERIFY2(!l.delay.standing(), std::to_string(k).c_str());
+            }
+            QVERIFY2(l.delay.queueMs() < 10, std::to_string(l.delay.queueMs()).c_str());
+            // A probe at 4 Mb/s on this link is delayed, and known to be within 600 ms; its padding then stops.
+            QCOMPARE(l.delay.probe(l.at()), LinkDelay::Probe::None);
+            l.delay.beginProbe(l.at(), 700ms);
+            QVERIFY(l.delay.probeSending(l.at()));
+            frames = 0;
+            while (l.delay.probe(l.at()) == LinkDelay::Probe::Running && frames < 50) l.picture(20000), ++frames;
+            QCOMPARE(l.delay.probe(l.at()), LinkDelay::Probe::Delayed);
+            QVERIFY(!l.delay.probeSending(l.at()));
+            QVERIFY2(frames * 40 <= 600, std::to_string(frames * 40).c_str());
+            // The probe's own queue drains and is not taken for the pictures'.
+            l.delay.restart(l.at());
+            for (int k = 0; k < 125; ++k) {
+                l.picture(7500);
+                QVERIFY2(!l.delay.standing(), std::to_string(k).c_str());
+            }
+            // The link released: the same probe arrives, known within a second of its beginning.
+            l.capacity = 100e6;
+            l.delay.beginProbe(l.at(), 700ms);
+            for (frames = 0; l.delay.probe(l.at()) == LinkDelay::Probe::Running && frames < 50; ++frames) {
+                QCOMPARE(l.delay.probeSending(l.at()), frames * 40 < 700);
+                l.picture(20000);
+            }
+            QCOMPARE(l.delay.probe(l.at()), LinkDelay::Probe::Arrived);
+            QVERIFY2(frames * 40 <= 1000, std::to_string(frames * 40).c_str());
+            // A probe that loses three packets in ten is delayed too.
+            l.lost = 0.3;
+            l.delay.beginProbe(l.at(), 700ms);
+            for (frames = 0; l.delay.probe(l.at()) == LinkDelay::Probe::Running && frames < 60; ++frames) l.picture(20000);
+            QCOMPARE(l.delay.probe(l.at()), LinkDelay::Probe::Delayed);
+            QVERIFY(l.ok);
+        }
+        {
+            // A key frame ten times the usual size on a link with a quarter to spare queues and drains: not standing.
+            Link l;
+            l.capacity = 5e6;
+            for (int k = 0; k < 250; ++k) {
+                l.picture(k % 100 == 50 ? 200000 : 20000);
+                QVERIFY2(!l.delay.standing(), std::to_string(k).c_str());
+            }
+            QVERIFY(l.ok);
+        }
+        {
+            // Past the sequence numbers' wrap (65,536 packets), the reports are still matched to what was sent.
+            Link l;
+            for (int k = 0; k < 4500; ++k) l.picture(20000);
+            QVERIFY(l.count > 70000 && !l.delay.standing());
+            l.capacity = 2e6;
+            int frames = 0;
+            while (!l.delay.standing() && frames < 200) l.picture(20000), ++frames;
+            QVERIFY2(frames * 40 <= 2500, std::to_string(frames * 40).c_str());
+            QVERIFY(l.ok);
+        }
+
+        // The ladder steered by it. With arrival reports, a try due is a probe first: delayed, the viewer stays and
+        // the next is twice as far off; arrived, they move up.
+        auto never = [](int) { return false; };
+        auto always = [](int) { return true; };
+        const auto t0 = RungSteering::Clock::now();
+        RungSteering s;
+        s.movedAt = t0 - 10s;
+        s.nextTry = t0;
+        s.probes = true;
+        QCOMPARE(s.report(1, 2, 0.0, t0, t0, never, always), 1);
+        QVERIFY(s.probing && !s.trying);
+        QCOMPARE(s.probed(1, false, t0 + 1s, always), 1);
+        QVERIFY(!s.probing);
+        QVERIFY(s.hold == 16000ms);
+        for (int k = 2; k < 17; ++k) {
+            QCOMPARE(s.report(1, 2, 0.0, t0 + std::chrono::seconds(k), t0 + std::chrono::seconds(k), never, always), 1);
+            QVERIFY2(!s.probing, std::to_string(k).c_str());
+        }
+        QCOMPARE(s.report(1, 2, 0.0, t0 + 18s, t0 + 18s, never, always), 1);
+        QVERIFY(s.probing);
+        QCOMPARE(s.probed(1, true, t0 + 19s, always), 0);
+        QVERIFY(s.trying && !s.probing);
+        s.switched(t0 + 19s);
+        // A queue standing 5 s after the move: the try failed, so down again and the wait doubled once more.
+        QCOMPARE(s.delayed(0, 2, t0 + 24s, never, always), 1);
+        QVERIFY(!s.trying);
+        QVERIFY(s.hold == 32000ms);
+        s.switched(t0 + 24s);
+        // A standing queue moves to the rung that fits what arrived, and not at all within 0.7 s of a move.
+        QCOMPARE(s.delayed(1, 2, t0 + 24s + 500ms, never, always), 1);
+        RungSteering fits;
+        fits.movedAt = t0 - 10s;
+        QCOMPARE(fits.delayed(0, 2, t0, [](int i) { return i == 1; }, always), 2);
+        // Heavy loss while a probe is out ends it as delayed.
+        RungSteering lossy;
+        lossy.movedAt = t0 - 10s;
+        lossy.nextTry = t0;
+        lossy.probes = true;
+        QCOMPARE(lossy.report(1, 2, 0.0, t0, t0, never, always), 1);
+        QVERIFY(lossy.probing);
+        QCOMPARE(lossy.report(1, 2, 0.30, t0 + 1s, t0 + 1s, never, always), 2);
+        QVERIFY(!lossy.probing);
+        QVERIFY(lossy.hold == 16000ms);
+        // Without arrival reports a try moves at once, as before.
+        RungSteering blind;
+        blind.movedAt = t0 - 10s;
+        blind.nextTry = t0;
+        QCOMPARE(blind.report(1, 2, 0.0, t0, t0, never, always), 0);
+        QVERIFY(blind.trying && !blind.probing);
+    }
+
+    // A viewer whose link carries 2 Mb/s and queues the rest without dropping anything: moved down a size by the
+    // delay alone, kept from the full size while probes at its rate arrive late, and moved back once the link is
+    // released; another viewer keeps the full picture throughout.
+    void browserReviewQueueingLink() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        // Noise, so each rung's encoder spends its whole bit rate (full 4 Mb/s, half 1.5, quarter 0.5).
+        ReviewRig rig;
+        rig.settings.codec = "h264";  // (or AV1 or VP9, where the browser has no H.264)
+        rig.settings.bitrateKbps = 4000;
+        rig.settings.audioBitrateKbps = 64;
+        rig.settings.rungs = 3;
+        rig.picture = [](FrameTime f) {
+            auto img = std::make_shared<Image>(640, 360);
+            uint32_t seed = uint32_t(f) * 2654435761u + 1;
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x) {
+                    seed = seed * 1664525u + 1013904223u;
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(seed >> 24) / 255.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(640, 360, "rec709", &why), why.c_str());
+        rig.playing = true;  // (new noise each frame)
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why), why.c_str());
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        // One viewer on the page, as a reviewer joins; another through a relay that can be slowed, which queues
+        // whatever does not fit and drops nothing.
+        QCOMPARE(tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+        ThrottledRelay relay;
+        relay.lossless = true;
+        QVERIFY(relay.start(quint16(rig.port())));
+        QCOMPARE(tab.js(whepPlayerScript("slow", rig.passphrase(), "/whep", rig.port(), relay.port())).toString(), QStringLiteral("ok"));
+        const QString full = decodedSizeScript("__montage.pc"), slow = decodedSizeScript("slow");
+        QVERIFY2(tab.until(full + ".then(s => s === '640x360')", 20), qPrintable(tab.js(full).toString()));
+        QVERIFY2(tab.until(slow + ".then(s => s === '640x360')", 20), qPrintable(tab.js(slow).toString()));
+        QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{2, 0, 0}));
+        qInfo("Codec: %s", rig.review->stats().encoder.c_str());
+        // The browser reports when packets arrive (the answer took up the extension and its feedback).
+        QVERIFY(tab.js("slow.remoteDescription.sdp.includes('transport-wide-cc-extensions-01') && slow.remoteDescription.sdp.includes('transport-cc')").toBool());
+        QCOMPARE(rig.review->stats().queueMoves, 0);
+
+        // The relay held to 2 Mb/s: off the full size within 5 s by Montage's count, with nothing dropped; the page's
+        // own viewer stays at full size.
+        const auto onRungs = [&] {
+            const ReviewStats st = rig.review->stats();
+            QStringList on;
+            for (int n : st.rungViewers) on << QString::number(n);
+            return QString("viewers on each rung %1; %2 probes, %3 moves for a queue; the slow viewer decodes %4; %5 packets dropped")
+                .arg(on.join('/'))
+                .arg(st.probes)
+                .arg(st.queueMoves)
+                .arg(tab.js(slow).toString())
+                .arg(relay.dropped.load());
+        };
+        std::vector<QString> fullSizes;
+        QElapsedTimer t;
+        t.start();
+        relay.kbps = 2000;
+        qint64 down = -1;
+        // (the aim is 5 s, as printed; a loaded runner is given 8)
+        while (t.elapsed() < 8000 && down < 0) {
+            if (rig.review->stats().rungViewers[0] == 1) down = t.elapsed();
+            else QThread::msleep(20);
+        }
+        qInfo("At 2 Mb/s, nothing dropped: moved down after %lld ms (%s)", (long long)down, qPrintable(onRungs()));
+        QVERIFY2(down >= 0, qPrintable(onRungs()));
+        QCOMPARE(relay.dropped.load(), int64_t(0));
+        QVERIFY(rig.review->stats().queueMoves >= 1);
+        QVERIFY2(tab.until(slow + ".then(s => s !== '' && s !== '640x360')", 15), qPrintable(onRungs()));
+        qInfo("The slow viewer shows the smaller size %lld ms after the link slowed", (long long)t.elapsed());
+        // Held there for 20 s: probes go out and are delayed, so the viewer is never moved to the full size.
+        const int probesBefore = rig.review->stats().probes;
+        t.restart();
+        while (t.elapsed() < 20000) {
+            QVERIFY2(rig.review->stats().rungViewers[0] == 1, qPrintable(onRungs()));
+            fullSizes.push_back(tab.js(full).toString());
+            QThread::msleep(200);
+        }
+        const int probesHeld = rig.review->stats().probes;
+        qInfo("Held at 2 Mb/s for 20 s: %s", qPrintable(onRungs()));
+        QVERIFY2(probesHeld > probesBefore, qPrintable(onRungs()));
+        // Released: a probe arrives, and the viewer is back at full size.
+        relay.kbps = 0;
+        t.restart();
+        qint64 up = -1;
+        while (t.elapsed() < 70000 && up < 0) {
+            fullSizes.push_back(tab.js(full).toString());
+            if (tab.js(slow).toString() == "640x360") up = t.elapsed();
+            else QThread::msleep(100);
+        }
+        qInfo("Released: full size again after %lld ms (%s)", (long long)up, qPrintable(onRungs()));
+        QVERIFY2(up >= 0, qPrintable(onRungs()));
+        QVERIFY(rig.review->stats().probes > probesHeld);
+        for (const QString& s : fullSizes) QCOMPARE(s, QStringLiteral("640x360"));
+        QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{2, 0, 0}));
+        QCOMPARE(relay.dropped.load(), int64_t(0));
+    }
+
+    // A relay's shared secret: the login made from it is the one the REST scheme for TURN gives (checked against
+    // values worked out with OpenSSL), the settings take a secret or a user name and password, and a review started
+    // with a secret gives its page that login and never the secret, and lets nobody new in once its time is up.
+    void reviewRelayLogin() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        const std::string secret = "a secret made up for this test";
+        const TurnLogin made = turnRestLogin(secret, 1700003600);
+        QCOMPARE(made.user, std::string("1700003600:montage"));
+        QCOMPARE(made.password, std::string("frH/rlW08jUIAVKW4ZbvwiuQ7Eg="));
+        QCOMPARE(turnRestLogin(secret, 1700003600, "Ana").user, std::string("1700003600:Ana"));
+        QCOMPARE(turnRestLogin(secret, 1700003600, "Ana").password, std::string("OpzEJvMOQl1MsepUJ5kVUOJiLmI="));
+        QVERIFY(turnRestLogin("another secret", 1700003600).password != made.password);
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        ReviewRig rig;
+        rig.settings.turnServer = "turn:127.0.0.1:3478";
+        rig.settings.turnSecret = secret;
+        rig.settings.turnExpirySeconds = 30;
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        // A secret or a user name and password, not both and not neither; a secret needs its relay; a link lasts 30
+        // seconds to 30 days.
+        StreamSettings bad = rig.settings;
+        bad.turnUser = "reviewer", bad.turnPassword = "a password";
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("not both"));
+        bad = rig.settings;
+        bad.turnSecret.clear();
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("shared secret, or"));
+        bad = rig.settings;
+        bad.turnServer.clear();
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("needs the TURN relay"));
+        bad = rig.settings;
+        bad.turnExpirySeconds = 29;
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("30 seconds to 30 days"));
+        bad.turnExpirySeconds = 30 * 86400 + 1;
+        QVERIFY(!checkStreamSettings(bad).empty());
+        bad.turnExpirySeconds = 30 * 86400;
+        QVERIFY(checkStreamSettings(bad).empty());
+        rig.picture = [](FrameTime) { return std::make_shared<const Image>(320, 180); };
+        const qint64 before = QDateTime::currentSecsSinceEpoch();
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        const qint64 expires = rig.review->stats().linkExpires;
+        QVERIFY2(expires >= before + 30 && expires <= QDateTime::currentSecsSinceEpoch() + 30, std::to_string(expires - before).c_str());
+        // The page's configuration names the relay with the login the secret makes for that time, and the secret is
+        // nowhere in it.
+        const QByteArray pass = QByteArray::fromStdString(rig.settings.passphrase);
+        const QByteArray config = httpsRequest({}, rig.port(), "GET", "/config", pass);
+        QCOMPARE(httpStatusOf(config), 200);
+        QVERIFY(!config.contains(QByteArray::fromStdString(secret)));
+        const TurnLogin login = turnRestLogin(secret, expires);
+        QJsonObject relay;
+        for (const QJsonValue& v : QJsonDocument::fromJson(httpBodyOf(config)).object().value("iceServers").toArray())
+            if (v.toObject().value("urls").toString().startsWith("turn:")) relay = v.toObject();
+        QCOMPARE(relay.value("urls").toString(), QStringLiteral("turn:127.0.0.1:3478"));
+        QCOMPARE(relay.value("username").toString(), QString::fromStdString(login.user));
+        QCOMPARE(relay.value("credential").toString(), QString::fromStdString(login.password));
+        // Once the time is up, the configuration and an offer are both answered 410 with the reason, even with the
+        // passphrase; without it, 401 as ever.
+        while (QDateTime::currentSecsSinceEpoch() < expires) QThread::msleep(200);
+        const QByteArray late = httpsRequest({}, rig.port(), "GET", "/config", pass);
+        QCOMPARE(httpStatusOf(late), 410);
+        QCOMPARE(httpBodyOf(late), QByteArray("This review link has expired"));
+        const QByteArray offer = httpsRequest({}, rig.port(), "POST", "/whep", pass, "v=0\r\n", "application/sdp");
+        QCOMPARE(httpStatusOf(offer), 410);
+        QCOMPARE(httpStatusOf(httpsRequest({}, rig.port(), "GET", "/config", "not the passphrase")), 401);
+        QCOMPARE(rig.review->stats().linkExpires, int64_t(expires));
+    }
+
+    // Montage's own way through a TURN relay (libjuice's server here): an offer's addresses are moved onto the bridge's
+    // loopback ports and the answer's onto the relay; what Montage's end sends a viewer's address reaches it from
+    // the relay and what the viewer sends back arrives from that address's port; nobody else's packets are passed
+    // on; and a wrong login or a relay that is not there is said so.
+    void reviewRelayBridge() {
+        using namespace montage::output;
+        // The offer: UDP candidates with IPv4 addresses become host candidates on loopback, the rest are left out.
+        const std::string offer = "v=0\r\na=ice-ufrag:abcd\r\n"
+                                  "a=candidate:1 1 udp 2122260223 192.0.2.7 50001 typ host generation 0\r\n"
+                                  "a=candidate:2 1 UDP 1686052607 198.51.100.9 50002 typ srflx raddr 192.0.2.7 rport 50001\r\n"
+                                  "a=candidate:3 1 udp 41885439 203.0.113.5 50003 typ relay raddr 0.0.0.0 rport 0\r\n"
+                                  "a=candidate:4 1 tcp 1518280447 192.0.2.7 9 typ host tcptype active\r\n"
+                                  "a=candidate:5 1 udp 2122262783 2001:db8::7 50005 typ host\r\n"
+                                  "a=candidate:6 1 udp 2122260223 4f0c2b1e-0d5a-4d6e-9a54-1c9f6d1b2a3c.local 50006 typ host\r\n"
+                                  "a=candidate:7 1 udp 2122260223 192.0.2.8 50007 typ host\r\n"
+                                  "a=end-of-candidates\r\na=mid:0\r\n";
+        std::vector<std::string> asked;
+        const std::string moved = offerThroughRelay(offer, [&](const std::string& ip, uint16_t port) {
+            asked.push_back(ip + ":" + std::to_string(port));
+            return uint16_t(ip == "192.0.2.8" ? 0 : 40000 + asked.size());
+        });
+        QCOMPARE(asked, (std::vector<std::string>{"192.0.2.7:50001", "198.51.100.9:50002", "203.0.113.5:50003", "192.0.2.8:50007"}));
+        QCOMPARE(moved, std::string("v=0\r\na=ice-ufrag:abcd\r\n"
+                                    "a=candidate:1 1 UDP 2122260223 127.0.0.1 40001 typ host\r\n"
+                                    "a=candidate:2 1 UDP 1686052607 127.0.0.1 40002 typ host\r\n"
+                                    "a=candidate:3 1 UDP 41885439 127.0.0.1 40003 typ host\r\n"
+                                    "a=end-of-candidates\r\na=mid:0\r\n"));
+        // The answer: Montage's loopback candidate becomes its address at the relay, and nothing else is offered.
+        uint16_t local = 0;
+        const std::string answer = answerThroughRelay("v=0\r\na=candidate:1 1 UDP 2122317823 127.0.0.1 51234 typ host\r\n"
+                                                      "a=candidate:2 1 UDP 2122317567 10.1.2.3 51234 typ host\r\na=end-of-candidates\r\n",
+                                                      "203.0.113.20", 49160, &local);
+        QCOMPARE(local, uint16_t(51234));
+        QCOMPARE(answer, std::string("v=0\r\na=candidate:1 1 UDP 2122317823 203.0.113.20 49160 typ relay raddr 0.0.0.0 rport 0\r\na=end-of-candidates\r\n"));
+        QVERIFY(answerThroughRelay("v=0\r\na=candidate:2 1 UDP 2122317567 10.1.2.3 51234 typ host\r\n", "203.0.113.20", 49160, &local) == "v=0\r\n");
+        QCOMPARE(local, uint16_t(0));
+#ifndef MONTAGE_TEST_TURN
+        QSKIP("The rest needs libjuice's TURN server (a build with WebRTC)");
+#else
+        juice_server_credentials_t user{"reviewer", "relay-password-2", 0};
+        juice_server_config_t config{};
+        config.credentials = &user;
+        config.credentials_count = 1;
+        config.max_allocations = 16;
+        config.max_peers = 16;
+        config.bind_address = "127.0.0.1";
+        config.port = 0;
+        config.realm = "montage-test";
+        juice_server_t* turn = juice_server_create(&config);
+        QVERIFY(turn);
+        auto endTurn = qScopeGuard([&] { juice_server_destroy(turn); });
+        const uint16_t turnPort = juice_server_get_port(turn);
+        // A relay of the test's own that speaks as relays did before RFC 8489 (it names no password algorithms, as
+        // coturn does not): it calls the first nonce stale once, checks each request's signature for itself
+        // (HMAC-SHA1 under the MD5 of user:realm:password), and passes packets both ways.
+        struct OldRelay {
+            std::atomic<bool> stop{false};
+            std::atomic<int> port{0}, relayed{0}, signedRight{0}, signedWrong{0}, stale{0}, newStyle{0}, permissions{0};
+            std::atomic<int> lifetime{600}, refreshes{0}, released{0};  // seconds an address is given for; Refresh requests for more, and for none
+            std::thread thread;
+            static void attribute(QByteArray& b, quint16 type, const QByteArray& value) {
+                b.append(char(type >> 8)).append(char(type & 0xff)).append(char(value.size() >> 8)).append(char(value.size() & 0xff)).append(value);
+                while (b.size() % 4) b.append('\0');
+            }
+            static QByteArray message(quint16 type, const QByteArray& id, const QByteArray& attributes) {
+                QByteArray b;
+                b.append(char(type >> 8)).append(char(type & 0xff)).append(char(attributes.size() >> 8)).append(char(attributes.size() & 0xff));
+                return b + QByteArray::fromHex("2112a442") + id + attributes;
+            }
+            static QByteArray address(quint16 port) {  // (XOR-…-ADDRESS of 127.0.0.1 and a port)
+                QByteArray v = QByteArray::fromHex("0001");
+                const quint16 p = port ^ 0x2112;
+                v.append(char(p >> 8)).append(char(p & 0xff));
+                return v + QByteArray::fromHex("5e12a443");
+            }
+            void run() {
+                QUdpSocket front, back;
+                front.setProxy(QNetworkProxy::NoProxy);
+                back.setProxy(QNetworkProxy::NoProxy);
+                front.bind(QHostAddress::LocalHost, 0);
+                back.bind(QHostAddress::LocalHost, 0);
+                relayed = back.localPort();
+                port = front.localPort();
+                quint16 client = 0;
+                const QByteArray key = QCryptographicHash::hash("reviewer:old-relay:relay-password-2", QCryptographicHash::Md5);
+                while (!stop) {
+                    front.waitForReadyRead(2);
+                    while (front.hasPendingDatagrams()) {
+                        QByteArray d(int(front.pendingDatagramSize()), 0);
+                        front.readDatagram(d.data(), d.size(), nullptr, &client);
+                        if (d.size() < 20) continue;
+                        const quint16 type = quint16(quint8(d[0]) << 8 | quint8(d[1]));
+                        const QByteArray id = d.mid(8, 12);
+                        QByteArray nonce, data;
+                        quint16 peer = 0;
+                        quint32 asked = 0;
+                        qsizetype integrityAt = -1;
+                        for (qsizetype at = 20; at + 4 <= d.size();) {
+                            const quint16 t = quint16(quint8(d[at]) << 8 | quint8(d[at + 1]));
+                            const qsizetype n = quint8(d[at + 2]) << 8 | quint8(d[at + 3]);
+                            const QByteArray value = d.mid(at + 4, n);
+                            if (t == 0x0015) nonce = value;
+                            if (t == 0x0013) data = value;
+                            if (t == 0x0012 && n >= 4) peer = quint16((quint8(value[2]) << 8 | quint8(value[3])) ^ 0x2112);
+                            if (t == 0x0008) integrityAt = at;
+                            if (t == 0x000D && n == 4) asked = qFromBigEndian<quint32>(value.constData());
+                            if (t == 0x001C || t == 0x001D || t == 0x8002) ++newStyle;
+                            at += 4 + ((n + 3) & ~qsizetype(3));
+                        }
+                        if (type == 0x0016) {  // a Send indication: on to the peer from the relayed port
+                            if (peer) back.writeDatagram(data, QHostAddress::LocalHost, peer);
+                            continue;
+                        }
+                        QByteArray challenge;
+                        attribute(challenge, 0x0014, "old-relay");
+                        if (integrityAt < 0 || nonce == "first") {
+                            QByteArray error = QByteArray::fromHex(integrityAt < 0 ? "00000401" : "00000426");  // 401, or 438 stale nonce
+                            stale += integrityAt >= 0;
+                            QByteArray a;
+                            attribute(a, 0x0009, error + "No");
+                            attribute(a, 0x0015, integrityAt < 0 ? "first" : "second");
+                            front.writeDatagram(message(type | 0x0110, id, a + challenge), QHostAddress::LocalHost, client);
+                            continue;
+                        }
+                        QByteArray covered = d.left(integrityAt);
+                        const qsizetype length = integrityAt - 20 + 24;
+                        covered[2] = char(length >> 8), covered[3] = char(length & 0xff);
+                        const bool right = nonce == "second" && QMessageAuthenticationCode::hash(covered, key, QCryptographicHash::Sha1) == d.mid(integrityAt + 4, 20);
+                        ++(right ? signedRight : signedWrong);
+                        QByteArray a;
+                        if (!right) {
+                            attribute(a, 0x0009, QByteArray::fromHex("00000401") + "No");
+                            attribute(a, 0x0015, "second");
+                            a += challenge;
+                        } else if (type == 0x0003) {
+                            attribute(a, 0x0016, address(back.localPort()));
+                            attribute(a, 0x000D, QByteArray::fromHex("0000") + char(lifetime >> 8) + char(lifetime & 0xff));
+                        } else if (type == 0x0004) {
+                            ++(asked ? refreshes : released);
+                            attribute(a, 0x000D, asked ? QByteArray::fromHex("0000") + char(lifetime >> 8) + char(lifetime & 0xff) : QByteArray(4, '\0'));
+                        } else if (type == 0x0008) {
+                            ++permissions;
+                        }
+                        front.writeDatagram(message(type | (right ? 0x0100 : 0x0110), id, a), QHostAddress::LocalHost, client);
+                    }
+                    back.waitForReadyRead(2);
+                    while (back.hasPendingDatagrams()) {  // from a peer: a Data indication to the client
+                        QByteArray d(int(back.pendingDatagramSize()), 0);
+                        quint16 from = 0;
+                        back.readDatagram(d.data(), d.size(), nullptr, &from);
+                        QByteArray a;
+                        attribute(a, 0x0012, address(from));
+                        attribute(a, 0x0013, d);
+                        if (client) front.writeDatagram(message(0x0017, QByteArray(12, 'i'), a), QHostAddress::LocalHost, client);
+                    }
+                }
+            }
+        } old;
+        auto allocate = [](RelayBridge& b) { return montage::reviewtest::allocateAt(b); };
+        auto socket = [] {
+            auto s = std::make_unique<QUdpSocket>();
+            s->setProxy(QNetworkProxy::NoProxy);
+            s->bind(QHostAddress::LocalHost, 0);
+            return s;
+        };
+        // One datagram read with where it came from, waited for; an empty one for none in time.
+        struct Got {
+            QByteArray data;
+            quint16 from = 0;
+        };
+        auto read = [](QUdpSocket& s, int ms) {
+            Got g;
+            if (!s.hasPendingDatagrams() && !s.waitForReadyRead(ms)) return g;
+            g.data.resize(int(s.pendingDatagramSize()));
+            s.readDatagram(g.data.data(), g.data.size(), nullptr, &g.from);
+            return g;
+        };
+        {
+            RelayBridge bridge("127.0.0.1", turnPort, {"reviewer", "relay-password-2"});
+            QCOMPARE(bridge.relayedPort(), uint16_t(0));
+            QCOMPARE(allocate(bridge), std::string());
+            QCOMPARE(bridge.relayedAddress(), std::string("127.0.0.1"));
+            const uint16_t relayed = bridge.relayedPort();
+            QVERIFY(relayed != 0 && relayed != turnPort);
+            auto viewer = socket(), end = socket(), stranger = socket(), second = socket();
+            const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+            QVERIFY(alias != 0 && alias != relayed);
+            QCOMPARE(bridge.peer("127.0.0.1", viewer->localPort()), alias);  // (the same address, the same port)
+            QCOMPARE(bridge.peer("::1", 5000), uint16_t(0));
+            QCOMPARE(bridge.peer("viewer.example", 5000), uint16_t(0));
+            QCOMPARE(bridge.peer("127.0.0.1", 0), uint16_t(0));
+            // Montage's end to the viewer: it arrives from Montage's address at the relay (sent again until the
+            // relay has let the viewer's address in).
+            Got got;
+            for (int i = 0; i < 50 && got.data.isEmpty(); ++i) {
+                end->writeDatagram("to the viewer", QHostAddress::LocalHost, alias);
+                got = read(*viewer, 100);
+            }
+            QCOMPARE(got.data, QByteArray("to the viewer"));
+            QCOMPARE(got.from, quint16(relayed));
+            while (!read(*viewer, 200).data.isEmpty()) {}
+            // The viewer back: it arrives at Montage's end from the port that stands for the viewer.
+            viewer->writeDatagram("to Montage", QHostAddress::LocalHost, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("to Montage"));
+            QCOMPARE(got.from, quint16(alias));
+            QCOMPARE(bridge.fromRelay(), uint64_t(1));
+            QVERIFY(bridge.toRelay() >= 1);
+            // Montage's end answering a viewer's connectivity check names where the check came from, which behind the
+            // bridge is the port that stands for the viewer: the answer reaches the viewer naming the viewer's own
+            // address instead, signed with the ICE password and fingerprinted again as if it had been made so. One
+            // that names another address goes on as it is.
+            auto crc = [](const QByteArray& b) {
+                quint32 c = 0xFFFFFFFFu;
+                for (const char ch : b) {
+                    c ^= quint8(ch);
+                    for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+                }
+                return ~c;
+            };
+            const QByteArray icePassword = "an ICE password of the test";
+            auto checkAnswer = [&](quint16 names) {
+                QByteArray a;
+                OldRelay::attribute(a, 0x0020, OldRelay::address(names));
+                QByteArray m = OldRelay::message(0x0101, QByteArray(12, 't'), a);
+                m[3] = char(a.size() + 24);
+                OldRelay::attribute(m, 0x0008, QMessageAuthenticationCode::hash(m, icePassword, QCryptographicHash::Sha1));
+                m[3] = char(m.size() - 20 + 8);
+                const quint32 f = crc(m) ^ 0x5354554Eu;
+                QByteArray print;
+                for (int k = 3; k >= 0; --k) print.append(char(f >> (8 * k)));
+                OldRelay::attribute(m, 0x8028, print);
+                return m;
+            };
+            bridge.setLocal(end->localPort(), icePassword.toStdString());
+            QThread::msleep(100);
+            end->writeDatagram(checkAnswer(alias), QHostAddress::LocalHost, alias);
+            got = read(*viewer, 3000);
+            QCOMPARE(got.data.toHex(), checkAnswer(viewer->localPort()).toHex());
+            end->writeDatagram(checkAnswer(4242), QHostAddress::LocalHost, alias);
+            got = read(*viewer, 3000);
+            QCOMPARE(got.data.toHex(), checkAnswer(4242).toHex());
+            // Another socket of this computer's sending to the viewer's port is not Montage's end: nothing goes on.
+            const uint64_t before = bridge.toRelay();
+            stranger->writeDatagram("not from Montage", QHostAddress::LocalHost, alias);
+            QVERIFY(read(*viewer, 500).data.isEmpty());
+            QCOMPARE(bridge.toRelay(), before);
+            // A sender the offer did not name, at an address the relay lets in, gets a port of its own.
+            second->writeDatagram("from elsewhere", QHostAddress::LocalHost, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("from elsewhere"));
+            QVERIFY(got.from != 0 && got.from != alias);
+            end->writeDatagram("and back", QHostAddress::LocalHost, got.from);
+            got = read(*second, 3000);
+            QCOMPARE(got.data, QByteArray("and back"));
+            QCOMPARE(got.from, quint16(relayed));
+            QCOMPARE(bridge.lastError(), std::string());
+        }
+        // A login the relay does not know is said to be that; a relay that is not there, that it did not answer.
+        {
+            RelayBridge wrong("127.0.0.1", turnPort, {"reviewer", "not the password"});
+            const std::string why = allocate(wrong);
+            QVERIFY2(QString::fromStdString(why).contains("login"), why.c_str());
+            QCOMPARE(wrong.relayedPort(), uint16_t(0));
+            QCOMPARE(wrong.lastError(), why);
+        }
+        {
+            auto nobody = socket();
+            const uint16_t unused = nobody->localPort();
+            nobody.reset();
+            RelayBridge absent("127.0.0.1", unused, {"reviewer", "relay-password-2"});
+            QElapsedTimer waited;
+            waited.start();
+            const std::string why = allocate(absent);
+            QVERIFY2(QString::fromStdString(why).contains("did not answer"), why.c_str());
+            QVERIFY2(waited.elapsed() >= 4000 && waited.elapsed() < 12000, std::to_string(waited.elapsed()).c_str());
+        }
+        {
+            RelayBridge nowhere("relay.invalid", 3478, {"reviewer", "relay-password-2"});
+            const std::string why = allocate(nowhere);
+            QVERIFY2(QString::fromStdString(why).contains("not found"), why.c_str());
+        }
+        old.thread = std::thread([&] { old.run(); });
+        auto endOld = qScopeGuard([&] {
+            old.stop = true;
+            old.thread.join();
+        });
+        QTRY_VERIFY(old.port != 0);
+        {
+            RelayBridge bridge("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+            QCOMPARE(allocate(bridge), std::string());
+            QCOMPARE(int(bridge.relayedPort()), old.relayed.load());
+            QCOMPARE(old.stale.load(), 1);
+            auto viewer = socket(), end = socket();
+            const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+            QVERIFY(alias != 0);
+            Got got;
+            for (int i = 0; i < 50 && got.data.isEmpty(); ++i) {
+                end->writeDatagram("the older way", QHostAddress::LocalHost, alias);
+                got = read(*viewer, 100);
+            }
+            QCOMPARE(got.data, QByteArray("the older way"));
+            QCOMPARE(int(got.from), old.relayed.load());
+            viewer->writeDatagram("and back again", QHostAddress::LocalHost, quint16(old.relayed));
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("and back again"));
+            QCOMPARE(got.from, quint16(alias));
+            QTRY_VERIFY(old.permissions >= 1);
+            QCOMPARE(old.signedWrong.load(), 0);
+            QVERIFY(old.signedRight >= 2);
+            QCOMPARE(old.newStyle.load(), 0);
+        }
+        {
+            RelayBridge wrong("127.0.0.1", uint16_t(old.port), {"reviewer", "not the password"});
+            const std::string why = allocate(wrong);
+            QVERIFY2(QString::fromStdString(why).contains("login"), why.c_str());
+            QVERIFY(old.signedWrong >= 1);
+        }
+        // A relay that gives its address for 20 seconds is asked to keep it half way through that, with the login,
+        // and the address still carries afterwards; a bridge that ends gives its address back.
+        {
+            old.lifetime = 20;
+            const int wrongBefore = old.signedWrong, releasedBefore = old.released;
+            QCOMPARE(old.refreshes.load(), 0);
+            QElapsedTimer waited;
+            {
+                RelayBridge bridge("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+                QCOMPARE(allocate(bridge), std::string());
+                waited.start();
+                QTRY_VERIFY_WITH_TIMEOUT(old.refreshes >= 1, 30000);
+                QVERIFY2(waited.elapsed() >= 8000 && waited.elapsed() < 19000, std::to_string(waited.elapsed()).c_str());
+                auto viewer = socket(), end = socket();
+                const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+                Got got;
+                for (int i = 0; i < 50 && got.data.isEmpty(); ++i) {
+                    end->writeDatagram("kept", QHostAddress::LocalHost, alias);
+                    got = read(*viewer, 100);
+                }
+                QCOMPARE(got.data, QByteArray("kept"));
+                QCOMPARE(bridge.lastError(), std::string());
+                QCOMPARE(old.released.load(), releasedBefore);
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(old.released > releasedBefore, 5000);
+            QCOMPARE(old.signedWrong.load(), wrongBefore);
+        }
+#endif
+    }
+
+    // Only through the relay, with a capture of what reaches a viewer's addresses: a viewer of the test's own offers
+    // three addresses (sockets the test holds) as host, server-reflexive and relay candidates. Montage answers with
+    // its address at the relay alone; every packet that reaches those sockets comes from that address, none comes
+    // while the way from Montage to the relay is cut, and they come again once it is mended.
+    void browserReviewOnlyThroughRelay() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+#ifndef MONTAGE_TEST_TURN
+        QSKIP("Needs libjuice's TURN server (a build with WebRTC)");
+#else
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        juice_server_credentials_t user{"reviewer", "relay-password-3", 0};
+        juice_server_config_t config{};
+        config.credentials = &user;
+        config.credentials_count = 1;
+        config.max_allocations = 16;
+        config.max_peers = 16;
+        config.bind_address = "127.0.0.1";
+        config.port = 0;
+        config.realm = "montage-test";
+        juice_server_t* turn = juice_server_create(&config);
+        QVERIFY(turn);
+        auto endTurn = qScopeGuard([&] { juice_server_destroy(turn); });
+        // Montage reaches the relay through a tap that counts, and can be cut.
+        ThrottledRelay tap;
+        QVERIFY(tap.start(juice_server_get_port(turn)));
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.settings.turnServer = "turn:127.0.0.1:" + std::to_string(tap.port());
+        rig.settings.turnUser = "reviewer";
+        rig.settings.turnPassword = "relay-password-3";
+        rig.settings.relayOnly = true;
+        // (a STUN server in the settings is the browsers' alone: Montage asks it nothing, as the sockets below show)
+        QUdpSocket stun;
+        stun.setProxy(QNetworkProxy::NoProxy);
+        QVERIFY(stun.bind(QHostAddress::LocalHost, 0));
+        rig.settings.iceServers = {"stun:127.0.0.1:" + std::to_string(stun.localPort())};
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        rig.picture = [](FrameTime) { return std::make_shared<const Image>(320, 180); };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        std::vector<std::unique_ptr<QUdpSocket>> viewer;
+        for (int i = 0; i < 3; ++i) {
+            viewer.push_back(std::make_unique<QUdpSocket>());
+            viewer.back()->setProxy(QNetworkProxy::NoProxy);
+            QVERIFY(viewer.back()->bind(QHostAddress::LocalHost, 0));
+        }
+        const QByteArray offer = QByteArray("v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n"
+                                            "m=video 9 UDP/TLS/RTP/SAVPF 98\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\n"
+                                            "a=ice-ufrag:tEsT\r\na=ice-pwd:a0b1c2d3e4f5a6b7c8d9e0f1\r\n"
+                                            "a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n"
+                                            "a=setup:actpass\r\na=mid:0\r\na=recvonly\r\na=rtcp-mux\r\n"
+                                            "a=rtpmap:98 VP9/90000\r\na=rtcp-fb:98 nack\r\na=rtcp-fb:98 nack pli\r\na=fmtp:98 profile-id=0\r\n") +
+                                 "a=candidate:1 1 udp 2122260223 127.0.0.1 " + QByteArray::number(viewer[0]->localPort()) + " typ host generation 0\r\n" +
+                                 "a=candidate:2 1 udp 1686052607 127.0.0.1 " + QByteArray::number(viewer[1]->localPort()) + " typ srflx raddr 10.0.0.2 rport 50000\r\n" +
+                                 "a=candidate:3 1 udp 41885439 127.0.0.1 " + QByteArray::number(viewer[2]->localPort()) + " typ relay raddr 0.0.0.0 rport 0\r\n" +
+                                 "a=candidate:4 1 tcp 1518280447 127.0.0.1 9 typ host tcptype active\r\n"
+                                 "a=candidate:5 1 udp 2122262783 ::1 50005 typ host\r\na=end-of-candidates\r\n";
+        const QByteArray response = httpsRequest({}, rig.port(), "POST", "/whep", QByteArray::fromStdString(rig.settings.passphrase), offer, "application/sdp", 20000);
+        QVERIFY2(httpStatusOf(response) == 201, response.left(400).constData());
+        // The answer offers one candidate: Montage's address at the relay.
+        QList<QByteArray> offered;
+        for (const QByteArray& line : httpBodyOf(response).split('\n'))
+            if (line.startsWith("a=candidate:")) offered.push_back(line.trimmed());
+        QCOMPARE(offered.size(), qsizetype(1));
+        QVERIFY2(offered[0].contains(" typ relay "), offered[0].constData());
+        const QList<QByteArray> parts = offered[0].split(' ');
+        QCOMPARE(parts[4], QByteArray("127.0.0.1"));
+        const quint16 relayed = parts[5].toUShort();
+        QVERIFY(relayed != 0);
+        // What reaches the viewer's sockets, for a while: connectivity checks (STUN binding requests), and where from.
+        struct Seen {
+            int packets = 0, checks = 0, elsewhere = 0;
+        };
+        auto watch = [&](int ms, bool untilAll) {
+            std::vector<Seen> seen(viewer.size());
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) {
+                bool all = true;
+                for (size_t i = 0; i < viewer.size(); ++i) {
+                    viewer[i]->waitForReadyRead(10);
+                    while (viewer[i]->hasPendingDatagrams()) {
+                        QByteArray d(int(viewer[i]->pendingDatagramSize()), 0);
+                        quint16 from = 0;
+                        viewer[i]->readDatagram(d.data(), d.size(), nullptr, &from);
+                        ++seen[i].packets;
+                        seen[i].checks += d.size() >= 20 && d[0] == 0 && d[1] == 1 && d.mid(4, 4) == QByteArray::fromHex("2112a442");
+                        seen[i].elsewhere += from != relayed;
+                    }
+                    all = all && seen[i].packets > 0;
+                }
+                if (untilAll && all) break;
+            }
+            return seen;
+        };
+        const std::vector<Seen> first = watch(10000, true);
+        for (size_t i = 0; i < first.size(); ++i) {
+            qInfo("Viewer address %d: %d packets, %d of them checks, %d not from the relay", int(i), first[i].packets, first[i].checks, first[i].elsewhere);
+            QVERIFY(first[i].packets > 0);
+            QCOMPARE(first[i].checks, first[i].packets);
+            QCOMPARE(first[i].elsewhere, 0);
+        }
+        QVERIFY(tap.forwarded > 0);
+        // The way to the relay cut: nothing at all reaches the viewer's addresses (what was on its way is let pass).
+        tap.blocked = true;
+        watch(300, false);
+        const int64_t forwarded = tap.forwarded;
+        const std::vector<Seen> cut = watch(2500, false);
+        for (const Seen& s : cut) QCOMPARE(s.packets, 0);
+        QCOMPARE(tap.forwarded.load(), forwarded);
+        // Mended: the checks come again, from the relay as before.
+        tap.blocked = false;
+        int again = 0;
+        for (const Seen& s : watch(20000, true)) {
+            again += s.packets;
+            QCOMPARE(s.elsewhere, 0);
+        }
+        QVERIFY(again > 0);
+        // The STUN server of the settings was never asked anything by Montage.
+        QVERIFY(!stun.hasPendingDatagrams());
+        qInfo("Through the tap: %lld packets to the relay, %lld back", (long long)tap.forwarded.load(), (long long)tap.returned.load());
+#endif
+    }
+
+    void browserReviewRelaySecret_data() {
+        QTest::addColumn<bool>("coturn");
+        QTest::newRow("libjuice") << false;
+        QTest::newRow("coturn") << true;
+    }
+
+    // A review only through a relay that shares a secret with Montage. With coturn (the "coturn" row: turnserver on
+    // this computer's loopback with that secret, where there is one), the relay works each login out for itself;
+    // libjuice's relay (the other row) is told the review's login and knows no other. A link with a fresh login plays
+    // in Chrome, and in Firefox where there is one, through the relay at both ends; a login whose time has passed is
+    // refused by the relay; and once the link's own time is up the page says so, and coturn takes its login no more.
+    void browserReviewRelaySecret() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        QFETCH(bool, coturn);
+        const std::string secret = "a shared secret made up for this test";
+        QTemporaryDir dir;
+        QProcess server;
+        auto endServer = qScopeGuard([&] {
+            if (server.state() == QProcess::NotRunning) return;
+            server.terminate();
+            if (!server.waitForFinished(5000)) server.kill();
+            server.waitForFinished(3000);
+        });
+        auto serverLog = [&] {
+            QFile f(dir.path() + "/turnserver.log");
+            return f.open(QIODevice::ReadOnly) ? f.readAll().right(3000) : QByteArray();
+        };
+        int turnPort = 0;
+#ifdef MONTAGE_TEST_TURN
+        juice_server_t* turn = nullptr;
+        auto endTurn = qScopeGuard([&] {
+            if (turn) juice_server_destroy(turn);
+        });
+#endif
+        if (coturn) {
+#ifndef Q_OS_LINUX
+            QSKIP("coturn is run for this test on Linux only");
+#else
+            QString exe = QString::fromLocal8Bit(qgetenv("MONTAGE_TEST_TURNSERVER"));
+            if (exe.isEmpty()) exe = QStandardPaths::findExecutable(QStringLiteral("turnserver"));
+            if (exe.isEmpty()) QSKIP("Needs coturn's turnserver (MONTAGE_TEST_TURNSERVER, or turnserver on the PATH)");
+            if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+            // (a port free for UDP and for TCP: the relay listens on both)
+            for (int tries = 0; tries < 20 && !turnPort; ++tries) {
+                QUdpSocket udp;
+                QTcpServer tcp;
+                if (udp.bind(QHostAddress::LocalHost, 0) && tcp.listen(QHostAddress::LocalHost, udp.localPort())) turnPort = udp.localPort();
+            }
+            QVERIFY(turnPort != 0);
+            server.setProcessChannelMode(QProcess::MergedChannels);
+            server.setStandardOutputFile(dir.path() + "/turnserver.log");
+            server.start(exe, {"-n", "--log-file=stdout", "--no-cli", "--no-tls", "--no-dtls", "--listening-ip=127.0.0.1", "--relay-ip=127.0.0.1",
+                               "--listening-port=" + QString::number(turnPort), "--min-port=49160", "--max-port=49260", "--allow-loopback-peers",
+                               "--use-auth-secret", "--static-auth-secret=" + QString::fromStdString(secret), "--realm=montage-test",
+                               "--pidfile=" + dir.path() + "/turnserver.pid", "--userdb=" + dir.path() + "/turndb"});
+            QVERIFY2(server.waitForStarted(15000), qPrintable(server.errorString()));
+            // It is up once it answers a STUN binding request.
+            bool up = false;
+            QElapsedTimer waited;
+            waited.start();
+            QUdpSocket ask;
+            ask.setProxy(QNetworkProxy::NoProxy);
+            QVERIFY(ask.bind(QHostAddress::LocalHost, 0));
+            while (!up && waited.elapsed() < 30000 && server.state() != QProcess::NotRunning) {
+                ask.writeDatagram(QByteArray::fromHex("000100002112a442") + QByteArray(12, 'q'), QHostAddress::LocalHost, quint16(turnPort));
+                if (ask.waitForReadyRead(300)) {
+                    QByteArray d(int(ask.pendingDatagramSize()), 0);
+                    ask.readDatagram(d.data(), d.size());
+                    up = d.startsWith(QByteArray::fromHex("0101"));
+                }
+            }
+            QVERIFY2(up, serverLog().constData());
+#endif
+        } else {
+#ifndef MONTAGE_TEST_TURN
+            QSKIP("Needs libjuice's TURN server (a build with WebRTC)");
+#else
+            if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+            juice_server_config_t config{};
+            config.max_allocations = 16;
+            config.max_peers = 16;
+            config.bind_address = "127.0.0.1";
+            config.port = 0;
+            config.realm = "montage-test";
+            turn = juice_server_create(&config);
+            QVERIFY(turn);
+            turnPort = juice_server_get_port(turn);
+#endif
+        }
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        // The browsers are started first: the link's time runs from when the review starts.
+        const bool firefox = !GeckoBrowser::firefox().empty() && !GeckoBrowser::geckodriver().empty();
+        if (coturn && !firefox && qEnvironmentVariableIsSet("MONTAGE_REQUIRE_FIREFOX")) QFAIL("MONTAGE_REQUIRE_FIREFOX is set, and no Firefox and geckodriver were found");
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why, {"--allow-loopback-in-peer-connection"}), why.c_str());
+        GeckoBrowser fx;
+        if (firefox) QVERIFY2(fx.start(&why), why.c_str());
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.settings.turnServer = "turn:127.0.0.1:" + std::to_string(turnPort);
+        rig.settings.turnSecret = secret;
+        rig.settings.turnExpirySeconds = 60;
+        rig.settings.relayOnly = true;
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        rig.picture = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        const qint64 expires = rig.review->stats().linkExpires;
+        QVERIFY(expires > QDateTime::currentSecsSinceEpoch() + 50);
+        const TurnLogin login = turnRestLogin(secret, expires);
+#ifdef MONTAGE_TEST_TURN
+        if (turn) {
+            // (kept for as long as the relay runs: libjuice's relay lets go of a login given a time while addresses
+            // made with it still point at it, so the time running out at the relay is left to the coturn row)
+            juice_server_credentials_t made{login.user.c_str(), login.password.c_str(), 0};
+            QCOMPARE(juice_server_add_credentials(turn, &made, 0), 0);
+        }
+#endif
+        // Chrome: given the login the secret makes (not the secret), it plays, both ends of the pair in use at the relay.
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        QCOMPARE(tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+        QVERIFY2(tab.until("__montage.stage === 'connected' && __montage.presented > 10", 30),
+                 (tab.js("__montage.stage").toString() + " " + QString::fromStdString(rig.review->stats().error) + " " + QString::fromUtf8(serverLog())).toUtf8().constData());
+        QCOMPARE(tab.js("__montage.pc.getConfiguration().iceServers.filter(s => s.username).map(s => s.username + ' ' + s.credential).join()").toString(),
+                 QString::fromStdString(login.user + " " + login.password));
+        QCOMPARE(tab.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
+        const QString pair = tab.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
+                                    "return p ? r.get(p.localCandidateId).candidateType + ' ' + r.get(p.remoteCandidateId).candidateType : ''; })")
+                                 .toString();
+        QCOMPARE(pair, QStringLiteral("relay relay"));
+        // Firefox the same.
+        if (firefox) {
+            auto until = [&](const QString& expression, int seconds) {
+                QElapsedTimer t;
+                t.start();
+                while (t.elapsed() < seconds * 1000) {
+                    if (fx.js(expression).toBool()) return true;
+                    QThread::msleep(100);
+                }
+                return false;
+            };
+            QVERIFY2(fx.navigate(rig.page(), &why), why.c_str());
+            QVERIFY2(until("document.readyState === 'complete' && !!window.__montage", 20), fx.log().right(2000).constData());
+            QCOMPARE(fx.js("__montage.join('Bo', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+            QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30),
+                     (fx.js("__montage.stage").toString() + " " + fx.js("__montage.pc.iceConnectionState").toString() + " " +
+                      QString::fromStdString(rig.review->stats().error) + " " + QString::fromUtf8(serverLog()))
+                         .toUtf8()
+                         .constData());
+            QCOMPARE(fx.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
+            // (the pair in use, where Firefox's statistics name it)
+            const QString types = fx.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'candidate-pair' && (s.selected || (s.nominated && s.state === 'succeeded'))) p = s; });"
+                                        "const l = p && r.get(p.localCandidateId), m = p && r.get(p.remoteCandidateId); return l && m ? l.candidateType + ' ' + m.candidateType : ''; })")
+                                      .toString();
+            qInfo("Firefox %s through the relay: %s", qPrintable(fx.version()), qPrintable(types));
+            if (!types.isEmpty()) QCOMPARE(types, QStringLiteral("relay relay"));
+            QCOMPARE(rig.review->stats().viewers, 2);
+        } else {
+            qInfo("No Firefox and geckodriver here: Chrome alone");
+        }
+        // A login made for a time already past: the relay refuses it.
+        {
+            RelayBridge past("127.0.0.1", uint16_t(turnPort), turnRestLogin(secret, QDateTime::currentSecsSinceEpoch() - 60));
+            const std::string refused = allocateAt(past);
+            QVERIFY2(QString::fromStdString(refused).contains("login"), (refused + " " + serverLog().toStdString()).c_str());
+        }
+        // The review's own login is still taken while its time lasts.
+        {
+            RelayBridge fresh("127.0.0.1", uint16_t(turnPort), login);
+            QCOMPARE(allocateAt(fresh), std::string());
+        }
+        // Once the link's time is up: the page tells a newcomer so, and coturn takes the review's login no more.
+        while (QDateTime::currentSecsSinceEpoch() < expires + 2) QThread::msleep(200);
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        QCOMPARE(tab.js("__montage.join('Cy', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("This review link has expired"));
+        if (coturn) {
+            RelayBridge late("127.0.0.1", uint16_t(turnPort), login);
+            const std::string refused = allocateAt(late);
+            QVERIFY2(QString::fromStdString(refused).contains("login"), (refused + " " + serverLog().toStdString()).c_str());
+        }
     }
 
     void ndiOutput() {
@@ -24353,6 +25865,284 @@ colorspaces:
         QCOMPARE(qAlpha(view.pixel(150, 150)), 0);
     }
 
+    // A plug-in that renders with OpenGL takes its picture from a texture of a context that shares its textures with
+    // the plug-ins' (as the GPU compositor's OpenGL context does) and draws into another, with nothing read back. The
+    // pictures match the CPU's within 1/1023, for an effect that tells the top of the picture from the bottom and for
+    // a transition. A plug-in without OpenGL has the texture read back and its picture written in.
+    void ofxSharedTextures() {
+        QTemporaryDir dir;
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath((dir.path() + "/ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve, temporal;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.dissolve/1", dissolve) &&
+                reg.find("org.montage.test.temporal/1", temporal));
+        std::string why, err;
+        if (!ofx::initializeGpu(&why)) QSKIP(why.c_str());
+        if (invert.openGL != "true" || dissolve.openGL != "true") QSKIP("The test plug-ins were built without OpenGL");
+        // The compositor's stand-in: an OpenGL 3.3 core context made sharing with the plug-ins' (current on this thread).
+        QSurfaceFormat format;
+        format.setVersion(3, 3);
+        format.setProfile(QSurfaceFormat::CoreProfile);
+        QOffscreenSurface surface;
+        surface.setFormat(format);
+        surface.create();
+        QOpenGLContext other;
+        other.setFormat(format);
+        other.setShareContext(ofx::gl::context());
+        QVERIFY2(surface.isValid() && other.create() && other.makeCurrent(&surface), "no second OpenGL context");
+        QVERIFY2(ofx::gl::sharesWith(&other), "the two OpenGL contexts do not share their textures");
+        QOpenGLExtraFunctions* f = other.extraFunctions();
+        const int W = 96, H = 54;
+        std::vector<GLuint> textures;
+        // A float texture with a picture's rows as the compositor stores them, top row first.
+        auto texture = [&](const Image* img) {
+            GLuint t = 0;
+            f->glGenTextures(1, &t);
+            f->glBindTexture(GL_TEXTURE_2D, t);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            f->glTexImage2D(GL_TEXTURE_2D, 0, 0x8814 /* GL_RGBA32F */, W, H, 0, GL_RGBA, GL_FLOAT, img ? img->px.data() : nullptr);
+            f->glBindTexture(GL_TEXTURE_2D, 0);
+            f->glFinish();  // (the other context sees what was uploaded)
+            textures.push_back(t);
+            return ofx::GlPicture{t, W, H};
+        };
+        auto pixels = [&](const ofx::GlPicture& t) {
+            Image out(W, H);
+            GLuint fbo = 0;
+            f->glGenFramebuffers(1, &fbo);
+            f->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            f->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.texture, 0);
+            f->glReadPixels(0, 0, W, H, GL_RGBA, GL_FLOAT, out.px.data());
+            f->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            f->glDeleteFramebuffers(1, &fbo);
+            return out;
+        };
+        auto worst = [](const Image& a, const Image& b) {
+            float d = a.px.size() == b.px.size() ? 0.0f : 1e9f;
+            for (size_t k = 0; k < a.px.size() && k < b.px.size(); ++k) d = std::max(d, std::fabs(a.px[k] - b.px[k]));
+            return d;
+        };
+        Project p = makeDefaultProject();
+        Image picture(W, H), second(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float a = 0.25f + 0.75f * float(x) / W;
+                float* px = picture.at(x, y);
+                px[0] = a * float(y) / H, px[1] = a * 0.5f, px[2] = a * (1 - float(x) / W), px[3] = a;
+                px = second.at(x, y);
+                px[0] = 0.9f - 0.8f * float(y) / H, px[1] = float(x) / W, px[2] = 0.3f, px[3] = 1.0f;
+            }
+        // The effect leaves the lower half of the picture alone, so a picture handed over upside down would show.
+        Effect e = ofx::makeEffect(p, invert);
+        e.params["param.amount"] = Param(0.7);
+        e.params["param.tint.g"] = Param(0.5);
+        e.params["param.mode"] = Param(2.0);
+        Image cpu = picture;
+        ofx::setGpuRendering(false);
+        QVERIFY2(ofx::applyEffect(e, 0, cpu, 1.0, {}, &err), err.c_str());
+        ofx::setGpuRendering(true);
+        QCOMPARE(cpu.at(48, H - 1)[1], picture.at(48, H - 1)[1]);
+        QVERIFY(std::fabs(cpu.at(48, 0)[1] - picture.at(48, 0)[1]) > 0.05f);
+        const ofx::GlPicture in = texture(&picture), out = texture(nullptr);
+        QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
+        int readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+        QVERIFY2(ofx::applyEffectTexture(e, 0, in, out, 1.0, {}, &err), err.c_str());
+        QCOMPARE(ofx::gpuReadBacks(), readBacks);
+        QCOMPARE(ofx::gpuTextureRenders(), direct + 1);
+        float d = worst(pixels(out), cpu);
+        QVERIFY2(d <= 1.0f / 1023, qPrintable(QString("effect: %1").arg(d)));
+        // Through the picture in memory instead (as before), one read-back is counted.
+        Image through = picture;
+        QVERIFY(ofx::applyEffect(e, 0, through, 1.0, {}, &err));
+        QCOMPARE(ofx::gpuReadBacks(), readBacks + 1);
+        QVERIFY(worst(through, cpu) <= 1.0f / 1023);
+
+        // A transition, its two sides and its picture all textures.
+        Effect tr = ofx::makeEffect(p, dissolve);
+        Image mixed;
+        ofx::setGpuRendering(false);
+        QVERIFY2(ofx::applyTransition(tr, 3, 0.25, picture, second, mixed, 1.0, &err), err.c_str());
+        ofx::setGpuRendering(true);
+        QVERIFY(std::fabs(mixed.at(10, 40)[0] - (0.75f * picture.at(10, 40)[0] + 0.25f * second.at(10, 40)[0])) < 1e-5f);
+        const ofx::GlPicture to = texture(&second), mix = texture(nullptr);
+        QVERIFY2(ofx::rendersTextures(tr, &why, true), why.c_str());
+        QVERIFY(!ofx::rendersTextures(tr) && !ofx::rendersTextures(e, nullptr, true));  // (each as what it is)
+        readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+        QVERIFY2(ofx::applyTransitionTexture(tr, 3, 0.25, in, to, mix, 1.0, &err), err.c_str());
+        QCOMPARE(ofx::gpuReadBacks(), readBacks);
+        QCOMPARE(ofx::gpuTextureRenders(), direct + 1);
+        d = worst(pixels(mix), mixed);
+        QVERIFY2(d <= 1.0f / 1023, qPrintable(QString("transition: %1").arg(d)));
+
+        // A plug-in without OpenGL is not given textures; asked all the same, its source is read back (counted) and its
+        // picture written into the texture.
+        Effect avg = ofx::makeEffect(p, temporal);
+        QVERIFY(!ofx::rendersTextures(avg, &why));
+        QVERIFY2(why.find("does not render with OpenGL") != std::string::npos, why.c_str());
+        Image averaged = picture;
+        QVERIFY2(ofx::applyEffect(avg, 0, averaged, 1.0, {}, &err), err.c_str());
+        const ofx::GlPicture plain = texture(nullptr);
+        readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+        QVERIFY2(ofx::applyEffectTexture(avg, 0, in, plain, 1.0, {}, &err), err.c_str());
+        QCOMPARE(ofx::gpuReadBacks(), readBacks + 1);
+        QCOMPARE(ofx::gpuTextureRenders(), direct);
+        d = worst(pixels(plain), averaged);
+        QVERIFY2(d <= 1e-6f, qPrintable(QString("in memory: %1").arg(d)));
+        // With OpenGL for plug-ins switched off the same holds for the effect that would render with it, and it is
+        // given textures again once OpenGL is back on.
+        ofx::setGpuRendering(false);
+        QVERIFY(!ofx::rendersTextures(e));
+        readBacks = ofx::gpuReadBacks();
+        QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
+        ofx::setGpuRendering(true);
+        QCOMPARE(ofx::gpuReadBacks(), readBacks + 1);
+        d = worst(pixels(plain), cpu);
+        QVERIFY2(d <= 1e-6f, qPrintable(QString("switched off: %1").arg(d)));
+        QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
+        // Textures of two sizes are refused.
+        QVERIFY(!ofx::applyEffectTexture(e, 0, in, ofx::GlPicture{out.texture, W, H - 2}, 1.0, {}, &err));
+        f->glDeleteTextures(GLsizei(textures.size()), textures.data());
+        other.doneCurrent();
+    }
+
+    // An OpenFX plug-in that renders with OpenGL, chained with a GPU blur on a clip, and an OpenFX transition, in frames
+    // the GPU draws. Where the compositor draws with OpenGL its textures are the plug-ins' context's too: the plug-in
+    // draws from and into them, with no read-back and no layer made on the CPU, whichever of the two contexts was made
+    // first and after the device was lost. On another backend the layer is made on the CPU, as before. Either way the
+    // frames match the CPU's within 1/1023.
+    void gpuOfxTextures() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath((dir.path() + "/ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.dissolve/1", dissolve));
+        if (!ofx::initializeGpu(&why)) QSKIP(why.c_str());
+        if (invert.openGL != "true" || dissolve.openGL != "true") QSKIP("The test plug-ins were built without OpenGL");
+        const QByteArray backend = qgetenv("MONTAGE_GPU").toLower();
+        const QString device = QString::fromStdString(gpu::deviceName());
+        // (Asked for OpenGL, the two contexts must share: the test is not to pass by drawing on the CPU.)
+        if (backend == "opengl") QVERIFY2(gpu::sharesOpenGl(), qPrintable("not shared on " + device));
+        if (backend == "vulkan") QVERIFY2(!gpu::sharesOpenGl(), qPrintable("shared on " + device));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        auto addPicture = [&](const char* name, int w, int h, float phase) {
+            QImage q(w, h, QImage::Format_RGBA64);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.21f + phase), float(y) / h,
+                                                           0.5f + 0.4f * std::sin(x * 0.07f - y * 0.13f + phase), 1.0f));
+            const QString path = dir.filePath(name);
+            if (!q.save(path)) return Id{};
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id wide = addPicture("wide.png", 160, 90, 0), other = addPicture("other.png", 160, 90, 1.7f), small = addPicture("small.png", 120, 80, 0.6f);
+        QVERIFY(wide && other && small);
+        // The frame on the CPU and on the GPU, and what the GPU frame took: texture steps, layers made on the CPU, and
+        // OpenGL renders read back.
+        struct Took {
+            long steps = 0, cpuLayers = 0, gpuFrames = 0;
+            int readBacks = 0, direct = 0;
+            double worst = 0;
+            std::string cpuLayer, fallback;
+        };
+        auto frame = [&](FrameTime t) {
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats before = gpu::stats();
+            const int readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            Took took;
+            took.steps = after.textureSteps - before.textureSteps, took.cpuLayers = after.cpuLayers - before.cpuLayers;
+            took.gpuFrames = after.gpuFrames - before.gpuFrames;
+            took.readBacks = ofx::gpuReadBacks() - readBacks, took.direct = ofx::gpuTextureRenders() - direct;
+            took.cpuLayer = after.lastCpuLayer, took.fallback = after.lastFallback;
+            took.worst = cpu.px.size() == onGpu.px.size() && !cpu.empty() ? 0 : 1e9;
+            for (size_t k = 0; k < cpu.px.size() && k < onGpu.px.size(); ++k) took.worst = std::max(took.worst, std::fabs(double(cpu.px[k]) - onGpu.px[k]));
+            return took;
+        };
+        auto said = [&](const char* what, const Took& t) {
+            return QString("%1 on %2: off by %3; %4 GPU frames (%5), %6 texture steps, %7 into textures, %8 read back, %9 CPU layers (%10)")
+                .arg(what, device).arg(t.worst).arg(t.gpuFrames).arg(QString::fromStdString(t.fallback)).arg(t.steps).arg(t.direct).arg(t.readBacks)
+                .arg(t.cpuLayers).arg(QString::fromStdString(t.cpuLayer));
+        };
+        // What each frame must have taken, shared or not.
+        auto check = [&](const char* what, const Took& t, const char* cpuLayerNames) {
+            const QString text = said(what, t);
+            if (t.worst > 1.0 / 1023 || t.gpuFrames != 1) return text;
+            if (gpu::sharesOpenGl()) return t.steps == 1 && t.direct == 1 && t.readBacks == 0 && t.cpuLayers == 0 ? QString() : text;
+            return t.steps == 0 && t.direct == 0 && t.cpuLayers >= 1 && t.cpuLayer.find(cpuLayerNames) != std::string::npos ? QString() : text;
+        };
+        // V1 a full-frame picture; V2 a smaller one, scaled and moved, through the plug-in (which leaves its lower half
+        // alone, so a picture handed over upside down would show) and then a blur the GPU draws.
+        QVERIFY(edit::placeMedia(p, s, wide, 0, 0, 20, {TrackKind::Video, 0}, {}, false).ok);
+        const auto placed = edit::placeMedia(p, s, small, 0, 0, 20, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(placed.ok);
+        {
+            Clip* top = edit::clipById(s, placed.created[0]);
+            top->motion.params["scale"] = 90.0;
+            top->motion.params["pos_x"] = 7.0;
+            Effect fx = ofx::makeEffect(p, invert);
+            fx.params["param.amount"] = Param(0.7);
+            fx.params["param.tint.g"] = Param(0.5);
+            fx.params["param.mode"] = Param(2.0);
+            top->effects.push_back(fx);
+            Effect blur = makeEffect(p, "gaussian_blur");
+            blur.params["radius"] = Param(3.0);
+            top->effects.push_back(blur);
+        }
+        QString wrong = check("effect and blur", frame(5), "Test Invert");
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        // (and the plug-in did change the frame: without it the picture differs)
+        {
+            RenderOptions o;
+            o.gpu = true;
+            const Image with = renderProgramFrame(p, s, 5, o);
+            edit::clipById(s, placed.created[0])->effects[0].enabled = false;
+            const Image without = renderProgramFrame(p, s, 5, o);
+            edit::clipById(s, placed.created[0])->effects[0].enabled = true;
+            double changed = 0;
+            for (size_t k = 0; k < with.px.size() && k < without.px.size(); ++k) changed = std::max(changed, std::fabs(double(with.px[k]) - without.px[k]));
+            QVERIFY2(changed > 0.05, qPrintable(QString::number(changed)));
+        }
+        // An OpenFX transition between two pictures on V1, later in the sequence.
+        const auto first = edit::placeMedia(p, s, wide, 30, 0, 20, {TrackKind::Video, 0}, {}, false);
+        const auto second = edit::placeMedia(p, s, other, 50, 0, 20, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(first.ok && second.ok);
+        const edit::Result added = edit::addTransition(p, s, first.created[0], edit::Edge::Out, "ofx:org.montage.test.dissolve/1", 8);
+        QVERIFY2(added.ok, added.error.c_str());
+        wrong = check("transition", frame(49), "ofx transition");
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        if (!gpu::sharesOpenGl()) return;
+        // The device lost and set up again: its new context is made sharing with the plug-ins', which is there already.
+        gpu::loseDeviceForTesting();
+        wrong = check("effect after the device was lost", frame(6), "Test Invert");
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        // And the compositor shut down and set up again.
+        gpu::shutdown();
+        QVERIFY2(gpu::initialize(&why), why.c_str());
+        QVERIFY(gpu::sharesOpenGl());
+        wrong = check("transition after a new start", frame(50), "ofx transition");
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+    }
+
     void gpuFallback() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
@@ -24394,6 +26184,16 @@ colorspaces:
         const std::string layer = gpu::stats().lastCpuLayer;
         QVERIFY2(layer.find("\"" + masked.name + "\"") == 0 && layer.find("Color Correct") != std::string::npos, layer.c_str());
         QVERIFY(edit::clipById(s, maskedId));
+        // With less kept between frames than the frame uses, the frame drawn again still makes no texture anew.
+        gpu::setTextureBudgetForTesting(4096);
+        o.gpu = true;
+        renderProgramFrame(p, s, 5, o);
+        const gpu::Stats once = gpu::stats();
+        renderProgramFrame(p, s, 5, o);
+        const gpu::Stats twice = gpu::stats();
+        gpu::setTextureBudgetForTesting(0);
+        QCOMPARE(twice.gpuFrames, once.gpuFrames + 1);
+        QCOMPARE(twice.texturesMade, once.texturesMade);
         // An adjustment layer with an effect only the CPU draws needs the canvas beneath it there: the frame falls back.
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
         adj.effects.push_back(makeEffect(p, "texture_pop"));
@@ -24863,6 +26663,21 @@ colorspaces:
             const long passes = gpu::stats().filterPasses;
             compare(3 + FrameTime(k), what);
             if (k >= 11) QVERIFY2(gpu::stats().filterPasses > passes + 5, qPrintable(what + ": not drawn in passes"));
+            if (k >= 11) {
+                // Lens Blur's textures are more than the compositor keeps between frames (a 4K layer's are, against its
+                // own budget; the budget is set low here): the frame drawn again makes none of them anew.
+                RenderOptions again;
+                again.gpu = true;
+                gpu::setTextureBudgetForTesting(1 << 20);
+                renderProgramFrame(p, s, 3 + FrameTime(k), again);
+                const gpu::Stats once = gpu::stats();
+                renderProgramFrame(p, s, 3 + FrameTime(k), again);
+                const gpu::Stats twice = gpu::stats();
+                gpu::setTextureBudgetForTesting(0);
+                QVERIFY2(twice.gpuFrames == once.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(twice.lastFallback)));
+                QVERIFY2(twice.texturesMade == once.texturesMade,
+                         qPrintable(QString("%1: %2 textures made again").arg(what).arg(twice.texturesMade - once.texturesMade)));
+            }
             // (it did something: the depth and the object were there)
             if (k == 0 || k == 6 || k == 8 || k >= 11) QVERIFY2(renderProgramFrame(p, s, 5, plain).px != untouched.px, qPrintable(what));
         }
@@ -25158,6 +26973,115 @@ colorspaces:
             QCOMPARE(gpu::mappedHardware().find("vulkan") != std::string::npos, mapped);
         }
     }
+
+    void gpuHardwareFramesImportedOnce() {
+        // A hardware frame the frame cache keeps is imported into the compositor's API, or copied on the GPU, once,
+        // however often it is drawn: what was made stays with the frame, as VA-API's frames imported into Vulkan or
+        // OpenGL do. Shown on the path that runs here: frames FFmpeg uploads into its Vulkan device as one image of
+        // all the planes, whose planes the compositor copies on the GPU. Drawn again, and as two layers of one
+        // frame, the frame is copied once; decoded again after the cache let it go, it is copied again; after the
+        // device is lost, once more on the new one; and a frame of an image a plane, sampled where it is, has nothing
+        // made for it at all. Every draw is the frame's own picture.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        if (!gpu::takesPlanes()) QSKIP("this GPU does not take 8 and 16-bit textures of one and two channels");
+        if (!hwDevice(AV_HWDEVICE_TYPE_VULKAN)) QSKIP("FFmpeg makes no Vulkan device here");
+        const bool mapped = gpu::mappedHardware().find("vulkan") != std::string::npos;
+        auto restore = qScopeGuard([] {
+            setHwUploadForTesting("");
+            MediaPool::instance().clear();
+        });
+        QTemporaryDir dir;
+        const int W = 96, H = 54;
+        const std::string path = dir.filePath("kept.mkv").toStdString();
+        QVERIFY(writeYcbcrVideo(path, AV_PIX_FMT_NV12, W, H, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, AVCHROMA_LOC_LEFT, [](int c, int x, int y) {
+            const double v = c == 0 ? 0.5 + 0.35 * std::sin(x * 0.045 + y * 0.03) : 0.5 + 0.18 * std::sin(x * (c == 1 ? 0.07 : 0.05) - y * 0.04);
+            return int(std::lround(16 + ((c ? 240 : 235) - 16) * v));
+        }, 24));
+        MediaItem m;
+        QVERIFY(probeMedia(path, m));
+        const double step = m.fps.valid() ? 1 / m.fps.toDouble() : 0.04;
+        auto frameAt = [&](int i) { return MediaPool::instance().videoFrame(path, i * step, 0, 0, false, true); };
+        // One frame drawn as `layers` layers, each filling the canvas: what the draw took, and how far the picture is
+        // from the frame's own.
+        struct Drawn {
+            bool ok = false;
+            gpu::Stats st;
+            double worst = 1;
+        };
+        auto draw = [&](const Frame16Ptr& f, int layers) {
+            gpu::Frame g;
+            g.width = W, g.height = H;
+            for (int i = 0; i < layers; ++i) {
+                g.items.emplace_back();
+                g.items.back().a.frame = f;
+                g.items.back().a.place.full = true;
+            }
+            Drawn d;
+            Image onGpu;
+            gpu::resetStats();
+            d.ok = gpu::execute(g, &onGpu);
+            d.st = gpu::stats();
+            const Image own = toImage(*f);
+            if (d.ok && own.px.size() == onGpu.px.size()) {
+                d.worst = 0;
+                for (size_t k = 0; k < own.px.size(); ++k) d.worst = std::max(d.worst, std::fabs(double(own.px[k]) - onGpu.px[k]));
+            }
+            return d;
+        };
+        // What a draw must have taken: frames drawn from the device's memory, and made for it (imported or copied).
+        auto took = [&](const char* what, const Drawn& d, long fromDevice, long made) {
+            const QString text = QStringLiteral("%1: drawn %2, off by %3; %4 from the device's memory, %5 made for it, %6 copied on the GPU, %7 read back (%8)")
+                                     .arg(what).arg(d.ok).arg(d.worst).arg(d.st.hwMapped).arg(d.st.hwImports).arg(d.st.hwGpuCopies).arg(d.st.hwReadBacks)
+                                     .arg(QString::fromStdString(d.st.lastHwFallback));
+            if (!d.ok || d.worst > 1.0 / 1023) return text;
+            if (!mapped) return d.st.hwMapped == 0 && d.st.hwImports == 0 ? QString() : text;
+            return d.st.hwMapped == fromDevice && d.st.hwImports == made && d.st.hwGpuCopies == made && d.st.hwReadBacks == 0 ? QString() : text;
+        };
+#define TOOK(what, drawn, fromDevice, made) \
+    do { \
+        const QString wrong = took(what, drawn, fromDevice, made); \
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong)); \
+    } while (false)
+        // One image of all the planes: copied on the GPU when first drawn, and not again.
+        setHwUploadForTesting("vulkan-multiplane");
+        MediaPool::instance().clear();
+        Frame16Ptr f = frameAt(3);
+        QVERIFY(f && f->planes);
+        if (mapped) QVERIFY(f->planes->hw != nullptr);
+        TOOK("first draw", draw(f, 1), 1, 1);
+        TOOK("second draw", draw(f, 1), 1, 0);
+        TOOK("third draw", draw(f, 1), 1, 0);
+        TOOK("as two layers, drawn before", draw(f, 2), 2, 0);
+        // (another frame, first drawn as two layers: the second layer uses what the first made)
+        Frame16Ptr other = frameAt(9);
+        QVERIFY(other && other->planes);
+        TOOK("two layers of a frame not drawn before", draw(other, 2), 2, 1);
+        TOOK("the first frame again", draw(f, 1), 1, 0);
+        // The cache lets the frame go, and what was kept with it; decoded again it is a new frame, copied once.
+        f.reset();
+        other.reset();
+        MediaPool::instance().clear();
+        f = frameAt(3);
+        QVERIFY(f && f->planes);
+        TOOK("decoded again", draw(f, 1), 1, 1);
+        TOOK("decoded again, second draw", draw(f, 1), 1, 0);
+        // The device lost: what the old one kept for the frame is not the new one's, which copies it once more.
+        gpu::loseDeviceForTesting();
+        TOOK("after the device was lost", draw(f, 1), 1, 1);
+        TOOK("after the device was lost, second draw", draw(f, 1), 1, 0);
+        // An image a plane is sampled where it is: nothing is made for it, the first time or later.
+        f.reset();
+        setHwUploadForTesting("vulkan");
+        MediaPool::instance().clear();
+        f = frameAt(3);
+        QVERIFY(f && f->planes);
+        TOOK("an image a plane", draw(f, 1), 1, 0);
+        TOOK("an image a plane, second draw", draw(f, 1), 1, 0);
+#undef TOOK
+        QCOMPARE(gpu::mappedHardware().find("vulkan") != std::string::npos, mapped);
+    }
+
     void chromaAlikeAtEverySize() {
         // Sharp chroma, each sample its own: a high-quality frame at 99 % is the one at 100 % resized, and nothing else
         // (one chroma filter at every size: the picture is converted at its own size, then resized).
@@ -26682,6 +28606,215 @@ colorspaces:
         QVERIFY(t.elapsed() < 15000);
     }
 
+    // Nightly 15 Nov: low latency HLS as a player is promised it. The preload hint after a segment's last part
+    // names the next segment's first; every part but a segment's last is 85% of its playlist's PART-TARGET at least
+    // (with sound, a part asked shorter than 13 coded frames is made that long); a blocking reload for what is too
+    // far ahead, or for a part without a segment, is answered 400; a segment older than the folder's newest or
+    // further on than two past it is 404 at once, the next ones are waited for; and 256 requests held for what is
+    // not made yet do not keep the next player out.
+    void liveLowLatencyPartsAndOrigin() {
+        QCOMPARE(QString::fromStdString(livePreloadHint(12, 0, 4)), QString("seg00012.1.m4s"));
+        QCOMPARE(QString::fromStdString(livePreloadHint(12, 2, 4)), QString("seg00012.3.m4s"));
+        QCOMPARE(QString::fromStdString(livePreloadHint(12, 4, 4)), QString("seg00013.1.m4s"));
+        for (double fps : {24.0, 25.0, 30000.0 / 1001, 30.0, 50.0, 60.0})
+            for (double asked : {0.1, 0.15, 0.2, 0.33, 0.5, 1.0})
+                for (const char* codec : {"none", "aac", "libopus", "ac3", "eac3"}) {
+                    const LivePartPlan plan = livePartPlan(asked, 2, fps, codec);
+                    const double part = double(plan.partFrames) / fps;
+                    const double coded = std::strcmp(codec, "none") == 0 ? 0 : std::strcmp(codec, "libopus") == 0 ? 0.02 : codec[0] == 'a' && codec[1] == 'a' ? 1024.0 / 48000 : 0.032;
+                    const QByteArray what = QByteArray(codec) + " " + QByteArray::number(fps) + " " + QByteArray::number(asked);
+                    QVERIFY2(plan.segmentFrames % plan.partFrames == 0, what.constData());
+                    QVERIFY2(part <= plan.partTarget + 1e-9 && part >= 0.85 * plan.partTarget, what.constData());
+                    QVERIFY2(part + coded <= plan.soundPartTarget + 1e-9 && part - coded >= 0.85 * plan.soundPartTarget, what.constData());
+                    if (coded == 0) QCOMPARE(plan.partFrames, int64_t(std::llround(asked * fps)));
+                    else QVERIFY2(part >= asked - 0.5 / fps - 1e-9 && part < std::max(asked, coded * 13) + 1 / fps, what.constData());
+                }
+        const std::string listed = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:1\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.5\n"
+                                   "#EXT-X-PART-INF:PART-TARGET=0.5\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:1.0,\nseg00010.m4s\n#EXTINF:1.0,\nseg00011.m4s\n"
+                                   "#EXTINF:1.0,\nseg00012.m4s\n#EXT-X-PART:DURATION=0.5,URI=\"seg00013.1.m4s\"\n";
+        QCOMPARE(liveBlockingReload(listed, 12, -1), 200);
+        QCOMPARE(liveBlockingReload(listed, 13, 0), 200);
+        QCOMPARE(liveBlockingReload(listed, 13, 1), 0);
+        QCOMPARE(liveBlockingReload(listed, 13, -1), 0);
+        QCOMPARE(liveBlockingReload(listed, 14, 0), 0);
+        QCOMPARE(liveBlockingReload(listed, 15, -1), 400);
+        QCOMPARE(liveBlockingReload(listed, 13, 6), 0);  // (the advance part limit of half second parts: six past the last)
+        QCOMPARE(liveBlockingReload(listed, 13, 7), 400);
+        QCOMPARE(liveBlockingReload(listed + "#EXT-X-ENDLIST\n", 99, -1), 200);
+
+        // A package made with sound and parts asked a tenth of a second long, its playlists read as they change.
+        if (avcodec_find_encoder_by_name("libx264")) {
+            QTemporaryDir dir;
+            LiveSettings ls;
+            ls.folder = dir.filePath("live").toStdString();
+            ls.rungs = {{320, 180, 300000, "libx264"}};
+            ls.segmentSeconds = 1;
+            ls.window = 6;
+            ls.lowLatency = true;
+            ls.partSeconds = 0.1;
+            ls.audioCodec = "aac";
+            ls.preset = "ultrafast";
+            const LivePartPlan plan = livePartPlan(ls.partSeconds, ls.segmentSeconds, 30, ls.audioCodec);
+            const int perSegment = int(plan.segmentFrames / plan.partFrames);
+            QCOMPARE(plan.partFrames, int64_t(9));
+            QCOMPARE(perSegment, 3);
+            std::string err;
+            LivePackager packager;
+            QVERIFY2(packager.start(ls, &err), err.c_str());
+            AVFrame* pic = av_frame_alloc();
+            pic->format = AV_PIX_FMT_YUV420P, pic->width = 320, pic->height = 180;
+            QVERIFY(av_frame_get_buffer(pic, 0) >= 0);
+            AVFrame* snd = av_frame_alloc();
+            snd->format = AV_SAMPLE_FMT_FLTP, snd->sample_rate = 48000, snd->nb_samples = 1600;
+            av_channel_layout_default(&snd->ch_layout, 2);
+            QVERIFY(av_frame_get_buffer(snd, 0) >= 0);
+            QSet<QString> seen;
+            int boundaries = 0, soundParts = 0, pictureParts = 0;
+            QString wrong;
+            // Reads the playlists as they are: each part against its playlist's target, and the hint against the
+            // parts listed.
+            auto look = [&] {
+                for (const QString& name : QDir(dir.filePath("live")).entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+                    QFile f(dir.filePath("live/" + name + "/playlist.m3u8"));
+                    if (!f.open(QIODevice::ReadOnly)) continue;
+                    const QString text = QString::fromUtf8(f.readAll());
+                    if (seen.contains(name + text)) continue;
+                    seen.insert(name + text);
+                    double target = 0;
+                    int64_t number = 0;
+                    QList<QList<double>> segments{{}};  // (each segment's parts, the last the one being made)
+                    QString hint;
+                    for (const QString& l : text.split('\n')) {
+                        if (l.startsWith("#EXT-X-PART-INF:PART-TARGET=")) target = l.mid(28).toDouble();
+                        else if (l.startsWith("#EXT-X-MEDIA-SEQUENCE:")) number = l.mid(22).toLongLong();
+                        else if (l.startsWith("#EXT-X-PART:DURATION=")) segments.last() << l.mid(21).section(',', 0, 0).toDouble();
+                        else if (l.startsWith("#EXT-X-PRELOAD-HINT:")) hint = l.section("URI=\"", 1).section('"', 0, 0);
+                        else if (!l.isEmpty() && !l.startsWith('#')) segments << QList<double>(), ++number;
+                    }
+                    if (text.contains("#EXT-X-ENDLIST") || target <= 0) continue;
+                    for (const QList<double>& parts : segments)
+                        for (int j = 0; j < parts.size(); ++j) {
+                            (name.startsWith('a') ? soundParts : pictureParts)++;
+                            if (parts[j] > target + 1e-4 || (j + 1 < perSegment && parts[j] < 0.85 * target))
+                                wrong = QString("%1: a part of %2 s against a target of %3\n%4").arg(name).arg(parts[j]).arg(target).arg(text);
+                            if (j >= perSegment) wrong = name + ": more parts than a segment has\n" + text;
+                        }
+                    const int made = int(segments.last().size());
+                    const QString expected = QString::fromStdString(livePreloadHint(number, made, perSegment));
+                    if (hint != expected) wrong = QString("%1: hints at %2, not %3\n%4").arg(name, hint, expected, text);
+                    if (made == perSegment) ++boundaries;
+                }
+            };
+            const int frames = 30 * 5;
+            for (int f = 0; f < frames; ++f) {
+                QVERIFY(av_frame_make_writable(pic) >= 0);
+                for (int y = 0; y < 180; ++y) memset(pic->data[0] + y * pic->linesize[0], (f * 7 + y) & 0xff, 320);
+                for (int c = 1; c < 3; ++c)
+                    for (int y = 0; y < 90; ++y) memset(pic->data[c] + y * pic->linesize[c], 128, 160);
+                pic->pts = f;
+                packager.picture(pic, 30, 1);
+                QVERIFY(av_frame_make_writable(snd) >= 0);
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < 1600; ++i) reinterpret_cast<float*>(snd->data[c])[i] = 0.2f * float(std::sin((f * 1600 + i) * 0.05));
+                snd->pts = int64_t(f) * 1600;
+                packager.sound(snd);
+                QElapsedTimer t;
+                t.start();
+                do {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    look();
+                } while (packager.status().behind > 0.2 && t.elapsed() < 10000);
+            }
+            QElapsedTimer t;
+            t.start();
+            while (packager.status().segments < 4 && t.elapsed() < 60000) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                look();
+            }
+            av_frame_free(&pic);
+            av_frame_free(&snd);
+            packager.finish();
+            QVERIFY2(packager.status().error.empty(), packager.status().error.c_str());
+            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+            QVERIFY2(boundaries >= 2 && soundParts >= 6 && pictureParts >= 6,
+                     qPrintable(QString("%1 %2 %3").arg(boundaries).arg(soundParts).arg(pictureParts)));
+        }
+
+        // The origin, on a folder with segments 10 to 12 and the first part of 13.
+        QTemporaryDir dir;
+        QVERIFY(QDir(dir.path()).mkpath("v1"));
+        auto put = [&](const QString& name, const QByteArray& bytes) {
+            QSaveFile f(dir.filePath("v1/" + name));
+            return f.open(QIODevice::WriteOnly) && f.write(bytes) == bytes.size() && f.commit();
+        };
+        QVERIFY(put("playlist.m3u8", QByteArray::fromStdString(listed)));
+        for (const char* name : {"seg00010.m4s", "seg00011.m4s", "seg00012.m4s", "seg00013.m4s", "seg00013.1.m4s"}) QVERIFY(put(name, "x"));
+        LiveOrigin origin;
+        std::string err;
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, nullptr, &err, "127.0.0.1", 30), err.c_str());
+        auto ask = [&](const QByteArray& path) {
+            auto s = std::make_unique<QTcpSocket>();
+            s->connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            if (s->waitForConnected(5000)) {
+                s->write("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n");
+                s->flush();
+            }
+            return s;
+        };
+        // The answer's status within `ms` (0 when none came).
+        auto status = [](QTcpSocket& s, int ms) {
+            QByteArray in = s.readAll();
+            QElapsedTimer t;
+            t.start();
+            while (!in.contains("\r\n") && t.elapsed() < ms && (s.state() == QAbstractSocket::ConnectedState || s.bytesAvailable() > 0)) {
+                s.waitForReadyRead(50);
+                in += s.readAll();
+            }
+            return in.contains("\r\n") ? in.left(in.indexOf("\r\n")).split(' ').value(1).toInt() : 0;
+        };
+        auto get = [&](const QByteArray& path) { return status(*ask(path), 3000); };
+        QCOMPARE(get("/v1/playlist.m3u8"), 200);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=12"), 200);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=13&_HLS_part=0"), 200);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_part=0"), 400);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=soon"), 400);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=15"), 400);
+        QCOMPARE(get("/v1/playlist.m3u8?_HLS_msn=13&_HLS_part=7"), 400);
+        // A part not yet listed is held, and answered once it is.
+        {
+            auto held = ask("/v1/playlist.m3u8?_HLS_msn=13&_HLS_part=1");
+            QCOMPARE(status(*held, 400), 0);
+            QVERIFY(put("playlist.m3u8", QByteArray::fromStdString(listed) + "#EXT-X-PART:DURATION=0.5,URI=\"seg00013.2.m4s\"\n"));
+            QCOMPARE(status(*held, 3000), 200);
+        }
+        // A segment gone from the window (or a gap's, never made) and one a player has no cause to ask for yet are
+        // not waited for; the next one is.
+        QCOMPARE(get("/v1/seg00009.m4s"), 404);
+        QCOMPARE(get("/v1/seg00016.m4s"), 404);
+        QCOMPARE(get("/v1/seg00012.2.m4s"), 404);
+        {
+            auto held = ask("/v1/seg00014.m4s");
+            QCOMPARE(status(*held, 400), 0);
+            QVERIFY(put("seg00014.m4s", "x"));
+            QCOMPARE(status(*held, 3000), 200);
+        }
+        // 256 requests for the segment after next, each held: the next request is answered all the same, the one
+        // held longest told to come back.
+        std::vector<std::unique_ptr<QTcpSocket>> waiting;
+        QTest::qWait(300);  // (the origin has seen that 14 is the newest)
+        for (int i = 0; i < 256; ++i) {
+            waiting.push_back(ask("/v1/seg00016.m4s"));
+            QVERIFY(waiting.back()->state() == QAbstractSocket::ConnectedState);
+        }
+        QTest::qWait(300);
+        QCOMPARE(status(*waiting.back(), 100), 0);
+        QCOMPARE(get("/v1/seg00010.m4s"), 200);
+        QCOMPARE(status(*waiting.front(), 3000), 503);
+        QCOMPARE(get("/v1/playlist.m3u8"), 200);
+        waiting.clear();
+        origin.stop();
+    }
+
     void livePackageCarries() {
         // What a channel carries, packaged live: FFmpeg-encoded H.264 with CEA-608 captions in its user data, two AAC
         // sound streams (eng, fra) and a SCTE 35 splice_insert three seconds ahead of its splice, sent as MPEG-TS over
@@ -26770,6 +28903,8 @@ colorspaces:
         ls.partSeconds = 0.2;
         ls.preset = "ultrafast";
         ls.captionLanguage = "en";
+        // (a segment's frames: a whole number of parts, each long enough for its sound's coded frames)
+        const int64_t segFrames = livePartPlan(ls.partSeconds, ls.segmentSeconds, 25, ls.audioCodec).segmentFrames;
         LivePackager packager;
         QVERIFY2(packager.start(ls, &err), err.c_str());
         LiveOrigin origin;
@@ -26899,12 +29034,12 @@ colorspaces:
         }
 
         // The rungs' segments: a keyframe at each splice (decoded from the segment that holds it).
-        QTRY_VERIFY_WITH_TIMEOUT(packager.status().segments > manual.frame / 25 + 1, 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(packager.status().segments > manual.frame / segFrames + 1, 20000);
         const LiveStatus mid = packager.status();
         for (const LiveCueStatus& c : {fed, manual})
             for (int rung = 0; rung < 2; ++rung) {
                 const QString rdir = folder + "/" + QString::fromStdString(mid.renditions[size_t(rung)]);
-                const QString seg = rdir + QStringLiteral("/seg%1.m4s").arg(c.frame / 25 + 1, 5, 10, QChar('0'));
+                const QString seg = rdir + QStringLiteral("/seg%1.m4s").arg(c.frame / segFrames + 1, 5, 10, QChar('0'));
                 QFile init(rdir + "/init.mp4"), media(seg);
                 QVERIFY(init.open(QIODevice::ReadOnly) && media.open(QIODevice::ReadOnly));
                 const QString joined = dir.filePath(QStringLiteral("probe%1.mp4").arg(rung));
@@ -26917,7 +29052,7 @@ colorspaces:
                 // (the cue's event message, in the chunk made when it was asked for: the feed's three seconds ahead,
                 // the one by hand with its picture)
                 bool told = false;
-                const int64_t at = c.frame / 25 + 1;
+                const int64_t at = c.frame / segFrames + 1;
                 for (int64_t k = c.fromFeed ? at - 4 : at - 1; k <= at && !told; ++k) {
                     QFile g(rdir + QStringLiteral("/seg%1.m4s").arg(k, 5, 10, QChar('0')));
                     if (!g.open(QIODevice::ReadOnly)) continue;

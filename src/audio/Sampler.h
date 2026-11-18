@@ -67,6 +67,8 @@ using Loader = std::function<AudioBufferPtr(const std::string& path, int sampleR
 
 // Which sounds are streamed from disk: those longer than `longerThan` seconds (never when 0), their first
 // `headSeconds` kept in memory, the rest decoded into a cache file under `cacheDir` ("" the system's temporary folder).
+// A cache file is used again while its source is unchanged; a changed source's earlier one is removed when the new
+// one is made, and any not used for a week when the folder is next used (never one a kit of this process plays from).
 struct StreamOptions {
     double longerThan = 20;
     double headSeconds = 1;

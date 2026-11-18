@@ -28584,6 +28584,18 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
             <numerusform></numerusform>
         </translation>
     </message>
+    <message>
+        <source>; the link works until %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>; the link&apos;s time is up: stop and start for a new one</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>expiry goes with a TURN relay&apos;s secret</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::RemoteReviewPanel</name>
@@ -28881,6 +28893,44 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     </message>
     <message>
         <source> From another network they need TCP and UDP port %1 forwarded here, or a TURN relay or ICE server named above.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In place of a login</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The secret your relay shares with Montage, for a relay set to make its logins from a shared secret. Each review then has a login of its own, which reviewers&apos; pages are given instead of one that lasts, and the review link and that login stop letting anyone new in after the time chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Link works for 1 hour</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Link works for 8 hours</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Link works for 1 day</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Link works for 1 week</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Link works for 30 days</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Link works for %n second(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Relay secret:</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -32987,6 +33037,12 @@ so the jump in the picture morphs across instead of cutting</source>
     <message>
         <source>Some tracks of the grouped take could not be imported</source>
         <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>The input has %n channel(s): only that many of the group&apos;s tracks record</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
     </message>
 </context>
 <context>

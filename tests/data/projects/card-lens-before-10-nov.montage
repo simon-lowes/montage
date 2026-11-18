@@ -1,0 +1,235 @@
+{
+    "activeSequence": 1,
+    "format": "montage-project",
+    "media": [],
+    "mediaStereo": 2,
+    "name": "Untitled",
+    "nextId": 83,
+    "sequences": [
+        {
+            "audio": [
+                {
+                    "clips": [],
+                    "id": 5,
+                    "name": "A1",
+                    "surround": null
+                },
+                {
+                    "clips": [],
+                    "id": 6,
+                    "name": "A2",
+                    "surround": null
+                },
+                {
+                    "clips": [],
+                    "id": 7,
+                    "name": "A3",
+                    "surround": null
+                }
+            ],
+            "fps": [
+                25,
+                1
+            ],
+            "height": 180,
+            "id": 1,
+            "in": -1,
+            "markers": [],
+            "name": "Sequence 1",
+            "out": -1,
+            "playhead": 0,
+            "sampleRate": 48000,
+            "video": [
+                {
+                    "clips": [
+                        {
+                            "duration": 10,
+                            "effects": [
+                                {
+                                    "id": 79,
+                                    "params": {
+                                        "ambient": 30,
+                                        "camera": 3,
+                                        "camera_index": 1,
+                                        "camera_track": 0,
+                                        "depth_of_field": 1,
+                                        "focus_distance": 507.455168378114,
+                                        "fov": 35,
+                                        "fstop": {
+                                            "keys": [
+                                                [
+                                                    0,
+                                                    1.4,
+                                                    "linear"
+                                                ],
+                                                [
+                                                    9,
+                                                    22,
+                                                    "linear"
+                                                ]
+                                            ],
+                                            "value": 2.8
+                                        },
+                                        "ground": 0,
+                                        "ground_strength": 80,
+                                        "ground_y": 0,
+                                        "light_angle": -40,
+                                        "light_color.b": 1,
+                                        "light_color.g": 1,
+                                        "light_color.r": 1,
+                                        "light_distance": 3,
+                                        "light_height": 45,
+                                        "light_kind": 0,
+                                        "light_strength": 100,
+                                        "lit": 0,
+                                        "pivot_x": 0,
+                                        "pivot_y": 0,
+                                        "pos_x": -160,
+                                        "pos_y": 0,
+                                        "pos_z": -507.455168378114,
+                                        "rot_x": 0,
+                                        "rot_y": 0,
+                                        "rot_z": 0,
+                                        "rough": 50,
+                                        "shadows": 0,
+                                        "spot_angle": 30,
+                                        "units_m": 0,
+                                        "width": 1
+                                    },
+                                    "strings": {
+                                        "camera_file": ""
+                                    },
+                                    "type": "layer_3d"
+                                }
+                            ],
+                            "generator": {
+                                "id": 78,
+                                "params": {
+                                    "alpha": 100,
+                                    "color.b": 1,
+                                    "color.g": 1,
+                                    "color.r": 1
+                                },
+                                "type": "color"
+                            },
+                            "id": 77,
+                            "media": 0,
+                            "name": "",
+                            "sourceIn": 0,
+                            "speed": 1,
+                            "start": 0
+                        }
+                    ],
+                    "id": 2,
+                    "name": "V1",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                        {
+                            "duration": 10,
+                            "generator": {
+                                "id": 76,
+                                "params": {
+                                    "aim": 0,
+                                    "aim_x": 0,
+                                    "aim_y": 0,
+                                    "aim_z": 0,
+                                    "fov": 35,
+                                    "pos_x": 0,
+                                    "pos_y": 0,
+                                    "pos_z": 0,
+                                    "rot_x": 0,
+                                    "rot_y": 0,
+                                    "rot_z": 0
+                                },
+                                "type": "camera3d"
+                            },
+                            "id": 75,
+                            "media": 0,
+                            "name": "",
+                            "sourceIn": 0,
+                            "speed": 1,
+                            "start": 0
+                        }
+                    ],
+                    "id": 3,
+                    "name": "V2",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                        {
+                            "duration": 10,
+                            "effects": [
+                                {
+                                    "id": 82,
+                                    "params": {
+                                        "ambient": 30,
+                                        "camera": 3,
+                                        "camera_index": 1,
+                                        "camera_track": 0,
+                                        "depth_of_field": 0,
+                                        "focus_distance": 0,
+                                        "fov": 35,
+                                        "fstop": 2.8,
+                                        "ground": 0,
+                                        "ground_strength": 80,
+                                        "ground_y": 0,
+                                        "light_angle": -40,
+                                        "light_color.b": 1,
+                                        "light_color.g": 1,
+                                        "light_color.r": 1,
+                                        "light_distance": 3,
+                                        "light_height": 45,
+                                        "light_kind": 0,
+                                        "light_strength": 100,
+                                        "lit": 0,
+                                        "pivot_x": 0,
+                                        "pivot_y": 0,
+                                        "pos_x": 160,
+                                        "pos_y": 0,
+                                        "pos_z": -507.455168378114,
+                                        "rot_x": 0,
+                                        "rot_y": 0,
+                                        "rot_z": 0,
+                                        "rough": 50,
+                                        "shadows": 0,
+                                        "spot_angle": 30,
+                                        "units_m": 0,
+                                        "width": 1
+                                    },
+                                    "strings": {
+                                        "camera_file": ""
+                                    },
+                                    "type": "layer_3d"
+                                }
+                            ],
+                            "generator": {
+                                "id": 81,
+                                "params": {
+                                    "alpha": 100,
+                                    "color.b": 1,
+                                    "color.g": 1,
+                                    "color.r": 1
+                                },
+                                "type": "color"
+                            },
+                            "id": 80,
+                            "media": 0,
+                            "name": "",
+                            "sourceIn": 0,
+                            "speed": 1,
+                            "start": 0
+                        }
+                    ],
+                    "id": 4,
+                    "name": "V3",
+                    "surround": null
+                }
+            ],
+            "width": 320
+        }
+    ],
+    "version": 1
+}

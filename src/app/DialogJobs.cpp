@@ -1,5 +1,6 @@
 #include "DialogJobs.h"
 
+#include <QLockFile>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -197,7 +198,10 @@ int DialogJobs::resume() {
         run->options = optionsFromJson(r.data.value("options").toObject());
         // (the files the run before had begun are this job's own: they are written again, not beside themselves)
         for (const QJsonValue& v : r.data.value("files").toArray()) run->options.replace.push_back(v.toString().toStdString());
-        // Held by this Montage from now on (unless another one, started with this, took it meanwhile).
+        // Held by this Montage from now on, unless another one, started with this, took it meanwhile: looked at again
+        // and written under a lock on the job's folder, so of two that find it interrupted only one takes it.
+        QLockFile taking(jobs::jobFolder(r.id, folder_) + QStringLiteral("/resume.lock"));
+        if (!taking.tryLock(0)) continue;
         if (jobs::Record now; !jobs::load(r.id, now, folder_) || now.status != QLatin1String("interrupted")) continue;
         r.status = QStringLiteral("running");
         r.progress = 0;

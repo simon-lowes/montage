@@ -5,6 +5,10 @@
 #ifdef Q_OS_UNIX
 #include <sys/stat.h>
 #endif
+#ifdef Q_OS_LINUX
+#include <sys/resource.h>
+#include <csignal>
+#endif
 #include <QCryptographicHash>
 #include <QtEndian>
 #include <QPainter>
@@ -2159,8 +2163,8 @@ private slots:
     // without its caller calling again. Each file starts with the picture after the one before it ended on, its
     // timecode the feed's own there (counted on from the last picture that carried one: files begin between a
     // transport stream's groups), every picture the one its timecode names, and its sound the feed's from its first
-    // samples (the sound a decoder's held pictures let run ahead goes in at the start). A file that cannot be written
-    // is said and the feed watched on.
+    // samples (the sound a decoder's held pictures let run ahead goes in at the start). A file that cannot be begun,
+    // or cannot be written on once begun, is said and the feed watched on.
     void captureFromTheSameReception() {
         const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
         if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
@@ -2268,6 +2272,37 @@ private slots:
             QVERIFY(std::get<0>(ended[2]) == path("no-such-folder/same.mov") && !std::get<1>(ended[2]) && !std::get<2>(ended[2]).empty());
         }
         QVERIFY(waitFor([&] { return r.status().path.empty() && cs.live->look().frame >= 5; }));  // (watched on)
+        // A file that is begun and then cannot be written on (a full disk: here the process's file size limit, lowered
+        // while it records) is said the same way, and the feed is watched on.
+        size_t failed = 0;
+#ifdef Q_OS_LINUX
+        {
+            failed = 1;
+            struct rlimit was {};
+            QVERIFY(getrlimit(RLIMIT_FSIZE, &was) == 0);
+            const auto before = std::signal(SIGXFSZ, SIG_IGN);
+            struct rlimit low = was;
+            low.rlim_cur = 150000;
+            QVERIFY(setrlimit(RLIMIT_FSIZE, &low) == 0);
+            const bool asked = r.recordTo({path("same-full.mov"), "prores_proxy"}, &err);
+            const bool told = asked && waitFor([&] {
+                std::lock_guard lock(said);
+                return ended.size() >= 4;
+            });
+            setrlimit(RLIMIT_FSIZE, &was);
+            std::signal(SIGXFSZ, before);
+            QVERIFY2(asked, err.c_str());
+            QVERIFY2(told, r.status().error.c_str());
+            {
+                std::lock_guard lock(said);
+                QVERIFY2(std::get<0>(ended[3]) == path("same-full.mov") && !std::get<1>(ended[3]) && std::get<2>(ended[3]).rfind("Cannot write ", 0) == 0,
+                         std::get<2>(ended[3]).c_str());
+            }
+            const int64_t then = cs.live->look().pictures;
+            QVERIFY(waitFor([&] { return r.status().path.empty() && cs.live->look().pictures >= then + 10; }));
+            QVERIFY2(r.recording() && r.status().error.empty(), r.status().error.c_str());
+        }
+#endif
         QVERIFY2(record(files[2]), err.c_str());
         // The sender's one call still stands (its stream opened once), and stopping ends the last file as ever.
         QCOMPARE(sender.state(), QProcess::Running);
@@ -2278,7 +2313,7 @@ private slots:
         QVERIFY(!cs.live->look().running);
         {
             std::lock_guard lock(said);
-            QCOMPARE(ended.size(), size_t(3));  // (the last is onFinished's)
+            QCOMPARE(ended.size(), size_t(3) + failed);  // (the last is onFinished's)
         }
         // Each file: as long as the recorder said, its timecode the feed's at its first picture, every picture the one
         // that names (its grey 8 codes a frame within the second), its sound there from the start.
@@ -11432,7 +11467,7 @@ private slots:
         streamed.cacheDir = cache.path().toStdString();
         sampler::StreamOptions whole;
         whole.longerThan = 0;
-        const sampler::KitPtr disk = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        sampler::KitPtr disk = sampler::loadKit(st, rate, nullptr, {}, streamed);
         const sampler::KitPtr memory = sampler::loadKit(st, rate, nullptr, {}, whole);
         QVERIFY(disk->pads[0].sounds[0].disk && !memory->pads[0].sounds[0].disk);
         QCOMPARE(disk->pads[0].sounds[0].end - disk->pads[0].sounds[0].start, memory->pads[0].sounds[0].end - memory->pads[0].sounds[0].start);
@@ -11444,6 +11479,40 @@ private slots:
         double energy = 0;
         for (float x : a) energy += double(x) * x;
         QVERIFY(energy > 1000);
+
+        // The cache folder is kept small (nightly 15 Nov: nothing was ever removed from it). The sound changed while
+        // a kit plays from its cache file: a new one is made and the earlier one stays for that kit; once no kit
+        // plays from it, the next load removes it. Files not used for a week go too, newer ones of other sounds stay.
+        auto cached = [&] { return QDir(cache.path()).entryList({"sound-*.f32", "kit-*.f32", "*.part*"}, QDir::Files); };
+        QCOMPARE(cached().size(), 1);
+        const QString first = cached().front();
+        longSound.resize(size_t(26) * rate, 0.1f);
+        QVERIFY(writeMonoWav(longFile, longSound, rate));
+        sampler::KitPtr changed = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QVERIFY(changed->pads[0].sounds[0].disk && changed->pads[0].sounds[0].disk->file != disk->pads[0].sounds[0].disk->file);
+        QCOMPARE(cached().size(), 2);
+        QVERIFY(cached().contains(first));
+        {
+            const std::vector<float> still = sampler::renderNotes(disk, held, 1, 0, int64_t(26) * rate);
+            QVERIFY(still.size() == a.size() && std::memcmp(still.data(), a.data(), a.size() * sizeof(float)) == 0);
+        }
+        const QString second = QFileInfo(QString::fromStdString(changed->pads[0].sounds[0].disk->file)).fileName();
+        for (const char* name : {"sound-123-456.f32", "kit-1-2.f32", "sound-9.f32.part3", "sound-777-888.f32"}) {
+            QFile f(cache.filePath(name));
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write("12345678") == 8);
+            f.close();
+            if (std::strcmp(name, "sound-777-888.f32") != 0)
+                std::filesystem::last_write_time(std::filesystem::path(f.fileName().toStdString()),
+                                                 std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 8));
+        }
+        const sampler::KitPtr again = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QCOMPARE(again->pads[0].sounds[0].disk.get(), changed->pads[0].sounds[0].disk.get());  // (the one file, shared)
+        QCOMPARE(cached().size(), 3);  // (the earlier version still played from, the new one, and the other sound's)
+        QVERIFY(cached().contains(first) && cached().contains(second) && cached().contains("sound-777-888.f32"));
+        disk.reset();
+        const sampler::KitPtr last = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QCOMPARE(cached().size(), 2);
+        QVERIFY(!cached().contains(first) && cached().contains(second) && cached().contains("sound-777-888.f32"));
     }
 
     void mcpMidiMap() {
@@ -23408,6 +23477,270 @@ if ui["pressed"] == "add":
         }
     }
 
+    // Nightly 15 Nov: padding at a low constant rate. Pictures encoded here whose sizes leave the buffer one to five
+    // bytes over where it should stand (less than a filler unit's own six) each get a whole unit: the buffer is never
+    // past full at any removal, and every picture has arrived by its own. With none added it stood up to five bytes
+    // over, which at 400 kb/s is more than the two ticks kept free.
+    void hrdPaddingAtLowRates() {
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+        // (a plain colour: every picture, keyframes too, far under a frame's share of the rate)
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "color", 120));
+        ExportSettings st;
+        st.videoCodec = "libx264";
+        st.audioCodec = "none";
+        st.preset = "veryfast";
+        st.gop = 25;
+        st.hrd = "cbr";
+        st.videoBitrate = 400000;
+        st.path = path("low-rate-src.mp4");
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        // Its access units without their filler data and SEI (the splicer writes its own), and its parameter sets.
+        using Unit = std::vector<uint8_t>;
+        std::vector<std::vector<Unit>> pictures;
+        std::vector<Unit> sets;
+        int lengthSize = 0;
+        {
+            AVFormatContext* in = nullptr;
+            QVERIFY(avformat_open_input(&in, st.path.c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(in, nullptr);
+            const AVCodecParameters* par = in->streams[0]->codecpar;
+            sets = hrd::parameterSets(AV_CODEC_ID_H264, par->extradata, size_t(par->extradata_size), lengthSize);
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(in, pkt) >= 0) {
+                std::vector<Unit> units;
+                for (int at = 0; at + 4 <= pkt->size;) {
+                    const int n = int(qFromBigEndian<quint32>(pkt->data + at));
+                    at += 4;
+                    if (n <= 0 || at + n > pkt->size) break;
+                    const int type = pkt->data[at] & 0x1f;
+                    if (type != 12 && type != 6) units.emplace_back(pkt->data + at, pkt->data + at + n);
+                    at += n;
+                }
+                pictures.push_back(std::move(units));
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&in);
+        }
+        QCOMPARE(lengthSize, 4);
+        QCOMPARE(pictures.size(), size_t(120));
+        auto joined = [](const std::vector<Unit>& units) {
+            Unit au;
+            for (const Unit& u : units) {
+                const uint32_t n = uint32_t(u.size());
+                au.insert(au.end(), {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)});
+                au.insert(au.end(), u.begin(), u.end());
+            }
+            return au;
+        };
+        // (what the splicer adds to each of its own: its SEI, the same wherever the picture's size is changed)
+        std::vector<int64_t> added;
+        {
+            HrdSplicer plain;
+            QVERIFY(plain.start(AV_CODEC_ID_H264, sets, lengthSize, 25, 2));
+            QVERIFY(plain.cbr() && plain.bitRate() == 400000.0);
+            for (size_t i = 0; i <= pictures.size(); ++i) {
+                const Unit out = i < pictures.size() ? plain.push(joined(pictures[i]), int64_t(i), true, false, nullptr) : plain.finish(nullptr);
+                if (i > 0) added.push_back(int64_t(out.size()) - int64_t(joined(pictures[i - 1]).size()));
+            }
+        }
+        // The first twenty go in as they are (small: the splicer fills the buffer and pads them whole). Each one after
+        // is made up with filler data of its encoder's to a frame's bytes less a few: 30 (a pad the splicer makes
+        // whole), then 1 to 9 in turn (under a unit's own six, and just over).
+        HrdSplicer splicer;
+        QVERIFY(splicer.start(AV_CODEC_ID_H264, sets, lengthSize, 25, 2));
+        const double rate = splicer.bitRate(), size = splicer.bufferBits();
+        const int64_t frameBytes = int64_t(rate / 25 / 8);
+        std::vector<Unit> made;
+        int shaped = 0;
+        for (size_t i = 0; i <= pictures.size(); ++i) {
+            Unit out;
+            if (i < pictures.size()) {
+                std::vector<Unit> units = pictures[i];
+                const int64_t now = int64_t(joined(units).size()) + added[i];
+                const int64_t under = i % 2 == 0 ? 30 : 1 + int64_t(i / 2) % 9;
+                const int64_t fill = frameBytes - under - now - 4 - 2;  // (a filler unit: its length, its header and its end)
+                if (i >= 20 && fill >= 1) {
+                    Unit f{12};
+                    f.insert(f.end(), size_t(fill), 0xff);
+                    f.push_back(0x80);
+                    units.push_back(std::move(f));
+                    ++shaped;
+                }
+                out = splicer.push(joined(units), int64_t(i), true, true, nullptr);
+            } else {
+                out = splicer.finish(nullptr);
+            }
+            if (i > 0) made.push_back(std::move(out));
+        }
+        QCOMPARE(made.size(), pictures.size());
+        QVERIFY2(shaped >= 90, qPrintable(QString::number(shaped)));
+        // The buffer run as the splicer keeps it: bits in at the rate from the start, the first picture taken after
+        // nine tenths of the buffer's time, one each frame after; four bytes of start code for each unit.
+        const double first = 0.9 * size / rate;
+        double taken = 0, highest = 0, latest = 0;
+        int smallest = 0;
+        for (size_t i = 0; i < made.size(); ++i) {
+            const double removal = first + double(i) / 25;
+            highest = std::max(highest, rate * removal - taken - size);
+            double bits = 0;
+            for (int at = 0; at + 4 <= int(made[i].size());) {
+                const int n = int(qFromBigEndian<quint32>(made[i].data() + at));
+                if ((made[i][size_t(at) + 4] & 0x1f) == 12 && n == 2) ++smallest;
+                bits += double(n + 4) * 8;
+                at += 4 + n;
+            }
+            taken += bits;
+            latest = std::max(latest, taken - rate * removal);
+        }
+        qInfo("padding at %.0f bits/s: fullest %.1f bits from full, latest %.1f bits from late, %d units of filler with nothing in them", rate, highest,
+              latest, smallest);
+        QVERIFY2(highest <= 1e-6, qPrintable(QString::number(highest)));
+        QVERIFY2(latest <= 1e-6, qPrintable(QString::number(latest)));
+        QVERIFY(smallest >= 5);
+    }
+
+    // Nightly 15 Nov: a joined stream's pictures wait no longer between decoding and showing than their reordering
+    // needs. Segments coded without B-pictures are shown as they are decoded (they waited two frames); segments and a
+    // smart render's joins whose B-pictures reorder by two wait two (the smart render's waited three). Read from each
+    // picture's timing SEI: the least any picture waits is nothing.
+    void joinsWaitNoLongerThanTheirReordering() {
+        struct Waits {
+            int64_t pictures = 0, least = -1, most = -1;
+            int early = 0;  // packets to be shown before they are decoded
+        };
+        auto waits = [](const std::string& file) {
+            Waits w;
+            AVFormatContext* in = nullptr;
+            if (avformat_open_input(&in, file.c_str(), nullptr, nullptr) < 0) return w;
+            avformat_find_stream_info(in, nullptr);
+            const AVCodecParameters* par = in->streams[0]->codecpar;
+            int lengthSize = 0;
+            std::map<int, hrd::Sps> sps;
+            std::map<int, hrd::Pps> pps;
+            hrd::AccessUnit u;
+            // (the parameter sets its decoder configuration holds, read as an access unit of them)
+            std::vector<uint8_t> sets;
+            for (const std::vector<uint8_t>& s : hrd::parameterSets(par->codec_id, par->extradata, size_t(std::max(0, par->extradata_size)), lengthSize)) {
+                const uint32_t n = uint32_t(s.size());
+                sets.insert(sets.end(), {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)});
+                sets.insert(sets.end(), s.begin(), s.end());
+            }
+            if (!sets.empty()) hrd::readAccessUnit(par->codec_id, sets.data(), sets.size(), 4, sps, pps, u);
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(in, pkt) >= 0) {
+                hrd::AccessUnit au;
+                if (pkt->stream_index == 0 && pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE && pkt->pts < pkt->dts) ++w.early;
+                if (pkt->stream_index == 0 && hrd::readAccessUnit(par->codec_id, pkt->data, size_t(pkt->size), lengthSize, sps, pps, au) && au.pt.present) {
+                    ++w.pictures;
+                    w.least = w.least < 0 ? au.pt.dpbOutputDelay : std::min(w.least, au.pt.dpbOutputDelay);
+                    w.most = std::max(w.most, au.pt.dpbOutputDelay);
+                }
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&in);
+            return w;
+        };
+        auto footage = [](Project& gen, int frames) {
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+            Clip grad = makeGeneratorClip(gen, "gradient", frames);
+            grad.generator.params["angle"].addKey(0, 0.0);
+            grad.generator.params["angle"].addKey(frames - 1, 140.0);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, grad);
+            edit::addTrack(gen, gs, TrackKind::Video);
+            Clip ball = makeGeneratorClip(gen, "shape", frames);
+            ball.generator.params["shape"] = 1.0;
+            ball.generator.params["width"] = 40.0;
+            ball.generator.params["height"] = 40.0;
+            ball.generator.params["pos_x"].addKey(0, -140.0);
+            ball.generator.params["pos_x"].addKey(frames - 1, 140.0);
+            edit::overwrite(gen, gs, {TrackKind::Video, 1}, ball);
+        };
+        std::string err;
+        // ---- Two segments joined: without B-pictures every picture is shown as it is decoded; with x264's own
+        // (reordered by two) some wait nothing and none more than a few frames.
+        for (const char* preset : {"ultrafast", "veryfast"}) {
+            Project p = makeDefaultProject();
+            footage(p, 48);
+            Sequence& seq = *p.active();
+            ExportSettings base;
+            base.videoCodec = "libx264";
+            base.audioCodec = "none";
+            base.preset = preset;
+            base.gop = 12;
+            base.hrd = "cbr";
+            base.videoBitrate = 600000;
+            base.path = path((std::string("waits-") + preset + ".mp4").c_str());
+            QVERIFY2(exportSplits(base, &err), err.c_str());
+            const std::vector<ExportSegment> halves{{0, 24}, {24, 48}};
+            ExportSettings whole = base;
+            whole.in = 0, whole.out = 48;
+            std::vector<std::string> files;
+            for (int k = 0; k < 2; ++k) {
+                const std::string file = path((std::string("waits-") + preset + "-" + std::to_string(k) + ".mp4").c_str());
+                const ExportSettings x = segmentExportSettings(base, halves[size_t(k)], file, seq.fps);
+                QVERIFY2(exportSequence(p, seq, x, {}, nullptr, &err), err.c_str());
+                files.push_back(file);
+            }
+            HrdReport report;
+            QVERIFY2(joinExportSegments(p, seq, whole, 0, files, halves, {}, nullptr, &err, &report), err.c_str());
+            QVERIFY2(report.checked && report.signalled, report.summary().c_str());
+            const Waits w = waits(whole.path);
+            qInfo("%s segments joined: %lld pictures wait %lld to %lld ticks", preset, static_cast<long long>(w.pictures), static_cast<long long>(w.least),
+                  static_cast<long long>(w.most));
+            QCOMPARE(w.pictures, int64_t(48));
+            QCOMPARE(w.least, int64_t(0));
+            if (std::string(preset) == "ultrafast") QCOMPARE(w.most, int64_t(0));
+            else QVERIFY(w.most > 0);
+            QCOMPARE(w.early, 0);
+        }
+        // ---- A smart render of footage whose B-pictures reorder by two: its joins' do too, and the whole waits two
+        // frames, not three.
+        for (const char* codec : {"libx264", "libx265"}) {
+            Project gen = makeDefaultProject();
+            footage(gen, 100);
+            ExportSettings st;
+            st.videoCodec = codec;
+            st.audioCodec = "none";
+            st.preset = std::string(codec) == "libx264" ? "veryfast" : "ultrafast";
+            st.gop = 12;
+            st.hrd = "cbr";
+            st.videoBitrate = 700000;
+            st.path = path((std::string("waits-src-") + codec + ".mp4").c_str());
+            QVERIFY2(exportSequence(gen, *gen.active(), st, nullptr, nullptr, &err), err.c_str());
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+            MediaItem m = probeOrFail(p, st.path);
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 5, 45, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(edit::placeMedia(p, s, m.id, 40, 58, 98, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 60).ok);
+            QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 66).ok);
+            for (Clip& c : s.videoTracks[0].clips)
+                if (c.start == 60) c.effects.push_back(makeEffect(p, "invert"));
+            ExportSettings ex = st;
+            ex.path = path((std::string("waits-smart-") + codec + ".mp4").c_str());
+            ex.smartRenderInBandHevc = true;
+            int copied = -1;
+            HrdReport r;
+            QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied, nullptr, nullptr, &r), err.c_str());
+            QVERIFY2(copied > 0, codec);
+            QVERIFY2(r.checked && r.conforms(), (std::string(codec) + ": " + r.summary()).c_str());
+            const Waits w = waits(ex.path);
+            qInfo("%s smart render: %lld pictures wait %lld to %lld ticks", codec, static_cast<long long>(w.pictures), static_cast<long long>(w.least),
+                  static_cast<long long>(w.most));
+            QCOMPARE(w.pictures, int64_t(80));
+            QCOMPARE(w.least, int64_t(0));
+            QCOMPARE(w.early, 0);
+        }
+    }
+
     void longGopBufferModel() {
         // Video packets in decode order: their bytes and the frame each shows.
         struct Coded {
@@ -24719,6 +25052,48 @@ private slots:
         QCOMPARE(interpretationOf(again.media[0]).chroma, std::string());
         const std::vector<double> taken = blueOf(again);
         for (size_t x = 0; x < 256; ++x) QCOMPARE(taken[x], now[x]);
+
+        // A project saved in the days between untagged 4:2:2 being read co-sited and projects saying so showed it
+        // co-sited. The fixture is one as a build of 9 November wrote it: neither mark, and a track with a colour, which
+        // no build that read the footage centred wrote. Opened, its footage is left as the file's own and its frames
+        // come out as a new project's do.
+        const QString fixturePath = QString(MONTAGE_TEST_DATA_DIR) + "/projects/coloured-track-9-nov.montage";
+        {
+            QFile fixture(fixturePath);
+            QVERIFY(fixture.open(QIODevice::ReadOnly));
+            QJsonObject between = QJsonDocument::fromJson(fixture.readAll()).object();
+            QVERIFY(!between.contains("chromaSiting") && !between.contains("cameraLens"));
+            // (its footage is the file made above)
+            QJsonArray media = between.value("media").toArray();
+            QCOMPARE(media.size(), 1);
+            QJsonObject item = media.at(0).toObject();
+            item["path"] = QString::fromStdString(footage);
+            media[0] = item;
+            between["media"] = media;
+            Project opened;
+            QVERIFY2(projectFromJson(QJsonDocument(between).toJson().toStdString(), opened, &err), err.c_str());
+            QVERIFY(opened.chromaChecked);
+            QCOMPARE(opened.active()->videoTracks[0].color, std::string("#3a7bd5"));
+            checkStereoMedia(opened);
+            QCOMPARE(opened.media[0].path, footage);
+            const std::vector<double> asBetween = blueOf(opened);
+            QCOMPARE(asBetween.size(), size_t(256));
+            for (size_t x = 0; x < 256; ++x) QCOMPARE(asBetween[x], now[x]);
+            // The same project without the track's colour is one an earlier build could have written: centred.
+            QJsonArray sequences = between.value("sequences").toArray();
+            QJsonObject sequence = sequences.at(0).toObject();
+            QJsonArray tracks = sequence.value("video").toArray();
+            QJsonObject track = tracks.at(0).toObject();
+            QVERIFY(track.contains("color"));
+            track.remove("color");
+            tracks[0] = track;
+            sequence["video"] = tracks;
+            sequences[0] = sequence;
+            between["sequences"] = sequences;
+            Project earlier;
+            QVERIFY2(projectFromJson(QJsonDocument(between).toJson().toStdString(), earlier, &err), err.c_str());
+            QVERIFY(!earlier.chromaChecked);
+        }
     }
 
     void smartRenderingLimits() {
@@ -39739,27 +40114,49 @@ private slots:
                     QVERIFY(std::fabs(across - cornerToCorner) <= 1);
                 }
             }
-            // Its own depth of field on a card seen through the camera is read into the camera when opened.
-            Project q = p;
-            Sequence& qs = *q.active();
-            qs.videoTracks[1].clips[0].generator.params["dof"] = 0.0;
-            Effect& own = qs.videoTracks[0].clips[0].effects[0];
-            own.params["depth_of_field"] = 1.0, own.params["fstop"] = 4.0, own.params["focus_distance"] = 900.0;
-            // (saved before the camera's lens took it: without the project's mark)
-            QJsonObject saved = QJsonDocument::fromJson(QByteArray::fromStdString(projectToJson(q))).object();
-            saved.remove("cameraLens");
-            Project back;
+        }
+
+        // ---- A project saved before the Camera clip had a lens keeps each card's own depth of field. The fixture is
+        // one as a build before 10 November wrote it: two cards seen through the scene's camera, twice as far as the
+        // first's focus, the first with its own depth of field and its f-stop keyframed from 1.4 to 22. Opened, the
+        // first card's depth of field is still its own with its keyframes, the camera's lens stays off, the second
+        // card is as sharp as it was, and the first is blurred less as its lens closes.
+        {
+            const QString fixturePath = QString(MONTAGE_TEST_DATA_DIR) + "/projects/card-lens-before-10-nov.montage";
+            Project opened;
             std::string err;
-            QVERIFY2(projectFromJson(QJsonDocument(saved).toJson().toStdString(), back, &err), err.c_str());
-            const Effect& bg = back.active()->videoTracks[1].clips[0].generator;
-            const Effect& be = back.active()->videoTracks[0].clips[0].effects[0];
-            QVERIFY(bg.p("dof", 0, 0) == 1.0 && bg.p("fstop", 0, 0) == 4.0 && bg.p("focus_distance", 0, 0) == 900.0 && bg.p("units_m", 0, 0) == 1000.0);
-            QVERIFY(be.p("depth_of_field", 0, 1) == 0.0);
-            // Saved since, a card's own is kept as it is.
-            Project kept;
-            QVERIFY2(projectFromJson(projectToJson(q), kept, &err), err.c_str());
-            QVERIFY(kept.active()->videoTracks[1].clips[0].generator.p("dof", 0, 1) == 0.0);
-            QVERIFY(kept.active()->videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
+            QVERIFY2(loadProject(fixturePath.toStdString(), opened, &err), err.c_str());
+            Sequence& os = *opened.active();
+            QVERIFY(os.videoTracks.size() >= 3);
+            const Effect& lens = os.videoTracks[0].clips[0].effects[0];
+            QVERIFY(lens.p("depth_of_field", 0, 0) == 1.0);
+            QCOMPARE(lens.params.at("fstop").keys.size(), size_t(2));
+            QVERIFY(lens.p("fstop", 0, 0) == 1.4 && lens.p("fstop", 9, 0) == 22.0);
+            QVERIFY(os.videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+            QVERIFY(os.videoTracks[2].clips[0].effects[0].p("depth_of_field", 0, 0) <= 0.5);
+            // (the same with no lens anywhere, to tell blur by: the left half is the first card's, and from five
+            // eighths across is the second's, clear of the first's widest blur)
+            Project sharp = opened;
+            sharp.active()->videoTracks[0].clips[0].effects[0].params["depth_of_field"] = 0.0;
+            RenderOptions ro = o;
+            auto blur = [&](FrameTime t, bool right) {
+                const Image a = renderSequenceFrame(opened, os, t, ro), b = renderSequenceFrame(sharp, *sharp.active(), t, ro);
+                double sum = 0;
+                for (int y = 0; y < a.height; ++y)
+                    for (int x = right ? a.width * 5 / 8 : 0; x < (right ? a.width : a.width / 2); ++x) sum += std::fabs(double(a.at(x, y)[3]) - b.at(x, y)[3]);
+                return sum;
+            };
+            const double firstOpen = blur(0, false), firstClosed = blur(9, false);
+            qInfo("a card's own lens kept: blur %.2f at f/1.4, %.2f at f/22", firstOpen, firstClosed);
+            QVERIFY(firstOpen > 20);
+            QVERIFY(firstClosed < firstOpen / 4);
+            QCOMPARE(blur(0, true), 0.0);
+            QCOMPARE(blur(9, true), 0.0);
+            // Saved now and opened again, it is the same.
+            Project again;
+            QVERIFY2(projectFromJson(projectToJson(opened), again, &err), err.c_str());
+            QVERIFY(again.active()->videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+            QVERIFY(again.active()->videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
         }
 
         // ---- A moving card in a solved scene's USD and USDZ exports: its picture byte for byte and its transform at
@@ -39810,6 +40207,53 @@ private slots:
                 return std::array<double, 16>{pl.axisU[0], pl.axisU[1], pl.axisU[2], 0, pl.axisV[0], pl.axisV[1], pl.axisV[2], 0,
                                               pl.normal[0], pl.normal[1], pl.normal[2], 0, pl.origin[0], pl.origin[1], pl.origin[2], 1};
             };
+            // A card whose Width is keyed (nightly 15 Nov): each frame's matrix puts the plane's corners where the
+            // card's are then, twice as far apart at the end as at the start.
+            {
+                Sequence grown = s;
+                Effect& ge = grown.videoTracks[1].clips[0].effects[0];
+                ge.params["width"] = Param();
+                ge.params["width"].keys = {{0, 1.5}, {9, 3.0}};
+                const std::vector<SolvedSceneMesh> g = solvedSceneModels(p, grown, 0, grown.videoTracks[0].clips[0]);
+                QVERIFY(g.size() == 1 && g[0].motion.size() == 10 && g[0].positions.size() >= 12);
+                for (int i = 0; i < 10; ++i) {
+                    const Layer3DPlace pl = layer3dPlace(ge, i, W, H);
+                    const std::array<double, 16>& m = g[0].motion[size_t(i)].second;
+                    double across = 0, up = 0, off = 0;
+                    for (size_t v = 0; v + 2 < g[0].positions.size(); v += 3) {
+                        double q[3];
+                        for (int a = 0; a < 3; ++a)
+                            q[a] = g[0].positions[v] * m[size_t(a)] + g[0].positions[v + 1] * m[size_t(4 + a)] + g[0].positions[v + 2] * m[size_t(8 + a)] +
+                                   m[size_t(12 + a)] - pl.origin[size_t(a)];
+                        across = std::max(across, std::fabs(q[0] * pl.axisU[0] + q[1] * pl.axisU[1] + q[2] * pl.axisU[2]));
+                        up = std::max(up, std::fabs(q[0] * pl.axisV[0] + q[1] * pl.axisV[1] + q[2] * pl.axisV[2]));
+                        off = std::max(off, std::fabs(q[0] * pl.normal[0] + q[1] * pl.normal[1] + q[2] * pl.normal[2]));
+                    }
+                    QVERIFY2(std::fabs(across - W * pl.unit / 2) < 1e-5 && std::fabs(up - H * pl.unit / 2) < 1e-5 && off < 1e-5,
+                             qPrintable(QString("frame %1: %2 across, %3 up, %4 off its plane").arg(i).arg(across * 2).arg(up * 2).arg(off)));
+                }
+            }
+            // A card in an HDR sequence (nightly 15 Nov): its picture is brought to SDR, so it reads as the one a
+            // Rec.709 sequence makes, where the sequence's own code values would be far darker.
+            {
+                Sequence hdr = s;
+                hdr.colorSpace = "rec2100pq";
+                const std::vector<SolvedSceneMesh> h = solvedSceneModels(p, hdr, 0, hdr.videoTracks[0].clips[0]);
+                QVERIFY(h.size() == 1 && !h[0].picture.empty());
+                QImage sdr;
+                QVERIFY(sdr.loadFromData(QByteArray::fromStdString(h[0].picture), "PNG"));
+                sdr = sdr.convertToFormat(QImage::Format_RGBA8888);
+                QVERIFY(sdr.size() == png.size());
+                int worst = 0, brightest = 0;
+                for (int y = H / 4; y < H * 3 / 4; y += 3)
+                    for (int x = W / 4; x < W * 3 / 4; x += 3) {
+                        const QColor a = png.pixelColor(x, y), b = sdr.pixelColor(x, y);
+                        if (a.alpha() != 255) continue;
+                        worst = std::max({worst, std::abs(a.red() - b.red()), std::abs(a.green() - b.green()), std::abs(a.blue() - b.blue())});
+                        brightest = std::max({brightest, a.red(), a.green(), a.blue()});
+                    }
+                QVERIFY2(brightest > 100 && worst <= 10, qPrintable(QString("%1 off, brightest %2").arg(worst).arg(brightest)));
+            }
             const QByteArray tinyusdz = qgetenv("MONTAGE_TEST_TINYUSDZ");
             if (tinyusdz.isEmpty()) qInfo("MONTAGE_TEST_TINYUSDZ is not set: tinyusdz's read-back is left out");
             for (const char* name : {"moving.usda", "moving.usdz"}) {
@@ -40390,6 +40834,56 @@ private slots:
             QVERIFY2(importSvgShapes(path("big.svg"), e, w, h, &notes, &err), err.c_str());
             QVERIFY2(took.elapsed() < 10000, qPrintable(QString::number(took.elapsed())));
             QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("2000 rules") != std::string::npos; }));
+            // One rule whose selector list is 30,000 selectors long, over 3,000 declarations (nightly 15 Nov): as
+            // many rules as its selectors, so it is read to the 2,000 too, its declarations held once (each selector
+            // had a copy of them: gigabytes from under 100 KB).
+            std::string list = "<style>rect";
+            for (int i = 0; i < 30000; ++i) list += ",a";
+            list += "{";
+            for (int i = 0; i < 3000; ++i) list += "p" + std::to_string(i) + ":1;";
+            list += "fill:#00ff00}</style><rect x=\"0\" y=\"0\" width=\"10\" height=\"10\"/>";
+            {
+                std::ofstream f(path("list.svg"));
+                f << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">" << list << "</svg>";
+            }
+            QVERIFY(QFileInfo(QString::fromStdString(path("list.svg"))).size() < 100000);
+            notes.clear();
+            took.restart();
+            Effect listed = makeEffect(p, "shape");
+            QVERIFY2(importSvgShapes(path("list.svg"), listed, w, h, &notes, &err), err.c_str());
+            QVERIFY2(took.elapsed() < 5000, qPrintable(QString::number(took.elapsed())));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("2000 rules") != std::string::npos; }));
+            // Rules of long compounds that every element and its ancestors match, on thousands of elements copied by
+            // <use> (hours of comparing names): the sheets are tried until that has taken long enough, the elements
+            // after go without them, and the import says so.
+            std::string every;
+            for (int i = 0; i < 30; ++i) every += ".n" + std::to_string(i);
+            std::string names;
+            for (int i = 0; i < 30; ++i) names += (i ? " n" : "n") + std::to_string(i);
+            std::string deep = "<style>";
+            for (int i = 0; i < 1500; ++i) {
+                for (int k = 0; k < 12; ++k) deep += every + " ";
+                deep += "rect" + every + " { fill: #0000ff }\n";
+            }
+            deep += "</style><defs><g id=\"ten\">";
+            for (int i = 0; i < 10; ++i) deep += "<rect class=\"" + names + "\" x=\"" + std::to_string(i) + "\" y=\"0\" width=\"1\" height=\"1\"/>";
+            deep += "</g><g id=\"hundred\">";
+            for (int i = 0; i < 10; ++i) deep += "<use href=\"#ten\" y=\"" + std::to_string(i) + "\"/>";
+            deep += "</g></defs>";
+            for (int k = 0; k < 12; ++k) deep += "<g class=\"" + names + "\">";
+            for (int i = 0; i < 20; ++i) deep += "<use href=\"#hundred\"/>";
+            for (int k = 0; k < 12; ++k) deep += "</g>";
+            {
+                std::ofstream f(path("deep.svg"));
+                f << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">" << deep << "</svg>";
+            }
+            notes.clear();
+            took.restart();
+            Effect matched = makeEffect(p, "shape");
+            QVERIFY2(importSvgShapes(path("deep.svg"), matched, w, h, &notes, &err), err.c_str());
+            qInfo("a sheet of long compounds on copied elements: %lld ms", static_cast<long long>(took.elapsed()));
+            QVERIFY2(took.elapsed() < 60000, qPrintable(QString::number(took.elapsed())));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("too many rules to try") != std::string::npos; }));
         }
         // Text: read out (where it is, its font, size and colour) to be made titles, which a layer imported into a
         // sequence gets on the track above it, drawn where the SVG has it.

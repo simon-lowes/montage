@@ -12,6 +12,7 @@
 #include <QJsonArray>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLocale>
 #include <QNetworkInterface>
 #include <QPainter>
 #include <QPushButton>
@@ -96,6 +97,8 @@ output::StreamSettings RemoteReviewController::loadSettings() {
     c.turnServer = s.value("review/turnServer").toString().toStdString();
     c.turnUser = s.value("review/turnUser").toString().toStdString();
     c.turnPassword = s.value("review/turnPassword").toString().toStdString();
+    c.turnSecret = s.value("review/turnSecret").toString().toStdString();
+    c.turnExpirySeconds = std::clamp(s.value("review/turnExpiry", c.turnExpirySeconds).toInt(), 30, 30 * 86400);
     c.relayOnly = s.value("review/relayOnly", false).toBool() && !c.turnServer.empty();
     c.rungs = std::clamp(s.value("review/rungs", c.rungs).toInt(), 1, 3);
     c.hdr = s.value("review/hdr", true).toBool();
@@ -131,6 +134,8 @@ void RemoteReviewController::saveSettings(const output::StreamSettings& c, const
     s.setValue("review/turnServer", qs(c.turnServer));
     s.setValue("review/turnUser", qs(c.turnUser));
     s.setValue("review/turnPassword", qs(c.turnPassword));
+    s.setValue("review/turnSecret", qs(c.turnSecret));
+    s.setValue("review/turnExpiry", c.turnExpirySeconds);
     s.setValue("review/relayOnly", c.relayOnly);
     s.setValue("review/rungs", c.rungs);
     s.setValue("review/hdr", c.hdr);
@@ -344,6 +349,11 @@ QString RemoteReviewController::status() const {
         if (st.hdrViewers > 0) text += tr(", %n in HDR", "", st.hdrViewers);
         if (st.skipped > 0) text += tr(", %n frame(s) skipped (encoding fell behind)", "", int(std::min<int64_t>(st.skipped, 1 << 30)));
         if (!st.error.empty()) text += QStringLiteral(" (%1)").arg(qs(st.error));
+        // (a link made with a relay's secret lets nobody new in after its time)
+        if (st.linkExpires > 0)
+            text += st.linkExpires > QDateTime::currentSecsSinceEpoch()
+                        ? tr("; the link works until %1").arg(QLocale().toString(QDateTime::fromSecsSinceEpoch(st.linkExpires), QLocale::ShortFormat))
+                        : tr("; the link's time is up: stop and start for a new one");
         return text + tr("; %n note(s) received", "", st.markers);
     }
     const QString picture = tr("%1 %2 × %3 (%4)").arg(codecText(st.encoder)).arg(m.width).arg(m.height).arg(qs(st.encoder));
@@ -375,7 +385,7 @@ QByteArray RemoteReviewController::toolJson() {
 "key":{"type":"string","description":"Browsers: the certificate's private key (PEM, without a password)"},
 "max_viewers":{"type":"number","description":"Browsers: viewers at once (1 to 64)"},
 "simulcast":{"type":["boolean","integer"],"description":"Browsers: the picture at several sizes at once, each viewer moved between them by their own connection: true (full, half and quarter size, the default), false (full size only), or the number of sizes, 1 to 3"},
-"turn":{"type":"object","description":"Browsers: a TURN relay the user runs (RFC 8656), given to viewers' pages with the passphrase; url \"\" for none","properties":{"url":{"type":"string","description":"turn:host:3478, or turns:host:5349 over TLS"},"username":{"type":"string"},"password":{"type":"string"},"relay_only":{"type":"boolean","description":"Every viewer's media through the relay, never directly"}}},
+"turn":{"type":"object","description":"Browsers: a TURN relay the user runs (RFC 8656), given to viewers' pages with the passphrase; url \"\" for none","properties":{"url":{"type":"string","description":"turn:host:3478, or turns:host:5349 over TLS"},"username":{"type":"string"},"password":{"type":"string"},"secret":{"type":"string","description":"In place of username and password: the secret the relay shares with Montage (a relay set to make logins from a shared secret). Each review then has a login of its own that runs out; \"\" for none"},"expiry":{"type":"integer","description":"With secret: how long the review link and its login last from the start, in seconds (30 to 2592000; 86400 unless given)"},"relay_only":{"type":"boolean","description":"Every viewer's media through the relay, never directly: Montage then sends to no address but the relay's"}}},
 "hdr":{"type":"boolean","description":"Browsers: an HDR sequence (PQ or HLG) as 10-bit HDR to browsers that decode it, tone mapped to Rec. 709 for the rest (default true); false: SDR for everyone"},
 "hardware":{"type":"boolean","description":"Encode on NVENC where there is one"},
 "bitrate_kbps":{"type":"number","description":"250 to 200000"},
@@ -430,15 +440,30 @@ QString RemoteReviewController::runTool(const QJsonObject& args, QJsonObject& st
             const QJsonObject t = args.value("turn").toObject();
             if (t.contains("url")) {
                 const std::string url = t.value("url").toString().trimmed().toStdString();
-                if (url != c.turnServer) c.turnUser.clear(), c.turnPassword.clear();  // (one relay's login never goes to another)
+                if (url != c.turnServer) c.turnUser.clear(), c.turnPassword.clear(), c.turnSecret.clear();  // (one relay's login never goes to another)
                 c.turnServer = url;
             }
             if (t.contains("username")) c.turnUser = t.value("username").toString().toStdString();
             if (t.contains("password")) c.turnPassword = t.value("password").toString().toStdString();
+            // (a secret given takes the place of a login kept from before, and a login given that of a secret)
+            if (t.contains("secret")) {
+                c.turnSecret = t.value("secret").toString().toStdString();
+                if (!c.turnSecret.empty() && !t.contains("username") && !t.contains("password")) c.turnUser.clear(), c.turnPassword.clear();
+            } else if (t.contains("username") || t.contains("password")) {
+                c.turnSecret.clear();
+            }
+            if (t.contains("expiry")) {
+                if (c.turnSecret.empty()) {
+                    isError = true;
+                    return tr("expiry goes with a TURN relay's secret");
+                }
+                c.turnExpirySeconds = t.value("expiry").toInt(-1);  // (one out of range is refused below)
+            }
             if (t.contains("relay_only")) c.relayOnly = t.value("relay_only").toBool();
             if (c.turnServer.empty()) {
                 c.turnUser.clear();
                 c.turnPassword.clear();
+                c.turnSecret.clear();
                 if (!t.contains("relay_only")) c.relayOnly = false;
             }
         }
@@ -482,7 +507,15 @@ QString RemoteReviewController::runTool(const QJsonObject& args, QJsonObject& st
             structured["sizes"] = sizes;
             structured["hdr"] = settings_.hdr;
             structured["hdr_viewers"] = st.hdrViewers;
-            if (!settings_.turnServer.empty()) structured["turn"] = QJsonObject{{"url", qs(settings_.turnServer)}, {"relay_only", settings_.relayOnly}};
+            if (!settings_.turnServer.empty()) {
+                // (never the relay's password or secret; with a secret, when the link and its login run out)
+                QJsonObject turn{{"url", qs(settings_.turnServer)}, {"relay_only", settings_.relayOnly}};
+                if (st.linkExpires > 0) {
+                    turn["expires"] = QDateTime::fromSecsSinceEpoch(st.linkExpires, Qt::UTC).toString(Qt::ISODate);
+                    turn["expires_in"] = double(std::max<qint64>(0, st.linkExpires - QDateTime::currentSecsSinceEpoch()));
+                }
+                structured["turn"] = turn;
+            }
         }
     }
     return status();
@@ -638,6 +671,30 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     loginRow->addWidget(turnUser_, 1);
     loginRow->addWidget(turnPassword_, 1);
     form->addRow(tr("Relay login:"), turnLogin);
+    auto* turnSecret = new QWidget(this);
+    turnSecret->setObjectName(QStringLiteral("reviewStreamTurnSecretRow"));
+    auto* secretRow = new QHBoxLayout(turnSecret);
+    secretRow->setContentsMargins(0, 0, 0, 0);
+    turnSecret_ = new QLineEdit(qs(st.turnSecret), this);
+    turnSecret_->setObjectName(QStringLiteral("reviewStreamTurnSecret"));
+    turnSecret_->setPlaceholderText(tr("In place of a login"));
+    turnSecret_->setEchoMode(QLineEdit::Password);
+    turnSecret_->setToolTip(tr("The secret your relay shares with Montage, for a relay set to make its logins from a shared secret. Each review then "
+                               "has a login of its own, which reviewers' pages are given instead of one that lasts, and the review link and that "
+                               "login stop letting anyone new in after the time chosen."));
+    turnExpiry_ = new QComboBox(this);
+    turnExpiry_->setObjectName(QStringLiteral("reviewStreamTurnExpiry"));
+    turnExpiry_->addItem(tr("Link works for 1 hour"), 3600);
+    turnExpiry_->addItem(tr("Link works for 8 hours"), 8 * 3600);
+    turnExpiry_->addItem(tr("Link works for 1 day"), 86400);
+    turnExpiry_->addItem(tr("Link works for 1 week"), 7 * 86400);
+    turnExpiry_->addItem(tr("Link works for 30 days"), 30 * 86400);
+    // (a time set elsewhere, by an agent, is kept as it is)
+    if (turnExpiry_->findData(st.turnExpirySeconds) < 0) turnExpiry_->addItem(tr("Link works for %n second(s)", "", st.turnExpirySeconds), st.turnExpirySeconds);
+    turnExpiry_->setCurrentIndex(turnExpiry_->findData(st.turnExpirySeconds));
+    secretRow->addWidget(turnSecret_, 1);
+    secretRow->addWidget(turnExpiry_, 1);
+    form->addRow(tr("Relay secret:"), turnSecret);
     relayOnly_ = new QCheckBox(tr("Everything through the relay (never directly)"), this);
     relayOnly_->setObjectName(QStringLiteral("reviewStreamRelayOnly"));
     relayOnly_->setChecked(st.relayOnly);
@@ -656,8 +713,12 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     hdr_->setToolTip(tr("An HDR sequence (PQ or HLG) goes as 10-bit HDR to browsers that say they decode it, and tone mapped to Rec. 709 "
                         "as the viewer shows it to the rest"));
     form->addRow(QString(), hdr_);
-    auto relayChanged = [this] { relayOnly_->setEnabled(!controller_->running() && !turn_->text().trimmed().isEmpty()); };
+    auto relayChanged = [this] {
+        relayOnly_->setEnabled(!controller_->running() && !turn_->text().trimmed().isEmpty());
+        turnExpiry_->setEnabled(!controller_->running() && !turnSecret_->text().isEmpty());
+    };
     connect(turn_, &QLineEdit::textChanged, this, relayChanged);
+    connect(turnSecret_, &QLineEdit::textChanged, this, relayChanged);
     relayChanged();
     connect(viewers_, &QComboBox::currentIndexChanged, this, [this] {
         // Each kind keeps its own address while the other is chosen.
@@ -737,6 +798,7 @@ void RemoteReviewPanel::viewersChanged() {
     form_->setRowVisible(findChild<QWidget*>(QStringLiteral("reviewStreamMarkersRow")), !web);
     for (QWidget* w : std::initializer_list<QWidget*>{certificate_, key_, ice_, maxViewers_, turn_, relayOnly_, rungs_, hdr_}) form_->setRowVisible(w, web);
     form_->setRowVisible(findChild<QWidget*>(QStringLiteral("reviewStreamTurnLogin")), web);
+    form_->setRowVisible(findChild<QWidget*>(QStringLiteral("reviewStreamTurnSecretRow")), web);
     if (web) colour_->setCurrentIndex(0);
     colour_->setEnabled(!web && !controller_->running());
 }
@@ -759,6 +821,8 @@ output::StreamSettings RemoteReviewPanel::chosenSettings() const {
     s.turnServer = turn_->text().trimmed().toStdString();
     s.turnUser = turnUser_->text().trimmed().toStdString();
     s.turnPassword = turnPassword_->text().toStdString();
+    s.turnSecret = turnSecret_->text().toStdString();
+    s.turnExpirySeconds = turnExpiry_->currentData().toInt();
     s.relayOnly = relayOnly_->isChecked() && !s.turnServer.empty();
     s.rungs = rungs_->currentData().toInt();
     s.hdr = hdr_->isChecked();
@@ -777,9 +841,10 @@ void RemoteReviewPanel::refresh() {
     const bool on = controller_->running();
     start_->setText(on ? tr("Stop") : tr("Start"));
     for (QWidget* w : std::initializer_list<QWidget*>{viewers_, address_, direction_, passphrase_, codec_, hardware_, size_, bitrate_, colour_, burn_, audio_,
-                                                      markers_, latency_, certificate_, key_, ice_, maxViewers_, turn_, turnUser_, turnPassword_, rungs_, hdr_})
+                                                      markers_, latency_, certificate_, key_, ice_, maxViewers_, turn_, turnUser_, turnPassword_, turnSecret_, rungs_, hdr_})
         w->setEnabled(!on);
     relayOnly_->setEnabled(!on && !turn_->text().trimmed().isEmpty());
+    turnExpiry_->setEnabled(!on && !turnSecret_->text().isEmpty());
     markersPort_->setEnabled(!on && markers_->isChecked());
     colour_->setEnabled(!on && !viewers_->currentData().toBool());
     status_->setText(controller_->status());

@@ -74,10 +74,15 @@ private:
         int paramMsb = 127, paramLsb = 127;  // 127/127: none chosen (the "null" parameter)
         bool rpn = false;
         int dataMsb = -1;
+        // Data entry's fine half when it is the first to come after the parameter was chosen (-1 otherwise), and
+        // whether it is held for the coarse half to follow (a parameter known to send the fine half first).
+        int dataLsb = -1;
+        bool lsbHeld = false;
         Channel();
     };
     Channel ch_[16];
     std::set<std::tuple<int, bool, int>> fine_;  // (channel, rpn, parameter) seen sending data entry's fine half
+    std::set<std::tuple<int, bool, int>> lsbFirst_;  // those seen sending it before the coarse half
     std::map<std::tuple<int, bool, int>, int> coarse_;  // each parameter's last coarse half (for fine-only updates)
 };
 

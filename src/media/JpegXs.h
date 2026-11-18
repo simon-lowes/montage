@@ -41,6 +41,9 @@ struct JxsHeader {
 };
 // False when `data` does not start with a JPEG XS codestream's header.
 bool readJxsHeader(const uint8_t* data, size_t size, JxsHeader& out);
+// Whether a codestream with this header is one decoded here: three components, each side at most 16,384 samples and
+// 64 million pixels in all (past 10K: a header asking for more is refused before anything is set aside for it).
+bool jxsPictureFits(const JxsHeader& h, std::string* why = nullptr);
 // ISO/IEC 21122-2's names: "Main 422.10", and the level and sublevel ("2k-1", "Sublev3bpp"); "" when not one of them.
 std::string jxsProfileName(uint16_t ppih);
 std::string jxsLevelName(uint16_t plev);

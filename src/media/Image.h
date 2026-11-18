@@ -107,6 +107,13 @@ struct YcbcrPlanes {
         std::shared_ptr<const YcbcrPlanes> planes;
     };
     std::shared_ptr<Copied> copied;
+    // What render/GpuCompositor made of the hardware frame for its own API (an import, or a copy on the GPU), made once
+    // and kept while the frame is, so a cached frame drawn again is not imported again (render/GpuHardware).
+    struct GpuKept {
+        std::mutex mutex;
+        std::shared_ptr<void> made;
+    };
+    std::shared_ptr<GpuKept> gpuKept;
     int chromaWidth() const { return (width + (1 << log2ChromaW) - 1) >> log2ChromaW; }
     int chromaHeight() const { return (height + (1 << log2ChromaH) - 1) >> log2ChromaH; }
     size_t bytes() const;

@@ -30,13 +30,28 @@ if command -v sha256sum > /dev/null; then got=$(sha256sum "$tmp/c2pa.crate" | cu
 tar -xzf "$tmp/c2pa.crate" -C "$tmp"
 src="$tmp/c2pa-c-ffi-$VERSION"
 
+# The crate's build script writes c2pa.h. Left to itself it works the folder out from where Cargo keeps its own
+# intermediate files, which Cargo 1.100 moved (the header then lands beside them, not beside the library), so it is
+# told where: C2PA_HEADER_DIR is the build script's own setting for that.
+header_dir="$tmp/include"
+mkdir -p "$header_dir"
+header_dir_native=$header_dir
+command -v cygpath > /dev/null && header_dir_native=$(cygpath -m "$header_dir")  # (MSYS2: the native Cargo's own spelling)
+
 # Rust's own cryptography (no OpenSSL to find), local files only (no HTTP client): its Cargo.lock pins every crate.
-(cd "$src" && cargo rustc --release --locked --no-default-features --features rust_native_crypto,file_io \
-  --crate-type staticlib -- --print native-static-libs) 2> "$tmp/build.log" || { cat "$tmp/build.log" >&2; exit 1; }
+(cd "$src" && C2PA_HEADER_DIR="$header_dir_native" cargo rustc --release --locked --no-default-features \
+  --features rust_native_crypto,file_io --crate-type staticlib -- --print native-static-libs) 2> "$tmp/build.log" ||
+  { cat "$tmp/build.log" >&2; exit 1; }
 native=$(sed -n 's/.*native-static-libs: //p' "$tmp/build.log" | tail -1)
 
 lib=$(find "$src/target/release" -maxdepth 1 \( -name 'libc2pa_c.a' -o -name 'c2pa_c.lib' \) | head -1)
-[ -n "$lib" ] && [ -f "$src/target/release/c2pa.h" ] || { echo "the build made no library or header" >&2; exit 1; }
+if [ -z "$lib" ] || [ ! -f "$header_dir/c2pa.h" ]; then
+  echo "the build made no library or header (library: ${lib:-none}; in $header_dir: $(ls "$header_dir" | tr '\n' ' '))" >&2
+  echo "c2pa.h and static libraries under the build folder:" >&2
+  find "$src/target" \( -name 'c2pa.h' -o -name '*c2pa_c*.a' -o -name '*c2pa_c*.lib' \) >&2 || true
+  tail -20 "$tmp/build.log" >&2
+  exit 1
+fi
 # The crates compiled in (this platform's, the features above, no build-only crates) and their licence files.
 features=(--locked --no-default-features --features rust_native_crypto,file_io)
 (cd "$src" && cargo tree "${features[@]}" -e normal --prefix none --format '{p}') |
@@ -63,7 +78,7 @@ done < "$tmp/metadata.tsv"
 SUDO=""
 if ! mkdir -p "$PREFIX" 2> /dev/null || [ ! -w "$PREFIX" ]; then SUDO="sudo"; $SUDO mkdir -p "$PREFIX"; fi
 $SUDO mkdir -p "$PREFIX/include" "$PREFIX/lib"
-$SUDO cp "$src/target/release/c2pa.h" "$PREFIX/include/"
+$SUDO cp "$header_dir/c2pa.h" "$PREFIX/include/"
 $SUDO cp "$lib" "$PREFIX/lib/libc2pa_c.a"
 echo "$native" | $SUDO tee "$PREFIX/lib/c2pa-native-libs.txt" > /dev/null
 $SUDO rm -rf "$PREFIX/licenses"

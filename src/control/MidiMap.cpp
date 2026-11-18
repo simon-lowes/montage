@@ -119,6 +119,7 @@ void Decoder::reset() {
     for (Channel& c : ch_) c = Channel();
     fine_.clear();
     coarse_.clear();
+    lsbFirst_.clear();
 }
 
 void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>& out) {
@@ -146,11 +147,23 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
     if (m.size() < 3) return;
     Channel& c = ch_[ch];
     const int n = d1, v = d2;
-    switch (n) {  // choosing a parameter
-        case 99: c.paramMsb = v; c.rpn = false; c.dataMsb = -1; return;
-        case 98: c.paramLsb = v; c.rpn = false; c.dataMsb = -1; return;
-        case 101: c.paramMsb = v; c.rpn = true; c.dataMsb = -1; return;
-        case 100: c.paramLsb = v; c.rpn = true; c.dataMsb = -1; return;
+    // Choosing a parameter: data entry starts afresh. A fine half still held for a coarse half that never came (a
+    // controller that sends the fine half first moved by its fine half alone) goes out with the coarse half the
+    // parameter last had.
+    auto chosenAgain = [&] {
+        if (c.lsbHeld && c.dataLsb >= 0) {
+            const int param = (c.paramMsb << 7) | c.paramLsb;
+            const auto it = coarse_.find(std::make_tuple(ch, c.rpn, param));
+            out({{c.rpn ? Kind::Rpn : Kind::Nrpn, ch, param}, ((it != coarse_.end() ? it->second : 0) << 7) | c.dataLsb, 16384});
+        }
+        c.dataMsb = c.dataLsb = -1;
+        c.lsbHeld = false;
+    };
+    switch (n) {
+        case 99: chosenAgain(); c.paramMsb = v; c.rpn = false; return;
+        case 98: chosenAgain(); c.paramLsb = v; c.rpn = false; return;
+        case 101: chosenAgain(); c.paramMsb = v; c.rpn = true; return;
+        case 100: chosenAgain(); c.paramLsb = v; c.rpn = true; return;
         default: break;
     }
     const bool chosen = !(c.paramMsb == 127 && c.paramLsb == 127);
@@ -161,9 +174,28 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
         if (n == 6) {
             c.dataMsb = v;
             coarse_[id] = v;
-            if (!fine_.count(id)) out({key, v, 128});  // a parameter that sends only the coarse half
+            if (c.dataLsb >= 0) {
+                // The fine half came first, straight after the parameter was chosen (some controllers send them in
+                // that order): the value is whole now, and the parameter is known to send them so.
+                lsbFirst_.insert(id);
+                out({key, (v << 7) | c.dataLsb, 16384});
+                c.dataLsb = -1;
+                c.lsbHeld = false;
+            } else if (!fine_.count(id)) {
+                out({key, v, 128});  // a parameter that sends only the coarse half
+            }
         } else if (n == 38) {
             fine_.insert(id);
+            if (c.dataMsb < 0) {
+                // The first half since the parameter was chosen. From a parameter that sends the fine half first it
+                // waits for its coarse half (sent with the old one, the value would step back before it steps on);
+                // a second one in a row is a fine half alone after all.
+                const bool second = c.dataLsb >= 0;
+                c.dataLsb = v;
+                c.lsbHeld = !second && lsbFirst_.count(id) > 0;
+                if (c.lsbHeld) return;
+                if (second) lsbFirst_.erase(id);
+            }
             // (a fine half alone, after the parameter was chosen again: with the coarse half it last had)
             int msb = c.dataMsb;
             if (msb < 0)
@@ -452,7 +484,8 @@ void Mapper::handle(const Event& e, const Targets& targets) {
             const int steps = m.invert ? -e.steps : e.steps;
             const double lo = std::min(m.low, m.high), hi = std::max(m.low, m.high);
             const double base = isNaN(cur) ? m.low : cur;
-            change.value = std::clamp(base + steps * m.step * (hi - lo), lo, hi);
+            // (an increment goes towards the range's far end, which a range written the other way round has below)
+            change.value = std::clamp(base + steps * m.step * (m.high - m.low), lo, hi);
             set = true;
         } else if (m.encoding == Encoding::Button) {
             const bool down = e.key.kind == Kind::Note ? e.value > 0 : e.key.kind == Kind::Program || e.value >= 64;

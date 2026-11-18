@@ -214,11 +214,14 @@ bool readEtm(const std::string& xml, const QDomElement& root, Facility& f, std::
     if (text(pub, "MessageType") != kFlm7) return fail(error, "Not a Facility List Message (its MessageType is " + text(pub, "MessageType") + ")");
     // Signed, the signature holding and covering the public part.
     dcp::SignatureCheck check;
+    check.rootMayBeLeftOut = true;
     std::string err;
     if (!dcp::verifyXmlSignature(xml, &err, &check)) return fail(error, "The FLM's signature does not hold: " + err);
-    // (and its signer's chain checks as a device's does: the root it goes up to is what must be trusted)
+    // (and its signer's chain checks as a device's does: the root it goes up to is what must be trusted. A signature
+    // may leave its root out: the chain is then taken as far as it goes, and takeFlm ends it with the trusted root
+    // that made it, or refuses it)
     dcp::ChainCheck signer;
-    if (!dcp::checkCertificateChain(check.certificates, signer, &err)) return fail(error, "The FLM's signer: " + err);
+    if (!dcp::checkCertificateChain(check.certificates, signer, &err, true)) return fail(error, "The FLM's signer: " + err);
     f.signer = signer.certificates;
     const std::string publicRef = "#" + pub.attribute(QStringLiteral("Id")).toStdString();
     if (std::none_of(check.references.begin(), check.references.end(), [&](const std::string& r) { return r.empty() || (r == publicRef && r.size() > 1); }))
@@ -496,6 +499,8 @@ std::vector<std::string> untrustedRoots(const Facility& f, const std::vector<Fac
     auto check = [&](const std::vector<std::string>& chain) {
         if (chain.empty()) return;
         if (std::find(known.begin(), known.end(), certificateKey(chain.back())) != known.end()) return;
+        // (a signer's chain that stops below its root has no root to ask about: takeFlm ends it with a trusted one)
+        if (dcp::ChainCheck part; dcp::checkCertificateChain(chain, part, nullptr, true) && !part.complete) return;
         const std::string root = certificateKey(chain.front());
         if (std::find(roots.begin(), roots.end(), root) != roots.end() || std::find(seen.begin(), seen.end(), root) != seen.end()) return;
         seen.push_back(root);
@@ -520,6 +525,23 @@ bool takeFlm(std::vector<Facility>& list, Facility f, const std::vector<std::str
         for (const std::string& r : roots) names += (names.empty() ? "" : "; ") + rootDescription(r);
         return fail(error, "The FLM of " + f.name + " has certificates from roots not trusted: " + names +
                                ". Trust a root only once its maker or the cinema has confirmed its thumbprint");
+    }
+    // A signer's chain that stops below its root (the signature left it out): ended with the trusted root that made
+    // its topmost certificate, or the signer one the list already holds for this cinema; refused otherwise.
+    if (dcp::ChainCheck part; !f.signer.empty() && dcp::checkCertificateChain(f.signer, part, nullptr, true) && !part.complete) {
+        const std::string leaf = certificateKey(f.signer.back());
+        bool whole = false;
+        for (const Facility& c : list)
+            if (!whole && !f.id.empty() && c.id == f.id && !c.signer.empty() && certificateKey(c.signer.back()) == leaf) f.signer = c.signer, whole = true;
+        for (size_t i = 0; !whole && i < trusted.size(); ++i) {
+            std::vector<std::string> with = f.signer;
+            with.push_back(trusted[i]);
+            dcp::ChainCheck ended;
+            if (dcp::checkCertificateChain(with, ended) && ended.complete) f.signer = ended.certificates, whole = true;
+        }
+        if (!whole)
+            return fail(error, "The FLM of " + f.name + ": its signature leaves out its root, and none of the trusted roots made its signer's chain (" +
+                                   rootDescription(f.signer.front()) + ")");
     }
     mergeFacility(list, std::move(f), changes);
     return true;
