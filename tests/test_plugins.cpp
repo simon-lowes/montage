@@ -2778,6 +2778,46 @@ private slots:
 #endif
     }
 
+    void dmaBufExportOfSeveralPlanes() {
+        // A driver writes one modifier for each plane of an image it exports. Asked about an image of two planes (a
+        // compressed layout), the query is given nowhere to write them and the export is refused; for one plane the
+        // format and the modifier come back.
+        struct Driver {
+            static int& planes() {
+                static int n = 1;
+                return n;
+            }
+            static int& written() {
+                static int n = 0;
+                return n;
+            }
+            static unsigned query(void*, void*, int* fourcc, int* planes, unsigned long long* modifiers) {
+                if (fourcc) *fourcc = 0x48344241;
+                if (planes) *planes = Driver::planes();
+                for (int i = 0; modifiers && i < Driver::planes(); ++i) modifiers[i] = 0x0100000000000002ull + unsigned(i), ++written();
+                return 1;
+            }
+            static unsigned refuses(void*, void*, int*, int*, unsigned long long*) { return 0; }
+        };
+        int fourcc = 0;
+        unsigned long long modifier = 7;
+        Driver::planes() = 2;
+        QVERIFY(!ofx::gl::onePlaneExport(&Driver::query, nullptr, nullptr, fourcc, modifier));
+        QCOMPARE(Driver::written(), 0);
+        QVERIFY(fourcc == 0 && modifier == 7);
+        Driver::planes() = 4;
+        QVERIFY(!ofx::gl::onePlaneExport(&Driver::query, nullptr, nullptr, fourcc, modifier));
+        QCOMPARE(Driver::written(), 0);
+        Driver::planes() = 1;
+        QVERIFY(ofx::gl::onePlaneExport(&Driver::query, nullptr, nullptr, fourcc, modifier));
+        QCOMPARE(Driver::written(), 1);
+        QCOMPARE(fourcc, 0x48344241);
+        QCOMPARE(modifier, 0x0100000000000002ull);
+        // A driver that refuses the query, or none, exports nothing.
+        QVERIFY(!ofx::gl::onePlaneExport(&Driver::refuses, nullptr, nullptr, fourcc, modifier));
+        QVERIFY(!ofx::gl::onePlaneExport(nullptr, nullptr, nullptr, fourcc, modifier));
+    }
+
     void failingOpenFxPluginsAreBypassed() {
         // An OpenFX plug-in that crashes or hangs is bypassed for that frame (the picture as it came), named, and
         // started again for the next; past its restarts it stays bypassed until Restart.
