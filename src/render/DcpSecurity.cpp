@@ -168,6 +168,7 @@ struct Free {
     void operator()(EVP_CIPHER_CTX* p) const { EVP_CIPHER_CTX_free(p); }
     void operator()(BIGNUM* p) const { BN_free(p); }
     void operator()(X509_EXTENSION* p) const { X509_EXTENSION_free(p); }
+    void operator()(X509_NAME* p) const { X509_NAME_free(p); }
 };
 template <class T>
 using Ptr = std::unique_ptr<T, Free>;
@@ -404,11 +405,14 @@ bool makeCertificateChain(const std::string& organisation, CertificateChain& out
         SHA1(der, size_t(n), md);
         OPENSSL_free(der);
         const std::string dnq = base64(md, 20);
-        X509_NAME* name = X509_get_subject_name(c);
+        // (The name is made apart and then set: OpenSSL 4 gives a certificate's own name back read-only.)
+        Ptr<X509_NAME> name(X509_NAME_new());
+        if (!name) return fail("Cannot name the certificate");
         const std::pair<const char*, std::string> entries[] = {{"O", org}, {"OU", "Montage DCP signer"}, {"CN", names[i]}, {"dnQualifier", dnq}};
         for (const auto& [field, value] : entries)
-            if (!X509_NAME_add_entry_by_txt(name, field, V_ASN1_PRINTABLESTRING, reinterpret_cast<const unsigned char*>(value.data()), int(value.size()), -1, 0))
+            if (!X509_NAME_add_entry_by_txt(name.get(), field, V_ASN1_PRINTABLESTRING, reinterpret_cast<const unsigned char*>(value.data()), int(value.size()), -1, 0))
                 return fail("Cannot name the certificate");
+        if (!X509_set_subject_name(c, name.get())) return fail("Cannot name the certificate");
         X509* issuer = i == 0 ? c : certs[i - 1].get();
         X509_set_issuer_name(c, X509_get_subject_name(issuer));
         X509V3_CTX ctx;
