@@ -425,10 +425,13 @@ bool makeReviewCertificate(const std::vector<std::string>& hosts, std::string& c
     X509_gmtime_adj(X509_getm_notBefore(x.get()), -3600);
     X509_gmtime_adj(X509_getm_notAfter(x.get()), 2L * 365 * 24 * 3600);
     X509_set_pubkey(x.get(), key.get());
-    X509_NAME* name = X509_get_subject_name(x.get());
-    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_UTF8, reinterpret_cast<const unsigned char*>("Montage"), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_UTF8, reinterpret_cast<const unsigned char*>("Montage live review"), -1, -1, 0);
-    X509_set_issuer_name(x.get(), name);
+    // (The name is made apart and then set: OpenSSL 4 gives a certificate's own name back read-only.)
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name(X509_NAME_new(), X509_NAME_free);
+    if (!name) return fail("no certificate name");
+    X509_NAME_add_entry_by_txt(name.get(), "O", MBSTRING_UTF8, reinterpret_cast<const unsigned char*>("Montage"), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_UTF8, reinterpret_cast<const unsigned char*>("Montage live review"), -1, -1, 0);
+    X509_set_subject_name(x.get(), name.get());
+    X509_set_issuer_name(x.get(), name.get());
     std::string san;
     for (const std::string& h : hosts) {
         if (h.empty() || h.find_first_of(",\r\n") != std::string::npos) continue;

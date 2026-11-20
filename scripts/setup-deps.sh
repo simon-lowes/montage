@@ -69,30 +69,73 @@ if ! install_packages 240; then
   install_packages 480
 fi
 # ONNX Runtime (object masks): Ubuntu does not package it, so Microsoft's
-# release archive goes to /opt/onnxruntime, where CMake looks for it.
+# release goes to /opt/onnxruntime, where CMake looks for it.
 ORT_VERSION=1.30.0
 case "$(uname -m)" in
-  x86_64) ORT_ARCH=x64 ;;
-  aarch64) ORT_ARCH=aarch64 ;;
+  x86_64) ORT_ARCH=x64; ORT_NUGET_ARCH=x64 ;;
+  aarch64) ORT_ARCH=aarch64; ORT_NUGET_ARCH=arm64 ;;
   *) ORT_ARCH="" ;;
 esac
+# Microsoft's NuGet package of the same release holds the same library and headers. It is the second source:
+# on 19 November 2026 GitHub answered 404 for the release archive that had worked until then.
+ort_from_nuget() {
+  curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --speed-limit 51200 --speed-time 60 --max-time 900 \
+    -o "$tmp/ort.nupkg" "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$ORT_VERSION/microsoft.ml.onnxruntime.$ORT_VERSION.nupkg" \
+    || return 1
+  mkdir -p "$tmp/ort/include" "$tmp/ort/lib"
+  python3 -I - "$tmp/ort.nupkg" "$tmp/ort" "$ORT_NUGET_ARCH" "$ORT_VERSION" <<'EOF' || return 1
+import os, sys, zipfile
+nupkg, out, arch, version = sys.argv[1:]
+native = f"runtimes/linux-{arch}/native/"
+with zipfile.ZipFile(nupkg) as z:
+    names = z.namelist()
+    if native + "libonnxruntime.so" not in names:
+        sys.exit(f"no {native}libonnxruntime.so in the package")
+    for name in names:
+        base = os.path.basename(name)
+        if name.startswith("build/native/include/") and base.endswith(".h"):
+            target = os.path.join(out, "include", base)
+        elif name == native + "libonnxruntime.so":
+            target = os.path.join(out, "lib", "libonnxruntime.so." + version)
+        elif name.startswith(native) and base.endswith(".so"):
+            target = os.path.join(out, "lib", base)
+        elif name in ("LICENSE", "ThirdPartyNotices.txt"):
+            target = os.path.join(out, name)
+        else:
+            continue
+        with z.open(name) as src, open(target, "wb") as dst:
+            dst.write(src.read())
+os.chmod(os.path.join(out, "lib", "libonnxruntime.so." + version), 0o755)
+os.symlink("libonnxruntime.so." + version, os.path.join(out, "lib", "libonnxruntime.so.1"))
+os.symlink("libonnxruntime.so.1", os.path.join(out, "lib", "libonnxruntime.so"))
+with open(os.path.join(out, "VERSION_NUMBER"), "w") as f:
+    f.write(version + "\n")
+EOF
+}
 if [ -n "$ORT_ARCH" ] && [ ! -f /opt/onnxruntime/include/onnxruntime_cxx_api.h ]; then
   tmp=$(mktemp -d)
   echo "$(date -u +%T) ONNX Runtime $ORT_VERSION"
   # (A download slower than 50 KB/s for a minute is given up and retried. GitHub's release downloads can answer 504
-  # for minutes at a time, so a failed round is tried again after a pause, for up to about five minutes in all.)
+  # for minutes at a time, so a failed round tries NuGet, and then both again after a pause, for about five minutes.)
   ort_url="https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-linux-$ORT_ARCH-$ORT_VERSION.tgz"
   for round in 1 2 3 4 5 6; do
     if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --speed-limit 51200 --speed-time 60 --max-time 600 \
          -o "$tmp/ort.tgz" "$ort_url"; then
+      $SUDO mkdir -p /opt/onnxruntime
+      $SUDO tar -xzf "$tmp/ort.tgz" -C /opt/onnxruntime --strip-components=1
       break
     fi
-    [ "$round" -eq 6 ] && { echo "ONNX Runtime could not be downloaded from $ort_url" >&2; exit 22; }
+    echo "$(date -u +%T) ONNX Runtime's archive could not be downloaded from GitHub; trying its NuGet package"
+    rm -rf "$tmp/ort" "$tmp/ort.nupkg"
+    if ort_from_nuget; then
+      $SUDO mkdir -p /opt/onnxruntime
+      $SUDO cp -a "$tmp/ort/." /opt/onnxruntime/
+      break
+    fi
+    [ "$round" -eq 6 ] && { echo "ONNX Runtime could not be downloaded from $ort_url or NuGet" >&2; exit 22; }
     echo "$(date -u +%T) ONNX Runtime download failed; trying again in 45 s"
     sleep 45
   done
-  $SUDO mkdir -p /opt/onnxruntime
-  $SUDO tar -xzf "$tmp/ort.tgz" -C /opt/onnxruntime --strip-components=1
   rm -rf "$tmp"
 fi
 echo "Dependencies installed. Build with: cmake -S . -B build -G Ninja && cmake --build build"

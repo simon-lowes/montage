@@ -544,6 +544,19 @@ void overlayProjection(int width, int height, const double m[6]) {
 
 // ---- Pictures shared between processes -------------------------------------------------------------------------------
 
+bool onePlaneExport(DmaBufExportQuery query, void* display, void* image, int& fourcc, unsigned long long& modifier) {
+    if (!query) return false;
+    int format = 0, planes = 0;
+    if (!query(display, image, &format, &planes, nullptr) || planes != 1 || format == 0) return false;
+    // (Room for four all the same: no format has more planes, should the driver's count change between the two calls.)
+    unsigned long long modifiers[4] = {modifier, modifier, modifier, modifier};
+    int again = 0;
+    if (!query(display, image, &format, &again, modifiers) || again != 1 || format == 0) return false;
+    fourcc = format;
+    modifier = modifiers[0];
+    return true;
+}
+
 #ifdef __linux__
 
 namespace {
@@ -674,11 +687,16 @@ bool exportDmaBuf(unsigned texture, int width, int height, DmaBuf& out, std::str
     const int level[] = {kEglGlTextureLevel, 0, kEglNone};
     const EglImage image = e.createImage(e.display, e.currentContext(), kEglGlTexture2d, reinterpret_cast<void*>(uintptr_t(texture)), level);
     if (!image) return no("EGL made no image of the picture's texture (error " + std::to_string(e.error()) + ")");
-    int fourcc = 0, planes = 0, fd = -1, stride = 0, offset = 0;
+    // (The driver writes a descriptor, a stride and an offset for each plane: only one plane is exported, with room for
+    // four all the same.)
+    int fourcc = 0, fds[4] = {-1, -1, -1, -1}, strides[4] = {}, offsets[4] = {};
     unsigned long long modifier = kNoModifier;
-    bool ok = e.exportQuery(e.display, image, &fourcc, &planes, &modifier) && planes == 1 && fourcc != 0;
-    ok = ok && e.exportImage(e.display, image, &fd, &stride, &offset) && fd >= 0 && stride > 0 && offset >= 0;
+    bool ok = onePlaneExport(e.exportQuery, e.display, image, fourcc, modifier);
+    ok = ok && e.exportImage(e.display, image, fds, strides, offsets) && fds[0] >= 0 && strides[0] > 0 && offsets[0] >= 0;
     e.destroyImage(e.display, image);  // (the DMA-BUF keeps the storage)
+    for (int i = 1; i < 4; ++i)
+        if (fds[i] >= 0) ::close(fds[i]), ok = false;
+    const int fd = fds[0], stride = strides[0], offset = offsets[0];
     if (!ok) {
         if (fd >= 0) ::close(fd);
         return no("the OpenGL driver did not export the picture's texture as a DMA-BUF of one plane");

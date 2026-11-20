@@ -76,6 +76,11 @@ bool exportDmaBuf(unsigned texture, int width, int height, DmaBuf& out, std::str
 // (inside run()) A texture of this context showing `buf`'s picture, once its fence has signalled; 0, with why.
 unsigned importDmaBuf(const DmaBuf& buf, std::string* why = nullptr);
 void closeDmaBuf(DmaBuf& buf);  // (its descriptors closed; any thread)
+// What a driver's export query (eglExportDMABUFImageQueryMESA's shape) says of an image, asked in two steps: how many
+// planes first, with nowhere to write a modifier, and the modifier only once there is one plane, since the driver
+// writes one modifier for each plane. False when the image is not one plane of a known format.
+using DmaBufExportQuery = unsigned (*)(void* display, void* image, int* fourcc, int* planes, unsigned long long* modifiers);
+bool onePlaneExport(DmaBufExportQuery query, void* display, void* image, int& fourcc, unsigned long long& modifier);
 // A DMA-BUF's descriptors handed from one process to another (any thread): the taker opens a post, a socket under a
 // name of its own (-1, with why, when none can be made), and the giver sends them there, keeping its own.
 int openDmaBufPost(const std::string& name, std::string* why = nullptr);

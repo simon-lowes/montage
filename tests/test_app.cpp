@@ -3093,23 +3093,20 @@ private slots:
         });
         for (int k = 0; k < (omtOk ? 1 : 2); ++k) {
             auto p = std::make_unique<QProcess>();
+            p->setProcessChannelMode(QProcess::ForwardedChannels);  // (its few errors in the test's own output)
             const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
                                    : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(streamPorts[k]);
             p->start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128",
                               "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
                               "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
                               "-c:a", "mp2", "-f", "mpegts", to});
-            // (a busy Mac runner once took more than ten seconds to start the command, and once more than a minute:
-            // wait longer, and say what the process reports and how busy the machine is when it does not start)
+            // Only a command that could not be run fails here; the pictures below show it sending. (On macOS, which
+            // makes a pipe and marks it close-on-exec in two steps, a process another thread starts in between keeps
+            // the pipe that tells Qt the command has started, so Qt can wait as long as that process lives: a Mac
+            // runner with nothing much to do once waited more than three minutes for a sender that was running.)
             streams.push_back(std::move(p));
-            double load[3] = {-1, -1, -1};
-            const bool started = streams.back()->waitForStarted(180000);
-#ifndef _WIN32
-            if (!started) (void)getloadavg(load, 3);
-#endif
-            QVERIFY2(started, qPrintable(QString("state %1, error %2: %3; load %4 %5 %6")
-                                             .arg(int(streams.back()->state())).arg(int(streams.back()->error())).arg(streams.back()->errorString())
-                                             .arg(load[0]).arg(load[1]).arg(load[2])));
+            if (!streams.back()->waitForStarted(30000))
+                QVERIFY2(streams.back()->error() != QProcess::FailedToStart, qPrintable(streams.back()->errorString()));
         }
         // (waiting on pictures, not the clock: a busy machine is slow)
         QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, 60000);

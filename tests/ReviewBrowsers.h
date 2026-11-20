@@ -51,6 +51,20 @@ inline int freeTcpPort() {
     return int(s.serverPort());
 }
 
+// A port free for TCP and for UDP alike: a review serves its page over TCP and its media over UDP on the same number,
+// and a TCP port the system hands out can be one some other program (a browser's own WebRTC) holds for UDP.
+inline int freeReviewPort() {
+    for (int tries = 0; tries < 50; ++tries) {
+        const int port = freeTcpPort();
+        const auto udpFree = [port](const QHostAddress& at) {
+            QUdpSocket udp;
+            return udp.bind(at, quint16(port));
+        };
+        if (udpFree(QHostAddress::AnyIPv4) && udpFree(QHostAddress::LocalHost)) return port;
+    }
+    return freeTcpPort();
+}
+
 // What a relay bridge says of its asking the relay for an address, waited for (15 s at most): "" when it has one.
 inline std::string allocateAt(output::RelayBridge& bridge) {
     struct Said {
@@ -404,7 +418,7 @@ struct ReviewRig {
     std::atomic<int64_t> playhead{100};
 
     ReviewRig() {
-        settings.address = "https://127.0.0.1:" + std::to_string(freeTcpPort());
+        settings.address = "https://127.0.0.1:" + std::to_string(freeReviewPort());
         settings.passphrase = output::generatePassphrase();
         settings.hardware = false;
         settings.bitrateKbps = 3000;
