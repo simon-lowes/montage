@@ -24281,8 +24281,13 @@ colorspaces:
             RelayBridge fresh("127.0.0.1", uint16_t(turnPort), login);
             QCOMPARE(allocateAt(fresh), std::string());
         }
-        // Once the link's time is up: the page tells a newcomer so, and coturn takes the review's login no more.
+        // Once the link's time is up: those watching are told so and let go (the relay would cut them at their next
+        // refresh with the login), the page tells a newcomer so, and coturn takes the review's login no more.
         while (QDateTime::currentSecsSinceEpoch() < expires + 2) QThread::msleep(200);
+        QVERIFY2(tab.until("__montage.stage === 'expired'", 10), tab.js("__montage.stage").toString().toUtf8().constData());
+        QCOMPARE(tab.js("document.getElementById('state').textContent").toString(), QStringLiteral("This review link has expired"));
+        if (firefox) QTRY_COMPARE_WITH_TIMEOUT(fx.js("__montage.stage").toString(), QStringLiteral("expired"), 10000);
+        QTRY_COMPARE_WITH_TIMEOUT(rig.review->stats().viewers, 0, 10000);
         QVERIFY2(tab.open(rig.page(), &why), why.c_str());
         QCOMPARE(tab.js("__montage.join('Cy', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("This review link has expired"));
         if (coturn) {

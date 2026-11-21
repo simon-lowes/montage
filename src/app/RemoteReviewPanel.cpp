@@ -349,7 +349,7 @@ QString RemoteReviewController::status() const {
         if (st.hdrViewers > 0) text += tr(", %n in HDR", "", st.hdrViewers);
         if (st.skipped > 0) text += tr(", %n frame(s) skipped (encoding fell behind)", "", int(std::min<int64_t>(st.skipped, 1 << 30)));
         if (!st.error.empty()) text += QStringLiteral(" (%1)").arg(qs(st.error));
-        // (a link made with a relay's secret lets nobody new in after its time)
+        // (a link made with a relay's secret ends at its time, for everyone watching too)
         if (st.linkExpires > 0)
             text += st.linkExpires > QDateTime::currentSecsSinceEpoch()
                         ? tr("; the link works until %1").arg(QLocale().toString(QDateTime::fromSecsSinceEpoch(st.linkExpires), QLocale::ShortFormat))
@@ -681,7 +681,7 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     turnSecret_->setEchoMode(QLineEdit::Password);
     turnSecret_->setToolTip(tr("The secret your relay shares with Montage, for a relay set to make its logins from a shared secret. Each review then "
                                "has a login of its own, which reviewers' pages are given instead of one that lasts, and the review link and that "
-                               "login stop letting anyone new in after the time chosen."));
+                               "login end after the time chosen: nobody new gets in, and anyone still watching is told the link has expired."));
     turnExpiry_ = new QComboBox(this);
     turnExpiry_->setObjectName(QStringLiteral("reviewStreamTurnExpiry"));
     turnExpiry_->addItem(tr("Link works for 1 hour"), 3600);

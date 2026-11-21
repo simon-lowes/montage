@@ -802,9 +802,11 @@ struct BrowserReviewBackend::Impl {
     uint16_t relayPort = 0;
     std::set<std::shared_ptr<RelayBridge>> bridging;
     // The relay's login for this review: the settings' own, or one made from the shared secret that runs out at
-    // `expires` (seconds since 1970; 0: none), when the link stops letting viewers in too.
+    // `expires` (seconds since 1970; 0: none), when the link ends too.
     TurnLogin relayLogin;
     std::atomic<int64_t> expires{0};
+    // (the web server's thread) Once the link has ended: when its viewers were told so (and let go a second later).
+    std::optional<Clock::time_point> endedAt;
 
     // The web server's thread, its loop and the object queued work runs on.
     std::thread http;
@@ -1101,7 +1103,8 @@ struct BrowserReviewBackend::Impl {
     }
 
     // The review link's time is up (only one with a relay's shared secret has a time): nobody new is let in, as the
-    // relay lets no login from it in.
+    // relay lets no login from it in, and every viewer is told and let go (pruneViewers), as the relay would cut
+    // those it carries at their next refresh with that login.
     bool expired() const {
         const int64_t at = expires;
         return at > 0 && std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() >= at;
@@ -1562,9 +1565,11 @@ struct BrowserReviewBackend::Impl {
         retired.emplace_back(Clock::now(), v);
     }
 
-    // Viewers whose connection failed or closed, or never came up, are let go.
+    // Viewers whose connection failed or closed, or never came up, are let go; once the link's time is up, every
+    // viewer is told so and let go a second later. A viewer whose way through the relay failed leaves why.
     void pruneViewers() {
-        std::vector<std::shared_ptr<Viewer>> drop, gone;
+        std::vector<std::shared_ptr<Viewer>> drop, gone, told;
+        const bool ended = expired();
         {
             std::lock_guard lock(m);
             const auto now = Clock::now();
@@ -1572,9 +1577,16 @@ struct BrowserReviewBackend::Impl {
                 gone.push_back(std::move(retired.front().second));
                 retired.pop_front();
             }
+            if (ended && !endedAt) {
+                endedAt = now;
+                for (const auto& [id, v] : viewers) told.push_back(v);
+            }
+            const bool letGo = endedAt && now - *endedAt >= std::chrono::seconds(1);
             for (auto it = viewers.begin(); it != viewers.end();) {
                 const auto& v = it->second;
-                if (v->gone || (!v->connected && now - v->created > std::chrono::seconds(30))) {
+                if (letGo || v->gone || (!v->connected && now - v->created > std::chrono::seconds(30))) {
+                    if (v->bridge)
+                        if (std::string why = v->bridge->lastError(); !why.empty()) lastError = why;
                     drop.push_back(v);
                     pointing.erase(v->id);
                     it = viewers.erase(it);
@@ -1584,6 +1596,7 @@ struct BrowserReviewBackend::Impl {
             }
             for (auto it = pointing.begin(); it != pointing.end();) it = now - it->second.at > kPointerLife ? pointing.erase(it) : std::next(it);
         }
+        for (const auto& v : told) sendText(*v, {{"t", "end"}, {"why", "This review link has expired"}});
         for (const auto& v : drop) closeViewer(v);
     }
 
@@ -2244,6 +2257,7 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
         std::lock_guard lock(d.m);
         d.open = true;
         d.woken = false;
+        d.endedAt.reset();
         d.lastError.clear();
         d.received.clear();
         d.markerCount = 0;
@@ -2371,6 +2385,9 @@ ReviewStats BrowserReviewBackend::stats() const {
     s.queueMoves = d_->queueMoves;
     s.linkExpires = d_->open ? d_->expires.load() : 0;
     s.error = d_->lastError;
+    // (a viewer's way through the relay that failed: the relay's refusal, or its address for them running out)
+    for (const auto& [id, v] : d_->viewers)
+        if (s.error.empty() && v->bridge) s.error = v->bridge->lastError();
     s.markers = d_->markerCount;
     return s;
 }

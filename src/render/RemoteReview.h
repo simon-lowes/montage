@@ -48,8 +48,9 @@ struct StreamSettings {
     bool relayOnly = false;
     // In place of the user name and password, the secret the relay shares with Montage (coturn's use-auth-secret):
     // each review then has a login of its own that the relay takes for turnExpirySeconds from when the review starts
-    // (render/TurnRelay.h), and once that has passed the review link lets nobody new in either. Viewers' pages are
-    // given that login, never the secret.
+    // (render/TurnRelay.h), and once that has passed the review link ends: nobody new is let in, and viewers still
+    // watching are told so and let go (the relay would cut those it carries at their next refresh with that login).
+    // Viewers' pages are given that login, never the secret.
     std::string turnSecret;
     int turnExpirySeconds = 86400;
     int maxViewers = 8;
