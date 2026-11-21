@@ -23761,6 +23761,10 @@ colorspaces:
             // and from addresses let in.
             std::atomic<int> dropRefreshes{0}, dropPermissions{0};
             std::atomic<bool> strict{false};
+            // Answers given unsigned, or signed wrongly (the relay's own answers are signed, as RFC 8489 has them);
+            // an Allocate refused 486 with a long reason in UTF-8 that has a control character in it.
+            std::atomic<bool> unsignedAnswers{false}, wronglySigned{false}, refuseAllocate{false};
+            std::atomic<bool> staleRelease{false};  // an address given back is answered 438 once, with a new nonce
             std::thread thread;
             static void attribute(QByteArray& b, quint16 type, const QByteArray& value) {
                 b.append(char(type >> 8)).append(char(type & 0xff)).append(char(value.size() >> 8)).append(char(value.size() & 0xff)).append(value);
@@ -23840,14 +23844,27 @@ colorspaces:
                             front.writeDatagram(message(type | 0x0110, id, a + challenge), QHostAddress::LocalHost, client);
                             continue;
                         }
+                        if (staleRelease && type == 0x0004 && !asked && nonce == "second") {
+                            QByteArray a;
+                            attribute(a, 0x0009, QByteArray::fromHex("00000426") + "Stale Nonce");
+                            attribute(a, 0x0015, "renewed");
+                            front.writeDatagram(message(type | 0x0110, id, a + challenge), QHostAddress::LocalHost, client);
+                            continue;
+                        }
                         QByteArray covered = d.left(integrityAt);
                         const qsizetype length = integrityAt - 20 + 24;
                         covered[2] = char(length >> 8), covered[3] = char(length & 0xff);
-                        const bool right = nonce == "second" && QMessageAuthenticationCode::hash(covered, key, QCryptographicHash::Sha1) == d.mid(integrityAt + 4, 20);
+                        const bool right = (nonce == "second" || nonce == "renewed") &&
+                                           QMessageAuthenticationCode::hash(covered, key, QCryptographicHash::Sha1) == d.mid(integrityAt + 4, 20);
                         ++(right ? signedRight : signedWrong);
                         QByteArray a;
                         bool mismatch = false;
-                        if (!right) {
+                        if (right && type == 0x0003 && refuseAllocate) {
+                            QByteArray reason = "Allocation quota reached \x07" "for ";
+                            for (int k = 0; k < 80; ++k) reason += "\xc3\xa9";  // (é)
+                            attribute(a, 0x0009, QByteArray::fromHex("00000456") + reason);
+                            mismatch = true;
+                        } else if (!right) {
                             attribute(a, 0x0009, QByteArray::fromHex("00000401") + "No");
                             attribute(a, 0x0015, "second");
                             a += challenge;
@@ -23866,7 +23883,15 @@ colorspaces:
                             ++permissions;
                             allowed.insert(peer);
                         }
-                        front.writeDatagram(message(type | (right && !mismatch ? 0x0100 : 0x0110), id, a), QHostAddress::LocalHost, client);
+                        QByteArray answer = message(type | (right && !mismatch ? 0x0100 : 0x0110), id, a);
+                        if (right && !unsignedAnswers) {
+                            // (MESSAGE-INTEGRITY over the answer, its length counting the attribute)
+                            answer[2] = char((a.size() + 24) >> 8), answer[3] = char((a.size() + 24) & 0xff);
+                            QByteArray mac = QMessageAuthenticationCode::hash(answer, key, QCryptographicHash::Sha1);
+                            if (wronglySigned) mac[0] = char(mac[0] ^ 1);
+                            attribute(answer, 0x0008, mac);
+                        }
+                        front.writeDatagram(answer, QHostAddress::LocalHost, client);
                     }
                     back.waitForReadyRead(2);
                     while (back.hasPendingDatagrams()) {  // from a peer: a Data indication to the client
@@ -24042,6 +24067,38 @@ colorspaces:
             QVERIFY2(QString::fromStdString(why).contains("login"), why.c_str());
             QVERIFY(old.signedWrong >= 1);
         }
+        // Nightly 19 Nov: the relay's answers are taken only signed with the login's key; one unsigned or signed
+        // wrongly is as if it never came (the address is not taken from it). A refusal's reason is the relay's
+        // text, printable and cut at 80 characters, never inside one.
+        for (std::atomic<bool>* way : {&old.unsignedAnswers, &old.wronglySigned}) {
+            *way = true;
+            RelayBridge unproven("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+            const std::string why = allocate(unproven);
+            *way = false;
+            QVERIFY2(QString::fromStdString(why).contains("did not answer"), why.c_str());
+            QCOMPARE(unproven.relayedPort(), uint16_t(0));
+        }
+        {
+            old.refuseAllocate = true;
+            RelayBridge refused("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+            const QString why = QString::fromStdString(allocate(refused));
+            old.refuseAllocate = false;
+            QVERIFY2(why.startsWith("The TURN relay refused (486 Allocation quota reached for éé"), qPrintable(why));
+            QVERIFY2(why.endsWith(QStringLiteral("é…)")), qPrintable(why));
+            QCOMPARE(why.size(), QStringLiteral("The TURN relay refused (486 ").size() + 80 + 2);
+            QVERIFY(!why.contains(QChar::ReplacementCharacter) && !why.contains(QChar(7)));
+        }
+        // An address given back on a nonce the relay then calls stale is given back again with the new one.
+        {
+            old.staleRelease = true;
+            const int releasedBefore = old.released;
+            {
+                RelayBridge bridge("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+                QCOMPARE(allocate(bridge), std::string());
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(old.released > releasedBefore, 3000);
+            old.staleRelease = false;
+        }
         // A relay that gives its address for 20 seconds is asked to keep it half way through that, with the login,
         // and the address still carries afterwards; a bridge that ends gives its address back.
         {
@@ -24116,6 +24173,132 @@ colorspaces:
             QVERIFY(!through("after it ran out", 1000));
         }
 #endif
+    }
+
+    // Nightly 19 Nov: what a relay that sends anything at all sends the bridge, a few thousand times over, each a
+    // message of a kind the bridge reads (a challenge, an address, a refusal, a stale nonce, a viewer's packet)
+    // changed at random, and answers to a viewer's checks from Montage's end changed the same way: the bridge reads
+    // them all without reading past one (valgrind says so) and still does as it is asked afterwards.
+    void reviewRelayBridgeFuzzed() {
+        using namespace montage::output;
+        QRandomGenerator rng(19112026);
+        auto attribute = [](QByteArray& b, quint16 type, const QByteArray& value) {
+            b.append(char(type >> 8)).append(char(type & 0xff)).append(char(value.size() >> 8)).append(char(value.size() & 0xff)).append(value);
+            while (b.size() % 4) b.append('\0');
+        };
+        auto message = [](quint16 type, const QByteArray& id, const QByteArray& attributes) {
+            QByteArray b;
+            b.append(char(type >> 8)).append(char(type & 0xff)).append(char(attributes.size() >> 8)).append(char(attributes.size() & 0xff));
+            return b + QByteArray::fromHex("2112a442") + id + attributes;
+        };
+        auto address = [](quint16 port) {  // (XOR-…-ADDRESS of 127.0.0.1 and a port)
+            QByteArray v = QByteArray::fromHex("0001");
+            const quint16 p = port ^ 0x2112;
+            v.append(char(p >> 8)).append(char(p & 0xff));
+            return v + QByteArray::fromHex("5e12a443");
+        };
+        auto changed = [&](QByteArray m) {
+            switch (rng.bounded(6)) {
+            case 0:  // (bytes flipped)
+                for (int k = int(rng.bounded(1, 5)); k > 0 && !m.isEmpty(); --k) m[int(rng.bounded(int(m.size())))] = char(rng.bounded(256));
+                break;
+            case 1:  // (cut short)
+                m.truncate(int(rng.bounded(int(m.size()) + 1)));
+                break;
+            case 2:  // (the message's length)
+                if (m.size() >= 4) m[2] = char(rng.bounded(256)), m[3] = char(rng.bounded(256) & ~3);
+                break;
+            case 3:  // (an attribute's length)
+                for (int at = 20; at + 4 <= m.size(); at += 4) {
+                    if (rng.bounded(4) == 0) {
+                        m[at + 2] = char(rng.bounded(256)), m[at + 3] = char(rng.bounded(256));
+                        break;
+                    }
+                }
+                break;
+            case 4:  // (more after it)
+                for (int k = int(rng.bounded(1, 64)); k > 0; --k) m.append(char(rng.bounded(256)));
+                break;
+            default:  // (as it is)
+                break;
+            }
+            return m;
+        };
+        QUdpSocket relay;
+        relay.setProxy(QNetworkProxy::NoProxy);
+        QVERIFY(relay.bind(QHostAddress::LocalHost, 0));
+        std::atomic<bool> allocated{false};  // (before the bridge, which may call back until it ends)
+        RelayBridge bridge("127.0.0.1", relay.localPort(), {"reviewer", "relay-password-2"});
+        bridge.allocate([&](const std::string&) { allocated = true; });
+        auto viewer = std::make_unique<QUdpSocket>(), end = std::make_unique<QUdpSocket>();
+        for (auto* s : {viewer.get(), end.get()}) {
+            s->setProxy(QNetworkProxy::NoProxy);
+            QVERIFY(s->bind(QHostAddress::LocalHost, 0));
+        }
+        const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+        QVERIFY(alias != 0);
+        bridge.setLocal(end->localPort(), "an ICE password of the test");
+        // The bridge's latest request, and the port it sends from.
+        QByteArray id;
+        quint16 from = 0;
+        auto heard = [&] {
+            while (relay.hasPendingDatagrams()) {
+                QByteArray d(int(relay.pendingDatagramSize()), 0);
+                relay.readDatagram(d.data(), d.size(), nullptr, &from);
+                if (d.size() >= 20) id = d.mid(8, 12);
+            }
+        };
+        QTRY_VERIFY_WITH_TIMEOUT((heard(), !id.isEmpty()), 5000);
+        int sent = 0;
+        for (int round = 0; round < 4000; ++round) {
+            heard();
+            const QByteArray which = rng.bounded(8) == 0 ? QByteArray(12, char(rng.bounded(256))) : id;
+            QByteArray a;
+            QByteArray m;
+            switch (rng.bounded(6)) {
+            case 0:  // a challenge
+                attribute(a, 0x0009, QByteArray::fromHex("00000401") + "Unauthorized");
+                attribute(a, 0x0014, "fuzz-relay");
+                attribute(a, 0x0015, QByteArray::number(round));
+                if (rng.bounded(2)) attribute(a, 0x8002, QByteArray::fromHex("0002000000010000"));
+                m = message(0x0113, which, a);
+                break;
+            case 1:  // an address
+                attribute(a, 0x0016, address(quint16(rng.bounded(1024, 65535))));
+                attribute(a, 0x000D, QByteArray::fromHex("00000258"));
+                attribute(a, 0x0008, QByteArray(20, 'm'));
+                m = message(0x0103, which, a);
+                break;
+            case 2:  // a refusal
+                attribute(a, 0x0009, QByteArray::fromHex("00000456") + QByteArray(int(rng.bounded(120)), char(rng.bounded(32, 256))));
+                m = message(quint16(0x0110 | (rng.bounded(2) ? 0x0003 : 0x0004)), which, a);
+                break;
+            case 3:  // a stale nonce
+                attribute(a, 0x0009, QByteArray::fromHex("00000426") + "Stale Nonce");
+                attribute(a, 0x0015, "fresh");
+                m = message(0x0113, which, a);
+                break;
+            default:  // a viewer's packet
+                attribute(a, 0x0012, address(viewer->localPort()));
+                attribute(a, 0x0013, QByteArray(int(rng.bounded(200)), 'v'));
+                m = message(0x0017, QByteArray(12, 'i'), a);
+                break;
+            }
+            relay.writeDatagram(changed(m), QHostAddress::LocalHost, from);
+            // From Montage's end: an answer to the viewer's check, naming the port that stands for the viewer.
+            QByteArray check;
+            attribute(check, 0x0020, address(alias));
+            attribute(check, 0x0008, QByteArray(20, 'i'));
+            attribute(check, 0x8028, QByteArray(4, 'f'));
+            end->writeDatagram(changed(message(0x0101, QByteArray(12, 't'), check)), QHostAddress::LocalHost, alias);
+            if (++sent % 50 == 0) QThread::msleep(2);
+        }
+        while (end->hasPendingDatagrams()) end->receiveDatagram();
+        // Still at work: it answers, and gives the viewer's address the port it gave before.
+        QThread::msleep(300);
+        QCOMPARE(bridge.peer("127.0.0.1", viewer->localPort()), alias);
+        qInfo("%d messages sent (allocated: %d); %llu packets passed on to Montage's end and %llu to the relay; the bridge says: %s", sent, int(allocated.load()),
+              (unsigned long long)bridge.fromRelay(), (unsigned long long)bridge.toRelay(), bridge.lastError().c_str());
     }
 
     // Only through the relay, with a capture of what reaches a viewer's addresses: a viewer of the test's own offers

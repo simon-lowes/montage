@@ -385,7 +385,7 @@ QByteArray RemoteReviewController::toolJson() {
 "key":{"type":"string","description":"Browsers: the certificate's private key (PEM, without a password)"},
 "max_viewers":{"type":"number","description":"Browsers: viewers at once (1 to 64)"},
 "simulcast":{"type":["boolean","integer"],"description":"Browsers: the picture at several sizes at once, each viewer moved between them by their own connection: true (full, half and quarter size, the default), false (full size only), or the number of sizes, 1 to 3"},
-"turn":{"type":"object","description":"Browsers: a TURN relay the user runs (RFC 8656), given to viewers' pages with the passphrase; url \"\" for none","properties":{"url":{"type":"string","description":"turn:host:3478, or turns:host:5349 over TLS"},"username":{"type":"string"},"password":{"type":"string"},"secret":{"type":"string","description":"In place of username and password: the secret the relay shares with Montage (a relay set to make logins from a shared secret). Each review then has a login of its own that runs out; \"\" for none"},"expiry":{"type":"integer","description":"With secret: how long the review link and its login last from the start, in seconds (30 to 2592000; 86400 unless given)"},"relay_only":{"type":"boolean","description":"Every viewer's media through the relay, never directly: Montage then sends to no address but the relay's"}}},
+"turn":{"type":"object","description":"Browsers: a TURN relay the user runs (RFC 8656), given to viewers' pages with the passphrase; url \"\" for none","properties":{"url":{"type":"string","description":"turn:host:3478, or turns:host:5349 over TLS"},"username":{"type":"string"},"password":{"type":"string"},"secret":{"type":"string","description":"In place of username and password: the secret the relay shares with Montage (a relay set to make logins from a shared secret). Each review then has a login of its own that runs out; \"\" for none"},"expiry":{"type":"integer","description":"With secret: how long the review link and its login last from the start, in seconds (30 to 2592000; 86400 unless given)"},"relay_only":{"type":"boolean","description":"Every viewer's media through the relay, never directly: Montage then sends media to no address but the relay's (the page and its signalling still go over HTTPS between each viewer and Montage)"}}},
 "hdr":{"type":"boolean","description":"Browsers: an HDR sequence (PQ or HLG) as 10-bit HDR to browsers that decode it, tone mapped to Rec. 709 for the rest (default true); false: SDR for everyone"},
 "hardware":{"type":"boolean","description":"Encode on NVENC where there is one"},
 "bitrate_kbps":{"type":"number","description":"250 to 200000"},
@@ -720,6 +720,18 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     connect(turn_, &QLineEdit::textChanged, this, relayChanged);
     connect(turnSecret_, &QLineEdit::textChanged, this, relayChanged);
     relayChanged();
+    // One relay's login and secret never go to another: once the relay they were given for is changed by hand, they
+    // are cleared.
+    turnFor_ = turn_->text().trimmed();
+    for (QLineEdit* login : {turnUser_, turnPassword_, turnSecret_})
+        connect(login, &QLineEdit::textEdited, this, [this] { turnFor_ = turn_->text().trimmed(); });
+    connect(turn_, &QLineEdit::textEdited, this, [this](const QString& text) {
+        if (turnFor_.isEmpty() || text.trimmed() == turnFor_) return;
+        turnUser_->clear();
+        turnPassword_->clear();
+        turnSecret_->clear();
+        turnFor_.clear();
+    });
     connect(viewers_, &QComboBox::currentIndexChanged, this, [this] {
         // Each kind keeps its own address while the other is chosen.
         const bool web = viewers_->currentData().toBool();

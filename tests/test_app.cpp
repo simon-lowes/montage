@@ -23745,6 +23745,17 @@ print("added " + ui["name"])
         secret->setText(QStringLiteral("a secret made up for this test"));
         QVERIFY(expiry->isEnabled());
         QCOMPARE(expiry->currentData().toInt(), 86400);
+        // A login and secret given for one relay are cleared when another is typed in its place.
+        auto* user = dlg->findChild<QLineEdit*>("reviewStreamTurnUser");
+        auto* password = dlg->findChild<QLineEdit*>("reviewStreamTurnPassword");
+        user->clear();
+        QTest::keyClicks(user, QStringLiteral("ana"));
+        QTest::keyClicks(turn, QStringLiteral("0"));
+        QCOMPARE(turn->text(), QStringLiteral("turn:relay.example.com:34780"));
+        QVERIFY(user->text().isEmpty() && password->text().isEmpty() && secret->text().isEmpty());
+        QTest::keyClick(turn, Qt::Key_Backspace);
+        user->setText(QStringLiteral("ana"));
+        password->setText(QStringLiteral("relay-secret"));
         secret->clear();
         rungs->setCurrentIndex(rungs->findData(2));
         hdr->setChecked(true);
