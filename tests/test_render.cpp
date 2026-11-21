@@ -29143,7 +29143,7 @@ colorspaces:
     // steadily gets the whole file.
     void liveOriginClientsThatDoNotRead() {
         QTemporaryDir dir;
-        const int size = 12 << 20;
+        const int size = 24 << 20;  // (more than a loopback connection holds on its way, on any of the systems)
         {
             QFile f(dir.filePath("big.mp4"));
             QVERIFY(f.open(QIODevice::WriteOnly));
@@ -29157,6 +29157,8 @@ colorspaces:
             s.setReadBufferSize(1024);
             s.connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
             if (!s.waitForConnected(5000)) return false;
+            // (a receive buffer of a set size: Windows can otherwise grow a loopback one by many megabytes)
+            s.setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 64 << 10);
             s.write("GET /big.mp4 HTTP/1.1\r\nHost: x\r\n\r\n");
             return s.flush() || s.bytesToWrite() == 0;
         };
