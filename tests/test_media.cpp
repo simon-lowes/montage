@@ -41094,6 +41094,30 @@ private slots:
             qInfo("a sheet of long compounds on copied elements: %lld ms", static_cast<long long>(took.elapsed()));
             QVERIFY2(took.elapsed() < 60000, qPrintable(QString::number(took.elapsed())));
             QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("too many rules to try") != std::string::npos; }));
+            // One element of 50,000 class names under 300 rules that each name 300 of them (nightly 19 Nov): the
+            // work is counted before each compound is tried, not only between elements, so trying stops part way
+            // through that one element (its rules would take billions of comparisons), and it goes without them.
+            std::string costly = "<style>";
+            std::string compound = "rect";
+            for (int i = 0; i < 300; ++i) compound += ".n" + std::to_string(49999 - i);
+            for (int i = 0; i < 300; ++i) costly += compound + " { fill: #0000ff }\n";
+            costly += "</style><rect x=\"0\" y=\"0\" width=\"100\" height=\"100\" class=\"";
+            for (int i = 0; i < 50000; ++i) costly += (i ? " n" : "n") + std::to_string(i);
+            costly += "\"/>";
+            {
+                std::ofstream f(path("costly.svg"));
+                f << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">" << costly << "</svg>";
+            }
+            notes.clear();
+            took.restart();
+            Effect one = makeEffect(p, "shape");
+            QVERIFY2(importSvgShapes(path("costly.svg"), one, w, h, &notes, &err), err.c_str());
+            qInfo("one element of many names: %lld ms", static_cast<long long>(took.elapsed()));
+            QVERIFY2(took.elapsed() < 30000, qPrintable(QString::number(took.elapsed())));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("too many rules to try") != std::string::npos; }));
+            const Image drawn = renderShape(one, 0, 100, 100, 1);
+            QCOMPARE(drawn.row(50)[50 * 4 + 2], 0.0f);  // (black, SVG's own fill, not the rules' blue)
+            QCOMPARE(drawn.row(50)[50 * 4 + 3], 1.0f);
         }
         // Text: read out (where it is, its font, size and colour) to be made titles, which a layer imported into a
         // sequence gets on the track above it, drawn where the SVG has it.
