@@ -5,10 +5,6 @@
 #ifdef Q_OS_UNIX
 #include <sys/stat.h>
 #endif
-#ifdef Q_OS_LINUX
-#include <sys/resource.h>
-#include <csignal>
-#endif
 #include <QCryptographicHash>
 #include <QtEndian>
 #include <QPainter>
@@ -2272,25 +2268,19 @@ private slots:
             QVERIFY(std::get<0>(ended[2]) == path("no-such-folder/same.mov") && !std::get<1>(ended[2]) && !std::get<2>(ended[2]).empty());
         }
         QVERIFY(waitFor([&] { return r.status().path.empty() && cs.live->look().frame >= 5; }));  // (watched on)
-        // A file that is begun and then cannot be written on (a full disk: here the process's file size limit, lowered
-        // while it records) is said the same way, and the feed is watched on.
+        // A file that is begun and then cannot be written on (a full disk: here a file of that name whose every write is
+        // refused as a full disk's, Linux's /dev/full; nightly 19 Nov: not the process's file size limit, which every
+        // other thread's files had while it was lowered) is said the same way, and the feed is watched on.
         size_t failed = 0;
 #ifdef Q_OS_LINUX
         {
             failed = 1;
-            struct rlimit was {};
-            QVERIFY(getrlimit(RLIMIT_FSIZE, &was) == 0);
-            const auto before = std::signal(SIGXFSZ, SIG_IGN);
-            struct rlimit low = was;
-            low.rlim_cur = 150000;
-            QVERIFY(setrlimit(RLIMIT_FSIZE, &low) == 0);
+            QVERIFY(QFile::link("/dev/full", QString::fromStdString(path("same-full.mov"))));
             const bool asked = r.recordTo({path("same-full.mov"), "prores_proxy"}, &err);
             const bool told = asked && waitFor([&] {
                 std::lock_guard lock(said);
                 return ended.size() >= 4;
             });
-            setrlimit(RLIMIT_FSIZE, &was);
-            std::signal(SIGXFSZ, before);
             QVERIFY2(asked, err.c_str());
             QVERIFY2(told, r.status().error.c_str());
             {
