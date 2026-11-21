@@ -22942,10 +22942,52 @@ colorspaces:
 #endif
     }
 
-    // Guessers from 48 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
-    // from elsewhere is tried every time, when right and when wrong, while they guess. The networks are fewer than the
-    // 64 connections the review keeps open at once: on a computer too busy to answer quickly every guesser's
-    // connection is open together, and with every place taken a newcomer's would be turned away before it is read.
+    // Nightly 19 Nov: many addresses holding one connection each, sending nothing, with every place taken, keep no
+    // newcomer out: when they are of one network (as the /64s of an IPv6 /56 are), and when each is of a network of
+    // its own. Each newcomer is answered in the place of the oldest, and the rest are still held.
+    void browserReviewSlotsFromManyAddresses() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+#ifndef Q_OS_LINUX
+        QSKIP("Needs every 127.x address to be this computer's (Linux)");
+#else
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        ReviewRig rig;
+        rig.picture = [](FrameTime) { return std::make_shared<const Image>(320, 180); };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        const QByteArray pass = QByteArray::fromStdString(rig.settings.passphrase);
+        for (const bool oneNetwork : {true, false}) {
+            std::vector<std::unique_ptr<QTcpSocket>> idle;
+            for (int a = 0; a < 64; ++a) {
+                auto c = std::make_unique<QTcpSocket>();
+                c->setProxy(QNetworkProxy::NoProxy);
+                const QString from = oneNetwork ? QStringLiteral("127.0.5.%1").arg(a + 1) : QStringLiteral("127.6.%1.9").arg(a);
+                if (!c->bind(QHostAddress(from))) continue;
+                c->connectToHost(QStringLiteral("127.0.0.1"), quint16(rig.port()));
+                if (c->waitForConnected(2000)) idle.push_back(std::move(c));
+            }
+            QCOMPARE(idle.size(), size_t(64));
+            QThread::msleep(200);
+            QElapsedTimer took;
+            took.start();
+            QCOMPARE(httpsStatus(oneNetwork ? "127.0.6.7" : "127.7.0.5", rig.port(), "/config", pass, 4000), 200);
+            QCOMPARE(httpsStatus(oneNetwork ? "127.0.6.8" : "127.7.1.5", rig.port(), "/config", pass, 4000), 200);
+            int still = 0;
+            for (auto& c : idle) still += c->state() == QAbstractSocket::ConnectedState && !c->waitForDisconnected(1);
+            qInfo("%s: two newcomers answered in %lld ms with %d of the 64 still held", oneNetwork ? "One network" : "Many networks",
+                  (long long)took.elapsed(), still);
+            QVERIFY(still >= 60);  // (made room for, not timed out: the handshake allows 5 s)
+            idle.clear();
+            QThread::msleep(300);
+        }
+#endif
+    }
+
+    // Guessers from 64 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
+    // from elsewhere is tried every time, when right and when wrong, while they guess. The networks are as many as the
+    // connections the review keeps open at once: on a computer too busy to answer quickly every guesser's connection
+    // is open together, and a newcomer's is answered in the place of the oldest of theirs.
     void browserReviewGuessersFromManyNetworks() {
         using namespace montage::output;
         using namespace montage::reviewtest;
@@ -22961,7 +23003,7 @@ colorspaces:
         const int port = rig.port();
         std::atomic<bool> guessing{true};
         std::atomic<int> first{0}, wrong{0}, refused{0}, dropped{0};
-        const int networks = 48;
+        const int networks = 64;
         std::vector<std::thread> guessers;
         for (int n = 0; n < networks; ++n)
             guessers.emplace_back([&, n] {

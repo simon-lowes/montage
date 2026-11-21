@@ -905,7 +905,11 @@ struct BrowserReviewBackend::Impl {
             // Full. A reviewer who gave the passphrase lately still gets in, in the place of the oldest connection
             // still waiting to be answered from anyone else. Anyone else gets in by their share: in the place of the
             // oldest connection waiting from the address (IPv6 /64) holding the most, when that holds more than
-            // theirs, so that a few addresses holding every place cannot keep a newcomer out.
+            // theirs, so that a few addresses holding every place cannot keep a newcomer out. A newcomer from an
+            // address holding none gets in even when every address holds one (many addresses of one network, as an
+            // IPv6 /56 has 256 /64s, or of many): in the place of the oldest connection waiting from the network
+            // holding the most, so that those of one network taking every place make room only for each other, and
+            // anyone else's connection is the oldest only once all the places have been taken again after it.
             QSslSocket* oldest = nullptr;
             gate.tidy(Clock::now());  // (trust that has run out counts for nothing here either)
             if (gate.trusted(from)) {
@@ -916,23 +920,32 @@ struct BrowserReviewBackend::Impl {
                     }
             } else {
                 // (of the addresses with a connection that could go: one waiting to be answered)
-                std::map<QString, int> held;
+                std::map<QString, int> held, heldAround;
                 std::set<QString> waiting;
                 for (QSslSocket* o : open)
                     if (o != c) {
                         ++held[guesser(o->peerAddress())];
+                        ++heldAround[network(o->peerAddress())];
                         if (!o->property("answered").toBool()) waiting.insert(guesser(o->peerAddress()));
                     }
                 QString most;
                 int mostHeld = 0;
                 for (const auto& [who, n] : held)
                     if (n > mostHeld && waiting.count(who) && !gate.trusted(who)) most = who, mostHeld = n;
-                if (mostHeld > held[from] + 1)
+                const int mine = held[from];
+                if (mostHeld > mine + 1)
                     for (QSslSocket* o : open)
                         if (o != c && !o->property("answered").toBool() && guesser(o->peerAddress()) == most) {
                             oldest = o;
                             break;
                         }
+                if (!oldest && mine == 0) {
+                    // (the oldest of those waiting from the networks holding the most: children are listed oldest first)
+                    int mostAround = 0;
+                    for (QSslSocket* o : open)
+                        if (o != c && !o->property("answered").toBool() && !gate.trusted(guesser(o->peerAddress())))
+                            if (const int n = heldAround[network(o->peerAddress())]; n > mostAround) oldest = o, mostAround = n;
+                }
             }
             if (!oldest) {
                 c->abort();
