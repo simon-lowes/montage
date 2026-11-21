@@ -2272,11 +2272,13 @@ private slots:
             QVERIFY(std::fabs(values["rev"] - 0.4) < 1e-12);
         }
         // ---- NRPN data entry with the fine half first (nightly 15 Nov: each value came out with the coarse half
-        // of the one before). The first pair shows the order; from then on the value is given whole, once, when its
-        // coarse half arrives; a fine half alone goes out when the parameter is next chosen.
+        // of the one before). The first pair shows the order, and its value comes once, whole (nightly 19 Nov: not
+        // first with a coarse half of 0); from then on the value is given whole, once, when its coarse half arrives;
+        // a fine half alone goes out when the parameter is next chosen.
         decoder.reset();
         events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 20, 0xB1, 6, 10});
-        QVERIFY(!events.empty() && events.back().key == nrpn && events.back().value == (10 << 7 | 20) && events.back().resolution == 16384);
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
         events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 0, 0xB1, 6, 11});
         QCOMPARE(events.size(), size_t(1));
         QVERIFY(events[0].key == nrpn && events[0].value == (11 << 7 | 0));
@@ -2290,6 +2292,18 @@ private slots:
         events = decode({0xB1, 99, 3, 0xB1, 98, 5, 0xB1, 6, 1, 0xB1, 38, 2, 0xB1, 99, 3, 0xB1, 98, 5, 0xB1, 6, 1, 0xB1, 38, 3});
         QCOMPARE(events.size(), size_t(3));
         QVERIFY(events[1].value == (1 << 7 | 2) && events[2].value == (1 << 7 | 3));
+        // The parameter chosen only once, then pair after pair with the fine half first (nightly 19 Nov: each fine
+        // half went out with the coarse half before it, and the coarse halves were lost): each value once, whole.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 20, 0xB1, 6, 10, 0xB1, 38, 30, 0xB1, 6, 11, 0xB1, 38, 40, 0xB1, 6, 12});
+        QCOMPARE(events.size(), size_t(3));
+        QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
+        QVERIFY(events[1].key == nrpn && events[1].value == (11 << 7 | 30));
+        QVERIFY(events[2].key == nrpn && events[2].value == (12 << 7 | 40));
+        // (then a fine half alone, twice: the second goes out with the coarse half it has)
+        events = decode({0xB1, 38, 41, 0xB1, 38, 42});
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (12 << 7 | 42));
 
         // ---- One fader, three targets, each in its own range.
         {
