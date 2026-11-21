@@ -19244,6 +19244,20 @@ colorspaces:
             QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
             other.setFrameLimit(size_t(1) << 40);
             QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
+            // Nightly 19 Nov: a stream's frames are held to the most it may be coded at: 4:4:4 at 12 bits up to its 36
+            // bits a pixel uncompressed, 4:2:2 at 10 bits to 24, an SDP naming more bits than that to those; 8K at
+            // 4:4:4 and 12 bits is the largest taken.
+            st::VideoFormat xs;
+            xs.codec = "jxsv", xs.width = 1920, xs.height = 1080, xs.sampling = st::Sampling::Ycc444, xs.depth = 12, xs.bpp = 5;
+            QCOMPARE(st::jxsvFrameLimit(xs), size_t(1920 * 1080 * 36 / 8 + 65536));
+            xs.sampling = st::Sampling::Ycc422, xs.depth = 10;
+            QCOMPARE(st::jxsvFrameLimit(xs), size_t(1920 * 1080 * 3 + 65536));
+            xs.bpp = 28;
+            QCOMPARE(st::jxsvFrameLimit(xs), size_t(1920 * 1080 * 28 / 8 + 65536));
+            xs.width = 8192, xs.height = 4320, xs.sampling = st::Sampling::Rgb, xs.depth = 12, xs.bpp = 5;
+            QCOMPARE(st::jxsvFrameLimit(xs), st::JxsvAssembler::kLargestFrame);
+            other.setFrameLimit(st::jxsvFrameLimit(xs));
+            QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
         }
         {
             // One whole frame with an odd long packet does not stay the measure of the frames after: once a frame of

@@ -321,6 +321,13 @@ Pgroup pgroup(Sampling s, int depth) {
         if (units * perPixelUnit * depth % 8 == 0) return {units * unitPixels, units * perPixelUnit * depth / 8};
 }
 
+size_t jxsvFrameLimit(const VideoFormat& f) {
+    const Pgroup pg = pgroup(f.sampling, f.depth);
+    const double raw = pg.pixels > 0 ? 8.0 * pg.bytes / pg.pixels : 0;
+    const double bits = std::max({24.0, std::isfinite(f.bpp) ? f.bpp : 0.0, raw});
+    return size_t(std::min(double(f.width) * f.height * bits / 8 + 65536, double(JxsvAssembler::kLargestFrame)));
+}
+
 bool videoFormatOk(const VideoFormat& f, std::string* why) {
     auto fail = [&](const std::string& w) {
         if (why) *why = w;
