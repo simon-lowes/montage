@@ -28900,10 +28900,6 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>The secret your relay shares with Montage, for a relay set to make its logins from a shared secret. Each review then has a login of its own, which reviewers&apos; pages are given instead of one that lasts, and the review link and that login stop letting anyone new in after the time chosen.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Link works for 1 hour</source>
         <translation type="unfinished"></translation>
     </message>
@@ -28931,6 +28927,10 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     </message>
     <message>
         <source>Relay secret:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The secret your relay shares with Montage, for a relay set to make its logins from a shared secret. Each review then has a login of its own, which reviewers&apos; pages are given instead of one that lasts, and the review link and that login end after the time chosen: nobody new gets in, and anyone still watching is told the link has expired.</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
