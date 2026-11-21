@@ -12861,7 +12861,8 @@ colorspaces:
             QVERIFY(changes.size() == 1 && changes[0].find("screen 1") != std::string::npos && changes[0].find("changed") != std::string::npos);
         }
         // A security manager known by the chain whose leaf names it one: a link encryptor's chain listed first is
-        // passed over; a server with only another device's certificate is refused.
+        // passed over; a server with only another device's certificate leaves its screen out, with a note, and the
+        // cinema's other screens are read as before; an FLM with no other screen is refused.
         {
             QFile in(flms[0]);
             QVERIFY(in.open(QIODevice::ReadOnly));
@@ -12879,7 +12880,19 @@ colorspaces:
             QCOMPARE(f.screens[0].server.thumbprint, thumb(cinemas[0].screens[0].server.certificates.back()));
             std::string only = original;
             only.replace(only.find(serverKeys), serverKeys.size(), le);
-            QVERIFY(!readFlm(only, f, &err) && err.find("not a security manager") != std::string::npos);
+            QVERIFY2(readFlm(only, f, &err), err.c_str());
+            QVERIFY(f.screens.size() == 2 && f.screens[0].name == "2" && f.screens[1].name == "3");
+            QCOMPARE(f.screens[0].server.thumbprint, thumb(cinemas[0].screens[1].server.certificates.back()));
+            QVERIFY(std::any_of(f.notes.begin(), f.notes.end(), [](const std::string& n) {
+                return n.find("screen 1") != std::string::npos && n.find("not a security manager") != std::string::npos;
+            }));
+            std::string none = only;
+            for (int k : {1, 2}) {
+                const std::string keys = keyInfo(cinemas[0].screens[size_t(k)].server, false);
+                QVERIFY(none.find(keys) != std::string::npos);
+                none.replace(none.find(keys), keys.size(), le);
+            }
+            QVERIFY(!readFlm(none, f, &err) && err.find("lists no screen") != std::string::npos && err.find("not a security manager") != std::string::npos);
         }
         // (a base64 letter at or before `at` changed: a different certificate of the same length)
         auto flip = [](std::string& text, size_t at) {
@@ -13153,6 +13166,21 @@ colorspaces:
         QVERIFY(dcp::signXml(two, facility, &err));
         QVERIFY2(readFlm(two, lake, &err), err.c_str());
         QVERIFY(lake.screens.size() == 2 && lake.screens[0].devices.empty() && lake.otherDevices.size() == 1 && lake.notes.size() == 1);
+        // A security manager whose certificate names only other devices' roles is left out, with a note; the FLM
+        // listed two, so the projector is still kept apart from the one screen read.
+        {
+            dcp::CertificateChain encryptor;
+            QVERIFY(dcp::makeCertificateChain("Lake Encryptor", encryptor, &err, "LE"));
+            std::string notServer = etm(true);
+            const std::string keys = etmKeyInfo(cinemas[0].screens[0].server);
+            QVERIFY(notServer.find(keys) != std::string::npos);
+            notServer.replace(notServer.find(keys), keys.size(), etmKeyInfo(encryptor));
+            QVERIFY(dcp::signXml(notServer, facility, &err));
+            Facility one;
+            QVERIFY2(readFlm(notServer, one, &err), err.c_str());
+            QVERIFY(one.screens.size() == 1 && one.screens[0].name == "Screen Two" && one.screens[0].devices.empty() && one.otherDevices.size() == 1);
+            QVERIFY(std::any_of(one.notes.begin(), one.notes.end(), [](const std::string& n) { return n.find("not a security manager") != std::string::npos; }));
+        }
         // An offset written with its sign, or without one.
         for (const char* offset : {"+01:00", "01:00"}) {
             std::string east = etm(false, offset);

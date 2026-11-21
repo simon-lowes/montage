@@ -12886,7 +12886,8 @@ void McpServer::Impl::addTools() {
     add("montage_make_kdm", "Make KDMs for an encrypted DCP",
         "Make Key Delivery Messages (SMPTE ST 430-1) so cinema servers can play an encrypted DCP, made from the DKDM "
         "montage_export_dcp kept, signed by Montage's certificate chain, its keys valid from `from` to `until`: one for "
-        "each server certificate in `servers` (the files the cinema sends; a chain file's leaf is used), and one for each "
+        "each server certificate in `servers` (the files the cinema sends; a chain file's leaf is used; each must be a "
+        "screen's server in the facility list, or a chain up to a root the user trusts), and one for each "
         "screen in `screens` from the facility list, encrypted to the screen's server with its projector and other "
         "devices in AuthorizedDeviceInfo, a folder and a zip for each cinema. `flm` reads Facility List Messages (Extended "
         "FLMs, SMPTE ST 430-16, or ST 430-7 FLMs) into the facility list first, every certificate chain checked; with "
@@ -12952,6 +12953,18 @@ void McpServer::Impl::addTools() {
             KdmRequest r;
             r.dkdm = absolute(need(a, "dkdm")).toStdString();
             for (const QJsonValue& v : a.value("servers").toArray()) r.recipients.push_back(absolute(v.toString()).toStdString());
+            if (!r.recipients.empty()) {
+                // (a KDM opens the picture to whoever holds the certificate's key: only for a server the user has
+                // taken into the facility list, or whose chain goes up to a root the user trusts)
+                if (!reading && !a.contains("screens") && !loadFacilities(facilities, &err)) return fail(QString::fromStdString(err));
+                std::vector<std::string> trusted;
+                if (!loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
+                for (const std::string& path : r.recipients)
+                    if (!knownServer(path, facilities, trusted, &err))
+                        return fail(QString::fromStdString(path + ": " + err) +
+                                    QStringLiteral(". This tool cannot trust a certificate: ask the user to add the screen in Montage (File > Make KDMs > Add Screen) "
+                                                   "or to read its cinema's FLM there"));
+            }
             std::vector<std::string> names;
             for (const QJsonValue& v : a.value("screens").toArray()) names.push_back(v.toString().toStdString());
             if (!names.empty() && !pickScreens(facilities, names, r.screens, &err)) throw ArgError{QString::fromStdString(err)};

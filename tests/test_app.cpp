@@ -9910,6 +9910,16 @@ private slots:
             QVERIFY(f.open(QIODevice::WriteOnly));
             f.write(QByteArray::fromStdString(cinema.certificates.back()));
             f.close();
+            // (a server certificate is taken only once it is a screen's in the facility list, which the user adds:
+            // the list is put back afterwards)
+            std::vector<Facility> before, list;
+            QVERIFY2(loadFacilities(before, &err), err.c_str());
+            auto restore = qScopeGuard([&] { saveFacilities(before); });
+            r = call("montage_make_kdm", {{"dkdm", locked.value("dkdm")}, {"servers", QJsonArray{server}}, {"folder", dir_.filePath("kdms")}});
+            QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("Add Screen"));
+            list = before;
+            QVERIFY2(addScreenByHand(list, "Corner Cinema", "1", server.toStdString(), {}, &err), err.c_str());
+            QVERIFY2(saveFacilities(list, &err), err.c_str());
             r = call("montage_make_kdm", {{"dkdm", locked.value("dkdm")}, {"servers", QJsonArray{server}}, {"folder", dir_.filePath("kdms")}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
             const QJsonArray kdms = r.value("structuredContent").toObject().value("kdms").toArray();
@@ -10061,6 +10071,31 @@ private slots:
             dcp::CertificateInfo projector;
             QVERIFY(dcp::readCertificate(projectors[1].certificates.back(), projector));
             QVERIFY(opened.trustedDevices == std::vector<std::string>{projector.thumbprint});
+        }
+        // A server certificate named over MCP: taken when it is a listed screen's server (its leaf alone) or a chain
+        // up to a root the user trusts; refused, and nothing written, for a chain from another root or another
+        // leaf given alone.
+        {
+            dcp::CertificateChain elsewhere;
+            QVERIFY(dcp::makeCertificateChain("Elsewhere", elsewhere, &err, "SM"));
+            auto pemFile = [&](const QString& name, const std::vector<std::string>& certs) {
+                std::string text;
+                for (const std::string& c : certs) text += c.empty() || c.back() == '\n' ? c : c + "\n";
+                const QString file = dir_.filePath(name);
+                return dcp::writeWholeFile(file.toStdString(), text) ? file : QString();
+            };
+            const QString listedLeaf = pemFile("park-server-1.pem", {servers[0].certificates.back()});
+            const QString trustedChain = pemFile("park-server-2-chain.pem", servers[1].certificates);
+            for (const QString& file : {listedLeaf, trustedChain}) {
+                r = call({{"dkdm", dkdm}, {"servers", QJsonArray{file}}, {"folder", dir_.filePath("mcp-servers")}});
+                QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+                QCOMPARE(r.value("structuredContent").toObject().value("kdms").toArray().size(), 1);
+            }
+            for (const QString& file : {pemFile("elsewhere-chain.pem", elsewhere.certificates), pemFile("elsewhere.pem", {elsewhere.certificates.back()})}) {
+                r = call({{"dkdm", dkdm}, {"servers", QJsonArray{listedLeaf, file}}, {"folder", dir_.filePath("mcp-elsewhere")}});
+                QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("not a screen's in the facility list"), QJsonDocument(r).toJson().constData());
+            }
+            QVERIFY(!QFileInfo::exists(dir_.filePath("mcp-elsewhere")));
         }
         // Refused: a screen not in the list, and a window past the DKDM's.
         QVERIFY(call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens/7"}}, {"folder", dir_.filePath("mcp-booking")}}).value("isError").toBool());

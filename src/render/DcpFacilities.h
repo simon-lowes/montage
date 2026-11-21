@@ -58,7 +58,8 @@ struct Facility {
 };
 
 // Reads an Extended FLM (ST 430-16) or an FLM (ST 430-7); false (and why) when it is neither, a chain does not check,
-// an ST 430-7 FLM's signature does not hold, or it lists no screen with a server certificate.
+// an ST 430-7 FLM's signature does not hold, or it lists no screen with a server certificate. A security manager whose
+// certificates name only other devices' roles is left out, and its screen with it, with a note.
 bool readFlm(const std::string& xml, Facility& out, std::string* error = nullptr);
 bool readFlmFile(const std::string& path, Facility& out, std::string* error = nullptr);
 
@@ -92,6 +93,11 @@ std::string rootDescription(const std::string& pem);
 // (likewise), which go into its KDMs. Replaces a screen of that name.
 bool addScreenByHand(std::vector<Facility>& list, const std::string& cinema, const std::string& screen, const std::string& server,
                      const std::vector<std::string>& devices, std::string* error = nullptr);
+
+// Whether a server certificate (PEM text or a file of it: a chain, or a leaf alone) is one KDMs may go to without the
+// user saying so: its leaf is a screen's server in `list`, or its chain checks and goes up to one of the `trusted`
+// roots; false (and why) when it is neither.
+bool knownServer(const std::string& certificate, const std::vector<Facility>& list, const std::vector<std::string>& trusted, std::string* error = nullptr);
 
 // What a booking needs of a screen: its server's leaf and its active devices' thumbprints. A screen whose suite lists
 // devices of which none can be named (all inactive, or without certificates or thumbprints) authorises its server

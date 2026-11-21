@@ -121,8 +121,10 @@ bool fail(std::string* error, const std::string& why) {
     return false;
 }
 
-// ST 430-16 DeviceType.
-bool readDevice16(const QDomElement& e, FacilityDevice& d, const std::string& where, Facility& f, std::string* error) {
+// ST 430-16 DeviceType. `notServer`: a security manager whose certificates name only other devices' roles (its suite
+// is left out of the list, with a note).
+bool readDevice16(const QDomElement& e, FacilityDevice& d, const std::string& where, Facility& f, std::string* error, bool& notServer) {
+    notServer = false;
     d.type = text(e, "DeviceTypeID");
     d.serial = text(e, "DeviceSerial");
     d.manufacturer = text(e, "Manufacturer");
@@ -147,9 +149,12 @@ bool readDevice16(const QDomElement& e, FacilityDevice& d, const std::string& wh
         if (certs.empty() || r > role) certs = chain, role = r;
     }
     if (!certs.empty()) {
-        if (d.type == "SM" && role < 0)
-            return fail(error, what + ": its certificates name other devices' roles, not a security manager's (SM)");
         if (!takeChain(d, certs, false, what, error)) return false;
+        if (d.type == "SM" && role < 0) {
+            notServer = true;
+            f.notes.push_back(what + ": its certificates name other devices' roles, not a security manager's (SM), so the screen is left out");
+            return true;
+        }
         if (byThumbprint && identifier != d.thumbprint) {
             dcp::CertificateInfo leaf;
             dcp::readCertificate(d.certificates.back(), leaf);
@@ -186,12 +191,18 @@ bool readExtended(const QDomElement& root, Facility& f, std::string* error) {
             // (names are unique in an FLM; one that repeats a name is told apart all the same)
             for (int k = 2; std::any_of(f.screens.begin(), f.screens.end(), [&](const FacilityScreen& o) { return sameName(o.name, screen.name); }); ++k)
                 screen.name = auditorium + " (" + std::to_string(k) + ")";
-            bool server = false;
+            bool server = false, notServer = false;
             for (const QDomElement& e : children(suite, "Device")) {
                 FacilityDevice d;
-                if (!readDevice16(e, d, where, f, error)) return false;
+                bool notThis = false;
+                if (!readDevice16(e, d, where, f, error, notThis)) return false;
+                if (notThis) {
+                    if (server || notServer) return fail(error, where + ": a suite with two security managers");
+                    notServer = true;
+                    continue;
+                }
                 if (d.type == "SM") {
-                    if (server) return fail(error, where + ": a suite with two security managers");
+                    if (server || notServer) return fail(error, where + ": a suite with two security managers");
                     if (d.certificates.empty()) return fail(error, where + ": its security manager has no certificate");
                     if (!d.active) f.notes.push_back(where + ": its server is marked inactive (no KDMs are made for it)");
                     screen.server = std::move(d);
@@ -201,6 +212,7 @@ bool readExtended(const QDomElement& root, Facility& f, std::string* error) {
                     screen.devices.push_back(std::move(d));
                 }
             }
+            if (notServer) continue;  // (its number kept, so the next suite's name is as it would be)
             if (!server) return fail(error, where + ": a suite with no security manager (SM)");
             f.screens.push_back(std::move(screen));
         }
@@ -240,7 +252,7 @@ bool readEtm(const std::string& xml, const QDomElement& root, Facility& f, std::
     if (text(ext, "FLMPartial") == "true") f.notes.push_back("A partial FLM: " + text(pub, "AnnotationText"));
     std::vector<FacilityDevice> servers, others;
     const QDomElement list = child(ext, "SecurityDeviceList");
-    int n = 0;
+    int n = 0, notServers = 0;
     for (QDomElement e = list.firstChildElement(); !e.isNull(); e = e.nextSiblingElement()) {
         if (e.localName() != QLatin1String("SecurityDevice") && e.localName() != QLatin1String("SecurityDeviceCertificate")) continue;
         FacilityDevice d;
@@ -252,8 +264,12 @@ bool readEtm(const std::string& xml, const QDomElement& root, Facility& f, std::
         d.name = text(desc, "DeviceName");
         const std::string what = f.name + ", device " + std::to_string(++n);
         if (!takeChain(d, certificatesIn(child(e, "KeyInfo")), false, what, error)) return false;
-        if (d.type == "SM" && serverRole(d.commonName) < 0)
-            return fail(error, what + ": its certificate names other devices' roles, not a security manager's (SM)");
+        if (d.type == "SM" && serverRole(d.commonName) < 0) {
+            // (left out, and still counted: the other devices are a screen's only when the FLM lists one server)
+            f.notes.push_back(what + ": its certificate names other devices' roles, not a security manager's (SM), so it is left out");
+            ++notServers;
+            continue;
+        }
         if (d.name.empty()) d.name = d.commonName.substr(d.commonName.find('.') == std::string::npos ? 0 : d.commonName.find('.') + 1);
         (d.type == "SM" ? servers : others).push_back(std::move(d));
     }
@@ -266,7 +282,7 @@ bool readEtm(const std::string& xml, const QDomElement& root, Facility& f, std::
         f.screens.push_back(std::move(screen));
     }
     // One screen: its devices are the rest; several: an ST 430-7 FLM does not say whose they are.
-    if (f.screens.size() == 1) f.screens.front().devices = std::move(others);
+    if (f.screens.size() == 1 && notServers == 0) f.screens.front().devices = std::move(others);
     else if (!others.empty()) {
         f.otherDevices = std::move(others);
         f.notes.push_back(std::to_string(f.otherDevices.size()) + " device(s) not in any screen's KDMs: the FLM does not say which screen each is in");
@@ -324,7 +340,8 @@ bool readFlm(const std::string& xml, Facility& out, std::string* error) {
     else if (root.localName() == QLatin1String("DCinemaSecurityMessage")) ok = readEtm(xml, root, f, error);
     else return fail(error, "Not a Facility List Message (ST 430-16 or ST 430-7)");
     if (!ok) return false;
-    if (f.screens.empty()) return fail(error, "The FLM of " + f.name + " lists no screen with a server certificate");
+    if (f.screens.empty())
+        return fail(error, "The FLM of " + f.name + " lists no screen with a server certificate" + (f.notes.empty() ? std::string() : " (" + f.notes.back() + ")"));
     out = std::move(f);
     return true;
 }
@@ -583,6 +600,25 @@ bool addScreenByHand(std::vector<Facility>& list, const std::string& cinema, con
     if (same != it->screens.end()) *same = std::move(s);
     else it->screens.push_back(std::move(s));
     return true;
+}
+
+bool knownServer(const std::string& certificate, const std::vector<Facility>& list, const std::vector<std::string>& trusted, std::string* error) {
+    if (!dcp::securityAvailable()) return fail(error, "This build has no OpenSSL, so it cannot check certificates");
+    std::string err;
+    const std::string text = readText(certificate, &err);
+    if (text.empty()) return fail(error, err.empty() ? "No server certificate" : err);
+    FacilityDevice d;
+    if (!takeChain(d, {text}, true, "The server certificate", error)) return false;
+    const std::string leaf = certificateKey(d.certificates.back());
+    for (const Facility& c : list)
+        for (const FacilityScreen& s : c.screens)
+            if (!s.server.certificates.empty() && certificateKey(s.server.certificates.back()) == leaf) return true;
+    if (d.chainComplete)
+        for (const std::string& t : trusted)
+            if (certificateKey(t) == certificateKey(d.certificates.front())) return true;
+    return fail(error, "The server certificate " + d.commonName + " is not a screen's in the facility list, and " +
+                           (d.chainComplete ? "its chain goes up to a root not trusted (" + rootDescription(d.certificates.front()) + ")"
+                                            : std::string("it is given without the chain up to its root")));
 }
 
 KdmScreen kdmScreen(const Facility& cinema, const FacilityScreen& screen) {
