@@ -380,7 +380,17 @@ int openMediaInput(AVFormatContext** fmt, const std::string& decorated) {
         av_dict_free(&o);
         return rc;
     }
-    return avformat_open_input(fmt, path.c_str(), nullptr, nullptr);
+    const int rc = avformat_open_input(fmt, path.c_str(), nullptr, nullptr);
+    // FFmpeg 9.1 claims a JPEG with a Multi-Picture Format or gain-map segment (a camera's preview, an HDR still) as
+    // two pictures at 25 frames a second; Montage reads the gain map itself, so such a JPEG opens as the one still it
+    // is, as earlier FFmpeg opened it.
+    if (rc >= 0 && *fmt && (*fmt)->iformat && (*fmt)->iformat->name && std::strcmp((*fmt)->iformat->name, "jpeg_mpf") == 0) {
+        if (const AVInputFormat* still = av_find_input_format("jpeg_pipe")) {
+            avformat_close_input(fmt);
+            return avformat_open_input(fmt, path.c_str(), still, nullptr);
+        }
+    }
+    return rc;
 }
 
 namespace {
