@@ -588,7 +588,10 @@ private:
 
 // A viewer's reports on their picture: the share of packets lost (in RTCP sender and receiver reports) and, with the
 // transport-wide sequence number extension agreed (`wideId`, 0 without), when each packet arrived. Every picture packet
-// sent is numbered here on its way out, last in the chain, so one sent again on request goes as it first did.
+// sent is numbered here on its way out, last in the chain. One sent again on a viewer's asking goes without a number
+// (what is kept for sending again is kept before this, and sent again past it): it is not judged, and the one the link
+// lost stays lost. That is as wanted: a probe judges what share of its first sending the link carried, and the share
+// of the first sending that arrives is the same whether what is sent again is counted with it or not.
 class FeedbackReader final : public rtc::MediaHandler {
 public:
     FeedbackReader(std::weak_ptr<Viewer> viewer, uint32_t ssrc, int wideId) : viewer_(std::move(viewer)), ssrc_(ssrc), wideId_(wideId) {}
