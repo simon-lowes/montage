@@ -66,6 +66,28 @@
 #ifndef GL_READ_FRAMEBUFFER_BINDING
 #define GL_READ_FRAMEBUFFER_BINDING 0x8CAA
 #endif
+#ifndef GL_PIXEL_PACK_BUFFER
+#define GL_PIXEL_PACK_BUFFER 0x88EB
+#endif
+#ifndef GL_PIXEL_UNPACK_BUFFER
+#define GL_PIXEL_UNPACK_BUFFER 0x88EC
+#endif
+#ifndef GL_PACK_ROW_LENGTH
+#define GL_PACK_ROW_LENGTH 0x0D02
+#define GL_PACK_SKIP_ROWS 0x0D03
+#define GL_PACK_SKIP_PIXELS 0x0D04
+#endif
+#ifndef GL_UNPACK_ROW_LENGTH
+#define GL_UNPACK_ROW_LENGTH 0x0CF2
+#define GL_UNPACK_SKIP_ROWS 0x0CF3
+#define GL_UNPACK_SKIP_PIXELS 0x0CF4
+#endif
+#ifndef GL_PACK_SWAP_BYTES
+#define GL_PACK_SWAP_BYTES 0x0D00
+#endif
+#ifndef GL_UNPACK_SWAP_BYTES
+#define GL_UNPACK_SWAP_BYTES 0x0CF0
+#endif
 
 namespace montage::ofx::gl {
 
@@ -318,6 +340,27 @@ void callBack(const std::function<void()>& fn) {
     c->wake.wait(lock, [&] { return std::find(c->asks.begin(), c->asks.end(), &ask) == c->asks.end(); });
 }
 
+namespace {
+
+// Pixels moved between a texture and memory (`pack`: read from the texture) as plain rows, whatever a plug-in in this
+// process left set on the context: rows as long as the picture's, nothing skipped, bytes in their order, and no buffer
+// bound to read into or write from in memory's place. (Left set, a read wrote past the picture.)
+void plainTransfers(Worker& w, bool pack) {
+    QOpenGLExtraFunctions* f = w.f;
+    const bool es = w.context->isOpenGLES();
+    const QSurfaceFormat format = w.context->format();
+    if (!es || format.majorVersion() >= 3) {
+        f->glPixelStorei(pack ? GL_PACK_ROW_LENGTH : GL_UNPACK_ROW_LENGTH, 0);
+        f->glPixelStorei(pack ? GL_PACK_SKIP_ROWS : GL_UNPACK_SKIP_ROWS, 0);
+        f->glPixelStorei(pack ? GL_PACK_SKIP_PIXELS : GL_UNPACK_SKIP_PIXELS, 0);
+    }
+    if (!es) f->glPixelStorei(pack ? GL_PACK_SWAP_BYTES : GL_UNPACK_SWAP_BYTES, 0);
+    if (es ? format.majorVersion() >= 3 : format.version() >= qMakePair(2, 1)) f->glBindBuffer(pack ? GL_PIXEL_PACK_BUFFER : GL_PIXEL_UNPACK_BUFFER, 0);
+    f->glPixelStorei(pack ? GL_PACK_ALIGNMENT : GL_UNPACK_ALIGNMENT, 4);
+}
+
+}  // namespace
+
 unsigned upload(const Image& img) {
     QOpenGLExtraFunctions* f = worker().f;
     if (!f || img.empty()) return 0;
@@ -331,7 +374,7 @@ unsigned upload(const Image& img) {
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    f->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    plainTransfers(worker(), false);
     f->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, img.width, img.height, 0, GL_RGBA, GL_FLOAT, rows.data());
     f->glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
@@ -347,6 +390,7 @@ unsigned makeTexture(int width, int height, bool half) {
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    plainTransfers(worker(), false);  // (nothing is read from a buffer for it)
     f->glTexImage2D(GL_TEXTURE_2D, 0, half ? GL_RGBA16F : GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
     f->glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
@@ -415,7 +459,7 @@ void readTexture(unsigned texture, int width, int height, bool topFirst, Image& 
     out = Image(width, height);
     const size_t row = size_t(width) * 4;
     std::vector<float> rows(topFirst ? 0 : out.px.size());
-    f->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    plainTransfers(w, true);
     f->glReadPixels(0, 0, width, height, GL_RGBA, GL_FLOAT, topFirst ? out.px.data() : rows.data());
     if (!topFirst)
         for (int y = 0; y < height; ++y) std::memcpy(out.row(height - 1 - y), rows.data() + size_t(y) * row, row * sizeof(float));
@@ -425,7 +469,7 @@ void writeTexture(unsigned texture, const Image& img) {
     QOpenGLExtraFunctions* f = worker().f;
     if (!f || !texture || img.empty()) return;
     f->glBindTexture(GL_TEXTURE_2D, texture);
-    f->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    plainTransfers(worker(), false);
     f->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.width, img.height, GL_RGBA, GL_FLOAT, img.px.data());
     f->glBindTexture(GL_TEXTURE_2D, 0);
 }
@@ -450,6 +494,7 @@ bool makeTarget(Target& t, int width, int height) {
     f->glBindTexture(GL_TEXTURE_2D, tex);
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    plainTransfers(worker(), false);
     f->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
     f->glBindTexture(GL_TEXTURE_2D, 0);
     f->glGenFramebuffers(1, &fbo);
@@ -482,7 +527,7 @@ void read(const Target& t, Image& out) {
     if (!f || !t.fbo) return;
     std::vector<float> rows(out.px.size());
     f->glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
-    f->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    plainTransfers(worker(), true);
     f->glReadPixels(0, 0, t.width, t.height, GL_RGBA, GL_FLOAT, rows.data());
     const size_t row = size_t(t.width) * 4;
     for (int y = 0; y < t.height; ++y) std::memcpy(out.row(t.height - 1 - y), rows.data() + size_t(y) * row, row * sizeof(float));

@@ -26312,6 +26312,49 @@ colorspaces:
         QCOMPARE(qAlpha(view.pixel(150, 150)), 0);
     }
 
+    // Nightly 19 Nov: pictures move between the plug-ins' textures and memory as plain rows, whatever a plug-in in
+    // Montage's process left set on the context (a read wrote past the picture with a longer row length set, and into
+    // a bound buffer instead of the picture).
+    void openFxPixelTransfersIgnoreLeftState() {
+        std::string why;
+        if (!ofx::initializeGpu(&why)) QSKIP(why.c_str());
+        const int W = 13, H = 7;
+        Image img(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* px = img.at(x, y);
+                px[0] = float(x) / W, px[1] = float(y) / H, px[2] = 0.25f, px[3] = 1;
+            }
+        Image back;
+        bool ran = ofx::gl::run([&] {
+            QOpenGLExtraFunctions* f = ofx::gl::context()->extraFunctions();
+            // (as a plug-in might leave them: rows longer than the picture's, some skipped, and buffers bound)
+            GLuint buffers[2] = {0, 0};
+            f->glGenBuffers(2, buffers);
+            f->glBindBuffer(0x88EB /* GL_PIXEL_PACK_BUFFER */, buffers[0]);
+            f->glBufferData(0x88EB, 64, nullptr, GL_STREAM_READ);
+            f->glBindBuffer(0x88EC /* GL_PIXEL_UNPACK_BUFFER */, buffers[1]);
+            f->glBufferData(0x88EC, 64, nullptr, GL_STREAM_DRAW);
+            f->glPixelStorei(0x0D02 /* GL_PACK_ROW_LENGTH */, W + 5);
+            f->glPixelStorei(0x0D03 /* GL_PACK_SKIP_ROWS */, 2);
+            f->glPixelStorei(0x0CF2 /* GL_UNPACK_ROW_LENGTH */, W + 3);
+            f->glPixelStorei(0x0CF4 /* GL_UNPACK_SKIP_PIXELS */, 1);
+            const unsigned texture = ofx::gl::makeTexture(W, H);
+            ofx::gl::writeTexture(texture, img);
+            ofx::gl::readTexture(texture, W, H, true, back);
+            ofx::gl::destroyTexture(texture);
+            f->glBindBuffer(0x88EB, 0);
+            f->glBindBuffer(0x88EC, 0);
+            f->glDeleteBuffers(2, buffers);
+            while (f->glGetError() != GL_NO_ERROR) {
+            }
+        });
+        QVERIFY(ran);
+        QCOMPARE(back.width, W);
+        QCOMPARE(back.height, H);
+        QVERIFY(back.px == img.px);
+    }
+
     // A plug-in that renders with OpenGL takes its picture from a texture of a context that shares its textures with
     // the plug-ins' (as the GPU compositor's OpenGL context does) and draws into another, with nothing read back. The
     // pictures match the CPU's within 1/1023, for an effect that tells the top of the picture from the bottom and for
