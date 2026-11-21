@@ -29,6 +29,7 @@
 
 #include "audio/DynLib.h"
 #include "audio/PluginHost.h"
+#include "audio/PluginHostInternal.h"
 #include "core/Effects.h"
 #include "core/Expression.h"
 #include "core/ProjectLock.h"
@@ -2755,30 +2756,42 @@ std::string effectName(const Effect& e) {
     return it != e.strings.end() && !it->second.empty() ? it->second : "OpenFX Plugin";
 }
 
+namespace {
+// A picture that comes back without its effect, for `why`. An export's picture would go on without it and the export
+// would say it went well, so the export rendering on this thread is told and stops, naming the plug-in: one not
+// installed or blocked here, or one failing in this process. (One in a host tells it in remote::render.) A render that
+// is no export's tells nobody. Always false.
+bool lost(const Effect& e, const PluginDesc* d, std::string why, std::string* error) {
+    if (plugins::renderingForExport() && !(d && !d->id.empty() && plugins::remote::pluginHeldBypassed(d->id))) {
+        const std::string name = d && !d->label.empty() ? d->label : effectName(e);
+        const std::string named = name + " ";
+        plugins::remote::noteOfflineFailure(name, why.rfind(named, 0) == 0 ? why.substr(named.size()) : "could not render: " + why);
+    }
+    if (error) *error = std::move(why);
+    return false;
+}
+}  // namespace
+
 bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch, std::string* error, const ColorSpace* working) {
     if (img.empty()) return true;
+    PluginDesc d;
+    std::string why;
     if (remote::isolated()) {
         // In a plug-in host (render/OfxRemote.h).
-        PluginDesc d;
-        if (!Registry::instance().lookUp(e, d, error)) return false;
-        if (d.transition() || d.generator()) {
-            if (error) *error = d.label + (d.transition() ? " is a transition" : " is a generator") + ", not a clip effect";
-            return false;
-        }
+        if (!Registry::instance().lookUp(e, d, &why)) return lost(e, nullptr, std::move(why), error);
+        if (d.transition() || d.generator())
+            return lost(e, &d, d.label + (d.transition() ? " is a transition" : " is a generator") + ", not a clip effect", error);
         Image out;
         if (!remote::render(remote::Kind::Effect, e, d, t, 0, scale, img.width, img.height, &img, nullptr, out, &fetch, error, working))
             return false;
         img = std::move(out);
         return true;
     }
-    PluginDesc d;
     Loaded* l = nullptr;
-    GiveBack inst{acquire(e, d, l, error)};
-    if (!inst.inst) return false;
-    if (d.transition() || d.generator()) {
-        if (error) *error = d.label + (d.transition() ? " is a transition" : " is a generator") + ", not a clip effect";
-        return false;
-    }
+    GiveBack inst{acquire(e, d, l, &why)};
+    if (!inst.inst) return lost(e, &d, std::move(why), error);
+    if (d.transition() || d.generator())
+        return lost(e, &d, d.label + (d.transition() ? " is a transition" : " is a generator") + ", not a clip effect", error);
     Job job;
     job.effect = &e;
     job.t = t;
@@ -2787,7 +2800,7 @@ bool applyEffect(const Effect& e, double t, Image& img, double scale, const Fram
     job.source = &img;
     job.fetch = &fetch;
     Image out;
-    if (!runRender(d, l, inst.inst, job, out, error, working)) return false;
+    if (!runRender(d, l, inst.inst, job, out, &why, working)) return lost(e, &d, std::move(why), error);
     img = std::move(out);
     return true;
 }
@@ -2803,23 +2816,17 @@ bool applyTransition(const Effect& e, double t, double progress, const Image& fr
     // (a side with nothing is transparent; the other is fitted to the first)
     Image a = from.empty() ? Image(w, h) : from;
     Image b = to.empty() ? Image(w, h) : to.width == w && to.height == h ? to : resizeImage(to, w, h);
+    PluginDesc d;
+    std::string why;
     if (remote::isolated()) {
-        PluginDesc d;
-        if (!Registry::instance().lookUp(e, d, error)) return false;
-        if (!d.transition()) {
-            if (error) *error = d.label + " is not a transition";
-            return false;
-        }
+        if (!Registry::instance().lookUp(e, d, &why)) return lost(e, nullptr, std::move(why), error);
+        if (!d.transition()) return lost(e, &d, d.label + " is not a transition", error);
         return remote::render(remote::Kind::Transition, e, d, t, std::clamp(progress, 0.0, 1.0), scale, w, h, &a, &b, out, nullptr, error, working);
     }
-    PluginDesc d;
     Loaded* l = nullptr;
-    GiveBack inst{acquire(e, d, l, error)};
-    if (!inst.inst) return false;
-    if (!d.transition()) {
-        if (error) *error = d.label + " is not a transition";
-        return false;
-    }
+    GiveBack inst{acquire(e, d, l, &why)};
+    if (!inst.inst) return lost(e, &d, std::move(why), error);
+    if (!d.transition()) return lost(e, &d, d.label + " is not a transition", error);
     Job job;
     job.effect = &e;
     job.t = t;
@@ -2827,34 +2834,28 @@ bool applyTransition(const Effect& e, double t, double progress, const Image& fr
     job.width = w, job.height = h;
     job.images = {{kOfxImageEffectTransitionSourceFromClipName, &a}, {kOfxImageEffectTransitionSourceToClipName, &b}};
     job.progress = std::clamp(progress, 0.0, 1.0);
-    return runRender(d, l, inst.inst, job, out, error, working);
+    return runRender(d, l, inst.inst, job, out, &why, working) || lost(e, &d, std::move(why), error);
 }
 
 bool renderGenerator(const Effect& e, double t, int w, int h, double scale, Image& out, std::string* error, const ColorSpace* working) {
     if (w <= 0 || h <= 0) return false;
+    PluginDesc d;
+    std::string why;
     if (remote::isolated()) {
-        PluginDesc d;
-        if (!Registry::instance().lookUp(e, d, error)) return false;
-        if (!d.generator()) {
-            if (error) *error = d.label + " is not a generator";
-            return false;
-        }
+        if (!Registry::instance().lookUp(e, d, &why)) return lost(e, nullptr, std::move(why), error);
+        if (!d.generator()) return lost(e, &d, d.label + " is not a generator", error);
         return remote::render(remote::Kind::Generator, e, d, t, 0, scale, w, h, nullptr, nullptr, out, nullptr, error, working);
     }
-    PluginDesc d;
     Loaded* l = nullptr;
-    GiveBack inst{acquire(e, d, l, error)};
-    if (!inst.inst) return false;
-    if (!d.generator()) {
-        if (error) *error = d.label + " is not a generator";
-        return false;
-    }
+    GiveBack inst{acquire(e, d, l, &why)};
+    if (!inst.inst) return lost(e, &d, std::move(why), error);
+    if (!d.generator()) return lost(e, &d, d.label + " is not a generator", error);
     Job job;
     job.effect = &e;
     job.t = t;
     job.scale = scale;
     job.width = w, job.height = h;
-    return runRender(d, l, inst.inst, job, out, error, working);
+    return runRender(d, l, inst.inst, job, out, &why, working) || lost(e, &d, std::move(why), error);
 }
 
 bool rendersTextures(const Effect& e, std::string* why, bool transition) {

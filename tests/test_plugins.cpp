@@ -2944,6 +2944,56 @@ private slots:
         QVERIFY(hostsGone());
     }
 
+    // Nightly 19 Nov: an export stops, naming the plug-in, also when an OpenFX plug-in it would lose is not installed
+    // here, or fails in Montage's own process, in a host or not. Both were left out of every frame of an export that
+    // said it went well. A render that is no export's still just leaves the effect out.
+    void exportStopsAtAMissingOrFailingOpenFxPlugin() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-export-missing-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert));
+        QVERIFY(reg.find("org.montage.test.dissolve/1", dissolve));
+        ExportSettings st;
+        st.path = path("ofx-export-missing.mkv").toStdString();
+        st.videoCodec = "ffv1";
+        st.audioCodec = "none";
+        for (const bool isolated : {false, true}) {
+            Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
+            // A project made where a plug-in is installed that this computer does not have.
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+            Clip clip = makeGeneratorClip(p, "color", 10);
+            Effect gone = ofx::makeEffect(p, invert);
+            gone.strings["ofx_id"] = "org.montage.test.elsewhere/1";
+            gone.strings["ofx_name"] = "Test Elsewhere";
+            clip.effects.push_back(gone);
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, clip).ok);
+            std::string err;
+            QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in Test Elsewhere is not installed"), err.c_str());
+            // Rendered for no export, the effect is left out and nothing is told.
+            const uint64_t before = offlineFailureSerial();
+            Image img(8, 8);
+            img.fill(0.2f, 0.4f, 0.6f, 1.0f);
+            QVERIFY(!ofx::applyEffect(gone, 0, img, 1.0, {}, &err));
+            QCOMPARE(offlineFailureSerial(), before);
+            // A plug-in that will not render as a clip's effect (a transition put there) fails as the export renders.
+            Effect wrong = ofx::makeEffect(p, dissolve);
+            s.videoTracks[0].clips[0].effects = {wrong};
+            QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in Test Dissolve ") && err.find("transition") != std::string::npos,
+                     err.c_str());
+            // With the plug-in it names, the export goes through.
+            s.videoTracks[0].clips[0].effects = {ofx::makeEffect(p, invert)};
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            ofx::remote::releaseIdle();
+        }
+    }
+
     // Phase 15 #2: OpenFX on-screen controls drawn by the plug-in's host. The host draws them (the Draw Suite and
     // OpenGL alike) into one premultiplied picture at the monitor's size and pixel ratio; it is the drawing Montage
     // makes in its own process, within 1/255, and a drag sets what it sets there. No instance is made in Montage.
