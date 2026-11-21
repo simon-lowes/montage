@@ -23052,7 +23052,7 @@ colorspaces:
     // no try of its network's (reviewers behind one network where one had mistyped were refused untried after the
     // third). With more networks guessing than the gate lists, a newcomer from elsewhere is still tried (the ration
     // the networks not listed share gained a try in a quarter of an hour), and what the guessers together may try
-    // stays a few a second.
+    // stays a few a second. Guessers asking faster than the rations fill keep no newcomer out (nightly 19 Nov).
     void reviewPassphraseGate() {
         using namespace montage::output;
         using namespace std::chrono_literals;
@@ -23137,6 +23137,65 @@ colorspaces:
             }
             QCOMPARE(newcomers, 12);
             QVERIFY2(wrong >= 100 && wrong <= 10 * 60 + 600, qPrintable(QString::number(wrong)));
+        }
+        {
+            // The list full, and then guessers from 200 networks not listed asking fifty a second between them, ten
+            // times what the ration they share fills by. Once each has guessed wrong (the first minute and a half),
+            // for two minutes a newcomer from another such network every five seconds, with the right passphrase:
+            // every one is tried, and the guessers together are tried no more than five a second.
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            for (int n = 0; n < int(Gate::kListed); ++n) {
+                now += 1ms;
+                if (gate.ask(address(n, 9), network(n), now).answer == Gate::Answer::Try) gate.wrong(address(n, 9), network(n), now);
+            }
+            QCOMPARE(gate.networksListed(), Gate::kListed);
+            int newcomers = 0, wrong = 0, wrongMeanwhile = 0;
+            for (int step = 0; step < 50 * 210; ++step) {
+                now += 20ms;
+                const int other = 10000 + step % 200;
+                if (gate.ask(address(other, 9), network(other), now).answer == Gate::Answer::Try) {
+                    ++wrong;
+                    wrongMeanwhile += step >= 50 * 90;
+                    gate.wrong(address(other, 9), network(other), now);
+                }
+                if (step >= 50 * 90 && step % 250 == 0) {
+                    const int fresh = 30000 + step;
+                    const Gate::Verdict v = gate.ask(address(fresh, 5), network(fresh), now);
+                    QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString("the newcomer at %1 s").arg(step * 0.02)));
+                    gate.right(address(fresh, 5), network(fresh), now, v);
+                    ++newcomers;
+                }
+            }
+            QCOMPARE(newcomers, 24);
+            QVERIFY2(wrongMeanwhile <= 5 * 120 + 4, qPrintable(QString::number(wrongMeanwhile)));
+            QVERIFY2(wrong >= 5 * 200, qPrintable(QString::number(wrong)));
+        }
+        {
+            // 200 addresses behind one network (one shared by many, as a carrier's) guessing twenty a second
+            // between them, four times what its ration fills by: after the first minute, a newcomer behind the same
+            // network every five seconds is tried, and let in with the right passphrase.
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            int newcomers = 0, wrong = 0;
+            for (int step = 0; step < 20 * 180; ++step) {
+                now += 50ms;
+                const int host = 1 + step % 200;
+                if (gate.ask(address(1, host), network(1), now).answer == Gate::Answer::Try) {
+                    ++wrong;
+                    gate.wrong(address(1, host), network(1), now);
+                }
+                if (step >= 20 * 60 && step % 100 == 0) {
+                    const int host = 201 + newcomers;
+                    const Gate::Verdict v = gate.ask(address(1, host), network(1), now);
+                    QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString("the newcomer at %1 s").arg(step * 0.05)));
+                    gate.right(address(1, host), network(1), now, v);
+                    QVERIFY(gate.trusted(address(1, host)));
+                    ++newcomers;
+                }
+            }
+            QCOMPARE(newcomers, 24);
+            QVERIFY2(wrong <= 5 * 180 + 4, qPrintable(QString::number(wrong)));
         }
     }
 
