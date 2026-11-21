@@ -16596,6 +16596,7 @@ private slots:
         }
         // Codecs that cannot carry the overhead channels fold them down instead of failing or turning into stereo:
         // AAC and FLAC to the ear-level 7.1 or 5.1, AC-3 to 5.1, MP3 to stereo; PCM keeps them all.
+        // (FFmpeg 9.1's AAC takes 7.1.4 too, but in a form players may not place, so it folds there as well.)
         QCOMPARE(exportAudioLayout("7.1.4", "aac"), std::string("7.1"));
         QCOMPARE(exportAudioLayout("5.1.4", "flac"), std::string("5.1"));
         QCOMPARE(exportAudioLayout("7.1.4", "pcm_s24le"), std::string("7.1.4"));

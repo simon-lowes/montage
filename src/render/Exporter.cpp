@@ -2928,8 +2928,11 @@ std::string exportAudioLayout(const std::string& layout, const std::string& code
         if (codec.rfind("pcm_", 0) == 0) return layout;
         return codec == "aac" || codec == "libfdk_aac" || codec == "aac_at" ? "ambix" : "stereo";
     }
-    if (exportCodecCarries(codec, layout)) return layout;
     const std::string ear = earLevelLayout(layout);
+    // FFmpeg's own AAC (from 9.1) writes the overhead layouts other than 5.1.2 through a program config element,
+    // which players may not place: those fold to the ear level, as earlier FFmpeg exported them.
+    const bool unreadable = codec == "aac" && ear != layout && layout != "5.1.2";
+    if (!unreadable && exportCodecCarries(codec, layout)) return layout;
     if (codec == "eac3" && (layout == "7.1" || ear == "7.1")) return "7.1";  // (in two substreams, render/Ac3.h)
     if (ear != layout && exportCodecCarries(codec, ear)) return ear;
     if (layoutChannels(layout) > 6 && exportCodecCarries(codec, "5.1")) return "5.1";
