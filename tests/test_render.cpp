@@ -16100,6 +16100,49 @@ colorspaces:
         timer.restart();
         QCOMPARE(int(titleGlyphs(on, 0, 800, 600, 1.0, 30, 30).size()), 5);
         QVERIFY2(timer.elapsed() < 20000, qPrintable(QString::number(timer.elapsed())));
+        // Nightly 19 Nov: 60,000 letters each faded in by the Text Animation, half a second into its second. Each
+        // letter's unit is found by a search, not by going over every unit (letters squared: seconds a frame), so it
+        // costs about what the letters alone do; the first letters are in and the last still out.
+        const int many = 60000;
+        Effect faded = makeEffect(p, "title");
+        faded.strings["font"] = "DejaVu Sans";
+        faded.params["size"] = 12.0;
+        faded.strings["text"] = std::string(size_t(many), 'i');
+        SvgTextLayout row;
+        for (int i = 0; i < many; ++i) row.x.push_back(double(i % 700));
+        faded.strings["svg_text"] = svgTextLayoutJson(row);
+        timer.restart();
+        QCOMPARE(int(titleGlyphs(faded, 15, 800, 600, 1.0, 30, 30).size()), many);
+        const qint64 still = timer.elapsed();
+        faded.params["text_anim"] = 2.0;  // Fade, by letter
+        timer.restart();
+        const std::vector<TitleGlyph> fading = titleGlyphs(faded, 15, 800, 600, 1.0, 30, 30);
+        const qint64 animated = timer.elapsed();
+        QCOMPARE(int(fading.size()), many);
+        qInfo("60,000 letters: %lld ms still, %lld ms fading in", static_cast<long long>(still), static_cast<long long>(animated));
+        QVERIFY2(animated < still * 2 + 1000, qPrintable(QString("%1 ms still, %2 ms fading in").arg(still).arg(animated)));
+        QVERIFY2(fading.front().opacity > 0.99 && fading.back().opacity < 0.01,
+                 qPrintable(QString("%1 %2").arg(fading.front().opacity).arg(fading.back().opacity)));
+        // The search itself: every character of three lines of two-letter words and single letters, against going
+        // over the units; then 300,000 units each looked up (going over them would be 4.5 x 10^10 steps).
+        std::vector<TitleTextUnit> words;
+        for (int line = 0; line < 3; ++line)
+            for (int from = line; from < 40; from += 3) words.push_back({line, from, line == 1 ? 1 : 2});
+        for (int line = -1; line < 4; ++line)
+            for (int from = -1; from < 45; ++from) {
+                int want = -1;
+                for (size_t u = 0; u < words.size(); ++u)
+                    if (words[u].line == line && from >= words[u].from && from < words[u].from + words[u].len) want = int(u);
+                QCOMPARE(titleTextUnitAt(words, line, from), want);
+            }
+        std::vector<TitleTextUnit> letters;
+        for (int i = 0; i < 300000; ++i) letters.push_back({i / 1000, 2 * (i % 1000), 1});
+        timer.restart();
+        long found = 0;
+        for (int i = 0; i < 300000; ++i) found += titleTextUnitAt(letters, i / 1000, 2 * (i % 1000)) == i;
+        QCOMPARE(found, 300000L);
+        QCOMPARE(titleTextUnitAt(letters, 5, 1), -1);
+        QVERIFY2(timer.elapsed() < 5000, qPrintable(QString::number(timer.elapsed())));
     }
 
     void textOnMasksAndShapePaths() {

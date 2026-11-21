@@ -134,6 +134,14 @@ std::optional<SvgTextLayout> parseSvgTextLayout(const std::string& json);
 // The title's font axes of its own (params "axis.<tag>", for every character; runs' axes override them).
 std::vector<std::string> titleAxes(const Effect& g);
 
+// A unit of the title's Text Animation (text_anim: a letter, word or line), as characters of one line of its text.
+struct TitleTextUnit {
+    int line = 0, from = 0, len = 0;
+};
+// Which of `units` (in order of line, then start, none overlapping) holds character `from` of line `line`: its index,
+// or -1 (a space between them). Found by a search: a title animated by letter has tens of thousands.
+int titleTextUnitAt(const std::vector<TitleTextUnit>& units, int line, int from);
+
 // One glyph cluster of a styled title as drawn at frame t.
 struct TitleGlyph {
     int index = 0, length = 0;  // its characters in the title's text (newlines counted)
