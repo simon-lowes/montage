@@ -29239,6 +29239,19 @@ colorspaces:
         QCOMPARE(liveBlockingReload(listed, 13, 6), 0);  // (the advance part limit of half second parts: six past the last)
         QCOMPARE(liveBlockingReload(listed, 13, 7), 400);
         QCOMPARE(liveBlockingReload(listed + "#EXT-X-ENDLIST\n", 99, -1), 200);
+        // Nightly 19 Nov: a part of the segment after the one being made is too far ahead when it is more than the advance
+        // part limit past the last part listed, the rest of the segment being made counted (as many parts as the last
+        // segment listed: here four, one of them made, so three to come, then the asked part's own from its first).
+        const std::string withParts = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.5\n"
+                                      "#EXT-X-PART-INF:PART-TARGET=0.5\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:2.0,\nseg00010.m4s\n"
+                                      "#EXT-X-PART:DURATION=0.5,URI=\"seg00011.1.m4s\"\n#EXT-X-PART:DURATION=0.5,URI=\"seg00011.2.m4s\"\n"
+                                      "#EXT-X-PART:DURATION=0.5,URI=\"seg00011.3.m4s\"\n#EXT-X-PART:DURATION=0.5,URI=\"seg00011.4.m4s\"\n#EXTINF:2.0,\nseg00011.m4s\n"
+                                      "#EXT-X-PART:DURATION=0.5,URI=\"seg00012.1.m4s\"\n";
+        QCOMPARE(liveBlockingReload(withParts, 12, 6), 0);
+        QCOMPARE(liveBlockingReload(withParts, 12, 7), 400);
+        QCOMPARE(liveBlockingReload(withParts, 13, 2), 0);
+        QCOMPARE(liveBlockingReload(withParts, 13, 3), 400);
+        QCOMPARE(liveBlockingReload(listed, 14, 5), 0);  // (the segment before listed no parts: its own counted from its first)
 
         // A package made with sound and parts asked a tenth of a second long, its playlists read as they change.
         if (avcodec_find_encoder_by_name("libx264")) {

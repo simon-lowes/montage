@@ -1873,7 +1873,7 @@ std::string livePreloadHint(int64_t segment, int partsMade, int partsPerSegment)
 
 int liveBlockingReload(const std::string& playlist, int64_t msn, int part) {
     int64_t sequence = 0, complete = 0;
-    int partsAfter = 0;
+    int partsAfter = 0, partsBefore = 0;  // (the parts listed after the last segment, and those of the last segment)
     double partTarget = 0;
     size_t at = 0;
     while (at <= playlist.size()) {
@@ -1888,7 +1888,7 @@ int liveBlockingReload(const std::string& playlist, int64_t msn, int part) {
             const size_t t = line.find("PART-TARGET=");
             if (t != std::string_view::npos) partTarget = std::atof(std::string(line.substr(t + 12)).c_str());
         } else if (line.rfind("#EXT-X-PART:", 0) == 0) ++partsAfter;
-        else if (!line.empty() && line[0] != '#') ++complete, partsAfter = 0;
+        else if (!line.empty() && line[0] != '#') ++complete, partsBefore = partsAfter, partsAfter = 0;
     }
     if (msn < 0) return 400;
     const int64_t last = sequence + complete - 1;
@@ -1898,8 +1898,10 @@ int liveBlockingReload(const std::string& playlist, int64_t msn, int part) {
         // (the advance part limit: three, or with parts of under a second three seconds of them)
         const int limit = partTarget > 0 && partTarget < 1 ? int(std::ceil(3 / partTarget)) : 3;
         if (msn == last + 1 && partsAfter > part) return 200;
-        // (of the segment after the one being made, counted from its first)
-        if (part > (msn == last + 1 ? partsAfter - 1 : -1) + limit) return 400;
+        // (of the segment after the one being made, counted from the last part listed: the parts of the one being made
+        // still to come, as many as the last segment had, then its own from its first)
+        const int toCome = std::max(0, partsBefore - partsAfter);
+        if (part > (msn == last + 1 ? partsAfter - 1 : -1 - toCome) + limit) return 400;
     }
     return 0;
 }
