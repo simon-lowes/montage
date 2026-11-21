@@ -3264,6 +3264,83 @@ private slots:
         QVERIFY(!failureOf(probe.id).has_value());
     }
 
+    // Nightly 19 Nov: a late reply says what the effect was when its event was sent, and one handed on with the next
+    // pen or key writes only what is still as it was then. (It wrote all it set over newer edits, as one undo step;
+    // and the monitor, which kept the effect as asked, stopped keeping it while a slow draw was out, so late replies
+    // after one were lost.)
+    void lateOpenFxControlRepliesKeepNewerEdits() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-controls-newer-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc probe;
+        QVERIFY(reg.find("org.montage.test.probe/1", probe));
+        Project p = makeDefaultProject();
+        Hosting hostingMode(Isolation::PerInstance);
+        // (as isolatedOpenFxControlsDrawTheSame: Centre (0.3, 0.6) is at view (120, 80), and view (x, y) is Centre
+        // (x / 400, (200 - y) / 200))
+        ofx::View v;
+        v.width = 400, v.height = 200, v.frameW = 400, v.frameH = 200;
+        v.m[0] = 1, v.m[1] = 0, v.m[2] = 0, v.m[3] = 0, v.m[4] = -1, v.m[5] = 200;
+        std::string err;
+        Effect e = ofx::makeEffect(p, probe);
+        e.params["param.centre.x"] = Param(0.3);
+        e.params["param.centre.y"] = Param(0.6);
+        std::unique_ptr<ofx::Interact> c;
+        {
+            Fault f("slow:pen:1");  // (the drag's first move in time, all later moves and releases late)
+            c = ofx::Interact::open(e, &err);
+        }
+        QVERIFY2(c && c->remote(), err.c_str());
+        auto near = [](const Effect& x, const char* key, double want) { return std::fabs(x.params.at(key).at(0) - want) < 1e-9; };
+        Effect edited;
+        bool changed = false;
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, e, 0, v, 120, 80, 1, edited, changed));
+        QVERIFY(c->pen(ofx::Interact::Pen::Move, e, 0, v, 150, 60, 1, edited, changed) && changed);
+        e = edited;  // (Centre (0.375, 0.7))
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, e, 0, v, 160, 50, 1, edited, changed) && !changed && c->waiting());
+        // The late release's Centre, and the effect as the release was sent with it.
+        Effect set, asked;
+        QVERIFY(eventually([&] { return c->lateEdits(set, &asked); }, 10000));
+        QVERIFY(near(set, "param.centre.x", 0.4) && near(set, "param.centre.y", 0.75));
+        QVERIFY(near(asked, "param.centre.x", 0.375) && near(asked, "param.centre.y", 0.7));
+        e.params["param.centre.x"] = Param(0.4), e.params["param.centre.y"] = Param(0.75);  // (as the monitor writes it)
+        // Another drag released late, then Centre's x set by the user before the reply is handed on.
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, e, 0, v, 160, 50, 1, edited, changed));
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, e, 0, v, 170, 40, 1, edited, changed) && c->waiting());
+        Effect now = e;
+        now.params["param.centre.x"] = Param(0.9);
+        ofx::Overlay o;
+        QVERIFY(eventually([&] {
+            c->draw(now, 0, v, o);
+            return !c->waiting();
+        }, 10000));
+        // A key goes with the reply's y, which nothing has changed since, and the user's x, which stays.
+        QVERIFY(!c->key(true, 0x61, "a", now, 0, v, edited, changed));
+        QVERIFY(changed);
+        QVERIFY2(near(edited, "param.centre.x", 0.9), qPrintable(QString::number(edited.params.at("param.centre.x").at(0))));
+        QVERIFY(near(edited, "param.centre.y", 0.8));
+        // A late reply that only sets what the user has changed since hands on nothing.
+        e = edited;
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, e, 0, v, 360, 40, 1, edited, changed));
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, e, 0, v, 360, 20, 1, edited, changed) && c->waiting());  // (y 0.9)
+        now = e;
+        now.params["param.centre.y"] = Param(0.5);
+        QVERIFY(eventually([&] {
+            c->draw(now, 0, v, o);
+            return !c->waiting();
+        }, 10000));
+        QVERIFY(!c->key(true, 0x61, "a", now, 0, v, edited, changed));
+        QVERIFY(!changed && near(edited, "param.centre.y", 0.5) && near(edited, "param.centre.x", 0.9));
+        QVERIFY(!c->failed());
+        c.reset();
+        QVERIFY(eventually([] {
+            ofx::remote::releaseIdle();
+            return runningHosts().empty();
+        }, 20000));
+    }
+
     // In a host shared by a maker's plug-ins, the second of two crashes it while loading: that one alone is blocked
     // (the host said which plug-in it was loading), and the first is started again as if nothing of its own failed.
     void sharedHostBlamesThePlugInLoading() {

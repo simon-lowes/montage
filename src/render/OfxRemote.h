@@ -66,8 +66,9 @@ public:
     // A message is still out (waiting()), and for longer than the deadline (unresponsive()).
     bool waiting() const;
     bool unresponsive() const;
-    // What a late pen or key reply set and no event has handed on yet: only those parameters and strings.
-    bool lateEdits(Effect& changes);
+    // What a late pen or key reply set and no event has handed on yet: only those parameters and strings, and the
+    // effect its event was sent with (`asked`).
+    bool lateEdits(Effect& changes, Effect* asked = nullptr);
     const std::string& failure() const { return failure_; }
     struct Link;
 
@@ -83,7 +84,8 @@ private:
     void fail(int result);
     bool takeImage(double pixelRatio);
     bool readEdited(Effect& edited, bool& changed);
-    bool takeLate(Effect& into);  // (merges what late replies set into `into`)
+    // `edited`: `now` with what late replies set that is still as it was when their event was sent (lateAnswer).
+    bool takeLate(const Effect& now, Effect& edited);
     std::unique_ptr<Link> link_;
     PluginDesc desc_;
     std::string bypass_;  // what a failure past its restarts bypasses (render/OfxRemote.cpp bypassKey)
@@ -96,6 +98,8 @@ private:
     std::string drawnMsg_;    // the draw whose picture last_ is (not asked again while drawing without waiting)
     std::string pendingDraw_;
     Effect late_;             // what late pen and key replies set
+    Effect lateAsked_;        // the effect the first of them was asked with
+    Effect pendingAsked_;     // the effect the pen or key still out was sent with
     bool lateEdits_ = false;
     bool failed_ = false;
     std::string failure_;

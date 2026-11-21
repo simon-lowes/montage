@@ -43,10 +43,7 @@ public:
     // Whether an effect's open controls run in a plug-in host, and whether they are not answering it now.
     bool inHost(Id clip, Id effect) const;
     bool unresponsive(Id clip, Id effect) const;
-    // What an answer that came late may still write. `asked`: the effect as it was when the control was sent the pen
-    // or key the answer is to; `now`: as it is; `changes`: the parameters and strings the answer sets. `edited` is
-    // `now` with those of them that are still as they were when asked (one changed since keeps its newer value);
-    // false when that leaves nothing to change.
+    // What an answer that came late may still write: render/Ofx.h's lateAnswer.
     static bool lateAnswer(const Effect& asked, const Effect& now, const Effect& changes, Effect& edited);
 
 protected:
@@ -59,11 +56,9 @@ private:
     // Writes what the plugin set into the effect (inside the open gesture, or as its own undo step).
     void apply(const Target& t, const Effect& edited, bool gesture);
     // What a late answer from controls in a host set (`changes`: those parameters and strings), as its own step:
-    // lateAnswer's, against the effect as it was when the control was asked (`asked`).
+    // lateAnswer's, against the effect as it was when the control was asked (`asked`: the controls keep it, for the
+    // pen or key that answer is to).
     void applyLate(const Target& t, const Effect& changes, const Effect& asked);
-    // The effect as it was when its control was last sent a pen or key with no answer out (`now` when never).
-    Effect askedAs(const Target& t, const Effect& now) const;
-    void noteAsked(const Target& t, const Effect& e, const ofx::Interact& in);
     bool pen(ofx::Interact::Pen kind, QEvent* e);
 
     EditorState* state_;
@@ -72,8 +67,6 @@ private:
         std::string plugin;  // ofx_id it was opened for
         Target target;
         std::unique_ptr<ofx::Interact> interact;
-        Effect asked;  // the effect when a pen or key was last sent with no answer out
-        bool hasAsked = false;
     };
     std::map<std::pair<Id, Id>, Open> open_;
     Target pressed_;           // the effect a press went to, while the pen is down

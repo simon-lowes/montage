@@ -2757,6 +2757,33 @@ std::string effectName(const Effect& e) {
 }
 
 namespace {
+bool sameParam(const Param& a, const Param& b) {
+    return a.value == b.value && a.keys == b.keys && a.repeat == b.repeat && a.expr == b.expr && a.exprFrom == b.exprFrom && a.exprSeed == b.exprSeed;
+}
+}  // namespace
+
+bool lateAnswer(const Effect& asked, const Effect& now, const Effect& changes, Effect& edited) {
+    edited = now;
+    bool any = false;
+    for (const auto& [key, param] : changes.params) {
+        const auto was = asked.params.find(key), is = now.params.find(key);
+        // (changed since the control was asked: by the user, an undo, or a later answer. The newer value stays.)
+        if ((was == asked.params.end()) != (is == now.params.end()) || (is != now.params.end() && !sameParam(was->second, is->second))) continue;
+        if (is != now.params.end() && sameParam(is->second, param)) continue;  // (as it is already)
+        edited.params[key] = param;
+        any = true;
+    }
+    for (const auto& [key, value] : changes.strings) {
+        const auto was = asked.strings.find(key), is = now.strings.find(key);
+        if ((was == asked.strings.end()) != (is == now.strings.end()) || (is != now.strings.end() && was->second != is->second)) continue;
+        if (is != now.strings.end() && is->second == value) continue;
+        edited.strings[key] = value;
+        any = true;
+    }
+    return any;
+}
+
+namespace {
 // A picture that comes back without its effect, for `why`. An export's picture would go on without it and the export
 // would say it went well, so the export rendering on this thread is told and stops, naming the plug-in: one not
 // installed or blocked here, or one failing in this process. (One in a host tells it in remote::render.) A render that
@@ -3157,7 +3184,7 @@ bool Interact::failed() const { return failed_ || (remote_ && remote_->failed())
 bool Interact::unresponsive() const { return remote_ && !remote_->failed() && remote_->unresponsive(); }
 std::string Interact::failure() const { return remote_ ? remote_->failure() : std::string(); }
 bool Interact::waiting() const { return remote_ && remote_->waiting(); }
-bool Interact::lateEdits(Effect& changes) { return remote_ && remote_->lateEdits(changes); }
+bool Interact::lateEdits(Effect& changes, Effect* asked) { return remote_ && remote_->lateEdits(changes, asked); }
 bool Interact::tidyClosed() { return remote::drainClosedControls(); }
 
 void setLoadWatcher(std::function<void(const std::string&, bool)> watch) {

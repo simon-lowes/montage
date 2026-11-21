@@ -584,6 +584,7 @@ int Controls::send(uint32_t cmd, const Effect& e, double t, const View& v, const
         // (its last picture stays up; the reply is taken when it comes, or the host is ended as hung)
         pendingCmd_ = sent ? cmd : kPartOut;
         pendingRatio_ = a.pixelRatio;
+        if (sent && (cmd == wire::OfxOverlayPen || cmd == wire::OfxOverlayKey)) pendingAsked_ = e;  // (its late answer's)
         if (pendingCmd_ == wire::OfxOverlayDraw) pendingDraw_ = msg;
         sentUs_ = began;
         if (sent && cmd == wire::OfxOverlayDraw) slowDraws_ = true;
@@ -646,6 +647,7 @@ bool Controls::settle(int64_t waitUs) {
         Effect set;
         bool changed = false;
         if (readEdited(set, changed) && changed) {
+            if (!lateEdits_) lateAsked_ = pendingAsked_;
             for (auto& [key, p] : set.params) late_.params[key] = p;
             for (auto& [key, v] : set.strings) late_.strings[key] = v;
             lateEdits_ = true;
@@ -662,19 +664,24 @@ void Controls::noteBlobOut() {
     sentUs_ = ipc::nowUs();
 }
 
-bool Controls::takeLate(Effect& into) {
+bool Controls::takeLate(const Effect& now, Effect& edited) {
     if (!lateEdits_) return false;
-    for (auto& [key, p] : late_.params) into.params[key] = p;
-    for (auto& [key, v] : late_.strings) into.strings[key] = v;
-    late_ = Effect{};
+    // (only what is still as it was when asked: a parameter set since keeps its newer value)
+    const bool any = lateAnswer(lateAsked_, now, late_, edited);
+    late_ = lateAsked_ = Effect{};
     lateEdits_ = false;
-    return true;
+    return any;
 }
 
-bool Controls::lateEdits(Effect& changes) {
+bool Controls::lateEdits(Effect& changes, Effect* asked) {
     settle();
     changes = Effect{};
-    return takeLate(changes);
+    if (!lateEdits_) return false;
+    changes = std::move(late_);
+    if (asked) *asked = std::move(lateAsked_);
+    late_ = lateAsked_ = Effect{};
+    lateEdits_ = false;
+    return true;
 }
 
 bool Controls::takeImage(double ratio) {
@@ -742,7 +749,7 @@ bool Controls::pen(int kind, const Effect& e, double t, const View& v, double vx
     edited = e;
     changed = false;
     if (!settle(kDeadlineUs)) return false;  // (not responding: the pen is not sent)
-    changed = takeLate(edited);  // (what a late reply set goes first, and with the effect the control is sent)
+    changed = takeLate(e, edited);  // (what a late reply set goes first, and with the effect the control is sent)
     const int r = send(wire::OfxOverlayPen, edited, t, v, [&](void* p) {
         auto* a = static_cast<wire::OverlayArgs*>(p);
         a->pen = kind;
@@ -761,7 +768,7 @@ bool Controls::key(bool down, int keysym, const std::string& text, const Effect&
     edited = e;
     changed = false;
     if (!settle(kDeadlineUs)) return false;
-    changed = takeLate(edited);
+    changed = takeLate(e, edited);
     const int r = send(wire::OfxOverlayKey, edited, t, v, [&](void* p) {
         auto* a = static_cast<wire::OverlayArgs*>(p);
         a->keysym = keysym;

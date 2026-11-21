@@ -149,6 +149,11 @@ bool isOfxType(const std::string& type);
 // A clip effect running `d`: its identity and one parameter per plugin parameter, at the plugin's defaults.
 Effect makeEffect(Project& p, const PluginDesc& d);
 std::string effectName(const Effect& e);
+// What an on-screen control's answer that came late may still write. `asked`: the effect as it was when the control
+// was sent the pen or key the answer is to; `now`: as it is; `changes`: the parameters and strings the answer sets.
+// `edited` is `now` with those of them that are still as they were when asked (one changed since, by the user, an undo
+// or a later answer, keeps its newer value); false when that leaves nothing to change.
+bool lateAnswer(const Effect& asked, const Effect& now, const Effect& changes, Effect& edited);
 
 // Runs the effect's plugin on `img` (premultiplied RGBA float, rendered at `scale` of full size) at clip frame `t`.
 // `fetch` gives the source at another clip frame for plugins that ask (false: none; the current frame is given).
@@ -285,7 +290,8 @@ public:
     bool draw(const Effect& e, double t, const View& v, Overlay& out);
     enum class Pen { Down, Move, Up };
     // A pen event at view point (vx, vy). True when the plugin took it; `edited` (a copy of `e`) then holds the
-    // parameters it set, keyed at `t` where they are animated, and `changed` says whether it set any.
+    // parameters it set, keyed at `t` where they are animated, and `changed` says whether it set any. (In a host,
+    // `edited` also holds what a late reply set that is still as it was when that reply's event was sent: lateAnswer.)
     bool pen(Pen kind, const Effect& e, double t, const View& v, double vx, double vy, double pressure, Effect& edited, bool& changed);
     // A key (an OfxKeySyms code, and its text) pressed or let go.
     bool key(bool down, int keysym, const std::string& text, const Effect& e, double t, const View& v, Effect& edited, bool& changed);
@@ -297,8 +303,9 @@ public:
     // (in a host) A message is still out: its answer is taken at a later call (a poll repaints for it).
     bool waiting() const;
     // (in a host) What the control set in a reply that came after its deadline and that no pen or key event has handed
-    // on: only those parameters and strings. False when there is none.
-    bool lateEdits(Effect& changes);
+    // on: only those parameters and strings, and in `asked` the effect as that reply's event was sent with it (to give
+    // lateAnswer). False when there is none.
+    bool lateEdits(Effect& changes, Effect* asked = nullptr);
     // Controls in hosts closed with an answer still out are let go as their answers come: true while some still wait
     // (to be asked again a little later, from the GUI thread).
     static bool tidyClosed();
