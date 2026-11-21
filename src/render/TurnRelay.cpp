@@ -294,6 +294,7 @@ struct RelayBridge::Impl {
     quint16 algorithm = 0;  // (0: none named, the key is MD5's)
     QByteArray icePassword;  // Montage's end's, once said
     bool allocated = false, asked = false, refreshing = false, lookingUp = false;
+    std::string refreshRefused;  // the relay's refusal of the last Refresh, until one is taken
     int lifetime = kLifetimeAsked;  // seconds, as the relay last gave it
     // When to ask for the address again, and when the relay lets it go unless it is (now()'s clock, ms).
     qint64 refreshAt = 0, expiresAt = 0, permitAt = 0;
@@ -446,7 +447,9 @@ struct RelayBridge::Impl {
             requests.erase(it);
             if (r.done) r.done(nullptr);
         }
-        if (allocated && at >= expiresAt) lapsed("The TURN relay's address for this viewer ran out: the relay did not answer in time to keep it");
+        if (allocated && at >= expiresAt)
+            lapsed("The TURN relay's address for this viewer ran out: " +
+                   (refreshRefused.empty() ? std::string("the relay did not answer in time to keep it") : "the relay refused to keep it. " + refreshRefused));
         // The address is asked for again half way through its time and, when an asking goes unanswered (six seconds
         // of sending it), at once again for as long as the address lasts: a lost answer costs no viewer their picture.
         if (allocated && !refreshing && at >= refreshAt) {
@@ -466,8 +469,10 @@ struct RelayBridge::Impl {
                     // (437: the relay knows the address no more; another refusal is asked again a few seconds on)
                     if (errorCode(*answer) == 437) return lapsed(refusal(answer));
                     refreshAt = now() + 5000;
+                    refreshRefused = refusal(answer);
                     return fail(answer);
                 }
+                refreshRefused.clear();
                 lifetimeFrom(*answer);
             };
             send(std::move(r));
