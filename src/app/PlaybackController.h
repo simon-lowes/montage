@@ -260,6 +260,7 @@ private:
     SoundOut* scrubOut_ = nullptr;  // (through the audio device, or Qt Multimedia's output)
     bool scrubNoOutput_ = false, scrubTriedDevice_ = false;
     int scrubTriedRate_ = 0;
+    QElapsedTimer scrubRetry_;  // since scrubbing's output was last opened, or the device chosen last asked for
     AudioMixer scrubMixer_;
     bool globalMute_ = false;
     bool ambisonicBinaural_ = true;

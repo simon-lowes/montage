@@ -3694,8 +3694,20 @@ private slots:
         QTRY_COMPARE(e.status().rate, 48000);
         QTest::qWait(1000);
         const double wall = double(heard.nsecsElapsed()) / 1e9, said = e.heardSeconds(out) - from;
-        e.removeOutput(out);
         QVERIFY2(std::fabs(said - wall) < 0.2, qPrintable(QString("%1 s heard in %2 s").arg(said).arg(wall)));
+        // The output latency the device reports with its new rate is the one taken off at once (nightly 19 Nov: the
+        // one it had before stayed until the device panel next asked): half a second more of it here, at 96 kHz.
+        {
+            QElapsedTimer since;
+            since.start();
+            const double before = e.heardSeconds(out);
+            audiodev::loopbackChangeRate(96000, 256 + 48000);
+            QTRY_COMPARE(e.roundTripAt(48000), 256);  // (the new rate known, without asking the device panel's way)
+            QTest::qWait(1000);
+            const double gained = e.heardSeconds(out) - before, elapsed = double(since.nsecsElapsed()) / 1e9;
+            QVERIFY2(std::fabs(gained - (elapsed - 0.5)) < 0.2, qPrintable(QString("%1 s heard in %2 s").arg(gained).arg(elapsed)));
+        }
+        e.removeOutput(out);
         audiodev::setLoopbackOptions({});
     }
 

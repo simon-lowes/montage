@@ -14101,6 +14101,21 @@ const auto seq = [this] { return state()->sequence(); };
         program->seek(30);
         QVERIFY(program->scrubOutput()->onDevice());
         QCOMPARE(program->scrubOutput()->opens() - opened, 2);
+        // The device unplugged while scrubbing and plugged back in, with nothing else opening it again: scrubbing goes
+        // back to it within a few seconds (nightly 19 Nov: not until playback opened it).
+        audiodev::LoopbackOptions unplugged;
+        unplugged.unplugged = true;
+        audiodev::setLoopbackOptions(unplugged);
+        const bool lost = QTest::qWaitFor([&] { return !engine.isOpen(); });
+        program->seek(31);
+        const bool moved = !program->scrubOutput()->onDevice();
+        audiodev::setLoopbackOptions({});  // (plugged back in before anything is checked)
+        QVERIFY(lost && moved);
+        QTest::qWait(500);
+        QVERIFY(!engine.isOpen());
+        int at = 32;
+        QTRY_VERIFY_WITH_TIMEOUT((program->seek(at++ % 2 ? 33 : 32), program->scrubOutput()->onDevice()), 8000);
+        QVERIFY(engine.isOpen());
         engine.setSettings(before);
         state()->newProject();
     }
