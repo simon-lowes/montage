@@ -876,7 +876,9 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
                 if ((flags & wire::kWantsHandle) && !(flags & wire::kHasMask))
                     handled = renderToHandle(e, t, out, scale, fetch, space, post, handle, noHandle, failed, error);
                 else if (flags & wire::kWantsHandle) noHandle = "an effect with a mask of its own is not shared as a handle";
-                ok = handled || (!failed && ofx::applyEffect(e, t, out, scale, fetch, &error, space));
+                // (one whose OpenGL render failed renders as ever, through shared memory, and that is why)
+                if (failed) noHandle = "its OpenGL render failed: " + error;
+                ok = handled || ofx::applyEffect(e, t, out, scale, fetch, &error, space);
             } else if (kind == 1) {
                 const Image from = (empties & 1) ? Image() : picture(0);
                 const Image to = (empties & 2) ? Image() : picture(1);

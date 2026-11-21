@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
 #endif
 
 #ifndef GL_RGBA32F
@@ -772,6 +773,34 @@ bool exportDmaBuf(unsigned texture, int width, int height, DmaBuf& out, std::str
     return true;
 }
 
+bool dmaBufFits(const DmaBuf& buf, std::string* why) {
+    auto no = [&](const std::string& reason) {
+        if (why) *why = reason;
+        return false;
+    };
+    if (buf.fd < 0 || buf.width <= 0 || buf.height <= 0 || !buf.fourcc || !buf.stride) return no("the shared picture is not described");
+    // (a row holds a byte a pixel at the least; the rows from the offset on lie inside the buffer, where it says how
+    // large it is)
+    if (buf.stride < unsigned(buf.width) || buf.stride > (1u << 30) || buf.offset > (1u << 30))
+        return no("the shared picture's rows are not of its size");
+    const off_t size = ::lseek(buf.fd, 0, SEEK_END);
+    if (size >= 0 && uint64_t(buf.offset) + uint64_t(buf.stride) * uint64_t(buf.height) > uint64_t(size))
+        return no("the shared picture is larger than its buffer");
+    return true;
+}
+
+bool awaitDrawn(const DmaBuf& buf, std::string* why, int waitMs) {
+    if (buf.fence < 0) return true;
+    pollfd p{buf.fence, POLLIN, 0};
+    int r = 0;
+    do {
+        r = ::poll(&p, 1, waitMs < 0 ? kFenceWaitMs : waitMs);
+    } while (r < 0 && errno == EINTR);
+    if (r > 0) return true;
+    if (why) *why = "the shared picture was not drawn within " + std::to_string(std::max(1, (waitMs < 0 ? kFenceWaitMs : waitMs) / 1000)) + " s";
+    return false;
+}
+
 unsigned importDmaBuf(const DmaBuf& buf, std::string* why) {
     auto no = [&](const std::string& reason) {
         if (why) *why = reason;
@@ -780,15 +809,9 @@ unsigned importDmaBuf(const DmaBuf& buf, std::string* why) {
     const Egl e = eglNow();
     QOpenGLExtraFunctions* f = worker().f;
     if (!e.imports || !f) return no(e.whyNoImport);
-    if (buf.fd < 0 || buf.width <= 0 || buf.height <= 0 || !buf.fourcc || !buf.stride) return no("the shared picture is not described");
-    if (buf.fence >= 0) {
-        pollfd p{buf.fence, POLLIN, 0};
-        int r = 0;
-        do {
-            r = ::poll(&p, 1, kFenceWaitMs);
-        } while (r < 0 && errno == EINTR);
-        if (r <= 0) return no("the shared picture was not drawn within " + std::to_string(kFenceWaitMs / 1000) + " s");
-    }
+    std::string bad;
+    if (!dmaBufFits(buf, &bad)) return no(bad);
+    if (!awaitDrawn(buf, &bad)) return no(bad);  // (at once when the caller has waited for it already)
     std::vector<int> a = {kEglWidth, buf.width, kEglHeight, buf.height, kEglFourcc, int(buf.fourcc), kEglPlane0Fd, buf.fd,
                           kEglPlane0Offset, int(buf.offset), kEglPlane0Pitch, int(buf.stride)};
     if (e.modifiers && buf.modifier != kNoModifier) {
@@ -872,6 +895,19 @@ bool takeMessage(int post, int waitMs, std::vector<int>& fds, long long& from) {
 
 }  // namespace
 
+int heldAtOnce() {
+    // (net.unix.max_dgram_qlen, 10 or 512 by default as the kernel goes: a socket takes one more before senders wait)
+    static const int held = [] {
+        int n = 512;
+        if (FILE* f = std::fopen("/proc/sys/net/unix/max_dgram_qlen", "r")) {
+            if (std::fscanf(f, "%d", &n) != 1) n = 512;
+            std::fclose(f);
+        }
+        return std::clamp(n, 1, 1 << 16) + 1;
+    }();
+    return held;
+}
+
 int openDmaBufPost(const std::string& name, std::string* why) {
     auto no = [&](int s) {
         if (why) *why = std::string("no socket for the shared picture's descriptors (") + std::strerror(errno) + ")";
@@ -916,7 +952,8 @@ bool sendDmaBuf(const std::string& post, const DmaBuf& buf) {
     c->cmsg_type = SCM_RIGHTS;
     c->cmsg_len = CMSG_LEN(n * sizeof(int));
     std::memcpy(CMSG_DATA(c), fds, n * sizeof(int));
-    const bool sent = ::sendmsg(s, &m, MSG_NOSIGNAL) == 1;
+    // (a post filled by another process is not waited on: the picture goes through shared memory instead)
+    const bool sent = ::sendmsg(s, &m, MSG_NOSIGNAL | MSG_DONTWAIT) == 1;
     ::close(s);
     return sent;
 }
@@ -927,9 +964,11 @@ bool receiveDmaBuf(int post, long long pid, bool fence, int waitMs, DmaBuf& buf,
     long long from = -1;
     bool whole = false;
     // The newest message is the one waited for (it was sent before the reply that said so); older ones were never
-    // taken, and go. (No more than a socket holds at once are looked through, whoever keeps sending.)
+    // taken, and go. (As many as the socket holds at once are looked through, and one more, so the host's is among
+    // them whatever another process sent first, and no more, whoever keeps sending.)
+    const int most = heldAtOnce() + 1;
     int taken = 0;
-    for (int wait = waitMs; taken < 64 && takeMessage(post, wait, fds, from); wait = 0, ++taken) {
+    for (int wait = waitMs; taken < most && takeMessage(post, wait, fds, from); wait = 0, ++taken) {
         if (from == pid && fds.size() == (fence ? 2u : 1u)) {
             closeDmaBuf(buf);
             whole = true;
@@ -974,6 +1013,15 @@ void closeDmaBufPost(int) {}
 bool sendDmaBuf(const std::string&, const DmaBuf&) { return false; }
 bool receiveDmaBuf(int, long long, bool, int, DmaBuf& buf, std::string* why) {
     buf.fd = buf.fence = -1;
+    if (why) *why = kLinuxOnly;
+    return false;
+}
+int heldAtOnce() { return 0; }
+bool dmaBufFits(const DmaBuf&, std::string* why) {
+    if (why) *why = kLinuxOnly;
+    return false;
+}
+bool awaitDrawn(const DmaBuf&, std::string* why, int) {
     if (why) *why = kLinuxOnly;
     return false;
 }

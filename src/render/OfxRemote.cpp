@@ -237,6 +237,11 @@ bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w
     buf.modifier = ph.modifier;
     buf.width = w;
     buf.height = h;
+    // (not the plug-ins' OpenGL thread waits for the host's fence, nor takes a picture its buffer does not hold)
+    if (!gl::dmaBufFits(buf, &why) || !gl::awaitDrawn(buf, &why)) {
+        gl::closeDmaBuf(buf);
+        return false;
+    }
     bool ok = false;
     const bool ran = gl::run([&] {
         const unsigned texture = gl::importDmaBuf(buf, &why);
@@ -412,7 +417,8 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
                 std::lock_guard lock(gPicturesM);
                 gHandlesOff = why.empty() ? std::string("a handle could not be taken") : why;
             }
-            return render(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
+            // (by renderInHost, so a failure is told to the export once, by the render() that asked)
+            return renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
         }
         if (asked) {
             viaMemory.assign(wire::payload(c.base()), size_t(std::min<uint64_t>(hd->payloadBytes, wire::kPayload)));

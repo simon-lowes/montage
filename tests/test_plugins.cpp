@@ -2772,7 +2772,55 @@ private slots:
             QVERIFY(ofx::gl::receiveDmaBuf(post, getpid(), false, 2000, got, &why));
             QVERIFY(sameFile(got.fd, other.handle()));
             ofx::gl::closeDmaBuf(got);
+            // (nightly 19 Nov) The host's message is found behind as many others as the post holds (only 64 were
+            // looked through, so another process's messages could hide it), and a full post makes the sender give up
+            // at once rather than wait (the host's render waited, and timed out).
+            const int held = ofx::gl::heldAtOnce();
+            QVERIFY(held >= 1);
+            const int ahead = std::min(held - 1, 500);  // (descriptors in flight are limited too)
+            for (int k = 0; k < ahead; ++k) QVERIFY(ofx::gl::sendDmaBuf(name, sent));  // (one descriptor: not whole)
+            sent.fence = other.handle();
+            QVERIFY(ofx::gl::sendDmaBuf(name, sent));
+            QVERIFY2(ofx::gl::receiveDmaBuf(post, getpid(), true, 2000, got, &why), why.c_str());
+            QVERIFY(sameFile(got.fd, other.handle()) && sameFile(got.fence, other.handle()));
+            ofx::gl::closeDmaBuf(got);
+            if (held <= 500) {
+                // (sent until the post is full, which it is after as many as it holds)
+                QElapsedTimer clock;
+                clock.start();
+                int sends = 0;
+                while (sends <= held && ofx::gl::sendDmaBuf(name, sent)) ++sends;
+                QVERIFY2(sends == held, qPrintable(QString::number(sends)));
+                QVERIFY(clock.elapsed() < 1000);
+                QVERIFY(ofx::gl::receiveDmaBuf(post, getpid(), true, 0, got, &why));
+                ofx::gl::closeDmaBuf(got);
+                QVERIFY(!ofx::gl::receiveDmaBuf(post, getpid(), true, 0, got, &why));  // (all taken)
+            }
             ofx::gl::closeDmaBufPost(post);
+            // (nightly 19 Nov) A picture's buffer is taken only with its rows inside it, and its fence is waited for
+            // where the handle is taken, not on the plug-ins' OpenGL thread.
+            QFile picture(path("handle-picture.bin"));
+            QVERIFY(picture.open(QIODevice::ReadWrite) && picture.resize(16 * 8 * 8));
+            ofx::gl::DmaBuf b;
+            b.fd = picture.handle();
+            b.width = 16, b.height = 8, b.fourcc = 0x48344241, b.stride = 16 * 8;
+            QVERIFY2(ofx::gl::dmaBufFits(b, &why), why.c_str());
+            b.offset = 8;  // (its last row past the end)
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why) && !why.empty());
+            b.offset = 0, b.height = 9;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.height = 8, b.stride = 15;  // (shorter than a row)
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.stride = 0xffffffffu;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            int fence[2] = {-1, -1};
+            QCOMPARE(::pipe(fence), 0);
+            b.stride = 16 * 8, b.fence = fence[0];
+            QVERIFY(!ofx::gl::awaitDrawn(b, &why, 50) && !why.empty());
+            QCOMPARE(::write(fence[1], "x", 1), ssize_t(1));
+            QVERIFY(ofx::gl::awaitDrawn(b, &why, 50));
+            ::close(fence[0]);
+            ::close(fence[1]);
             QVERIFY(!ofx::gl::sendDmaBuf(name, sent));  // (the post is gone with its socket)
         }
 #endif
