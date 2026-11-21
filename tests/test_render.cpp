@@ -28679,6 +28679,72 @@ colorspaces:
         QVERIFY(t.elapsed() < 15000);
     }
 
+    // Nightly 19 Nov: clients that ask for a file and never read it are let go 20 s after they last took any of it,
+    // so they cannot hold the origin's table (and what they were sent) for good; a client that reads slowly but
+    // steadily gets the whole file.
+    void liveOriginClientsThatDoNotRead() {
+        QTemporaryDir dir;
+        const int size = 12 << 20;
+        {
+            QFile f(dir.filePath("big.mp4"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            QByteArray block(1 << 20, 'x');
+            for (int i = 0; i < size / block.size(); ++i) f.write(block);
+        }
+        LiveOrigin origin;
+        std::string err;
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, nullptr, &err), err.c_str());
+        auto ask = [&](QTcpSocket& s) {
+            s.setReadBufferSize(1024);
+            s.connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            if (!s.waitForConnected(5000)) return false;
+            s.write("GET /big.mp4 HTTP/1.1\r\nHost: x\r\n\r\n");
+            return s.flush() || s.bytesToWrite() == 0;
+        };
+        // (what a client is sent in all: the body's bytes after the headers, read until the origin closes)
+        auto drain = [](QTcpSocket& s, QByteArray& in, qint64& body, int ms) {
+            s.setReadBufferSize(0);
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) {
+                in += s.readAll();
+                if (body < 0 && in.contains("\r\n\r\n")) body = in.size() - (in.indexOf("\r\n\r\n") + 4), in.clear();
+                else if (body >= 0) body += in.size(), in.clear();
+                if (s.state() != QAbstractSocket::ConnectedState && s.bytesAvailable() == 0) break;
+                s.waitForReadyRead(100);
+            }
+        };
+        std::vector<std::unique_ptr<QTcpSocket>> idle;
+        for (int i = 0; i < 3; ++i) {
+            idle.push_back(std::make_unique<QTcpSocket>());
+            QVERIFY(ask(*idle.back()));
+        }
+        QTcpSocket steady;
+        QVERIFY(ask(steady));
+        QByteArray steadyIn;
+        qint64 steadyBody = -1;
+        QElapsedTimer t;
+        t.start();
+        while (t.elapsed() < 26000) {
+            // (64 KB every fifth of a second)
+            steady.setReadBufferSize(64 << 10);
+            QTest::qWait(200);
+            steadyIn += steady.readAll();
+            if (steadyBody < 0 && steadyIn.contains("\r\n\r\n"))
+                steadyBody = steadyIn.size() - (steadyIn.indexOf("\r\n\r\n") + 4), steadyIn.clear();
+            else if (steadyBody >= 0) steadyBody += steadyIn.size(), steadyIn.clear();
+        }
+        for (auto& s : idle) {
+            QByteArray in;
+            qint64 body = -1;
+            drain(*s, in, body, 20000);
+            QVERIFY2(body >= 0 && body < size, qPrintable(QString::number(body)));
+            QVERIFY(s->state() != QAbstractSocket::ConnectedState);
+        }
+        drain(steady, steadyIn, steadyBody, 20000);
+        QCOMPARE(steadyBody, qint64(size));
+    }
+
     // Nightly 15 Nov: low latency HLS as a player is promised it. The preload hint after a segment's last part
     // names the next segment's first; every part but a segment's last is 85% of its playlist's PART-TARGET at least
     // (with sound, a part asked shorter than 13 coded frames is made that long); a blocking reload for what is too
