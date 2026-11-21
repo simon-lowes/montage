@@ -2942,6 +2942,15 @@ private slots:
         namespace st = st2110;
         const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
         if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
+        // Every wait fits inside Qt Test's watchdog for the function, so a step that runs out fails with its own
+        // message (and the phases reached go to the output as they pass); the sources outlive the function, so no wait
+        // outlasts what it waits on, but not by much, so a sender an aborted run leaves behind ends by itself.
+        QElapsedTimer sinceStart;
+        sinceStart.start();
+        const qint64 watchdog = qEnvironmentVariableIntValue("QTEST_FUNCTION_TIMEOUT") > 0 ? qEnvironmentVariableIntValue("QTEST_FUNCTION_TIMEOUT") : 300000;
+        auto within = [&](qint64 ms) { return int(std::clamp<qint64>(watchdog - 15000 - sinceStart.elapsed(), 1, ms)); };
+        auto phase = [&](const char* what) { qInfo("multiviewer: %s after %lld ms", what, sinceStart.elapsed()); };
+        const int lifetimeS = int(watchdog / 1000) + 30;
         state()->newProject();
         QVERIFY(state()->edit("25p", [](Project&, Sequence& s) {
             s.width = 320, s.height = 180, s.fps = {25, 1};
@@ -2985,7 +2994,7 @@ private slots:
             QVERIFY2(tx[k].open(o, v, st::AudioFormat{}, &err), err.c_str());
             sending[k] = std::thread([&, k] {
                 const std::vector<float> sound(1920 * 2, 0.25f);
-                for (int t = 0; !stop && t < 25 * 120; ++t) {
+                for (int t = 0; !stop && t < 25 * lifetimeS; ++t) {
                     const output::Timecode tc = output::timecodeOf(FrameTime((10 + k) * 3600 * 25 + t), {25, 1});
                     sent[k] = t;
                     if (!tx[k].send(rasters[size_t(t % 25)], sound.data(), 1920, &tc, {}, &stop)) break;
@@ -3043,7 +3052,7 @@ private slots:
         // The stream over SRT (UDP where FFmpeg has no SRT), Montage listening.
         QProcess protocols;
         protocols.start(ffmpeg, {"-hide_banner", "-protocols"});
-        protocols.waitForFinished(20000);
+        protocols.waitForFinished(within(20000));
         const bool srt = QString::fromLocal8Bit(protocols.readAllStandardOutput()).contains(QRegularExpression(QStringLiteral("\\n\\s*srt\\s*\\n")));
         int streamPorts[2];
         for (int& port : streamPorts) {
@@ -3097,7 +3106,7 @@ private slots:
             const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
                                    : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(streamPorts[k]);
             p->start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128",
-                              "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
+                              "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", QString::number(lifetimeS), "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
                               "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
                               "-c:a", "mp2", "-f", "mpegts", to});
             // Only a command that could not be run fails here; the pictures below show it sending. (On macOS, which
@@ -3105,17 +3114,20 @@ private slots:
             // the pipe that tells Qt the command has started, so Qt can wait as long as that process lives: a Mac
             // runner with nothing much to do once waited more than three minutes for a sender that was running.)
             streams.push_back(std::move(p));
-            if (!streams.back()->waitForStarted(30000))
+            if (!streams.back()->waitForStarted(within(30000)))
                 QVERIFY2(streams.back()->error() != QProcess::FailedToStart, qPrintable(streams.back()->errorString()));
         }
+        phase("senders started");
         // (waiting on pictures, not the clock: a busy machine is slow)
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, 60000);
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, within(60000));
+        phase("four tiles showing");
         // Each tile's picture the one its timecode names, its hour the source's, close behind what was sent.
         const int hours[4] = {10, 11, 12, omtOk ? 13 : 14};
         int checked[4] = {0, 0, 0, 0};
         QElapsedTimer t;
         t.start();
-        while (t.elapsed() < 40000 && *std::min_element(checked, checked + 4) < 15) {
+        const int timecodesFor = within(40000);
+        while (t.elapsed() < timecodesFor && *std::min_element(checked, checked + 4) < 15) {
             QTest::qWait(30);
             for (int i = 0; i < 4; ++i) {
                 const LiveFeed::Now now = mv->feed(i)->look();
@@ -3135,6 +3147,7 @@ private slots:
             }
         }
         for (int i = 0; i < 4; ++i) QVERIFY2(checked[i] >= 15, qPrintable(QString::number(i)));
+        phase("timecodes checked");
         // The meters: the senders' quarter of full scale (-12 dBFS), FFmpeg's sine at an eighth (-18).
         r = call({{"action", "multiview"}});
         const QJsonArray tiles = r.value("structuredContent").toObject().value("inputs").toArray();
@@ -3154,16 +3167,17 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(source->liveShowing() && mv->tile(0).onSource && !mv->tile(1).onSource);
         QVERIFY(source->accessibleSummary().startsWith("Live: Cam A"));
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia(), 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia(), within(20000));
+        phase("live media ready");
         const Id media = source->liveMedia();
         QCOMPARE(mv->tile(0).media, media);
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= 30, 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= 30, within(20000));
         r = call({{"action", "live"}, {"mark_in", true}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonObject atIn = r.value("structuredContent").toObject();
         const FrameTime in = FrameTime(atIn.value("in").toDouble());
         QVERIFY2(in >= 30, QJsonDocument(atIn).toJson().constData());
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= in + 40, 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= in + 40, within(20000));
         r = call({{"action", "live"}, {"mark_out", true}});
         const FrameTime out = FrameTime(r.value("structuredContent").toObject().value("out").toDouble());
         QVERIFY2(out >= in + 40 && state()->sourceIn() == in, QJsonDocument(r).toJson().constData());
@@ -3182,7 +3196,8 @@ private slots:
         QVERIFY(m);
         const int64_t first = std::llround(m->timecode * 25);  // (the recording's first frame's timecode, in frames)
         QCOMPARE(QString::fromStdString(mv->feed(0)->timecodeAt(0)).left(2), QString("10"));
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() > out + 25, 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() > out + 25, within(20000));
+        phase("In and Out marked");
         // (a sender held up past a fifth of a second goes on from now, and a busy machine's receiver can miss frames:
         // the recording, placed by the pictures' timestamps, holds the last picture again for the slots it passed
         // over, so those frames are a few behind)
@@ -3199,14 +3214,16 @@ private slots:
             int got = -1;
             QElapsedTimer wait;
             wait.start();
+            const qint64 readFor = within(untilReadAgain);
             do {
                 if (got >= 0) QTest::qWait(200);
                 const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), k, {});
                 got = f.width > 0 ? int(std::lround(f.at(f.width / 2, f.height / 2)[1] * 255)) : 0;
-            } while (!matches(got, k) && wait.elapsed() < untilReadAgain);
+            } while (!matches(got, k) && wait.elapsed() < readFor);
             QVERIFY2(matches(got, k), qPrintable(QStringLiteral("frame %1: %2, sent %3 (sender %4 slots behind, %5 repeated)")
                                                      .arg(k).arg(got).arg(greyOf(first + in + k)).arg(tx[0].slotsSkipped())
                                                      .arg(mv->tile(0).repeated)));
+            phase("a recorded frame matched");
         }
         // LIVE off scrubs the recording so far (the tile no longer on the Source monitor); on again, it is.
         auto* badge = source->findChild<QToolButton*>(QStringLiteral("liveBadge"));
@@ -3230,20 +3247,23 @@ private slots:
         // Its recording ended from the reception it was made by: the feed was opened once, and is watched on.
         QCOMPARE(mv->tile(0).opened, 1);
         const int64_t seen = mv->tile(0).pictures;
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).running && mv->tile(0).pictures > seen + 5, 20000);
+        phase("recording stopped");
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).running && mv->tile(0).pictures > seen + 5, within(20000));
         // The stream, watched since its sender called in, chosen and recorded: from that same reception (its sender
         // has not called again: its feed opened once), the file starting on a picture between the stream's groups
         // with the feed's own timecode there, each picture the one its timecode names.
         r = call({{"action", "multiview"}, {"choose", QJsonArray{2}}, {"record", true}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(mv->tile(2).recording && !mv->tile(0).recording);
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(2).media != 0, 30000);
-        QTRY_VERIFY_WITH_TIMEOUT(mv->feed(2)->look().frame >= 40, 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(2).media != 0, within(30000));
+        QTRY_VERIFY_WITH_TIMEOUT(mv->feed(2)->look().frame >= 40, within(30000));
+        phase("stream recorded");
         r = call({{"action", "multiview"}, {"record", false}});
         QVERIFY(!mv->tile(2).recording && mv->tile(2).running);
         QCOMPARE(mv->tile(2).opened, 1);
         QCOMPARE(r.value("structuredContent").toObject().value("inputs").toArray()[2].toObject().value("opened").toInt(), 1);
-        QCOMPARE(streams[0]->state(), QProcess::Running);
+        // (not finished: on macOS Qt may never hear that the sender started, leaving it Starting while it sends)
+        QVERIFY(streams[0]->state() != QProcess::NotRunning);
         {
             const QString file = mv->tile(2).path;
             QVERIFY2(QFileInfo(file).fileName() == QStringLiteral("Stream 001.mov"), qPrintable(file));
