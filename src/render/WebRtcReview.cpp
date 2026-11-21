@@ -614,12 +614,20 @@ public:
                         }
                     }
                 } else if (type == 205 && count == 15 && wideId_) {
-                    ArrivalReport report;
-                    if (parseTransportFeedback(d + at, length, report))
-                        if (auto v = viewer_.lock()) {
+                    // (read only as far as what was sent them allows: a report of a few bytes saying 65,535 packets
+                    // were lost is not walked through, under the lock the sending shares)
+                    if (auto v = viewer_.lock()) {
+                        size_t room = 0;
+                        {
+                            std::lock_guard lock(v->linkM);
+                            room = v->link.reportRoom();
+                        }
+                        ArrivalReport report;
+                        if (parseTransportFeedback(d + at, length, report, room)) {
                             std::lock_guard lock(v->linkM);
                             v->link.feedback(report, Clock::now());
                         }
+                    }
                 }
                 at += length;
             }
@@ -2229,7 +2237,8 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
             return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)");
         if (d.settings.relayOnly) {
             // Only through the relay: Montage's end of each connection stays on this computer's loopback behind a
-            // bridge to the relay, and its ICE is told of no server, so nothing leaves for anywhere but the relay.
+            // bridge to the relay, and its ICE is told of no server, so no media leaves for anywhere but the relay
+            // (the page and its signalling are HTTPS, between the viewer and this review's own address).
             d.relayHost = relayHost;
             d.relayPort = relayPort;
             d.iceServers.clear();

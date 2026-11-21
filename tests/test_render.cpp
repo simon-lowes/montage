@@ -23140,6 +23140,48 @@ colorspaces:
         }
     }
 
+    // Nightly 19 Nov: what a viewer's arrival reports may go over is earned by sending to them, so that a report of a
+    // few bytes saying 65,528 packets were lost is not read (Montage walked every one, under the lock the sending
+    // shares), while reports of what was sent are read as before, and each costs what it went over.
+    void reviewLinkDelayReportRoom() {
+        using namespace montage::output;
+        using Clock = LinkDelay::Clock;
+        // 36 bytes: eight runs of 8,191 packets not received, from sequence number 0 on.
+        std::vector<uint8_t> crafted = {0x8f, 205, 0, 8, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0xff, 0xf8, 0, 0, 1, 0};
+        for (int i = 0; i < 8; ++i) crafted.insert(crafted.end(), {0x1f, 0xff});
+        QCOMPARE(crafted.size(), size_t(36));
+        ArrivalReport report;
+        QVERIFY(parseTransportFeedback(crafted.data(), crafted.size(), report));  // (well formed: read when nothing limits it)
+        QCOMPARE(report.packets.size(), size_t(65528));
+        LinkDelay link;
+        QCOMPARE(link.reportRoom(), size_t(0));
+        const Clock::time_point t0 = Clock::now();
+        for (int i = 0; i < 100; ++i) link.sent(1200, t0 + std::chrono::milliseconds(i));
+        QCOMPARE(link.reportRoom(), size_t(400));
+        QVERIFY(!parseTransportFeedback(crafted.data(), crafted.size(), report, link.reportRoom()));
+        QVERIFY(report.packets.empty());
+        // A report of the hundred sent, each arrived a millisecond after the one before: read, four times over, and
+        // then not until more is sent.
+        std::vector<uint8_t> all = {0xaf, 205, 0, 30, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 100, 0, 0, 1, 0, 0x20, 100};
+        for (int i = 0; i < 100; ++i) all.push_back(4);
+        all.insert(all.end(), {0, 2});
+        QCOMPARE(all.size(), size_t(124));
+        for (int pass = 0; pass < 4; ++pass) {
+            QVERIFY2(parseTransportFeedback(all.data(), all.size(), report, link.reportRoom()), qPrintable(QString::number(pass)));
+            QCOMPARE(report.packets.size(), size_t(100));
+            link.feedback(report, t0 + std::chrono::milliseconds(200 + pass));
+            QCOMPARE(link.reportRoom(), size_t(300 - 100 * pass));
+        }
+        QVERIFY(!parseTransportFeedback(all.data(), all.size(), report, link.reportRoom()));
+        QVERIFY(link.active(t0 + std::chrono::milliseconds(300)));
+        for (int i = 0; i < 25; ++i) link.sent(1200, t0 + std::chrono::milliseconds(300));
+        QVERIFY(parseTransportFeedback(all.data(), all.size(), report, link.reportRoom()));
+        // Room is earned up to four times the packets remembered, however long the sending.
+        for (int i = 0; i < 40000; ++i) link.sent(100, t0 + std::chrono::milliseconds(400));
+        QCOMPARE(link.reportRoom(), size_t(0xffff));
+        QVERIFY(parseTransportFeedback(crafted.data(), crafted.size(), report, link.reportRoom()));
+    }
+
     // Live review's judgement of a viewer's link by delay: the arrival reports read, the packets numbered and padded,
     // the queue followed through a link that carries less than it is sent without dropping anything, and the ladder
     // steered by it.
