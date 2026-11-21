@@ -11515,6 +11515,83 @@ private slots:
         QVERIFY(!cached().contains(first) && cached().contains(second) && cached().contains("sound-777-888.f32"));
     }
 
+    void samplerCacheAcrossProcesses() {
+        // Two Montages share the sampler's cache folder (nightly 19 Nov): one tidying it never removes a cache file
+        // the other still plays from, neither an earlier version of a changed sound nor one older than a week, nor
+        // a kit's own file. The other Montage is this test run again with the folder and the sound in its
+        // environment.
+        const int rate = 48000;
+        SamplerSettings st;
+        SamplerSlot sl;
+        sl.key = 40;
+        const QByteArray childDir = qgetenv("MONTAGE_TEST_SAMPLER_CACHE"), childSound = qgetenv("MONTAGE_TEST_SAMPLER_SOUND");
+        sampler::StreamOptions streamed;
+        if (!childDir.isEmpty()) {
+            // The other Montage: loads the sound as it is now, which tidies the folder, and plays it.
+            streamed.cacheDir = childDir.toStdString();
+            sl.sounds = {{childSound.toStdString(), 0, 0, 1, 127}};
+            st.pads = {sl};
+            const sampler::KitPtr kit = sampler::loadKit(st, rate, nullptr, {}, streamed);
+            QVERIFY(kit->pads[0].sounds.size() == 1 && kit->pads[0].sounds[0].disk);
+            return;
+        }
+        std::vector<float> longSound(size_t(25) * rate);
+        for (size_t i = 0; i < longSound.size(); ++i) longSound[i] = float(0.3 * std::sin(double(i) * 0.017));
+        const std::string longFile = path("sampler-shared.wav");
+        QVERIFY(writeMonoWav(longFile, longSound, rate));
+        sl.sounds = {{longFile, 0, 0, 1, 127}};
+        st.pads = {sl};
+        QTemporaryDir cache;
+        streamed.cacheDir = cache.path().toStdString();
+        sampler::KitPtr kit = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QVERIFY(kit->pads[0].sounds.size() == 1 && kit->pads[0].sounds[0].disk);
+        const std::string first = kit->pads[0].sounds[0].disk->file;
+        // A kit of a loader's sound: streamed from a file of the kit's own.
+        auto whole = std::make_shared<AudioBuffer>();
+        whole->sampleRate = rate;
+        whole->channels = 2;
+        whole->samples.assign(size_t(25) * rate * 2, 0.25f);
+        SamplerSettings ls = st;
+        ls.pads[0].sounds = {{"loaded", 0, 0, 1, 127}};
+        sampler::KitPtr loaded = sampler::loadKit(ls, rate, nullptr, [&](const std::string&, int, std::string*) { return AudioBufferPtr(whole); }, streamed);
+        QVERIFY(loaded->pads[0].sounds.size() == 1 && loaded->pads[0].sounds[0].disk);
+        const std::string own = loaded->pads[0].sounds[0].disk->file;
+        QVERIFY(QFileInfo(QString::fromStdString(own)).fileName().startsWith("kit-"));
+        // Both as if last written over a week ago (a session left open), and the sound changed since.
+        for (const std::string& f : {first, own})
+            std::filesystem::last_write_time(std::filesystem::path(f), std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 8));
+        longSound.resize(size_t(26) * rate, 0.1f);
+        QVERIFY(writeMonoWav(longFile, longSound, rate));
+        QProcess other;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert("MONTAGE_TEST_SAMPLER_CACHE", cache.path());
+        env.insert("MONTAGE_TEST_SAMPLER_SOUND", QString::fromStdString(longFile));
+        other.setProcessEnvironment(env);
+        other.start(QCoreApplication::applicationFilePath(), {"samplerCacheAcrossProcesses"});
+        QVERIFY(other.waitForStarted());
+        QVERIFY(other.waitForFinished(120000));
+        QVERIFY2(other.exitStatus() == QProcess::NormalExit && other.exitCode() == 0, other.readAllStandardOutput().constData());
+        auto cached = [&] { return QDir(cache.path()).entryList({"sound-*.f32", "kit-*.f32"}, QDir::Files); };
+        QCOMPARE(cached().size(), 3);  // (the earlier version and the kit's file, both played from here, and the new one)
+        QVERIFY(QFileInfo::exists(QString::fromStdString(first)) && QFileInfo::exists(QString::fromStdString(own)));
+        // Both still play here: the earlier version of the sound, and the loader's sound.
+        const std::vector<SamplerNote> held{{40, 100, 0, int64_t(24) * rate}};
+        const std::vector<float> a = sampler::renderNotes(kit, held, 1, 0, int64_t(24) * rate);
+        double late = 0;
+        for (size_t i = size_t(20) * rate * 2; i < size_t(23) * rate * 2; ++i) late = std::max(late, double(std::fabs(a[i])));
+        QVERIFY(late > 0.1);
+        const std::vector<float> b = sampler::renderNotes(loaded, held, 1, 0, int64_t(24) * rate);
+        QVERIFY(std::fabs(b[size_t(22) * rate * 2]) > 0.02);
+        // Once this Montage lets them go, the kit's file goes with its kit and the next load takes the earlier version.
+        kit.reset();
+        loaded.reset();
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(own)));
+        const sampler::KitPtr now = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QVERIFY(now->pads[0].sounds[0].disk && now->pads[0].sounds[0].disk->file != first);
+        QCOMPARE(cached().size(), 1);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(first)));
+    }
+
     void mcpMidiMap() {
         // MIDI Learn's maps edited over MCP: a mapping added, shown, replaced and removed, in the file the app reads.
         QTemporaryDir dir;

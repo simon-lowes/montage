@@ -14,6 +14,13 @@
 #include <optional>
 #include <thread>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include "ElasticAudio.h"
 #include "core/TakeLanes.h"
 #include "media/MediaPool.h"
@@ -83,13 +90,52 @@ std::atomic<double> gThrottle{0};
 std::atomic<int64_t> gUnderruns{0};
 std::atomic<uint64_t> gCacheSerial{0};
 
-// A cache file made for one kit (a sound given by a loader): removed with its last user.
-struct OwnedDiskSound : DiskSound {
-    ~OwnedDiskSound() {
-        std::error_code ec;
-        std::filesystem::remove(file, ec);
+// A cache file held open while a kit plays from it, so that no Montage tidying the folder (this one or another
+// sharing it) removes it: on Windows an open file cannot be removed; elsewhere it is held with a shared lock, and
+// tidying removes a file only under an exclusive one. A file made for one kit (a sound given by a loader) is
+// removed with its last user.
+struct HeldDiskSound : DiskSound {
+    std::FILE* hold = nullptr;
+    bool owned = false;
+    ~HeldDiskSound() {
+        if (hold) std::fclose(hold);  // (closed first: Windows removes no open file)
+        if (owned) {
+            std::error_code ec;
+            std::filesystem::remove(file, ec);
+        }
     }
 };
+
+// The file at `path` opened and held (as above); nullptr when it is not there, or was removed while it was opened.
+std::FILE* holdFile(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return nullptr;
+#ifndef _WIN32
+    // (where the file system has no locks, held as well as it can be: open)
+    if (::flock(fileno(f), LOCK_SH) == 0) {
+        // Removed between the open and the lock: what was opened is no longer the file of that name.
+        struct stat held {}, named {};
+        if (::fstat(fileno(f), &held) != 0 || ::stat(path.c_str(), &named) != 0 || held.st_ino != named.st_ino || held.st_dev != named.st_dev) {
+            std::fclose(f);
+            return nullptr;
+        }
+    }
+#endif
+    return f;
+}
+
+// Removes a cache file unless a Montage holds it (it is left then).
+void removeUnheld(const std::filesystem::path& file) {
+    std::error_code ec;
+#ifdef _WIN32
+    std::filesystem::remove(file, ec);  // (refused while any process has it open)
+#else
+    const int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    if (::flock(fd, LOCK_EX | LOCK_NB) == 0) std::filesystem::remove(file, ec);  // (removed under the lock, then let go)
+    ::close(fd);
+#endif
+}
 
 std::filesystem::path cacheFolder(const StreamOptions& o) {
     std::error_code ec;
@@ -98,27 +144,29 @@ std::filesystem::path cacheFolder(const StreamOptions& o) {
     return dir;
 }
 
-// The cache files this process's kits play from (by path): tidying never takes one of them, and a file asked for
-// again while a kit still plays from it is that kit's.
+// The cache files this process's kits play from (by path): a file asked for again while a kit still plays from it
+// is that kit's.
 std::mutex gCacheM;
 std::map<std::string, std::weak_ptr<const DiskSound>> gCacheInUse;
 
 // A cache folder kept small: the cache files of earlier versions of one source (`sourcePrefix`: their names' start;
 // `keep` the one for the source as it is now), and whatever has not been used for a week (cache files, parts a crash
-// left, kits' own files), are removed; what this process plays from stays.
+// left, kits' own files), are removed; what any Montage plays from stays.
 void tidyCache(const std::filesystem::path& dir, const std::string& sourcePrefix, const std::filesystem::path& keep) {
     std::error_code ec;
     const auto now = std::filesystem::file_time_type::clock::now();
     std::lock_guard<std::mutex> lock(gCacheM);
     for (auto it = gCacheInUse.begin(); it != gCacheInUse.end();) it = it->second.expired() ? gCacheInUse.erase(it) : std::next(it);
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+    // (stepped with an error code: a folder that cannot be read on is left as it is, not thrown out of)
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::filesystem::directory_entry& entry = *it;
         const std::string name = entry.path().filename().string();
         if (name.rfind("sound-", 0) != 0 && name.rfind("kit-", 0) != 0) continue;
         if (entry.path() == keep || gCacheInUse.count(entry.path().string())) continue;
         std::error_code e2;
         const auto used = std::filesystem::last_write_time(entry.path(), e2);
         const bool earlier = !sourcePrefix.empty() && name.rfind(sourcePrefix, 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".f32") == 0;
-        if (earlier || (!e2 && now - used > std::chrono::hours(24 * 7))) std::filesystem::remove(entry.path(), e2);
+        if (earlier || (!e2 && now - used > std::chrono::hours(24 * 7))) removeUnheld(entry.path());
     }
 }
 
@@ -148,7 +196,7 @@ AudioBufferPtr readHead(const DiskSound& d, int64_t from, int64_t frames, int ra
 
 // A long file decoded in blocks straight into its cache file (kept to be used again while the file is unchanged: named
 // for the source and rate, then for the file as it is, so a changed file's earlier cache file is known and removed).
-std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate, const StreamOptions& o, std::string* why) {
+std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate, const StreamOptions& o, std::string* why, int tries = 2) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
     if (ec) {
@@ -175,15 +223,16 @@ std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate,
         tidyCache(dir, source, file);
         return live;
     }
-    auto d = std::make_shared<DiskSound>();
+    auto d = std::make_shared<HeldDiskSound>();
     d->file = file.string();
-    if (const auto have = std::filesystem::file_size(file, ec); !ec && have > 0 && have % 8 == 0) {
-        d->frames = int64_t(have / 8);
-        std::filesystem::last_write_time(file, std::filesystem::file_time_type::clock::now(), ec);  // (used now)
-        inUse(d);
-        tidyCache(dir, source, file);
-        return d;
-    }
+    if (const auto have = std::filesystem::file_size(file, ec); !ec && have > 0 && have % 8 == 0)
+        if ((d->hold = holdFile(d->file))) {
+            d->frames = int64_t(have / 8);
+            std::filesystem::last_write_time(file, std::filesystem::file_time_type::clock::now(), ec);  // (used now)
+            inUse(d);
+            tidyCache(dir, source, file);
+            return d;
+        }
     const std::string part = d->file + ".part" + std::to_string(gCacheSerial++);
     std::FILE* f = std::fopen(part.c_str(), "wb");
     if (!f) {
@@ -207,6 +256,8 @@ std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate,
         std::filesystem::remove(part, ec);
         return nullptr;
     }
+    // (another Montage, with the source changed again, may have removed it as an earlier version just now: made again)
+    if (!(d->hold = holdFile(d->file))) return tries > 1 ? decodeToDisk(path, rate, o, why, tries - 1) : nullptr;
     d->frames = frames;
     inUse(d);
     tidyCache(dir, source, file);
@@ -215,15 +266,16 @@ std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate,
 
 // A sound a loader gave, written to a cache file of the kit's own.
 std::shared_ptr<const DiskSound> writeToDisk(const AudioBuffer& stereo, const StreamOptions& o) {
-    auto d = std::make_shared<OwnedDiskSound>();
+    auto d = std::make_shared<HeldDiskSound>();
     d->file = (cacheFolder(o) / ("kit-" + std::to_string(uint64_t(std::chrono::steady_clock::now().time_since_epoch().count())) + "-" +
                                  std::to_string(gCacheSerial++) + ".f32"))
                   .string();
     std::FILE* f = std::fopen(d->file.c_str(), "wb");
     if (!f) return nullptr;
+    d->owned = true;  // (from here on removed with the kit, or now if it cannot be held)
     const bool ok = writeFloats(f, stereo.samples.data(), stereo.samples.size());
     std::fclose(f);
-    if (!ok) return nullptr;
+    if (!ok || !(d->hold = holdFile(d->file))) return nullptr;
     d->frames = stereo.frames();
     return d;
 }
