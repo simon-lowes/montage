@@ -2263,6 +2263,11 @@ struct LiveOrigin::State {
                 socket->deleteLater();
                 return;
             }
+#ifdef Q_OS_WIN
+            // (Windows otherwise takes many megabytes into a connection's send buffer whether or not its client reads
+            // them, so a client that reads nothing still seemed to take what it was sent)
+            socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, 1 << 20);
+#endif
             auto r = std::make_unique<Request>();
             r->socket = socket;
             Request* raw = r.get();
