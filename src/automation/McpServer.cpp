@@ -832,7 +832,7 @@ McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOn
     const bool exports = tool.startsWith(QLatin1String("montage_export_"));
     const auto kind = [readOnly, exports](const QString& k) {
         const auto named = [&k](const char* n) { return k == QLatin1String(n) || k.endsWith(QLatin1Char('_') + QLatin1String(n)); };
-        for (const char* w : {"output", "report"})
+        for (const char* w : {"output", "report", "record"})
             if (named(w)) return 2;
         for (const char* f : {"folder", "dir"})
             if (named(f)) return readOnly ? 1 : 2;
@@ -842,12 +842,22 @@ McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOn
             if (named(r)) return 1;
         return 0;
     };
-    for (auto it = a.begin(); it != a.end(); ++it) {
-        const int k = kind(it.key());
-        if (!k) continue;
-        const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
-        for (const QJsonValue& v : list)
-            if (v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << oneNameFor(v.toString());
+    // (in the objects inside the arguments too, as a live package's recording, streaming.live.record)
+    std::function<void(const QJsonObject&, int)> walk = [&](const QJsonObject& o, int depth) {
+        for (auto it = o.begin(); it != o.end(); ++it) {
+            const int k = kind(it.key());
+            const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
+            for (const QJsonValue& v : list)
+                if (v.isObject() && depth < 8) walk(v.toObject(), depth + 1);
+                else if (k && v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << oneNameFor(v.toString());
+        }
+    };
+    walk(a, 0);
+    // (a live package's recording, when none is named, is the package folder's name with .mov, beside it)
+    if (const QJsonObject live = a.value("streaming").toObject().value("live").toObject();
+        tool == QLatin1String("montage_render") && !live.isEmpty() && !live.contains("record") && !a.value("output").toString().isEmpty()) {
+        const QFileInfo fi(QDir::cleanPath(absolute(a.value("output").toString())));
+        out.writes << oneNameFor(fi.absoluteDir().filePath(fi.fileName() + ".mov"));
     }
     out.writes.removeDuplicates();
     out.reads.removeDuplicates();
@@ -861,6 +871,22 @@ bool mcpPathsOverlap(const QString& a, const QString& b) {
         return in.size() > folder.size() && in.startsWith(folder) && (folder.endsWith(QLatin1Char('/')) || in.at(folder.size()) == QLatin1Char('/'));
     };
     return inside(a, b) || inside(b, a);
+}
+
+// What a call would write of what only Montage writes, and only as the user asks: the roots the user trusts for
+// facility lists, the facility list, Montage's DCP certificate chain and the DKDMs (empty: none).
+static QString ownFileWritten(const McpCallPaths& paths) {
+    const std::pair<std::string, const char*> own[] = {{trustedRootsFile(), "the roots trusted for facility lists"},
+                                                       {facilitiesFile(), "the facility list"},
+                                                       {dcp::signerFolder(), "its DCP certificates"},
+                                                       {dcp::dkdmFolder(), "the DKDMs of its DCPs"}};
+    for (const auto& [file, what] : own) {
+        if (file.empty()) continue;
+        const QString name = oneNameFor(QString::fromStdString(file));
+        for (const QString& w : paths.writes)
+            if (mcpPathsOverlap(w, name)) return QStringLiteral("%1 is where Montage keeps %2: a tool does not write there").arg(w, QLatin1String(what));
+    }
+    return {};
 }
 
 struct McpServer::Impl {
@@ -15745,6 +15771,7 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
         auto tool = std::find_if(d_->tools.begin(), d_->tools.end(), [&](const auto& t) { return t.name == name; });
         if (tool == d_->tools.end()) return error(-32602, QStringLiteral("Unknown tool: %1").arg(name));
         QJsonObject args = params.value("arguments").toObject();
+        if (const QString why = ownFileWritten(mcpCallPaths(name, args, tool->readOnly)); !why.isEmpty()) return reply(resultJson(fail(why)));
         // In the background: a job id now, the call run later (montage_job reads it).
         const QJsonValue async = args.value("async");
         if (name != QLatin1String("montage_job") && (async.toBool() || async.toString().compare(QLatin1String("true"), Qt::CaseInsensitive) == 0)) {

@@ -9968,6 +9968,40 @@ private slots:
             QVERIFY(mcpPathsOverlap(deeper.writes.front(), render.writes.front()));
         }
 #endif
+        // Nightly 19 Nov: paths inside the arguments' objects count too: a live package's recording is written, and
+        // the one made beside the package's folder when none is named.
+        const McpCallPaths live = mcpCallPaths("montage_render", {{"output", folder + "/pkg"}, {"streaming", QJsonObject{{"live", QJsonObject{{"record", folder + "/rec.mov"}}}}}}, false);
+        QVERIFY(live.writes.contains(mcpCallPaths("montage_export_adm", {{"path", folder + "/rec.mov"}}, true).writes.front()));
+        const McpCallPaths beside = mcpCallPaths("montage_render", {{"output", folder + "/pkg"}, {"streaming", QJsonObject{{"live", QJsonObject{{"seconds", 5}}}}}}, false);
+        QVERIFY(beside.writes.contains(mcpCallPaths("montage_export_adm", {{"path", folder + "/pkg.mov"}}, true).writes.front()));
+        // No call writes where Montage keeps what only the user changes (the roots trusted for facility lists, the
+        // facility list, its DCP certificates and DKDMs), in the background or not; nothing is written there.
+        {
+            McpServer server;
+            auto call = [&](const QString& name, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", name}, {"arguments", args}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            const QString roots = QString::fromStdString(trustedRootsFile());
+            const bool hadRoots = QFileInfo::exists(roots);
+            const QByteArray rootsBefore = [&] {
+                QFile f(roots);
+                return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+            }();
+            for (const QString& own : {roots, QString::fromStdString(facilitiesFile()), QString::fromStdString(dcp::signerFolder()) + "/root.pem",
+                                       QString::fromStdString(dcp::dkdmFolder()) + "/new.xml"})
+                for (bool async : {false, true}) {
+                    QJsonObject args{{"path", own}};
+                    if (async) args["async"] = true;
+                    const QJsonObject r = call("montage_export_markers", args);
+                    QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+                }
+            QVERIFY(!call("montage_export_markers", {{"path", folder + "/markers.csv"}}).value("content").toArray().at(0).toObject().value("text").toString().contains("where Montage keeps"));
+            QFile f(roots);
+            QCOMPARE(QFileInfo::exists(roots), hadRoots);
+            if (hadRoots) QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == rootsBefore);
+        }
     }
 
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.

@@ -11116,6 +11116,68 @@ private slots:
         QFile::remove(out.value("recording").toString());
     }
 
+    // Nightly 19 Nov: two live packages made over MCP in the background, which run side by side, wait for each other
+    // when they write one recording (named inside streaming.live, or the one a package makes beside its folder when
+    // none is named), and run together when each writes its own.
+    void mcpLiveRendersShareARecording() {
+        const auto kinds = captureDeviceKinds();
+        if (std::find(kinds.begin(), kinds.end(), "lavfi") == kinds.end()) QSKIP("This build reaches no FFmpeg input devices (libavdevice)");
+        const QString base = QString::fromStdString(path("live-shared"));
+        QDir(base).removeRecursively();
+        QVERIFY(QDir().mkpath(base));
+        const int atOnce = jobs::atOnce();
+        jobs::setAtOnce(2);
+        auto restore = qScopeGuard([&] {
+            jobs::setAtOnce(atOnce);
+            QDir(base).removeRecursively();
+        });
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const QString& name, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"}, {"params", QJsonObject{{"name", name}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto start = [&](const QString& folder, const QString& record) {
+            QJsonObject live{{"url", "testsrc2=size=160x90:rate=25,realtime"}, {"device", "lavfi"}, {"seconds", 3}};
+            if (!record.isEmpty()) live["record"] = record;
+            const QJsonObject r = call("montage_render", {{"output", folder}, {"async", true},
+                                                          {"streaming", QJsonObject{{"live", live}, {"segments", "ts"}, {"segment_seconds", 1}, {"dash", false},
+                                                                                    {"audio_codec", "none"},
+                                                                                    {"ladder", QJsonArray{QJsonObject{{"width", 160}, {"height", 90}, {"bitrate", 200000}}}}}}});
+            return r.value("structuredContent").toObject().value("job").toString();
+        };
+        // (whether the two ran at once at any time; each must end done)
+        auto together = [&](const QString& a, const QString& b, bool& both) {
+            both = false;
+            QElapsedTimer t;
+            t.start();
+            QString sa, sb;
+            while (t.elapsed() < 120000) {
+                sa = call("montage_job", {{"job", a}}).value("structuredContent").toObject().value("status").toString();
+                sb = call("montage_job", {{"job", b}}).value("structuredContent").toObject().value("status").toString();
+                both |= sa == "running" && sb == "running";
+                const auto finished = [](const QString& s) { return s == "done" || s == "failed" || s == "cancelled"; };
+                if (finished(sa) && finished(sb)) break;
+                QTest::qWait(50);
+            }
+            return sa == "done" && sb == "done";
+        };
+        bool both = true;
+        const QString shared = base + "/shared.mov";
+        QString a = start(base + "/a", shared), b = start(base + "/b", shared);
+        QVERIFY(!a.isEmpty() && !b.isEmpty());
+        QVERIFY(together(a, b, both));
+        QVERIFY(!both);
+        a = start(base + "/c", {}), b = start(base + "/d", base + "/c.mov");
+        QVERIFY(together(a, b, both));
+        QVERIFY(!both);
+        a = start(base + "/e", {}), b = start(base + "/f", base + "/own.mov");
+        QVERIFY(together(a, b, both));
+        QVERIFY(both);
+        QVERIFY(QFileInfo(shared).size() > 0 && QFileInfo(base + "/e.mov").size() > 0 && QFileInfo(base + "/own.mov").size() > 0);
+    }
+
     void mcpLiveLanguagesAndCues() {
         // montage_render's streaming.live with every sound stream (FFmpeg's test source with two tones, named English
         // and French), captions listed though the feed has none, an ad break and two chapters placed ahead, in low
