@@ -11564,6 +11564,10 @@ private slots:
         auto cached = [&] { return QDir(cache.path()).entryList({"sound-*.f32", "kit-*.f32"}, QDir::Files); };
         QCOMPARE(cached().size(), 3);  // (the earlier version and the kit's file, both played from here, and the new one)
         QVERIFY(QFileInfo::exists(QString::fromStdString(first)) && QFileInfo::exists(QString::fromStdString(own)));
+        // Nor does this Montage's own tidying take them (the kit's file was never kept before).
+        const sampler::KitPtr here = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QVERIFY(here->pads[0].sounds[0].disk && here->pads[0].sounds[0].disk->file != first);
+        QCOMPARE(cached().size(), 3);
         // Both still play here: the earlier version of the sound, and the loader's sound.
         const std::vector<SamplerNote> held{{40, 100, 0, int64_t(24) * rate}};
         const std::vector<float> a = sampler::renderNotes(kit, held, 1, 0, int64_t(24) * rate);
