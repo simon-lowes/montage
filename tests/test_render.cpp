@@ -23613,6 +23613,11 @@ colorspaces:
             std::atomic<bool> stop{false};
             std::atomic<int> port{0}, relayed{0}, signedRight{0}, signedWrong{0}, stale{0}, newStyle{0}, permissions{0};
             std::atomic<int> lifetime{600}, refreshes{0}, released{0};  // seconds an address is given for; Refresh requests for more, and for none
+            // Sendings of Refresh (for more time) and of CreatePermission to leave unanswered; and whether the relay
+            // lets an address go once its time is up unrefreshed (answering a Refresh 437 then) and carries only to
+            // and from addresses let in.
+            std::atomic<int> dropRefreshes{0}, dropPermissions{0};
+            std::atomic<bool> strict{false};
             std::thread thread;
             static void attribute(QByteArray& b, quint16 type, const QByteArray& value) {
                 b.append(char(type >> 8)).append(char(type & 0xff)).append(char(value.size() >> 8)).append(char(value.size() & 0xff)).append(value);
@@ -23639,6 +23644,10 @@ colorspaces:
                 port = front.localPort();
                 quint16 client = 0;
                 const QByteArray key = QCryptographicHash::hash("reviewer:old-relay:relay-password-2", QCryptographicHash::Md5);
+                QElapsedTimer clock;
+                clock.start();
+                qint64 expiresAt = 0;
+                std::set<quint16> allowed;
                 while (!stop) {
                     front.waitForReadyRead(2);
                     while (front.hasPendingDatagrams()) {
@@ -23664,8 +23673,18 @@ colorspaces:
                             at += 4 + ((n + 3) & ~qsizetype(3));
                         }
                         if (type == 0x0016) {  // a Send indication: on to the peer from the relayed port
-                            if (peer) back.writeDatagram(data, QHostAddress::LocalHost, peer);
+                            if (peer && (!strict || (clock.elapsed() < expiresAt && allowed.count(peer)))) back.writeDatagram(data, QHostAddress::LocalHost, peer);
                             continue;
+                        }
+                        if (integrityAt >= 0 && nonce != "first") {
+                            if (type == 0x0004 && asked && dropRefreshes > 0) {
+                                --dropRefreshes;
+                                continue;
+                            }
+                            if (type == 0x0008 && dropPermissions > 0) {
+                                --dropPermissions;
+                                continue;
+                            }
                         }
                         QByteArray challenge;
                         attribute(challenge, 0x0014, "old-relay");
@@ -23684,6 +23703,7 @@ colorspaces:
                         const bool right = nonce == "second" && QMessageAuthenticationCode::hash(covered, key, QCryptographicHash::Sha1) == d.mid(integrityAt + 4, 20);
                         ++(right ? signedRight : signedWrong);
                         QByteArray a;
+                        bool mismatch = false;
                         if (!right) {
                             attribute(a, 0x0009, QByteArray::fromHex("00000401") + "No");
                             attribute(a, 0x0015, "second");
@@ -23691,19 +23711,26 @@ colorspaces:
                         } else if (type == 0x0003) {
                             attribute(a, 0x0016, address(back.localPort()));
                             attribute(a, 0x000D, QByteArray::fromHex("0000") + char(lifetime >> 8) + char(lifetime & 0xff));
+                            expiresAt = clock.elapsed() + qint64(lifetime) * 1000;
+                        } else if (type == 0x0004 && asked && strict && clock.elapsed() >= expiresAt) {
+                            mismatch = true;
+                            attribute(a, 0x0009, QByteArray::fromHex("00000425") + "Allocation Mismatch");
                         } else if (type == 0x0004) {
                             ++(asked ? refreshes : released);
                             attribute(a, 0x000D, asked ? QByteArray::fromHex("0000") + char(lifetime >> 8) + char(lifetime & 0xff) : QByteArray(4, '\0'));
+                            if (asked) expiresAt = clock.elapsed() + qint64(lifetime) * 1000;
                         } else if (type == 0x0008) {
                             ++permissions;
+                            allowed.insert(peer);
                         }
-                        front.writeDatagram(message(type | (right ? 0x0100 : 0x0110), id, a), QHostAddress::LocalHost, client);
+                        front.writeDatagram(message(type | (right && !mismatch ? 0x0100 : 0x0110), id, a), QHostAddress::LocalHost, client);
                     }
                     back.waitForReadyRead(2);
                     while (back.hasPendingDatagrams()) {  // from a peer: a Data indication to the client
                         QByteArray d(int(back.pendingDatagramSize()), 0);
                         quint16 from = 0;
                         back.readDatagram(d.data(), d.size(), nullptr, &from);
+                        if (strict && (clock.elapsed() >= expiresAt || !allowed.count(from))) continue;
                         QByteArray a;
                         attribute(a, 0x0012, address(from));
                         attribute(a, 0x0013, d);
@@ -23898,6 +23925,52 @@ colorspaces:
             }
             QTRY_VERIFY_WITH_TIMEOUT(old.released > releasedBefore, 5000);
             QCOMPARE(old.signedWrong.load(), wrongBefore);
+        }
+        // Nightly 19 Nov: a relay that keeps an address only while it is refreshed and carries only to addresses let
+        // in. Every sending of the first CreatePermission and of the first Refresh goes unanswered: the viewer's
+        // address is asked for again within seconds (not four minutes on), and the address is kept past its first
+        // twenty seconds. Once the relay answers no Refresh at all, the bridge says the address ran out and carries
+        // nothing more.
+        {
+            old.lifetime = 20;
+            old.strict = true;
+            old.dropPermissions = 5;
+            old.dropRefreshes = 5;
+            auto endStrict = qScopeGuard([&] {
+                old.strict = false;
+                old.dropPermissions = 0;
+                old.dropRefreshes = 0;
+                old.lifetime = 600;
+            });
+            const int refreshesBefore = old.refreshes;
+            RelayBridge bridge("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+            QCOMPARE(allocate(bridge), std::string());
+            QElapsedTimer since;
+            since.start();
+            auto viewer = socket(), end = socket();
+            const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+            QVERIFY(alias != 0);
+            auto through = [&](const QByteArray& what, int ms) {
+                QElapsedTimer t;
+                t.start();
+                while (t.elapsed() < ms) {
+                    end->writeDatagram(what, QHostAddress::LocalHost, alias);
+                    if (read(*viewer, 100).data == what) return true;
+                }
+                return false;
+            };
+            QVERIFY(through("let in again", 12000));
+            QCOMPARE(old.dropPermissions.load(), 0);
+            qInfo("Through %lld ms after the first CreatePermission was lost", (long long)since.elapsed());
+            while (since.elapsed() < 23000) QThread::msleep(100);
+            QCOMPARE(old.dropRefreshes.load(), 0);
+            QVERIFY(old.refreshes > refreshesBefore);
+            QVERIFY(through("kept past its first time", 3000));
+            QCOMPARE(bridge.lastError(), std::string());
+            old.dropRefreshes = 1000;
+            QTRY_VERIFY_WITH_TIMEOUT(!bridge.lastError().empty(), 30000);
+            QVERIFY2(QString::fromStdString(bridge.lastError()).contains("ran out"), bridge.lastError().c_str());
+            QVERIFY(!through("after it ran out", 1000));
         }
 #endif
     }

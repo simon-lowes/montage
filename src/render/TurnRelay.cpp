@@ -71,6 +71,7 @@ enum : quint16 {
 const int kMaxPeers = 32;
 const int kLifetimeAsked = 600;          // seconds
 const int kPermissionEveryMs = 240000;   // (a permission lasts five minutes)
+const int kPermissionAgainMs = 1000;     // a CreatePermission unanswered is asked again this soon after
 const int kResendMs[] = {300, 600, 1200, 2400, 1500};  // the waits after each sending of a request: six seconds in all
 
 void put16(QByteArray& b, quint16 v) {
@@ -288,9 +289,10 @@ struct RelayBridge::Impl {
     QByteArray realm, nonce, key, algorithms;
     quint16 algorithm = 0;  // (0: none named, the key is MD5's)
     QByteArray icePassword;  // Montage's end's, once said
-    bool allocated = false, asked = false;
+    bool allocated = false, asked = false, refreshing = false;
     int lifetime = kLifetimeAsked;  // seconds, as the relay last gave it
-    qint64 refreshAt = 0, permitAt = 0;
+    // When to ask for the address again, and when the relay lets it go unless it is (now()'s clock, ms).
+    qint64 refreshAt = 0, expiresAt = 0, permitAt = 0;
     std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
     std::function<void(const std::string&)> allocateDone;
 
@@ -299,6 +301,14 @@ struct RelayBridge::Impl {
     void lifetimeFrom(const Message& answer) {
         if (const QByteArray* l = answer.find(kLifetime); l && l->size() == 4) lifetime = int(std::clamp<quint32>(get32(*l, 0), 20, 3600));
         refreshAt = now() + qint64(lifetime) * 500;
+        expiresAt = now() + qint64(lifetime) * 1000;
+    }
+    // The relay has let the address go (its time ran out unrefreshed, or it no longer knows it): nothing more is
+    // carried, and the bridge says why.
+    void lapsed(const std::string& why) {
+        if (!allocated) return;
+        allocated = false;
+        setError(why);
     }
 
     void run() {
@@ -410,16 +420,28 @@ struct RelayBridge::Impl {
             requests.erase(it);
             if (r.done) r.done(nullptr);
         }
-        if (allocated && at >= refreshAt) {
-            refreshAt = at + qint64(lifetime) * 500;
+        if (allocated && at >= expiresAt) lapsed("The TURN relay's address for this viewer ran out: the relay did not answer in time to keep it");
+        // The address is asked for again half way through its time and, when an asking goes unanswered (six seconds
+        // of sending it), at once again for as long as the address lasts: a lost answer costs no viewer their picture.
+        if (allocated && !refreshing && at >= refreshAt) {
+            refreshing = true;
             Request r;
             r.method = kRefresh;
             QByteArray life;
             put32(life, kLifetimeAsked);
             r.attributes.emplace_back(kLifetime, life);
             r.done = [this](const Message* answer) {
-                if (!answer) return;
-                if ((answer->type & 0x0110) == kError) return fail(answer);
+                refreshing = false;
+                if (!answer) {
+                    refreshAt = now();
+                    return;
+                }
+                if ((answer->type & 0x0110) == kError) {
+                    // (437: the relay knows the address no more; another refusal is asked again a few seconds on)
+                    if (errorCode(*answer) == 437) return lapsed(refusal(answer));
+                    refreshAt = now() + 5000;
+                    return fail(answer);
+                }
                 lifetimeFrom(*answer);
             };
             send(std::move(r));
@@ -434,10 +456,14 @@ struct RelayBridge::Impl {
         std::lock_guard lock(m);
         error = why;
     }
+    static int errorCode(const Message& answer) {
+        const QByteArray* e = answer.find(kErrorCode);
+        return e && e->size() >= 4 ? (quint8((*e)[2]) & 7) * 100 + quint8((*e)[3]) : 0;
+    }
     static std::string refusal(const Message* answer) {
         const QByteArray* e = answer ? answer->find(kErrorCode) : nullptr;
         if (!e || e->size() < 4) return "The TURN relay did not answer";
-        const int code = (quint8((*e)[2]) & 7) * 100 + quint8((*e)[3]);
+        const int code = errorCode(*answer);
         const QByteArray reason = e->mid(4, 80);
         if (code == 401 || code == 431) return "The TURN relay did not take Montage's login (" + std::to_string(code) + "): its time may be up";
         return "The TURN relay refused (" + std::to_string(code) + (reason.isEmpty() ? "" : " " + QString::fromUtf8(reason).simplified().toStdString()) + ")";
@@ -452,8 +478,7 @@ struct RelayBridge::Impl {
         Request r = std::move(it->second);
         requests.erase(it);
         if ((m.type & 0x0110) == kError) {
-            const QByteArray* e = m.find(kErrorCode);
-            const int code = e && e->size() >= 4 ? (quint8((*e)[2]) & 7) * 100 + quint8((*e)[3]) : 0;
+            const int code = errorCode(m);
             const QByteArray* n = m.find(kNonce);
             const QByteArray* rl = m.find(kRealm);
             // (401 once the login has been sent with this realm is the relay's refusal of it)
@@ -532,7 +557,8 @@ struct RelayBridge::Impl {
         if (auto done = std::exchange(allocateDone, nullptr)) done(why);
     }
 
-    // The relay is asked to let a viewer's address in (again every four minutes).
+    // The relay is asked to let a viewer's address in (again every four minutes, and a second after an asking that
+    // went unanswered, so a lost answer leaves no gap of minutes in the picture).
     void permit(quint32 ip, quint16 peerPort, bool again) {
         if (!again && !permitted.insert(ip).second) return;
         if (!allocated) return;
@@ -540,7 +566,8 @@ struct RelayBridge::Impl {
         r.method = kCreatePermission;
         r.attributes.emplace_back(kXorPeerAddress, xorAddress(ip, peerPort));
         r.done = [this](const Message* answer) {
-            if (!answer || (answer->type & 0x0110) == kError) fail(answer);
+            if (!answer) permitAt = std::min(permitAt, now() + kPermissionAgainMs);
+            else if ((answer->type & 0x0110) == kError) fail(answer);
         };
         send(std::move(r));
     }
