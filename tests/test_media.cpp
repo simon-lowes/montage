@@ -24634,6 +24634,145 @@ if ui["pressed"] == "add":
         }
     }
 
+    void av1DecoderModelCrafted() {
+        // AV1 streams written bit by bit into IVF files (nightly 19 Nov): a removal-time counter that wraps many times
+        // between random access points, buffer delays of the largest the header can state, and a stream of frame
+        // headers a few bytes each that state 32 removal times. Every frame is 320x180 at 50 frames a second, and the
+        // decoding tick is one frame.
+        struct Bits {
+            QByteArray b;
+            int n = 0;
+            void put(uint64_t v, int len) {
+                for (int i = len - 1; i >= 0; --i, ++n) {
+                    if (n % 8 == 0) b.append(char(0));
+                    if ((v >> i) & 1) b[b.size() - 1] = char(uint8_t(b[b.size() - 1]) | (0x80 >> (n % 8)));
+                }
+            }
+            QByteArray done() {
+                put(1, 1);  // trailing bits
+                return b;
+            }
+        };
+        auto obu = [](int type, const QByteArray& payload) {
+            QByteArray o(1, char(type << 3 | 2));
+            for (uint32_t v = uint32_t(payload.size());; v >>= 7) {
+                o.append(char((v & 0x7f) | (v >= 0x80 ? 0x80 : 0)));
+                if (v < 0x80) break;
+            }
+            return o + payload;
+        };
+        struct Model {
+            int ops = 1, delayLength = 20, removalLength = 4;
+            uint64_t decoderDelay = 45000, encoderDelay = 45000;  // 90 kHz
+        };
+        auto sequenceHeader = [&](const Model& m) {
+            Bits s;
+            s.put(0, 3), s.put(0, 1), s.put(0, 1);  // profile 0, not a still picture, not reduced
+            s.put(1, 1), s.put(1, 32), s.put(50, 32), s.put(0, 1);  // timing info: 50 a second, no equal interval
+            s.put(1, 1), s.put(uint64_t(m.delayLength - 1), 5), s.put(1, 32), s.put(uint64_t(m.removalLength - 1), 5), s.put(0, 5);
+            s.put(0, 1), s.put(uint64_t(m.ops - 1), 5);  // no initial display delay; the operating points
+            for (int i = 0; i < m.ops; ++i) {
+                s.put(0, 12), s.put(0, 5);  // every layer; level 2.0 (1.5 Mb/s)
+                s.put(1, 1), s.put(m.decoderDelay, m.delayLength), s.put(m.encoderDelay, m.delayLength), s.put(0, 1);
+            }
+            s.put(8, 4), s.put(8, 4), s.put(319, 9), s.put(179, 9);  // the largest frame size
+            s.put(0, 1), s.put(0, 3), s.put(0, 4), s.put(0, 1);  // no frame ids, no tools, no order hint
+            s.put(0, 1), s.put(0, 1);  // screen content tools off
+            s.put(0, 3);  // no superres, CDEF or restoration
+            s.put(0, 1), s.put(0, 1), s.put(0, 1), s.put(0, 1), s.put(0, 2), s.put(0, 1);  // 8-bit 4:2:0, no colour description
+            s.put(0, 1);  // no film grain
+            return obu(1, s.done());
+        };
+        auto frameHeader = [&](const Model& m, bool key, uint64_t removal) {
+            Bits f;
+            f.put(0, 1), f.put(key ? 0 : 1, 2), f.put(1, 1), f.put(0, 1);  // a key or inter frame, shown, its presentation time
+            if (!key) f.put(1, 1);  // error resilient (no primary reference frame)
+            f.put(0, 1), f.put(0, 1);  // CDF updates on, no frame size override
+            f.put(1, 1);  // removal times stated
+            for (int i = 0; i < m.ops; ++i) f.put(removal & ((uint64_t(1) << m.removalLength) - 1), m.removalLength);
+            return obu(3, f.done());
+        };
+        auto writeIvf = [&](const std::string& file, const std::vector<QByteArray>& units) {
+            QFile out(QString::fromStdString(file));
+            QVERIFY(out.open(QIODevice::WriteOnly));
+            auto le = [](uint64_t v, int bytes) {
+                QByteArray a;
+                for (int i = 0; i < bytes; ++i) a.append(char((v >> (8 * i)) & 0xff));
+                return a;
+            };
+            out.write("DKIF" + le(0, 2) + le(32, 2) + "AV01" + le(320, 2) + le(180, 2) + le(50, 4) + le(1, 4) + le(units.size(), 4) + le(0, 4));
+            for (size_t i = 0; i < units.size(); ++i) out.write(le(uint64_t(units[i].size()), 4) + le(i, 8) + units[i]);
+        };
+        // Each temporal unit: a temporal delimiter, the sequence header in the first, the frame header and a tile
+        // group of `tileBytes`. A key frame every 250 frames; removal times count from the one before (a key frame's
+        // own too).
+        auto stream = [&](const Model& m, int frames, int tileBytes) {
+            std::vector<QByteArray> units;
+            int key = 0;
+            for (int i = 0; i < frames; ++i) {
+                QByteArray tu = obu(2, {});
+                if (i == 0) tu += sequenceHeader(m);
+                tu += frameHeader(m, i % 250 == 0, uint64_t(i - key)) + obu(4, QByteArray(tileBytes, char(0x5a)));
+                units.push_back(tu);
+                if (i % 250 == 0) key = i;
+            }
+            return units;
+        };
+
+        // A 4-bit removal time wraps every 16 frames, 15 times between key frames: each frame is still removed a tick
+        // after the one before it, so the stream conforms, at both of its operating points.
+        Model wraps;
+        wraps.ops = 2;
+        const std::string wrapFile = path("av1-wraps.ivf");
+        writeIvf(wrapFile, stream(wraps, 3000, 200));
+        const HrdReport w = checkHrd(wrapFile);
+        QVERIFY2(w.checked && w.conforms(), (w.summary() + " " + w.note + " " + (w.issues.empty() ? std::string() : w.issues.front().text)).c_str());
+        QCOMPARE(w.codec, std::string("AV1"));
+        QCOMPARE(w.frames, int64_t(3000));
+        QCOMPARE(w.schedules.size(), size_t(2));
+        QVERIFY(w.highest > 0 && w.highest < 0.2);
+
+        // Both buffer delays at 2^32 - 1 (13 hours): the decoder's is reported as more than the buffer can take, every
+        // group arrives one after another, and the buffer overflows. 100,000 frames are run in seconds, not compared
+        // each with every other.
+        Model late;
+        late.delayLength = 32, late.removalLength = 32;
+        late.decoderDelay = late.encoderDelay = 0xffffffffu;
+        const std::string lateFile = path("av1-late.ivf");
+        writeIvf(lateFile, stream(late, 100000, 16));
+        QElapsedTimer t;
+        t.start();
+        const HrdReport l = checkHrd(lateFile);
+        QVERIFY2(t.elapsed() < 60000, std::to_string(t.elapsed()).c_str());
+        QVERIFY2(l.checked && !l.conforms(), (l.summary() + " " + l.note).c_str());
+        QCOMPARE(l.frames, int64_t(100000));
+        QCOMPARE(l.issues.front().kind, std::string("timing"));
+        QVERIFY2(l.issues.front().text.find("decoder_buffer_delay is 4294967295") == 0, l.issues.front().text.c_str());
+        QVERIFY(std::any_of(l.issues.begin(), l.issues.end(), [](const HrdIssue& i) { return i.kind == "overflow"; }));
+
+        // 400,000 frame headers of 8 bytes, 1,000 to a temporal unit, each stating 32 one-bit removal times: kept as
+        // read, they would take over 40 times the file's 3 MB. The check stops and says why instead.
+        Model many;
+        many.ops = 32, many.removalLength = 1;
+        std::vector<QByteArray> units;
+        for (int u = 0; u < 400; ++u) {
+            QByteArray tu = u == 0 ? sequenceHeader(many) : QByteArray();
+            for (int i = 0; i < 1000; ++i) tu += frameHeader(many, u == 0 && i == 0, uint64_t(i));
+            units.push_back(tu);
+        }
+        QCOMPARE(frameHeader(many, false, 0).size(), 8);
+        const std::string manyFile = path("av1-many-headers.ivf");
+        writeIvf(manyFile, units);
+        const HrdReport m = checkHrd(manyFile);
+        QVERIFY2(!m.checked && m.error.empty(), m.summary().c_str());
+        QVERIFY2(m.note.find("too many OBUs for its size") != std::string::npos, m.note.c_str());
+        // The first 1,000 of them alone are run.
+        units.resize(1);
+        writeIvf(manyFile, units);
+        const HrdReport one = checkHrd(manyFile);
+        QVERIFY2(one.checked && one.schedules.size() == 32, (one.summary() + " " + one.note).c_str());
+    }
+
 private:
     // A file's video packets in decode order: their bytes, the frame each shows, and whether it is a key frame.
     struct CodedPacket {
