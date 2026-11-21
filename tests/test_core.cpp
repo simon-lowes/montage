@@ -5490,6 +5490,18 @@ private slots:
         const Sequence* nested = fx.p.findSequence(m->sequenceId);
         QCOMPARE(trackAt(*nested, V2)->clips[0].start, FrameTime(10));
         QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));  // nested audio gets its own clip
+        // A 5.1 sequence's clips nest in a 5.1 sequence, folded down to stereo as it is (nightly 19 Nov).
+        Fixture surround;
+        surround.s().audioLayout = "5.1";
+        surround.s().downmixCentreDb = -6, surround.s().downmixSurroundDb = -99;
+        const Result placed = placeMedia(surround.p, surround.s(), surround.media, 0, 0, 30, V1, A1, false);
+        QVERIFY(placed.ok);
+        const Result nestedSurround = makeCompound(surround.p, surround.s(), placed.created, "Nest");
+        QVERIFY(nestedSurround.ok);
+        const Sequence& inner = *surround.p.findSequence(surround.p.findMedia(clipById(surround.s(), nestedSurround.created[0])->mediaId)->sequenceId);
+        QCOMPARE(inner.audioLayout, std::string("5.1"));
+        QCOMPARE(inner.downmixCentreDb, -6.0);
+        QCOMPARE(inner.downmixSurroundDb, -99.0);
     }
 
     void nestInToOutAcrossTracks() {
@@ -5768,6 +5780,26 @@ private slots:
             clipById(*plain.active(), clips[1])->markers.push_back(k);
             QVERIFY(replaceSources(plain, *plain.active(), clips, online.id, false).ok);
             QCOMPARE(clipById(*plain.active(), clips[1])->markers[0].t, FrameTime(40));
+        }
+        // By timecode to a file that starts a second later (nightly 19 Nov): the second clip's in-point moves back a
+        // second. A marker in the clip moves with it; one in the old file's handles, on a moment before the new file
+        // starts, is put on its first frame, not on a frame before it.
+        {
+            Project later = before;
+            MediaItem late = online;
+            late.id = later.newId();
+            late.timecode = 3600 + 1;
+            later.media.push_back(late);
+            Clip& second = *clipById(*later.active(), clips[1]);
+            Marker in, handle;
+            in.t = 40, handle.t = 5;
+            second.markers = {in, handle};
+            QVERIFY(replaceSources(later, *later.active(), {clips[1]}, late.id, true).ok);
+            const Clip& moved = *clipById(*later.active(), clips[1]);
+            const FrameTime second1 = FrameTime(std::llround(later.active()->fpsValue()));
+            QCOMPARE(moved.sourceIn, double(30 - second1));
+            QCOMPARE(moved.markers[0].t, FrameTime(40 - second1));
+            QCOMPARE(moved.markers[1].t, FrameTime(0));
         }
         // An L-cut (the sound leading the picture by 12 frames) keeps its lead; a separate recorder's sound linked to
         // the picture is left on its own file.

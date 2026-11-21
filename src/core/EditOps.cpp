@@ -2061,9 +2061,10 @@ Result replaceSources(Project& p, Sequence& s, const std::vector<Id>& ids, Id me
             if (c.mediaId != mediaId) c.channels = fresh.channels;  // another file's channels
             c.mediaId = mediaId;
             c.name = fresh.name;
-            // (its markers are on source frames: moved as its source is, so each stays on the moment it marked)
+            // (its markers are on source frames: moved as its source is, so each stays on the moment it marked; one on
+            // a moment before the new file starts, in the old one's handles, is put on its first frame)
             if (const FrameTime moved = FrameTime(std::llround(std::max(0.0, sourceIn) - c.sourceIn)); moved != 0)
-                for (Marker& k : c.markers) k.t += moved;
+                for (Marker& k : c.markers) k.t = std::max<FrameTime>(0, k.t + moved);
             c.sourceIn = std::max(0.0, sourceIn);
             c.unrendered.clear();
             const FrameTime limit = sourceLimit(p, work, c);
@@ -2647,6 +2648,9 @@ Result nestClips(Project& p, Sequence& s, const std::vector<Id>& all, const std:
     Sequence nested = makeSequence(p, name, s.width, s.height, s.fps, int(s.videoTracks.size()),
                                    int(s.audioTracks.size()));
     nested.sampleRate = s.sampleRate;
+    // (the same speakers, and fold-down to stereo: a 5.1 or ambisonic mix nests as one)
+    nested.audioLayout = s.audioLayout;
+    nested.downmixCentreDb = s.downmixCentreDb, nested.downmixSurroundDb = s.downmixSurroundDb;
     nested.colorSpace = s.colorSpace;  // same working space: the clips are not converted twice
     nested.hdrPeakNits = s.hdrPeakNits;
     // The same kind of picture: stereo clips keep their depth, 360° footage stays whole.
