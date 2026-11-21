@@ -5602,6 +5602,25 @@ private slots:
             QVERIFY(compoundOn(f.p, *trackAt(outer, A2)));
         }
         {
+            // A track both soloed and muted is silent in the mix, and so is every other while it is soloed: neither
+            // audio track is nested, and only the picture is.
+            Fixture f;
+            f.put(V1, 0, 60);
+            sound(f, A1, 0, 60);
+            sound(f, A2, 0, 60);
+            trackAt(f.s(), A2)->solo = true;
+            trackAt(f.s(), A2)->muted = true;
+            const Id seq = f.s().id;
+            const Result r = nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range");
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& outer = *f.p.findSequence(seq);
+            QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));
+            QCOMPARE(trackAt(outer, A2)->clips.size(), size_t(1));
+            const Sequence* nested = compoundOn(f.p, *trackAt(outer, V1));
+            QVERIFY(nested);
+            QVERIFY(trackAt(*nested, A1)->clips.empty() && trackAt(*nested, A2)->clips.empty());
+        }
+        {
             // Two audio tracks whose faders differ: the compound plays through the lower track's fader, and the other
             // track's difference from it is kept on its track inside the nested sequence.
             Fixture f;

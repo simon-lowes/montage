@@ -2733,13 +2733,13 @@ std::string trackWords(const Sequence& s, TrackRef r) {
 }
 
 // Whether a track's clips are seen or heard at all: a muted track's are not, nor an audio track's while another is
-// soloed.
+// soloed. A track both soloed and muted stays silent, as the mixer keeps it.
 bool trackPlays(const Sequence& s, TrackRef r) {
     const Track* t = trackAt(s, r);
     if (!t) return false;
     if (r.kind == TrackKind::Video) return !t->muted;
     const bool anySolo = std::any_of(s.audioTracks.begin(), s.audioTracks.end(), [](const Track& k) { return k.solo; });
-    return anySolo ? t->solo : !t->muted;
+    return !t->muted && (!anySolo || t->solo);
 }
 
 bool overlapsRange(const Track& t, FrameTime a, FrameTime b) {
