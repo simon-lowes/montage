@@ -1787,7 +1787,12 @@ HrdReport checkHrd(const std::string& path, const std::atomic<bool>* cancel) {
         r.error = "cannot open " + path;
         return r;
     }
-    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+    // (AV1 is read OBU by OBU from its packets, its sequence header in them or the container's: a container that
+    // names it needs no probe, which would only decode frames the check never looks at)
+    bool namesAv1 = false;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i)
+        namesAv1 = namesAv1 || (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && fmt->streams[i]->codecpar->codec_id == kAv1);
+    if (!namesAv1 && avformat_find_stream_info(fmt, nullptr) < 0) {
         avformat_close_input(&fmt);
         r.error = "cannot read " + path;
         return r;

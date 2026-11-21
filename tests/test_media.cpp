@@ -24698,6 +24698,8 @@ if ui["pressed"] == "add":
     }
 
     void av1DecoderModelCrafted() {
+        QElapsedTimer sinceStart;  // (each part's end goes to the output, so a run that stops says where)
+        sinceStart.start();
         // AV1 streams written bit by bit into IVF files (nightly 19 Nov): a removal-time counter that wraps many times
         // between random access points, buffer delays of the largest the header can state, and a stream of frame
         // headers a few bytes each that state 32 removal times. Every frame is 320x180 at 50 frames a second, and the
@@ -24794,6 +24796,7 @@ if ui["pressed"] == "add":
         QCOMPARE(w.frames, int64_t(3000));
         QCOMPARE(w.schedules.size(), size_t(2));
         QVERIFY(w.highest > 0 && w.highest < 0.2);
+        qInfo("AV1 model: the wrapping counter checked after %lld ms", sinceStart.elapsed());
 
         // Both buffer delays at 2^32 - 1 (13 hours): the decoder's is reported as more than the buffer can take, every
         // group arrives one after another, and the buffer overflows. 100,000 frames are run in seconds, not compared
@@ -24812,6 +24815,7 @@ if ui["pressed"] == "add":
         QCOMPARE(l.issues.front().kind, std::string("timing"));
         QVERIFY2(l.issues.front().text.find("decoder_buffer_delay is 4294967295") == 0, l.issues.front().text.c_str());
         QVERIFY(std::any_of(l.issues.begin(), l.issues.end(), [](const HrdIssue& i) { return i.kind == "overflow"; }));
+        qInfo("AV1 model: the late buffer checked after %lld ms", sinceStart.elapsed());
 
         // 400,000 frame headers of 8 bytes, 1,000 to a temporal unit, each stating 32 one-bit removal times: kept as
         // read, they would take over 40 times the file's 3 MB. The check stops and says why instead.
@@ -24829,6 +24833,7 @@ if ui["pressed"] == "add":
         const HrdReport m = checkHrd(manyFile);
         QVERIFY2(!m.checked && m.error.empty(), m.summary().c_str());
         QVERIFY2(m.note.find("too many OBUs for its size") != std::string::npos, m.note.c_str());
+        qInfo("AV1 model: the many headers refused after %lld ms", sinceStart.elapsed());
         // The first 1,000 of them alone are run.
         units.resize(1);
         writeIvf(manyFile, units);
