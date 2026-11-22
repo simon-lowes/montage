@@ -1792,6 +1792,9 @@ HrdReport checkHrd(const std::string& path, const std::atomic<bool>* cancel) {
     bool namesAv1 = false;
     for (unsigned i = 0; i < fmt->nb_streams; ++i)
         namesAv1 = namesAv1 || (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && fmt->streams[i]->codecpar->codec_id == kAv1);
+    // (nor its parser, which FFmpeg 9 runs over IVF: it reads only what the check reads again, and on a crafted stream
+    // logs an error for every packet)
+    if (namesAv1) fmt->flags |= AVFMT_FLAG_NOPARSE;
     if (!namesAv1 && avformat_find_stream_info(fmt, nullptr) < 0) {
         avformat_close_input(&fmt);
         r.error = "cannot read " + path;
