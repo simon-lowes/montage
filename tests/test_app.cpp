@@ -2950,6 +2950,24 @@ private slots:
         const qint64 watchdog = qEnvironmentVariableIntValue("QTEST_FUNCTION_TIMEOUT") > 0 ? qEnvironmentVariableIntValue("QTEST_FUNCTION_TIMEOUT") : 300000;
         auto within = [&](qint64 ms) { return int(std::clamp<qint64>(watchdog - 15000 - sinceStart.elapsed(), 1, ms)); };
         auto phase = [&](const char* what) { qInfo("multiviewer: %s after %lld ms", what, sinceStart.elapsed()); };
+        // (a Mac runner has twice stopped here with nothing more said until the watchdog: so that the next such stop
+        // shows where every thread was, should the function come near the watchdog, macOS's sampler is run on it)
+        std::atomic<bool> over{false};
+        std::thread hangReport([&over, at = watchdog - 10000] {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(at);
+            while (!over && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#ifdef Q_OS_MACOS
+            if (!over) {
+                std::fprintf(stderr, "multiviewer: still running near the watchdog; where its threads are:\n");
+                std::fflush(stderr);
+                std::system(("/usr/bin/sample " + std::to_string(QCoreApplication::applicationPid()) + " 1 -mayDie -file /dev/stderr").c_str());
+            }
+#endif
+        });
+        auto endHangReport = qScopeGuard([&] {
+            over = true;
+            hangReport.join();
+        });
         const int lifetimeS = int(watchdog / 1000) + 30;
         state()->newProject();
         QVERIFY(state()->edit("25p", [](Project&, Sequence& s) {
