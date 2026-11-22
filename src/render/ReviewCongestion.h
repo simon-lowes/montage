@@ -7,6 +7,7 @@
 // padding at a higher rate, which either arrives as promptly as the pictures did or does not.
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -33,8 +34,8 @@ struct ArrivalReport {
 };
 
 // Reads one RTCP packet (from its header on, `size` bytes with it) as a transport-wide feedback report; false when it
-// is not one or is cut short.
-bool parseTransportFeedback(const uint8_t* packet, size_t size, ArrivalReport& out);
+// is not one, is cut short, or goes over more than `most` packets (a few bytes can say 65,535 were lost).
+bool parseTransportFeedback(const uint8_t* packet, size_t size, ArrivalReport& out, size_t most = 0xffff);
 
 // An RTP packet with the transport-wide sequence number added to its header extensions under `id` (1 to 14), in the
 // one-byte or two-byte form the packet already uses (a header extension is begun when it has none). Empty when the
@@ -58,6 +59,10 @@ public:
     uint16_t nextSequence() const { return uint16_t(nextSequence_ & 0xffff); }
     // A report read at `now`.
     void feedback(const ArrivalReport& report, Clock::time_point now);
+    // How many packets the next report may go over (for parseTransportFeedback's `most`). Reports go over the packets
+    // sent, each once or a few times, so what they may go over is earned by sending: four for each packet sent, up to
+    // four times as many as are remembered. Reading a viewer's reports then costs no more than sending them theirs.
+    size_t reportRoom() const { return size_t(std::min<int64_t>(room_, 0xffff)); }
 
     // Reports have come in the last two seconds.
     bool active(Clock::time_point now) const;
@@ -113,6 +118,7 @@ private:
     Clock::time_point lastReport_;
     int64_t sinceUs_ = 0;                       // standing() looks at groups sent from here on
     int64_t probeFromUs_ = -1, probeUntilUs_ = -1;
+    int64_t room_ = 0;  // what reports may still go over (reportRoom())
 };
 
 }  // namespace montage::output

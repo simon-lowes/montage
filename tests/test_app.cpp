@@ -2942,6 +2942,42 @@ private slots:
         namespace st = st2110;
         const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
         if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
+        // Every wait fits inside Qt Test's watchdog for the function, so a step that runs out fails with its own
+        // message (and the phases reached go to the output as they pass); the sources outlive the function, so no wait
+        // outlasts what it waits on, but not by much, so a sender an aborted run leaves behind ends by itself.
+        QElapsedTimer sinceStart;
+        sinceStart.start();
+        const qint64 watchdog = qEnvironmentVariableIntValue("QTEST_FUNCTION_TIMEOUT") > 0 ? qEnvironmentVariableIntValue("QTEST_FUNCTION_TIMEOUT") : 300000;
+        auto within = [&](qint64 ms) { return int(std::clamp<qint64>(watchdog - 15000 - sinceStart.elapsed(), 1, ms)); };
+        auto phase = [&](const char* what) { qInfo("multiviewer: %s after %lld ms", what, sinceStart.elapsed()); };
+        // (waits on the clock: Qt's own waits count their steps, which a Mac runner that sleeps long stretches past the
+        // watchdog)
+        auto until = [&](const auto& met, int ms) {
+            QElapsedTimer w;
+            w.start();
+            const int limit = within(ms);
+            while (!met() && w.elapsed() < limit) QTest::qWait(20);
+            return bool(met());
+        };
+        // (a Mac runner has twice stopped here with nothing more said until the watchdog: so that the next such stop
+        // shows where every thread was, should the function come near the watchdog, macOS's sampler is run on it)
+        std::atomic<bool> over{false};
+        std::thread hangReport([&over, at = watchdog - 10000] {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(at);
+            while (!over && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#ifdef Q_OS_MACOS
+            if (!over) {
+                std::fprintf(stderr, "multiviewer: still running near the watchdog; where its threads are:\n");
+                std::fflush(stderr);
+                std::system(("/usr/bin/sample " + std::to_string(QCoreApplication::applicationPid()) + " 1 -mayDie -file /dev/stderr").c_str());
+            }
+#endif
+        });
+        auto endHangReport = qScopeGuard([&] {
+            over = true;
+            hangReport.join();
+        });
+        const int lifetimeS = int(watchdog / 1000) + 30;
         state()->newProject();
         QVERIFY(state()->edit("25p", [](Project&, Sequence& s) {
             s.width = 320, s.height = 180, s.fps = {25, 1};
@@ -2985,7 +3021,7 @@ private slots:
             QVERIFY2(tx[k].open(o, v, st::AudioFormat{}, &err), err.c_str());
             sending[k] = std::thread([&, k] {
                 const std::vector<float> sound(1920 * 2, 0.25f);
-                for (int t = 0; !stop && t < 25 * 120; ++t) {
+                for (int t = 0; !stop && t < 25 * lifetimeS; ++t) {
                     const output::Timecode tc = output::timecodeOf(FrameTime((10 + k) * 3600 * 25 + t), {25, 1});
                     sent[k] = t;
                     if (!tx[k].send(rasters[size_t(t % 25)], sound.data(), 1920, &tc, {}, &stop)) break;
@@ -3022,7 +3058,7 @@ private slots:
                     pictures.push_back(std::move(out));
                 }
                 auto next = std::chrono::steady_clock::now();
-                for (int t = 0; !stop && t < 25 * 59; ++t) {
+                for (int t = 0; !stop && t < 25 * lifetimeS; ++t) {
                     const int64_t ts = (int64_t(13) * 3600 * 25 + t) * 400000;
                     const std::vector<float> planar(size_t(1920) * 2, 0.5f);
                     omtTx.sendAudio(planar.data(), 2, 1920, 1920, 48000, ts);
@@ -3030,7 +3066,7 @@ private slots:
                     v.width = 320, v.height = 180, v.stride = 320 * 2, v.data = pictures[size_t(t % 25)].data(), v.rateN = 25, v.rateD = 1;
                     v.timestamp = ts;
                     char tc[32];
-                    std::snprintf(tc, sizeof tc, "13:00:%02d:%02d", t / 25, t % 25);
+                    std::snprintf(tc, sizeof tc, "13:%02d:%02d:%02d", t / 1500, t / 25 % 60, t % 25);
                     v.metadata = std::string("<montage_timecode value=\"") + tc + "\"/>";
                     omtSent = t;
                     omtTx.sendVideo(v);
@@ -3043,7 +3079,7 @@ private slots:
         // The stream over SRT (UDP where FFmpeg has no SRT), Montage listening.
         QProcess protocols;
         protocols.start(ffmpeg, {"-hide_banner", "-protocols"});
-        protocols.waitForFinished(20000);
+        protocols.waitForFinished(within(20000));
         const bool srt = QString::fromLocal8Bit(protocols.readAllStandardOutput()).contains(QRegularExpression(QStringLiteral("\\n\\s*srt\\s*\\n")));
         int streamPorts[2];
         for (int& port : streamPorts) {
@@ -3097,7 +3133,7 @@ private slots:
             const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
                                    : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(streamPorts[k]);
             p->start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128",
-                              "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
+                              "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", QString::number(lifetimeS), "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
                               "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
                               "-c:a", "mp2", "-f", "mpegts", to});
             // Only a command that could not be run fails here; the pictures below show it sending. (On macOS, which
@@ -3105,17 +3141,21 @@ private slots:
             // the pipe that tells Qt the command has started, so Qt can wait as long as that process lives: a Mac
             // runner with nothing much to do once waited more than three minutes for a sender that was running.)
             streams.push_back(std::move(p));
-            if (!streams.back()->waitForStarted(30000))
+            if (!streams.back()->waitForStarted(within(30000)))
                 QVERIFY2(streams.back()->error() != QProcess::FailedToStart, qPrintable(streams.back()->errorString()));
         }
+        phase("senders started");
         // (waiting on pictures, not the clock: a busy machine is slow)
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, 60000);
+        QVERIFY2(until([&] { return mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10; }, 60000),
+                 qPrintable(QStringLiteral("pictures per tile: %1 %2 %3 %4").arg(mv->tile(0).pictures).arg(mv->tile(1).pictures).arg(mv->tile(2).pictures).arg(mv->tile(3).pictures)));
+        phase("four tiles showing");
         // Each tile's picture the one its timecode names, its hour the source's, close behind what was sent.
         const int hours[4] = {10, 11, 12, omtOk ? 13 : 14};
         int checked[4] = {0, 0, 0, 0};
         QElapsedTimer t;
         t.start();
-        while (t.elapsed() < 40000 && *std::min_element(checked, checked + 4) < 15) {
+        const int timecodesFor = within(40000);
+        while (t.elapsed() < timecodesFor && *std::min_element(checked, checked + 4) < 15) {
             QTest::qWait(30);
             for (int i = 0; i < 4; ++i) {
                 const LiveFeed::Now now = mv->feed(i)->look();
@@ -3135,6 +3175,7 @@ private slots:
             }
         }
         for (int i = 0; i < 4; ++i) QVERIFY2(checked[i] >= 15, qPrintable(QString::number(i)));
+        phase("timecodes checked");
         // The meters: the senders' quarter of full scale (-12 dBFS), FFmpeg's sine at an eighth (-18).
         r = call({{"action", "multiview"}});
         const QJsonArray tiles = r.value("structuredContent").toObject().value("inputs").toArray();
@@ -3154,16 +3195,17 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(source->liveShowing() && mv->tile(0).onSource && !mv->tile(1).onSource);
         QVERIFY(source->accessibleSummary().startsWith("Live: Cam A"));
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia(), 20000);
+        QVERIFY2(until([&] { return source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia(); }, 20000), "source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia()");
+        phase("live media ready");
         const Id media = source->liveMedia();
         QCOMPARE(mv->tile(0).media, media);
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= 30, 20000);
+        QVERIFY2(until([&] { return source->liveFrame() >= 30; }, 20000), "source->liveFrame() >= 30");
         r = call({{"action", "live"}, {"mark_in", true}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonObject atIn = r.value("structuredContent").toObject();
         const FrameTime in = FrameTime(atIn.value("in").toDouble());
         QVERIFY2(in >= 30, QJsonDocument(atIn).toJson().constData());
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= in + 40, 20000);
+        QVERIFY2(until([&] { return source->liveFrame() >= in + 40; }, 20000), "source->liveFrame() >= in + 40");
         r = call({{"action", "live"}, {"mark_out", true}});
         const FrameTime out = FrameTime(r.value("structuredContent").toObject().value("out").toDouble());
         QVERIFY2(out >= in + 40 && state()->sourceIn() == in, QJsonDocument(r).toJson().constData());
@@ -3182,7 +3224,8 @@ private slots:
         QVERIFY(m);
         const int64_t first = std::llround(m->timecode * 25);  // (the recording's first frame's timecode, in frames)
         QCOMPARE(QString::fromStdString(mv->feed(0)->timecodeAt(0)).left(2), QString("10"));
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() > out + 25, 20000);
+        QVERIFY2(until([&] { return source->liveFrame() > out + 25; }, 20000), "source->liveFrame() > out + 25");
+        phase("In and Out marked");
         // (a sender held up past a fifth of a second goes on from now, and a busy machine's receiver can miss frames:
         // the recording, placed by the pictures' timestamps, holds the last picture again for the slots it passed
         // over, so those frames are a few behind)
@@ -3199,14 +3242,16 @@ private slots:
             int got = -1;
             QElapsedTimer wait;
             wait.start();
+            const qint64 readFor = within(untilReadAgain);
             do {
                 if (got >= 0) QTest::qWait(200);
                 const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), k, {});
                 got = f.width > 0 ? int(std::lround(f.at(f.width / 2, f.height / 2)[1] * 255)) : 0;
-            } while (!matches(got, k) && wait.elapsed() < untilReadAgain);
+            } while (!matches(got, k) && wait.elapsed() < readFor);
             QVERIFY2(matches(got, k), qPrintable(QStringLiteral("frame %1: %2, sent %3 (sender %4 slots behind, %5 repeated)")
                                                      .arg(k).arg(got).arg(greyOf(first + in + k)).arg(tx[0].slotsSkipped())
                                                      .arg(mv->tile(0).repeated)));
+            phase("a recorded frame matched");
         }
         // LIVE off scrubs the recording so far (the tile no longer on the Source monitor); on again, it is.
         auto* badge = source->findChild<QToolButton*>(QStringLiteral("liveBadge"));
@@ -3226,24 +3271,27 @@ private slots:
         QCOMPARE(state()->sourceIn(), in);
         r = call({{"action", "live"}, {"watch", false}});
         QVERIFY(!source->liveShowing() && !source->liveFeed());
-        QTRY_VERIFY(!mv->tileWidget(0)->tally().isValid());
+        QVERIFY2(until([&] { return !mv->tileWidget(0)->tally().isValid(); }, 5000), "!mv->tileWidget(0)->tally().isValid()");
         // Its recording ended from the reception it was made by: the feed was opened once, and is watched on.
         QCOMPARE(mv->tile(0).opened, 1);
         const int64_t seen = mv->tile(0).pictures;
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).running && mv->tile(0).pictures > seen + 5, 20000);
+        phase("recording stopped");
+        QVERIFY2(until([&] { return mv->tile(0).running && mv->tile(0).pictures > seen + 5; }, 20000), "mv->tile(0).running && mv->tile(0).pictures > seen + 5");
         // The stream, watched since its sender called in, chosen and recorded: from that same reception (its sender
         // has not called again: its feed opened once), the file starting on a picture between the stream's groups
         // with the feed's own timecode there, each picture the one its timecode names.
         r = call({{"action", "multiview"}, {"choose", QJsonArray{2}}, {"record", true}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(mv->tile(2).recording && !mv->tile(0).recording);
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(2).media != 0, 30000);
-        QTRY_VERIFY_WITH_TIMEOUT(mv->feed(2)->look().frame >= 40, 30000);
+        QVERIFY2(until([&] { return mv->tile(2).media != 0; }, 30000), "mv->tile(2).media != 0");
+        QVERIFY2(until([&] { return mv->feed(2)->look().frame >= 40; }, 30000), "mv->feed(2)->look().frame >= 40");
+        phase("stream recorded");
         r = call({{"action", "multiview"}, {"record", false}});
         QVERIFY(!mv->tile(2).recording && mv->tile(2).running);
         QCOMPARE(mv->tile(2).opened, 1);
         QCOMPARE(r.value("structuredContent").toObject().value("inputs").toArray()[2].toObject().value("opened").toInt(), 1);
-        QCOMPARE(streams[0]->state(), QProcess::Running);
+        // (not finished: on macOS Qt may never hear that the sender started, leaving it Starting while it sends)
+        QVERIFY(streams[0]->state() != QProcess::NotRunning);
         {
             const QString file = mv->tile(2).path;
             QVERIFY2(QFileInfo(file).fileName() == QStringLiteral("Stream 001.mov"), qPrintable(file));
@@ -9910,6 +9958,16 @@ private slots:
             QVERIFY(f.open(QIODevice::WriteOnly));
             f.write(QByteArray::fromStdString(cinema.certificates.back()));
             f.close();
+            // (a server certificate is taken only once it is a screen's in the facility list, which the user adds:
+            // the list is put back afterwards)
+            std::vector<Facility> before, list;
+            QVERIFY2(loadFacilities(before, &err), err.c_str());
+            auto restore = qScopeGuard([&] { saveFacilities(before); });
+            r = call("montage_make_kdm", {{"dkdm", locked.value("dkdm")}, {"servers", QJsonArray{server}}, {"folder", dir_.filePath("kdms")}});
+            QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("Add Screen"));
+            list = before;
+            QVERIFY2(addScreenByHand(list, "Corner Cinema", "1", server.toStdString(), {}, &err), err.c_str());
+            QVERIFY2(saveFacilities(list, &err), err.c_str());
             r = call("montage_make_kdm", {{"dkdm", locked.value("dkdm")}, {"servers", QJsonArray{server}}, {"folder", dir_.filePath("kdms")}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
             const QJsonArray kdms = r.value("structuredContent").toObject().value("kdms").toArray();
@@ -9958,6 +10016,40 @@ private slots:
             QVERIFY(mcpPathsOverlap(deeper.writes.front(), render.writes.front()));
         }
 #endif
+        // Nightly 19 Nov: paths inside the arguments' objects count too: a live package's recording is written, and
+        // the one made beside the package's folder when none is named.
+        const McpCallPaths live = mcpCallPaths("montage_render", {{"output", folder + "/pkg"}, {"streaming", QJsonObject{{"live", QJsonObject{{"record", folder + "/rec.mov"}}}}}}, false);
+        QVERIFY(live.writes.contains(mcpCallPaths("montage_export_adm", {{"path", folder + "/rec.mov"}}, true).writes.front()));
+        const McpCallPaths beside = mcpCallPaths("montage_render", {{"output", folder + "/pkg"}, {"streaming", QJsonObject{{"live", QJsonObject{{"seconds", 5}}}}}}, false);
+        QVERIFY(beside.writes.contains(mcpCallPaths("montage_export_adm", {{"path", folder + "/pkg.mov"}}, true).writes.front()));
+        // No call writes where Montage keeps what only the user changes (the roots trusted for facility lists, the
+        // facility list, its DCP certificates and DKDMs), in the background or not; nothing is written there.
+        {
+            McpServer server;
+            auto call = [&](const QString& name, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", name}, {"arguments", args}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            const QString roots = QString::fromStdString(trustedRootsFile());
+            const bool hadRoots = QFileInfo::exists(roots);
+            const QByteArray rootsBefore = [&] {
+                QFile f(roots);
+                return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+            }();
+            for (const QString& own : {roots, QString::fromStdString(facilitiesFile()), QString::fromStdString(dcp::signerFolder()) + "/root.pem",
+                                       QString::fromStdString(dcp::dkdmFolder()) + "/new.xml"})
+                for (bool async : {false, true}) {
+                    QJsonObject args{{"path", own}};
+                    if (async) args["async"] = true;
+                    const QJsonObject r = call("montage_export_markers", args);
+                    QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+                }
+            QVERIFY(!call("montage_export_markers", {{"path", folder + "/markers.csv"}}).value("content").toArray().at(0).toObject().value("text").toString().contains("where Montage keeps"));
+            QFile f(roots);
+            QCOMPARE(QFileInfo::exists(roots), hadRoots);
+            if (hadRoots) QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == rootsBefore);
+        }
     }
 
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
@@ -10061,6 +10153,31 @@ private slots:
             dcp::CertificateInfo projector;
             QVERIFY(dcp::readCertificate(projectors[1].certificates.back(), projector));
             QVERIFY(opened.trustedDevices == std::vector<std::string>{projector.thumbprint});
+        }
+        // A server certificate named over MCP: taken when it is a listed screen's server (its leaf alone) or a chain
+        // up to a root the user trusts; refused, and nothing written, for a chain from another root or another
+        // leaf given alone.
+        {
+            dcp::CertificateChain elsewhere;
+            QVERIFY(dcp::makeCertificateChain("Elsewhere", elsewhere, &err, "SM"));
+            auto pemFile = [&](const QString& name, const std::vector<std::string>& certs) {
+                std::string text;
+                for (const std::string& c : certs) text += c.empty() || c.back() == '\n' ? c : c + "\n";
+                const QString file = dir_.filePath(name);
+                return dcp::writeWholeFile(file.toStdString(), text) ? file : QString();
+            };
+            const QString listedLeaf = pemFile("park-server-1.pem", {servers[0].certificates.back()});
+            const QString trustedChain = pemFile("park-server-2-chain.pem", servers[1].certificates);
+            for (const QString& file : {listedLeaf, trustedChain}) {
+                r = call({{"dkdm", dkdm}, {"servers", QJsonArray{file}}, {"folder", dir_.filePath("mcp-servers")}});
+                QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+                QCOMPARE(r.value("structuredContent").toObject().value("kdms").toArray().size(), 1);
+            }
+            for (const QString& file : {pemFile("elsewhere-chain.pem", elsewhere.certificates), pemFile("elsewhere.pem", {elsewhere.certificates.back()})}) {
+                r = call({{"dkdm", dkdm}, {"servers", QJsonArray{listedLeaf, file}}, {"folder", dir_.filePath("mcp-elsewhere")}});
+                QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("not a screen's in the facility list"), QJsonDocument(r).toJson().constData());
+            }
+            QVERIFY(!QFileInfo::exists(dir_.filePath("mcp-elsewhere")));
         }
         // Refused: a screen not in the list, and a window past the DKDM's.
         QVERIFY(call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens/7"}}, {"folder", dir_.filePath("mcp-booking")}}).value("isError").toBool());
@@ -14101,6 +14218,21 @@ const auto seq = [this] { return state()->sequence(); };
         program->seek(30);
         QVERIFY(program->scrubOutput()->onDevice());
         QCOMPARE(program->scrubOutput()->opens() - opened, 2);
+        // The device unplugged while scrubbing and plugged back in, with nothing else opening it again: scrubbing goes
+        // back to it within a few seconds (nightly 19 Nov: not until playback opened it).
+        audiodev::LoopbackOptions unplugged;
+        unplugged.unplugged = true;
+        audiodev::setLoopbackOptions(unplugged);
+        const bool lost = QTest::qWaitFor([&] { return !engine.isOpen(); });
+        program->seek(31);
+        const bool moved = !program->scrubOutput()->onDevice();
+        audiodev::setLoopbackOptions({});  // (plugged back in before anything is checked)
+        QVERIFY(lost && moved);
+        QTest::qWait(500);
+        QVERIFY(!engine.isOpen());
+        int at = 32;
+        QTRY_VERIFY_WITH_TIMEOUT((program->seek(at++ % 2 ? 33 : 32), program->scrubOutput()->onDevice()), 8000);
+        QVERIFY(engine.isOpen());
         engine.setSettings(before);
         state()->newProject();
     }
@@ -23730,6 +23862,17 @@ print("added " + ui["name"])
         secret->setText(QStringLiteral("a secret made up for this test"));
         QVERIFY(expiry->isEnabled());
         QCOMPARE(expiry->currentData().toInt(), 86400);
+        // A login and secret given for one relay are cleared when another is typed in its place.
+        auto* user = dlg->findChild<QLineEdit*>("reviewStreamTurnUser");
+        auto* password = dlg->findChild<QLineEdit*>("reviewStreamTurnPassword");
+        user->clear();
+        QTest::keyClicks(user, QStringLiteral("ana"));
+        QTest::keyClicks(turn, QStringLiteral("0"));
+        QCOMPARE(turn->text(), QStringLiteral("turn:relay.example.com:34780"));
+        QVERIFY(user->text().isEmpty() && password->text().isEmpty() && secret->text().isEmpty());
+        QTest::keyClick(turn, Qt::Key_Backspace);
+        user->setText(QStringLiteral("ana"));
+        password->setText(QStringLiteral("relay-secret"));
         secret->clear();
         rungs->setCurrentIndex(rungs->findData(2));
         hdr->setChecked(true);

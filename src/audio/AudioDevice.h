@@ -144,12 +144,14 @@ std::unique_ptr<Stream> openStream(const DeviceSettings& s, int rate, int inputs
 struct LoopbackOptions {
     int reportedInput = 0, reportedOutput = 0;  // frames
     int unreported = 0;                         // more frames of round trip it does not report
+    bool unplugged = false;                     // gone (as a device unplugged): the one open is lost, none opens
 };
 void setLoopbackOptions(const LoopbackOptions& o);
 LoopbackOptions loopbackOptions();
-// The loopback open now: runs at `rate` from its next period (as a server whose rate is changed), or holds its next
-// callback back for `ms` (an overload).
-void loopbackChangeRate(int rate);
+// The loopback open now: runs at `rate` from its next period (as a server whose rate is changed), reporting
+// `reportedOutput` frames of output latency from then on (-1: as it did), or holds its next callback back for `ms`
+// (an overload).
+void loopbackChangeRate(int rate, int reportedOutput = -1);
 void loopbackStall(int ms);
 
 // JACK: the library that would be loaded (MONTAGE_JACK_LIBRARY, PipeWire's, then the system's), "" when none loads.

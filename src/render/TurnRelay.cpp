@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QCryptographicHash>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QHostAddress>
 #include <QHostInfo>
@@ -71,7 +72,10 @@ enum : quint16 {
 const int kMaxPeers = 32;
 const int kLifetimeAsked = 600;          // seconds
 const int kPermissionEveryMs = 240000;   // (a permission lasts five minutes)
+const int kPermissionAgainMs = 1000;     // a CreatePermission unanswered is asked again this soon after
 const int kResendMs[] = {300, 600, 1200, 2400, 1500};  // the waits after each sending of a request: six seconds in all
+const int kLookupMs = 5000;   // how long the relay's name is looked up for
+const int kReleaseMs = 250;   // how long the address given back waits for the relay's answer, each time
 
 void put16(QByteArray& b, quint16 v) {
     const quint16 be = qToBigEndian(v);
@@ -286,11 +290,14 @@ struct RelayBridge::Impl {
     std::map<quint64, Alias> aliases;  // by the viewer's address and port
     std::set<quint32> permitted;
     QByteArray realm, nonce, key, algorithms;
+    QByteArray md5Key;  // (the key as MD5 makes it, whatever was chosen: libjuice's relay signs its answers with it)
     quint16 algorithm = 0;  // (0: none named, the key is MD5's)
     QByteArray icePassword;  // Montage's end's, once said
-    bool allocated = false, asked = false;
+    bool allocated = false, asked = false, refreshing = false, lookingUp = false;
+    std::string refreshRefused;  // the relay's refusal of the last Refresh, until one is taken
     int lifetime = kLifetimeAsked;  // seconds, as the relay last gave it
-    qint64 refreshAt = 0, permitAt = 0;
+    // When to ask for the address again, and when the relay lets it go unless it is (now()'s clock, ms).
+    qint64 refreshAt = 0, expiresAt = 0, permitAt = 0;
     std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
     std::function<void(const std::string&)> allocateDone;
 
@@ -299,6 +306,14 @@ struct RelayBridge::Impl {
     void lifetimeFrom(const Message& answer) {
         if (const QByteArray* l = answer.find(kLifetime); l && l->size() == 4) lifetime = int(std::clamp<quint32>(get32(*l, 0), 20, 3600));
         refreshAt = now() + qint64(lifetime) * 500;
+        expiresAt = now() + qint64(lifetime) * 1000;
+    }
+    // The relay has let the address go (its time ran out unrefreshed, or it no longer knows it): nothing more is
+    // carried, and the bridge says why.
+    void lapsed(const std::string& why) {
+        if (!allocated) return;
+        allocated = false;
+        setError(why);
     }
 
     void run() {
@@ -324,15 +339,37 @@ struct RelayBridge::Impl {
             home = nullptr;
             loop = nullptr;
         }
-        // The address is given back (one message, unanswered: the relay lets it go by itself otherwise).
+        // The address is given back (the relay lets it go by itself otherwise). Its answer is waited for a moment,
+        // and a nonce the relay calls stale (438) is taken and the address given back once more with it.
         if (allocated) {
+            QObject::disconnect(&o, nullptr, &h, nullptr);
             Request r;
             r.method = kRefresh;
             QByteArray zero;
             put32(zero, 0);
             r.attributes.emplace_back(kLifetime, zero);
-            o.write(build(r, randomId()));
-            o.waitForBytesWritten(50);
+            for (int round = 0; round < 2; ++round) {
+                const QByteArray id = randomId();
+                o.write(build(r, id));
+                o.waitForBytesWritten(50);
+                bool stale = false, answered = false;
+                QElapsedTimer waited;
+                waited.start();
+                while (!answered && waited.elapsed() < kReleaseMs && o.waitForReadyRead(int(std::max<qint64>(1, kReleaseMs - waited.elapsed())))) {
+                    while (!answered && o.hasPendingDatagrams()) {
+                        QByteArray d(int(o.pendingDatagramSize()), '\0');
+                        const qint64 n = o.readDatagram(d.data(), d.size());
+                        Message msg;
+                        if (n <= 0 || !parse(d.left(n), msg) || msg.id != id || (msg.type & ~0x0110) != kRefresh) continue;
+                        answered = true;
+                        if (const QByteArray* nonceGiven = msg.find(kNonce); (msg.type & 0x0110) == kError && errorCode(msg) == 438 && nonceGiven) {
+                            nonce = *nonceGiven;
+                            stale = true;
+                        }
+                    }
+                }
+                if (!stale) break;
+            }
         }
         requests.clear();
         allocateDone = nullptr;
@@ -410,16 +447,32 @@ struct RelayBridge::Impl {
             requests.erase(it);
             if (r.done) r.done(nullptr);
         }
-        if (allocated && at >= refreshAt) {
-            refreshAt = at + qint64(lifetime) * 500;
+        if (allocated && at >= expiresAt)
+            lapsed("The TURN relay's address for this viewer ran out: " +
+                   (refreshRefused.empty() ? std::string("the relay did not answer in time to keep it") : "the relay refused to keep it. " + refreshRefused));
+        // The address is asked for again half way through its time and, when an asking goes unanswered (six seconds
+        // of sending it), at once again for as long as the address lasts: a lost answer costs no viewer their picture.
+        if (allocated && !refreshing && at >= refreshAt) {
+            refreshing = true;
             Request r;
             r.method = kRefresh;
             QByteArray life;
             put32(life, kLifetimeAsked);
             r.attributes.emplace_back(kLifetime, life);
             r.done = [this](const Message* answer) {
-                if (!answer) return;
-                if ((answer->type & 0x0110) == kError) return fail(answer);
+                refreshing = false;
+                if (!answer) {
+                    refreshAt = now();
+                    return;
+                }
+                if ((answer->type & 0x0110) == kError) {
+                    // (437: the relay knows the address no more; another refusal is asked again a few seconds on)
+                    if (errorCode(*answer) == 437) return lapsed(refusal(answer));
+                    refreshAt = now() + 5000;
+                    refreshRefused = refusal(answer);
+                    return fail(answer);
+                }
+                refreshRefused.clear();
                 lifetimeFrom(*answer);
             };
             send(std::move(r));
@@ -434,26 +487,68 @@ struct RelayBridge::Impl {
         std::lock_guard lock(m);
         error = why;
     }
+    static int errorCode(const Message& answer) {
+        const QByteArray* e = answer.find(kErrorCode);
+        return e && e->size() >= 4 ? (quint8((*e)[2]) & 7) * 100 + quint8((*e)[3]) : 0;
+    }
     static std::string refusal(const Message* answer) {
         const QByteArray* e = answer ? answer->find(kErrorCode) : nullptr;
         if (!e || e->size() < 4) return "The TURN relay did not answer";
-        const int code = (quint8((*e)[2]) & 7) * 100 + quint8((*e)[3]);
-        const QByteArray reason = e->mid(4, 80);
+        const int code = errorCode(*answer);
         if (code == 401 || code == 431) return "The TURN relay did not take Montage's login (" + std::to_string(code) + "): its time may be up";
-        return "The TURN relay refused (" + std::to_string(code) + (reason.isEmpty() ? "" : " " + QString::fromUtf8(reason).simplified().toStdString()) + ")";
+        // (the relay's reason as text: printable characters only, at most 80 of them, never cut inside one)
+        QString reason;
+        for (const QChar ch : QString::fromUtf8(e->mid(4)).simplified())
+            if (ch.isPrint() || ch.isSurrogate()) reason += ch;
+        if (reason.size() > 80) {
+            const qsizetype cut = reason[79].isHighSurrogate() ? 79 : 80;
+            reason = reason.left(cut) + QChar(0x2026);
+        }
+        return "The TURN relay refused (" + std::to_string(code) + (reason.isEmpty() ? "" : " " + reason.toStdString()) + ")";
     }
     void fail(const Message* answer) { setError(refusal(answer)); }
 
+    // Whether an answer is signed with the login's key (RFC 8489 §9.2.5): it has MESSAGE-INTEGRITY or
+    // MESSAGE-INTEGRITY-SHA256, and each one it has is right for the message up to it, under the key chosen or the
+    // one MD5 makes (either is proof the relay knows the password).
+    bool signedRight(const QByteArray& d) const {
+        const qsizetype end = std::min<qsizetype>(d.size(), 20 + get16(d, 2));
+        bool any = false;
+        for (qsizetype at = 20; at + 4 <= end;) {
+            const quint16 type = get16(d, at);
+            const qsizetype size = get16(d, at + 2);
+            if (at + 4 + size > end) return false;
+            if (type == kMessageIntegrity || type == kMessageIntegritySha256) {
+                const bool sha256 = type == kMessageIntegritySha256;
+                if (size != (sha256 ? 32 : 20)) return false;
+                QByteArray covered = d.left(at);
+                const quint16 length = qToBigEndian(quint16(at - 20 + 4 + size));
+                memcpy(covered.data() + 2, &length, 2);
+                const QCryptographicHash::Algorithm hash = sha256 ? QCryptographicHash::Sha256 : QCryptographicHash::Sha1;
+                const QByteArray given = d.mid(at + 4, size);
+                if (QMessageAuthenticationCode::hash(covered, key, hash) != given && QMessageAuthenticationCode::hash(covered, md5Key, hash) != given) return false;
+                any = true;
+            }
+            at += 4 + ((size + 3) & ~qsizetype(3));
+        }
+        return any;
+    }
+
     // An answer to a request: the relay's realm and nonce are taken from a 401 or 438 and the request sent again
-    // with the login (three times at most); anything else is the request's answer.
-    void answered(const Message& m) {
+    // with the login (three times at most); anything else is the request's answer. Once Montage signs its
+    // requests, an answer that is not signed with the same key (any but a 401 or 438, which carry the relay's
+    // challenge) is as if it had not come: the request is sent again as before.
+    void answered(const Message& m, const QByteArray& raw) {
         auto it = requests.find(m.id);
         if (it == requests.end() || (m.type & ~0x0110) != it->second.method) return;
+        const int answerCode = (m.type & 0x0110) == kError ? errorCode(m) : 0;
+        const bool challenge = answerCode == 401 || answerCode == 438;
+        const bool signedAtAll = m.find(kMessageIntegrity) || m.find(kMessageIntegritySha256);
+        if (!key.isEmpty() && !challenge && ((m.type & 0x0110) == kSuccess || signedAtAll) && !signedRight(raw)) return;
         Request r = std::move(it->second);
         requests.erase(it);
         if ((m.type & 0x0110) == kError) {
-            const QByteArray* e = m.find(kErrorCode);
-            const int code = e && e->size() >= 4 ? (quint8((*e)[2]) & 7) * 100 + quint8((*e)[3]) : 0;
+            const int code = errorCode(m);
             const QByteArray* n = m.find(kNonce);
             const QByteArray* rl = m.find(kRealm);
             // (401 once the login has been sent with this realm is the relay's refusal of it)
@@ -474,7 +569,9 @@ struct RelayBridge::Impl {
                     algorithm = sha256 ? 2 : md5 ? 1 : 0;
                     if (algorithm == 2) hash = QCryptographicHash::Sha256;
                 }
-                key = QCryptographicHash::hash(QByteArray::fromStdString(login.user) + ":" + realm + ":" + QByteArray::fromStdString(login.password), hash);
+                const QByteArray said = QByteArray::fromStdString(login.user) + ":" + realm + ":" + QByteArray::fromStdString(login.password);
+                key = QCryptographicHash::hash(said, hash);
+                md5Key = QCryptographicHash::hash(said, QCryptographicHash::Md5);
                 ++r.logins;
                 return send(std::move(r));
             }
@@ -487,10 +584,18 @@ struct RelayBridge::Impl {
         // let go of meanwhile ends at once.
         quint32 literal = 0;
         if (isIpv4(QString::fromStdString(host), literal)) return allocateAt(QHostAddress(literal));
-        QHostInfo::lookupHost(QString::fromStdString(host), home, [this](const QHostInfo& found) {
+        // (a lookup gets a few seconds: a name server that never answers is said so)
+        lookingUp = true;
+        const int lookup = QHostInfo::lookupHost(QString::fromStdString(host), home, [this](const QHostInfo& found) {
+            if (!std::exchange(lookingUp, false)) return;
             for (const QHostAddress& a : found.addresses())
                 if (a.protocol() == QAbstractSocket::IPv4Protocol) return allocateAt(a);
             allocateAt({});
+        });
+        QTimer::singleShot(kLookupMs, home, [this, lookup] {
+            if (!std::exchange(lookingUp, false)) return;
+            QHostInfo::abortHostLookup(lookup);
+            allocated_("The TURN relay's address (" + host + ") was not found in time");
         });
     }
     // The one socket to the outside, connected to the relay, and the relay asked for an address.
@@ -532,7 +637,8 @@ struct RelayBridge::Impl {
         if (auto done = std::exchange(allocateDone, nullptr)) done(why);
     }
 
-    // The relay is asked to let a viewer's address in (again every four minutes).
+    // The relay is asked to let a viewer's address in (again every four minutes, and a second after an asking that
+    // went unanswered, so a lost answer leaves no gap of minutes in the picture).
     void permit(quint32 ip, quint16 peerPort, bool again) {
         if (!again && !permitted.insert(ip).second) return;
         if (!allocated) return;
@@ -540,7 +646,8 @@ struct RelayBridge::Impl {
         r.method = kCreatePermission;
         r.attributes.emplace_back(kXorPeerAddress, xorAddress(ip, peerPort));
         r.done = [this](const Message* answer) {
-            if (!answer || (answer->type & 0x0110) == kError) fail(answer);
+            if (!answer) permitAt = std::min(permitAt, now() + kPermissionAgainMs);
+            else if ((answer->type & 0x0110) == kError) fail(answer);
         };
         send(std::move(r));
     }
@@ -617,7 +724,7 @@ struct RelayBridge::Impl {
                     a->socket->writeDatagram(*data, QHostAddress(QHostAddress::LocalHost), to);
                 }
             } else if (msg.type & 0x0100) {
-                answered(msg);
+                answered(msg, d);
             }
         }
     }

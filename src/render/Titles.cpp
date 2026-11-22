@@ -530,6 +530,16 @@ TitlePathCurve mappedCurve(TitlePathCurve c, const QTransform& m) {
     return c;
 }
 
+int titleTextUnitAt(const std::vector<TitleTextUnit>& units, int line, int from) {
+    // (the last unit starting at or before the character, if it reaches it)
+    const auto after = std::upper_bound(units.begin(), units.end(), std::make_pair(line, from), [](const std::pair<int, int>& k, const TitleTextUnit& u) {
+        return k.first != u.line ? k.first < u.line : k.second < u.from;
+    });
+    if (after == units.begin()) return -1;
+    const TitleTextUnit& u = *(after - 1);
+    return u.line == line && from >= u.from && from < u.from + u.len ? int(after - 1 - units.begin()) : -1;
+}
+
 namespace {
 
 // A point of a curve's segment at u in [0, 1], and its direction there (not normalised).
@@ -867,9 +877,7 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
     const int by = int(std::lround(g.pAt("text_anim_by", t)));  // 0 letters, 1 words, 2 lines
     const double across = std::max(0.1, g.pAt("text_anim_dur", t, 1.0));
     const bool animateOut = g.pAt("text_anim_out", t) > 0.5;
-    struct Unit {
-        int line, from, len;
-    };
+    using Unit = TitleTextUnit;
     std::vector<Unit> units;
     if (textAnim != 0)
         for (int i = 0; i < lines.size(); ++i) {
@@ -1040,11 +1048,7 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
         }
         const int nLines = int(rich.size());
         // Legacy units by their first character.
-        auto legacyUnit = [&](int line, int from) {
-            for (int u = 0; u < n; ++u)
-                if (units[size_t(u)].line == line && from >= units[size_t(u)].from && from < units[size_t(u)].from + units[size_t(u)].len) return u;
-            return -1;
-        };
+        auto legacyUnit = [&](int line, int from) { return titleTextUnitAt(units, line, from); };
         PathSampler path;
         const bool onPath = !svg && titlePath(g, t, scale, cx, cy, w, h, pathFn, path);
         // An SVG's text: each letter where its x, y, dx and dy put it (or along its textPath), turned by its rotate,

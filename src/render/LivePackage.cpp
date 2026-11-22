@@ -1873,7 +1873,7 @@ std::string livePreloadHint(int64_t segment, int partsMade, int partsPerSegment)
 
 int liveBlockingReload(const std::string& playlist, int64_t msn, int part) {
     int64_t sequence = 0, complete = 0;
-    int partsAfter = 0;
+    int partsAfter = 0, partsBefore = 0;  // (the parts listed after the last segment, and those of the last segment)
     double partTarget = 0;
     size_t at = 0;
     while (at <= playlist.size()) {
@@ -1888,7 +1888,7 @@ int liveBlockingReload(const std::string& playlist, int64_t msn, int part) {
             const size_t t = line.find("PART-TARGET=");
             if (t != std::string_view::npos) partTarget = std::atof(std::string(line.substr(t + 12)).c_str());
         } else if (line.rfind("#EXT-X-PART:", 0) == 0) ++partsAfter;
-        else if (!line.empty() && line[0] != '#') ++complete, partsAfter = 0;
+        else if (!line.empty() && line[0] != '#') ++complete, partsBefore = partsAfter, partsAfter = 0;
     }
     if (msn < 0) return 400;
     const int64_t last = sequence + complete - 1;
@@ -1898,8 +1898,10 @@ int liveBlockingReload(const std::string& playlist, int64_t msn, int part) {
         // (the advance part limit: three, or with parts of under a second three seconds of them)
         const int limit = partTarget > 0 && partTarget < 1 ? int(std::ceil(3 / partTarget)) : 3;
         if (msn == last + 1 && partsAfter > part) return 200;
-        // (of the segment after the one being made, counted from its first)
-        if (part > (msn == last + 1 ? partsAfter - 1 : -1) + limit) return 400;
+        // (of the segment after the one being made, counted from the last part listed: the parts of the one being made
+        // still to come, as many as the last segment had, then its own from its first)
+        const int toCome = std::max(0, partsBefore - partsAfter);
+        if (part > (msn == last + 1 ? partsAfter - 1 : -1 - toCome) + limit) return 400;
     }
     return 0;
 }
@@ -1997,12 +1999,15 @@ struct LiveOrigin::State {
     struct Request {
         QTcpSocket* socket = nullptr;
         QByteArray in;
-        bool parsed = false, head = false, streaming = false, done = false, skip = false;
+        // (gone: let go, its socket deleted once control is back in the loop)
+        bool parsed = false, head = false, streaming = false, done = false, skip = false, gone = false;
         QString rel;
         int64_t msn = -1;
         int part = -1;
         Clock::time_point came;
         Clock::time_point accepted = Clock::now();  // (a request not whole 10 s after this is let go)
+        // (when the client last took some of what it was sent: an answer it has not taken any of for 20 s is let go)
+        Clock::time_point moved = accepted;
         qint64 sent = 0;
         // (a held playlist request: the file as last read, so it is read again only when it has changed, or every
         // tenth of a second at least)
@@ -2024,13 +2029,33 @@ struct LiveOrigin::State {
         else if (length >= 0) h += "Content-Length: " + QByteArray::number(length) + "\r\n";
         return h + "\r\n";
     }
+    // (what is sent counts as taken when nothing was waiting before it: the 20 s are from then)
+    void send(Request& r, const QByteArray& bytes) {
+        if (r.socket->bytesToWrite() == 0) r.moved = Clock::now();
+        // (in pieces, each handed to the system on its own: Windows takes one send whole, however far past the
+        // connection's buffer, so a client that reads nothing would be sent all of a big file and never seen to stall)
+        constexpr qsizetype kPiece = 64 << 10;
+        if (bytes.size() <= kPiece) r.socket->write(bytes);
+        else
+            for (qsizetype at = 0; at < bytes.size(); at += kPiece) r.socket->write(bytes.mid(at, kPiece));
+    }
     void close(Request& r) {
         r.done = true;
         r.socket->disconnectFromHost();
     }
+    // Lets a connection go at once, unanswered or not wholly sent.
+    void drop(Request& r) {
+        r.done = r.gone = true;
+        r.socket->abort();
+        r.socket->deleteLater();
+    }
+    // Whether a request is an answer, or a growing segment, that its client has not taken any of for 20 s.
+    static bool stalled(const Request& r, Clock::time_point now) {
+        return !r.gone && (r.done || r.streaming) && r.socket->bytesToWrite() > 0 && now - r.moved > std::chrono::seconds(20);
+    }
     void answer(Request& r, int code, const QByteArray& type, const QByteArray& body) {
-        r.socket->write(headers(code, type, body.size(), false));
-        if (!r.head) r.socket->write(body);
+        send(r, headers(code, type, body.size(), false));
+        if (!r.head) send(r, body);
         close(r);
     }
     bool after(const Request& r, double seconds) const { return Clock::now() > r.came + std::chrono::milliseconds(int64_t(seconds * 1000)); }
@@ -2150,12 +2175,12 @@ struct LiveOrigin::State {
             if (f.open(QIODevice::ReadOnly) && f.size() > r.sent && f.seek(r.sent)) {
                 const QByteArray more = f.read(f.size() - r.sent);
                 if (!more.isEmpty()) {
-                    r.socket->write(QByteArray::number(qlonglong(more.size()), 16) + "\r\n" + more + "\r\n");
+                    send(r, QByteArray::number(qlonglong(more.size()), 16) + "\r\n" + more + "\r\n");
                     r.sent += more.size();
                 }
             }
             if (!grows && (!f.isOpen() || f.size() <= r.sent)) {
-                r.socket->write("0\r\n\r\n");
+                send(r, "0\r\n\r\n");
                 close(r);
             }
             return;
@@ -2177,7 +2202,7 @@ struct LiveOrigin::State {
         }
         if (r.msn >= 0 && r.rel.endsWith(".m3u8") && !playlistCanAnswer(r, f)) return;
         if (grows) {
-            r.socket->write(headers(200, contentType(r.rel), -1, true));
+            send(r, headers(200, contentType(r.rel), -1, true));
             if (r.head) return close(r);  // (the headers alone)
             r.streaming = true;
             return attempt(r);
@@ -2213,9 +2238,7 @@ struct LiveOrigin::State {
                 for (auto& q : requests)
                     if (!q->parsed && !q->done && (!oldest || q->accepted < oldest->accepted)) oldest = q.get();
                 if (oldest) {
-                    oldest->done = true;
-                    oldest->socket->abort();  // (its request goes with the socket, once control is back in the loop)
-                    oldest->socket->deleteLater();
+                    drop(*oldest);  // (its request goes with the socket, once control is back in the loop)
                     --open;
                 } else {
                     // (all whole requests: the one held longest for something not yet made is told to come back, so
@@ -2228,11 +2251,28 @@ struct LiveOrigin::State {
                     }
                 }
             }
-            if (!socket->setSocketDescriptor(fd) || open >= 256 || requests.size() >= 512) {
+            // (and with 512 kept, answered ones among them still being sent, the one whose client has taken
+            // nothing for longest makes room: clients that never read what they asked for cannot keep players out)
+            auto kept = std::count_if(requests.begin(), requests.end(), [](const std::unique_ptr<Request>& q) { return !q->gone; });
+            if (kept >= 512) {
+                Request* stuck = nullptr;
+                for (auto& q : requests)
+                    if (q->done && !q->gone && (!stuck || q->moved < stuck->moved)) stuck = q.get();
+                if (stuck) {
+                    drop(*stuck);
+                    --kept;
+                }
+            }
+            if (!socket->setSocketDescriptor(fd) || open >= 256 || kept >= 512) {
                 socket->abort();
                 socket->deleteLater();
                 return;
             }
+#ifdef Q_OS_WIN
+            // (Windows otherwise takes many megabytes into a connection's send buffer whether or not its client reads
+            // them, so a client that reads nothing still seemed to take what it was sent)
+            socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, 1 << 20);
+#endif
             auto r = std::make_unique<Request>();
             r->socket = socket;
             Request* raw = r.get();
@@ -2242,6 +2282,7 @@ struct LiveOrigin::State {
                 raw->in += raw->socket->readAll();
                 attempt(*raw);
             });
+            QObject::connect(socket, &QTcpSocket::bytesWritten, &server, [raw] { raw->moved = Clock::now(); });
             QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
             // (the request goes with its socket)
             QObject::connect(socket, &QObject::destroyed, &server, [this, raw] {
@@ -2261,14 +2302,11 @@ struct LiveOrigin::State {
             std::vector<Request*> waiting, slow;
             const auto now = Clock::now();
             for (auto& r : requests)
-                if (!r->done && r->parsed) waiting.push_back(r.get());
+                if (stalled(*r, now)) slow.push_back(r.get());
+                else if (!r->done && r->parsed) waiting.push_back(r.get());
                 else if (!r->done && now - r->accepted > std::chrono::seconds(10)) slow.push_back(r.get());
             for (Request* r : waiting) attempt(*r);
-            for (Request* r : slow) {
-                r->done = true;
-                r->socket->abort();
-                r->socket->deleteLater();
-            }
+            for (Request* r : slow) drop(*r);
         });
         tick.start(10);
         {

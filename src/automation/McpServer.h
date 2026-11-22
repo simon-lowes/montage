@@ -28,8 +28,9 @@ namespace montage {
 // where the file system ignores it): what the call writes (output, report, any *_output or *_report; an export
 // tool's path and file; and of a tool that changes the project its folders too: folder, dir, any *_folder or *_dir)
 // and what it reads (path, file, files, paths, any *_path or *_file, and a read-only tool's folders; lists of them
-// too). A path it both reads and writes counts as written. Background calls wait on these, so two never write one
-// file at once.
+// too), in the objects inside the arguments as well; a recording (record, any *_record, and a live package's own,
+// beside its folder, when montage_render names none) is written. A path it both reads and writes counts as written.
+// Background calls wait on these, so two never write one file at once.
 struct McpCallPaths {
     QStringList writes, reads;
 };

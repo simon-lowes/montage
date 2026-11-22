@@ -994,11 +994,20 @@ void PlaybackController::scrubAudio(FrameTime t) {
     // (a device chosen but not there now leaves the snippets on Qt Multimedia's output: it is asked for again once it
     // is open, not at every frame, which held the window up and cut each snippet short)
     const bool asTried = scrubTriedDevice_ == device && scrubTriedRate_ == s->sampleRate;
+    // A device that went away may be back, and nothing else opens it again until playback starts: it is asked for
+    // every few seconds while scrubbing (opened, when it is there, with what plays meanwhile left as it is), and the
+    // snippets move to it below.
+    if (asTried && device && !scrubOut_->onDevice() && !engine.isOpen() && scrubRetry_.isValid() && scrubRetry_.elapsed() >= 3000) {
+        scrubRetry_.start();
+        audiodev::Feed probe(engine);
+        probe.open(s->sampleRate, 2, 0.05);
+    }
     const bool deviceMoved = asTried && device && scrubOut_->onDevice() != engine.isOpen();  // (gone, or back)
     if (!asTried || deviceMoved || (!scrubNoOutput_ && !scrubOut_->isOpen())) {
         scrubTriedDevice_ = device;
         scrubTriedRate_ = s->sampleRate;
         scrubNoOutput_ = !scrubOut_->open(s->sampleRate, 2, 0.15);
+        scrubRetry_.start();
     }
     if (scrubNoOutput_) return;  // (nothing to play on: not tried again until that changes)
     // One frame of audio (at least 40 ms), faded at both ends to avoid clicks.

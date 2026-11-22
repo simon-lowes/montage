@@ -5,10 +5,6 @@
 #ifdef Q_OS_UNIX
 #include <sys/stat.h>
 #endif
-#ifdef Q_OS_LINUX
-#include <sys/resource.h>
-#include <csignal>
-#endif
 #include <QCryptographicHash>
 #include <QtEndian>
 #include <QPainter>
@@ -2272,25 +2268,19 @@ private slots:
             QVERIFY(std::get<0>(ended[2]) == path("no-such-folder/same.mov") && !std::get<1>(ended[2]) && !std::get<2>(ended[2]).empty());
         }
         QVERIFY(waitFor([&] { return r.status().path.empty() && cs.live->look().frame >= 5; }));  // (watched on)
-        // A file that is begun and then cannot be written on (a full disk: here the process's file size limit, lowered
-        // while it records) is said the same way, and the feed is watched on.
+        // A file that is begun and then cannot be written on (a full disk: here a file of that name whose every write is
+        // refused as a full disk's, Linux's /dev/full; nightly 19 Nov: not the process's file size limit, which every
+        // other thread's files had while it was lowered) is said the same way, and the feed is watched on.
         size_t failed = 0;
 #ifdef Q_OS_LINUX
         {
             failed = 1;
-            struct rlimit was {};
-            QVERIFY(getrlimit(RLIMIT_FSIZE, &was) == 0);
-            const auto before = std::signal(SIGXFSZ, SIG_IGN);
-            struct rlimit low = was;
-            low.rlim_cur = 150000;
-            QVERIFY(setrlimit(RLIMIT_FSIZE, &low) == 0);
+            QVERIFY(QFile::link("/dev/full", QString::fromStdString(path("same-full.mov"))));
             const bool asked = r.recordTo({path("same-full.mov"), "prores_proxy"}, &err);
             const bool told = asked && waitFor([&] {
                 std::lock_guard lock(said);
                 return ended.size() >= 4;
             });
-            setrlimit(RLIMIT_FSIZE, &was);
-            std::signal(SIGXFSZ, before);
             QVERIFY2(asked, err.c_str());
             QVERIFY2(told, r.status().error.c_str());
             {
@@ -11126,6 +11116,68 @@ private slots:
         QFile::remove(out.value("recording").toString());
     }
 
+    // Nightly 19 Nov: two live packages made over MCP in the background, which run side by side, wait for each other
+    // when they write one recording (named inside streaming.live, or the one a package makes beside its folder when
+    // none is named), and run together when each writes its own.
+    void mcpLiveRendersShareARecording() {
+        const auto kinds = captureDeviceKinds();
+        if (std::find(kinds.begin(), kinds.end(), "lavfi") == kinds.end()) QSKIP("This build reaches no FFmpeg input devices (libavdevice)");
+        const QString base = QString::fromStdString(path("live-shared"));
+        QDir(base).removeRecursively();
+        QVERIFY(QDir().mkpath(base));
+        const int atOnce = jobs::atOnce();
+        jobs::setAtOnce(2);
+        auto restore = qScopeGuard([&] {
+            jobs::setAtOnce(atOnce);
+            QDir(base).removeRecursively();
+        });
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const QString& name, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"}, {"params", QJsonObject{{"name", name}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto start = [&](const QString& folder, const QString& record) {
+            QJsonObject live{{"url", "testsrc2=size=160x90:rate=25,realtime"}, {"device", "lavfi"}, {"seconds", 3}};
+            if (!record.isEmpty()) live["record"] = record;
+            const QJsonObject r = call("montage_render", {{"output", folder}, {"async", true},
+                                                          {"streaming", QJsonObject{{"live", live}, {"segments", "ts"}, {"segment_seconds", 1}, {"dash", false},
+                                                                                    {"audio_codec", "none"},
+                                                                                    {"ladder", QJsonArray{QJsonObject{{"width", 160}, {"height", 90}, {"bitrate", 200000}}}}}}});
+            return r.value("structuredContent").toObject().value("job").toString();
+        };
+        // (whether the two ran at once at any time; each must end done)
+        auto together = [&](const QString& a, const QString& b, bool& both) {
+            both = false;
+            QElapsedTimer t;
+            t.start();
+            QString sa, sb;
+            while (t.elapsed() < 120000) {
+                sa = call("montage_job", {{"job", a}}).value("structuredContent").toObject().value("status").toString();
+                sb = call("montage_job", {{"job", b}}).value("structuredContent").toObject().value("status").toString();
+                both |= sa == "running" && sb == "running";
+                const auto finished = [](const QString& s) { return s == "done" || s == "failed" || s == "cancelled"; };
+                if (finished(sa) && finished(sb)) break;
+                QTest::qWait(50);
+            }
+            return sa == "done" && sb == "done";
+        };
+        bool both = true;
+        const QString shared = base + "/shared.mov";
+        QString a = start(base + "/a", shared), b = start(base + "/b", shared);
+        QVERIFY(!a.isEmpty() && !b.isEmpty());
+        QVERIFY(together(a, b, both));
+        QVERIFY(!both);
+        a = start(base + "/c", {}), b = start(base + "/d", base + "/c.mov");
+        QVERIFY(together(a, b, both));
+        QVERIFY(!both);
+        a = start(base + "/e", {}), b = start(base + "/f", base + "/own.mov");
+        QVERIFY(together(a, b, both));
+        QVERIFY(both);
+        QVERIFY(QFileInfo(shared).size() > 0 && QFileInfo(base + "/e.mov").size() > 0 && QFileInfo(base + "/own.mov").size() > 0);
+    }
+
     void mcpLiveLanguagesAndCues() {
         // montage_render's streaming.live with every sound stream (FFmpeg's test source with two tones, named English
         // and French), captions listed though the feed has none, an ad break and two chapters placed ahead, in low
@@ -11513,6 +11565,87 @@ private slots:
         const sampler::KitPtr last = sampler::loadKit(st, rate, nullptr, {}, streamed);
         QCOMPARE(cached().size(), 2);
         QVERIFY(!cached().contains(first) && cached().contains(second) && cached().contains("sound-777-888.f32"));
+    }
+
+    void samplerCacheAcrossProcesses() {
+        // Two Montages share the sampler's cache folder (nightly 19 Nov): one tidying it never removes a cache file
+        // the other still plays from, neither an earlier version of a changed sound nor one older than a week, nor
+        // a kit's own file. The other Montage is this test run again with the folder and the sound in its
+        // environment.
+        const int rate = 48000;
+        SamplerSettings st;
+        SamplerSlot sl;
+        sl.key = 40;
+        const QByteArray childDir = qgetenv("MONTAGE_TEST_SAMPLER_CACHE"), childSound = qgetenv("MONTAGE_TEST_SAMPLER_SOUND");
+        sampler::StreamOptions streamed;
+        if (!childDir.isEmpty()) {
+            // The other Montage: loads the sound as it is now, which tidies the folder, and plays it.
+            streamed.cacheDir = childDir.toStdString();
+            sl.sounds = {{childSound.toStdString(), 0, 0, 1, 127}};
+            st.pads = {sl};
+            const sampler::KitPtr kit = sampler::loadKit(st, rate, nullptr, {}, streamed);
+            QVERIFY(kit->pads[0].sounds.size() == 1 && kit->pads[0].sounds[0].disk);
+            return;
+        }
+        std::vector<float> longSound(size_t(25) * rate);
+        for (size_t i = 0; i < longSound.size(); ++i) longSound[i] = float(0.3 * std::sin(double(i) * 0.017));
+        const std::string longFile = path("sampler-shared.wav");
+        QVERIFY(writeMonoWav(longFile, longSound, rate));
+        sl.sounds = {{longFile, 0, 0, 1, 127}};
+        st.pads = {sl};
+        QTemporaryDir cache;
+        streamed.cacheDir = cache.path().toStdString();
+        sampler::KitPtr kit = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QVERIFY(kit->pads[0].sounds.size() == 1 && kit->pads[0].sounds[0].disk);
+        const std::string first = kit->pads[0].sounds[0].disk->file;
+        // A kit of a loader's sound: streamed from a file of the kit's own.
+        auto whole = std::make_shared<AudioBuffer>();
+        whole->sampleRate = rate;
+        whole->channels = 2;
+        whole->samples.assign(size_t(25) * rate * 2, 0.25f);
+        SamplerSettings ls = st;
+        ls.pads[0].sounds = {{"loaded", 0, 0, 1, 127}};
+        sampler::KitPtr loaded = sampler::loadKit(ls, rate, nullptr, [&](const std::string&, int, std::string*) { return AudioBufferPtr(whole); }, streamed);
+        QVERIFY(loaded->pads[0].sounds.size() == 1 && loaded->pads[0].sounds[0].disk);
+        const std::string own = loaded->pads[0].sounds[0].disk->file;
+        QVERIFY(QFileInfo(QString::fromStdString(own)).fileName().startsWith("kit-"));
+        // Both as if last written over a week ago (a session left open), and the sound changed since.
+        for (const std::string& f : {first, own})
+            std::filesystem::last_write_time(std::filesystem::path(f), std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 8));
+        longSound.resize(size_t(26) * rate, 0.1f);
+        QVERIFY(writeMonoWav(longFile, longSound, rate));
+        QProcess other;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert("MONTAGE_TEST_SAMPLER_CACHE", cache.path());
+        env.insert("MONTAGE_TEST_SAMPLER_SOUND", QString::fromStdString(longFile));
+        other.setProcessEnvironment(env);
+        other.start(QCoreApplication::applicationFilePath(), {"samplerCacheAcrossProcesses"});
+        QVERIFY(other.waitForStarted());
+        QVERIFY(other.waitForFinished(120000));
+        QVERIFY2(other.exitStatus() == QProcess::NormalExit && other.exitCode() == 0, other.readAllStandardOutput().constData());
+        auto cached = [&] { return QDir(cache.path()).entryList({"sound-*.f32", "kit-*.f32"}, QDir::Files); };
+        QCOMPARE(cached().size(), 3);  // (the earlier version and the kit's file, both played from here, and the new one)
+        QVERIFY(QFileInfo::exists(QString::fromStdString(first)) && QFileInfo::exists(QString::fromStdString(own)));
+        // Nor does this Montage's own tidying take them (the kit's file was never kept before).
+        const sampler::KitPtr here = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QVERIFY(here->pads[0].sounds[0].disk && here->pads[0].sounds[0].disk->file != first);
+        QCOMPARE(cached().size(), 3);
+        // Both still play here: the earlier version of the sound, and the loader's sound.
+        const std::vector<SamplerNote> held{{40, 100, 0, int64_t(24) * rate}};
+        const std::vector<float> a = sampler::renderNotes(kit, held, 1, 0, int64_t(24) * rate);
+        double late = 0;
+        for (size_t i = size_t(20) * rate * 2; i < size_t(23) * rate * 2; ++i) late = std::max(late, double(std::fabs(a[i])));
+        QVERIFY(late > 0.1);
+        const std::vector<float> b = sampler::renderNotes(loaded, held, 1, 0, int64_t(24) * rate);
+        QVERIFY(std::fabs(b[size_t(22) * rate * 2]) > 0.02);
+        // Once this Montage lets them go, the kit's file goes with its kit and the next load takes the earlier version.
+        kit.reset();
+        loaded.reset();
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(own)));
+        const sampler::KitPtr now = sampler::loadKit(st, rate, nullptr, {}, streamed);
+        QVERIFY(now->pads[0].sounds[0].disk && now->pads[0].sounds[0].disk->file != first);
+        QCOMPARE(cached().size(), 1);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(first)));
     }
 
     void mcpMidiMap() {
@@ -16463,6 +16596,7 @@ private slots:
         }
         // Codecs that cannot carry the overhead channels fold them down instead of failing or turning into stereo:
         // AAC and FLAC to the ear-level 7.1 or 5.1, AC-3 to 5.1, MP3 to stereo; PCM keeps them all.
+        // (FFmpeg 9.1's AAC takes 7.1.4 too, but in a form players may not place, so it folds there as well.)
         QCOMPARE(exportAudioLayout("7.1.4", "aac"), std::string("7.1"));
         QCOMPARE(exportAudioLayout("5.1.4", "flac"), std::string("5.1"));
         QCOMPARE(exportAudioLayout("7.1.4", "pcm_s24le"), std::string("7.1.4"));
@@ -24561,6 +24695,150 @@ if ui["pressed"] == "add":
             QVERIFY(!none.checked && none.error.empty());
             QVERIFY2(none.note.find("no decoder model") != std::string::npos, none.note.c_str());
         }
+    }
+
+    void av1DecoderModelCrafted() {
+        QElapsedTimer sinceStart;  // (each part's end goes to the output, so a run that stops says where)
+        sinceStart.start();
+        // AV1 streams written bit by bit into IVF files (nightly 19 Nov): a removal-time counter that wraps many times
+        // between random access points, buffer delays of the largest the header can state, and a stream of frame
+        // headers a few bytes each that state 32 removal times. Every frame is 320x180 at 50 frames a second, and the
+        // decoding tick is one frame.
+        struct Bits {
+            QByteArray b;
+            int n = 0;
+            void put(uint64_t v, int len) {
+                for (int i = len - 1; i >= 0; --i, ++n) {
+                    if (n % 8 == 0) b.append(char(0));
+                    if ((v >> i) & 1) b[b.size() - 1] = char(uint8_t(b[b.size() - 1]) | (0x80 >> (n % 8)));
+                }
+            }
+            QByteArray done() {
+                put(1, 1);  // trailing bits
+                return b;
+            }
+        };
+        auto obu = [](int type, const QByteArray& payload) {
+            QByteArray o(1, char(type << 3 | 2));
+            for (uint32_t v = uint32_t(payload.size());; v >>= 7) {
+                o.append(char((v & 0x7f) | (v >= 0x80 ? 0x80 : 0)));
+                if (v < 0x80) break;
+            }
+            return o + payload;
+        };
+        struct Model {
+            int ops = 1, delayLength = 20, removalLength = 4;
+            uint64_t decoderDelay = 45000, encoderDelay = 45000;  // 90 kHz
+        };
+        auto sequenceHeader = [&](const Model& m) {
+            Bits s;
+            s.put(0, 3), s.put(0, 1), s.put(0, 1);  // profile 0, not a still picture, not reduced
+            s.put(1, 1), s.put(1, 32), s.put(50, 32), s.put(0, 1);  // timing info: 50 a second, no equal interval
+            s.put(1, 1), s.put(uint64_t(m.delayLength - 1), 5), s.put(1, 32), s.put(uint64_t(m.removalLength - 1), 5), s.put(0, 5);
+            s.put(0, 1), s.put(uint64_t(m.ops - 1), 5);  // no initial display delay; the operating points
+            for (int i = 0; i < m.ops; ++i) {
+                s.put(0, 12), s.put(0, 5);  // every layer; level 2.0 (1.5 Mb/s)
+                s.put(1, 1), s.put(m.decoderDelay, m.delayLength), s.put(m.encoderDelay, m.delayLength), s.put(0, 1);
+            }
+            s.put(8, 4), s.put(8, 4), s.put(319, 9), s.put(179, 9);  // the largest frame size
+            s.put(0, 1), s.put(0, 3), s.put(0, 4), s.put(0, 1);  // no frame ids, no tools, no order hint
+            s.put(0, 1), s.put(0, 1);  // screen content tools off
+            s.put(0, 3);  // no superres, CDEF or restoration
+            s.put(0, 1), s.put(0, 1), s.put(0, 1), s.put(0, 1), s.put(0, 2), s.put(0, 1);  // 8-bit 4:2:0, no colour description
+            s.put(0, 1);  // no film grain
+            return obu(1, s.done());
+        };
+        auto frameHeader = [&](const Model& m, bool key, uint64_t removal) {
+            Bits f;
+            f.put(0, 1), f.put(key ? 0 : 1, 2), f.put(1, 1), f.put(0, 1);  // a key or inter frame, shown, its presentation time
+            if (!key) f.put(1, 1);  // error resilient (no primary reference frame)
+            f.put(0, 1), f.put(0, 1);  // CDF updates on, no frame size override
+            f.put(1, 1);  // removal times stated
+            for (int i = 0; i < m.ops; ++i) f.put(removal & ((uint64_t(1) << m.removalLength) - 1), m.removalLength);
+            return obu(3, f.done());
+        };
+        auto writeIvf = [&](const std::string& file, const std::vector<QByteArray>& units) {
+            QFile out(QString::fromStdString(file));
+            QVERIFY(out.open(QIODevice::WriteOnly));
+            auto le = [](uint64_t v, int bytes) {
+                QByteArray a;
+                for (int i = 0; i < bytes; ++i) a.append(char((v >> (8 * i)) & 0xff));
+                return a;
+            };
+            out.write("DKIF" + le(0, 2) + le(32, 2) + "AV01" + le(320, 2) + le(180, 2) + le(50, 4) + le(1, 4) + le(units.size(), 4) + le(0, 4));
+            for (size_t i = 0; i < units.size(); ++i) out.write(le(uint64_t(units[i].size()), 4) + le(i, 8) + units[i]);
+        };
+        // Each temporal unit: a temporal delimiter, the sequence header in the first, the frame header and a tile
+        // group of `tileBytes`. A key frame every 250 frames; removal times count from the one before (a key frame's
+        // own too).
+        auto stream = [&](const Model& m, int frames, int tileBytes) {
+            std::vector<QByteArray> units;
+            int key = 0;
+            for (int i = 0; i < frames; ++i) {
+                QByteArray tu = obu(2, {});
+                if (i == 0) tu += sequenceHeader(m);
+                tu += frameHeader(m, i % 250 == 0, uint64_t(i - key)) + obu(4, QByteArray(tileBytes, char(0x5a)));
+                units.push_back(tu);
+                if (i % 250 == 0) key = i;
+            }
+            return units;
+        };
+
+        // A 4-bit removal time wraps every 16 frames, 15 times between key frames: each frame is still removed a tick
+        // after the one before it, so the stream conforms, at both of its operating points.
+        Model wraps;
+        wraps.ops = 2;
+        const std::string wrapFile = path("av1-wraps.ivf");
+        writeIvf(wrapFile, stream(wraps, 3000, 200));
+        const HrdReport w = checkHrd(wrapFile);
+        QVERIFY2(w.checked && w.conforms(), (w.summary() + " " + w.note + " " + (w.issues.empty() ? std::string() : w.issues.front().text)).c_str());
+        QCOMPARE(w.codec, std::string("AV1"));
+        QCOMPARE(w.frames, int64_t(3000));
+        QCOMPARE(w.schedules.size(), size_t(2));
+        QVERIFY(w.highest > 0 && w.highest < 0.2);
+        qInfo("AV1 model: the wrapping counter checked after %lld ms", sinceStart.elapsed());
+
+        // Both buffer delays at 2^32 - 1 (13 hours): the decoder's is reported as more than the buffer can take, every
+        // group arrives one after another, and the buffer overflows. 100,000 frames are run in seconds, not compared
+        // each with every other.
+        Model late;
+        late.delayLength = 32, late.removalLength = 32;
+        late.decoderDelay = late.encoderDelay = 0xffffffffu;
+        const std::string lateFile = path("av1-late.ivf");
+        writeIvf(lateFile, stream(late, 100000, 16));
+        QElapsedTimer t;
+        t.start();
+        const HrdReport l = checkHrd(lateFile);
+        QVERIFY2(t.elapsed() < 60000, std::to_string(t.elapsed()).c_str());
+        QVERIFY2(l.checked && !l.conforms(), (l.summary() + " " + l.note).c_str());
+        QCOMPARE(l.frames, int64_t(100000));
+        QCOMPARE(l.issues.front().kind, std::string("timing"));
+        QVERIFY2(l.issues.front().text.find("decoder_buffer_delay is 4294967295") == 0, l.issues.front().text.c_str());
+        QVERIFY(std::any_of(l.issues.begin(), l.issues.end(), [](const HrdIssue& i) { return i.kind == "overflow"; }));
+        qInfo("AV1 model: the late buffer checked after %lld ms", sinceStart.elapsed());
+
+        // 400,000 frame headers of 8 bytes, 1,000 to a temporal unit, each stating 32 one-bit removal times: kept as
+        // read, they would take over 40 times the file's 3 MB. The check stops and says why instead.
+        Model many;
+        many.ops = 32, many.removalLength = 1;
+        std::vector<QByteArray> units;
+        for (int u = 0; u < 400; ++u) {
+            QByteArray tu = u == 0 ? sequenceHeader(many) : QByteArray();
+            for (int i = 0; i < 1000; ++i) tu += frameHeader(many, u == 0 && i == 0, uint64_t(i));
+            units.push_back(tu);
+        }
+        QCOMPARE(frameHeader(many, false, 0).size(), 8);
+        const std::string manyFile = path("av1-many-headers.ivf");
+        writeIvf(manyFile, units);
+        const HrdReport m = checkHrd(manyFile);
+        QVERIFY2(!m.checked && m.error.empty(), m.summary().c_str());
+        QVERIFY2(m.note.find("too many OBUs for its size") != std::string::npos, m.note.c_str());
+        qInfo("AV1 model: the many headers refused after %lld ms", sinceStart.elapsed());
+        // The first 1,000 of them alone are run.
+        units.resize(1);
+        writeIvf(manyFile, units);
+        const HrdReport one = checkHrd(manyFile);
+        QVERIFY2(one.checked && one.schedules.size() == 32, (one.summary() + " " + one.note).c_str());
     }
 
 private:
@@ -40884,6 +41162,30 @@ private slots:
             qInfo("a sheet of long compounds on copied elements: %lld ms", static_cast<long long>(took.elapsed()));
             QVERIFY2(took.elapsed() < 60000, qPrintable(QString::number(took.elapsed())));
             QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("too many rules to try") != std::string::npos; }));
+            // One element of 50,000 class names under 300 rules that each name 300 of them (nightly 19 Nov): the
+            // work is counted before each compound is tried, not only between elements, so trying stops part way
+            // through that one element (its rules would take billions of comparisons), and it goes without them.
+            std::string costly = "<style>";
+            std::string compound = "rect";
+            for (int i = 0; i < 300; ++i) compound += ".n" + std::to_string(49999 - i);
+            for (int i = 0; i < 300; ++i) costly += compound + " { fill: #0000ff }\n";
+            costly += "</style><rect x=\"0\" y=\"0\" width=\"100\" height=\"100\" class=\"";
+            for (int i = 0; i < 50000; ++i) costly += (i ? " n" : "n") + std::to_string(i);
+            costly += "\"/>";
+            {
+                std::ofstream f(path("costly.svg"));
+                f << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">" << costly << "</svg>";
+            }
+            notes.clear();
+            took.restart();
+            Effect one = makeEffect(p, "shape");
+            QVERIFY2(importSvgShapes(path("costly.svg"), one, w, h, &notes, &err), err.c_str());
+            qInfo("one element of many names: %lld ms", static_cast<long long>(took.elapsed()));
+            QVERIFY2(took.elapsed() < 30000, qPrintable(QString::number(took.elapsed())));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("too many rules to try") != std::string::npos; }));
+            const Image drawn = renderShape(one, 0, 100, 100, 1);
+            QCOMPARE(drawn.row(50)[50 * 4 + 2], 0.0f);  // (black, SVG's own fill, not the rules' blue)
+            QCOMPARE(drawn.row(50)[50 * 4 + 3], 1.0f);
         }
         // Text: read out (where it is, its font, size and colour) to be made titles, which a layer imported into a
         // sequence gets on the track above it, drawn where the SVG has it.

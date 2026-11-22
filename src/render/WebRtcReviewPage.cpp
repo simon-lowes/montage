@@ -172,7 +172,8 @@ const char* browserReviewScript() {
   }
 
   function status() {
-    const live = { connected: 'Live', connecting: 'Connecting…', failed: 'The connection failed', disconnected: 'Connection lost…', closed: 'Ended' };
+    const live = { connected: 'Live', connecting: 'Connecting…', failed: 'The connection failed', disconnected: 'Connection lost…', closed: 'Ended',
+      expired: 'This review link has expired' };
     let text = live[state.stage] || state.stage || '';
     if (state.stage === 'connected' && state.rung) {
       text += state.rung.hdr ? ', HDR' : '';
@@ -197,6 +198,11 @@ const char* browserReviewScript() {
       if (n) { n.status = m.t === 'ack' ? 'sent' : ('not sent: ' + (m.why || '')); n.el.querySelector('.sent').textContent = m.t === 'ack' ? '✓' : n.status; }
     } else if (m.t === 'p') {
       pointer(m);
+    } else if (m.t === 'end') {
+      // (the link's time is up: Montage lets this connection go)
+      state.stage = 'expired'; state.error = m.why || '';
+      if (state.pc) state.pc.close();
+      status();
     }
   }
 

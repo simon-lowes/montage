@@ -918,7 +918,9 @@ struct CssRule {
 // (a drawing's style sheets read to this many rules, each of this many compound selectors at most: every rule is
 // tried on every element, so a crafted sheet cannot hold the import up. A list of selectors is so many rules, its
 // declarations held once. And the trying itself is counted, in names compared: past kMaxCssWork the sheets are left
-// off the elements that remain, since long compounds on elements copied by <use> would still take hours.)
+// off the elements that remain, since long compounds on elements copied by <use> would still take hours. It is
+// counted before each compound is tried, so one element of tens of thousands of names cannot pass it by much either:
+// a compound that would take it past is not tried, and that element goes without the sheets too.)
 constexpr long kMaxCssWork = 400000000;
 constexpr size_t kMaxCssRules = 2000;
 constexpr qsizetype kMaxCssCompounds = 16;
@@ -994,7 +996,15 @@ std::vector<CssRule> parseCss(QString text, int& order) {
 }
 
 bool compoundMatches(const CssCompound& c, const SvgNode& n, long* work) {
-    if (work) *work += 1 + long(c.classes.size()) * long(std::max<qsizetype>(1, n.classes.size()));
+    if (work) {
+        // (in 64 bits: long is 32 on Windows, and the work kept never passes kMaxCssWork + 1)
+        const int64_t cost = 1 + int64_t(c.classes.size()) * int64_t(std::max<qsizetype>(1, n.classes.size()));
+        if (int64_t(*work) + cost > kMaxCssWork) {
+            *work = kMaxCssWork + 1;
+            return false;
+        }
+        *work += long(cost);
+    }
     if (!c.type.isEmpty() && c.type != n.name) return false;
     if (!c.id.isEmpty() && (!n.attrs.count("id") || n.attrs.at("id") != c.id)) return false;
     for (const QString& k : c.classes)
@@ -1034,8 +1044,13 @@ Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, con
     if (sheet && !sheet->empty() && (!work || *work <= kMaxCssWork)) {
         static const std::vector<const SvgNode*> none;
         std::vector<const CssRule*> picked;
-        for (const CssRule& r : *sheet)
+        for (const CssRule& r : *sheet) {
             if (ruleMatches(r, n, ancestors ? *ancestors : none, work)) picked.push_back(&r);
+            if (work && *work > kMaxCssWork) {
+                picked.clear();  // (some of its rules tried, not all: none of them, as for the elements after it)
+                break;
+            }
+        }
         std::stable_sort(picked.begin(), picked.end(), [](const CssRule* a, const CssRule* b) {
             return a->specificity != b->specificity ? a->specificity < b->specificity : a->order < b->order;
         });

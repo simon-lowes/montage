@@ -158,18 +158,22 @@ std::vector<uint8_t> jxsvBoxes(const VideoFormat& f, uint16_t ppih, uint16_t ple
 // `maxPayload` bytes, every packet of a packetization unit as long but its last; `frameCount` the F counter's frame.
 bool packJxsv(const std::vector<uint8_t>& boxes, const uint8_t* codestream, size_t size, const std::vector<uint32_t>& units, int packetMode,
               int64_t frameCount, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
+// The most bytes a frame of a JPEG XS format's packets may come to (JxsvAssembler::setFrameLimit): its picture at the
+// bits a pixel its SDP names, at the bits of the picture uncompressed (a sender may code that many: 36 for 4:4:4 at 12
+// bits), or at 24, whichever is most, and the boxes before it.
+size_t jxsvFrameLimit(const VideoFormat& f);
 // Packets a frame of `size` bytes makes (`units` its slices', in the slice mode).
 int jxsvPacketCount(size_t boxBytes, size_t size, const std::vector<uint32_t>& units, int packetMode, int maxPayload = 1200);
 // Rebuilds codestreams from RFC 9134 packets. A frame missing packets keeps what came: the slices they carried are
 // taken from the frame before (the same bytes each frame, at a constant bit rate), so a lost packet damages only the
 // lines of its slices; without a frame before to take them from, the frame is passed over. A frame is held to
-// `frameLimit` bytes of packets (by default the largest picture taken here at 24 bits a pixel): what a sender puts
-// under one timestamp past that is dropped as it comes, and the frame passed over.
+// `frameLimit` bytes of packets (by default the largest picture taken here, uncompressed at 4:4:4 and 12 bits): what
+// a sender puts under one timestamp past that is dropped as it comes, and the frame passed over.
 class JxsvAssembler {
 public:
     JxsvAssembler() = default;
-    static constexpr size_t kLargestFrame = size_t(8192) * 4320 * 3 + 65536;
-    static constexpr size_t kMostParts = 300000;  // (packets a frame: the largest in packets of 512 bytes, and more)
+    static constexpr size_t kLargestFrame = size_t(8192) * 4320 * 9 / 2 + 65536;
+    static constexpr size_t kMostParts = 400000;  // (packets a frame: the largest in packets of 512 bytes, and more)
     void setFrameLimit(size_t bytes) { limit_ = std::clamp<size_t>(bytes, 4096, kLargestFrame); }
     size_t frameLimit() const { return limit_; }
     size_t heldBytes() const { return bytes_; }  // of the frame being built

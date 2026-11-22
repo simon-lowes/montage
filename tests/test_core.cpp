@@ -2272,11 +2272,13 @@ private slots:
             QVERIFY(std::fabs(values["rev"] - 0.4) < 1e-12);
         }
         // ---- NRPN data entry with the fine half first (nightly 15 Nov: each value came out with the coarse half
-        // of the one before). The first pair shows the order; from then on the value is given whole, once, when its
-        // coarse half arrives; a fine half alone goes out when the parameter is next chosen.
+        // of the one before). The first pair shows the order, and its value comes once, whole (nightly 19 Nov: not
+        // first with a coarse half of 0); from then on the value is given whole, once, when its coarse half arrives;
+        // a fine half alone goes out when the parameter is next chosen.
         decoder.reset();
         events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 20, 0xB1, 6, 10});
-        QVERIFY(!events.empty() && events.back().key == nrpn && events.back().value == (10 << 7 | 20) && events.back().resolution == 16384);
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
         events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 0, 0xB1, 6, 11});
         QCOMPARE(events.size(), size_t(1));
         QVERIFY(events[0].key == nrpn && events[0].value == (11 << 7 | 0));
@@ -2290,6 +2292,18 @@ private slots:
         events = decode({0xB1, 99, 3, 0xB1, 98, 5, 0xB1, 6, 1, 0xB1, 38, 2, 0xB1, 99, 3, 0xB1, 98, 5, 0xB1, 6, 1, 0xB1, 38, 3});
         QCOMPARE(events.size(), size_t(3));
         QVERIFY(events[1].value == (1 << 7 | 2) && events[2].value == (1 << 7 | 3));
+        // The parameter chosen only once, then pair after pair with the fine half first (nightly 19 Nov: each fine
+        // half went out with the coarse half before it, and the coarse halves were lost): each value once, whole.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 20, 0xB1, 6, 10, 0xB1, 38, 30, 0xB1, 6, 11, 0xB1, 38, 40, 0xB1, 6, 12});
+        QCOMPARE(events.size(), size_t(3));
+        QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
+        QVERIFY(events[1].key == nrpn && events[1].value == (11 << 7 | 30));
+        QVERIFY(events[2].key == nrpn && events[2].value == (12 << 7 | 40));
+        // (then a fine half alone, twice: the second goes out with the coarse half it has)
+        events = decode({0xB1, 38, 41, 0xB1, 38, 42});
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (12 << 7 | 42));
 
         // ---- One fader, three targets, each in its own range.
         {
@@ -5476,6 +5490,18 @@ private slots:
         const Sequence* nested = fx.p.findSequence(m->sequenceId);
         QCOMPARE(trackAt(*nested, V2)->clips[0].start, FrameTime(10));
         QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));  // nested audio gets its own clip
+        // A 5.1 sequence's clips nest in a 5.1 sequence, folded down to stereo as it is (nightly 19 Nov).
+        Fixture surround;
+        surround.s().audioLayout = "5.1";
+        surround.s().downmixCentreDb = -6, surround.s().downmixSurroundDb = -99;
+        const Result placed = placeMedia(surround.p, surround.s(), surround.media, 0, 0, 30, V1, A1, false);
+        QVERIFY(placed.ok);
+        const Result nestedSurround = makeCompound(surround.p, surround.s(), placed.created, "Nest");
+        QVERIFY(nestedSurround.ok);
+        const Sequence& inner = *surround.p.findSequence(surround.p.findMedia(clipById(surround.s(), nestedSurround.created[0])->mediaId)->sequenceId);
+        QCOMPARE(inner.audioLayout, std::string("5.1"));
+        QCOMPARE(inner.downmixCentreDb, -6.0);
+        QCOMPARE(inner.downmixSurroundDb, -99.0);
     }
 
     void nestInToOutAcrossTracks() {
@@ -5600,6 +5626,25 @@ private slots:
             QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));
             QCOMPARE(trackAt(outer, A2)->clips.size(), size_t(3));
             QVERIFY(compoundOn(f.p, *trackAt(outer, A2)));
+        }
+        {
+            // A track both soloed and muted is silent in the mix, and so is every other while it is soloed: neither
+            // audio track is nested, and only the picture is.
+            Fixture f;
+            f.put(V1, 0, 60);
+            sound(f, A1, 0, 60);
+            sound(f, A2, 0, 60);
+            trackAt(f.s(), A2)->solo = true;
+            trackAt(f.s(), A2)->muted = true;
+            const Id seq = f.s().id;
+            const Result r = nestRange(f.p, f.s(), 10, 50, allTracks(f.s()), "Range");
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& outer = *f.p.findSequence(seq);
+            QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));
+            QCOMPARE(trackAt(outer, A2)->clips.size(), size_t(1));
+            const Sequence* nested = compoundOn(f.p, *trackAt(outer, V1));
+            QVERIFY(nested);
+            QVERIFY(trackAt(*nested, A1)->clips.empty() && trackAt(*nested, A2)->clips.empty());
         }
         {
             // Two audio tracks whose faders differ: the compound plays through the lower track's fader, and the other
@@ -5735,6 +5780,26 @@ private slots:
             clipById(*plain.active(), clips[1])->markers.push_back(k);
             QVERIFY(replaceSources(plain, *plain.active(), clips, online.id, false).ok);
             QCOMPARE(clipById(*plain.active(), clips[1])->markers[0].t, FrameTime(40));
+        }
+        // By timecode to a file that starts a second later (nightly 19 Nov): the second clip's in-point moves back a
+        // second. A marker in the clip moves with it; one in the old file's handles, on a moment before the new file
+        // starts, is put on its first frame, not on a frame before it.
+        {
+            Project later = before;
+            MediaItem late = online;
+            late.id = later.newId();
+            late.timecode = 3600 + 1;
+            later.media.push_back(late);
+            Clip& second = *clipById(*later.active(), clips[1]);
+            Marker in, handle;
+            in.t = 40, handle.t = 5;
+            second.markers = {in, handle};
+            QVERIFY(replaceSources(later, *later.active(), {clips[1]}, late.id, true).ok);
+            const Clip& moved = *clipById(*later.active(), clips[1]);
+            const FrameTime second1 = FrameTime(std::llround(later.active()->fpsValue()));
+            QCOMPARE(moved.sourceIn, double(30 - second1));
+            QCOMPARE(moved.markers[0].t, FrameTime(40 - second1));
+            QCOMPARE(moved.markers[1].t, FrameTime(0));
         }
         // An L-cut (the sound leading the picture by 12 frames) keeps its lead; a separate recorder's sound linked to
         // the picture is left on its own file.

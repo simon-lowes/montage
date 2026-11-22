@@ -2772,7 +2772,55 @@ private slots:
             QVERIFY(ofx::gl::receiveDmaBuf(post, getpid(), false, 2000, got, &why));
             QVERIFY(sameFile(got.fd, other.handle()));
             ofx::gl::closeDmaBuf(got);
+            // (nightly 19 Nov) The host's message is found behind as many others as the post holds (only 64 were
+            // looked through, so another process's messages could hide it), and a full post makes the sender give up
+            // at once rather than wait (the host's render waited, and timed out).
+            const int held = ofx::gl::heldAtOnce();
+            QVERIFY(held >= 1);
+            const int ahead = std::min(held - 1, 500);  // (descriptors in flight are limited too)
+            for (int k = 0; k < ahead; ++k) QVERIFY(ofx::gl::sendDmaBuf(name, sent));  // (one descriptor: not whole)
+            sent.fence = other.handle();
+            QVERIFY(ofx::gl::sendDmaBuf(name, sent));
+            QVERIFY2(ofx::gl::receiveDmaBuf(post, getpid(), true, 2000, got, &why), why.c_str());
+            QVERIFY(sameFile(got.fd, other.handle()) && sameFile(got.fence, other.handle()));
+            ofx::gl::closeDmaBuf(got);
+            if (held <= 500) {
+                // (sent until the post is full, which it is after as many as it holds)
+                QElapsedTimer clock;
+                clock.start();
+                int sends = 0;
+                while (sends <= held && ofx::gl::sendDmaBuf(name, sent)) ++sends;
+                QVERIFY2(sends == held, qPrintable(QString::number(sends)));
+                QVERIFY(clock.elapsed() < 1000);
+                QVERIFY(ofx::gl::receiveDmaBuf(post, getpid(), true, 0, got, &why));
+                ofx::gl::closeDmaBuf(got);
+                QVERIFY(!ofx::gl::receiveDmaBuf(post, getpid(), true, 0, got, &why));  // (all taken)
+            }
             ofx::gl::closeDmaBufPost(post);
+            // (nightly 19 Nov) A picture's buffer is taken only with its rows inside it, and its fence is waited for
+            // where the handle is taken, not on the plug-ins' OpenGL thread.
+            QFile picture(path("handle-picture.bin"));
+            QVERIFY(picture.open(QIODevice::ReadWrite) && picture.resize(16 * 8 * 8));
+            ofx::gl::DmaBuf b;
+            b.fd = picture.handle();
+            b.width = 16, b.height = 8, b.fourcc = 0x48344241, b.stride = 16 * 8;
+            QVERIFY2(ofx::gl::dmaBufFits(b, &why), why.c_str());
+            b.offset = 8;  // (its last row past the end)
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why) && !why.empty());
+            b.offset = 0, b.height = 9;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.height = 8, b.stride = 15;  // (shorter than a row)
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.stride = 0xffffffffu;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            int fence[2] = {-1, -1};
+            QCOMPARE(::pipe(fence), 0);
+            b.stride = 16 * 8, b.fence = fence[0];
+            QVERIFY(!ofx::gl::awaitDrawn(b, &why, 50) && !why.empty());
+            QCOMPARE(::write(fence[1], "x", 1), ssize_t(1));
+            QVERIFY(ofx::gl::awaitDrawn(b, &why, 50));
+            ::close(fence[0]);
+            ::close(fence[1]);
             QVERIFY(!ofx::gl::sendDmaBuf(name, sent));  // (the post is gone with its socket)
         }
 #endif
@@ -2942,6 +2990,56 @@ private slots:
         QVERIFY(!ok);
         QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in ") && err.find("Test Invert") != std::string::npos, err.c_str());
         QVERIFY(hostsGone());
+    }
+
+    // Nightly 19 Nov: an export stops, naming the plug-in, also when an OpenFX plug-in it would lose is not installed
+    // here, or fails in Montage's own process, in a host or not. Both were left out of every frame of an export that
+    // said it went well. A render that is no export's still just leaves the effect out.
+    void exportStopsAtAMissingOrFailingOpenFxPlugin() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-export-missing-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert));
+        QVERIFY(reg.find("org.montage.test.dissolve/1", dissolve));
+        ExportSettings st;
+        st.path = path("ofx-export-missing.mkv").toStdString();
+        st.videoCodec = "ffv1";
+        st.audioCodec = "none";
+        for (const bool isolated : {false, true}) {
+            Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
+            // A project made where a plug-in is installed that this computer does not have.
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+            Clip clip = makeGeneratorClip(p, "color", 10);
+            Effect gone = ofx::makeEffect(p, invert);
+            gone.strings["ofx_id"] = "org.montage.test.elsewhere/1";
+            gone.strings["ofx_name"] = "Test Elsewhere";
+            clip.effects.push_back(gone);
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, clip).ok);
+            std::string err;
+            QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in Test Elsewhere is not installed"), err.c_str());
+            // Rendered for no export, the effect is left out and nothing is told.
+            const uint64_t before = offlineFailureSerial();
+            Image img(8, 8);
+            img.fill(0.2f, 0.4f, 0.6f, 1.0f);
+            QVERIFY(!ofx::applyEffect(gone, 0, img, 1.0, {}, &err));
+            QCOMPARE(offlineFailureSerial(), before);
+            // A plug-in that will not render as a clip's effect (a transition put there) fails as the export renders.
+            Effect wrong = ofx::makeEffect(p, dissolve);
+            s.videoTracks[0].clips[0].effects = {wrong};
+            QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in Test Dissolve ") && err.find("transition") != std::string::npos,
+                     err.c_str());
+            // With the plug-in it names, the export goes through.
+            s.videoTracks[0].clips[0].effects = {ofx::makeEffect(p, invert)};
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            ofx::remote::releaseIdle();
+        }
     }
 
     // Phase 15 #2: OpenFX on-screen controls drawn by the plug-in's host. The host draws them (the Draw Suite and
@@ -3212,6 +3310,83 @@ private slots:
             return runningHosts().empty();
         }, 20000));
         QVERIFY(!failureOf(probe.id).has_value());
+    }
+
+    // Nightly 19 Nov: a late reply says what the effect was when its event was sent, and one handed on with the next
+    // pen or key writes only what is still as it was then. (It wrote all it set over newer edits, as one undo step;
+    // and the monitor, which kept the effect as asked, stopped keeping it while a slow draw was out, so late replies
+    // after one were lost.)
+    void lateOpenFxControlRepliesKeepNewerEdits() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-controls-newer-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc probe;
+        QVERIFY(reg.find("org.montage.test.probe/1", probe));
+        Project p = makeDefaultProject();
+        Hosting hostingMode(Isolation::PerInstance);
+        // (as isolatedOpenFxControlsDrawTheSame: Centre (0.3, 0.6) is at view (120, 80), and view (x, y) is Centre
+        // (x / 400, (200 - y) / 200))
+        ofx::View v;
+        v.width = 400, v.height = 200, v.frameW = 400, v.frameH = 200;
+        v.m[0] = 1, v.m[1] = 0, v.m[2] = 0, v.m[3] = 0, v.m[4] = -1, v.m[5] = 200;
+        std::string err;
+        Effect e = ofx::makeEffect(p, probe);
+        e.params["param.centre.x"] = Param(0.3);
+        e.params["param.centre.y"] = Param(0.6);
+        std::unique_ptr<ofx::Interact> c;
+        {
+            Fault f("slow:pen:1");  // (the drag's first move in time, all later moves and releases late)
+            c = ofx::Interact::open(e, &err);
+        }
+        QVERIFY2(c && c->remote(), err.c_str());
+        auto near = [](const Effect& x, const char* key, double want) { return std::fabs(x.params.at(key).at(0) - want) < 1e-9; };
+        Effect edited;
+        bool changed = false;
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, e, 0, v, 120, 80, 1, edited, changed));
+        QVERIFY(c->pen(ofx::Interact::Pen::Move, e, 0, v, 150, 60, 1, edited, changed) && changed);
+        e = edited;  // (Centre (0.375, 0.7))
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, e, 0, v, 160, 50, 1, edited, changed) && !changed && c->waiting());
+        // The late release's Centre, and the effect as the release was sent with it.
+        Effect set, asked;
+        QVERIFY(eventually([&] { return c->lateEdits(set, &asked); }, 10000));
+        QVERIFY(near(set, "param.centre.x", 0.4) && near(set, "param.centre.y", 0.75));
+        QVERIFY(near(asked, "param.centre.x", 0.375) && near(asked, "param.centre.y", 0.7));
+        e.params["param.centre.x"] = Param(0.4), e.params["param.centre.y"] = Param(0.75);  // (as the monitor writes it)
+        // Another drag released late, then Centre's x set by the user before the reply is handed on.
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, e, 0, v, 160, 50, 1, edited, changed));
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, e, 0, v, 170, 40, 1, edited, changed) && c->waiting());
+        Effect now = e;
+        now.params["param.centre.x"] = Param(0.9);
+        ofx::Overlay o;
+        QVERIFY(eventually([&] {
+            c->draw(now, 0, v, o);
+            return !c->waiting();
+        }, 10000));
+        // A key goes with the reply's y, which nothing has changed since, and the user's x, which stays.
+        QVERIFY(!c->key(true, 0x61, "a", now, 0, v, edited, changed));
+        QVERIFY(changed);
+        QVERIFY2(near(edited, "param.centre.x", 0.9), qPrintable(QString::number(edited.params.at("param.centre.x").at(0))));
+        QVERIFY(near(edited, "param.centre.y", 0.8));
+        // A late reply that only sets what the user has changed since hands on nothing.
+        e = edited;
+        QVERIFY(c->pen(ofx::Interact::Pen::Down, e, 0, v, 360, 40, 1, edited, changed));
+        QVERIFY(!c->pen(ofx::Interact::Pen::Up, e, 0, v, 360, 20, 1, edited, changed) && c->waiting());  // (y 0.9)
+        now = e;
+        now.params["param.centre.y"] = Param(0.5);
+        QVERIFY(eventually([&] {
+            c->draw(now, 0, v, o);
+            return !c->waiting();
+        }, 10000));
+        QVERIFY(!c->key(true, 0x61, "a", now, 0, v, edited, changed));
+        QVERIFY(!changed && near(edited, "param.centre.y", 0.5) && near(edited, "param.centre.x", 0.9));
+        QVERIFY(!c->failed());
+        c.reset();
+        QVERIFY(eventually([] {
+            ofx::remote::releaseIdle();
+            return runningHosts().empty();
+        }, 20000));
     }
 
     // In a host shared by a maker's plug-ins, the second of two crashes it while loading: that one alone is blocked
@@ -3567,8 +3742,20 @@ private slots:
         QTRY_COMPARE(e.status().rate, 48000);
         QTest::qWait(1000);
         const double wall = double(heard.nsecsElapsed()) / 1e9, said = e.heardSeconds(out) - from;
-        e.removeOutput(out);
         QVERIFY2(std::fabs(said - wall) < 0.2, qPrintable(QString("%1 s heard in %2 s").arg(said).arg(wall)));
+        // The output latency the device reports with its new rate is the one taken off at once (nightly 19 Nov: the
+        // one it had before stayed until the device panel next asked): half a second more of it here, at 96 kHz.
+        {
+            QElapsedTimer since;
+            since.start();
+            const double before = e.heardSeconds(out);
+            audiodev::loopbackChangeRate(96000, 256 + 48000);
+            QTRY_COMPARE(e.roundTripAt(48000), 256);  // (the new rate known, without asking the device panel's way)
+            QTest::qWait(1000);
+            const double gained = e.heardSeconds(out) - before, elapsed = double(since.nsecsElapsed()) / 1e9;
+            QVERIFY2(std::fabs(gained - (elapsed - 0.5)) < 0.2, qPrintable(QString("%1 s heard in %2 s").arg(gained).arg(elapsed)));
+        }
+        e.removeOutput(out);
         audiodev::setLoopbackOptions({});
     }
 

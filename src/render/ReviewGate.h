@@ -9,7 +9,9 @@
 // once. The list holds so many networks; past that, the networks not in it have the same few tries a second between
 // them, so that guessing from more networks than the list holds gains nothing, and a newcomer is still tried within a
 // second or so of the guessers there letting up. A try is used up only by a wrong passphrase: the right one leaves
-// its network's ration as it was, for the next reviewer behind the same network.
+// its network's ration as it was, for the next reviewer behind the same network. The last try of a ration is kept for
+// addresses with no wrong passphrase on record: guessers who keep asking faster than the ration fills have theirs on
+// record, so they keep it from reaching more than one try, and that one goes to the next newcomer instead.
 #pragma once
 
 #include <QString>
@@ -26,6 +28,7 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr double kGuessRate = 5;                  // passphrases tried a second by the networks listed, and by the rest
     static constexpr double kNetworkBurst = 3;               // and at once from one network that has guessed wrong
+    static constexpr double kKeptForNewcomers = 1;           // of which addresses with a wrong one on record leave this many
     static constexpr double kListedBurst = 256;              // (fewer once the networks listed are more than a third of this)
     static constexpr double kPeerRate = 1, kPeerBurst = 8;   // and from one address not yet let in
     static constexpr std::chrono::hours kTrustedMemory{1};   // how long a right passphrase lets its address past the rest
@@ -56,8 +59,8 @@ public:
         tidy(now);
         const bool known = trusted(address);
         // (an address a reviewer is in lately, as a shared network's, is blocked only after many more)
-        if (const auto blocked = failures_.find(address); blocked != failures_.end() && blocked->second.count >= (known ? 100 : 10))
-            return {Answer::Blocked, 0, false};
+        const auto onRecord = failures_.find(address);
+        if (onRecord != failures_.end() && onRecord->second.count >= (known ? 100 : 10)) return {Answer::Blocked, 0, false};
         if (known) return {};
         if (peers_.size() > kListed) peers_.clear();  // (a flood of addresses: they start full again)
         Bucket& mine = peers_.try_emplace(address, Bucket{kPeerBurst, now}).first->second;
@@ -71,7 +74,9 @@ public:
         if (!ration) return {};
         ration->tokens = std::min(kNetworkBurst, ration->tokens + seconds(now - ration->at) * rate);
         ration->at = now;
-        if (ration->tokens < 1) return {Answer::NetworkBusy, int(std::clamp(std::ceil((1 - ration->tokens) / rate), 1.0, 600.0)), false};
+        // (an address that has guessed wrong lately leaves the last try for one that has not)
+        const double least = onRecord == failures_.end() ? 1 : 1 + kKeptForNewcomers;
+        if (ration->tokens < least) return {Answer::NetworkBusy, int(std::clamp(std::ceil((least - ration->tokens) / rate), 1.0, 600.0)), false};
         ration->tokens -= 1;
         return {Answer::Try, 0, true};
     }

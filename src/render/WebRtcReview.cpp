@@ -588,7 +588,10 @@ private:
 
 // A viewer's reports on their picture: the share of packets lost (in RTCP sender and receiver reports) and, with the
 // transport-wide sequence number extension agreed (`wideId`, 0 without), when each packet arrived. Every picture packet
-// sent is numbered here on its way out, last in the chain, so one sent again on request goes as it first did.
+// sent is numbered here on its way out, last in the chain. One sent again on a viewer's asking goes without a number
+// (what is kept for sending again is kept before this, and sent again past it): it is not judged, and the one the link
+// lost stays lost. That is as wanted: a probe judges what share of its first sending the link carried, and the share
+// of the first sending that arrives is the same whether what is sent again is counted with it or not.
 class FeedbackReader final : public rtc::MediaHandler {
 public:
     FeedbackReader(std::weak_ptr<Viewer> viewer, uint32_t ssrc, int wideId) : viewer_(std::move(viewer)), ssrc_(ssrc), wideId_(wideId) {}
@@ -614,12 +617,20 @@ public:
                         }
                     }
                 } else if (type == 205 && count == 15 && wideId_) {
-                    ArrivalReport report;
-                    if (parseTransportFeedback(d + at, length, report))
-                        if (auto v = viewer_.lock()) {
+                    // (read only as far as what was sent them allows: a report of a few bytes saying 65,535 packets
+                    // were lost is not walked through, under the lock the sending shares)
+                    if (auto v = viewer_.lock()) {
+                        size_t room = 0;
+                        {
+                            std::lock_guard lock(v->linkM);
+                            room = v->link.reportRoom();
+                        }
+                        ArrivalReport report;
+                        if (parseTransportFeedback(d + at, length, report, room)) {
                             std::lock_guard lock(v->linkM);
                             v->link.feedback(report, Clock::now());
                         }
+                    }
                 }
                 at += length;
             }
@@ -802,9 +813,11 @@ struct BrowserReviewBackend::Impl {
     uint16_t relayPort = 0;
     std::set<std::shared_ptr<RelayBridge>> bridging;
     // The relay's login for this review: the settings' own, or one made from the shared secret that runs out at
-    // `expires` (seconds since 1970; 0: none), when the link stops letting viewers in too.
+    // `expires` (seconds since 1970; 0: none), when the link ends too.
     TurnLogin relayLogin;
     std::atomic<int64_t> expires{0};
+    // (the web server's thread) Once the link has ended: when its viewers were told so (and let go a second later).
+    std::optional<Clock::time_point> endedAt;
 
     // The web server's thread, its loop and the object queued work runs on.
     std::thread http;
@@ -903,7 +916,11 @@ struct BrowserReviewBackend::Impl {
             // Full. A reviewer who gave the passphrase lately still gets in, in the place of the oldest connection
             // still waiting to be answered from anyone else. Anyone else gets in by their share: in the place of the
             // oldest connection waiting from the address (IPv6 /64) holding the most, when that holds more than
-            // theirs, so that a few addresses holding every place cannot keep a newcomer out.
+            // theirs, so that a few addresses holding every place cannot keep a newcomer out. A newcomer from an
+            // address holding none gets in even when every address holds one (many addresses of one network, as an
+            // IPv6 /56 has 256 /64s, or of many): in the place of the oldest connection waiting from the network
+            // holding the most, so that those of one network taking every place make room only for each other, and
+            // anyone else's connection is the oldest only once all the places have been taken again after it.
             QSslSocket* oldest = nullptr;
             gate.tidy(Clock::now());  // (trust that has run out counts for nothing here either)
             if (gate.trusted(from)) {
@@ -914,23 +931,32 @@ struct BrowserReviewBackend::Impl {
                     }
             } else {
                 // (of the addresses with a connection that could go: one waiting to be answered)
-                std::map<QString, int> held;
+                std::map<QString, int> held, heldAround;
                 std::set<QString> waiting;
                 for (QSslSocket* o : open)
                     if (o != c) {
                         ++held[guesser(o->peerAddress())];
+                        ++heldAround[network(o->peerAddress())];
                         if (!o->property("answered").toBool()) waiting.insert(guesser(o->peerAddress()));
                     }
                 QString most;
                 int mostHeld = 0;
                 for (const auto& [who, n] : held)
                     if (n > mostHeld && waiting.count(who) && !gate.trusted(who)) most = who, mostHeld = n;
-                if (mostHeld > held[from] + 1)
+                const int mine = held[from];
+                if (mostHeld > mine + 1)
                     for (QSslSocket* o : open)
                         if (o != c && !o->property("answered").toBool() && guesser(o->peerAddress()) == most) {
                             oldest = o;
                             break;
                         }
+                if (!oldest && mine == 0) {
+                    // (the oldest of those waiting from the networks holding the most: children are listed oldest first)
+                    int mostAround = 0;
+                    for (QSslSocket* o : open)
+                        if (o != c && !o->property("answered").toBool() && !gate.trusted(guesser(o->peerAddress())))
+                            if (const int n = heldAround[network(o->peerAddress())]; n > mostAround) oldest = o, mostAround = n;
+                }
             }
             if (!oldest) {
                 c->abort();
@@ -1101,7 +1127,8 @@ struct BrowserReviewBackend::Impl {
     }
 
     // The review link's time is up (only one with a relay's shared secret has a time): nobody new is let in, as the
-    // relay lets no login from it in.
+    // relay lets no login from it in, and every viewer is told and let go (pruneViewers), as the relay would cut
+    // those it carries at their next refresh with that login.
     bool expired() const {
         const int64_t at = expires;
         return at > 0 && std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() >= at;
@@ -1562,9 +1589,11 @@ struct BrowserReviewBackend::Impl {
         retired.emplace_back(Clock::now(), v);
     }
 
-    // Viewers whose connection failed or closed, or never came up, are let go.
+    // Viewers whose connection failed or closed, or never came up, are let go; once the link's time is up, every
+    // viewer is told so and let go a second later. A viewer whose way through the relay failed leaves why.
     void pruneViewers() {
-        std::vector<std::shared_ptr<Viewer>> drop, gone;
+        std::vector<std::shared_ptr<Viewer>> drop, gone, told;
+        const bool ended = expired();
         {
             std::lock_guard lock(m);
             const auto now = Clock::now();
@@ -1572,9 +1601,16 @@ struct BrowserReviewBackend::Impl {
                 gone.push_back(std::move(retired.front().second));
                 retired.pop_front();
             }
+            if (ended && !endedAt) {
+                endedAt = now;
+                for (const auto& [id, v] : viewers) told.push_back(v);
+            }
+            const bool letGo = endedAt && now - *endedAt >= std::chrono::seconds(1);
             for (auto it = viewers.begin(); it != viewers.end();) {
                 const auto& v = it->second;
-                if (v->gone || (!v->connected && now - v->created > std::chrono::seconds(30))) {
+                if (letGo || v->gone || (!v->connected && now - v->created > std::chrono::seconds(30))) {
+                    if (v->bridge)
+                        if (std::string why = v->bridge->lastError(); !why.empty()) lastError = why;
                     drop.push_back(v);
                     pointing.erase(v->id);
                     it = viewers.erase(it);
@@ -1584,6 +1620,7 @@ struct BrowserReviewBackend::Impl {
             }
             for (auto it = pointing.begin(); it != pointing.end();) it = now - it->second.at > kPointerLife ? pointing.erase(it) : std::next(it);
         }
+        for (const auto& v : told) sendText(*v, {{"t", "end"}, {"why", "This review link has expired"}});
         for (const auto& v : drop) closeViewer(v);
     }
 
@@ -2203,7 +2240,8 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
             return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)");
         if (d.settings.relayOnly) {
             // Only through the relay: Montage's end of each connection stays on this computer's loopback behind a
-            // bridge to the relay, and its ICE is told of no server, so nothing leaves for anywhere but the relay.
+            // bridge to the relay, and its ICE is told of no server, so no media leaves for anywhere but the relay
+            // (the page and its signalling are HTTPS, between the viewer and this review's own address).
             d.relayHost = relayHost;
             d.relayPort = relayPort;
             d.iceServers.clear();
@@ -2244,6 +2282,7 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
         std::lock_guard lock(d.m);
         d.open = true;
         d.woken = false;
+        d.endedAt.reset();
         d.lastError.clear();
         d.received.clear();
         d.markerCount = 0;
@@ -2371,6 +2410,9 @@ ReviewStats BrowserReviewBackend::stats() const {
     s.queueMoves = d_->queueMoves;
     s.linkExpires = d_->open ? d_->expires.load() : 0;
     s.error = d_->lastError;
+    // (a viewer's way through the relay that failed: the relay's refusal, or its address for them running out)
+    for (const auto& [id, v] : d_->viewers)
+        if (s.error.empty() && v->bridge) s.error = v->bridge->lastError();
     s.markers = d_->markerCount;
     return s;
 }

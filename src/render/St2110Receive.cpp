@@ -457,8 +457,8 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
             if (s.video.jpegXs()) {
                 if (!jpegXsAvailable()) return fail("This build of Montage has no JPEG XS (SVT-JPEG-XS) to receive ST 2110-22 with");
                 st->jxsv = std::make_unique<JxsvAssembler>();
-                // (a frame's packets are kept to the picture the SDP names at 24 bits a pixel, the most coded here)
-                st->jxsv->setFrameLimit(size_t(double(s.video.width) * s.video.height * 3) + 65536);
+                // (a frame's packets are kept to the picture the SDP names, at the most bits a pixel it may be coded at)
+                st->jxsv->setFrameLimit(jxsvFrameLimit(s.video));
                 st->decoder = std::make_unique<JxsDecoder>();
                 frameBytes = double(s.video.width) * s.video.height * s.video.bpp / 8;
             } else {

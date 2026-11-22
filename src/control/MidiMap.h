@@ -73,11 +73,9 @@ private:
         int last = -1;  // the last controller number seen
         int paramMsb = 127, paramLsb = 127;  // 127/127: none chosen (the "null" parameter)
         bool rpn = false;
-        int dataMsb = -1;
-        // Data entry's fine half when it is the first to come after the parameter was chosen (-1 otherwise), and
-        // whether it is held for the coarse half to follow (a parameter known to send the fine half first).
-        int dataLsb = -1;
-        bool lsbHeld = false;
+        // Data entry's fine half held for the coarse half to follow (-1 none): from a parameter known to send the fine
+        // half first, or one whose coarse half has not come yet.
+        int heldLsb = -1;
         Channel();
     };
     Channel ch_[16];

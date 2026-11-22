@@ -16,6 +16,8 @@ constexpr int kStandingGroups = 6;
 constexpr double kStandingMs = 50, kDrainingMsPerS = -25;
 constexpr double kProbeQueueMs = 40;
 constexpr int64_t kProbeWaitUs = 1'000'000;   // how long after a probe its reports are waited for
+constexpr size_t kRemembered = 32768;         // packets sent remembered at most
+constexpr int64_t kRoomPerPacket = 4;         // packets reports may go over, for each one sent
 
 int32_t signed24(uint32_t v) {
     v &= 0xffffff;
@@ -31,7 +33,7 @@ size_t rtpHeaderEnd(const uint8_t* rtp, size_t size) {
 
 }  // namespace
 
-bool parseTransportFeedback(const uint8_t* p, size_t size, ArrivalReport& out) {
+bool parseTransportFeedback(const uint8_t* p, size_t size, ArrivalReport& out, size_t most) {
     out = {};
     if (!p || size < 20 || (p[0] >> 6) != 2 || (p[0] & 31) != 15 || p[1] != 205) return false;
     const size_t length = (size_t((p[2] << 8) | p[3]) + 1) * 4;
@@ -44,6 +46,7 @@ bool parseTransportFeedback(const uint8_t* p, size_t size, ArrivalReport& out) {
     }
     out.base = uint16_t((p[12] << 8) | p[13]);
     const size_t count = size_t((p[14] << 8) | p[15]);
+    if (count > most) return false;
     out.referenceTime = (uint32_t(p[16]) << 16) | (uint32_t(p[17]) << 8) | p[18];
     size_t at = 20;
     std::vector<uint8_t> symbols;
@@ -147,7 +150,8 @@ uint16_t LinkDelay::sent(size_t bytes, Clock::time_point at) {
     s.bytes = uint32_t(bytes);
     s.group = firstGroup_ + int64_t(groups_.size()) - 1;
     sent_.push_back(s);
-    while (sent_.size() > 32768 || (!sent_.empty() && us - sent_.front().sentUs > kHistoryUs)) {
+    room_ = std::min<int64_t>(room_ + kRoomPerPacket, kRoomPerPacket * int64_t(kRemembered));
+    while (sent_.size() > kRemembered || (!sent_.empty() && us - sent_.front().sentUs > kHistoryUs)) {
         sent_.pop_front();
         ++firstSequence_;
     }
@@ -166,10 +170,12 @@ void LinkDelay::feedback(const ArrivalReport& r, Clock::time_point now) {
     reference_ = haveReference_ ? reference_ + signed24(r.referenceTime - lastReference_) : signed24(r.referenceTime);
     haveReference_ = true;
     lastReference_ = r.referenceTime;
+    room_ = std::max<int64_t>(0, room_ - int64_t(r.packets.size()));
     // (the latest packet sent with that number)
     int64_t sequence = nextSequence_ - int64_t(uint16_t(uint16_t(nextSequence_ & 0xffff) - r.base));
     int64_t arrivalUs = reference_ * 64000;
     int64_t latest = arrivals_.empty() ? INT64_MIN : arrivals_.back().first;
+    const size_t before = arrivals_.size();
     for (const ArrivalReport::Packet& packet : r.packets) {
         const int64_t n = sequence++;
         if (packet.received) arrivalUs += int64_t(packet.delta) * 250;
@@ -197,7 +203,12 @@ void LinkDelay::feedback(const ArrivalReport& r, Clock::time_point now) {
         latest = std::max(latest, arrivalUs);
     }
     while (!minima_.empty() && minima_.front().first < minima_.back().first - 60) minima_.pop_front();
-    std::sort(arrivals_.begin(), arrivals_.end());
+    // (only what this report added is sorted in: a report that adds nothing costs nothing here)
+    if (arrivals_.size() > before) {
+        const auto added = arrivals_.begin() + ptrdiff_t(before);
+        std::sort(added, arrivals_.end());
+        if (before > 0 && *added < *(added - 1)) std::inplace_merge(arrivals_.begin(), added, arrivals_.end());
+    }
     while (!arrivals_.empty() && arrivals_.front().first < latest - 2'000'000) arrivals_.pop_front();
 }
 

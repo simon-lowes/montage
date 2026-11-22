@@ -194,6 +194,7 @@ public:
             opt_ = gLoopOptions;
             gLoop = this;
         }
+        reportedOut_ = opt_.reportedOutput;
         // (never less than a buffer: what a callback hears was played before it, in a block before)
         delay_ = std::max(buffer_, std::max(0, opt_.reportedInput) + std::max(0, opt_.reportedOutput) + std::max(0, opt_.unreported));
         line_.assign(size_t(delay_) * size_t(std::max(1, inputs_)), 0.0f);
@@ -211,13 +212,19 @@ public:
     int bufferFrames() const override { return buffer_; }
     int inputs() const override { return inputs_; }
     int outputs() const override { return outputs_; }
-    Latency latency() const override { return {opt_.reportedInput, opt_.reportedOutput}; }
+    Latency latency() const override { return {opt_.reportedInput, reportedOut_.load()}; }
     int64_t xruns() const override { return xruns_.load(); }
     std::string device() const override { return "Loopback"; }
     std::vector<std::string> clockSources() const override { return {"Internal", "Word clock"}; }
     std::string clock() const override { return clock_; }
 
-    void changeRate(int rate) { pendingRate_ = rate; }
+    void unplug() {
+        if (cb_.lost) cb_.lost("The loopback was unplugged");
+    }
+    void changeRate(int rate, int reportedOutput) {
+        pendingOut_ = reportedOutput;
+        pendingRate_ = rate;
+    }
     void stall(int ms) { stallMs_ = ms; }
 
 private:
@@ -227,6 +234,7 @@ private:
         bool wasLate = false;
         while (running_) {
             if (const int r = pendingRate_.exchange(0); r > 0 && r != rate_) {
+                if (const int o = pendingOut_.exchange(-1); o >= 0) reportedOut_ = o;
                 rate_ = r;
                 if (cb_.rateChanged) cb_.rateChanged(r);
             }
@@ -273,7 +281,7 @@ private:
     int delay_ = 0, ring_ = 0;
     std::vector<float> line_;
     std::atomic<bool> running_{true};
-    std::atomic<int> pendingRate_{0}, stallMs_{0};
+    std::atomic<int> pendingRate_{0}, stallMs_{0}, pendingOut_{-1}, reportedOut_{0};
     std::atomic<int64_t> xruns_{0};
     std::thread thread_;
 };
@@ -283,6 +291,7 @@ private:
 void setLoopbackOptions(const LoopbackOptions& o) {
     std::lock_guard<std::mutex> lock(gLoopM);
     gLoopOptions = o;
+    if (o.unplugged && gLoop) gLoop->unplug();
 }
 
 LoopbackOptions loopbackOptions() {
@@ -290,9 +299,9 @@ LoopbackOptions loopbackOptions() {
     return gLoopOptions;
 }
 
-void loopbackChangeRate(int rate) {
+void loopbackChangeRate(int rate, int reportedOutput) {
     std::lock_guard<std::mutex> lock(gLoopM);
-    if (gLoop) gLoop->changeRate(rate);
+    if (gLoop) gLoop->changeRate(rate, reportedOutput);
 }
 
 void loopbackStall(int ms) {
@@ -308,7 +317,12 @@ std::unique_ptr<Stream> openStream(const DeviceSettings& s, int rate, int inputs
         case Host::Qt:
             if (error) *error = "Qt Multimedia's devices are opened by Qt";
             return nullptr;
-        case Host::Loopback: return std::make_unique<LoopbackStream>(s, rate, inputs, outputs, std::move(callbacks));
+        case Host::Loopback:
+            if (loopbackOptions().unplugged) {
+                if (error) *error = "The loopback is unplugged";
+                return nullptr;
+            }
+            return std::make_unique<LoopbackStream>(s, rate, inputs, outputs, std::move(callbacks));
         case Host::Jack: return detail::openJack(s, inputs, outputs, outputNames, std::move(callbacks), error);
         default: return detail::openPortAudio(s, rate, inputs, outputs, std::move(callbacks), error);
     }
@@ -388,6 +402,9 @@ struct Engine::Impl {
     std::atomic<int64_t> deviceFrames{0};
     std::atomic<int> outLatency{0};
     std::atomic<int> rateEvents{0};
+    // The rate changed since the latencies were last asked for (they are asked again by the next call that can hold
+    // openM: the device's callback that says so cannot).
+    std::atomic<bool> latencyStale{false};
     // The device or server went away (on its own thread, which must not wait for openM: the stream is closed by the
     // next call that holds it).
     std::atomic<bool> lost{false};
@@ -561,6 +578,7 @@ bool Engine::Impl::openLocked(std::string* why) {
     cb.rateChanged = [this](int r) {
         devRate = r;
         ++rateEvents;
+        latencyStale = true;
     };
     cb.lost = [this](const std::string& w) {
         {
@@ -582,6 +600,7 @@ bool Engine::Impl::openLocked(std::string* why) {
     devRate = stream->sampleRate();
     devBuffer = stream->bufferFrames();
     rateEvents = 0;
+    latencyStale = false;
     refreshRoundTrip();
     return true;
 }
@@ -719,6 +738,13 @@ double Engine::heardSeconds(int id) const {
         std::lock_guard<std::mutex> l(d_->m);
         for (const auto& o : d_->outputs)
             if (o->id == id) c = o;
+    }
+    // (a device's latencies can change with its rate, a JACK graph's do: asked again before the output latency is
+    // taken off, rather than when the device panel next asks; never waited for, as this is the picture's clock)
+    if (d_->latencyStale.load() && d_->openM.try_lock()) {
+        d_->latencyStale = false;
+        d_->refreshRoundTrip();
+        d_->openM.unlock();
     }
     const int rate = d_->devRate.load();
     if (!c || rate <= 0) return -1;

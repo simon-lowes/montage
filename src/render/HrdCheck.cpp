@@ -1430,15 +1430,21 @@ Av1Seq parseAv1Sequence(const uint8_t* d, size_t n) {
     return q;
 }
 
-// A frame header's start: whether it is a frame to decode, a key frame, and each operating point's removal time.
+// A frame header's start: whether it is a frame to decode and a key frame. Each operating point's removal time is kept
+// beside it, in one array for the whole stream (a small vector for each of millions of frames is most of the memory).
 struct Av1Frame {
     bool ok = false, showExisting = false, key = false;
-    std::vector<int64_t> removal;  // by operating point; -1 where none is stated
+    uint8_t ops = 0;  // how many removal times it has in that array (the sequence header's operating points)
+    int64_t at = 0;   // where they start
 };
 
-Av1Frame parseAv1Frame(const uint8_t* d, size_t n, const Av1Seq& q, int temporalId, int spatialId) {
+// `removals` gets one time for each operating point, -1 where none is stated.
+Av1Frame parseAv1Frame(const uint8_t* d, size_t n, const Av1Seq& q, int temporalId, int spatialId, std::vector<int64_t>& removals) {
     Av1Frame f;
-    f.removal.assign(q.ops.size(), -1);
+    f.at = int64_t(removals.size());
+    f.ops = uint8_t(std::min<size_t>(q.ops.size(), 32));
+    removals.resize(removals.size() + f.ops, -1);
+    int64_t* removal = removals.data() + f.at;
     nal::Reader r(d, n);
     int type = 0;
     bool show = true, errorResilient = true;
@@ -1465,10 +1471,10 @@ Av1Frame parseAv1Frame(const uint8_t* d, size_t n, const Av1Seq& q, int temporal
     r.u(q.orderHintBits);
     if (!intra && !errorResilient) r.u(3);  // primary_ref_frame
     if (q.modelInfo && r.flag()) {
-        for (size_t op = 0; op < q.ops.size(); ++op) {
+        for (size_t op = 0; op < f.ops; ++op) {
             if (!q.ops[op].model) continue;
             const int idc = q.ops[op].idc;
-            if (idc == 0 || (((idc >> temporalId) & 1) && ((idc >> (spatialId + 8)) & 1))) f.removal[op] = int64_t(r.u(q.removalLength));
+            if (idc == 0 || (((idc >> temporalId) & 1) && ((idc >> (spatialId + 8)) & 1))) removal[op] = int64_t(r.u(q.removalLength));
         }
     }
     f.ok = r.ok;
@@ -1536,12 +1542,25 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
     struct Obu {
         uint8_t type = 0, tid = 0, sid = 0;
         int32_t frame = -1;  // (a frame header's: its place in `headers`)
-        int64_t unit = 0;    // the temporal unit (packet) it is in
-        int64_t whole = 0;   // its bytes, header and all
+        int32_t unit = 0;    // the temporal unit (packet) it is in
+        int32_t whole = 0;   // its bytes, header and all (a packet's size is an int)
     };
     std::vector<Obu> units;
     std::vector<Av1Frame> headers;
+    std::vector<int64_t> removals;  // (the frame headers' removal times)
     std::vector<int64_t> ptsOf;
+    // What is kept is held to a few times the bytes read, past a floor no real stream comes near: a crafted one of
+    // millions of OBUs of two bytes, or of frame headers that each state 32 removal times in a few bytes, would else
+    // take tens of times its size. Each frame header is counted with what running a schedule over it takes later, and
+    // each temporal unit with its display order.
+    constexpr int64_t kKeptFloor = int64_t(64) << 20, kKeptPerByte = 4;
+    constexpr int64_t kGroupBytes = int64_t(sizeof(Av1Group) + 5 * sizeof(double)), kUnitBytes = 4 * int64_t(sizeof(int64_t));
+    int64_t bytesRead = 0;
+    bool tooMany = false;
+    auto kept = [&] {
+        return int64_t(units.capacity() * sizeof(Obu) + headers.capacity() * sizeof(Av1Frame) + removals.capacity() * sizeof(int64_t)) +
+               int64_t(headers.size()) * kGroupBytes + int64_t(ptsOf.size()) * kUnitBytes;
+    };
     Av1Seq running = seq;  // (the sequence header in force as the stream is read)
     bool modelStated = true;
     auto states = [](const Av1Seq& q) {
@@ -1554,11 +1573,18 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
         if (cancel && cancel->load()) break;
         if (pkt->stream_index == v) {
             const int64_t k = int64_t(ptsOf.size());
-            ptsOf.push_back(pkt->pts);
+            bytesRead += pkt->size;
+            if (k >= INT32_MAX) tooMany = true;
+            if (!tooMany) ptsOf.push_back(pkt->pts);
             obus(pkt->data, size_t(pkt->size), [&](int type, int tid, int sid, const uint8_t* p, size_t n, size_t whole) {
+                // (checked by OBU: one packet may hold millions)
+                if (tooMany || kept() > kKeptFloor + kKeptPerByte * bytesRead) {
+                    tooMany = true;
+                    return;
+                }
                 Obu o;
                 o.type = uint8_t(type), o.tid = uint8_t(tid), o.sid = uint8_t(sid);
-                o.unit = k, o.whole = int64_t(whole);
+                o.unit = int32_t(k), o.whole = int32_t(whole);
                 if (type == 1) {
                     const Av1Seq q = parseAv1Sequence(p, n);
                     if (q.valid) {
@@ -1568,10 +1594,14 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
                     }
                 } else if ((type == 3 || type == 6) && headers.size() < size_t(INT32_MAX)) {
                     o.frame = int32_t(headers.size());
-                    headers.push_back(parseAv1Frame(p, n, running, tid, sid));
+                    headers.push_back(parseAv1Frame(p, n, running, tid, sid, removals));
                 }
                 units.push_back(o);
             });
+            if (tooMany) {
+                av_packet_unref(pkt);
+                break;
+            }
             // (a stream that states no model is not read to its end)
             if (k == 0 && !states(seq)) {
                 modelStated = false;
@@ -1597,6 +1627,11 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
     r.model = "decoder model";
     if (!modelStated) {
         r.note = "the stream states no decoder model (AV1's is optional): nothing to check it against";
+        return;
+    }
+    if (tooMany) {
+        r.note = "the stream has too many OBUs for its size to be run through its model here (" + std::to_string(units.size()) +
+                 format(" in its first %.1f MB)", double(bytesRead) / 1e6);
         return;
     }
     std::vector<int64_t> shownOf(ptsOf.size(), 0);
@@ -1638,7 +1673,7 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
                 if (f.ok && !f.showExisting) {
                     inFrame = true;
                     cur.key = f.key;
-                    cur.removal = opIndex < f.removal.size() ? f.removal[opIndex] : -1;
+                    cur.removal = opIndex < f.ops ? removals[size_t(f.at) + opIndex] : -1;
                     cur.unit = o.unit, cur.shown = shownOf[size_t(o.unit)];
                     if (cur.removal < 0) missing = true;
                 }
@@ -1752,7 +1787,15 @@ HrdReport checkHrd(const std::string& path, const std::atomic<bool>* cancel) {
         r.error = "cannot open " + path;
         return r;
     }
-    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+    // (AV1 is read OBU by OBU from its packets, its sequence header in them or the container's: a container that
+    // names it needs no probe, which would only decode frames the check never looks at)
+    bool namesAv1 = false;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i)
+        namesAv1 = namesAv1 || (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && fmt->streams[i]->codecpar->codec_id == kAv1);
+    // (nor its parser, which FFmpeg 9 runs over IVF: it reads only what the check reads again, and on a crafted stream
+    // logs an error for every packet)
+    if (namesAv1) fmt->flags |= AVFMT_FLAG_NOPARSE;
+    if (!namesAv1 && avformat_find_stream_info(fmt, nullptr) < 0) {
         avformat_close_input(&fmt);
         r.error = "cannot read " + path;
         return r;

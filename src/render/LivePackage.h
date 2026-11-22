@@ -170,7 +170,9 @@ private:
 // from the newest in its folder to two past it: older ones and gaps are 404 at once); a file still growing is
 // sent as it grows (chunked); an MPD's UTCTiming (urn:mpeg:dash:utc:direct:2014) is the time it is sent; /time is the
 // time (ISO 8601). A connection that has not sent its whole request in 10 s is closed, and with 256 open the oldest
-// still sending one makes room for the next, else the one held longest (answered 503).
+// still sending one makes room for the next, else the one held longest (answered 503). An answer (or a growing
+// segment) its client has taken none of for 20 s is cut off, and with 512 connections kept the answered one whose
+// client has taken nothing for longest makes room.
 // A playlist delta update (HLS 6.2.5.1) of a media playlist: the segments wholly before its skip boundary
 // (CAN-SKIP-UNTIL seconds from its end) replaced by EXT-X-SKIP:SKIPPED-SEGMENTS, their date ranges kept; the playlist
 // as it is when it states no CAN-SKIP-UNTIL or nothing is that old. `skipped` gets the count.

@@ -12861,7 +12861,8 @@ colorspaces:
             QVERIFY(changes.size() == 1 && changes[0].find("screen 1") != std::string::npos && changes[0].find("changed") != std::string::npos);
         }
         // A security manager known by the chain whose leaf names it one: a link encryptor's chain listed first is
-        // passed over; a server with only another device's certificate is refused.
+        // passed over; a server with only another device's certificate leaves its screen out, with a note, and the
+        // cinema's other screens are read as before; an FLM with no other screen is refused.
         {
             QFile in(flms[0]);
             QVERIFY(in.open(QIODevice::ReadOnly));
@@ -12879,7 +12880,19 @@ colorspaces:
             QCOMPARE(f.screens[0].server.thumbprint, thumb(cinemas[0].screens[0].server.certificates.back()));
             std::string only = original;
             only.replace(only.find(serverKeys), serverKeys.size(), le);
-            QVERIFY(!readFlm(only, f, &err) && err.find("not a security manager") != std::string::npos);
+            QVERIFY2(readFlm(only, f, &err), err.c_str());
+            QVERIFY(f.screens.size() == 2 && f.screens[0].name == "2" && f.screens[1].name == "3");
+            QCOMPARE(f.screens[0].server.thumbprint, thumb(cinemas[0].screens[1].server.certificates.back()));
+            QVERIFY(std::any_of(f.notes.begin(), f.notes.end(), [](const std::string& n) {
+                return n.find("screen 1") != std::string::npos && n.find("not a security manager") != std::string::npos;
+            }));
+            std::string none = only;
+            for (int k : {1, 2}) {
+                const std::string keys = keyInfo(cinemas[0].screens[size_t(k)].server, false);
+                QVERIFY(none.find(keys) != std::string::npos);
+                none.replace(none.find(keys), keys.size(), le);
+            }
+            QVERIFY(!readFlm(none, f, &err) && err.find("lists no screen") != std::string::npos && err.find("not a security manager") != std::string::npos);
         }
         // (a base64 letter at or before `at` changed: a different certificate of the same length)
         auto flip = [](std::string& text, size_t at) {
@@ -13153,6 +13166,21 @@ colorspaces:
         QVERIFY(dcp::signXml(two, facility, &err));
         QVERIFY2(readFlm(two, lake, &err), err.c_str());
         QVERIFY(lake.screens.size() == 2 && lake.screens[0].devices.empty() && lake.otherDevices.size() == 1 && lake.notes.size() == 1);
+        // A security manager whose certificate names only other devices' roles is left out, with a note; the FLM
+        // listed two, so the projector is still kept apart from the one screen read.
+        {
+            dcp::CertificateChain encryptor;
+            QVERIFY(dcp::makeCertificateChain("Lake Encryptor", encryptor, &err, "LE"));
+            std::string notServer = etm(true);
+            const std::string keys = etmKeyInfo(cinemas[0].screens[0].server);
+            QVERIFY(notServer.find(keys) != std::string::npos);
+            notServer.replace(notServer.find(keys), keys.size(), etmKeyInfo(encryptor));
+            QVERIFY(dcp::signXml(notServer, facility, &err));
+            Facility one;
+            QVERIFY2(readFlm(notServer, one, &err), err.c_str());
+            QVERIFY(one.screens.size() == 1 && one.screens[0].name == "Screen Two" && one.screens[0].devices.empty() && one.otherDevices.size() == 1);
+            QVERIFY(std::any_of(one.notes.begin(), one.notes.end(), [](const std::string& n) { return n.find("not a security manager") != std::string::npos; }));
+        }
         // An offset written with its sign, or without one.
         for (const char* offset : {"+01:00", "01:00"}) {
             std::string east = etm(false, offset);
@@ -16100,6 +16128,49 @@ colorspaces:
         timer.restart();
         QCOMPARE(int(titleGlyphs(on, 0, 800, 600, 1.0, 30, 30).size()), 5);
         QVERIFY2(timer.elapsed() < 20000, qPrintable(QString::number(timer.elapsed())));
+        // Nightly 19 Nov: 60,000 letters each faded in by the Text Animation, half a second into its second. Each
+        // letter's unit is found by a search, not by going over every unit (letters squared: seconds a frame), so it
+        // costs about what the letters alone do; the first letters are in and the last still out.
+        const int many = 60000;
+        Effect faded = makeEffect(p, "title");
+        faded.strings["font"] = "DejaVu Sans";
+        faded.params["size"] = 12.0;
+        faded.strings["text"] = std::string(size_t(many), 'i');
+        SvgTextLayout row;
+        for (int i = 0; i < many; ++i) row.x.push_back(double(i % 700));
+        faded.strings["svg_text"] = svgTextLayoutJson(row);
+        timer.restart();
+        QCOMPARE(int(titleGlyphs(faded, 15, 800, 600, 1.0, 30, 30).size()), many);
+        const qint64 still = timer.elapsed();
+        faded.params["text_anim"] = 2.0;  // Fade, by letter
+        timer.restart();
+        const std::vector<TitleGlyph> fading = titleGlyphs(faded, 15, 800, 600, 1.0, 30, 30);
+        const qint64 animated = timer.elapsed();
+        QCOMPARE(int(fading.size()), many);
+        qInfo("60,000 letters: %lld ms still, %lld ms fading in", static_cast<long long>(still), static_cast<long long>(animated));
+        QVERIFY2(animated < still * 2 + 1000, qPrintable(QString("%1 ms still, %2 ms fading in").arg(still).arg(animated)));
+        QVERIFY2(fading.front().opacity > 0.99 && fading.back().opacity < 0.01,
+                 qPrintable(QString("%1 %2").arg(fading.front().opacity).arg(fading.back().opacity)));
+        // The search itself: every character of three lines of two-letter words and single letters, against going
+        // over the units; then 300,000 units each looked up (going over them would be 4.5 x 10^10 steps).
+        std::vector<TitleTextUnit> words;
+        for (int line = 0; line < 3; ++line)
+            for (int from = line; from < 40; from += 3) words.push_back({line, from, line == 1 ? 1 : 2});
+        for (int line = -1; line < 4; ++line)
+            for (int from = -1; from < 45; ++from) {
+                int want = -1;
+                for (size_t u = 0; u < words.size(); ++u)
+                    if (words[u].line == line && from >= words[u].from && from < words[u].from + words[u].len) want = int(u);
+                QCOMPARE(titleTextUnitAt(words, line, from), want);
+            }
+        std::vector<TitleTextUnit> letters;
+        for (int i = 0; i < 300000; ++i) letters.push_back({i / 1000, 2 * (i % 1000), 1});
+        timer.restart();
+        long found = 0;
+        for (int i = 0; i < 300000; ++i) found += titleTextUnitAt(letters, i / 1000, 2 * (i % 1000)) == i;
+        QCOMPARE(found, 300000L);
+        QCOMPARE(titleTextUnitAt(letters, 5, 1), -1);
+        QVERIFY2(timer.elapsed() < 5000, qPrintable(QString::number(timer.elapsed())));
     }
 
     void textOnMasksAndShapePaths() {
@@ -19172,6 +19243,20 @@ colorspaces:
             st::JxsvAssembler other;
             QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
             other.setFrameLimit(size_t(1) << 40);
+            QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
+            // Nightly 19 Nov: a stream's frames are held to the most it may be coded at: 4:4:4 at 12 bits up to its 36
+            // bits a pixel uncompressed, 4:2:2 at 10 bits to 24, an SDP naming more bits than that to those; 8K at
+            // 4:4:4 and 12 bits is the largest taken.
+            st::VideoFormat xs;
+            xs.codec = "jxsv", xs.width = 1920, xs.height = 1080, xs.sampling = st::Sampling::Ycc444, xs.depth = 12, xs.bpp = 5;
+            QCOMPARE(st::jxsvFrameLimit(xs), size_t(1920 * 1080 * 36 / 8 + 65536));
+            xs.sampling = st::Sampling::Ycc422, xs.depth = 10;
+            QCOMPARE(st::jxsvFrameLimit(xs), size_t(1920 * 1080 * 3 + 65536));
+            xs.bpp = 28;
+            QCOMPARE(st::jxsvFrameLimit(xs), size_t(1920 * 1080 * 28 / 8 + 65536));
+            xs.width = 8192, xs.height = 4320, xs.sampling = st::Sampling::Rgb, xs.depth = 12, xs.bpp = 5;
+            QCOMPARE(st::jxsvFrameLimit(xs), st::JxsvAssembler::kLargestFrame);
+            other.setFrameLimit(st::jxsvFrameLimit(xs));
             QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
         }
         {
@@ -22942,10 +23027,52 @@ colorspaces:
 #endif
     }
 
-    // Guessers from 48 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
-    // from elsewhere is tried every time, when right and when wrong, while they guess. The networks are fewer than the
-    // 64 connections the review keeps open at once: on a computer too busy to answer quickly every guesser's
-    // connection is open together, and with every place taken a newcomer's would be turned away before it is read.
+    // Nightly 19 Nov: many addresses holding one connection each, sending nothing, with every place taken, keep no
+    // newcomer out: when they are of one network (as the /64s of an IPv6 /56 are), and when each is of a network of
+    // its own. Each newcomer is answered in the place of the oldest, and the rest are still held.
+    void browserReviewSlotsFromManyAddresses() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+#ifndef Q_OS_LINUX
+        QSKIP("Needs every 127.x address to be this computer's (Linux)");
+#else
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        ReviewRig rig;
+        rig.picture = [](FrameTime) { return std::make_shared<const Image>(320, 180); };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        const QByteArray pass = QByteArray::fromStdString(rig.settings.passphrase);
+        for (const bool oneNetwork : {true, false}) {
+            std::vector<std::unique_ptr<QTcpSocket>> idle;
+            for (int a = 0; a < 64; ++a) {
+                auto c = std::make_unique<QTcpSocket>();
+                c->setProxy(QNetworkProxy::NoProxy);
+                const QString from = oneNetwork ? QStringLiteral("127.0.5.%1").arg(a + 1) : QStringLiteral("127.6.%1.9").arg(a);
+                if (!c->bind(QHostAddress(from))) continue;
+                c->connectToHost(QStringLiteral("127.0.0.1"), quint16(rig.port()));
+                if (c->waitForConnected(2000)) idle.push_back(std::move(c));
+            }
+            QCOMPARE(idle.size(), size_t(64));
+            QThread::msleep(200);
+            QElapsedTimer took;
+            took.start();
+            QCOMPARE(httpsStatus(oneNetwork ? "127.0.6.7" : "127.7.0.5", rig.port(), "/config", pass, 4000), 200);
+            QCOMPARE(httpsStatus(oneNetwork ? "127.0.6.8" : "127.7.1.5", rig.port(), "/config", pass, 4000), 200);
+            int still = 0;
+            for (auto& c : idle) still += c->state() == QAbstractSocket::ConnectedState && !c->waitForDisconnected(1);
+            qInfo("%s: two newcomers answered in %lld ms with %d of the 64 still held", oneNetwork ? "One network" : "Many networks",
+                  (long long)took.elapsed(), still);
+            QVERIFY(still >= 60);  // (made room for, not timed out: the handshake allows 5 s)
+            idle.clear();
+            QThread::msleep(300);
+        }
+#endif
+    }
+
+    // Guessers from 64 networks at once: each network is rationed by itself from its first wrong guess, so a newcomer
+    // from elsewhere is tried every time, when right and when wrong, while they guess. The networks are as many as the
+    // connections the review keeps open at once: on a computer too busy to answer quickly every guesser's connection
+    // is open together, and a newcomer's is answered in the place of the oldest of theirs.
     void browserReviewGuessersFromManyNetworks() {
         using namespace montage::output;
         using namespace montage::reviewtest;
@@ -22961,7 +23088,7 @@ colorspaces:
         const int port = rig.port();
         std::atomic<bool> guessing{true};
         std::atomic<int> first{0}, wrong{0}, refused{0}, dropped{0};
-        const int networks = 48;
+        const int networks = 64;
         std::vector<std::thread> guessers;
         for (int n = 0; n < networks; ++n)
             guessers.emplace_back([&, n] {
@@ -23010,7 +23137,7 @@ colorspaces:
     // no try of its network's (reviewers behind one network where one had mistyped were refused untried after the
     // third). With more networks guessing than the gate lists, a newcomer from elsewhere is still tried (the ration
     // the networks not listed share gained a try in a quarter of an hour), and what the guessers together may try
-    // stays a few a second.
+    // stays a few a second. Guessers asking faster than the rations fill keep no newcomer out (nightly 19 Nov).
     void reviewPassphraseGate() {
         using namespace montage::output;
         using namespace std::chrono_literals;
@@ -23096,6 +23223,107 @@ colorspaces:
             QCOMPARE(newcomers, 12);
             QVERIFY2(wrong >= 100 && wrong <= 10 * 60 + 600, qPrintable(QString::number(wrong)));
         }
+        {
+            // The list full, and then guessers from 200 networks not listed asking fifty a second between them, ten
+            // times what the ration they share fills by. Once each has guessed wrong (the first minute and a half),
+            // for two minutes a newcomer from another such network every five seconds, with the right passphrase:
+            // every one is tried, and the guessers together are tried no more than five a second.
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            for (int n = 0; n < int(Gate::kListed); ++n) {
+                now += 1ms;
+                if (gate.ask(address(n, 9), network(n), now).answer == Gate::Answer::Try) gate.wrong(address(n, 9), network(n), now);
+            }
+            QCOMPARE(gate.networksListed(), Gate::kListed);
+            int newcomers = 0, wrong = 0, wrongMeanwhile = 0;
+            for (int step = 0; step < 50 * 210; ++step) {
+                now += 20ms;
+                const int other = 10000 + step % 200;
+                if (gate.ask(address(other, 9), network(other), now).answer == Gate::Answer::Try) {
+                    ++wrong;
+                    wrongMeanwhile += step >= 50 * 90;
+                    gate.wrong(address(other, 9), network(other), now);
+                }
+                if (step >= 50 * 90 && step % 250 == 0) {
+                    const int fresh = 30000 + step;
+                    const Gate::Verdict v = gate.ask(address(fresh, 5), network(fresh), now);
+                    QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString("the newcomer at %1 s").arg(step * 0.02)));
+                    gate.right(address(fresh, 5), network(fresh), now, v);
+                    ++newcomers;
+                }
+            }
+            QCOMPARE(newcomers, 24);
+            QVERIFY2(wrongMeanwhile <= 5 * 120 + 4, qPrintable(QString::number(wrongMeanwhile)));
+            QVERIFY2(wrong >= 5 * 200, qPrintable(QString::number(wrong)));
+        }
+        {
+            // 200 addresses behind one network (one shared by many, as a carrier's) guessing twenty a second
+            // between them, four times what its ration fills by: after the first minute, a newcomer behind the same
+            // network every five seconds is tried, and let in with the right passphrase.
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            int newcomers = 0, wrong = 0;
+            for (int step = 0; step < 20 * 180; ++step) {
+                now += 50ms;
+                const int host = 1 + step % 200;
+                if (gate.ask(address(1, host), network(1), now).answer == Gate::Answer::Try) {
+                    ++wrong;
+                    gate.wrong(address(1, host), network(1), now);
+                }
+                if (step >= 20 * 60 && step % 100 == 0) {
+                    const int host = 201 + newcomers;
+                    const Gate::Verdict v = gate.ask(address(1, host), network(1), now);
+                    QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString("the newcomer at %1 s").arg(step * 0.05)));
+                    gate.right(address(1, host), network(1), now, v);
+                    QVERIFY(gate.trusted(address(1, host)));
+                    ++newcomers;
+                }
+            }
+            QCOMPARE(newcomers, 24);
+            QVERIFY2(wrong <= 5 * 180 + 4, qPrintable(QString::number(wrong)));
+        }
+    }
+
+    // Nightly 19 Nov: what a viewer's arrival reports may go over is earned by sending to them, so that a report of a
+    // few bytes saying 65,528 packets were lost is not read (Montage walked every one, under the lock the sending
+    // shares), while reports of what was sent are read as before, and each costs what it went over.
+    void reviewLinkDelayReportRoom() {
+        using namespace montage::output;
+        using Clock = LinkDelay::Clock;
+        // 36 bytes: eight runs of 8,191 packets not received, from sequence number 0 on.
+        std::vector<uint8_t> crafted = {0x8f, 205, 0, 8, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0xff, 0xf8, 0, 0, 1, 0};
+        for (int i = 0; i < 8; ++i) crafted.insert(crafted.end(), {0x1f, 0xff});
+        QCOMPARE(crafted.size(), size_t(36));
+        ArrivalReport report;
+        QVERIFY(parseTransportFeedback(crafted.data(), crafted.size(), report));  // (well formed: read when nothing limits it)
+        QCOMPARE(report.packets.size(), size_t(65528));
+        LinkDelay link;
+        QCOMPARE(link.reportRoom(), size_t(0));
+        const Clock::time_point t0 = Clock::now();
+        for (int i = 0; i < 100; ++i) link.sent(1200, t0 + std::chrono::milliseconds(i));
+        QCOMPARE(link.reportRoom(), size_t(400));
+        QVERIFY(!parseTransportFeedback(crafted.data(), crafted.size(), report, link.reportRoom()));
+        QVERIFY(report.packets.empty());
+        // A report of the hundred sent, each arrived a millisecond after the one before: read, four times over, and
+        // then not until more is sent.
+        std::vector<uint8_t> all = {0xaf, 205, 0, 30, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 100, 0, 0, 1, 0, 0x20, 100};
+        for (int i = 0; i < 100; ++i) all.push_back(4);
+        all.insert(all.end(), {0, 2});
+        QCOMPARE(all.size(), size_t(124));
+        for (int pass = 0; pass < 4; ++pass) {
+            QVERIFY2(parseTransportFeedback(all.data(), all.size(), report, link.reportRoom()), qPrintable(QString::number(pass)));
+            QCOMPARE(report.packets.size(), size_t(100));
+            link.feedback(report, t0 + std::chrono::milliseconds(200 + pass));
+            QCOMPARE(link.reportRoom(), size_t(300 - 100 * pass));
+        }
+        QVERIFY(!parseTransportFeedback(all.data(), all.size(), report, link.reportRoom()));
+        QVERIFY(link.active(t0 + std::chrono::milliseconds(300)));
+        for (int i = 0; i < 25; ++i) link.sent(1200, t0 + std::chrono::milliseconds(300));
+        QVERIFY(parseTransportFeedback(all.data(), all.size(), report, link.reportRoom()));
+        // Room is earned up to four times the packets remembered, however long the sending.
+        for (int i = 0; i < 40000; ++i) link.sent(100, t0 + std::chrono::milliseconds(400));
+        QCOMPARE(link.reportRoom(), size_t(0xffff));
+        QVERIFY(parseTransportFeedback(crafted.data(), crafted.size(), report, link.reportRoom()));
     }
 
     // Live review's judgement of a viewer's link by delay: the arrival reports read, the packets numbered and padded,
@@ -23613,6 +23841,15 @@ colorspaces:
             std::atomic<bool> stop{false};
             std::atomic<int> port{0}, relayed{0}, signedRight{0}, signedWrong{0}, stale{0}, newStyle{0}, permissions{0};
             std::atomic<int> lifetime{600}, refreshes{0}, released{0};  // seconds an address is given for; Refresh requests for more, and for none
+            // Sendings of Refresh (for more time) and of CreatePermission to leave unanswered; and whether the relay
+            // lets an address go once its time is up unrefreshed (answering a Refresh 437 then) and carries only to
+            // and from addresses let in.
+            std::atomic<int> dropRefreshes{0}, dropPermissions{0};
+            std::atomic<bool> strict{false};
+            // Answers given unsigned, or signed wrongly (the relay's own answers are signed, as RFC 8489 has them);
+            // an Allocate refused 486 with a long reason in UTF-8 that has a control character in it.
+            std::atomic<bool> unsignedAnswers{false}, wronglySigned{false}, refuseAllocate{false};
+            std::atomic<bool> staleRelease{false};  // an address given back is answered 438 once, with a new nonce
             std::thread thread;
             static void attribute(QByteArray& b, quint16 type, const QByteArray& value) {
                 b.append(char(type >> 8)).append(char(type & 0xff)).append(char(value.size() >> 8)).append(char(value.size() & 0xff)).append(value);
@@ -23639,6 +23876,10 @@ colorspaces:
                 port = front.localPort();
                 quint16 client = 0;
                 const QByteArray key = QCryptographicHash::hash("reviewer:old-relay:relay-password-2", QCryptographicHash::Md5);
+                QElapsedTimer clock;
+                clock.start();
+                qint64 expiresAt = 0;
+                std::set<quint16> allowed;
                 while (!stop) {
                     front.waitForReadyRead(2);
                     while (front.hasPendingDatagrams()) {
@@ -23664,8 +23905,18 @@ colorspaces:
                             at += 4 + ((n + 3) & ~qsizetype(3));
                         }
                         if (type == 0x0016) {  // a Send indication: on to the peer from the relayed port
-                            if (peer) back.writeDatagram(data, QHostAddress::LocalHost, peer);
+                            if (peer && (!strict || (clock.elapsed() < expiresAt && allowed.count(peer)))) back.writeDatagram(data, QHostAddress::LocalHost, peer);
                             continue;
+                        }
+                        if (integrityAt >= 0 && nonce != "first") {
+                            if (type == 0x0004 && asked && dropRefreshes > 0) {
+                                --dropRefreshes;
+                                continue;
+                            }
+                            if (type == 0x0008 && dropPermissions > 0) {
+                                --dropPermissions;
+                                continue;
+                            }
                         }
                         QByteArray challenge;
                         attribute(challenge, 0x0014, "old-relay");
@@ -23678,32 +23929,61 @@ colorspaces:
                             front.writeDatagram(message(type | 0x0110, id, a + challenge), QHostAddress::LocalHost, client);
                             continue;
                         }
+                        if (staleRelease && type == 0x0004 && !asked && nonce == "second") {
+                            QByteArray a;
+                            attribute(a, 0x0009, QByteArray::fromHex("00000426") + "Stale Nonce");
+                            attribute(a, 0x0015, "renewed");
+                            front.writeDatagram(message(type | 0x0110, id, a + challenge), QHostAddress::LocalHost, client);
+                            continue;
+                        }
                         QByteArray covered = d.left(integrityAt);
                         const qsizetype length = integrityAt - 20 + 24;
                         covered[2] = char(length >> 8), covered[3] = char(length & 0xff);
-                        const bool right = nonce == "second" && QMessageAuthenticationCode::hash(covered, key, QCryptographicHash::Sha1) == d.mid(integrityAt + 4, 20);
+                        const bool right = (nonce == "second" || nonce == "renewed") &&
+                                           QMessageAuthenticationCode::hash(covered, key, QCryptographicHash::Sha1) == d.mid(integrityAt + 4, 20);
                         ++(right ? signedRight : signedWrong);
                         QByteArray a;
-                        if (!right) {
+                        bool mismatch = false;
+                        if (right && type == 0x0003 && refuseAllocate) {
+                            QByteArray reason = "Allocation quota reached \x07" "for ";
+                            for (int k = 0; k < 80; ++k) reason += "\xc3\xa9";  // (é)
+                            attribute(a, 0x0009, QByteArray::fromHex("00000456") + reason);
+                            mismatch = true;
+                        } else if (!right) {
                             attribute(a, 0x0009, QByteArray::fromHex("00000401") + "No");
                             attribute(a, 0x0015, "second");
                             a += challenge;
                         } else if (type == 0x0003) {
                             attribute(a, 0x0016, address(back.localPort()));
                             attribute(a, 0x000D, QByteArray::fromHex("0000") + char(lifetime >> 8) + char(lifetime & 0xff));
+                            expiresAt = clock.elapsed() + qint64(lifetime) * 1000;
+                        } else if (type == 0x0004 && asked && strict && clock.elapsed() >= expiresAt) {
+                            mismatch = true;
+                            attribute(a, 0x0009, QByteArray::fromHex("00000425") + "Allocation Mismatch");
                         } else if (type == 0x0004) {
                             ++(asked ? refreshes : released);
                             attribute(a, 0x000D, asked ? QByteArray::fromHex("0000") + char(lifetime >> 8) + char(lifetime & 0xff) : QByteArray(4, '\0'));
+                            if (asked) expiresAt = clock.elapsed() + qint64(lifetime) * 1000;
                         } else if (type == 0x0008) {
                             ++permissions;
+                            allowed.insert(peer);
                         }
-                        front.writeDatagram(message(type | (right ? 0x0100 : 0x0110), id, a), QHostAddress::LocalHost, client);
+                        QByteArray answer = message(type | (right && !mismatch ? 0x0100 : 0x0110), id, a);
+                        if (right && !unsignedAnswers) {
+                            // (MESSAGE-INTEGRITY over the answer, its length counting the attribute)
+                            answer[2] = char((a.size() + 24) >> 8), answer[3] = char((a.size() + 24) & 0xff);
+                            QByteArray mac = QMessageAuthenticationCode::hash(answer, key, QCryptographicHash::Sha1);
+                            if (wronglySigned) mac[0] = char(mac[0] ^ 1);
+                            attribute(answer, 0x0008, mac);
+                        }
+                        front.writeDatagram(answer, QHostAddress::LocalHost, client);
                     }
                     back.waitForReadyRead(2);
                     while (back.hasPendingDatagrams()) {  // from a peer: a Data indication to the client
                         QByteArray d(int(back.pendingDatagramSize()), 0);
                         quint16 from = 0;
                         back.readDatagram(d.data(), d.size(), nullptr, &from);
+                        if (strict && (clock.elapsed() >= expiresAt || !allowed.count(from))) continue;
                         QByteArray a;
                         attribute(a, 0x0012, address(from));
                         attribute(a, 0x0013, d);
@@ -23872,6 +24152,38 @@ colorspaces:
             QVERIFY2(QString::fromStdString(why).contains("login"), why.c_str());
             QVERIFY(old.signedWrong >= 1);
         }
+        // Nightly 19 Nov: the relay's answers are taken only signed with the login's key; one unsigned or signed
+        // wrongly is as if it never came (the address is not taken from it). A refusal's reason is the relay's
+        // text, printable and cut at 80 characters, never inside one.
+        for (std::atomic<bool>* way : {&old.unsignedAnswers, &old.wronglySigned}) {
+            *way = true;
+            RelayBridge unproven("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+            const std::string why = allocate(unproven);
+            *way = false;
+            QVERIFY2(QString::fromStdString(why).contains("did not answer"), why.c_str());
+            QCOMPARE(unproven.relayedPort(), uint16_t(0));
+        }
+        {
+            old.refuseAllocate = true;
+            RelayBridge refused("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+            const QString why = QString::fromStdString(allocate(refused));
+            old.refuseAllocate = false;
+            QVERIFY2(why.startsWith("The TURN relay refused (486 Allocation quota reached for éé"), qPrintable(why));
+            QVERIFY2(why.endsWith(QStringLiteral("é…)")), qPrintable(why));
+            QCOMPARE(why.size(), QStringLiteral("The TURN relay refused (486 ").size() + 80 + 2);
+            QVERIFY(!why.contains(QChar::ReplacementCharacter) && !why.contains(QChar(7)));
+        }
+        // An address given back on a nonce the relay then calls stale is given back again with the new one.
+        {
+            old.staleRelease = true;
+            const int releasedBefore = old.released;
+            {
+                RelayBridge bridge("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+                QCOMPARE(allocate(bridge), std::string());
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(old.released > releasedBefore, 3000);
+            old.staleRelease = false;
+        }
         // A relay that gives its address for 20 seconds is asked to keep it half way through that, with the login,
         // and the address still carries afterwards; a bridge that ends gives its address back.
         {
@@ -23899,7 +24211,179 @@ colorspaces:
             QTRY_VERIFY_WITH_TIMEOUT(old.released > releasedBefore, 5000);
             QCOMPARE(old.signedWrong.load(), wrongBefore);
         }
+        // Nightly 19 Nov: a relay that keeps an address only while it is refreshed and carries only to addresses let
+        // in. Every sending of the first CreatePermission and of the first Refresh goes unanswered: the viewer's
+        // address is asked for again within seconds (not four minutes on), and the address is kept past its first
+        // twenty seconds. Once the relay answers no Refresh at all, the bridge says the address ran out and carries
+        // nothing more.
+        {
+            old.lifetime = 20;
+            old.strict = true;
+            old.dropPermissions = 5;
+            old.dropRefreshes = 5;
+            auto endStrict = qScopeGuard([&] {
+                old.strict = false;
+                old.dropPermissions = 0;
+                old.dropRefreshes = 0;
+                old.lifetime = 600;
+            });
+            const int refreshesBefore = old.refreshes;
+            RelayBridge bridge("127.0.0.1", uint16_t(old.port), {"reviewer", "relay-password-2"});
+            QCOMPARE(allocate(bridge), std::string());
+            QElapsedTimer since;
+            since.start();
+            auto viewer = socket(), end = socket();
+            const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+            QVERIFY(alias != 0);
+            auto through = [&](const QByteArray& what, int ms) {
+                QElapsedTimer t;
+                t.start();
+                while (t.elapsed() < ms) {
+                    end->writeDatagram(what, QHostAddress::LocalHost, alias);
+                    if (read(*viewer, 100).data == what) return true;
+                }
+                return false;
+            };
+            QVERIFY(through("let in again", 12000));
+            QCOMPARE(old.dropPermissions.load(), 0);
+            qInfo("Through %lld ms after the first CreatePermission was lost", (long long)since.elapsed());
+            while (since.elapsed() < 23000) QThread::msleep(100);
+            QCOMPARE(old.dropRefreshes.load(), 0);
+            QVERIFY(old.refreshes > refreshesBefore);
+            QVERIFY(through("kept past its first time", 3000));
+            QCOMPARE(bridge.lastError(), std::string());
+            old.dropRefreshes = 1000;
+            QTRY_VERIFY_WITH_TIMEOUT(!bridge.lastError().empty(), 30000);
+            QVERIFY2(QString::fromStdString(bridge.lastError()).contains("ran out"), bridge.lastError().c_str());
+            QVERIFY(!through("after it ran out", 1000));
+        }
 #endif
+    }
+
+    // Nightly 19 Nov: what a relay that sends anything at all sends the bridge, a few thousand times over, each a
+    // message of a kind the bridge reads (a challenge, an address, a refusal, a stale nonce, a viewer's packet)
+    // changed at random, and answers to a viewer's checks from Montage's end changed the same way: the bridge reads
+    // them all without reading past one (valgrind says so) and still does as it is asked afterwards.
+    void reviewRelayBridgeFuzzed() {
+        using namespace montage::output;
+        QRandomGenerator rng(19112026);
+        auto attribute = [](QByteArray& b, quint16 type, const QByteArray& value) {
+            b.append(char(type >> 8)).append(char(type & 0xff)).append(char(value.size() >> 8)).append(char(value.size() & 0xff)).append(value);
+            while (b.size() % 4) b.append('\0');
+        };
+        auto message = [](quint16 type, const QByteArray& id, const QByteArray& attributes) {
+            QByteArray b;
+            b.append(char(type >> 8)).append(char(type & 0xff)).append(char(attributes.size() >> 8)).append(char(attributes.size() & 0xff));
+            return b + QByteArray::fromHex("2112a442") + id + attributes;
+        };
+        auto address = [](quint16 port) {  // (XOR-…-ADDRESS of 127.0.0.1 and a port)
+            QByteArray v = QByteArray::fromHex("0001");
+            const quint16 p = port ^ 0x2112;
+            v.append(char(p >> 8)).append(char(p & 0xff));
+            return v + QByteArray::fromHex("5e12a443");
+        };
+        auto changed = [&](QByteArray m) {
+            switch (rng.bounded(6)) {
+            case 0:  // (bytes flipped)
+                for (int k = int(rng.bounded(1, 5)); k > 0 && !m.isEmpty(); --k) m[int(rng.bounded(int(m.size())))] = char(rng.bounded(256));
+                break;
+            case 1:  // (cut short)
+                m.truncate(int(rng.bounded(int(m.size()) + 1)));
+                break;
+            case 2:  // (the message's length)
+                if (m.size() >= 4) m[2] = char(rng.bounded(256)), m[3] = char(rng.bounded(256) & ~3);
+                break;
+            case 3:  // (an attribute's length)
+                for (int at = 20; at + 4 <= m.size(); at += 4) {
+                    if (rng.bounded(4) == 0) {
+                        m[at + 2] = char(rng.bounded(256)), m[at + 3] = char(rng.bounded(256));
+                        break;
+                    }
+                }
+                break;
+            case 4:  // (more after it)
+                for (int k = int(rng.bounded(1, 64)); k > 0; --k) m.append(char(rng.bounded(256)));
+                break;
+            default:  // (as it is)
+                break;
+            }
+            return m;
+        };
+        QUdpSocket relay;
+        relay.setProxy(QNetworkProxy::NoProxy);
+        QVERIFY(relay.bind(QHostAddress::LocalHost, 0));
+        std::atomic<bool> allocated{false};  // (before the bridge, which may call back until it ends)
+        RelayBridge bridge("127.0.0.1", relay.localPort(), {"reviewer", "relay-password-2"});
+        bridge.allocate([&](const std::string&) { allocated = true; });
+        auto viewer = std::make_unique<QUdpSocket>(), end = std::make_unique<QUdpSocket>();
+        for (auto* s : {viewer.get(), end.get()}) {
+            s->setProxy(QNetworkProxy::NoProxy);
+            QVERIFY(s->bind(QHostAddress::LocalHost, 0));
+        }
+        const uint16_t alias = bridge.peer("127.0.0.1", viewer->localPort());
+        QVERIFY(alias != 0);
+        bridge.setLocal(end->localPort(), "an ICE password of the test");
+        // The bridge's latest request, and the port it sends from.
+        QByteArray id;
+        quint16 from = 0;
+        auto heard = [&] {
+            while (relay.hasPendingDatagrams()) {
+                QByteArray d(int(relay.pendingDatagramSize()), 0);
+                relay.readDatagram(d.data(), d.size(), nullptr, &from);
+                if (d.size() >= 20) id = d.mid(8, 12);
+            }
+        };
+        QTRY_VERIFY_WITH_TIMEOUT((heard(), !id.isEmpty()), 5000);
+        int sent = 0;
+        for (int round = 0; round < 4000; ++round) {
+            heard();
+            const QByteArray which = rng.bounded(8) == 0 ? QByteArray(12, char(rng.bounded(256))) : id;
+            QByteArray a;
+            QByteArray m;
+            switch (rng.bounded(6)) {
+            case 0:  // a challenge
+                attribute(a, 0x0009, QByteArray::fromHex("00000401") + "Unauthorized");
+                attribute(a, 0x0014, "fuzz-relay");
+                attribute(a, 0x0015, QByteArray::number(round));
+                if (rng.bounded(2)) attribute(a, 0x8002, QByteArray::fromHex("0002000000010000"));
+                m = message(0x0113, which, a);
+                break;
+            case 1:  // an address
+                attribute(a, 0x0016, address(quint16(rng.bounded(1024, 65535))));
+                attribute(a, 0x000D, QByteArray::fromHex("00000258"));
+                attribute(a, 0x0008, QByteArray(20, 'm'));
+                m = message(0x0103, which, a);
+                break;
+            case 2:  // a refusal
+                attribute(a, 0x0009, QByteArray::fromHex("00000456") + QByteArray(int(rng.bounded(120)), char(rng.bounded(32, 256))));
+                m = message(quint16(0x0110 | (rng.bounded(2) ? 0x0003 : 0x0004)), which, a);
+                break;
+            case 3:  // a stale nonce
+                attribute(a, 0x0009, QByteArray::fromHex("00000426") + "Stale Nonce");
+                attribute(a, 0x0015, "fresh");
+                m = message(0x0113, which, a);
+                break;
+            default:  // a viewer's packet
+                attribute(a, 0x0012, address(viewer->localPort()));
+                attribute(a, 0x0013, QByteArray(int(rng.bounded(200)), 'v'));
+                m = message(0x0017, QByteArray(12, 'i'), a);
+                break;
+            }
+            relay.writeDatagram(changed(m), QHostAddress::LocalHost, from);
+            // From Montage's end: an answer to the viewer's check, naming the port that stands for the viewer.
+            QByteArray check;
+            attribute(check, 0x0020, address(alias));
+            attribute(check, 0x0008, QByteArray(20, 'i'));
+            attribute(check, 0x8028, QByteArray(4, 'f'));
+            end->writeDatagram(changed(message(0x0101, QByteArray(12, 't'), check)), QHostAddress::LocalHost, alias);
+            if (++sent % 50 == 0) QThread::msleep(2);
+        }
+        while (end->hasPendingDatagrams()) end->receiveDatagram();
+        // Still at work: it answers, and gives the viewer's address the port it gave before.
+        QThread::msleep(300);
+        QCOMPARE(bridge.peer("127.0.0.1", viewer->localPort()), alias);
+        qInfo("%d messages sent (allocated: %d); %llu packets passed on to Montage's end and %llu to the relay; the bridge says: %s", sent, int(allocated.load()),
+              (unsigned long long)bridge.fromRelay(), (unsigned long long)bridge.toRelay(), bridge.lastError().c_str());
     }
 
     // Only through the relay, with a capture of what reaches a viewer's addresses: a viewer of the test's own offers
@@ -24208,8 +24692,13 @@ colorspaces:
             RelayBridge fresh("127.0.0.1", uint16_t(turnPort), login);
             QCOMPARE(allocateAt(fresh), std::string());
         }
-        // Once the link's time is up: the page tells a newcomer so, and coturn takes the review's login no more.
+        // Once the link's time is up: those watching are told so and let go (the relay would cut them at their next
+        // refresh with the login), the page tells a newcomer so, and coturn takes the review's login no more.
         while (QDateTime::currentSecsSinceEpoch() < expires + 2) QThread::msleep(200);
+        QVERIFY2(tab.until("__montage.stage === 'expired'", 10), tab.js("__montage.stage").toString().toUtf8().constData());
+        QCOMPARE(tab.js("document.getElementById('state').textContent").toString(), QStringLiteral("This review link has expired"));
+        if (firefox) QTRY_COMPARE_WITH_TIMEOUT(fx.js("__montage.stage").toString(), QStringLiteral("expired"), 10000);
+        QTRY_COMPARE_WITH_TIMEOUT(rig.review->stats().viewers, 0, 10000);
         QVERIFY2(tab.open(rig.page(), &why), why.c_str());
         QCOMPARE(tab.js("__montage.join('Cy', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("This review link has expired"));
         if (coturn) {
@@ -25863,6 +26352,49 @@ colorspaces:
         }
         QCOMPARE(qGreen(view.pixel(150, 50)), 255);
         QCOMPARE(qAlpha(view.pixel(150, 150)), 0);
+    }
+
+    // Nightly 19 Nov: pictures move between the plug-ins' textures and memory as plain rows, whatever a plug-in in
+    // Montage's process left set on the context (a read wrote past the picture with a longer row length set, and into
+    // a bound buffer instead of the picture).
+    void openFxPixelTransfersIgnoreLeftState() {
+        std::string why;
+        if (!ofx::initializeGpu(&why)) QSKIP(why.c_str());
+        const int W = 13, H = 7;
+        Image img(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* px = img.at(x, y);
+                px[0] = float(x) / W, px[1] = float(y) / H, px[2] = 0.25f, px[3] = 1;
+            }
+        Image back;
+        bool ran = ofx::gl::run([&] {
+            QOpenGLExtraFunctions* f = ofx::gl::context()->extraFunctions();
+            // (as a plug-in might leave them: rows longer than the picture's, some skipped, and buffers bound)
+            GLuint buffers[2] = {0, 0};
+            f->glGenBuffers(2, buffers);
+            f->glBindBuffer(0x88EB /* GL_PIXEL_PACK_BUFFER */, buffers[0]);
+            f->glBufferData(0x88EB, 64, nullptr, GL_STREAM_READ);
+            f->glBindBuffer(0x88EC /* GL_PIXEL_UNPACK_BUFFER */, buffers[1]);
+            f->glBufferData(0x88EC, 64, nullptr, GL_STREAM_DRAW);
+            f->glPixelStorei(0x0D02 /* GL_PACK_ROW_LENGTH */, W + 5);
+            f->glPixelStorei(0x0D03 /* GL_PACK_SKIP_ROWS */, 2);
+            f->glPixelStorei(0x0CF2 /* GL_UNPACK_ROW_LENGTH */, W + 3);
+            f->glPixelStorei(0x0CF4 /* GL_UNPACK_SKIP_PIXELS */, 1);
+            const unsigned texture = ofx::gl::makeTexture(W, H);
+            ofx::gl::writeTexture(texture, img);
+            ofx::gl::readTexture(texture, W, H, true, back);
+            ofx::gl::destroyTexture(texture);
+            f->glBindBuffer(0x88EB, 0);
+            f->glBindBuffer(0x88EC, 0);
+            f->glDeleteBuffers(2, buffers);
+            while (f->glGetError() != GL_NO_ERROR) {
+            }
+        });
+        QVERIFY(ran);
+        QCOMPARE(back.width, W);
+        QCOMPARE(back.height, H);
+        QVERIFY(back.px == img.px);
     }
 
     // A plug-in that renders with OpenGL takes its picture from a texture of a context that shares its textures with
@@ -28606,6 +29138,74 @@ colorspaces:
         QVERIFY(t.elapsed() < 15000);
     }
 
+    // Nightly 19 Nov: clients that ask for a file and never read it are let go 20 s after they last took any of it,
+    // so they cannot hold the origin's table (and what they were sent) for good; a client that reads slowly but
+    // steadily gets the whole file.
+    void liveOriginClientsThatDoNotRead() {
+        QTemporaryDir dir;
+        const int size = 24 << 20;  // (more than a loopback connection holds on its way, on any of the systems)
+        {
+            QFile f(dir.filePath("big.mp4"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            QByteArray block(1 << 20, 'x');
+            for (int i = 0; i < size / block.size(); ++i) f.write(block);
+        }
+        LiveOrigin origin;
+        std::string err;
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, nullptr, &err), err.c_str());
+        auto ask = [&](QTcpSocket& s) {
+            s.setReadBufferSize(1024);
+            s.connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            if (!s.waitForConnected(5000)) return false;
+            // (a receive buffer of a set size: Windows can otherwise grow a loopback one by many megabytes)
+            s.setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 64 << 10);
+            s.write("GET /big.mp4 HTTP/1.1\r\nHost: x\r\n\r\n");
+            return s.flush() || s.bytesToWrite() == 0;
+        };
+        // (what a client is sent in all: the body's bytes after the headers, read until the origin closes)
+        auto drain = [](QTcpSocket& s, QByteArray& in, qint64& body, int ms) {
+            s.setReadBufferSize(0);
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) {
+                in += s.readAll();
+                if (body < 0 && in.contains("\r\n\r\n")) body = in.size() - (in.indexOf("\r\n\r\n") + 4), in.clear();
+                else if (body >= 0) body += in.size(), in.clear();
+                if (s.state() != QAbstractSocket::ConnectedState && s.bytesAvailable() == 0) break;
+                s.waitForReadyRead(100);
+            }
+        };
+        std::vector<std::unique_ptr<QTcpSocket>> idle;
+        for (int i = 0; i < 3; ++i) {
+            idle.push_back(std::make_unique<QTcpSocket>());
+            QVERIFY(ask(*idle.back()));
+        }
+        QTcpSocket steady;
+        QVERIFY(ask(steady));
+        QByteArray steadyIn;
+        qint64 steadyBody = -1;
+        QElapsedTimer t;
+        t.start();
+        while (t.elapsed() < 26000) {
+            // (64 KB every fifth of a second)
+            steady.setReadBufferSize(64 << 10);
+            QTest::qWait(200);
+            steadyIn += steady.readAll();
+            if (steadyBody < 0 && steadyIn.contains("\r\n\r\n"))
+                steadyBody = steadyIn.size() - (steadyIn.indexOf("\r\n\r\n") + 4), steadyIn.clear();
+            else if (steadyBody >= 0) steadyBody += steadyIn.size(), steadyIn.clear();
+        }
+        for (auto& s : idle) {
+            QByteArray in;
+            qint64 body = -1;
+            drain(*s, in, body, 20000);
+            QVERIFY2(body >= 0 && body < size, qPrintable(QString::number(body)));
+            QVERIFY(s->state() != QAbstractSocket::ConnectedState);
+        }
+        drain(steady, steadyIn, steadyBody, 20000);
+        QCOMPARE(steadyBody, qint64(size));
+    }
+
     // Nightly 15 Nov: low latency HLS as a player is promised it. The preload hint after a segment's last part
     // names the next segment's first; every part but a segment's last is 85% of its playlist's PART-TARGET at least
     // (with sound, a part asked shorter than 13 coded frames is made that long); a blocking reload for what is too
@@ -28641,6 +29241,19 @@ colorspaces:
         QCOMPARE(liveBlockingReload(listed, 13, 6), 0);  // (the advance part limit of half second parts: six past the last)
         QCOMPARE(liveBlockingReload(listed, 13, 7), 400);
         QCOMPARE(liveBlockingReload(listed + "#EXT-X-ENDLIST\n", 99, -1), 200);
+        // Nightly 19 Nov: a part of the segment after the one being made is too far ahead when it is more than the advance
+        // part limit past the last part listed, the rest of the segment being made counted (as many parts as the last
+        // segment listed: here four, one of them made, so three to come, then the asked part's own from its first).
+        const std::string withParts = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.5\n"
+                                      "#EXT-X-PART-INF:PART-TARGET=0.5\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:2.0,\nseg00010.m4s\n"
+                                      "#EXT-X-PART:DURATION=0.5,URI=\"seg00011.1.m4s\"\n#EXT-X-PART:DURATION=0.5,URI=\"seg00011.2.m4s\"\n"
+                                      "#EXT-X-PART:DURATION=0.5,URI=\"seg00011.3.m4s\"\n#EXT-X-PART:DURATION=0.5,URI=\"seg00011.4.m4s\"\n#EXTINF:2.0,\nseg00011.m4s\n"
+                                      "#EXT-X-PART:DURATION=0.5,URI=\"seg00012.1.m4s\"\n";
+        QCOMPARE(liveBlockingReload(withParts, 12, 6), 0);
+        QCOMPARE(liveBlockingReload(withParts, 12, 7), 400);
+        QCOMPARE(liveBlockingReload(withParts, 13, 2), 0);
+        QCOMPARE(liveBlockingReload(withParts, 13, 3), 400);
+        QCOMPARE(liveBlockingReload(listed, 14, 5), 0);  // (the segment before listed no parts: its own counted from its first)
 
         // A package made with sound and parts asked a tenth of a second long, its playlists read as they change.
         if (avcodec_find_encoder_by_name("libx264")) {
