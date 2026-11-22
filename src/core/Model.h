@@ -434,6 +434,19 @@ struct ClipAnimation {
     bool operator==(const ClipAnimation&) const = default;
 };
 
+// Auto Duck kept up to date (media/AutoDuck.h): what a music clip's duck was made from, so that it is made again when
+// the dialogue under it is added, trimmed, moved or muted. `keys` are the volume keyframes it wrote (clip frames and
+// dB): a keyframe of the clip's volume that is not among them was set or moved by hand, and is kept.
+struct DuckLink {
+    std::vector<Id> tracks;  // the dialogue's tracks
+    double amountDb = -15, fadeDown = 0.3, fadeUp = 0.8, minPause = 1.0, minSpeech = 0.2, thresholdDb = -40;
+    bool useTranscripts = true;
+    double base = 0;         // the clip's volume without the duck (dB)
+    std::vector<std::pair<FrameTime, double>> keys;
+    int kept = 0;            // how many keyframes moved by hand the last making kept
+    bool operator==(const DuckLink&) const = default;
+};
+
 struct Clip {
     Id id = 0;
     Id mediaId = 0;              // 0 for generator clips (titles, colour mattes...)
@@ -508,6 +521,7 @@ struct Clip {
     // Trim passes (render/TrimPasses.h): its trim for each of its sequence's targets, by TrimTarget::id (a "trim"
     // effect: lift, gamma, gain, saturation, highlights, mid_detail; keyframable). None: the target as mapped.
     std::map<std::string, Effect> trims;
+    std::optional<DuckLink> duck;  // (sound clips) its Auto Duck, when kept up to date
     bool operator==(const Clip&) const = default;
 };
 

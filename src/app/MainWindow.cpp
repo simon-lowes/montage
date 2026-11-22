@@ -816,6 +816,7 @@ void MainWindow::buildPanels() {
     // The dialogs' jobs are kept there too: a consolidation cut short by a crash is taken up again now, in the
     // background, and says so when it is done.
     dialogJobs_ = new DialogJobs(this, jobs::storeFolder());
+    dialogJobs_->setState(state_);  // (where a task nobody watches has its result applied)
     connect(dialogJobs_, &DialogJobs::resumed, this, [this](const QString& title) {
         statusBar()->showMessage(tr("Taking up again what Montage was doing when it stopped: %1").arg(title), 8000);
     });
@@ -1791,7 +1792,7 @@ void MainWindow::buildMenus() {
                 return;
             }
             AutoDuckDialog dlg(state_, music, this);
-            if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
+            if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this, dlg.keepUpToDate());
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, QT_TR_NOOP("Breath Control…"), QKeySequence(), withSeq([this] {
             bool ok = false;
@@ -5659,80 +5660,14 @@ void MainWindow::detectScenes(bool markOnly) {
     }
     const Id clipId = c->id;
     const std::string path = analysisSource(*m);  // (a proxy reads quicker, and is there when the file is not)
-    auto* dlg = new QProgressDialog(tr("Detecting scene cuts in %1...").arg(QString::fromStdString(m->name)), tr("Cancel"), 0, 1000, this);
-    dlg->setWindowModality(Qt::WindowModal);
-    dlg->setMinimumDuration(300);
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    connect(dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
-    QPointer<QProgressDialog> guard(dlg);
-    auto* watcher = new QFutureWatcher<std::vector<double>>(this);
-    connect(watcher, &QFutureWatcher<std::vector<double>>::finished, this, [this, watcher, dlg, clipId, cancel, markOnly] {
-        std::vector<double> cuts = watcher->result();
-        dlg->close();
-        dlg->deleteLater();
-        watcher->deleteLater();
-        if (*cancel) return;
-        int made = 0;
-        state_->apply(markOnly ? tr("Detect Shot Changes") : tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
-            Clip* clip = edit::clipById(sq, clipId);
-            if (!clip) return edit::Result::fail("The clip is gone");
-            // Map source times to timeline frames inside the clip.
-            std::vector<FrameTime> frames;
-            std::vector<FrameTime> sources;
-            for (double sec : cuts) {
-                double src = sec * sq.fpsValue();
-                double local = clip->ramped() ? clip->localForSource(src) : (src - clip->sourceIn) / clip->speed;
-                if (clip->reverse) local = double(clip->duration) - local;
-                FrameTime f = clip->start + FrameTime(std::llround(local));
-                if (f > clip->start && f < clip->end()) frames.push_back(f), sources.push_back(FrameTime(std::llround(src)));
-            }
-            // Each a shot-change marker on the clip's source, so it stays on that moment of the footage as the clip
-            // is moved, slipped or trimmed (the razor's cuts are through edits, which captions do not count as shot
-            // changes).
-            for (FrameTime src : sources)
-                if (std::none_of(clip->markers.begin(), clip->markers.end(), [src](const Marker& mk) { return mk.shotChange && mk.t == src; })) {
-                    Marker mk;
-                    mk.t = src;
-                    mk.name = tr("Shot change").toStdString();
-                    mk.shotChange = true;
-                    clip->markers.push_back(mk);
-                    if (markOnly) ++made;
-                }
-            std::sort(clip->markers.begin(), clip->markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
-            if (markOnly) {
-                if (!made) return edit::Result::fail("No new shot changes found in this clip");
-                return edit::Result{};
-            }
-            std::vector<TrackRef> tracks;
-            for (Id l : edit::linkedClips(sq, clipId))
-                if (auto loc = edit::locate(sq, l)) tracks.push_back(loc->track);
-            for (FrameTime f : frames) {
-                std::map<Id, Id> regroup;
-                for (TrackRef t : tracks) {
-                    const Clip* under = edit::clipAt(sq, t, f);
-                    Id group = under ? under->linkGroup : 0;
-                    auto r = edit::razor(p, sq, t, f);
-                    if (r.ok && group && !r.created.empty()) {
-                        auto it = regroup.find(group);
-                        if (it == regroup.end()) it = regroup.emplace(group, p.newId()).first;
-                        if (Clip* rc = edit::clipById(sq, r.created[0])) rc->linkGroup = it->second;
-                    }
-                }
-                ++made;
-            }
-            if (!made) return edit::Result::fail("No scene cuts found in this clip");
-            return edit::Result{};
-        });
-        if (made)
-            state_->message(markOnly ? tr("Marked %n shot change(s)", "", made) : tr("Cut the clip at %n scene change(s)", "", made), 5000);
-    });
-    watcher->setFuture(QtConcurrent::run([path, cancel, guard] {
-        return detectSceneCuts(path, 0.5, [guard](double f) {
-            QMetaObject::invokeMethod(qApp, [guard, f] {
-                if (guard) guard->setValue(int(f * 1000));
-            }, Qt::QueuedConnection);
-        }, cancel.get());
-    }));
+    // A background job (DialogJobs.h): watched behind its progress dialog or left to run, its cuts are applied as one
+    // undo step when it ends (DialogTasks.cpp), unless the clip has moved meanwhile.
+    const QJsonObject input{{"sequence", QString::number(s->id)}, {"clips", QJsonArray{QString::number(clipId)}},
+                            {"path", QString::fromStdString(path)}, {"markOnly", markOnly}};
+    const TaskOutcome r = dialogJobs_->run(state_, QStringLiteral("scene-detect"),
+                                           tr("Detecting scene cuts in %1...").arg(QString::fromStdString(m->name)), input, this);
+    if (r.how == TaskOutcome::Failed && !r.error.isEmpty()) state_->message(r.error, 6000);
+    if (r.done() && r.applied.contains("message")) state_->message(r.applied.value("message").toString(), 5000);
 }
 
 void MainWindow::normalizeLoudness() {

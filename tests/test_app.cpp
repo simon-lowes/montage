@@ -288,6 +288,7 @@
 #include "render/BackgroundJobs.h"
 #include "render/RenderFarm.h"
 #include "DialogJobs.h"
+#include "media/AutoDuck.h"
 #include "render/HrdCheck.h"
 #include <QProgressDialog>
 #include <QSaveFile>
@@ -525,6 +526,116 @@ class TestApp : public QObject {
         FrameTime dur = std::max<FrameTime>(s->duration(), FrameTime(s->fpsValue() * 10));
         int vw = std::max(100, viewport()->width() - 176 - 30);
         return double(vw) / double(dur);
+    }
+
+    // --- Background tasks (DialogJobs.h) ---
+
+    // Runs `begin` (something that starts a task and watches it) with the task held at its start, and closes its
+    // progress dialog with Run in Background. Returns the task's id: it is still held (setPaused lets it go on).
+    QString startInBackground(DialogJobs* jobs, const std::function<void()>& begin) {
+        const size_t before = jobs->tasks().size();
+        qputenv("MONTAGE_JOBS_PAUSE_AT", "0");
+        QTimer click;
+        connect(&click, &QTimer::timeout, this, [&click] {
+            for (QWidget* w : QApplication::topLevelWidgets())
+                if (w->objectName() == QLatin1String("jobProgress"))
+                    if (auto* b = w->findChild<QPushButton*>("jobBackground")) {
+                        click.stop();
+                        b->click();
+                        return;
+                    }
+        });
+        click.start(5);
+        begin();
+        click.stop();
+        qunsetenv("MONTAGE_JOBS_PAUSE_AT");
+        const auto tasks = jobs->tasks();
+        return tasks.size() > before ? tasks.back().id : QString();
+    }
+
+    // This test binary run again as a helper process (its only test dialogTaskHelper, told what to do by a file).
+    std::unique_ptr<QProcess> taskHelper(const QJsonObject& spec, const QString& pauseAt = {}) {
+        static int n = 0;
+        const QString file = dir_.filePath(QStringLiteral("task-helper-%1.json").arg(++n));
+        QFile f(file);
+        if (!f.open(QIODevice::WriteOnly)) return nullptr;
+        f.write(QJsonDocument(spec).toJson());
+        f.close();
+        auto p = std::make_unique<QProcess>();
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert("MONTAGE_TEST_TASK_HELPER", file);
+        env.insert("QT_QPA_PLATFORM", "offscreen");
+        env.insert("MONTAGE_NO_PLUGIN_SCAN", "1");
+        env.insert("MONTAGE_NO_RECOVERY_PROMPT", "1");
+        env.insert("MONTAGE_RECOVERY_DIR", dir_.filePath("helper-recovery"));
+        env.remove("MONTAGE_JOBS_PAUSE_AT");
+        if (!pauseAt.isEmpty()) env.insert("MONTAGE_JOBS_PAUSE_AT", pauseAt);
+        p->setProcessEnvironment(env);
+        p->setProcessChannelMode(QProcess::MergedChannels);
+        p->start(QCoreApplication::applicationFilePath(), {"dialogTaskHelper"});
+        return p;
+    }
+
+    // A task of `kind` begun on the project open now in a helper process, which is killed once the task has got as far
+    // as `pauseAt` (0 to 1). Then two more helpers are started together, as two Montages are after a crash: one of
+    // them takes the task up and finishes it. Returns the job's id in the store, "" with `why` when something went
+    // otherwise. (The helpers have no project open, so the result is kept and offered here, not applied there.)
+    QString killedAndTakenUp(const QString& kind, const QString& title, const QJsonObject& input, const QString& pauseAt, QString* why,
+                             int waitMs = 120000) {
+        const QString project = dir_.filePath("task-helper-project.json");
+        {
+            QFile f(project);
+            if (!f.open(QIODevice::WriteOnly)) return {};
+            f.write(QByteArray::fromStdString(projectToJson(state()->project())));
+        }
+        const QString store = jobs::storeFolder();
+        auto first = taskHelper(QJsonObject{{"mode", "start"}, {"store", store}, {"project", project}, {"kind", kind}, {"title", title}, {"input", input}},
+                                pauseAt);
+        if (!first || !first->waitForStarted(10000)) return *why = "the helper did not start", QString();
+        // Killed where it waits, part-way.
+        QString id;
+        QElapsedTimer t;
+        t.start();
+        while (id.isEmpty() && t.elapsed() < waitMs && first->state() != QProcess::NotRunning) {
+            QTest::qWait(50);
+            for (const jobs::Record& r : jobs::all("app"))
+                if (r.kind == kind && r.pid == first->processId() && r.step == QLatin1String("paused")) id = r.id;
+        }
+        if (id.isEmpty()) {
+            *why = "the task never got that far in the helper: " + QString::fromUtf8(first->readAll()).right(2000);
+            first->kill();
+            first->waitForFinished(10000);
+            return {};
+        }
+        first->kill();
+        first->waitForFinished(10000);
+        jobs::Record r;
+        if (!jobs::load(id, r) || r.status != QLatin1String("interrupted")) return *why = "after the kill the job reads " + r.status, QString();
+        // Two Montages started together: the job is taken up once.
+        const QString marks = dir_.filePath("task-helper-took-" + id);
+        QDir().mkpath(marks);
+        std::vector<std::unique_ptr<QProcess>> both;
+        for (int i = 0; i < 2; ++i) both.push_back(taskHelper(QJsonObject{{"mode", "resume"}, {"store", store}, {"marks", marks}}));
+        int took = 0;
+        for (auto& p : both) {
+            if (!p || !p->waitForFinished(waitMs) || p->exitStatus() != QProcess::NormalExit) {
+                *why = "a helper taking the job up did not end: " + (p ? QString::fromUtf8(p->readAll()).right(2000) : QString());
+                if (p) p->kill(), p->waitForFinished(10000);
+                return {};
+            }
+        }
+        for (const QString& name : QDir(marks).entryList(QDir::Files)) {
+            QFile f(marks + "/" + name);
+            if (f.open(QIODevice::ReadOnly)) took += f.readAll().trimmed().toInt();
+        }
+        if (took != 1) return *why = QStringLiteral("the job was taken up %1 times").arg(took), QString();
+        if (!jobs::load(id, r) || r.status != QLatin1String("done")) return *why = "taken up, the job ended " + r.status + ": " + r.error, QString();
+        return id;
+    }
+
+    static QJsonObject taskResult(const QString& id) {
+        QFile f(jobs::jobFolder(id) + "/result.json");
+        return f.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(f.readAll()).object() : QJsonObject();
     }
 
 private slots:
@@ -5432,6 +5543,370 @@ private slots:
         report = checkHrd(vbr.path);
         QVERIFY2(report.conforms() && report.signalled && !report.cbr, report.summary().c_str());
         QVERIFY2(std::fabs(report.bitRate - 1200000) < 12000 && std::fabs(report.bufferBits - 1200000) < 12000, report.summary().c_str());
+    }
+
+    void dialogTaskHelper() {
+        // Does nothing by itself. The tests of background tasks run this binary again with this as its only test, to
+        // have a task begun, or taken up, in a process of its own that can be killed.
+        const QString spec = qEnvironmentVariable("MONTAGE_TEST_TASK_HELPER");
+        if (spec.isEmpty()) return;
+        QFile f(spec);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+        DialogJobs jobs(nullptr, o.value("store").toString());
+        if (o.value("mode").toString() == "start") {
+            Project project;
+            std::string err;
+            QFile pf(o.value("project").toString());
+            QVERIFY(pf.open(QIODevice::ReadOnly));
+            QVERIFY2(projectFromJson(pf.readAll().toStdString(), project, &err), err.c_str());
+            QVERIFY(!jobs.startOn(project, nullptr, o.value("kind").toString(), o.value("title").toString(), o.value("input").toObject()).isEmpty());
+            QTest::qWait(600000);  // (killed long before)
+            return;
+        }
+        const int took = jobs.resume();
+        QFile mark(o.value("marks").toString() + QStringLiteral("/%1").arg(QCoreApplication::applicationPid()));
+        QVERIFY(mark.open(QIODevice::WriteOnly));
+        mark.write(QByteArray::number(took));
+        mark.close();
+        QElapsedTimer t;
+        t.start();
+        while (jobs.busy() && t.elapsed() < 600000) QTest::qWait(50);
+        QVERIFY(!jobs.busy());
+    }
+
+    void dialogTasksRunInBackground() {
+        // Auto Duck and Detect Scene Cuts are jobs in the store. Left to run with their dialog closed they give what a
+        // watched run gives. A result whose clip was moved meanwhile is offered and not applied. Killed part-way in
+        // another process, the job is taken up once by the Montages started next and gives the same.
+        DialogJobs* dialogs = win_->dialogJobs();
+        QVERIFY(dialogs);
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Dialogue", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        QVERIFY(state()->apply("Music", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, {TrackKind::Audio, 1}, false);
+        }));
+        const Id music = trackAt(*state()->sequence(), {TrackKind::Audio, 1})->clips.front().id;
+        const auto gain = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), music);
+            return c && c->audio.params.count("gain_db") ? c->audio.params.at("gain_db") : Param(0.0);
+        };
+        const auto latest = [](const QString& kind) {
+            jobs::Record found;
+            for (const jobs::Record& r : jobs::all("app"))
+                if (r.kind == kind && r.order >= found.order) found = r;
+            return found;
+        };
+        DuckOptions o;
+        // Watched: the keyframes to compare with, and the job's record and result in the store.
+        QCOMPARE(AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get()), 1);
+        const Param watched = gain();
+        QVERIFY(watched.animated());
+        const jobs::Record first = latest("auto-duck");
+        QCOMPARE(first.status, QStringLiteral("done"));
+        const QJsonObject watchedResult = taskResult(first.id);
+        QVERIFY(watchedResult.value("spans").toArray().size() >= 1);
+        state()->undo();
+        QVERIFY(!gain().animated());
+        // Its dialog closed while it runs: it is listed, goes on, and writes the same keyframes as one undo step.
+        QString said;
+        connect(dialogs, &DialogJobs::finished, this, [&](const QString&, bool, const QString& text) { said = text; });
+        QString id = startInBackground(dialogs, [&] { QCOMPARE(AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get()), -1); });
+        QVERIFY(!id.isEmpty());
+        QCOMPARE(dialogs->tasks().size(), size_t(1));
+        QVERIFY(dialogs->tasks()[0].paused);
+        QVERIFY(!gain().animated());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+        QVERIFY(gain() == watched);
+        QCOMPARE(state()->undoText(), QString("Auto Duck"));
+        QVERIFY2(said.contains("Ducked 1 clip"), qPrintable(said));
+        QVERIFY(taskResult(id) == watchedResult);
+        state()->undo();
+        // The music moved while it ran: the result is kept and offered with what moved, and is not applied.
+        QString offeredNote;
+        connect(dialogs, &DialogJobs::offered, this, [&](const QString&, const QString&, const QString& note) { offeredNote = note; });
+        id = startInBackground(dialogs, [&] { AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get()); });
+        QVERIFY(!id.isEmpty());
+        QVERIFY(state()->apply("Move", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {music}, 30, 0, 0); }));
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+        QVERIFY(!gain().animated());
+        QCOMPARE(state()->undoText(), QString("Move"));
+        QVERIFY2(offeredNote.contains("was moved"), qPrintable(offeredNote));
+        QCOMPARE(dialogs->offeredNote(id), offeredNote);
+        QVERIFY(taskResult(id) == watchedResult);
+        // Applied from the list when the user says so, onto the clip where it is now.
+        QVERIFY(dialogs->applyOffered(id));
+        QVERIFY(gain().animated());
+        QVERIFY(dialogs->offeredNote(id).isEmpty());
+        state()->undo();
+        state()->undo();
+        QVERIFY(!gain().animated());
+        disconnect(dialogs, &DialogJobs::offered, this, nullptr);
+        // Killed in another process at its start, then taken up by one of two Montages started together: the stretches
+        // of speech are the same, and applied here they write the same keyframes.
+        {
+            const Sequence& s = *state()->sequence();
+            const QJsonObject options{{"amount", o.amountDb},   {"fadeDown", o.fadeDown},   {"fadeUp", o.fadeUp},        {"minPause", o.minPause},
+                                      {"minSpeech", o.minSpeech}, {"threshold", o.thresholdDb}, {"transcripts", o.useTranscripts}};
+            const QJsonObject input{{"sequence", QString::number(s.id)},
+                                    {"clips", QJsonArray{QString::number(music)}},
+                                    {"tracks", QJsonArray{QString::number(s.audioTracks[0].id)}},
+                                    {"options", options},
+                                    {"keep", false}};
+            QString why;
+            const QString job = killedAndTakenUp("auto-duck", "Listening for dialogue…", input, "0", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(taskResult(job) == watchedResult);
+            QVERIFY(!dialogs->offeredNote(job).isEmpty());
+            QVERIFY(dialogs->applyOffered(job));
+            QVERIFY(gain() == watched);
+            state()->undo();
+        }
+
+        // Detect Scene Cuts: three plain shots of two seconds, cut where they change.
+        const QString film = dir_.path() + "/task-shots.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            const double colours[3][3] = {{0.8, 0.1, 0.1}, {0.1, 0.7, 0.2}, {0.1, 0.2, 0.9}};
+            for (int i = 0; i < 3; ++i) {
+                Clip c = makeGeneratorClip(gen, "color", 50);
+                c.start = i * 50;
+                c.generator.params["color.r"] = Param(colours[i][0]);
+                c.generator.params["color.g"] = Param(colours[i][1]);
+                c.generator.params["color.b"] = Param(colours[i][2]);
+                QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, c).ok);
+            }
+            ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+            st.path = film.toStdString();
+            st.preset = "ultrafast";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto shots = state()->importFiles({film});
+        QCOMPARE(shots.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, shots[0], 0, 0, 150, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips[0].id;
+        const auto starts = [&] {
+            std::vector<FrameTime> out;
+            for (const Clip& c : state()->sequence()->videoTracks[0].clips) out.push_back(c.start);
+            return out;
+        };
+        QAction* detect = nullptr;
+        for (QAction* a : win_->findChildren<QAction*>())
+            if (a->text() == QLatin1String("Detect &Scene Cuts")) detect = a;
+        QVERIFY(detect);
+        state()->setSelection({clip});
+        detect->trigger();  // (watched)
+        QCOMPARE(starts(), (std::vector<FrameTime>{0, 50, 100}));
+        QCOMPARE(state()->undoText(), QString("Detect Scene Cuts"));
+        const Sequence cut = *state()->sequence();
+        const QJsonObject cuts = taskResult(latest("scene-detect").id);
+        QCOMPARE(cuts.value("cuts").toArray().size(), 2);
+        state()->undo();
+        QCOMPARE(starts(), std::vector<FrameTime>{0});
+        // Left to run: the same cuts, the same edit.
+        state()->setSelection({clip});
+        id = startInBackground(dialogs, [&] { detect->trigger(); });
+        QVERIFY(!id.isEmpty());
+        QCOMPARE(starts(), std::vector<FrameTime>{0});
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+        QVERIFY(taskResult(id) == cuts);
+        QVERIFY(*state()->sequence() == cut);
+        QVERIFY2(said.contains("Cut the clip at 2 scene change"), qPrintable(said));
+        state()->undo();
+        // Killed part-way (half the film read) in another process and taken up: the same cuts, the same edit.
+        {
+            const QJsonObject input{{"sequence", QString::number(state()->sequence()->id)},
+                                    {"clips", QJsonArray{QString::number(clip)}},
+                                    {"path", film},
+                                    {"markOnly", false}};
+            QString why;
+            const QString job = killedAndTakenUp("scene-detect", "Detecting scene cuts", input, "0.4", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(taskResult(job) == cuts);
+            QVERIFY(dialogs->applyOffered(job));
+            QVERIFY(*state()->sequence() == cut);
+            state()->undo();
+        }
+        disconnect(dialogs, &DialogJobs::finished, this, nullptr);
+        state()->newProject();
+    }
+
+    void autoDuckKeptUpToDate() {
+        // A duck kept up to date follows the dialogue: moved by two seconds, its keyframes move by two seconds in the
+        // same undo step; a muted line leaves no dip; a keyframe moved by hand stays where it was put.
+        state()->newProject();
+        forgetHeardSound();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        const double fps = state()->sequence()->fpsValue();
+        const FrameTime second = FrameTime(std::llround(fps));
+        // The line: three seconds of the speech, two seconds in. The music: the whole file on A2, from the start.
+        QVERIFY(state()->apply("Line", [&](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 2 * second, 0, 3 * second, V1, A1, false); }));
+        QVERIFY(state()->apply("Music", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, {TrackKind::Audio, 1}, false);
+        }));
+        const Id line = trackAt(*state()->sequence(), A1)->clips.front().id;
+        const Id music = trackAt(*state()->sequence(), {TrackKind::Audio, 1})->clips.front().id;
+        const auto clipNow = [&](Id id) { return edit::clipById(*state()->sequence(), id); };
+        const auto keys = [&] {
+            const Clip* c = clipNow(music);
+            return c && c->audio.params.count("gain_db") ? c->audio.params.at("gain_db").keys : std::vector<Keyframe>{};
+        };
+        // The dialog offers it, off for a clip that has none.
+        {
+            AutoDuckDialog dlg(state(), {music}, win_.get());
+            auto* keep = dlg.findChild<QCheckBox*>("duckKeep");
+            QVERIFY(keep && !keep->isChecked() && !dlg.keepUpToDate());
+            keep->setChecked(true);
+            QVERIFY(dlg.keepUpToDate());
+        }
+        DuckOptions o;
+        QCOMPARE(AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get(), true), 1);
+        const std::vector<Keyframe> made = keys();
+        QVERIFY(made.size() >= 4);
+        QVERIFY(clipNow(music)->duck.has_value());
+        QCOMPARE(clipNow(music)->duck->tracks, std::vector<Id>{state()->sequence()->audioTracks[0].id});
+        QCOMPARE(clipNow(music)->duck->keys.size(), made.size());
+        // The dip sits over the line: down by its start, up after its end.
+        const auto dipStart = [](const std::vector<Keyframe>& k) {
+            for (const Keyframe& x : k)
+                if (x.v < -14.9) return x.t;
+            return FrameTime(-1);
+        };
+        QVERIFY2(std::llabs(dipStart(made) - 2 * second) <= second / 2, qPrintable(QString::number(dipStart(made))));
+        {
+            AutoDuckDialog dlg(state(), {music}, win_.get());
+            QVERIFY(dlg.keepUpToDate());  // (as the clip is now)
+        }
+        // The line moved two seconds later: every keyframe of the duck is two seconds later, within a frame, and the
+        // move and the duck are one undo step.
+        QVERIFY(state()->apply("Move Line", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {line}, 2 * second, 0, 0); }));
+        QCOMPARE(state()->undoText(), QString("Move Line"));
+        std::vector<Keyframe> moved = keys();
+        QCOMPARE(moved.size(), made.size());
+        for (size_t i = 0; i < made.size(); ++i) {
+            // (the first and last sit on the clip's ends and stay there)
+            if (i == 0 || i + 1 == made.size()) continue;
+            QVERIFY2(std::llabs(moved[i].t - made[i].t - 2 * second) <= 1, qPrintable(QString("%1: %2 -> %3").arg(i).arg(made[i].t).arg(moved[i].t)));
+            QCOMPARE(moved[i].v, made[i].v);
+        }
+        state()->undo();
+        QCOMPARE(clipNow(line)->start, 2 * second);
+        QVERIFY(keys() == made);
+        state()->redo();
+        QVERIFY(keys() == moved);
+        // Dragged, the duck follows while the line moves and is part of the drag's one undo step.
+        state()->beginGesture("Drag Line");
+        state()->updateGesture([&](Project& p, Sequence& s) { edit::moveClips(p, s, {line}, -second, 0, 0); });
+        QVERIFY(keys() != moved);
+        state()->updateGesture([&](Project& p, Sequence& s) { edit::moveClips(p, s, {line}, -2 * second, 0, 0); });
+        state()->endGesture(true);
+        QVERIFY(keys() == made);
+        QCOMPARE(state()->undoText(), QString("Drag Line"));
+        state()->undo();
+        QVERIFY(keys() == moved);
+        // A keyframe moved by hand stays: here the bottom of the dip, raised to -6 dB.
+        const FrameTime handAt = dipStart(moved);
+        QVERIFY(state()->edit("Raise Keyframe", [&](Project&, Sequence& s) {
+            for (Keyframe& k : edit::clipById(s, music)->audio.params["gain_db"].keys)
+                if (k.t == handAt) k.v = -6;
+            return true;
+        }));
+        QString said;
+        connect(state(), &EditorState::statusMessage, this, [&](const QString& text, int) { said = text; });
+        QVERIFY(state()->apply("Move Line Back", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {line}, -2 * second, 0, 0); }));
+        disconnect(state(), &EditorState::statusMessage, this, nullptr);
+        {
+            const std::vector<Keyframe> k = keys();
+            const auto hand = std::find_if(k.begin(), k.end(), [&](const Keyframe& x) { return x.t == handAt; });
+            QVERIFY(hand != k.end());
+            QCOMPARE(hand->v, -6.0);
+            QCOMPARE(clipNow(music)->duck->kept, 1);
+            QVERIFY2(said.contains("kept 1 keyframe"), qPrintable(said));
+            // (the duck's own are back where they were made first)
+            for (const Keyframe& x : made) QVERIFY(std::any_of(k.begin(), k.end(), [&](const Keyframe& y) { return y.t == x.t && y.v == x.v; }));
+            QCOMPARE(k.size(), made.size() + 1);
+        }
+        // The line's track muted: no dip is left (the keyframe set by hand stays); unmuted, it is back.
+        QVERIFY(state()->edit("Mute", [](Project&, Sequence& s) {
+            s.audioTracks[0].muted = true;
+            return true;
+        }));
+        {
+            const std::vector<Keyframe> k = keys();
+            QCOMPARE(k.size(), size_t(1));
+            QCOMPARE(k[0].t, handAt);
+        }
+        state()->undo();
+        QCOMPARE(keys().size(), made.size() + 1);
+        // More dialogue added later on the track: a second dip, in the step that added it.
+        const size_t before = keys().size();
+        QVERIFY(state()->apply("Second Line", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 8 * second, 4 * second, 6 * second, V1, A1, false);
+        }));
+        QVERIFY(keys().size() > before);
+        QCOMPARE(state()->undoText(), QString("Second Line"));
+        state()->undo();
+        QCOMPARE(keys().size(), before);
+        // Trimmed shorter at its end, the dip ends sooner.
+        const auto dipEnd = [](const std::vector<Keyframe>& k) {
+            FrameTime at = -1;
+            for (const Keyframe& x : k)
+                if (x.v < -14.9) at = x.t;
+            return at;
+        };
+        const FrameTime endBefore = dipEnd(keys());
+        QVERIFY(state()->apply("Trim Line", [&](Project& p, Sequence& s) { return edit::trim(p, s, line, edit::Edge::Out, -second, edit::TrimMode::Normal); }));
+        QVERIFY2(dipEnd(keys()) < endBefore, qPrintable(QString("%1 %2").arg(dipEnd(keys())).arg(endBefore)));
+        state()->undo();
+        // Saved and opened again, the duck is still kept up to date.
+        {
+            Project again;
+            std::string err;
+            QVERIFY2(projectFromJson(projectToJson(state()->project()), again, &err), err.c_str());
+            QVERIFY(again == state()->project());
+            const Clip* c = edit::clipById(*again.active(), music);
+            QVERIFY(c && c->duck && c->duck->kept == 1 && c->duck->keys.size() == made.size());
+            // A project as earlier versions wrote it has none, and opens as it was.
+            Project then;
+            QVERIFY(loadProject(std::string(MONTAGE_TEST_DATA_DIR) + "/projects/five-band-eq.montage", then));
+            for (const Sequence& sq : then.sequences) QVERIFY(!hasKeptDucks(sq));
+        }
+        // Sound that was not heard yet (a project just opened): the edit is made at once, the sound is listened to in
+        // the background, and the duck is then made again as part of that edit's undo step.
+        forgetHeardSound();
+        const std::vector<Keyframe> stale = keys();
+        QVERIFY(state()->apply("Move Unheard", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {line}, 2 * second, 0, 0); }));
+        QElapsedTimer t;
+        t.start();
+        while (keys() == stale && t.elapsed() < 60000) QTest::qWait(20);
+        QVERIFY(keys() != stale);
+        QTRY_VERIFY_WITH_TIMEOUT(win_->dialogJobs()->tasks().empty(), 60000);
+        QCOMPARE(state()->undoText(), QString("Move Unheard"));
+        state()->undo();
+        QVERIFY(keys() == stale);
+        // Ducked again without Keep Up to Date, the clip's duck is forgotten and follows nothing.
+        QCOMPARE(AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get(), false), 1);
+        QVERIFY(!clipNow(music)->duck.has_value());
+        const std::vector<Keyframe> plain = keys();
+        QVERIFY(state()->apply("Move Line", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {line}, second, 0, 0); }));
+        QVERIFY(keys() == plain);
+        state()->newProject();
     }
 
     void dialogJobsKeptAndResumed() {

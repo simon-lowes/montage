@@ -3,17 +3,16 @@
 #include <QCheckBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
-#include <QEventLoop>
 #include <QFormLayout>
-#include <QFutureWatcher>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QLabel>
 #include <QListWidget>
-#include <QProgressDialog>
 #include <QVBoxLayout>
-#include <QtConcurrent>
 #include <algorithm>
 #include <memory>
 
+#include "DialogJobs.h"
 #include "EditorState.h"
 #include "core/EditOps.h"
 
@@ -71,6 +70,16 @@ AutoDuckDialog::AutoDuckDialog(EditorState* state, const std::vector<Id>& music,
     form->addRow(tr("Fade up:"), fadeUp_);
     form->addRow(tr("Speech louder than:"), threshold_);
     form->addRow(QString(), transcripts_);
+    keep_ = new QCheckBox(tr("Keep up to date"), this);
+    keep_->setObjectName(QStringLiteral("duckKeep"));
+    keep_->setToolTip(tr("The duck remembers its dialogue tracks and these settings. When dialogue under it is added, trimmed,\n"
+                         "moved or muted, its keyframes are made again as part of that edit. A keyframe you move by hand is kept."));
+    // (as the selected clips are now: on when any of them is kept up to date already)
+    keep_->setChecked(s && std::any_of(music.begin(), music.end(), [&](Id id) {
+        const Clip* c = edit::clipById(*s, id);
+        return c && c->duck;
+    }));
+    form->addRow(QString(), keep_);
     lay->addLayout(form);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
@@ -88,6 +97,8 @@ DuckOptions AutoDuckDialog::options() const {
     return o;
 }
 
+bool AutoDuckDialog::keepUpToDate() const { return keep_->isChecked(); }
+
 std::vector<int> AutoDuckDialog::dialogueTracks() const {
     std::vector<int> out;
     for (int i = 0; i < tracks_->count(); ++i)
@@ -96,50 +107,28 @@ std::vector<int> AutoDuckDialog::dialogueTracks() const {
 }
 
 int AutoDuckDialog::apply(EditorState* state, const std::vector<Id>& music, const std::vector<int>& tracks, const DuckOptions& o,
-                          QWidget* parent) {
+                          QWidget* parent, bool keep) {
     const Sequence* seq = state->sequence();
     if (!seq || music.empty()) return -1;
     if (tracks.empty()) {
         state->message(tr("Choose the tracks the dialogue is on"), 5000);
         return -1;
     }
-    // Reading the dialogue's sound can take a while: in the background, with progress.
-    const Project project = state->project();
-    const Sequence sequence = *seq;
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    QProgressDialog progress(tr("Listening for dialogue…"), tr("Cancel"), 0, 0, parent);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    QObject::connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
-    using Out = std::pair<Spans, std::string>;
-    QFutureWatcher<Out> watcher;
-    QEventLoop wait;
-    QObject::connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([project, sequence, tracks, o, cancel] {
-        Out out;
-        out.first = dialogueSpans(project, sequence, tracks, o, &out.second, cancel.get());
-        return out;
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    QObject::disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
-    progress.close();
-    const Out r = watcher.result();
-    if (*cancel) return -1;
-    if (!r.second.empty()) {
-        state->message(QString::fromStdString(r.second), 6000);
-        return -1;
-    }
-    int changed = 0;
-    const Spans spans = r.first;
-    state->edit(tr("Auto Duck"), [&](Project&, Sequence& s) {
-        for (Id id : music)
-            if (Clip* c = edit::clipById(s, id)) changed += duckClip(*c, s, spans, o) ? 1 : 0;
-        return changed > 0;
-    });
-    state->message(spans.empty() ? tr("No dialogue found on those tracks")
-                                 : tr("Ducked %n clip(s) under %1 stretch(es) of dialogue", "", changed).arg(spans.size()),
-                   5000);
-    return changed;
+    // Reading the dialogue's sound can take a while: a background job (DialogJobs.h), watched behind its progress
+    // dialog or left to run. Its result, the stretches of speech, is applied as one undo step when it ends.
+    QJsonArray clips, trackIds;
+    for (Id id : music) clips.append(QString::number(id));
+    for (int i : tracks)
+        if (i >= 0 && i < int(seq->audioTracks.size())) trackIds.append(QString::number(seq->audioTracks[size_t(i)].id));
+    const QJsonObject options{{"amount", o.amountDb},       {"fadeDown", o.fadeDown},   {"fadeUp", o.fadeUp},
+                              {"minPause", o.minPause},     {"minSpeech", o.minSpeech}, {"threshold", o.thresholdDb},
+                              {"transcripts", o.useTranscripts}};
+    const QJsonObject input{{"sequence", QString::number(seq->id)}, {"clips", clips}, {"tracks", trackIds}, {"options", options}, {"keep", keep}};
+    const TaskOutcome r = DialogJobs::of(parent)->run(state, QStringLiteral("auto-duck"), tr("Listening for dialogue…"), input, parent);
+    if (r.how == TaskOutcome::Failed && !r.error.isEmpty()) state->message(r.error, 6000);
+    if (!r.done()) return -1;
+    state->message(r.applied.value("message").toString(), 5000);
+    return r.applied.value("changed").toInt();
 }
 
 }  // namespace montage

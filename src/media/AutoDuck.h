@@ -57,4 +57,32 @@ bool duckClip(Clip& c, const Sequence& s, const Spans& spans, const DuckOptions&
 // clips changed.
 int duckUnderDescriptions(Sequence& s, double amountDb, double fadeSeconds = 0.25);
 
+// --- Kept up to date ---
+//
+// dialogueSpans keeps how loud each file it reads is (its energy every 5 ms), for the session, so that a duck is made
+// again after an edit without reading the file again. With `heardOnly` it reads no file: where a clip's sound has not
+// been heard yet it returns nothing and sets `unheard`.
+Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>& tracks, const DuckOptions& o, std::string* error,
+                    const std::atomic<bool>* cancel, bool heardOnly, bool* unheard);
+void forgetHeardSound();  // (tests)
+
+DuckOptions duckOptions(const DuckLink& link);
+// The tracks' places in `s` (those still there).
+std::vector<int> duckTracks(const Sequence& s, const DuckLink& link);
+// Ducks `c` as duckClip does and remembers what the duck was made from (c.duck), so that it can be made again. Made
+// again, the keyframes the duck wrote before are replaced, and those the user set or moved by hand since are kept
+// (c.duck->kept says how many). Returns whether the clip changed.
+bool duckClipKept(Clip& c, const Sequence& s, const Spans& spans, const DuckOptions& o, const std::vector<Id>& tracks);
+
+struct DuckRefresh {
+    int clips = 0;         // ducks made again that changed their clip
+    int kept = 0;          // keyframes moved by hand that were kept in them
+    bool unheard = false;  // a duck was left as it was: sound under it has not been heard yet
+};
+// After an edit: every duck kept up to date in `s` whose dialogue tracks, or whose own clip's place, are not as in
+// `before` (null: every one) is made again from the sound already heard.
+DuckRefresh refreshKeptDucks(const Project& p, Sequence& s, const Sequence* before);
+// Whether `s` has a duck kept up to date.
+bool hasKeptDucks(const Sequence& s);
+
 }  // namespace montage

@@ -30,6 +30,7 @@
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectLock.h"
+#include "media/AutoDuck.h"
 #include "media/ContentCredentials.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
@@ -215,6 +216,7 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
         project_ = std::move(before);
         return false;
     }
+    followDucks(before, true);
     if (project_ == before) return true;
     QDateTime now = QDateTime::currentDateTimeUtc();
     bool merge = !mergeKey.isEmpty() && mergeKey == lastMergeKey_ && history_.canUndo() &&
@@ -270,8 +272,17 @@ void EditorState::updateGesture(const std::function<void(Project&, Sequence&)>& 
     if (!gesture_) return;
     project_ = gesture_->origin;
     if (Sequence* s = project_.active()) fn(project_, *s);
+    followDucks(gesture_->origin, false);
     gesture_->changed = !(project_ == gesture_->origin);
     emit projectChanged();
+}
+
+void EditorState::followDucks(const Project& before, bool say) {
+    Sequence* s = project_.active();
+    if (!s || !hasKeptDucks(*s)) return;
+    const DuckRefresh r = refreshKeptDucks(project_, *s, before.findSequence(s->id));
+    if (say && r.clips && r.kept) message(tr("Auto Duck was made again and kept %n keyframe(s) moved by hand", "", r.kept), 5000);
+    if (r.unheard) emit ducksUnheard();
 }
 
 void EditorState::endGesture(bool commit) {
