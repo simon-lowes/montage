@@ -2950,6 +2950,15 @@ private slots:
         const qint64 watchdog = qEnvironmentVariableIntValue("QTEST_FUNCTION_TIMEOUT") > 0 ? qEnvironmentVariableIntValue("QTEST_FUNCTION_TIMEOUT") : 300000;
         auto within = [&](qint64 ms) { return int(std::clamp<qint64>(watchdog - 15000 - sinceStart.elapsed(), 1, ms)); };
         auto phase = [&](const char* what) { qInfo("multiviewer: %s after %lld ms", what, sinceStart.elapsed()); };
+        // (waits on the clock: Qt's own waits count their steps, which a Mac runner that sleeps long stretches past the
+        // watchdog)
+        auto until = [&](const auto& met, int ms) {
+            QElapsedTimer w;
+            w.start();
+            const int limit = within(ms);
+            while (!met() && w.elapsed() < limit) QTest::qWait(20);
+            return bool(met());
+        };
         // (a Mac runner has twice stopped here with nothing more said until the watchdog: so that the next such stop
         // shows where every thread was, should the function come near the watchdog, macOS's sampler is run on it)
         std::atomic<bool> over{false};
@@ -3049,7 +3058,7 @@ private slots:
                     pictures.push_back(std::move(out));
                 }
                 auto next = std::chrono::steady_clock::now();
-                for (int t = 0; !stop && t < 25 * 59; ++t) {
+                for (int t = 0; !stop && t < 25 * lifetimeS; ++t) {
                     const int64_t ts = (int64_t(13) * 3600 * 25 + t) * 400000;
                     const std::vector<float> planar(size_t(1920) * 2, 0.5f);
                     omtTx.sendAudio(planar.data(), 2, 1920, 1920, 48000, ts);
@@ -3057,7 +3066,7 @@ private slots:
                     v.width = 320, v.height = 180, v.stride = 320 * 2, v.data = pictures[size_t(t % 25)].data(), v.rateN = 25, v.rateD = 1;
                     v.timestamp = ts;
                     char tc[32];
-                    std::snprintf(tc, sizeof tc, "13:00:%02d:%02d", t / 25, t % 25);
+                    std::snprintf(tc, sizeof tc, "13:%02d:%02d:%02d", t / 1500, t / 25 % 60, t % 25);
                     v.metadata = std::string("<montage_timecode value=\"") + tc + "\"/>";
                     omtSent = t;
                     omtTx.sendVideo(v);
@@ -3137,7 +3146,8 @@ private slots:
         }
         phase("senders started");
         // (waiting on pictures, not the clock: a busy machine is slow)
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, within(60000));
+        QVERIFY2(until([&] { return mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10; }, 60000),
+                 qPrintable(QStringLiteral("pictures per tile: %1 %2 %3 %4").arg(mv->tile(0).pictures).arg(mv->tile(1).pictures).arg(mv->tile(2).pictures).arg(mv->tile(3).pictures)));
         phase("four tiles showing");
         // Each tile's picture the one its timecode names, its hour the source's, close behind what was sent.
         const int hours[4] = {10, 11, 12, omtOk ? 13 : 14};
@@ -3185,17 +3195,17 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(source->liveShowing() && mv->tile(0).onSource && !mv->tile(1).onSource);
         QVERIFY(source->accessibleSummary().startsWith("Live: Cam A"));
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia(), within(20000));
+        QVERIFY2(until([&] { return source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia(); }, 20000), "source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia()");
         phase("live media ready");
         const Id media = source->liveMedia();
         QCOMPARE(mv->tile(0).media, media);
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= 30, within(20000));
+        QVERIFY2(until([&] { return source->liveFrame() >= 30; }, 20000), "source->liveFrame() >= 30");
         r = call({{"action", "live"}, {"mark_in", true}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonObject atIn = r.value("structuredContent").toObject();
         const FrameTime in = FrameTime(atIn.value("in").toDouble());
         QVERIFY2(in >= 30, QJsonDocument(atIn).toJson().constData());
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= in + 40, within(20000));
+        QVERIFY2(until([&] { return source->liveFrame() >= in + 40; }, 20000), "source->liveFrame() >= in + 40");
         r = call({{"action", "live"}, {"mark_out", true}});
         const FrameTime out = FrameTime(r.value("structuredContent").toObject().value("out").toDouble());
         QVERIFY2(out >= in + 40 && state()->sourceIn() == in, QJsonDocument(r).toJson().constData());
@@ -3214,7 +3224,7 @@ private slots:
         QVERIFY(m);
         const int64_t first = std::llround(m->timecode * 25);  // (the recording's first frame's timecode, in frames)
         QCOMPARE(QString::fromStdString(mv->feed(0)->timecodeAt(0)).left(2), QString("10"));
-        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() > out + 25, within(20000));
+        QVERIFY2(until([&] { return source->liveFrame() > out + 25; }, 20000), "source->liveFrame() > out + 25");
         phase("In and Out marked");
         // (a sender held up past a fifth of a second goes on from now, and a busy machine's receiver can miss frames:
         // the recording, placed by the pictures' timestamps, holds the last picture again for the slots it passed
@@ -3261,20 +3271,20 @@ private slots:
         QCOMPARE(state()->sourceIn(), in);
         r = call({{"action", "live"}, {"watch", false}});
         QVERIFY(!source->liveShowing() && !source->liveFeed());
-        QTRY_VERIFY(!mv->tileWidget(0)->tally().isValid());
+        QVERIFY2(until([&] { return !mv->tileWidget(0)->tally().isValid(); }, 5000), "!mv->tileWidget(0)->tally().isValid()");
         // Its recording ended from the reception it was made by: the feed was opened once, and is watched on.
         QCOMPARE(mv->tile(0).opened, 1);
         const int64_t seen = mv->tile(0).pictures;
         phase("recording stopped");
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).running && mv->tile(0).pictures > seen + 5, within(20000));
+        QVERIFY2(until([&] { return mv->tile(0).running && mv->tile(0).pictures > seen + 5; }, 20000), "mv->tile(0).running && mv->tile(0).pictures > seen + 5");
         // The stream, watched since its sender called in, chosen and recorded: from that same reception (its sender
         // has not called again: its feed opened once), the file starting on a picture between the stream's groups
         // with the feed's own timecode there, each picture the one its timecode names.
         r = call({{"action", "multiview"}, {"choose", QJsonArray{2}}, {"record", true}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(mv->tile(2).recording && !mv->tile(0).recording);
-        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(2).media != 0, within(30000));
-        QTRY_VERIFY_WITH_TIMEOUT(mv->feed(2)->look().frame >= 40, within(30000));
+        QVERIFY2(until([&] { return mv->tile(2).media != 0; }, 30000), "mv->tile(2).media != 0");
+        QVERIFY2(until([&] { return mv->feed(2)->look().frame >= 40; }, 30000), "mv->feed(2)->look().frame >= 40");
         phase("stream recorded");
         r = call({{"action", "multiview"}, {"record", false}});
         QVERIFY(!mv->tile(2).recording && mv->tile(2).running);
