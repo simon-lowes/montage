@@ -2032,7 +2032,12 @@ struct LiveOrigin::State {
     // (what is sent counts as taken when nothing was waiting before it: the 20 s are from then)
     void send(Request& r, const QByteArray& bytes) {
         if (r.socket->bytesToWrite() == 0) r.moved = Clock::now();
-        r.socket->write(bytes);
+        // (in pieces, each handed to the system on its own: Windows takes one send whole, however far past the
+        // connection's buffer, so a client that reads nothing would be sent all of a big file and never seen to stall)
+        constexpr qsizetype kPiece = 64 << 10;
+        if (bytes.size() <= kPiece) r.socket->write(bytes);
+        else
+            for (qsizetype at = 0; at < bytes.size(); at += kPiece) r.socket->write(bytes.mid(at, kPiece));
     }
     void close(Request& r) {
         r.done = true;
