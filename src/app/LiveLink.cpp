@@ -148,6 +148,10 @@ LiveLink::~LiveLink() {
         *cancel_ = true;
         worker_->cancel(runningId_);
     }
+    if (copy_) {
+        std::lock_guard l(copy_->m);
+        if (copy_->returned && !copy_->path.isEmpty()) QFile::remove(copy_->path), QFile::remove(copy_->path + ".bak");
+    }
     stop();
 }
 
@@ -661,6 +665,7 @@ void LiveLink::pump() {
     connect(watcher, &QFutureWatcher<std::string>::finished, this, [this, watcher, job, tool, live, before, snapshot, path, cancel] {
         std::string answer = watcher->result();
         watcher->deleteLater();
+        copy_.reset();
         if (job.async.isEmpty() && !answer.empty()) {
             QJsonObject reply = QJsonDocument::fromJson(QByteArray::fromStdString(answer)).object();
             reply["id"] = job.message.value("id");
@@ -684,10 +689,15 @@ void LiveLink::pump() {
         busy_ = false;
         pump();
     });
-    const QString copy = live ? path : QString();
+    auto copy = std::make_shared<RunningCopy>();
+    copy->path = live ? path : QString();
+    copy_ = copy;
     watcher->setFuture(QtConcurrent::run([worker, line, cancel, copy] {
         const std::vector<std::string> lines = worker->handle(line);
-        if (*cancel && !copy.isEmpty()) QFile::remove(copy), QFile::remove(copy + ".bak");
+        // (stopped before it returned; else whoever gets its answer removes the copy: the link, or its destructor)
+        std::lock_guard l(copy->m);
+        copy->returned = true;
+        if (*cancel && !copy->path.isEmpty()) QFile::remove(copy->path), QFile::remove(copy->path + ".bak");
         return lines.empty() ? std::string() : lines.back();
     }));
 }

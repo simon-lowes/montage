@@ -148,6 +148,14 @@ private:
     std::deque<Job> queue_;
     bool busy_ = false;
     std::shared_ptr<std::atomic<bool>> cancel_;  // the running tool's: its result is not to be applied
+    // The running tool's copy of the open project, and whether its work has returned: a link destroyed after that
+    // (its finish never to be delivered) removes the copy itself; one destroyed before leaves it to the work.
+    struct RunningCopy {
+        std::mutex m;
+        bool returned = false;
+        QString path;
+    };
+    std::shared_ptr<RunningCopy> copy_;
     bool runningExternal_ = false;
     std::map<QTcpSocket*, QByteArray> buffers_;
 };
