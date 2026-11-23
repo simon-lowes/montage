@@ -24,6 +24,9 @@
 #include <QInputDialog>
 #include <QTreeWidgetItemIterator>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <QThread>
 #include <thread>
 #include <sstream>
 #include <QElapsedTimer>
@@ -6048,6 +6051,126 @@ private slots:
         state()->undo();
         QVERIFY(!state()->project().findMedia(takes[0])->metadata.count("focus"));
         state()->newProject();
+    }
+
+    // Focus peaking is worked out off the interface thread: a monitor painted while it is shows what it had, the interface
+    // goes on answering however long peaking takes, and frames that come meanwhile are passed over for the latest.
+    void focusPeakingOffTheInterfaceThread() {
+        const int W = 960, H = 540;
+        auto chart = [&](int cell) {
+            QImage img(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) img.setPixel(x, y, (x / cell + y / cell) % 2 ? qRgb(230, 230, 230) : qRgb(20, 20, 20));
+            return img;
+        };
+        const QColor red = peakingColours()[0].first;
+        // Each picture waits at the gate, on the worker's thread, until the test opens it.
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool open = false, offThread = true;
+            int calls = 0;
+        };
+        auto gate = std::make_shared<Gate>();
+        QThread* const ui = QThread::currentThread();
+        ViewerWidget::setPeakingGateForTesting([gate, ui] {
+            std::unique_lock lock(gate->m);
+            ++gate->calls;
+            if (QThread::currentThread() == ui) gate->offThread = false;
+            gate->cv.wait(lock, [&] { return gate->open; });
+        });
+        auto setOpen = [gate](bool open) {
+            {
+                std::lock_guard lock(gate->m);
+                gate->open = open;
+            }
+            gate->cv.notify_all();
+        };
+        auto calls = [gate] {
+            std::lock_guard lock(gate->m);
+            return gate->calls;
+        };
+        auto putBack = qScopeGuard([&] {
+            setOpen(true);
+            ViewerWidget::setPeakingGateForTesting({});
+        });
+
+        ViewerWidget v;
+        v.resize(660, 380);
+        v.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&v));
+        v.setPeakingAtMonitorSize(false);
+        v.setImage(chart(24), 0);
+        const QImage a = v.image();
+        const QImage peakedA = focusPeakingView(a, red, 1);
+        v.setFocusPeaking(true);
+        // Painted while peaking is held: the paint does not wait, and shows the picture without peaking.
+        v.repaint();
+        QVERIFY(v.peakingPending());
+        QCOMPARE(v.paintedImage(), a);
+        QTRY_COMPARE(calls(), 1);
+        bool answered = false;
+        QTimer::singleShot(0, &v, [&] { answered = true; });
+        QTRY_VERIFY(answered);
+        QVERIFY(v.peakingPending());
+        // Let through: drawn when ready.
+        QSignalSpy shown(&v, &ViewerWidget::peakingShown);
+        setOpen(true);
+        QTRY_COMPARE(shown.count(), 1);
+        QVERIFY(!v.peakingPending());
+        QTRY_COMPARE(v.paintedImage(), peakedA);
+
+        // Two frames while the first of them is held: the last picture peaked shown meanwhile, and only the latest
+        // frame peaked after it.
+        setOpen(false);
+        v.setImage(chart(40), 1);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), peakedA);
+        QTRY_COMPARE(calls(), 2);
+        v.setImage(chart(56), 2);
+        const QImage peakedC = focusPeakingView(v.image(), red, 1);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), peakedA);
+        QCOMPARE(calls(), 2);
+        setOpen(true);
+        QTRY_COMPARE(v.paintedImage(), peakedC);
+        QVERIFY(!v.peakingPending());
+        QCOMPARE(calls(), 3);
+
+        // The picture as drawn, asked for (as tests and drawnImage ask), is worked out on the spot, and a
+        // paint after it peaks nothing again.
+        v.setImage(a, 3);
+        QCOMPARE(v.shownImage(), peakedA);
+        v.repaint();
+        QVERIFY(!v.peakingPending());
+        QCOMPARE(v.paintedImage(), peakedA);
+        QCOMPARE(calls(), 3);
+
+        // Off and on again: no old frame's peaking shown while the new one is worked out.
+        v.setFocusPeaking(false);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), a);
+        setOpen(false);
+        v.setImage(chart(40), 4);
+        const QImage b = v.image();
+        v.setFocusPeaking(true);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), b);
+        QTRY_COMPARE(calls(), 4);
+        setOpen(true);
+        QTRY_COMPARE(v.paintedImage(), focusPeakingView(b, red, 1));
+        QVERIFY(!v.peakingPending());
+        QVERIFY(gate->offThread);
+        // Off with one held: it lands, and nothing peaked is drawn.
+        setOpen(false);
+        v.setImage(a, 5);
+        v.repaint();
+        QTRY_COMPARE(calls(), 5);
+        v.setFocusPeaking(false);
+        setOpen(true);
+        QTRY_VERIFY(!v.peakingPending());
+        v.repaint();
+        QCOMPARE(v.paintedImage(), a);
     }
 
     void gamutScopeAndChecks() {

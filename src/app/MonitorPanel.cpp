@@ -25,6 +25,7 @@
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <utility>
 
 #include <QFutureWatcher>
@@ -92,6 +93,11 @@ void ViewerWidget::setExposureView(int mode) {
 
 void ViewerWidget::setFocusPeaking(bool on) {
     peaking_ = on;
+    if (!on) {
+        // (turned on again later, no old frame's peaking is shown while the new one is worked out)
+        peaked_ = QImage();
+        peakedKey_ = -1;
+    }
     update();
 }
 
@@ -124,23 +130,86 @@ void ViewerWidget::setSignal(const QImage& signal, FrameTime t, const QString& s
     if (exposure_ >= int(ExposureView::OutOfGamut709)) update();
 }
 
+namespace {
+std::mutex peakingGateMutex;
+std::function<void()> peakingGate;
+
+// The picture peaked: found in `image` at `size` (scaled as the monitor draws it), painted over `over` (an exposure check's
+// view of it) when there is one.
+QImage peakedAt(const QImage& image, const QImage& over, QSize size, const QColor& colour, int sensitivity) {
+    auto at = [&](const QImage& img) { return size == img.size() ? img : img.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation); };
+    return focusPeakingView(at(image), colour, sensitivity, over.isNull() ? QImage() : at(over));
+}
+}  // namespace
+
+void ViewerWidget::setPeakingGateForTesting(std::function<void()> gate) {
+    std::lock_guard lock(peakingGateMutex);
+    peakingGate = std::move(gate);
+}
+
+QString ViewerWidget::peakingWanted(QImage& exposed, QSize& size) const {
+    exposed = exposure_ ? exposedImage() : image_;
+    // Peaking is found in the picture itself (not in an exposure check's stripes and bands), at the monitor's size (scaled
+    // as it is drawn) or in its own pixels.
+    size = peakingSize();
+    return QStringLiteral("%1 %2 %3 %4x%5").arg(peakingColour_.name()).arg(peakingSensitivity_).arg(exposure_)
+        .arg(size.width()).arg(size.height());
+}
+
 QImage ViewerWidget::shownImage() const {
     if (!overlaid() || image_.isNull()) return image_;
-    const QImage exposed = exposure_ ? exposedImage() : image_;
+    QImage exposed;
+    QSize size;
+    const QString state = peakingWanted(exposed, size);
     if (!peaking_) return exposed;
-    // Peaking over that, found in the picture itself (not in an exposure check's stripes and bands) at the monitor's size
-    // (scaled as it is drawn) or in its own pixels.
-    const QSize size = peakingSize();
-    const QString state = QStringLiteral("%1 %2 %3 %4x%5").arg(peakingColour_.name()).arg(peakingSensitivity_).arg(exposure_)
-                              .arg(size.width()).arg(size.height());
     if (peakedKey_ != exposed.cacheKey() || peakedState_ != state || peaked_.isNull()) {
-        auto at = [&](const QImage& img) { return size == img.size() ? img : img.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation); };
-        const QImage picture = at(image_);
-        peaked_ = focusPeakingView(picture, peakingColour_, peakingSensitivity_, exposure_ ? at(exposed) : QImage());
+        peaked_ = peakedAt(image_, exposure_ ? exposed : QImage(), size, peakingColour_, peakingSensitivity_);
         peakedKey_ = exposed.cacheKey();
         peakedState_ = state;
     }
     return peaked_;
+}
+
+QImage ViewerWidget::paintedPicture() {
+    if (!overlaid() || image_.isNull()) return image_;
+    QImage exposed;
+    QSize size;
+    const QString state = peakingWanted(exposed, size);
+    if (!peaking_) return exposed;
+    if (peakedKey_ == exposed.cacheKey() && peakedState_ == state && !peaked_.isNull()) return peaked_;
+    if (!peakingWatch_) {
+        // Worked out off the interface thread; one at a time, so frames that came meanwhile are passed over for the latest.
+        peakingWatch_ = new QFutureWatcher<QImage>(this);
+        const qint64 key = exposed.cacheKey();
+        connect(peakingWatch_, &QFutureWatcher<QImage>::finished, this, [this, key, state] {
+            const QImage result = peakingWatch_->result();
+            peakingWatch_->deleteLater();
+            peakingWatch_ = nullptr;
+            // Kept unless peaking went off meanwhile, or the picture as it is now was peaked on the spot (shownImage).
+            QImage exposedNow;
+            QSize sizeNow;
+            const QString stateNow = peakingWanted(exposedNow, sizeNow);
+            if (peaking_ && !(peakedKey_ == exposedNow.cacheKey() && peakedState_ == stateNow && !peaked_.isNull())) {
+                peaked_ = result;
+                peakedKey_ = key;
+                peakedState_ = state;
+            }
+            update();  // (and if this was not the latest picture asked for, that one is peaked next)
+            emit peakingShown();
+        });
+        peakingWatch_->setFuture(QtConcurrent::run([image = image_, over = exposure_ ? exposed : QImage(), size,
+                                                    colour = peakingColour_, sensitivity = peakingSensitivity_] {
+            std::function<void()> gate;
+            {
+                std::lock_guard lock(peakingGateMutex);
+                gate = peakingGate;
+            }
+            if (gate) gate();
+            return peakedAt(image, over, size, colour, sensitivity);
+        }));
+    }
+    // Meanwhile the last picture peaked, or the first time the picture without peaking.
+    return peaked_.isNull() ? exposed : peaked_;
 }
 
 QImage ViewerWidget::exposedImage() const {
@@ -232,7 +301,8 @@ void ViewerWidget::paintContent(QPainter& p, bool picture) {
     p.setRenderHint(QPainter::SmoothPixmapTransform);
     if (picture || overlaid()) {
         // (the exposure check and focus peaking are an SDR picture, drawn over HDR too)
-        p.drawImage(r, calibrated_[0].get(overlaid() ? shownImage() : image_, lut));
+        painted_ = overlaid() ? paintedPicture() : image_;
+        p.drawImage(r, calibrated_[0].get(painted_, lut));
     } else {
         // Where the HDR surface's picture shows through.
         p.save();
