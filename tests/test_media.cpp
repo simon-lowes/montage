@@ -24541,6 +24541,339 @@ if ui["pressed"] == "add":
         QVERIFY2(issues.front().text.find("schedule 1") != std::string::npos, issues.front().text.c_str());
     }
 
+    void hrdConcatenatedJoin() {
+        // The HEVC file of the test above: its HRD stated, VBR at 600 kb/s into a second's buffer, a buffering period
+        // at each keyframe (the later ones CRA pictures with leading pictures after them).
+        Project gen = makeDefaultProject();
+        {
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = Rational{25, 1};
+            Clip grad = makeGeneratorClip(gen, "gradient", 60);
+            grad.generator.params["angle"].addKey(0, 0.0);
+            grad.generator.params["angle"].addKey(59, 140.0);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = 0.05;
+            grad.effects.push_back(grain);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, grad);
+        }
+        ExportSettings st;
+        st.videoCodec = "libx265";
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.gop = 12;
+        st.hrd = "vbr";
+        st.videoBitrate = 600000;
+        st.path = path("joined-src.mp4");
+        std::string err;
+        QVERIFY2(exportSequence(gen, *gen.active(), st, nullptr, nullptr, &err), err.c_str());
+
+        // What a buffering period says of one NAL schedule.
+        struct Period {
+            bool irapParams = false, concatenation = false;
+            int64_t cpbDelayOffset = 0, dpbDelayOffset = 0, delta = 0;
+            int64_t delay = 0, offset = 0, altDelay = 0, altOffset = 0;
+        };
+        // One access unit as it was written: its first slice's NAL unit type, its buffering period as the source had
+        // it, and its size as the check counts it.
+        struct Written {
+            int type = -1;
+            bool period = false;
+            Period said;
+            int64_t bits = 0;
+        };
+        hrd::Sps sps;
+        // The same pictures as a raw stream whose buffer is stated twice as large (they keep it all the more, and a
+        // longer initial delay fits it). `change` is asked at each buffering period, with its number and how many
+        // access units back the last picture that is not discardable lies: it may alter what the period says, and ask
+        // for its picture to become a BLA picture whose leading pictures are left out of the stream.
+        using Change = std::function<void(int period, int back, Period& p, bool& bla)>;
+        auto restate = [&](const std::string& out, const Change& change, std::vector<Written>& written) {
+            written.clear();
+            AVFormatContext* in = nullptr;
+            if (avformat_open_input(&in, st.path.c_str(), nullptr, nullptr) < 0) return false;
+            avformat_find_stream_info(in, nullptr);
+            const AVCodecParameters* par = in->streams[0]->codecpar;
+            int lengthSize = 0;
+            const auto sets = hrd::parameterSets(AV_CODEC_ID_HEVC, par->extradata, size_t(par->extradata_size), lengthSize);
+            QByteArray head;
+            auto put = [](QByteArray& to, const std::vector<uint8_t>& nalUnit) {
+                to.append("\0\0\0\1", 4);
+                to.append(reinterpret_cast<const char*>(nalUnit.data()), qsizetype(nalUnit.size()));
+            };
+            sps = hrd::Sps();
+            for (const std::vector<uint8_t>& u : sets) {
+                if (((u[0] >> 1) & 0x3f) != 33) {
+                    put(head, u);
+                    continue;
+                }
+                sps = hrd::parseHevcSps(u.data(), u.size());
+                if (!sps.valid || !sps.hrdTo || !sps.nal.present || sps.vcl.present || sps.nal.cpbs.size() != 1 || sps.nal.cpbs[0].cbr) return false;
+                const std::vector<uint8_t> rbsp = nal::unescape(u.data(), u.size());
+                nal::Writer w;
+                w.copy(rbsp, 16, sps.hrdFrom);
+                w.flag(true);   // vui_hrd_parameters_present_flag
+                w.flag(true);   // nal_hrd_parameters_present_flag
+                w.flag(false);  // vcl_hrd_parameters_present_flag
+                w.flag(false);  // sub_pic_hrd_params_present_flag
+                w.u(0, 4);      // bit_rate_scale: 64 bits/s
+                w.u(0, 4);      // cpb_size_scale: 16 bits
+                w.u(uint64_t(sps.nal.initialDelayLength - 1), 5);
+                w.u(uint64_t(sps.nal.cpbDelayLength - 1), 5);
+                w.u(uint64_t(sps.nal.dpbDelayLength - 1), 5);
+                for (int layer = 0; layer <= sps.maxSubLayersMinus1; ++layer) {
+                    w.flag(true);  // fixed_pic_rate_general_flag
+                    w.ue(0);       // elemental_duration_in_tc_minus1
+                    w.ue(0);       // cpb_cnt_minus1: one schedule
+                    w.ue(uint64_t(sps.nal.cpbs[0].bitRate / 64) - 1);
+                    w.ue(uint64_t(2 * sps.nal.cpbs[0].size / 16) - 1);
+                    w.flag(false);
+                }
+                w.copy(rbsp, sps.hrdTo, nal::stopBit(rbsp));
+                w.trailing();
+                put(head, nal::escape(u.data(), 2, w.out));
+            }
+            if (!sps.valid) return false;
+            const hrd::Params& hp = sps.nal;
+            QFile f(QString::fromStdString(out));
+            if (!f.open(QIODevice::WriteOnly)) return false;
+            std::map<int, hrd::Sps> spsSeen;
+            std::map<int, hrd::Pps> ppsSeen;
+            AVPacket* pkt = av_packet_alloc();
+            bool ok = true, dropping = false;
+            int periods = 0, back = 1;
+            while (ok && av_read_frame(in, pkt) >= 0) {
+                std::vector<std::vector<uint8_t>> units;
+                for (int at = 0; at + 4 <= pkt->size;) {
+                    const int n = int(qFromBigEndian<quint32>(pkt->data + at));
+                    at += 4;
+                    if (n < 2 || at + n > pkt->size) {
+                        ok = false;
+                        break;
+                    }
+                    units.emplace_back(pkt->data + at, pkt->data + at + n);
+                    at += n;
+                }
+                av_packet_unref(pkt);
+                Written wr;
+                int temporal = 0;
+                for (const std::vector<uint8_t>& u : units)
+                    if (((u[0] >> 1) & 0x3f) < 32) {
+                        wr.type = (u[0] >> 1) & 0x3f;
+                        temporal = (u[1] & 7) - 1;
+                        break;
+                    }
+                // (a BLA picture's leading pictures that cannot be decoded are not in the stream)
+                if (dropping && (wr.type == 8 || wr.type == 9)) continue;
+                if (wr.type >= 16 && wr.type <= 23) dropping = false;
+                bool bla = false;
+                QByteArray au = written.empty() ? head : QByteArray();
+                for (std::vector<uint8_t>& u : units) {
+                    const int type = (u[0] >> 1) & 0x3f;
+                    if (type == 39) {
+                        // A prefix SEI: its buffering period message is read, changed as asked and written again.
+                        const std::vector<uint8_t> rbsp = nal::unescape(u.data(), u.size(), 2);
+                        std::vector<uint8_t> made;
+                        size_t pos = 0;
+                        while (pos + 2 <= rbsp.size()) {
+                            int kind = 0, size = 0;
+                            while (pos < rbsp.size() && rbsp[pos] == 0xff) kind += 255, ++pos;
+                            kind += rbsp[pos++];
+                            while (pos < rbsp.size() && rbsp[pos] == 0xff) size += 255, ++pos;
+                            size += rbsp[pos++];
+                            if (pos + size_t(size) > rbsp.size()) {
+                                ok = false;
+                                break;
+                            }
+                            std::vector<uint8_t> payload(rbsp.begin() + qsizetype(pos), rbsp.begin() + qsizetype(pos) + size);
+                            pos += size_t(size);
+                            if (kind == 0) {
+                                nal::Reader r(payload);
+                                Period p;
+                                const uint64_t id = r.ue();  // bp_seq_parameter_set_id
+                                p.irapParams = r.flag();
+                                if (p.irapParams) p.cpbDelayOffset = int64_t(r.u(hp.cpbDelayLength)), p.dpbDelayOffset = int64_t(r.u(hp.dpbDelayLength));
+                                p.concatenation = r.flag();
+                                p.delta = int64_t(r.u(hp.cpbDelayLength));  // au_cpb_removal_delay_delta_minus1
+                                p.delay = int64_t(r.u(hp.initialDelayLength)), p.offset = int64_t(r.u(hp.initialDelayLength));
+                                if (p.irapParams) p.altDelay = int64_t(r.u(hp.initialDelayLength)), p.altOffset = int64_t(r.u(hp.initialDelayLength));
+                                ok = ok && r.ok;
+                                wr.period = true;
+                                wr.said = p;
+                                if (change) change(periods, back, p, bla);
+                                ++periods;
+                                for (const int64_t v : {p.delay, p.offset, p.altDelay, p.altOffset}) ok = ok && v >= 0 && v < (int64_t(1) << hp.initialDelayLength);
+                                ok = ok && p.delta >= 0 && p.delta < (int64_t(1) << hp.cpbDelayLength) && p.cpbDelayOffset < (int64_t(1) << hp.cpbDelayLength);
+                                nal::Writer w;
+                                w.ue(id);
+                                w.flag(p.irapParams);
+                                if (p.irapParams) w.u(uint64_t(p.cpbDelayOffset), hp.cpbDelayLength), w.u(uint64_t(p.dpbDelayOffset), hp.dpbDelayLength);
+                                w.flag(p.concatenation);
+                                w.u(uint64_t(p.delta), hp.cpbDelayLength);
+                                w.u(uint64_t(p.delay), hp.initialDelayLength), w.u(uint64_t(p.offset), hp.initialDelayLength);
+                                if (p.irapParams) w.u(uint64_t(p.altDelay), hp.initialDelayLength), w.u(uint64_t(p.altOffset), hp.initialDelayLength);
+                                w.payloadAlign();
+                                payload = w.out;
+                            }
+                            for (int v = kind; ; v -= 255) {
+                                made.push_back(uint8_t(std::min(v, 255)));
+                                if (v < 255) break;
+                            }
+                            for (int v = int(payload.size()); ; v -= 255) {
+                                made.push_back(uint8_t(std::min(v, 255)));
+                                if (v < 255) break;
+                            }
+                            made.insert(made.end(), payload.begin(), payload.end());
+                        }
+                        made.push_back(0x80);
+                        u = nal::escape(u.data(), 2, made);
+                    } else if (type < 32 && bla) {
+                        // (BLA_W_RADL: no leading picture that needs what came before the join)
+                        u[0] = uint8_t((u[0] & 0x81) | (17 << 1));
+                        wr.type = 17;
+                        dropping = true;
+                    }
+                    put(au, u);
+                }
+                hrd::AccessUnit counted;
+                ok = ok && hrd::readAccessUnit(AV_CODEC_ID_HEVC, reinterpret_cast<const uint8_t*>(au.constData()), size_t(au.size()), 0, spsSeen, ppsSeen, counted);
+                wr.bits = counted.bits;
+                f.write(au);
+                written.push_back(wr);
+                // (H.265 C.2.3's prevNonDiscardablePic: TemporalId 0, and not a RASL, RADL or sub-layer non-reference picture)
+                const bool discardable = temporal != 0 || (wr.type >= 6 && wr.type <= 9) || (wr.type <= 14 && wr.type % 2 == 0);
+                back = discardable ? back + 1 : 1;
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&in);
+            return ok && periods >= 4;
+        };
+
+        // As it was, but for the buffer's stated size: it conforms, a picture leaving the buffer every frame.
+        std::vector<Written> plain;
+        const std::string asWas = path("joined-as-was.hevc");
+        QVERIFY(restate(asWas, {}, plain));
+        const HrdReport was = checkHrd(asWas);
+        QVERIFY2(was.checked && was.signalled && was.conforms(), was.summary().c_str());
+        QCOMPARE(was.schedules.size(), size_t(1));
+        QCOMPARE(was.frames, int64_t(60));
+        QCOMPARE(plain.size(), size_t(60));
+        // The schedule reckoned here as H.265 C.2.2 and C.2.3 give it: a removal each clock tick from the first
+        // period's initial delay, each picture arriving at the stated rate no earlier than its period's delays allow.
+        const double tc = sps.tick(), rate = sps.nal.cpbs[0].bitRate;
+        QVERIFY(tc > 0 && rate > 0);
+        std::vector<double> removal(plain.size()), arrived(plain.size());
+        double sum = 0;
+        for (size_t k = 0; k < plain.size(); ++k) {
+            const Written& u = plain[k];
+            if (u.period) sum = double(u.said.delay + u.said.offset) / 90000;
+            removal[k] = k == 0 ? double(u.said.delay) / 90000 : removal[k - 1] + tc;
+            const double from = k == 0 ? 0 : std::max(arrived[k - 1], removal[k] - (u.period ? double(u.said.delay) / 90000 : sum));
+            arrived[k] = from + double(u.bits) / rate;
+        }
+        QVERIFY2(std::fabs(was.schedules[0].lastRemoval - removal.back()) < 1e-9,
+                 qPrintable(QStringLiteral("%1 and %2").arg(was.schedules[0].lastRemoval, 0, 'f', 6).arg(removal.back(), 0, 'f', 6)));
+        // The join is made at the third buffering period: a CRA picture, the picture before it in decoding order a
+        // discardable one, so the delta is counted from further back than one picture.
+        size_t join = 0;
+        int leading = 0;
+        for (size_t k = 0, n = 0; k < plain.size(); ++k)
+            if (plain[k].period && n++ == 2) join = k;
+        QVERIFY(join > 1 && plain[join].type == 21);
+        for (size_t k = join + 1; k < plain.size() && (plain[k].type == 8 || plain[k].type == 9); ++k) ++leading;
+        QVERIFY(leading > 0);
+        QVERIFY(plain[join - 1].type == 0);
+        QVERIFY(arrived[join - 1] <= removal[join - 1]);
+
+        // A seamless join: concatenation_flag set and the delta counted from the last picture that is not discardable,
+        // the initial delay as the buffer holds it. Both removal times C.2.3 gives agree, the stream conforms and its
+        // last picture leaves when it did.
+        std::vector<Written> made;
+        int backAtJoin = 0;
+        const std::string seamless = path("joined-seamless.hevc");
+        QVERIFY(restate(seamless, [&](int period, int back, Period& p, bool&) {
+            if (period != 2) return;
+            backAtJoin = back;
+            p.concatenation = true;
+            p.delta = back - 1;
+        }, made));
+        QVERIFY(backAtJoin > 1);
+        const HrdReport smooth = checkHrd(seamless);
+        QVERIFY2(smooth.checked && smooth.conforms(), (smooth.summary() + " " + (smooth.issues.empty() ? std::string() : smooth.issues.front().text)).c_str());
+        QCOMPARE(smooth.frames, int64_t(60));
+        QVERIFY(std::fabs(smooth.schedules[0].lastRemoval - removal.back()) < 1e-9);
+
+        // The same join with an initial delay the buffer cannot hold by then: the first removal time (the delta's) is
+        // as before, and only the second (when the buffer has held the picture for its initial delay, counted from the
+        // arrival of the picture before) is later, by two clock ticks. The later one stands: the join is reported, and
+        // every picture from it leaves two ticks late.
+        const int64_t longer = std::llround((removal[join - 1] - arrived[join - 1] + 2.5 * tc) * 90000);
+        const std::string waits = path("joined-waits.hevc");
+        QVERIFY(restate(waits, [&](int period, int back, Period& p, bool&) {
+            if (period != 2) return;
+            p.concatenation = true;
+            p.delta = back - 1;
+            p.delay = longer;
+        }, made));
+        const HrdReport late = checkHrd(waits);
+        QVERIFY2(late.checked && !late.conforms(), late.summary().c_str());
+        QCOMPARE(late.issues.size(), size_t(1));
+        QCOMPARE(late.issues[0].kind, std::string("concatenation"));
+        QCOMPARE(late.issues[0].frame, int64_t(join));
+        QCOMPARE(late.issueCount, int64_t(1));
+        QVERIFY2(late.issues[0].text.find("the later of the two removal times") != std::string::npos, late.issues[0].text.c_str());
+        QVERIFY2(std::fabs(late.schedules[0].lastRemoval - (removal.back() + 2 * tc)) < 1e-9,
+                 qPrintable(QStringLiteral("%1 and %2").arg(late.schedules[0].lastRemoval, 0, 'f', 6).arg(removal.back() + 2 * tc, 0, 'f', 6)));
+
+        // A delta that asks for three ticks more than the buffer needs: now the first time is the later one and
+        // stands. Nothing is wrong with the stream, and its pictures leave three ticks late from the join.
+        const std::string asked = path("joined-asked.hevc");
+        QVERIFY(restate(asked, [&](int period, int back, Period& p, bool&) {
+            if (period != 2) return;
+            p.concatenation = true;
+            p.delta = back - 1 + 3;
+        }, made));
+        const HrdReport gap = checkHrd(asked);
+        QVERIFY2(gap.checked && gap.conforms(), (gap.summary() + " " + (gap.issues.empty() ? std::string() : gap.issues.front().text)).c_str());
+        QVERIFY(std::fabs(gap.schedules[0].lastRemoval - (removal.back() + 3 * tc)) < 1e-9);
+
+        // The delay offset: the CRA picture made a BLA picture and its leading pictures left out. Its buffering period
+        // states alternative delays for that (the buffer's own) and a delay offset of the pictures left out, and its
+        // ordinary delay is one the buffer could not keep. The alternative delays are the ones used, and the offset
+        // closes the gap in the removal delays that follow: the stream conforms, every picture after the join leaving
+        // that many ticks earlier than in the whole stream.
+        const std::string cut = path("joined-bla.hevc");
+        QVERIFY(restate(cut, [&](int period, int, Period& p, bool& bla) {
+            if (period != 2) return;
+            bla = true;
+            p.irapParams = true;
+            p.cpbDelayOffset = leading;
+            p.dpbDelayOffset = 0;
+            p.altDelay = p.delay, p.altOffset = p.offset;
+            p.offset = p.delay + p.offset - 1, p.delay = 1;
+        }, made));
+        QCOMPARE(made.size(), plain.size() - size_t(leading));
+        QCOMPARE(made[join].type, 17);
+        const HrdReport broken = checkHrd(cut);
+        QVERIFY2(broken.checked && broken.conforms(), (broken.summary() + " " + (broken.issues.empty() ? std::string() : broken.issues.front().text)).c_str());
+        QCOMPARE(broken.frames, int64_t(60 - leading));
+        QVERIFY2(std::fabs(broken.schedules[0].lastRemoval - (removal.back() - leading * tc)) < 1e-9,
+                 qPrintable(QStringLiteral("%1 and %2").arg(broken.schedules[0].lastRemoval, 0, 'f', 6).arg(removal.back() - leading * tc, 0, 'f', 6)));
+        // Without the alternative delays (a CRA picture that stays one) the same period's ordinary delay is used, and
+        // the buffer cannot keep it.
+        const std::string kept = path("joined-cra.hevc");
+        QVERIFY(restate(kept, [&](int period, int, Period& p, bool&) {
+            if (period != 2) return;
+            p.irapParams = true;
+            p.cpbDelayOffset = leading;
+            p.altDelay = p.delay, p.altOffset = p.offset;
+            p.offset = p.delay + p.offset - 1, p.delay = 1;
+        }, made));
+        const HrdReport ordinary = checkHrd(kept);
+        QVERIFY2(ordinary.checked && !ordinary.conforms(), ordinary.summary().c_str());
+        QCOMPARE(ordinary.frames, int64_t(60));
+        QVERIFY(std::fabs(ordinary.schedules[0].lastRemoval - removal.back()) < 1e-9);
+    }
+
     void av1DecoderModel() {
         // AV1 that states its decoder model: libaom writes one when asked (timing-info=model). 40 frames of a moving
         // gradient at 320x180, 300 kb/s, a key frame every 12.
