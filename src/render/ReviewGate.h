@@ -12,6 +12,15 @@
 // its network's ration as it was, for the next reviewer behind the same network. The last try of a ration is kept for
 // addresses with no wrong passphrase on record: guessers who keep asking faster than the ration fills have theirs on
 // record, so they keep it from reaching more than one try, and that one goes to the next newcomer instead.
+//
+// The last try is kept from addresses, and an address is a cheap thing to change (an IPv6 /48 holds 65,536 /64s): a
+// guesser who sends each guess from a fresh address takes it. So, once the list is full, a network not in it that
+// has guessed nothing wrong lately is tried even when the ration the networks not listed share is out: the network,
+// not the address, is what has guessed nothing yet, and a newcomer from there with the right passphrase is let in at
+// once however the others guess. Each wrong passphrase from such a network puts the network on record for a quarter
+// of an hour (kRecorded networks at most; once the record is full the shared ration alone decides again), so this
+// costs one try a network in a quarter of an hour: guessing from fresh addresses gains nothing, and guessing from
+// fresh networks gains one try for each, as it did while the list had room.
 #pragma once
 
 #include <QString>
@@ -33,7 +42,8 @@ public:
     static constexpr double kPeerRate = 1, kPeerBurst = 8;   // and from one address not yet let in
     static constexpr std::chrono::hours kTrustedMemory{1};   // how long a right passphrase lets its address past the rest
     static constexpr std::chrono::minutes kFailureMemory{15};  // how long a wrong one is held against its address and network
-    static constexpr size_t kListed = 4096;                  // addresses and networks remembered
+    static constexpr size_t kListed = 4096;                  // networks listed, and addresses remembered as let in or asking
+    static constexpr size_t kRecorded = 4 * kListed;         // addresses with a wrong passphrase on record, and networks not listed
 
     enum class Answer { Try, Blocked, AddressBusy, NetworkBusy };
     struct Verdict {
@@ -48,7 +58,8 @@ public:
         forget(trusted_, [&](Clock::time_point t) { return now - t > kTrustedMemory; });
         forget(peers_, [&](const Bucket& b) { return now - b.at > std::chrono::minutes(1); });
         forget(listed_, [&](const Ration& n) { return now - n.last > kFailureMemory; });
-        while (failures_.size() > kListed)
+        forget(elsewhereWrong_, [&](Clock::time_point t) { return now - t > kFailureMemory; });
+        while (failures_.size() > kRecorded)
             failures_.erase(std::min_element(failures_.begin(), failures_.end(), [](const auto& a, const auto& b) { return a.second.last < b.second.last; }));
     }
     // Whether the address gave the right passphrase lately (as of the last tidy()).
@@ -76,7 +87,12 @@ public:
         ration->at = now;
         // (an address that has guessed wrong lately leaves the last try for one that has not)
         const double least = onRecord == failures_.end() ? 1 : 1 + kKeptForNewcomers;
-        if (ration->tokens < least) return {Answer::NetworkBusy, int(std::clamp(std::ceil((least - ration->tokens) / rate), 1.0, 600.0)), false};
+        if (ration->tokens < least) {
+            // (the ration shared by the networks not listed out: one of them that has guessed nothing wrong lately
+            // is tried all the same, while the record of such networks has room)
+            if (ration == &elsewhere_ && !elsewhereWrong_.count(network) && elsewhereWrong_.size() < kRecorded) return {Answer::Try, 0, false};
+            return {Answer::NetworkBusy, int(std::clamp(std::ceil((least - ration->tokens) / rate), 1.0, 600.0)), false};
+        }
         ration->tokens -= 1;
         return {Answer::Try, 0, true};
     }
@@ -105,6 +121,9 @@ public:
             n.last = now;
             n.at = now;
             n.tokens = std::clamp(std::floor(kListedBurst / double(listed_.size())), 0.0, kNetworkBurst);
+        } else if (elsewhereWrong_.size() < kRecorded || elsewhereWrong_.count(network)) {
+            // (a network the list has no room for is put on record: it has had its try past the shared ration)
+            elsewhereWrong_[network] = now;
         }
         // (per address: wrong guesses from elsewhere never hold back anyone's answer, the rations bound how fast all
         // of them together may guess)
@@ -113,6 +132,8 @@ public:
     }
 
     size_t networksListed() const { return listed_.size(); }
+    size_t addressesOnRecord() const { return failures_.size(); }
+    size_t networksOnRecord() const { return elsewhereWrong_.size(); }
 
 private:
     struct Failures {
@@ -155,6 +176,7 @@ private:
     std::map<QString, Clock::time_point> trusted_;  // addresses that gave the right passphrase lately
     std::map<QString, Ration> listed_;             // by network: those that guessed wrong lately
     Ration elsewhere_;                             // every network not listed, once the list is full
+    std::map<QString, Clock::time_point> elsewhereWrong_;  // networks not listed that guessed wrong lately
     bool elsewhereBegun_ = false;
 };
 
