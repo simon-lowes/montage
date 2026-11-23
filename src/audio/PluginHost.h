@@ -84,19 +84,26 @@ private:
 bool renderingRealtime();
 
 // An export marks its thread with this for as long as it renders. A plug-in that fails in its host, or is found
-// bypassed, by an offline render on a thread so marked stops that export (offlineFailureSerial() goes up): an audio
-// plug-in in its mix, or an OpenFX plug-in whose picture came back without it. Met by any other offline render, such
-// as a background analysis with a mixer of its own or an OpenFX plug-in's on-screen controls, it is recorded for the
-// main window's bar and nothing more: an export running beside it carries on, as its own render has lost nothing.
+// bypassed, by an offline render on a thread so marked stops that export (its failures() go up, and
+// offlineFailureSerial() with them): an audio plug-in in its mix, or an OpenFX plug-in whose picture came back without
+// it. Met by any other offline render, such as a background analysis with a mixer of its own or an OpenFX plug-in's
+// on-screen controls, it is recorded for the main window's bar and nothing more. Another export running at the same
+// time carries on too, as its own render has lost nothing: each export counts its own failures (a scope made on a
+// thread that already has one counts into that one's).
+struct ExportFailures;
 class ExportScope {
 public:
     ExportScope();
     ~ExportScope();
     ExportScope(const ExportScope&) = delete;
     ExportScope& operator=(const ExportScope&) = delete;
+    uint64_t failures() const;        // plug-in failures this export's render has met
+    std::string lastFailure() const;  // the last of them, as lastOfflineFailure() words it
 
 private:
-    bool previous_;
+    std::unique_ptr<ExportFailures> own_;
+    ExportFailures* failures_ = nullptr;
+    ExportFailures* previous_ = nullptr;
 };
 bool renderingForExport();
 
@@ -122,8 +129,9 @@ struct HostFailure {
 std::vector<HostFailure> hostFailures();
 // Goes up with each failure, restart or change of the list (the main window's bar watches it).
 uint64_t hostFailureSerial();
-// Goes up with each failure during an export's render (ExportScope), and when an export's render finds a plug-in
-// bypassed; lastOfflineFailure() says what it was.
+// Goes up with each failure during any export's render (ExportScope), and when an export's render finds a plug-in
+// bypassed; lastOfflineFailure() says what it was. (An export asks its own ExportScope, not these: they count every
+// export's.)
 uint64_t offlineFailureSerial();
 std::string lastOfflineFailure();
 // Starts the plug-in's bypassed instances again, in fresh hosts, with their last saved states (false: none bypassed).

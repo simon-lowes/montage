@@ -3064,6 +3064,62 @@ private slots:
         }
     }
 
+    // Nightly 23 Nov: an export stops for the plug-in failures of its own render only. Two exports run at once. One
+    // has an OpenFX plug-in that fails to render in Montage's own process at its third picture: it stops, naming the
+    // plug-in. The other, held in the middle of its frames until the first has stopped, goes through. (Failures were
+    // counted for all exports together, so the second stopped as well.)
+    void exportsAtOnceStopForTheirOwnPluginFailures() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-export-two-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert));
+        Hosting inProcess(Isolation::InProcess);
+        auto project = [&](bool withPlugin) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+            Clip clip = makeGeneratorClip(p, "color", 10);
+            if (withPlugin) clip.effects.push_back(ofx::makeEffect(p, invert));
+            edit::overwrite(p, s, {TrackKind::Video, 0}, clip);
+            return p;
+        };
+        const Project failing = project(true), plain = project(false);
+        ExportSettings stFailing, stPlain;
+        stFailing.path = path("ofx-export-fails.mkv").toStdString();
+        stPlain.path = path("ofx-export-beside.mkv").toStdString();
+        stFailing.videoCodec = stPlain.videoCodec = "ffv1";
+        stFailing.audioCodec = stPlain.audioCodec = "none";
+        std::atomic<bool> started{false}, release{false};
+        bool besideOk = false;
+        std::string besideError;
+        std::thread beside([&] {
+            besideOk = exportSequence(plain, *plain.active(), stPlain,
+                                      [&](double, FrameTime) {
+                                          started = true;
+                                          while (!release) QThread::msleep(2);
+                                      },
+                                      nullptr, &besideError);
+        });
+        const bool running = eventually([&] { return started.load(); });
+        bool failedOk = true;
+        std::string failedError;
+        if (running) {
+            Fault f("fail:render:2");
+            failedOk = exportSequence(failing, *failing.active(), stFailing, nullptr, nullptr, &failedError);
+        }
+        release = true;
+        beside.join();
+        QVERIFY(running);
+        QVERIFY(!failedOk);
+        QVERIFY2(QString::fromStdString(failedError).startsWith("Export stopped because the plug-in Test Invert "), failedError.c_str());
+        QVERIFY2(besideOk, besideError.c_str());
+        // With the plug-in rendering again, the first goes through too.
+        QVERIFY2(exportSequence(failing, *failing.active(), stFailing, nullptr, nullptr, &failedError), failedError.c_str());
+    }
+
     // Phase 15 #2: OpenFX on-screen controls drawn by the plug-in's host. The host draws them (the Draw Suite and
     // OpenGL alike) into one premultiplied picture at the monitor's size and pixel ratio; it is the drawing Montage
     // makes in its own process, within 1/255, and a drag sets what it sets there. No instance is made in Montage.

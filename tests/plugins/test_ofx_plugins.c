@@ -28,6 +28,7 @@
 #include <signal.h>
 #endif
 
+#define MONTAGE_TEST_FAULT_FAILS
 #include "test_fault.h"
 
 #include "ofxColour.h"
@@ -401,6 +402,7 @@ static OfxStatus mainInvert(const char* action, const void* handle, OfxPropertyS
     if (!strcmp(action, kOfxActionOpenGLContextDetached)) return glDetached();
     if (!strcmp(action, kOfxImageEffectActionRender)) {
         montage_test_fault("render", NULL, 0);
+        if (montage_test_fault_fails("render")) return kOfxStatFailed;
         int enabled = 0;
         gProp->propGetInt(in, kOfxImageEffectPropOpenGLEnabled, 0, &enabled);
         if (enabled) return renderInvertGl(effect, in);
@@ -411,6 +413,7 @@ static OfxStatus mainInvert(const char* action, const void* handle, OfxPropertyS
     if (!strcmp(action, kOfxImageEffectActionRender)) {
 #ifndef MONTAGE_TEST_OFX_GL
         montage_test_fault("render", NULL, 0);
+        if (montage_test_fault_fails("render")) return kOfxStatFailed;
 #endif
         return render(effect, in, 1);
     }

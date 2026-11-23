@@ -24,6 +24,13 @@ namespace montage::plugins {
 
 using namespace std::chrono_literals;
 
+// One export's own count of the plug-in failures its render met (ExportScope).
+struct ExportFailures {
+    std::atomic<uint64_t> count{0};
+    std::mutex m;
+    std::string last;
+};
+
 // ---------------------------------------------------------------------------
 // Settings
 
@@ -46,7 +53,16 @@ std::atomic<int> gMemoryLimitMb{4096};
 std::atomic<int> gAutoRestarts{2};
 std::atomic<bool> gInHost{false};
 thread_local bool tRealtime = false;
-thread_local bool tExport = false;
+thread_local ExportFailures* tExport = nullptr;  // (the export rendering on this thread, if one is)
+// Tells it of a failure.
+void tellExport(const std::string& what) {
+    if (!tExport) return;
+    {
+        std::lock_guard lock(tExport->m);
+        tExport->last = what;
+    }
+    ++tExport->count;
+}
 }  // namespace
 
 const char* isolationName(Isolation i) {
@@ -141,9 +157,20 @@ RenderModeScope::RenderModeScope(bool realtime) : previous_(tRealtime) { tRealti
 RenderModeScope::~RenderModeScope() { tRealtime = previous_; }
 bool renderingRealtime() { return tRealtime; }
 
-ExportScope::ExportScope() : previous_(tExport) { tExport = true; }
+ExportScope::ExportScope() : previous_(tExport) {
+    if (!tExport) {
+        own_ = std::make_unique<ExportFailures>();
+        tExport = own_.get();
+    }
+    failures_ = tExport;
+}
 ExportScope::~ExportScope() { tExport = previous_; }
-bool renderingForExport() { return tExport; }
+uint64_t ExportScope::failures() const { return failures_->count.load(); }
+std::string ExportScope::lastFailure() const {
+    std::lock_guard lock(failures_->m);
+    return failures_->last;
+}
+bool renderingForExport() { return tExport != nullptr; }
 
 namespace remote {
 
@@ -461,6 +488,7 @@ void recordFailure(const std::string& id, const std::string& name, const std::st
             if (const size_t cut = why.rfind("; bypassed"); cut != std::string::npos) why.erase(cut);
             b.lastOffline = f.name + " " + why;
             ++b.offlineSerial;
+            tellExport(b.lastOffline);
         }
     }
     ++b.serial;
@@ -475,6 +503,7 @@ void noteOfflineFailure(const std::string& name, const std::string& why) {
         b.lastOffline = name + " " + why;
     }
     ++b.offlineSerial;
+    tellExport(name + " " + why);
 }
 
 void noteRestart(const std::string& id) {
