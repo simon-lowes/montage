@@ -50,6 +50,7 @@
 #include "render/ShapeLayers.h"
 #include "render/ExtendClip.h"
 #include "render/FootageWords.h"
+#include "media/FieldRecorder.h"
 #include "media/LanguageModel.h"
 #include "render/ColorChart.h"
 #include "render/Crosstalk.h"
