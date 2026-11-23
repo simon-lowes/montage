@@ -34159,6 +34159,152 @@ colorspaces:
                 QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
             }
     }
+    void gpuEffectsMatchCpuUhd() {
+        // Six effects on a 3840 by 2160 frame, on the GPU within 1/1023 of the CPU: each at a setting that reaches far
+        // across the picture, the last three through a feathered mask, the picture scaled and turned over another.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 3840, s.height = 2160;
+        auto addPicture = [&](const char* name, int w, int h, bool alpha, float phase) {
+            QImage q(w, h, QImage::Format_RGBA64);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.021f + phase), float(y) / h,
+                                                           0.5f + 0.4f * std::sin(x * 0.007f - y * 0.013f + phase) * std::cos(y * 0.05f),
+                                                           alpha ? std::min(1.0f, 0.1f + 0.9f * float((x / 9 + y / 7) % 61) / 60) : 1.0f));
+            const QString path = dir.filePath(name);
+            if (!q.save(path)) return Id{};
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id wide = addPicture("wide.png", 3840, 2160, false, 0), small = addPicture("small.png", 2500, 1700, true, 0.6f);
+        QVERIFY(wide && small);
+        QVERIFY(edit::placeMedia(p, s, wide, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+        auto r2 = edit::placeMedia(p, s, small, 0, 0, 10, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(r2.ok);
+        Clip* top = edit::clipById(s, r2.created[0]);
+        QVERIFY(top);
+        top->motion.params["scale"] = 120.0, top->motion.params["rotation"] = 11.0, top->motion.params["pos_x"] = 90.0;
+        using Settings = std::vector<std::pair<const char*, double>>;
+        const Settings mask = {{"mask.shape", 1}, {"mask.x", 0.45}, {"mask.y", 0.55}, {"mask.w", 0.5}, {"mask.h", 0.4}, {"mask.feather", 60}};
+        const std::vector<std::pair<const char*, Settings>> effects = {
+            {"gaussian_blur", {{"radius", 60}}},
+            {"glow", {{"threshold", 0.4}, {"radius", 80}, {"intensity", 1.5}}},
+            {"directional_blur", {{"length", 120}, {"angle", 30}}},
+            {"sharpen", {{"amount", 2}, {"radius", 6}}},
+            {"turbulent_displace", {{"amount", 60}, {"size", 200}, {"complexity", 4}, {"seed", 3}}},
+            {"chromatic_aberration", {{"amount", 25}}},
+        };
+        for (size_t k = 0; k < effects.size(); ++k) {
+            Effect e = makeEffect(p, effects[k].first);
+            for (const auto& [key, v] : effects[k].second) e.params[key] = v;
+            if (k >= 3)
+                for (const auto& [key, v] : mask) e.params[key] = v;
+            top->effects = {e};
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, 3, o);
+            top->effects.front().enabled = false;
+            const Image still = renderProgramFrame(p, s, 3, o);
+            top->effects.front().enabled = true;
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, 3, o);
+            const gpu::Stats after = gpu::stats();
+            const QString what = QString::fromUtf8(effects[k].first) + (k >= 3 ? " through a mask" : "");
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QCOMPARE(onGpu.width, 3840);
+            QCOMPARE(cpu.width, 3840);
+            double worst = 0, changed = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c) {
+                        if (const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]); d > worst) worst = d, wx = x, wy = y;
+                        changed += std::fabs(cpu.at(x, y)[c] - still.at(x, y)[c]);
+                    }
+            QVERIFY2(changed > 1000, qPrintable(what + ": the effect did nothing"));
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
+            qInfo("%s at 3840x2160: GPU within %.2g of the CPU", qPrintable(what), worst);
+        }
+    }
+    void gpuEveryEffect() {
+        // Every video effect Montage has, at its defaults on a picture over another (and through a feathered mask):
+        // drawn on the GPU, nothing made on the CPU, except the ones listed here, which are still the CPU's (so one that
+        // newly falls back fails here, and so does one listed that the GPU now draws).
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90;
+        QImage q(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x)
+                q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.21f), float(y) / 90, 0.5f + 0.4f * std::sin(x * 0.07f - y * 0.13f),
+                                                       std::min(1.0f, 0.2f + 0.8f * float((x * 3 + y) % 61) / 60)));
+        const QString path = dir.filePath("picture.png");
+        QVERIFY(q.save(path));
+        MediaItem m;
+        QVERIFY(probeMedia(path.toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 1}, {}, false).ok);
+        Clip& top = s.videoTracks[1].clips.at(0);
+        top.motion.params["scale"] = 80.0, top.motion.params["rotation"] = 9.0;
+        const std::set<std::string> cpuOnly = {
+            // (from other frames, or an analysis of the clip over time)
+            "stabilize", "camera_track", "rolling_shutter", "surface_track", "stop_motion", "motion_blur", "deflicker", "frame_repair",
+            "perf_lock", "scratch_removal", "chart_match", "clean_plate",
+            // (a model's, or drawn around the faces found)
+            "object_removal", "learned_effect", "face_refine", "face_shape", "look_at_lens", "blemish_remover", "redact_faces",
+            "remove_background", "focus_repair", "relight", "behind_people", "sky_replace",
+            // (deep pictures and layers in 3D)
+            "make_deep", "deep_holdout", "deep_grade", "deep_slice", "flatten_deep", "layer_3d",
+            // (with no GPU form yet)
+            "texture_pop", "broadcast_safe", "film_look", "magnify", "lens_distortion", "lens_correction", "drop_shadow", "edge_bevel",
+            "layer_bevel", "patch_fill", "paint", "film_negative", "fade_restore"};
+        // (through a mask: on the CPU, not run on the camera's picture as they are without one)
+        const std::set<std::string> cpuOnlyMasked = {"aces_gamut_compress", "ocio"};
+        std::vector<std::string> fellBack, unlisted, nowGpu;
+        int tried = 0;
+        for (const EffectInfo& info : effectCatalog()) {
+            if (info.hidden || info.category != EffectCategory::VideoFilter) continue;
+            for (int masked = 0; masked < 2; ++masked) {
+                Effect e = makeEffect(p, info.type);
+                if (masked) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.5, e.params["mask.h"] = 0.4, e.params["mask.feather"] = 8.0;
+                top.effects = {e};
+                RenderOptions o;
+                o.gpu = true;
+                const gpu::Stats before = gpu::stats();
+                renderProgramFrame(p, s, 3, o);
+                const gpu::Stats after = gpu::stats();
+                ++tried;
+                const bool onGpu = after.gpuFrames == before.gpuFrames + 1 && after.cpuLayers == before.cpuLayers;
+                const std::string name = info.type + (masked ? " (masked)" : "");
+                const bool listed = cpuOnly.count(info.type) || (masked && cpuOnlyMasked.count(info.type));
+                if (!onGpu) {
+                    fellBack.push_back(name + ": " + (after.gpuFrames == before.gpuFrames ? after.lastFallback : after.lastCpuLayer));
+                    if (!listed) unlisted.push_back(fellBack.back());
+                } else if (listed) {
+                    nowGpu.push_back(name);
+                }
+            }
+        }
+        for (const std::string& f : fellBack) qInfo("on the CPU: %s", f.c_str());
+        qInfo("%d of %d drawn on the GPU", tried - int(fellBack.size()), tried);
+        QVERIFY(tried > 100);
+        QVERIFY2(unlisted.empty(), qPrintable(QString::fromStdString("on the CPU and not listed: " + (unlisted.empty() ? "" : unlisted.front()))));
+        QVERIFY2(nowGpu.empty(), qPrintable(QString::fromStdString("listed but drawn on the GPU: " + (nowGpu.empty() ? "" : nowGpu.front()))));
+    }
     void gpuApertureGlareUhd() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
