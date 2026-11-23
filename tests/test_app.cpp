@@ -2359,7 +2359,9 @@ private slots:
             QVERIFY(w.close());
         }
         state()->newProject();
-        QVERIFY(state()->save(dir_.path() + "/sampler-live.montage"));
+        // (in a folder of its own: what it records is not numbered among the other tests' takes)
+        QVERIFY(QDir(dir_.path()).mkpath(QStringLiteral("sampler-live")));
+        QVERIFY(state()->save(dir_.path() + "/sampler-live/sampler-live.montage"));
         QVERIFY(state()->edit("Tracks", [&](Project& p, Sequence& s) {
             while (s.audioTracks.size() < 3) edit::addTrack(p, s, TrackKind::Audio);
             s.audioTracks[1].pan = -1;
@@ -2512,7 +2514,9 @@ private slots:
         // stopped the take's file has that waveform, bucket for bucket.
         const int rate = 48000;
         state()->newProject();
-        QVERIFY(state()->save(dir_.path() + "/live-take.montage"));
+        // (in a folder of its own: its takes are not numbered among the other tests')
+        QVERIFY(QDir(dir_.path()).mkpath(QStringLiteral("live-take")));
+        QVERIFY(state()->save(dir_.path() + "/live-take/live-take.montage"));
         const double fps = state()->sequence()->fpsValue();
         ppf_ = measurePpf();
         audiodev::setLoopbackOptions({256, 512, 0});
@@ -2672,7 +2676,9 @@ private slots:
         QProcess jackd;
         if (jack && !startJackServer(jackd)) QSKIP("No jackd with a JACK library here");
         state()->newProject();
-        QVERIFY(state()->save(dir_.path() + QStringLiteral("/lost-%1.montage").arg(host)));
+        // (in a folder of its own: its takes are not numbered among the other tests')
+        QVERIFY(QDir(dir_.path()).mkpath(QStringLiteral("lost-%1").arg(host)));
+        QVERIFY(state()->save(dir_.path() + QStringLiteral("/lost-%1/lost.montage").arg(host)));
         QVERIFY(state()->edit("Picture", [&](Project& p, Sequence& s) {
             return edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 900)).ok;  // (thirty seconds to play through)
         }));
@@ -2793,7 +2799,9 @@ private slots:
         reg.setSearchPaths(plugins::Format::Clap, {QStringLiteral(MONTAGE_TEST_CLAP_DIR "/good").toStdString()});
         reg.scan();
         state()->newProject();
-        QVERIFY(state()->save(dir_.path() + QStringLiteral("/guard-%1.montage").arg(host)));
+        // (in a folder of its own: its takes are not numbered among the other tests')
+        QVERIFY(QDir(dir_.path()).mkpath(QStringLiteral("guard-%1").arg(host)));
+        QVERIFY(state()->save(dir_.path() + QStringLiteral("/guard-%1/guard.montage").arg(host)));
         const auto ids = state()->importFiles({tone});
         QCOMPARE(ids.size(), size_t(1));
         std::string pluginError;
