@@ -149,6 +149,7 @@ struct LoopbackOptions {
     int reportedInput = 0, reportedOutput = 0;  // frames
     int unreported = 0;                         // more frames of round trip it does not report
     bool unplugged = false;                     // gone (as a device unplugged): the one open is lost, none opens
+    int openMs = 0;                             // how long an open takes (as a system listing its devices first)
 };
 void setLoopbackOptions(const LoopbackOptions& o);
 LoopbackOptions loopbackOptions();

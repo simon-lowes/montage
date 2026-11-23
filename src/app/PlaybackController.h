@@ -9,6 +9,7 @@
 #include <QTimer>
 #include <QVector>
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
@@ -261,6 +262,7 @@ private:
     bool scrubNoOutput_ = false, scrubTriedDevice_ = false;
     int scrubTriedRate_ = 0;
     QElapsedTimer scrubRetry_;  // since scrubbing's output was last opened, or the device chosen last asked for
+    std::shared_ptr<std::atomic<bool>> scrubProbing_ = std::make_shared<std::atomic<bool>>(false);  // (the device asked for, off this thread)
     AudioMixer scrubMixer_;
     bool globalMute_ = false;
     bool ambisonicBinaural_ = true;

@@ -15160,12 +15160,26 @@ const auto seq = [this] { return state()->sequence(); };
         const bool lost = QTest::qWaitFor([&] { return !engine.isOpen(); });
         program->seek(31);
         const bool moved = !program->scrubOutput()->onDevice();
-        audiodev::setLoopbackOptions({});  // (plugged back in before anything is checked)
+        // (plugged back in before anything is checked, and slow to open, as a system listing its devices first: the
+        // asking is done off the window's thread, so no scrub waits for it; nightly 23 Nov)
+        audiodev::LoopbackOptions slow;
+        slow.openMs = 1500;
+        audiodev::setLoopbackOptions(slow);
         QVERIFY(lost && moved);
         QTest::qWait(500);
         QVERIFY(!engine.isOpen());
         int at = 32;
-        QTRY_VERIFY_WITH_TIMEOUT((program->seek(at++ % 2 ? 33 : 32), program->scrubOutput()->onDevice()), 8000);
+        qint64 longest = 0;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+                                     QElapsedTimer t;
+                                     t.start();
+                                     program->seek(at++ % 2 ? 33 : 32);
+                                     longest = std::max(longest, t.elapsed());
+                                     return program->scrubOutput()->onDevice();
+                                 }()),
+                                 10000);
+        QVERIFY2(longest < 1000, qPrintable(QString::number(longest)));
+        audiodev::setLoopbackOptions({});
         QVERIFY(engine.isOpen());
         engine.setSettings(before);
         state()->newProject();

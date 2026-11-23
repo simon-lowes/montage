@@ -2,6 +2,7 @@
 
 #include <QJsonArray>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -339,6 +340,7 @@ std::unique_ptr<Stream> openStream(const DeviceSettings& s, int rate, int inputs
             if (error) *error = "Qt Multimedia's devices are opened by Qt";
             return nullptr;
         case Host::Loopback:
+            if (const int ms = loopbackOptions().openMs; ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
             if (loopbackOptions().unplugged) {
                 if (error) *error = "The loopback is unplugged";
                 return nullptr;
@@ -618,6 +620,9 @@ struct Engine::Impl {
     // device's callback or by the feed thread: a caller may hold them for as long as opening a device takes.
     mutable std::recursive_mutex openM;
     std::unique_ptr<Stream> stream;
+    // Whether a stream is open and a device other than Qt Multimedia's chosen, as they were when openM was last let
+    // go: what isOpen() and active() say while another thread holds it (opening a device can take a second).
+    std::atomic<bool> openNow{false}, activeNow{false};
     DeviceSettings settings;
     DeviceSettings opened;  // what the stream was opened with (the settings, or what stood in for a device that is gone)
     bool standIn = false;
@@ -949,6 +954,7 @@ bool Engine::Impl::openWith(const DeviceSettings& s, std::string* why) {
     };
     std::string err;
     stream = openStream(s, rate, s.inputs, askedOutputs, outputNames, std::move(cb), &err);
+    openNow = stream != nullptr;
     if (!stream) {
         if (why) *why = err.empty() ? "The audio device could not be opened" : err;
         return false;
@@ -995,6 +1001,7 @@ bool Engine::Impl::openLocked(std::string* why) {
 void Engine::Impl::closeLocked() {
     // (the stream first: closing it waits for a callback under way, which waits for nothing)
     std::unique_ptr<Stream> s = std::move(stream);
+    openNow = false;
     s.reset();
     if (qEnvironmentVariableIsSet("MONTAGE_AUDIO_GUARD_LOG")) {
         if (const auto i = io.get()) {
@@ -1030,6 +1037,7 @@ void Engine::setSettings(const DeviceSettings& s) {
     const DeviceSettings old = d_->settings;
     d_->settings = s;
     d_->settings.bufferFrames = clampBuffer(s.bufferFrames);
+    d_->activeNow = s.host != Host::Qt;
     // Only the measured loopback changed: nothing to open again.
     DeviceSettings a = old, b = d_->settings;
     a.loopbackFrames = b.loopbackFrames, a.loopbackRate = b.loopbackRate, a.loopbackBuffer = b.loopbackBuffer;
@@ -1052,14 +1060,17 @@ DeviceSettings Engine::settings() const {
     return d_->settings;
 }
 
+// (neither waits for a device being opened or closed on another thread: they say what was so before it)
 bool Engine::active() const {
-    std::lock_guard<std::recursive_mutex> lock(d_->openM);
+    std::unique_lock<std::recursive_mutex> lock(d_->openM, std::try_to_lock);
+    if (!lock.owns_lock()) return d_->activeNow.load();
     d_->reapLocked();
     return d_->settings.host != Host::Qt;
 }
 
 bool Engine::isOpen() const {
-    std::lock_guard<std::recursive_mutex> lock(d_->openM);
+    std::unique_lock<std::recursive_mutex> lock(d_->openM, std::try_to_lock);
+    if (!lock.owns_lock()) return d_->openNow.load();
     d_->reapLocked();
     return d_->stream != nullptr;
 }

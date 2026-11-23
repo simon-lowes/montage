@@ -19,7 +19,9 @@
 #include <QIODevice>
 #include <QMediaDevices>
 #include <QMutex>
+#include <QRunnable>
 #include <QThread>
+#include <QThreadPool>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -998,10 +1000,19 @@ void PlaybackController::scrubAudio(FrameTime t) {
     // A device that went away may be back, and nothing else opens it again until playback starts: it is asked for
     // every few seconds while scrubbing (opened, when it is there, with what plays meanwhile left as it is), and the
     // snippets move to it below.
-    if (asTried && device && !scrubOut_->onDevice() && !engine.isOpen() && scrubRetry_.isValid() && scrubRetry_.elapsed() >= 3000) {
+    // The asking is done on a pool thread (nightly 23 Nov: on this one it held the window up every few seconds, the
+    // more so as an open that does not find its device has PortAudio list them all again); a scrub after it has the
+    // device open moves the snippets to it.
+    if (asTried && device && !scrubOut_->onDevice() && !engine.isOpen() && scrubRetry_.isValid() && scrubRetry_.elapsed() >= 3000 &&
+        !scrubProbing_->exchange(true)) {
         scrubRetry_.start();
-        audiodev::Feed probe(engine);
-        probe.open(s->sampleRate, 2, 0.05);
+        QThreadPool::globalInstance()->start(QRunnable::create([probing = scrubProbing_, rate = s->sampleRate] {
+            {
+                audiodev::Feed probe(audiodev::Engine::shared());
+                probe.open(rate, 2, 0.05);
+            }
+            probing->store(false);
+        }));
     }
     const bool deviceMoved = asTried && device && scrubOut_->onDevice() != engine.isOpen();  // (gone, or back)
     if (!asTried || deviceMoved || (!scrubNoOutput_ && !scrubOut_->isOpen())) {
