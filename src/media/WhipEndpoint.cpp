@@ -393,6 +393,7 @@ struct Feed {
     Stream video, audio;
     bool started = false, ended = false, reading = false;
     bool holding = false;  // pictures are held from a keyframe on
+    bool heldLost = false; // a picture's packet was lost since that keyframe (the pictures held do not all decode)
     double keyAt = 0;      // when that keyframe came
     bool byReports = false;
     std::string sdp;
@@ -588,6 +589,7 @@ struct Feed {
             if (step > 1) {
                 lost += step - 1;
                 ask = isVideo;
+                if (isVideo && holding && !started) heldLost = true;
             }
             if (step > 0) s.lastSeq = r.seq;
         } else {
@@ -606,12 +608,15 @@ struct Feed {
             cv.notify_all();
         } else {
             if (isVideo) {
-                if (beginsKeyframe(s.codec, r.payload, r.size) && (s.held.empty() || s.held.back().ts != ts)) {
-                    // (a later keyframe before the feed has begun: the feed begins there instead)
+                if (beginsKeyframe(s.codec, r.payload, r.size) && (s.held.empty() || s.held.back().ts != ts) && (!holding || heldLost)) {
+                    // (the first keyframe; or a later one before the feed has begun, after a loss: the feed begins
+                    // there instead. A later one with nothing lost is held with the rest: a sender sends keyframes
+                    // of its own while the sender's reports are waited for, and the feed begins at its first)
                     s.held.clear();
                     s.heldBytes = 0;
                     if (!holding) keyAt = now;
                     holding = true;
+                    heldLost = false;
                 }
                 if (!holding) {
                     ask = true;
@@ -619,6 +624,7 @@ struct Feed {
                     s.held.clear();
                     s.heldBytes = 0;
                     holding = false;
+                    heldLost = false;
                     ask = true;
                 } else {
                     s.heldBytes += n;

@@ -27137,7 +27137,7 @@ colorspaces:
             osc.connect(gain).connect(out);
             osc.start();
             const picture = c.captureStream(0).getVideoTracks()[0];
-            const t = window.__test = {flashes: 0, frames: 0, sendingAt: 0, stoppedAt: 0};
+            const t = window.__test = {flashes: 0, frames: 0, connectedAt: 0, firstSentAt: 0, framesSent: 0, keyframes: 0, sizes: [], stoppedAt: 0};
             let frame = 0;
             const draw = () => {
               const flash = frame % 36 < 3;
@@ -27156,24 +27156,47 @@ colorspaces:
             };
             t.timer = setInterval(draw, 1000 / 30);
             await __montageWhip.send(false, new MediaStream([picture, out.stream.getAudioTracks()[0]]));
+            // (what the sender says it has sent, and when it first sent a picture: a sender's encoder may take a moment
+            // after the connection, and its pacer holds pictures for a moment after they are made)
+            t.poll = setInterval(async () => {
+              const pc = __montageWhip.pc;
+              if (!pc) return;
+              (await pc.getStats()).forEach(s => {
+                if (s.type !== 'outbound-rtp' || s.kind !== 'video') return;
+                if (s.framesSent > 0 && !t.firstSentAt) t.firstSentAt = performance.now();
+                if (!t.connectedAt && __montageWhip.stage === 'sending') t.connectedAt = performance.now();
+                t.framesSent = s.framesSent || 0;
+                t.keyframes = s.keyFramesEncoded || 0;
+                const size = s.frameWidth + 'x' + s.frameHeight;
+                if (s.frameWidth && (!t.sizes.length || t.sizes[t.sizes.length - 1].size !== size)) t.sizes.push({size, at: performance.now()});
+              });
+            }, 20);
             return true;
         })())");
         QVERIFY2(tab.until("__montageWhip.stage === 'sending'", 30), (tab.js("__montageWhip.stage + ': ' + document.getElementById('state').textContent").toString().toStdString() + tab.log().right(1500).toStdString()).c_str());
-        tab.js("__test.sendingAt = performance.now(); true");
+        QVERIFY2(tab.until("__test.firstSentAt > 0", 10), "no picture sent");
         // A second sender while the first is connected: 409.
         QVERIFY(ask("POST", "/whip", "Bearer " + QByteArray::fromStdString(token), "v=0\r\n").startsWith("HTTP/1.1 409"));
         QThread::msleep(7000);
         QVERIFY(rec.recording());
-        // DELETE (the page's stop) ends the recording, all of it written.
-        tab.js("(async () => { __test.stoppedAt = performance.now(); clearInterval(__test.timer); await __montageWhip.stop(); return true; })()");
-        const double sent = (tab.js("__test.stoppedAt - __test.sendingAt").toDouble()) / 1000;
+        // DELETE (the page's stop) ends the recording, all of it written: once the pictures stop being made and the
+        // sender has sent what it held (its count of pictures sent still for a third of a second).
+        tab.js("__test.stoppedAt = performance.now(); clearInterval(__test.timer); true");
+        QVERIFY(tab.until("(() => { const t = __test; if (t.framesSent !== t.lastCount) { t.lastCount = t.framesSent; t.stillSince = performance.now(); }"
+                          " return performance.now() - t.stillSince > 300; })()", 10));
+        tab.js("(async () => { clearInterval(__test.poll); await __montageWhip.stop(); return true; })()");
+        const double sent = (tab.js("__test.stoppedAt - __test.firstSentAt").toDouble()) / 1000;
+        const int framesSent = tab.js("__test.framesSent").toInt();
+        // (for a failure's message: when the sender began after the connection, its keyframes, and its sizes in time)
+        const QString sender = tab.js("(() => { const t = __test; return 'first picture sent ' + Math.round(t.firstSentAt - t.connectedAt) + ' ms after the connection, ' +"
+                                      " t.keyframes + ' keyframes, sizes ' + t.sizes.map(s => s.size + ' at ' + Math.round(s.at - t.firstSentAt) + ' ms').join(', '); })()")
+                                   .toString();
         QVERIFY(rec.wait(20));
         QVERIFY2(finished && fine, finishedWhy.c_str());
         stopRecording.dismiss();
         const CaptureStatus st = rec.status();
         QVERIFY2(st.error.empty(), st.error.c_str());
-        QCOMPARE(st.width, 640);
-        QCOMPARE(st.height, 360);
+        QVERIFY2(st.width == 640 && st.height == 360, (std::to_string(st.width) + "x" + std::to_string(st.height) + "; " + sender.toStdString()).c_str());
         MediaItem item;
         QVERIFY2(probeMedia(cs.path, item, &why), why.c_str());
         QVERIFY(item.hasVideo && item.hasAudio);
@@ -27184,7 +27207,8 @@ colorspaces:
         const double fps = double(fpsNum) / fpsDen;
         // Its pictures: as many as the time sent (from the connection to the stop) within a second.
         const double recorded = double(lumas.size()) / fps;
-        qInfo("WHIP: %zu pictures at %.3f a second (%.2f s), %.2f s sent", lumas.size(), fps, recorded, sent);
+        qInfo("WHIP: %zu pictures at %.3f a second (%.2f s; %lld repeated, %lld dropped), %.2f s sent (%d pictures; %s)", lumas.size(), fps, recorded,
+              (long long)st.repeated, (long long)st.dropped, sent, framesSent, qPrintable(sender));
         QVERIFY2(std::fabs(recorded - sent) < 1.0, (std::to_string(recorded) + " recorded, " + std::to_string(sent) + " sent").c_str());
         // The flashes and the beeps: each flash's first picture, each beep's first sound, paired.
         std::vector<double> flashes, beeps;
