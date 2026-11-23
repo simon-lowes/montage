@@ -15447,6 +15447,46 @@ const auto seq = [this] { return state()->sequence(); };
             QVERIFY(t->effects.size() == 2 && t->effects[0].type == "denoise" && t->effects[1].type == "dialogue_align" &&
                     dialogueAlignmentApplies(t->effects[1], *t));
         }
+        // Aligning is a background job (DialogJobs.h): left to run, its dialog closed, the same alignment lands when it
+        // ends; killed in another Montage at its start and taken up by one of two started together, it is the same
+        // again, offered here (the helpers have no project open) and applied onto the take as it is.
+        {
+            QCOMPARE(state()->undoText(), QString("Align to Guide"));
+            const Clip aligned = *edit::clipById(*state()->sequence(), clip);
+            auto same = [&] {
+                const Clip* t = edit::clipById(*state()->sequence(), clip);
+                if (!t || t->effects.size() != 2 || t->duration != aligned.duration) return false;
+                Effect a = t->effects[1], b = aligned.effects[1];
+                a.id = b.id = 0;
+                return t->effects[0] == aligned.effects[0] && a == b;
+            };
+            state()->undo();
+            QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.size(), size_t(1));
+            DialogJobs* dialogs = DialogJobs::of(win_.get());
+            const QString id = startInBackground(dialogs, [&] { QVERIFY(!panel->alignToGuide()); });
+            QVERIFY(!id.isEmpty());
+            QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.size(), size_t(1));
+            dialogs->setPaused(id, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+            QVERIFY(same());
+            QCOMPARE(state()->undoText(), QString("Align to Guide"));
+            state()->undo();
+            const AdrCue& cue = state()->sequence()->adrCues[0];
+            const QJsonObject input{{"sequence", QString::number(state()->sequence()->id)},
+                                    {"clips", QJsonArray{QString::number(clip), QString::number(panel->guideClip())}},
+                                    {"clip", QString::number(clip)},
+                                    {"guide", QString::number(panel->guideClip())},
+                                    {"cue", QString::number(cue.id)},
+                                    {"from", double(cue.start)},
+                                    {"to", double(cue.end)},
+                                    {"precision", int(AlignPrecision::Normal)}};
+            QString why;
+            const QString job = killedAndTakenUp("adr-align", "Aligning to the guide…", input, "0", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(!dialogs->offeredNote(job).isEmpty());
+            QVERIFY(dialogs->applyOffered(job));
+            QVERIFY(same());
+        }
 
         // The cue sheet, out and back in.
         const QString sheet = dir_.path() + "/cues.csv";

@@ -16,7 +16,10 @@
 #include "DialogJobs.h"
 #include "DialogTasks.h"
 #include "EditorState.h"
+#include "core/Adr.h"
 #include "core/EditOps.h"
+#include "core/ProjectIO.h"
+#include "audio/DialogueAlign.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
 #include "render/RenderFarm.h"
@@ -32,6 +35,9 @@ struct DuckText {
 };
 struct WindowText {
     Q_DECLARE_TR_FUNCTIONS(montage::MainWindow)
+};
+struct AdrText {
+    Q_DECLARE_TR_FUNCTIONS(montage::AdrPanel)
 };
 
 Id idOf(const QJsonValue& v) { return Id(v.toString().toULongLong()); }
@@ -457,6 +463,99 @@ bool runImf(TaskRun& t) {
     return true;
 }
 
+// --- ADR: Align to Guide ---
+//
+// The take's sound matched to the guide's on a copy of the sequence; the alignment it made is the result, with the
+// take and the guide as they were (to see, when it is applied, that neither has changed since).
+
+bool runAdrAlign(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    const Id clip = idOf(t.input.value("clip")), guide = idOf(t.input.value("guide"));
+    const Clip* was = edit::clipById(*s, clip);
+    const Clip* guideWas = edit::clipById(*s, guide);
+    if (!was || !guideWas) {
+        t.error = "No such clip";
+        return false;
+    }
+    DialogueAlignOptions o;
+    o.precision = AlignPrecision(std::clamp(t.input.value("precision").toInt(int(AlignPrecision::Normal)), 0, 2));
+    o.from = FrameTime(t.input.value("from").toDouble(-1));
+    o.to = FrameTime(t.input.value("to").toDouble(-1));
+    t.progress(0);
+    Project p = *t.project;
+    Sequence* sq = p.findSequence(s->id);
+    DialogueAlignReport report;
+    const edit::Result r = edit::alignDialogue(p, *sq, clip, guide, o, &report, t.cancel);
+    if (t.cancelled()) return false;
+    if (!r.ok) {
+        t.error = r.error;
+        return false;
+    }
+    const Clip* take = edit::clipById(*sq, clip);
+    const auto made = take ? std::find_if(take->effects.rbegin(), take->effects.rend(), [](const Effect& e) { return e.type == "dialogue_align"; })
+                           : std::vector<Effect>::const_reverse_iterator();
+    if (!take || made == take->effects.rend()) {
+        t.error = "The alignment was not made";
+        return false;
+    }
+    t.result = QJsonObject{{"alignment", QString::fromStdString(effectToJsonString(*made))},
+                           {"duration", double(take->duration)},
+                           {"take", QString::fromStdString(clipToJsonString(*was))},
+                           {"guide", QString::fromStdString(clipToJsonString(*guideWas))},
+                           {"anchors", report.anchors},
+                           {"minRate", report.minRate},
+                           {"maxRate", report.maxRate}};
+    t.progress(1);
+    return true;
+}
+
+QJsonObject applyAdrAlign(EditorState* state, const QJsonObject& input, const QJsonObject& result) {
+    Clip was, guideWas;
+    Effect alignment;
+    if (!clipFromJsonString(result.value("take").toString().toStdString(), was) || !clipFromJsonString(result.value("guide").toString().toStdString(), guideWas) ||
+        !effectFromJsonString(result.value("alignment").toString().toStdString(), alignment))
+        return {{"changed", false}, {"failed", true}};
+    const Id clip = idOf(input.value("clip")), guide = idOf(input.value("guide")), cueId = idOf(input.value("cue"));
+    const FrameTime from = FrameTime(input.value("from").toDouble(-1)), to = FrameTime(input.value("to").toDouble(-1));
+    const FrameTime length = FrameTime(result.value("duration").toDouble());
+    // What the alignment was made from: the take, the guide and the cue's range as they were.
+    auto moved = [](const Clip& a, const Clip& b) {
+        return a.start != b.start || a.duration != b.duration || a.sourceIn != b.sourceIn || a.mediaId != b.mediaId || a.channels != b.channels ||
+               a.speed != b.speed || a.reverse != b.reverse || a.timing != b.timing || a.linkGroup != b.linkGroup;
+    };
+    const bool ok = state->apply(AdrText::tr("Align to Guide"), [&](Project& p, Sequence& sq) {
+        Clip* c = edit::clipById(sq, clip);
+        const Clip* g = edit::clipById(sq, guide);
+        const AdrCue* cue = findAdrCue(sq, cueId);
+        if (!c || !g) return edit::Result::fail("No such clip");
+        const auto loc = edit::locate(sq, clip);
+        if (moved(*c, was) || moved(*g, guideWas) || !cue || cue->start != from || cue->end != to || g->effects != guideWas.effects ||
+            (loc && trackAt(sq, loc->track) && trackAt(sq, loc->track)->locked))
+            return edit::Result::fail("The take, the guide or the cue changed while it was being aligned: align it again");
+        // The alignment made on the copy, in place of the clip's own for that take, at the end as alignDialogue
+        // leaves it.
+        std::erase_if(c->effects, [&](const Effect& e) { return e.type == "dialogue_align" && dialogueAlignmentApplies(e, *c); });
+        Effect e = alignment;
+        e.id = p.newId();  // (made on the copy)
+        c->effects.push_back(e);
+        // (longer to the next clip, as it is now)
+        FrameTime duration = length;
+        for (Track& t : sq.audioTracks)
+            if (std::any_of(t.clips.begin(), t.clips.end(), [&](const Clip& x) { return &x == c; }))
+                for (const Clip& x : t.clips)
+                    if (&x != c && x.start >= c->start && x.start < c->start + duration) duration = std::max(c->duration, x.start - c->start);
+        c->duration = duration;
+        return edit::Result{};
+    });
+    if (!ok) return {{"changed", false}, {"failed", true}};
+    return {{"changed", true},
+            {"message", AdrText::tr("Aligned to the guide: %1 anchors, stretched %2–%3 %")
+                            .arg(result.value("anchors").toInt())
+                            .arg(std::lround(100 * result.value("minRate").toDouble()))
+                            .arg(std::lround(100 * result.value("maxRate").toDouble()))}};
+}
+
 }  // namespace
 
 QJsonObject dcpResultToJson(const DcpResult& r) {
@@ -630,10 +729,11 @@ std::vector<ConformShot> conformShotsFromJson(const QJsonValue& v) {
 void registerDialogTaskKinds() {
     static std::once_flag once;
     std::call_once(once, [] {
-        DialogJobs::registerKind(QStringLiteral("auto-duck"), {runDuck, applyDuck});
-        DialogJobs::registerKind(QStringLiteral("scene-detect"), {runSceneCuts, applySceneCuts});
-        DialogJobs::registerKind(QStringLiteral("auto-mix"), {runMix, applyMixPlan, true});
-        DialogJobs::registerKind(QStringLiteral("conform-check"), {runConform, nullptr});
+        DialogJobs::registerKind(QStringLiteral("auto-duck"), {runDuck, applyDuck, false, nullptr});
+        DialogJobs::registerKind(QStringLiteral("scene-detect"), {runSceneCuts, applySceneCuts, false, nullptr});
+        DialogJobs::registerKind(QStringLiteral("auto-mix"), {runMix, applyMixPlan, true, nullptr});
+        DialogJobs::registerKind(QStringLiteral("conform-check"), {runConform, nullptr, false, nullptr});
+        DialogJobs::registerKind(QStringLiteral("adr-align"), {runAdrAlign, applyAdrAlign, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("dcp"), {runDcp, nullptr, false, discardPictures});
         DialogJobs::registerKind(QStringLiteral("imf"), {runImf, nullptr, false, discardPictures});
     });
