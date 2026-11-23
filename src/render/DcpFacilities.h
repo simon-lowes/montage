@@ -96,7 +96,7 @@ bool addScreenByHand(std::vector<Facility>& list, const std::string& cinema, con
 
 // Whether a server certificate (PEM text or a file of it: a chain, or a leaf alone) is one KDMs may go to without the
 // user saying so: its leaf is a screen's server in `list`, or its chain checks and goes up to one of the `trusted`
-// roots; false (and why) when it is neither.
+// roots and its leaf's common name names the SM role; false (and why) when it is neither.
 bool knownServer(const std::string& certificate, const std::vector<Facility>& list, const std::vector<std::string>& trusted, std::string* error = nullptr);
 
 // What a booking needs of a screen: its server's leaf and its active devices' thumbprints. A screen whose suite lists

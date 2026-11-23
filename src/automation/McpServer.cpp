@@ -807,7 +807,12 @@ QString json(const QJsonObject& o) { return QString::fromUtf8(QJsonDocument(o).t
 // A path as one name for the file it is: symbolic links followed as far as the path exists, and letter case folded
 // where the file system ignores it, so two spellings of one file are seen as one.
 static QString oneNameFor(const QString& path) {
-    QString clean = QDir::cleanPath(absolute(path));
+    // (FFmpeg, which writes most outputs, takes "file:" and its other protocols' names before a path, nested as
+    // "md5:file:/x": each is taken off, so they name the file they reach. One letter is a Windows drive.)
+    QString bare = path;
+    static const QRegularExpression scheme(QStringLiteral("^[A-Za-z][A-Za-z0-9+.\\-]+:"));
+    for (QRegularExpressionMatch m = scheme.match(bare); m.hasMatch(); m = scheme.match(bare)) bare = bare.mid(m.capturedLength());
+    QString clean = QDir::cleanPath(absolute(bare));
     QString rest;
     QFileInfo at(clean);
     // (what does not exist yet, an output and perhaps its folders, is kept as written under the part that does)
@@ -828,16 +833,21 @@ static QString oneNameFor(const QString& path) {
 
 McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOnly) {
     McpCallPaths out;
-    // (an export tool's path or file is where it writes, whether or not it leaves the project as it is)
+    // (an export tool's path or file is where it writes, whether or not it leaves the project as it is; so is that of
+    // any tool that changes things: a change list, a film list, paperwork, a script's PDF, a cue sheet. One that only
+    // reads its path there waits its turn for nothing, which costs less than two calls writing one file)
     const bool exports = tool.startsWith(QLatin1String("montage_export_"));
     const auto kind = [readOnly, exports](const QString& k) {
         const auto named = [&k](const char* n) { return k == QLatin1String(n) || k.endsWith(QLatin1Char('_') + QLatin1String(n)); };
         for (const char* w : {"output", "report", "record"})
             if (named(w)) return 2;
+        // (a captions file, a camera's .chan, .ply and .usda, cleaned splats, the folders an offload copies into)
+        for (const char* w : {"export", "chan", "ply", "usd", "save", "destinations"})
+            if (k == QLatin1String(w)) return 2;
         for (const char* f : {"folder", "dir"})
             if (named(f)) return readOnly ? 1 : 2;
         for (const char* r : {"path", "file"})
-            if (named(r)) return exports ? 2 : 1;
+            if (named(r)) return exports || !readOnly ? 2 : 1;
         for (const char* r : {"files", "paths"})
             if (named(r)) return 1;
         return 0;
@@ -859,6 +869,9 @@ McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOn
         const QFileInfo fi(QDir::cleanPath(absolute(a.value("output").toString())));
         out.writes << oneNameFor(fi.absoluteDir().filePath(fi.fileName() + ".mov"));
     }
+    // (a read-only tool that makes its folder a production when asked writes it then)
+    if (tool == QLatin1String("montage_production") && a.value("create").toBool() && !a.value("folder").toString().isEmpty())
+        out.writes << oneNameFor(a.value("folder").toString());
     out.writes.removeDuplicates();
     out.reads.removeDuplicates();
     for (const QString& w : out.writes) out.reads.removeAll(w);
@@ -873,20 +886,51 @@ bool mcpPathsOverlap(const QString& a, const QString& b) {
     return inside(a, b) || inside(b, a);
 }
 
-// What a call would write of what only Montage writes, and only as the user asks: the roots the user trusts for
-// facility lists, the facility list, Montage's DCP certificate chain and the DKDMs (empty: none).
-static QString ownFileWritten(const McpCallPaths& paths) {
+QString mcpOwnFileNamed(const QString& tool, const QJsonObject& arguments, const McpCallPaths& paths) {
     const std::pair<std::string, const char*> own[] = {{trustedRootsFile(), "the roots trusted for facility lists"},
                                                        {facilitiesFile(), "the facility list"},
                                                        {dcp::signerFolder(), "its DCP certificates"},
                                                        {dcp::dkdmFolder(), "the DKDMs of its DCPs"}};
-    for (const auto& [file, what] : own) {
-        if (file.empty()) continue;
-        const QString name = oneNameFor(QString::fromStdString(file));
+    std::vector<std::pair<QString, const char*>> names;
+    for (const auto& [file, what] : own)
+        if (!file.empty()) names.emplace_back(oneNameFor(QString::fromStdString(file)), what);
+    // What the call is known to write: there, or a folder that holds one of them.
+    for (const auto& [name, what] : names)
         for (const QString& w : paths.writes)
             if (mcpPathsOverlap(w, name)) return QStringLiteral("%1 is where Montage keeps %2: a tool does not write there").arg(w, QLatin1String(what));
-    }
-    return {};
+    // And every other text in the arguments, whatever its key: a tool may write to an argument this server does not
+    // know as a path. Only a DKDM and a server's certificate are read from there, by montage_make_kdm.
+    const bool kdm = tool == QLatin1String("montage_make_kdm");
+    QString found;
+    std::function<void(const QJsonValue&, const QString&, int)> look = [&](const QJsonValue& v, const QString& key, int depth) {
+        if (!found.isEmpty()) return;
+        // (no tool reads deeper than this; a call nested deeper still is refused, below)
+        if (depth > 16) {
+            found = QStringLiteral("The arguments are nested more than 16 deep");
+            return;
+        }
+        if (v.isObject()) {
+            const QJsonObject o = v.toObject();
+            for (auto it = o.begin(); it != o.end(); ++it) look(it.value(), it.key(), depth + 1);
+        } else if (v.isArray()) {
+            for (const QJsonValue& e : v.toArray()) look(e, key, depth + 1);
+        } else if (v.isString() && !(kdm && depth <= 2 && (key == QLatin1String("dkdm") || key == QLatin1String("servers")))) {
+            const QString text = v.toString();
+            // (no file system takes a longer path)
+            if (text.isEmpty() || text.size() > 32768) return;
+            const QString at = oneNameFor(text);
+            for (const auto& [name, what] : names) {
+                const bool inside = at.size() > name.size() && at.startsWith(name) && (name.endsWith(QLatin1Char('/')) || at.at(name.size()) == QLatin1Char('/'));
+                if (at == name || inside) {
+                    found = QStringLiteral("%1 is where Montage keeps %2: a tool is given no path there (only a DKDM or a server's certificate, to read)")
+                                .arg(text, QLatin1String(what));
+                    return;
+                }
+            }
+        }
+    };
+    look(arguments, QString(), 0);
+    return found;
 }
 
 struct McpServer::Impl {
@@ -15970,7 +16014,7 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
         auto tool = std::find_if(d_->tools.begin(), d_->tools.end(), [&](const auto& t) { return t.name == name; });
         if (tool == d_->tools.end()) return error(-32602, QStringLiteral("Unknown tool: %1").arg(name));
         QJsonObject args = params.value("arguments").toObject();
-        if (const QString why = ownFileWritten(mcpCallPaths(name, args, tool->readOnly)); !why.isEmpty()) return reply(resultJson(fail(why)));
+        if (const QString why = mcpOwnFileNamed(name, args, mcpCallPaths(name, args, tool->readOnly)); !why.isEmpty()) return reply(resultJson(fail(why)));
         // In the background: a job id now, the call run later (montage_job reads it).
         const QJsonValue async = args.value("async");
         if (name != QLatin1String("montage_job") && (async.toBool() || async.toString().compare(QLatin1String("true"), Qt::CaseInsensitive) == 0)) {

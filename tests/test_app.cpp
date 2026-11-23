@@ -10521,6 +10521,57 @@ private slots:
                     QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
                 }
             QVERIFY(!call("montage_export_markers", {{"path", folder + "/markers.csv"}}).value("content").toArray().at(0).toObject().value("text").toString().contains("where Montage keeps"));
+            // Nightly 23 Nov: other write keys and tools. The path of a tool that changes things (a change list, film
+            // lists, paperwork, a script's PDF) is written, so two such calls naming one file overlap; a production
+            // being made writes its folder; a path after FFmpeg's protocol names is the file it reaches.
+            for (const char* tool : {"montage_reconform", "montage_film_lists", "montage_paperwork", "montage_script"}) {
+                const McpCallPaths a = mcpCallPaths(tool, {{"project", folder + "/p.montage"}, {"path", wav}}, false);
+                QVERIFY2(a.writes == written.writes && a.reads.isEmpty(), tool);
+            }
+            QCOMPARE(mcpCallPaths("montage_production", {{"folder", folder + "/out"}, {"create", true}}, true).writes, render.writes);
+            QVERIFY(mcpCallPaths("montage_production", {{"folder", folder + "/out"}}, true).writes.isEmpty());
+            QCOMPARE(mcpCallPaths("montage_export_adm", {{"path", "file:" + wav}}, true).writes, written.writes);
+            QCOMPARE(mcpCallPaths("montage_export_adm", {{"path", "md5:file:" + wav}}, true).writes, written.writes);
+            for (const char* key : {"export", "chan", "ply", "usd", "destinations"})
+                QVERIFY2(mcpCallPaths("montage_captions", {{key, wav}}, false).writes == written.writes, key);
+            // Each of these names one of Montage's own files and is refused before it runs, whatever the key: the
+            // write keys above, a project, a farm, a key no tool has, a path after "file:", inside an object, a DKDM
+            // anywhere but montage_make_kdm's own.
+            const QString facilities = QString::fromStdString(facilitiesFile());
+            const QByteArray facilitiesBefore = [&] {
+                QFile g(facilities);
+                return g.open(QIODevice::ReadOnly) ? g.readAll() : QByteArray();
+            }();
+            const bool hadFacilities = QFileInfo::exists(facilities);
+            const QString dkdms = QString::fromStdString(dcp::dkdmFolder());
+            const std::pair<const char*, QJsonObject> refused[] = {
+                {"montage_reconform", {{"project", folder + "/p.montage"}, {"path", roots}}},
+                {"montage_film_lists", {{"project", folder + "/p.montage"}, {"path", facilities}}},
+                {"montage_paperwork", {{"project", folder + "/p.montage"}, {"path", roots}, {"async", true}}},
+                {"montage_script", {{"project", folder + "/p.montage"}, {"path", roots}}},
+                {"montage_captions", {{"project", folder + "/p.montage"}, {"export", facilities}}},
+                {"montage_camera_track", {{"project", folder + "/p.montage"}, {"clip", 1}, {"action", "export"}, {"chan", roots}}},
+                {"montage_offload", {{"source", folder}, {"destinations", QJsonArray{folder + "/copy", dkdms}}}},
+                {"montage_create_project", {{"project", roots}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"farm", dkdms}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"output", "file:" + roots}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"output", "md5:file:" + facilities}, {"async", true}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"output", folder + "/x.mov"}, {"streaming", QJsonObject{{"live", QJsonObject{{"anything", roots}}}}}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"output", folder + "/x.mov"}, {"dkdm", dkdms + "/new.xml"}}},
+                {"montage_export_markers", {{"path", folder + "/x.csv"}, {"note", QStringLiteral("file:%1/../%2").arg(dkdms, QFileInfo(dkdms).fileName())}}},
+            };
+            for (const auto& [tool, args] : refused) {
+                const QJsonObject r = call(tool, args);
+                QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+            }
+            // Arguments nested past what any tool reads are refused too.
+            QJsonValue deep = QJsonArray{roots};
+            for (int i = 0; i < 20; ++i) deep = QJsonObject{{"in", deep}};
+            const QJsonObject nested = call("montage_render", {{"project", folder + "/p.montage"}, {"output", folder + "/x.mov"}, {"deep", deep}});
+            QVERIFY2(nested.value("isError").toBool() && QJsonDocument(nested).toJson().contains("nested more than 16 deep"), QJsonDocument(nested).toJson().constData());
+            QFile g(facilities);
+            QCOMPARE(QFileInfo::exists(facilities), hadFacilities);
+            if (hadFacilities) QVERIFY(g.open(QIODevice::ReadOnly) && g.readAll() == facilitiesBefore);
             QFile f(roots);
             QCOMPARE(QFileInfo::exists(roots), hadRoots);
             if (hadRoots) QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == rootsBefore);
@@ -10653,6 +10704,12 @@ private slots:
                 QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("not a screen's in the facility list"), QJsonDocument(r).toJson().constData());
             }
             QVERIFY(!QFileInfo::exists(dir_.filePath("mcp-elsewhere")));
+            // Nightly 23 Nov: a chain up to a trusted root whose leaf is not a security manager's (the projector's) is
+            // refused too, and nothing is written.
+            r = call({{"dkdm", dkdm}, {"servers", QJsonArray{pemFile("park-projector-2-chain.pem", projectors[1].certificates)}},
+                      {"folder", dir_.filePath("mcp-projector")}});
+            QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("security manager"), QJsonDocument(r).toJson().constData());
+            QVERIFY(!QFileInfo::exists(dir_.filePath("mcp-projector")));
         }
         // Refused: a screen not in the list, and a window past the DKDM's.
         QVERIFY(call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens/7"}}, {"folder", dir_.filePath("mcp-booking")}}).value("isError").toBool());
