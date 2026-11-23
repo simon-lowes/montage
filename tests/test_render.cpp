@@ -31611,6 +31611,22 @@ colorspaces:
         QCOMPARE(gpu::stats().tableBytes, size_t(0));
         QVERIFY(gpu::stats().textureBytes + tables <= withGlare);
         QCOMPARE(out.px.size(), plainSmall.px.size());
+        // (nightly 23 Nov) What the last frames kept for later ones is let go once no frame has been drawn for a while
+        // (a fifth of a second here, 10 s outside tests); the next frame is drawn as before. (They were kept until
+        // frames came again: over a gigabyte after Lens Blur (Depth) at 4K.)
+        gpu::setIdleReleaseForTesting(200);
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        const Image blurred = out;
+        QVERIFY2(gpu::stats().textureBytes >= 3 * smallBytes, qPrintable(QString::number(gpu::stats().textureBytes)));
+        QElapsedTimer idle;
+        idle.start();
+        while (gpu::stats().textureBytes >= smallBytes && idle.elapsed() < 20000) QTest::qWait(50);
+        QVERIFY2(gpu::stats().textureBytes < smallBytes, qPrintable(QString::number(gpu::stats().textureBytes)));
+        QVERIFY(idle.elapsed() >= 150);
+        gpu::setIdleReleaseForTesting(0);
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        QCOMPARE(out.px, blurred.px);
+        QVERIFY(gpu::stats().textureBytes >= 3 * smallBytes);
     }
     // Masks and effects finished from the picture, drawn on the GPU as on the CPU: People masks and a depth worked out
     // from the picture (the models' places taken by stand-ins), Cryptomatte masks, masks bent with a surface track,

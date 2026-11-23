@@ -16,7 +16,8 @@
 // card's memory where the device says how much it has (Vulkan's device-local heaps; OpenGL's memory-info extensions),
 // or MONTAGE_GPU_MEMORY megabytes. A frame that would hold more than the budget is not drawn on the GPU (and not tried
 // again while nothing about it changes); where no budget is known, nothing is refused. Between frames it keeps the
-// textures the last frame used, and of the others up to 768 MB (or the budget, if less) for a few frames.
+// textures the last frame used, and of the others up to 768 MB (or the budget, if less) for a few frames; when no frame
+// has been drawn for 10 s, it lets them go.
 
 #include <functional>
 #include <memory>
@@ -232,6 +233,8 @@ void refuseHardwareFramesForTesting(bool refuse);
 void setTextureBudgetForTesting(size_t bytes);
 // Tests: the budget itself (0: the device's own again).
 void setTextureLimitForTesting(size_t bytes);
+// Tests: how long no frame is drawn before the textures kept for later frames are let go, ms (0: 10 s again).
+void setIdleReleaseForTesting(int ms);
 void countFallback(const std::string& why);  // (render/Compositor's bookkeeping)
 void countLayer(bool onGpu, const std::string& how = {});  // (and with MONTAGE_GPU_LOG, says how it was drawn)
 

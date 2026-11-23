@@ -85,6 +85,7 @@ void loseDeviceForTesting() {}
 void refuseHardwareFramesForTesting(bool) {}
 void setTextureBudgetForTesting(size_t) {}
 void setTextureLimitForTesting(size_t) {}
+void setIdleReleaseForTesting(int) {}
 
 }  // namespace montage::gpu
 
@@ -104,6 +105,7 @@ void setTextureLimitForTesting(size_t) {}
 #include <QVulkanInstance>
 #endif
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -248,6 +250,9 @@ public:
     size_t heldBytes = 0, peakBytes = 0, tableBytes = 0;
     std::string overBudget;
     std::atomic<size_t> limit{0};          // (tests: the budget; 0 for the device's own)
+    // How long no frame is drawn before the textures kept for later frames are let go (tests set it shorter).
+    std::atomic<int> idleMs{kIdleReleaseMs};
+    static constexpr int kIdleReleaseMs = 10000;
     // The budget: the most texture memory a frame may hold (0: none known).
     size_t textureBudget() const { return limit.load() ? limit.load() : ownBudget_.load(); }
     std::string mapped() const {
@@ -257,6 +262,7 @@ public:
 
 private:
     void loop();
+    void letGoIdle();  // (on the GPU's thread, between jobs: the pool let go once nothing has been drawn for idleMs)
     bool launch();  // the instance or surface backend_ needs, the GPU's thread and its device
     bool create();  // on the GPU's thread
     void announceMapped();
@@ -364,6 +370,8 @@ private:
     };
     std::vector<Pooled> pool_;
     long frameNo_ = 0;
+    std::chrono::steady_clock::time_point lastDrawn_{};  // (when the last frame ended)
+    bool idleLetGo_ = true;                               // (nothing kept since, or let go already)
     bool failed_ = false;  // a pass of this frame could not be drawn
     std::atomic<size_t> ownBudget_{0};  // (half the card's memory, or MONTAGE_GPU_MEMORY's; 0: not known)
     // The frame last refused for the budget, and the budget it was refused under: one like it is not tried again.
@@ -532,13 +540,35 @@ void Device::loop() {
         std::function<void()> job;
         {
             std::unique_lock lock(queueMutex_);
-            queueCv_.wait(lock, [this] { return quit_ || !queue_.empty(); });
+            // (woken now and then while idle, to let go of what the last frames kept)
+            const auto every = std::chrono::milliseconds(std::clamp(idleMs.load() / 2, 10, 1000));
+            if (!queueCv_.wait_for(lock, every, [this] { return quit_ || !queue_.empty(); })) {
+                lock.unlock();
+                letGoIdle();
+                continue;
+            }
             if (queue_.empty()) return;
             job = std::move(queue_.front());
             queue_.pop_front();
         }
         job();
     }
+}
+
+void Device::letGoIdle() {
+    // While frames are drawn, a frame keeps the textures the last one used however much they are (a 4K layer through
+    // Lens Blur (Depth) uses over a gigabyte). When nothing has been drawn for a while (playback stopped, the window
+    // left alone), they are let go: the next frame makes them again, once.
+    if (idleLetGo_ || !rhi_ || std::chrono::steady_clock::now() - lastDrawn_ < std::chrono::milliseconds(idleMs.load())) return;
+    idleLetGo_ = true;
+    while (!pool_.empty()) dropPooled(pool_.size() - 1);
+    // (an empty frame, after which the API frees what was let go: it holds a texture until a frame has ended past it)
+    QRhiCommandBuffer* cb = nullptr;
+    if (rhi_->beginOffscreenFrame(&cb) == QRhi::FrameOpSuccess) rhi_->endOffscreenFrame();
+    countHeld();
+    std::lock_guard statsLock(gStatsMutex);
+    gStats.textureBytes = heldBytes, gStats.tableBytes = tableBytes;
+    if (logFallbacks()) std::fprintf(stderr, "montage gpu: textures kept for later frames let go, none drawn for %d s\n", idleMs.load() / 1000);
 }
 
 bool Device::serve(const std::function<bool()>& fn) {
@@ -1765,6 +1795,8 @@ void Device::endFrame(bool drawn) {
     }
     ++frameNo_;
     failed_ = false;
+    lastDrawn_ = std::chrono::steady_clock::now();
+    idleLetGo_ = pool_.empty();
     const size_t peak = peakBytes;
     countHeld();
     peakBytes = peak;
@@ -2167,6 +2199,11 @@ void setTextureBudgetForTesting(size_t bytes) {
 void setTextureLimitForTesting(size_t bytes) {
     DeviceLock lock;
     if (gDevice) gDevice->limit = bytes;
+}
+
+void setIdleReleaseForTesting(int ms) {
+    DeviceLock lock;
+    if (gDevice) gDevice->idleMs = ms > 0 ? ms : Device::kIdleReleaseMs;
 }
 
 }  // namespace montage::gpu
