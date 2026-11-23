@@ -75,17 +75,9 @@ CommandFinder::CommandFinder(QWidget* window) : QDialog(window), window_(window)
     lay->addWidget(hint);
     connect(edit_, &QLineEdit::textChanged, this, [this] { refresh(); });
     connect(edit_, &QLineEdit::returnPressed, this, [this] {
-        const QString id = chosen();
-        if (id.isEmpty()) return;
-        // (closed first: a command that opens a dialog of its own does so over the main window)
-        accept();
-        run(id);
+        if (const QString id = chosen(); !id.isEmpty()) choose(id);
     });
-    connect(list_, &QListWidget::itemActivated, this, [this](QListWidgetItem* item) {
-        const QString id = item->data(kIdRole).toString();
-        accept();
-        run(id);
-    });
+    connect(list_, &QListWidget::itemActivated, this, [this](QListWidgetItem* item) { choose(item->data(kIdRole).toString()); });
     gather();
     refresh();
 }
@@ -210,6 +202,16 @@ bool CommandFinder::run(const QString& id) {
     if (!type.isEmpty()) emit applyRequested(type, category);
     else if (action) action->trigger();
     return true;
+}
+
+void CommandFinder::choose(const QString& id) {
+    // Hidden first, so that a command that opens a dialog of its own does so over the main window, and closed only
+    // once it has run: closed, this dialog is deleted (it is made to be), and a dialog the command waits on would
+    // delete it there, under the key or the click being handled.
+    const QPointer<CommandFinder> self(this);
+    hide();
+    run(id);
+    if (self) accept();
 }
 
 QStringList CommandFinder::recent() { return appSettings().value(kRecentKey).toStringList(); }

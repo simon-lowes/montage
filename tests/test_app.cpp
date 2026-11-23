@@ -25979,11 +25979,16 @@ print("added " + ui["name"])
         for (int i = 0; i < listed.indexOf(nest); ++i) QTest::keyClick(text, Qt::Key_Down);
         QCOMPARE(finder->chosen(), nest);
         const size_t undos = state()->history().undoCount();
-        whenModal<QInputDialog>(this, [](QInputDialog* d) {
+        // (the finder is hidden while the command's own dialog asks, and still there: closed, it is deleted, and it
+        // would be under the Return being handled)
+        bool finderWhileAsked = false;
+        whenModal<QInputDialog>(this, [&finder, &finderWhileAsked](QInputDialog* d) {
+            finderWhileAsked = finder && !finder->isVisible();
             d->setTextValue(QStringLiteral("Found"));
             d->accept();
         });
         QTest::keyClick(text, Qt::Key_Return);
+        QVERIFY(finderWhileAsked);
         QCOMPARE(state()->history().undoCount(), undos + 1);
         const Track& v1 = state()->sequence()->videoTracks[0];
         QCOMPARE(v1.clips.size(), size_t(3));

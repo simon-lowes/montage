@@ -54,6 +54,7 @@ private:
     };
     void gather();
     void refresh();
+    void choose(const QString& id);  // the one chosen with Return or a double-click: run, then closed
     const Entry* entry(const QString& id) const;
 
     QWidget* window_;
