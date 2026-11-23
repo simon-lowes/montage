@@ -834,7 +834,8 @@ void addChapters(AVFormatContext* oc, const Sequence& seq, FrameTime in, FrameTi
 // ---- Smart rendering --------------------------------------------------------------------------------------------
 // Frames that are one untouched clip of footage already in the export's intra-frame codec (ProRes, DNxHR) are
 // copied from the source file instead of being decoded and encoded again, as Premiere's and Final Cut's smart
-// rendering do: faster, and exactly the original pictures.
+// rendering do: faster, and exactly the original pictures. ProRes 4444 and 4444 XQ at 12 bits too (the export
+// Montage's own encoder codes): any 4444 or 4444 XQ source of the same flavour is 12-bit pictures, whoever coded it.
 
 bool isIntraCodec(const std::string& encoder) { return encoder == "prores_ks" || encoder == "dnxhd"; }
 
@@ -890,16 +891,18 @@ namespace {
 
 class SmartRenderer {
 public:
-    // `profile` is the export's ProRes or DNxHR profile option ("hq", "4444", "dnxhr_sq"...).
+    // `profile` is the export's ProRes or DNxHR profile option ("hq", "4444", "dnxhr_sq"...). The pictures the export
+    // makes are those its stream says (`vst`'s parameters: for 12-bit ProRes the encoder context is only raw pictures).
     SmartRenderer(const Project& p, const Sequence& seq, const ColorSpace& seqSpace, AVCodecContext* vctx, AVStream* vst, bool alpha,
                   const std::string& profile)
-        : p_(p), seq_(seq), seqSpace_(seqSpace), vctx_(vctx), vst_(vst), alpha_(alpha) {
+        : p_(p), seq_(seq), seqSpace_(seqSpace), vctx_(vctx), vst_(vst), alpha_(alpha), codec_(vst->codecpar->codec_id),
+          format_(vst->codecpar->format) {
         // The FourCC a ProRes flavour is stored under, and DNxHR's profile numbers.
         static const std::map<std::string, uint32_t> prores{{"proxy", MKTAG('a', 'p', 'c', 'o')}, {"lt", MKTAG('a', 'p', 'c', 's')},
                                                             {"standard", MKTAG('a', 'p', 'c', 'n')}, {"hq", MKTAG('a', 'p', 'c', 'h')},
                                                             {"4444", MKTAG('a', 'p', '4', 'h')}, {"4444xq", MKTAG('a', 'p', '4', 'x')}};
         static const std::map<std::string, int> dnxhr{{"dnxhr_lb", 1}, {"dnxhr_sq", 2}, {"dnxhr_hq", 3}, {"dnxhr_hqx", 4}, {"dnxhr_444", 5}};
-        if (vctx->codec_id == AV_CODEC_ID_PRORES) {
+        if (codec_ == AV_CODEC_ID_PRORES) {
             auto it = prores.find(profile.empty() ? "hq" : profile);
             tag_ = it != prores.end() ? it->second : 0;
         } else {
@@ -965,8 +968,8 @@ private:
         const AVRational rate = st->avg_frame_rate.num > 0 ? st->avg_frame_rate : st->r_frame_rate;
         const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(par->format));
         // The same pictures the encoder would make: codec, size, sampling, rate, progressive, the same flavour.
-        const bool same = par->codec_id == vctx_->codec_id && par->width == vctx_->width && par->height == vctx_->height &&
-                          par->format == vctx_->pix_fmt && av_cmp_q(rate, vctx_->framerate) == 0 &&
+        const bool same = par->codec_id == codec_ && par->width == vctx_->width && par->height == vctx_->height &&
+                          par->format == format_ && av_cmp_q(rate, vctx_->framerate) == 0 &&
                           (par->field_order == AV_FIELD_PROGRESSIVE || par->field_order == AV_FIELD_UNKNOWN) &&
                           (alpha_ || !(d && (d->flags & AV_PIX_FMT_FLAG_ALPHA))) && sameFlavour(*par);
         if (!same || seq_.width != par->width || seq_.height != par->height) return nullptr;
@@ -981,7 +984,7 @@ private:
 
     // ProRes and DNxHR come in flavours (Proxy, LT, 422, HQ, 4444; SQ, HQ, HQX, 444): only the same one may mix.
     bool sameFlavour(const AVCodecParameters& par) const {
-        if (vctx_->codec_id == AV_CODEC_ID_PRORES) return tag_ && par.codec_tag == tag_;
+        if (codec_ == AV_CODEC_ID_PRORES) return tag_ && par.codec_tag == tag_;
         return profile_ >= 0 && par.profile == profile_;
     }
 
@@ -1011,6 +1014,8 @@ private:
     AVCodecContext* vctx_;
     AVStream* vst_;
     bool alpha_;
+    AVCodecID codec_;
+    int format_;
     std::map<Id, Source> sources_;
     AVPacket* pkt_ = nullptr;
     int copied_ = 0;
@@ -1252,7 +1257,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->colorspace = tags.matrix;
         o.vctx->color_range = c == "mjpeg" ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
         // (Raw pictures for spatial video are only copied: frames in flight on many threads would just hold memory.)
-        o.vctx->thread_count = spatial ? 1 : 0;
+        // (12-bit ProRes too: Montage's own encoder has its own threads, and with frames in flight here a picture
+        // would come out after the copied ones that follow it)
+        o.vctx->thread_count = spatial || ownProRes ? 1 : 0;
         // Smart rendering interleaves copied packets with encoded ones, so the encoder must not hold frames back.
         if (s.smartRender && isIntraCodec(c)) o.vctx->thread_type = FF_THREAD_SLICE;
         // One pass of two (x264 and x265): the first at constant quality, measuring; the second at the bitrate.
@@ -2313,7 +2320,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.cancel = cancel;
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
-    if (wantVideo && s.smartRender && o.vctx && !av2Out && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
+    if (wantVideo && s.smartRender && o.vctx && !av2Out && (o.prores || isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "")) && W == seq.width && H == seq.height &&
+        !seq.stereo3d &&
         !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && sameColorSpace(outSpace, seqSpace) && !trim && !sceneGraded &&
         !conv.active())
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);

@@ -23231,6 +23231,102 @@ if ui["pressed"] == "add":
         QCOMPARE(copied, 0);
     }
 
+    void smartRendering12BitProRes() {
+        // ProRes 4444 at 12 bits (Montage's own encoder's export): untouched frames of 4444 sources are copied, those
+        // Montage coded at 12 bits and those another encoder coded (FFmpeg's here: any 4444 stream is read as 12-bit
+        // pictures), and the copies are the sources' packets byte for byte.
+        auto source = [&](const char* file, const char* pixFmt, double green, std::string* written) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 128, gs.height = 72, gs.fps = Rational{25, 1};
+            Clip ramp = makeGeneratorClip(gen, "color", 20);
+            ramp.generator.params["color.r"].addKey(0, 0.1);
+            ramp.generator.params["color.r"].addKey(19, 0.9);
+            ramp.generator.params["color.g"] = green;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+            ExportSettings st;
+            st.videoCodec = "prores_ks";
+            st.profile = "4444";
+            st.pixFmt = pixFmt;
+            st.audioCodec = "none";
+            st.path = path(file);
+            std::string err, encoder;
+            if (!exportSequence(gen, gs, st, nullptr, nullptr, &err, &encoder)) return false;
+            *written = encoder;
+            return true;
+        };
+        std::string own, theirs, err;
+        QVERIFY(source("smart12-own.mov", "yuv444p12le", 0.4, &own));
+        QVERIFY(source("smart12-other.mov", "yuv444p10le", 0.7, &theirs));
+        QCOMPARE(own, std::string("Montage ProRes (12-bit)"));
+        QVERIFY2(theirs != own, theirs.c_str());
+        // A cut: ten frames of the first as they are, ten of it inverted, then ten of the other as they are.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 128, s.height = 72, s.fps = Rational{25, 1};
+        MediaItem a = probeOrFail(p, path("smart12-own.mov")), b = probeOrFail(p, path("smart12-other.mov"));
+        p.media.push_back(a);
+        p.media.push_back(b);
+        QVERIFY(edit::placeMedia(p, s, a.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 10).ok);
+        s.videoTracks[0].clips[1].effects.push_back(makeEffect(p, "invert"));
+        QVERIFY(edit::placeMedia(p, s, b.id, 20, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(s.duration(), FrameTime(30));
+        ExportSettings ex;
+        ex.videoCodec = "prores_ks";
+        ex.profile = "4444";
+        ex.pixFmt = "yuv444p12le";
+        ex.audioCodec = "none";
+        ex.path = path("smart12.mov");
+        int copied = -1;
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+        QCOMPARE(copied, 20);
+        auto packets = [](const std::string& file) {
+            std::vector<QByteArray> out;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (fmt->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+                    out.push_back(QByteArray(reinterpret_cast<const char*>(pkt->data), pkt->size));
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            return out;
+        };
+        const auto first = packets(path("smart12-own.mov")), second = packets(path("smart12-other.mov")), smart = packets(ex.path);
+        QCOMPARE(first.size(), size_t(20));
+        QCOMPARE(second.size(), size_t(20));
+        QCOMPARE(smart.size(), size_t(30));
+        for (int i = 0; i < 10; ++i) QVERIFY2(smart[size_t(i)] == first[size_t(i)], qPrintable(QString::number(i)));
+        for (int i = 10; i < 20; ++i) QVERIFY2(smart[size_t(i)] != first[size_t(i)], qPrintable(QString::number(i)));
+        for (int i = 0; i < 10; ++i) QVERIFY2(smart[size_t(20 + i)] == second[size_t(i)], qPrintable(QString::number(20 + i)));
+        // The file plays through: every frame decodes, the inverted stretch inverted.
+        VideoDecoder da, dc;
+        QVERIFY(da.open(path("smart12-own.mov"), &err) && dc.open(ex.path, &err));
+        const size_t mid = (size_t(36) * 128 + 64) * 4;
+        const Frame16Ptr fa = da.frameAt(15 / 25.0, 0, 0), fc = dc.frameAt(15 / 25.0, 0, 0);
+        QVERIFY(fa && fc);
+        QVERIFY2(std::fabs(fa->px[mid] / 65535.0 + fc->px[mid] / 65535.0 - 1.0) < 0.02, qPrintable(QString("%1 %2").arg(fa->px[mid]).arg(fc->px[mid])));
+        const Frame16Ptr ca = da.frameAt(5 / 25.0, 0, 0), cc = dc.frameAt(5 / 25.0, 0, 0);
+        QVERIFY(ca && cc && ca->px == cc->px);
+        QVERIFY(dc.frameAt(25 / 25.0, 0, 0));
+        // Nothing is copied into another flavour, into an export that keeps alpha (the sources have none), or with
+        // smart rendering off.
+        ex.profile = "4444xq";
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+        QCOMPARE(copied, 0);
+        ex.profile = "4444";
+        ex.pixFmt = "yuva444p12le";
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+        QCOMPARE(copied, 0);
+        ex.pixFmt = "yuv444p12le";
+        ex.smartRender = false;
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+        QCOMPARE(copied, 0);
+    }
+
     void longGopSmartRendering() {
         // Video packets in decode order: their bytes and the frame each shows.
         struct Coded {
