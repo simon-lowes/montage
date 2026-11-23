@@ -1314,9 +1314,9 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
         vf.sublevel = withoutSpaces(jxsSublevelName(h.plev));
         boxes_ = jxsvBoxes(vf, h.ppih, h.plev, uint32_t(cs.size()));
         // (ST 2110-22's b=AS: each frame's IP packets, their IPv4, UDP and RTP headers and RFC 9134's, in kilobits a
-        // second, rounded up)
+        // second, rounded up; an interlaced frame is two fields' codestreams)
         const int packets = jxsvPacketCount(boxes_.size(), cs.size(), units, vf.packetMode, o.maxPayload);
-        const double bits = (double(boxes_.size() + cs.size()) + double(packets) * (20 + 8 + 12 + 4)) * 8;
+        const double bits = (double(boxes_.size() + cs.size()) + double(packets) * (20 + 8 + 12 + 4)) * 8 * (vf.interlaced ? 2 : 1);
         vf.bandwidthKbps = int64_t(std::ceil(bits * vf.fps.num / vf.fps.den / 1000));
     }
     s_ = std::make_unique<Sockets>();
