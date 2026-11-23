@@ -980,7 +980,7 @@ QJsonObject Node::receiverResource(const RConn& r) const {
     static const char* const labels[3] = {"Picture", "Sound", "Ancillary data"};
     static const char* const formats[3] = {"urn:x-nmos:format:video", "urn:x-nmos:format:audio", "urn:x-nmos:format:data"};
     const QJsonArray types = r.stream == 0   ? (jpegXsAvailable() ? QJsonArray{"video/raw", "video/jxsv"} : QJsonArray{"video/raw"})
-                             : r.stream == 1 ? QJsonArray{"audio/L24", "audio/L16"}
+                             : r.stream == 1 ? QJsonArray{"audio/L24", "audio/L16", "audio/AM824"}
                                              : QJsonArray{"video/smpte291"};
     // (each leg bound to its interface)
     auto nameOf = [&](const QString& address) {
@@ -992,7 +992,7 @@ QJsonObject Node::receiverResource(const RConn& r) const {
     return QJsonObject{{"id", idText(r.id)},
                        {"version", r.version},
                        {"label", o_.label + " " + labels[r.stream] + " in"},
-                       {"description", text("ST 2110-%1 receiver (ST 2022-7)").arg(r.stream == 0 ? (jpegXsAvailable() ? "20 and -22" : "20") : r.stream == 1 ? "30" : "40")},
+                       {"description", text("ST 2110-%1 receiver (ST 2022-7)").arg(r.stream == 0 ? (jpegXsAvailable() ? "20 and -22" : "20") : r.stream == 1 ? "30 and -31" : "40")},
                        {"tags", QJsonObject{}},
                        {"device_id", idText(deviceId_)},
                        {"transport", "urn:x-nmos:transport:rtp"},

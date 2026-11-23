@@ -21205,6 +21205,8 @@ colorspaces:
         const QJsonArray receivers = json("GET", nodeApi + "receivers").second.array();
         QCOMPARE(receivers.size(), 3);
         QCOMPARE(receivers[0].toObject()["caps"].toObject()["media_types"].toArray()[0].toString(), QStringLiteral("video/raw"));
+        // (the sound's receiver takes ST 2110-31's AES3 subframes too, kept bit for bit)
+        QVERIFY(receivers[1].toObject()["caps"].toObject()["media_types"].toArray().contains(QStringLiteral("audio/AM824")));
         QCOMPARE(receivers[0].toObject()["interface_bindings"].toArray().size(), 2);
         QCOMPARE(json("GET", nodeApi + "devices").second.array()[0].toObject()["receivers"].toArray().size(), 3);
         const QString videoId = node.receiverId(0).toString(QUuid::WithoutBraces), audioId = node.receiverId(1).toString(QUuid::WithoutBraces);
