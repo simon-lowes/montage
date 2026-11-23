@@ -25396,6 +25396,54 @@ if ui["pressed"] == "add":
         QVERIFY2(one.checked && one.schedules.size() == 32, (one.summary() + " " + one.note).c_str());
     }
 
+    // Nightly 23 Nov: the buffer check reads AV1 without probing the file, and that held for any file with an AV1
+    // video stream in it. AV1 that states its decoder model checks the same in MP4, Matroska and as bare OBUs; and a
+    // file whose default video is MPEG-2, with AV1 beside it, is probed and checked as the MPEG-2 alone is.
+    void av1DecoderModelContainers() {
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg to make the files with");
+        if (!avcodec_find_encoder_by_name("libaom-av1")) QSKIP("This build of FFmpeg has no libaom, the encoder that writes AV1's decoder model");
+        auto run = [&](const QStringList& args) {
+            QProcess pr;
+            pr.start(ffmpeg, QStringList{"-hide_banner", "-loglevel", "error", "-y"} + args);
+            return pr.waitForFinished(300000) && pr.exitCode() == 0;
+        };
+        const QString mp4 = QString::fromStdString(path("model-in.mp4")), mkv = QString::fromStdString(path("model-in.mkv")),
+                      obu = QString::fromStdString(path("model-in.obu")), mpeg2 = QString::fromStdString(path("vbv-alone.mkv")),
+                      both = QString::fromStdString(path("vbv-and-av1.mkv"));
+        if (!run({"-f", "lavfi", "-i", "testsrc2=s=320x180:r=25", "-frames:v", "40", "-c:v", "libaom-av1", "-cpu-used", "8", "-b:v", "300k", "-g", "12",
+                  "-aom-params", "timing-info=model", mp4}))
+            QSKIP("This libaom does not take timing-info=model");
+        QVERIFY(run({"-i", mp4, "-c", "copy", mkv}));
+        QVERIFY(run({"-i", mp4, "-c", "copy", "-f", "obu", obu}));
+        const HrdReport inMp4 = checkHrd(mp4.toStdString());
+        // (libaom codes its hidden alternate reference frames as frames of their own: more than the 40 shown)
+        QVERIFY2(inMp4.checked && inMp4.codec == "AV1" && inMp4.frames >= 40, inMp4.summary().c_str());
+        for (const QString& file : {mkv, obu}) {
+            const HrdReport r = checkHrd(file.toStdString());
+            QVERIFY2(r.checked && r.codec == "AV1", qPrintable(file + ": " + QString::fromStdString(r.summary() + r.note + r.error)));
+            QCOMPARE(r.frames, inMp4.frames);
+            QCOMPARE(r.bitRate, inMp4.bitRate);
+            QCOMPARE(r.bufferBits, inMp4.bufferBits);
+            QCOMPARE(r.issueCount, inMp4.issueCount);
+        }
+        // MPEG-2 at 30 frames a second with a VBV, alone and with the AV1 beside it.
+        QVERIFY(run({"-f", "lavfi", "-i", "testsrc2=s=640x360:r=30", "-frames:v", "45", "-c:v", "mpeg2video", "-b:v", "2M", "-maxrate", "2M", "-bufsize",
+                     "1M", "-g", "15", mpeg2}));
+        // (the MPEG-2 the default stream, so it is the one picked as best)
+        QVERIFY(run({"-i", mpeg2, "-i", mp4, "-map", "0:v", "-map", "1:v", "-c", "copy", "-disposition:v:0", "default", "-disposition:v:1", "0", both}));
+        const HrdReport alone = checkHrd(mpeg2.toStdString()), beside = checkHrd(both.toStdString());
+        QVERIFY2(alone.checked && alone.codec == "MPEG-2" && alone.frames == 45, alone.summary().c_str());
+        QVERIFY2(beside.checked && beside.codec == "MPEG-2", (beside.summary() + beside.note + beside.error).c_str());
+        QCOMPARE(beside.frames, alone.frames);
+        QCOMPARE(beside.bitRate, alone.bitRate);
+        QCOMPARE(beside.bufferBits, alone.bufferBits);
+        QCOMPARE(beside.initialDelay, alone.initialDelay);
+        QCOMPARE(beside.lowest, alone.lowest);
+        QCOMPARE(beside.highest, alone.highest);
+        QCOMPARE(beside.issueCount, alone.issueCount);
+    }
+
 private:
     // A file's video packets in decode order: their bytes, the frame each shows, and whether it is a key frame.
     struct CodedPacket {

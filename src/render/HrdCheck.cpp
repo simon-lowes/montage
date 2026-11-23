@@ -1595,9 +1595,15 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
     constexpr int64_t kGroupBytes = int64_t(sizeof(Av1Group) + 5 * sizeof(double)), kUnitBytes = 4 * int64_t(sizeof(int64_t));
     int64_t bytesRead = 0;
     bool tooMany = false;
+    // (a full vector's next block counted as well: while it grows, its old block and its new one, twice the size, are
+    // both held, so what is kept never passes the limit even then)
+    // (a frame header adds up to 32 removal times)
+    auto growing = [](const auto& v, size_t adds) {
+        return v.size() + adds > v.capacity() ? int64_t(std::max<size_t>(v.size() + adds, v.capacity() * 2) * sizeof(v[0])) : int64_t(0);
+    };
     auto kept = [&] {
         return int64_t(units.capacity() * sizeof(Obu) + headers.capacity() * sizeof(Av1Frame) + removals.capacity() * sizeof(int64_t)) +
-               int64_t(headers.size()) * kGroupBytes + int64_t(ptsOf.size()) * kUnitBytes;
+               growing(units, 1) + growing(headers, 1) + growing(removals, 32) + int64_t(headers.size()) * kGroupBytes + int64_t(ptsOf.size()) * kUnitBytes;
     };
     Av1Seq running = seq;  // (the sequence header in force as the stream is read)
     bool modelStated = true;
