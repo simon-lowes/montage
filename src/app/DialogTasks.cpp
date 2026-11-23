@@ -17,6 +17,7 @@
 #include "DialogJobs.h"
 #include "DialogTasks.h"
 #include "EditorState.h"
+#include "InspectorWidget.h"
 #include "core/Adr.h"
 #include "core/EditOps.h"
 #include "core/ProjectIO.h"
@@ -1067,6 +1068,7 @@ void registerDialogTaskKinds() {
         DialogJobs::registerKind(QStringLiteral("conform-check"), {runConform, nullptr, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("lens-board"), {runLensBoard, nullptr, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("vfx-pull"), {runVfxPull, applyVfxPull, false, nullptr});
+        registerInspectorTaskKinds();
         DialogJobs::registerKind(QStringLiteral("adr-align"), {runAdrAlign, applyAdrAlign, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("captions-translate"), {runTranslateCaptions, applyTranslateCaptions, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("captions-sdh"), {runSdhDraft, applySdhDraft, false, nullptr});

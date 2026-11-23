@@ -20352,6 +20352,99 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(kept.points.size(), size_t(40));
     }
 
+    void inspectorAnalysesAsBackgroundJobs() {
+        // The Inspector's analyses run as jobs in the store. Watched, Analyze Stabilization keys the effect as one undo
+        // step; left to run, what it found is put on the effect as it is when it ends (a setting changed meanwhile
+        // stays); killed part-way in another process and taken up, the same is found and offered here.
+        QImage tex(160, 90, QImage::Format_RGB32);
+        tex.fill(QColor(80, 80, 80));
+        {
+            QPainter pa(&tex);
+            for (int i = 0; i < 60; ++i)
+                pa.fillRect((i * 97) % 150, (i * 53) % 85, 4 + (i * 7) % 12, 4 + (i * 11) % 12, QColor((i * 37) % 255, (i * 71) % 255, (i * 13) % 255));
+        }
+        const QString png = dir_.path() + "/analysis-texture.png";
+        QVERIFY(tex.save(png));
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160, gs.height = 90, gs.fps = {25, 1};
+        MediaItem m;
+        m.id = gen.newId();
+        std::string err;
+        QVERIFY(probeMedia(png.toStdString(), m, &err));
+        gen.media.push_back(m);
+        Clip c = makeClip(gen, m, TrackKind::Video, gs);
+        c.duration = 20;
+        c.motion.params["scale"] = Param(130.0);
+        for (int i = 0; i < 20; ++i) {
+            c.motion.params["pos_x"].addKey(i, 4 * std::sin(i * 1.7), Interp::Hold);
+            c.motion.params["pos_y"].addKey(i, 3 * std::cos(i * 1.1), Interp::Hold);
+        }
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        ExportSettings st;
+        st.path = (dir_.path() + "/analysis-shaky.mp4").toStdString();
+        st.audioCodec = "none";
+        st.crf = 12;
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        Id clip = 0, eid = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            Clip& placed = s.videoTracks[0].clips.at(0);
+            clip = placed.id;
+            placed.effects.push_back(makeEffect(p, "stabilize"));
+            eid = placed.effects.back().id;
+            return true;
+        }));
+        auto effect = [&]() -> const Effect* {
+            const Clip* k = edit::clipById(*state()->sequence(), clip);
+            for (const Effect& e : k->effects)
+                if (e.id == eid) return &e;
+            return nullptr;
+        };
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector);
+        DialogJobs* dialogs = win_->dialogJobs();
+        // Watched.
+        const int steps = int(state()->history().undoCount());
+        inspector->analyzeStabilize(clip, eid);
+        QVERIFY(effect() && !effect()->s("motion").empty());
+        const std::string motion = effect()->s("motion");
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QCOMPARE(state()->undoText(), QString("Analyze Stabilization"));
+        state()->undo();
+        QVERIFY(effect()->s("motion").empty());
+        // Left to run, a setting changed meanwhile: both kept.
+        const QString id = startInBackground(dialogs, [&] { inspector->analyzeStabilize(clip, eid); });
+        QVERIFY(!id.isEmpty());
+        QVERIFY(state()->edit("By hand", [&](Project&, Sequence& s) {
+            Effect* e = edit::ownedEffect(s, clip, eid);
+            if (!e) return false;
+            e->params["crop"] = Param(0.25);
+            return true;
+        }));
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+        QCOMPARE(effect()->s("motion"), motion);
+        QCOMPARE(effect()->p("crop", 0), 0.25);
+        QCOMPARE(state()->undoText(), QString("Analyze Stabilization"));
+        state()->undo();
+        state()->undo();
+        QVERIFY(effect()->s("motion").empty());
+        // Killed in another process part-way, and taken up: the same motion, offered here and applied.
+        QString why;
+        const QJsonObject input{{"sequence", QString::number(state()->sequence()->id)}, {"clips", QJsonArray{QString::number(clip)}},
+                                {"clip", QString::number(clip)}, {"effect", QString::number(eid)}, {"what", "stabilize"}, {"args", QJsonObject{}}};
+        const QString job = killedAndTakenUp("inspector-analysis", "Analysing camera movement...", input, "0.3", &why);
+        QVERIFY2(!job.isEmpty(), qPrintable(why));
+        QVERIFY(dialogs->applyOffered(job));
+        QCOMPARE(effect()->s("motion"), motion);
+        state()->newProject();
+    }
+
     void stabilizeAndTrackFromInspector() {
         // A textured still shaken by a few pixels every frame.
         QImage tex(320, 180, QImage::Format_RGB32);
