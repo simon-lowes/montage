@@ -202,6 +202,7 @@ void visitSettings(S& s, V& v) {
     v("toneMapping", s.toneMapping);
     v("trimTarget", s.trimTarget);
     v("hdr10Plus", s.hdr10Plus);
+    v("filmGrain", s.filmGrain);
     v("loudnessTarget", s.loudnessTarget);
     v("peakCeiling", s.peakCeiling);
     v("dialogueGated", s.dialogueGated);

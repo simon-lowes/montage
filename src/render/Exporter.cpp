@@ -8,6 +8,7 @@
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
 #include "media/Av2.h"
+#include "render/Av1GrainExport.h"
 #include "media/JpegXs.h"
 #include "media/ProResEncoder.h"
 #include "render/ProRes.h"
@@ -3383,6 +3384,12 @@ bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames) {
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light, bool* keptUnsigned, HrdReport* hrd) {
+    // (grain carried as parameters: the cleaned sequence exported through here, then its frame headers written again)
+    if (exportCarriesGrain(s)) {
+        if (smartRendered) *smartRendered = 0;
+        if (hrd) *hrd = HrdReport{};
+        return exportCarryingGrain(p, seq, s, progress, cancel, error, encoderUsed, light, keptUnsigned);
+    }
     // (the outermost call checks: two passes export again through here)
     static thread_local int depth = 0;
     int copied = 0;

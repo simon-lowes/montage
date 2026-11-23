@@ -176,6 +176,10 @@
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
 #include "render/GrainMatch.h"
+#include "render/Av1FilmGrain.h"
+#include "render/Av1GrainExport.h"
+#include "render/Av1Headers.h"
+#include "Av1Streams.h"
 #include "render/LutToGrade.h"
 #include "render/MonitorSection.h"
 #include "render/LightLevel.h"
@@ -555,6 +559,29 @@ bool writeY4m(const QString& path, int w, int h, int frames, const Y4mFill& fill
         f.write(reinterpret_cast<const char*>(cr.data()), qint64(cr.size()));
     }
     return true;
+}
+
+// Film grain parameters for the AV1 grain tests: two shots' worth of a full set (three luma points, its own chroma
+// points, coefficients two samples back, overlap, restricted range), each frame with its own seed.
+montage::Av1FilmGrain av1TestGrain(int shot, int64_t frame) {
+    montage::Av1FilmGrain g;
+    g.apply = true;
+    g.seed = montage::av1GrainSeed(frame, 7);
+    g.numY = 3;
+    g.yValue[0] = 16, g.yScaling[0] = uint8_t(shot ? 90 : 40);
+    g.yValue[1] = 128, g.yScaling[1] = uint8_t(shot ? 120 : 70);
+    g.yValue[2] = 235, g.yScaling[2] = uint8_t(shot ? 60 : 30);
+    g.numCb = 2, g.cbValue[0] = 16, g.cbScaling[0] = 50, g.cbValue[1] = 240, g.cbScaling[1] = 80;
+    g.numCr = 1, g.crValue[0] = 100, g.crScaling[0] = 64;
+    g.scalingShift = 10;
+    g.arLag = 2;
+    const int8_t y[12] = {2, -5, 9, -4, 1, -6, 20, 33, 18, -7, 12, 41};
+    for (int i = 0; i < 12; ++i) g.arY[i] = y[i], g.arCb[i] = int8_t(y[i] / 2), g.arCr[i] = int8_t(-y[i] / 3);
+    g.arCb[12] = 40, g.arCr[12] = -25;
+    g.arShift = 7;
+    g.cbMult = 140, g.cbLumaMult = 180, g.cbOffset = 250;
+    g.overlap = true, g.clipRestricted = true;
+    return g;
 }
 
 // A moving, textured picture for the comparisons.
@@ -30104,6 +30131,428 @@ colorspaces:
         // (a muted track's edits are not seen)
         e.videoTracks[0].muted = true;
         QVERIFY(streamingShotChanges(e).empty());
+    }
+    void av1GrainWrittenIntoHeaders() {
+        // Film grain parameters written into the frame headers of AV1 made by this FFmpeg's encoders (libaom's, which
+        // keeps frames to show later, at 8 bits; SVT-AV1's at 10): dav1d, through FFmpeg, finds on every shown frame the
+        // parameters it was given, with a seed of its own and the second shot's scaling points from the cut on, and none
+        // on the frames given none; with the grain left off its pictures are the stream's as it was; Montage's own
+        // reading of the headers finds what dav1d does; and Montage's run of the grain synthesis on those pictures is
+        // dav1d's picture with its grain, to the code.
+        if (!avcodec_find_decoder_by_name("libdav1d")) QSKIP("This FFmpeg has no dav1d");
+        struct Case {
+            const char* encoder;
+            int depth;
+            std::vector<std::pair<std::string, std::string>> options;
+        };
+        const std::vector<Case> cases = {{"libaom-av1", 8, {{"cpu-used", "8"}, {"crf", "40"}, {"b", "0"}, {"lag-in-frames", "16"}}},
+                                         {"libsvtav1", 10, {{"preset", "12"}, {"crf", "45"}}}};
+        const int w = 192, h = 128, frames = 48, cut = 24;
+        int tried = 0;
+        for (const Case& k : cases) {
+            if (!avcodec_find_encoder_by_name(k.encoder)) continue;
+            ++tried;
+            av1streams::Stream s;
+            std::string err;
+            QVERIFY2(av1streams::encode(k.encoder, k.options, w, h, k.depth, frames, [&](int f, AVFrame* fr) {
+                const int unit = k.depth > 8 ? 4 : 1;
+                for (int p = 0; p < 3; ++p) {
+                    const int pw = p ? w / 2 : w, ph = p ? h / 2 : h;
+                    for (int y = 0; y < ph; ++y)
+                        for (int x = 0; x < pw; ++x) {
+                            int v = p ? 128 + ((x + f) % 32) - 16 : 20 + (x * 200) / pw + (((x / 16 + y / 16 + f / 4) % 2) ? 15 : 0);
+                            if (f >= cut && !p) v = 235 - (v - 20);  // (the second shot: the ramp the other way)
+                            v *= unit;
+                            if (k.depth > 8) reinterpret_cast<uint16_t*>(fr->data[p] + ptrdiff_t(y) * fr->linesize[p])[x] = uint16_t(v);
+                            else fr->data[p][ptrdiff_t(y) * fr->linesize[p] + x] = uint8_t(v);
+                        }
+                }
+            }, s, &err), err.c_str());
+            // (frames 30 to 33 carry none)
+            auto given = [&](int64_t f) { return f >= 30 && f < 34 ? Av1FilmGrain{} : av1TestGrain(f >= cut, f); };
+            Av1GrainWriter writer;
+            av1streams::Stream t;
+            t.config = s.config;
+            QVERIFY2(t.config.empty() || writer.configure(t.config, &err), err.c_str());
+            for (size_t i = 0; i < s.packets.size(); ++i) {
+                std::vector<uint8_t> out;
+                QVERIFY2(writer.rewrite(s.packets[i].data(), s.packets[i].size(), int64_t(i), given, out, &err), err.c_str());
+                t.packets.push_back(std::move(out));
+            }
+            QCOMPARE(writer.framesWithGrain >= frames - 4, true);
+            qInfo("%s: %lld frames given grain, %lld by a reference's parameters, %lld bytes added", k.encoder, (long long)writer.framesWithGrain,
+                  (long long)writer.framesByReference, (long long)writer.bytesAdded);
+
+            std::vector<av1streams::Picture> before, beside, applied;
+            QVERIFY(av1streams::decode(s, true, before) && av1streams::decode(t, true, beside) && av1streams::decode(t, false, applied));
+            QCOMPARE(int(before.size()), frames);
+            QCOMPARE(int(beside.size()), frames);
+            QCOMPARE(int(applied.size()), frames);
+            // Montage's own reading of the stream written: each shown frame's parameters.
+            Av1HeaderReader reader;
+            QVERIFY2(t.config.empty() || reader.configure(t.config.data(), t.config.size(), &err), err.c_str());
+            std::vector<Av1FilmGrain> shown;
+            for (const auto& pk : t.packets) {
+                std::vector<Av1FrameHeader> hs;
+                QVERIFY2(reader.read(pk.data(), pk.size(), hs, &err), err.c_str());
+                for (const Av1FrameHeader& hd : hs)
+                    if (hd.shown()) shown.push_back(hd.grain);
+            }
+            QVERIFY(reader.sequence().filmGrainPresent);
+            QCOMPARE(int(shown.size()), frames);
+            int worst = 0;
+            for (int i = 0; i < frames; ++i) {
+                const Av1FilmGrain want = given(i);
+                const av1streams::Picture& b = beside[size_t(i)];
+                for (int p = 0; p < 3; ++p) QVERIFY2(before[size_t(i)].plane[p] == b.plane[p], qPrintable(QString("frame %1 plane %2").arg(i).arg(p)));
+                QCOMPARE(b.hasGrain, want.apply);
+                QCOMPARE(shown[size_t(i)].apply, want.apply);
+                if (!want.apply) continue;
+                QVERIFY2(b.grain.seed == want.seed && b.grain.sameParameters(want), qPrintable(QString("frame %1").arg(i)));
+                QVERIFY2(shown[size_t(i)].seed == want.seed && shown[size_t(i)].sameParameters(want), qPrintable(QString("frame %1").arg(i)));
+                if (i > 0 && given(i - 1).apply) QVERIFY(b.grain.seed != beside[size_t(i) - 1].grain.seed);
+                QCOMPARE(int(b.grain.yScaling[1]), i >= cut ? 120 : 70);
+                // The synthesis here on the picture without its grain, against dav1d's with it.
+                av1streams::Picture mine = b;
+                Av1GrainPicture pic = mine.forGrain();
+                av1ApplyFilmGrain(b.grain, pic);
+                for (int p = 0; p < 3; ++p)
+                    for (size_t j = 0; j < mine.plane[p].size(); ++j) worst = std::max(worst, std::abs(int(mine.plane[p][j]) - int(applied[size_t(i)].plane[p][j])));
+            }
+            QVERIFY2(worst <= 1, qPrintable(QString("%1: the synthesis is off dav1d's by up to %2").arg(k.encoder).arg(worst)));
+            qInfo("%s: the synthesis here is off dav1d's by %d at most", k.encoder, worst);
+        }
+        if (tried == 0) QSKIP("This FFmpeg has no AV1 encoder");
+    }
+    void av1GrainParametersFromAProfile() {
+        // A measured grain (a model's: fine grain whose strength follows the square root of the light, its colours
+        // correlated 0.7) fitted to AV1's parameters for a 640-wide coded picture; the synthesis run on stripes a stop
+        // apart, nine frames of it, and measured again as Measure Grain measures: its strength in every stop and channel
+        // within 15 % of the profile's, its size within half a pixel. The parameters are within what a frame header
+        // may carry, and come back the same from a film grain table's text; a profile with no grain gives none.
+        const ColorSpace& space = rec709Space();
+        const WorkingSpaceScope working(&space);
+        const int W = 640, H = 192, kFrames = 9;
+        GrainModel m;
+        m.strength = 0.04, m.response = 0.5, m.correlation = 0.7, m.fineSize = 1, m.clusters = 0.2, m.clusterSize = 3, m.width = W;
+        const GrainProfile g = grainModelProfile(m);
+        Av1GrainTarget t;
+        t.width = W, t.bitDepth = 8;
+        const Av1FilmGrain fg = av1FilmGrainFrom(g, space, t);
+        std::string why;
+        QVERIFY2(fg.apply && fg.valid(&why), why.c_str());
+        QVERIFY(fg.numY >= 2 && fg.arLag > 0);
+        QVERIFY(!av1FilmGrainFrom(GrainProfile{}, space, t).apply);
+        std::vector<Image> frames;
+        const double kr = 0.2126, kb = 0.0722, kg = 1 - kr - kb;
+        for (int f = 0; f < kFrames; ++f) {
+            std::vector<uint16_t> Y(size_t(W) * H), Cb(size_t(W / 2) * (H / 2), 128), Cr(Cb.size(), 128);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    Y[size_t(y) * W + x] = uint16_t(std::lround(16 + 219 * fromLinear(space.transfer, std::exp2(x * 8 / W - 7.5))));
+            Av1GrainPicture pic;
+            pic.plane[0] = Y.data(), pic.plane[1] = Cb.data(), pic.plane[2] = Cr.data();
+            pic.stride[0] = W, pic.stride[1] = pic.stride[2] = W / 2;
+            pic.width = W, pic.height = H, pic.bitDepth = 8;
+            Av1FilmGrain each = fg;
+            each.seed = av1GrainSeed(f, 3);
+            av1ApplyFilmGrain(each, pic);
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double yy = (double(Y[size_t(y) * W + x]) - 16) / 219;
+                    auto chroma = [&](const std::vector<uint16_t>& c) {  // (between its samples, sited left)
+                        const double fx = x / 2.0, fy = (y - 0.5) / 2.0;
+                        const int x0 = std::clamp(int(std::floor(fx)), 0, W / 2 - 1), x1 = std::min(x0 + 1, W / 2 - 1);
+                        const int y0 = std::clamp(int(std::floor(fy)), 0, H / 2 - 1), y1 = std::min(y0 + 1, H / 2 - 1);
+                        const double ax = std::clamp(fx - x0, 0.0, 1.0), ay = std::clamp(fy - y0, 0.0, 1.0);
+                        const double v = (c[size_t(y0) * (W / 2) + x0] * (1 - ax) + c[size_t(y0) * (W / 2) + x1] * ax) * (1 - ay) +
+                                         (c[size_t(y1) * (W / 2) + x0] * (1 - ax) + c[size_t(y1) * (W / 2) + x1] * ax) * ay;
+                        return (v - 128) / 224;
+                    };
+                    const double cb = chroma(Cb), cr = chroma(Cr);
+                    const double r = yy + cr * 2 * (1 - kr), b = yy + cb * 2 * (1 - kb), gg = (yy - kr * r - kb * b) / kg;
+                    float* p = img.at(x, y);
+                    p[0] = float(r), p[1] = float(gg), p[2] = float(b), p[3] = 1;
+                }
+            frames.push_back(std::move(img));
+        }
+        GrainProfile again;
+        QVERIFY2(measureGrain(frames, space, {}, again, &why), why.c_str());
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(again.amplitude[c][b] / g.amplitude[c][b] - 1) < 0.15,
+                         qPrintable(QString("stop %1 channel %2: %3 for %4").arg(b).arg(c).arg(again.amplitude[c][b]).arg(g.amplitude[c][b])));
+        qInfo("size %.2f px for %.2f; colours correlated %.2f %.2f %.2f for 0.70", grainSize(again), grainSize(g), again.correlation[0],
+              again.correlation[1], again.correlation[2]);
+        QVERIFY2(std::fabs(grainSize(again) - grainSize(g)) < 0.5, qPrintable(QString("%1 for %2").arg(grainSize(again)).arg(grainSize(g))));
+
+        // As a film grain table (the text SvtAv1EncApp's --fgs-table and aomenc's --film-grain-table read), and back.
+        // (the table has no place for clip_to_restricted_range)
+        std::vector<Av1GrainTableEntry> entries{{0, 10000000, fg}, {10000000, 20000000, av1TestGrain(1, 5)}};
+        for (Av1GrainTableEntry& e : entries) e.grain.clipRestricted = false;
+        const std::string text = av1FilmGrainTable(entries);
+        QVERIFY(text.rfind("filmgrn1", 0) == 0);
+        std::vector<Av1GrainTableEntry> back;
+        QVERIFY2(parseAv1FilmGrainTable(text, back, &why), why.c_str());
+        QCOMPARE(back.size(), entries.size());
+        for (size_t i = 0; i < back.size(); ++i) {
+            QVERIFY(back[i].start == entries[i].start && back[i].end == entries[i].end);
+            QVERIFY(back[i].grain.sameParameters(entries[i].grain) && back[i].grain.seed == entries[i].grain.seed);
+        }
+        QVERIFY(!parseAv1FilmGrainTable("filmgrn1\nE 0 10 1 7 1\nnonsense", back, &why));
+        // Out of what a header may carry: refused.
+        Av1FilmGrain bad = fg;
+        bad.yValue[1] = bad.yValue[0];
+        QVERIFY(!bad.valid(&why));
+        bad = fg, bad.arLag = 4;
+        QVERIFY(!bad.valid(&why));
+    }
+    void av1ExportCarriesGrain() {
+        // Two shots, each a clip of stripes a stop apart with grain of its own strength (Grain Match's model, made in
+        // linear light, its colours correlated), exported to AV1 with the grain carried as parameters. Each shot's grain
+        // is measured and the picture cleaned; Montage's reading of the file's headers finds grain on every shown frame,
+        // a seed that changes every frame and scaling points that change at the cut. Decoded by dav1d, the grain it puts
+        // back measures as each shot's did (its strength in every stop measured within 15 %, the darkest within 25 %, its
+        // size within half a pixel); with dav1d's grain left off the picture is the clean one, well above the grainy one's PSNR. The file is
+        // smaller than one coding the grain as picture at the same setting (both sizes reported).
+        const char* encoder = avcodec_find_encoder_by_name("libsvtav1") ? "libsvtav1" : avcodec_find_encoder_by_name("libaom-av1") ? "libaom-av1" : nullptr;
+        if (!encoder || !avcodec_find_decoder_by_name("libdav1d")) QSKIP("This FFmpeg has no AV1 encoder, or no dav1d");
+        const ColorSpace& space = rec709Space();
+        QTemporaryDir dir;
+        const int W = 512, H = 192, kFrames = 24;
+        auto cleanCode = [&](int x) { return fromLinear(space.transfer, std::exp2(x / 64 - 7.5)); };
+        // An image (R′G′B′) as 8-bit 4:2:0 Y′CbCr, BT.709, limited range, chroma sited left.
+        auto toYuv = [&](const Image& img, std::vector<uint8_t>& y, std::vector<uint8_t>& cb, std::vector<uint8_t>& cr) {
+            const double kr = 0.2126, kb = 0.0722, kg = 1 - kr - kb;
+            std::vector<double> u(size_t(W) * H), v(u.size());
+            for (int r = 0; r < H; ++r)
+                for (int c = 0; c < W; ++c) {
+                    const float* p = img.at(c, r);
+                    const double l = kr * p[0] + kg * p[1] + kb * p[2];
+                    y[size_t(r) * W + c] = uint8_t(std::clamp(std::lround(16 + 219 * l), 0L, 255L));
+                    u[size_t(r) * W + c] = (p[2] - l) / (2 * (1 - kb)), v[size_t(r) * W + c] = (p[0] - l) / (2 * (1 - kr));
+                }
+            for (int r = 0; r < H / 2; ++r)
+                for (int c = 0; c < W / 2; ++c) {
+                    const size_t a = size_t(2 * r) * W + size_t(2 * c), b = a + size_t(W);
+                    cb[size_t(r) * (W / 2) + c] = uint8_t(std::clamp(std::lround(128 + 224 * (u[a] + u[b]) / 2), 0L, 255L));
+                    cr[size_t(r) * (W / 2) + c] = uint8_t(std::clamp(std::lround(128 + 224 * (v[a] + v[b]) / 2), 0L, 255L));
+                }
+        };
+        const double strengths[2] = {0.03, 0.07};
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {24, 1};
+        for (int shot = 0; shot < 2; ++shot) {
+            GrainModel gm;
+            gm.strength = strengths[shot], gm.response = 0.5, gm.correlation = 0.6, gm.fineSize = 1.2, gm.clusters = 0.2, gm.clusterSize = 3.5, gm.width = W;
+            const GrainProfile made = grainModelProfile(gm);
+            const QString file = dir.filePath(QString("shot%1.y4m").arg(shot));
+            QVERIFY(writeY4m(file, W, H, kFrames, [&](int f, auto& y, auto& cb, auto& cr) {
+                Image img(W, H);
+                for (int r = 0; r < H; ++r)
+                    for (int c = 0; c < W; ++c) {
+                        float* q = img.at(c, r);
+                        q[0] = q[1] = q[2] = float(cleanCode(c)), q[3] = 1;
+                    }
+                GrainSettings gs;
+                gs.seed = uint32_t(17 + shot);
+                addGrain(img, space, made, gs, f);
+                toYuv(img, y, cb, cr);
+            }, 24));
+            MediaItem m;
+            QVERIFY(probeMedia(file.toStdString(), m));
+            m.id = p.newId();
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, shot * kFrames, 0, -1, {TrackKind::Video, 0}, {}, false).ok);
+        }
+        QCOMPARE(s.duration(), FrameTime(2 * kFrames));
+        ExportSettings es;
+        es.videoCodec = encoder;
+        es.audioCodec = "none";
+        es.crf = 32;
+        es.preset = std::strcmp(encoder, "libsvtav1") == 0 ? "10" : "";
+        es.path = dir.filePath("grain.mkv").toStdString();
+        es.filmGrain = "measure";
+        std::string err;
+        Av1GrainReport rep;
+        QVERIFY2(exportCarryingGrain(p, s, es, {}, nullptr, &err, nullptr, nullptr, nullptr, &rep), err.c_str());
+        QCOMPARE(rep.shots.size(), size_t(2));
+        for (const Av1GrainShot& sh : rep.shots) QVERIFY2(sh.source == "measured" && sh.grain.apply, sh.note.c_str());
+        QCOMPARE(rep.framesWithGrain, int64_t(2 * kFrames));
+        // Coded as picture, at the same setting; and not for any other codec.
+        ExportSettings plain = es;
+        plain.filmGrain.clear();
+        plain.path = dir.filePath("plain.mkv").toStdString();
+        QVERIFY2(exportSequence(p, s, plain, {}, nullptr, &err), err.c_str());
+        ExportSettings h264 = es;
+        h264.videoCodec = "libx264";
+        h264.path = dir.filePath("h264.mp4").toStdString();
+        QVERIFY(!exportSequence(p, s, h264, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("AV1"), err.c_str());
+        const qint64 carried = QFileInfo(QString::fromStdString(es.path)).size(), coded = QFileInfo(QString::fromStdString(plain.path)).size();
+        qInfo("%s at CRF 32: %lld bytes with the grain carried as parameters, %lld coded as picture (%.0f %%)", encoder, (long long)carried,
+              (long long)coded, 100.0 * double(carried) / double(coded));
+        QVERIFY(carried < coded);
+
+        // The file's frame headers as Montage reads them.
+        av1streams::Stream st;
+        {
+            AVFormatContext* f = nullptr;
+            QVERIFY(avformat_open_input(&f, es.path.c_str(), nullptr, nullptr) >= 0 && avformat_find_stream_info(f, nullptr) >= 0);
+            const int v = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            QVERIFY(v >= 0);
+            const AVCodecParameters* par = f->streams[v]->codecpar;
+            st.config.assign(par->extradata, par->extradata + par->extradata_size);
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(f, pkt) >= 0) {
+                if (pkt->stream_index == v) st.packets.emplace_back(pkt->data, pkt->data + pkt->size);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&f);
+        }
+        Av1HeaderReader reader;
+        QVERIFY2(reader.configure(st.config.data(), st.config.size(), &err), err.c_str());
+        QVERIFY(reader.sequence().filmGrainPresent);
+        std::vector<Av1FilmGrain> shown;
+        for (const auto& pk : st.packets) {
+            std::vector<Av1FrameHeader> hs;
+            QVERIFY2(reader.read(pk.data(), pk.size(), hs, &err), err.c_str());
+            for (const Av1FrameHeader& hd : hs)
+                if (hd.shown()) shown.push_back(hd.grain);
+        }
+        QCOMPARE(int(shown.size()), 2 * kFrames);
+        for (int i = 0; i < 2 * kFrames; ++i) {
+            QVERIFY2(shown[size_t(i)].apply, qPrintable(QString("frame %1").arg(i)));
+            if (i > 0) QVERIFY(shown[size_t(i)].seed != shown[size_t(i) - 1].seed);
+            QVERIFY(shown[size_t(i)].sameParameters(shown[i < kFrames ? 0 : size_t(kFrames)]));
+        }
+        QVERIFY(!shown[0].sameParameters(shown[size_t(kFrames)]));
+        QVERIFY(shown[size_t(kFrames)].yScaling[shown[size_t(kFrames)].numY / 2] > shown[0].yScaling[shown[0].numY / 2]);
+
+        // Decoded with dav1d's grain, and without it.
+        std::vector<av1streams::Picture> grainy, cleaned;
+        QVERIFY(av1streams::decode(st, false, grainy) && av1streams::decode(st, true, cleaned));
+        QCOMPARE(int(grainy.size()), 2 * kFrames);
+        auto toImage = [&](const av1streams::Picture& d) {
+            const double kr = 0.2126, kb = 0.0722, kg = 1 - kr - kb;
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double yy = (double(d.plane[0][size_t(y) * W + x]) - 16) / 219;
+                    auto chroma = [&](const std::vector<uint16_t>& c) {
+                        const double fx = x / 2.0, fy = (y - 0.5) / 2.0;
+                        const int x0 = std::clamp(int(std::floor(fx)), 0, W / 2 - 1), x1 = std::min(x0 + 1, W / 2 - 1);
+                        const int y0 = std::clamp(int(std::floor(fy)), 0, H / 2 - 1), y1 = std::min(y0 + 1, H / 2 - 1);
+                        const double ax = std::clamp(fx - x0, 0.0, 1.0), ay = std::clamp(fy - y0, 0.0, 1.0);
+                        const double v = (c[size_t(y0) * (W / 2) + x0] * (1 - ax) + c[size_t(y0) * (W / 2) + x1] * ax) * (1 - ay) +
+                                         (c[size_t(y1) * (W / 2) + x0] * (1 - ax) + c[size_t(y1) * (W / 2) + x1] * ax) * ay;
+                        return (v - 128) / 224;
+                    };
+                    const double cb = chroma(d.plane[1]), cr = chroma(d.plane[2]);
+                    const double r = yy + cr * 2 * (1 - kr), b = yy + cb * 2 * (1 - kb), g = (yy - kr * r - kb * b) / kg;
+                    float* q = img.at(x, y);
+                    q[0] = float(r), q[1] = float(g), q[2] = float(b), q[3] = 1;
+                }
+            return img;
+        };
+        auto lumaPsnr = [&](const av1streams::Picture& d) {
+            double se = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double e = double(d.plane[0][size_t(y) * W + x]) - (16 + 219 * cleanCode(x));
+                    se += e * e;
+                }
+            return 10 * std::log10(255.0 * 255.0 / std::max(1e-9, se / (double(W) * H)));
+        };
+        const WorkingSpaceScope working(&space);
+        for (int shot = 0; shot < 2; ++shot) {
+            std::vector<Image> frames;
+            double clean = 0, withGrain = 0;
+            for (int f = shot * kFrames; f < (shot + 1) * kFrames; ++f) {
+                if (f < shot * kFrames + 9) frames.push_back(toImage(grainy[size_t(f)]));
+                clean += lumaPsnr(cleaned[size_t(f)]) / kFrames, withGrain += lumaPsnr(grainy[size_t(f)]) / kFrames;
+            }
+            GrainProfile back;
+            QVERIFY2(measureGrain(frames, space, {}, back, &err), err.c_str());
+            const GrainProfile& source = rep.shots[size_t(shot)].profile;
+            qInfo("shot %d: PSNR %.2f dB without the grain, %.2f with; size %.2f px for %.2f", shot, clean, withGrain, grainSize(back), grainSize(source));
+            double off = 0;
+            for (int b = 0; b < GrainProfile::kBands; ++b) {
+                if (!(source.measuredBands & back.measuredBands & (1 << b))) continue;
+                for (int c = 0; c < 3; ++c) off = std::max(off, std::fabs(back.amplitude[c][b] / source.amplitude[c][b] - 1));
+                for (int c = 0; c < 3; ++c)
+                    QVERIFY2(std::fabs(back.amplitude[c][b] / source.amplitude[c][b] - 1) < (b == 0 ? 0.25 : 0.15),
+                             qPrintable(QString("shot %1 stop %2 channel %3: %4 for %5").arg(shot).arg(b).arg(c).arg(back.amplitude[c][b]).arg(source.amplitude[c][b])));
+            }
+            qInfo("shot %d: its strength measured again within %.0f %% at every stop measured, the darkest included", shot, off * 100);
+            QVERIFY2(std::fabs(grainSize(back) - grainSize(source)) < 0.5, qPrintable(QString("%1 for %2").arg(grainSize(back)).arg(grainSize(source))));
+            QVERIFY2(clean > 38 && clean > withGrain + 3, qPrintable(QString("%1 %2").arg(clean).arg(withGrain)));
+        }
+    }
+    void av1GrainTableReadBySvtAv1() {
+        // A film grain table as Montage writes it, two shots of parameters, given to SVT-AV1's own encoder
+        // (SvtAv1EncApp --fgs-table, built in CI from v4.3.0): Montage's reading of the frame headers it writes finds on
+        // every shown frame the parameters of the shot the table gives for its time, as dav1d does.
+        const QString bin = qEnvironmentVariable("MONTAGE_TEST_SVTAV1");
+        QString app = bin.isEmpty() ? QString() : QDir(bin).filePath("SvtAv1EncApp");
+        if (!app.isEmpty() && !QFileInfo::exists(app)) app += ".exe";
+        if (app.isEmpty() || !QFileInfo::exists(app)) QSKIP("SVT-AV1's encoder was not built (MONTAGE_TEST_SVTAV1)");
+        QTemporaryDir dir;
+        const int w = 192, h = 128, frames = 48, cut = 24;
+        QVERIFY(writeY4m(dir.filePath("in.y4m"), w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) {
+            for (int r = 0; r < h; ++r)
+                for (int c = 0; c < w; ++c) y[size_t(r) * w + c] = uint8_t(20 + c + ((c / 16 + r / 16 + f / 4) % 2 ? 15 : 0));
+            std::fill(cb.begin(), cb.end(), uint8_t(120)), std::fill(cr.begin(), cr.end(), uint8_t(136));
+        }, 24));
+        // (times in units of 100 ns: frame f at 24 a second starts at f × 10^7 / 24)
+        auto at = [](int f) { return int64_t(f) * 10000000 / 24; };
+        std::vector<Av1GrainTableEntry> table{{at(0), at(cut), av1TestGrain(0, 0)}, {at(cut), at(frames), av1TestGrain(1, cut)}};
+        for (Av1GrainTableEntry& e : table) e.grain.clipRestricted = false;  // (the table has no place for it)
+        {
+            QFile f(dir.filePath("grain.tbl"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString(av1FilmGrainTable(table)));
+        }
+        QProcess pr;
+        pr.start(app, {"-i", dir.filePath("in.y4m"), "-b", dir.filePath("out.ivf"), "--preset", "12", "--crf", "45", "--keyint", "240",
+                       "--fgs-table", dir.filePath("grain.tbl")});
+        QVERIFY(pr.waitForFinished(300000));
+        QVERIFY2(pr.exitCode() == 0, pr.readAllStandardError().constData());
+        // The IVF's packets: a 32-byte header, then each frame's size, time and bytes.
+        QFile ivf(dir.filePath("out.ivf"));
+        QVERIFY(ivf.open(QIODevice::ReadOnly));
+        const QByteArray all = ivf.readAll();
+        av1streams::Stream st;
+        auto le32 = [&](qsizetype i) { return uint32_t(uint8_t(all[i])) | uint32_t(uint8_t(all[i + 1])) << 8 | uint32_t(uint8_t(all[i + 2])) << 16 | uint32_t(uint8_t(all[i + 3])) << 24; };
+        QVERIFY(all.size() >= 32 && all.startsWith("DKIF"));
+        for (qsizetype i = 32; i + 12 <= all.size();) {
+            const uint32_t n = le32(i);
+            QVERIFY(i + 12 + qsizetype(n) <= all.size());
+            st.packets.emplace_back(reinterpret_cast<const uint8_t*>(all.constData()) + i + 12, reinterpret_cast<const uint8_t*>(all.constData()) + i + 12 + n);
+            i += 12 + qsizetype(n);
+        }
+        Av1HeaderReader reader;
+        std::vector<Av1FilmGrain> shown;
+        std::string err;
+        for (const auto& pk : st.packets) {
+            std::vector<Av1FrameHeader> hs;
+            QVERIFY2(reader.read(pk.data(), pk.size(), hs, &err), err.c_str());
+            for (const Av1FrameHeader& hd : hs)
+                if (hd.shown()) shown.push_back(hd.grain);
+        }
+        QVERIFY(reader.sequence().filmGrainPresent);
+        QCOMPARE(int(shown.size()), frames);
+        std::vector<av1streams::Picture> beside;
+        QVERIFY(av1streams::decode(st, true, beside));
+        QCOMPARE(int(beside.size()), frames);
+        for (int i = 0; i < frames; ++i) {
+            const Av1FilmGrain& want = table[i < cut ? 0 : 1].grain;
+            QVERIFY2(shown[size_t(i)].apply && shown[size_t(i)].sameParameters(want), qPrintable(QString("frame %1").arg(i)));
+            QVERIFY(beside[size_t(i)].hasGrain && beside[size_t(i)].grain.sameParameters(shown[size_t(i)]) && beside[size_t(i)].grain.seed == shown[size_t(i)].seed);
+        }
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the

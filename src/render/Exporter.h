@@ -140,6 +140,10 @@ struct ExportSettings {
     // while it still matches the cut, else before the render) and carried in HEVC and AV1 video on every frame; the
     // same goes beside the file as name.hdr10plus.json, for other codecs and for encoders and checks that read it.
     bool hdr10Plus = false;
+    // Carry Grain as Parameters (AV1 only, render/Av1GrainExport.h): each shot's grain taken out of the picture before
+    // it is encoded and written beside it as AV1 film grain parameters, which the decoder puts back. "measure" (each
+    // shot's measured as Measure Grain does), a grain profile's text (one for every shot), or "" / "off".
+    std::string filmGrain;
     // Adaptive HDR metadata (PQ and HLG exports, render/AdaptiveHdr.h): each scene's reference white, headroom and the
     // gain curve to its SDR rendition (its SDR trim, else Montage's own mapping), carried in HEVC and AV1 video on every
     // frame so displays of any headroom tone map it as the grade did.
