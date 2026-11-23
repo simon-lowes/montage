@@ -108,7 +108,15 @@ struct HeldDiskSound : DiskSound {
 
 // The file at `path` opened and held (as above); nullptr when it is not there, or was removed while it was opened.
 std::FILE* holdFile(const std::string& path) {
+#ifndef _WIN32
+    // (closed in every program Montage starts: a plug-in host would else keep the file and its lock while it runs, and
+    // the cache could not be tidied of it)
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    std::FILE* f = fd >= 0 ? ::fdopen(fd, "rb") : nullptr;
+    if (!f && fd >= 0) ::close(fd);
+#else
     std::FILE* f = std::fopen(path.c_str(), "rb");
+#endif
     if (!f) return nullptr;
 #ifndef _WIN32
     // (where the file system has no locks, held as well as it can be: open)

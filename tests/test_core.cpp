@@ -21,6 +21,9 @@
 #include "core/Xlsx.h"
 #include <QtEndian>
 #include <cstring>
+#ifdef Q_OS_LINUX
+#include <fcntl.h>
+#endif
 #include "core/Cdl.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
@@ -1873,6 +1876,20 @@ private slots:
         QVERIFY(disk->pads[1].sounds[0].disk && disk->pads[1].sounds[0].start == std::llround(12.5 * rate));
         const std::string cacheFile = sd.disk->file;
         QVERIFY(QFileInfo::exists(QString::fromStdString(cacheFile)));
+#ifdef Q_OS_LINUX
+        {
+            // The cache file is held open, and closed in any program Montage starts (nightly 23 Nov: a plug-in host
+            // inherited it and its lock, so the cache could not be tidied while the host ran).
+            int held = 0;
+            const QDir fds(QStringLiteral("/proc/self/fd"));
+            for (const QString& name : fds.entryList(QDir::Files | QDir::System | QDir::NoDotAndDotDot)) {
+                if (QFile::symLinkTarget(fds.filePath(name)) != QString::fromStdString(cacheFile)) continue;
+                ++held;
+                QVERIFY2(::fcntl(name.toInt(), F_GETFD) & FD_CLOEXEC, qPrintable(name));
+            }
+            QVERIFY(held >= 1);
+        }
+#endif
         {
             // Offline, the disk at 100 MB/s: both keys, the second a little later.
             setDiskThrottle(0.01);
