@@ -222,14 +222,16 @@ bool asksForHandle(const Host& host, std::string& why) {
 }
 
 // The picture a host shares, read from the texture it is imported as: its descriptors are at `post`, sent before the
-// reply. False, with why, when it cannot be taken.
-bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w, int h, Image& out, std::string& why) {
+// reply. Its descriptors and its fence are waited for `waitMs` at most (what is left of the render's own wait, so a
+// fence that is slow to signal holds the frame no longer than a slow render would). False, with why, when it cannot be
+// taken.
+bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w, int h, int waitMs, Image& out, std::string& why) {
     if (ph.kind != 1 || ph.width != w || ph.height != h || !host.proc) {
         why = "the plug-in host's handle is not one Montage takes";
         return false;
     }
     gl::DmaBuf buf;
-    if (!gl::receiveDmaBuf(post, host.proc->pid(), ph.fence != 0, 2000, buf, &why)) return false;
+    if (!gl::receiveDmaBuf(post, host.proc->pid(), ph.fence != 0, std::min(waitMs, 2000), buf, &why)) return false;
     buf.fourcc = ph.fourcc;
     buf.stride = ph.stride;
     buf.offset = ph.offset;
@@ -237,7 +239,7 @@ bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w
     buf.width = w;
     buf.height = h;
     // (not the plug-ins' OpenGL thread waits for the host's fence, nor takes a picture its buffer does not hold)
-    if (!gl::dmaBufFits(buf, &why) || !gl::awaitDrawn(buf, &why)) {
+    if (!gl::dmaBufFits(buf, &why) || !gl::awaitDrawn(buf, &why, waitMs)) {
         gl::closeDmaBuf(buf);
         return false;
     }
@@ -409,7 +411,9 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
             std::string why = "the plug-in host's handle did not come through";
             const bool described = hd->payloadBytes >= sizeof ph;
             if (described) std::memcpy(&ph, wire::payload(c.base()), sizeof ph);
-            const bool taken = described && takeHandle(*link->host, link->post, ph, w, h, out, why);
+            // (what is left of this render's wait, 5 s at most, and a moment at the least for the descriptors to come)
+            const int waitMs = int(std::clamp<int64_t>((timeout - (ipc::nowUs() - began)) / 1000, 50, 5000));
+            const bool taken = described && takeHandle(*link->host, link->post, ph, w, h, waitMs, out, why);
             giveBack(key, std::move(link));
             if (taken) {
                 notePicture(d, true, {});
