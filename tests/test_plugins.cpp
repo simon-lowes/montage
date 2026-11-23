@@ -3994,6 +3994,10 @@ private slots:
         QCOMPARE(f.room(), int64_t(11025));
         std::vector<float> tone(size_t(44100) * 2);
         for (int i = 0; i < 44100; ++i) tone[size_t(i) * 2] = tone[size_t(i) * 2 + 1] = float(0.4 * std::sin(2 * M_PI * 1000 * i / 44100.0));
+        // (settled first: the cushion as deep as this computer needs. A device thread woken late runs the ring dry once
+        // before the cushion has grown for it, and that gap, heard in the tone, would lower its pitch as counted)
+        QThread::msleep(300);
+        e.resetXruns();
         heard.take();
         int64_t sent = 0;
         QElapsedTimer t;
@@ -4013,12 +4017,17 @@ private slots:
             if (std::fabs(v) > 1e-4f || !sounding.empty()) sounding.push_back(v);
         while (!sounding.empty() && std::fabs(sounding.back()) < 1e-4f) sounding.pop_back();
         for (float v : sounding) energy += double(v) * v;
+        const audiodev::EngineStatus st = e.status();
+        const auto told = [&](const QString& what) {
+            return QStringLiteral("%1 (%2 underruns, %3 xruns, %4 frames the feed was short)")
+                .arg(what).arg(st.underruns).arg(st.xruns).arg(f.starved());
+        };
         // A second of it at 48 kHz (the resampler's edges aside), at its pitch.
-        QVERIFY2(std::llabs(int64_t(sounding.size()) - 48000) < 600, qPrintable(QString::number(sounding.size())));
-        QVERIFY2(std::fabs(energy - 48000 * 0.08) < 48000 * 0.08 * 0.05, qPrintable(QString::number(energy)));
+        QVERIFY2(std::llabs(int64_t(sounding.size()) - 48000) < 600, qPrintable(told(QString::number(sounding.size()))));
+        QVERIFY2(std::fabs(energy - 48000 * 0.08) < 48000 * 0.08 * 0.05, qPrintable(told(QString::number(energy))));
         // (counted away from the ends, where the resampler's ringing crosses zero at a whisper)
         const double hz = toneHz(std::vector<float>(sounding.begin() + 1000, sounding.end() - 1000), 48000);
-        QVERIFY2(std::fabs(hz - 1000) < 1, qPrintable(QString::number(hz)));
+        QVERIFY2(std::fabs(hz - 1000) < 1, qPrintable(told(QString::number(hz))));
         // Let go: what was queued is not played.
         const int64_t played = f.played();
         QCOMPARE(f.push(tone.data(), 11025), int64_t(11025));

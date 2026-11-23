@@ -17,6 +17,9 @@
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include <pthread.h>
 #endif
 
@@ -209,6 +212,27 @@ void aheadOfOthers() {
 #endif
 }
 
+// The test device's own thread, as a driver's is. On macOS that is Core Audio's: woken on time for each block of
+// `periodNs`, with up to half of it to run (it only copies: the mixing and the plug-ins are on the feed thread); where
+// the system refuses, and elsewhere, as aheadOfOthers.
+void asADriversThread(int64_t periodNs) {
+#ifdef __APPLE__
+    mach_timebase_info_data_t base{};
+    if (mach_timebase_info(&base) == KERN_SUCCESS && base.numer > 0) {
+        const auto ticks = [&](int64_t ns) { return uint32_t(double(ns) * base.denom / base.numer); };
+        thread_time_constraint_policy_data_t policy{};
+        policy.period = ticks(periodNs);
+        policy.computation = ticks(std::max<int64_t>(periodNs / 2, 50000));
+        policy.constraint = ticks(periodNs);
+        policy.preemptible = 1;
+        if (thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, reinterpret_cast<thread_policy_t>(&policy),
+                              THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS)
+            return;
+    }
+#endif
+    aheadOfOthers();
+}
+
 class LoopbackStream : public Stream {
 public:
     LoopbackStream(const DeviceSettings& s, int rate, int inputs, int outputs, StreamCallbacks cb)
@@ -256,7 +280,7 @@ public:
 
 private:
     void run() {
-        aheadOfOthers();  // (as a driver's thread is)
+        asADriversThread(int64_t(1e9 * buffer_ / rate_.load()));
         std::vector<float> in(size_t(buffer_) * size_t(std::max(1, inputs_))), out(size_t(buffer_) * size_t(std::max(1, outputs_)));
         auto next = std::chrono::steady_clock::now();
         bool wasLate = false;
