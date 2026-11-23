@@ -18,6 +18,7 @@
 #include "DialogTasks.h"
 #include "EditorState.h"
 #include "InspectorWidget.h"
+#include "core/CaptionTools.h"
 #include "core/Adr.h"
 #include "core/EditOps.h"
 #include "core/ProjectIO.h"
@@ -201,6 +202,7 @@ QJsonObject applySceneCuts(EditorState* state, const QJsonObject& input, const Q
                 mk.name = WindowText::tr("Shot change").toStdString();
                 mk.shotChange = true;
                 clip->markers.push_back(mk);
+                markShotChangeOnLinked(sq, clipId, clip->markerFrame(mk));  // (on its linked sound too)
                 if (markOnly) ++made;
             }
         std::sort(clip->markers.begin(), clip->markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
