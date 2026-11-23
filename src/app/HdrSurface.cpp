@@ -240,6 +240,21 @@ WinDisplay windowsDisplay(HWND hwnd) {
 }
 #endif
 
+#if defined(MONTAGE_HDR_ENCODED)
+// The RHI's OpenGL context let go of the window, so the next frame makes it current again. Qt makes a window's
+// wl_surface again when the window changes role (the viewer's surface is made as a window of its own, then put inside
+// the viewer) and lets the EGL surface on the old one go; but the RHI, finding its context still current on the same
+// window, would not make it current again, and the frame would be swapped to no surface (EGL_BAD_SURFACE). Nothing
+// would be committed, the frame callback Qt asked for would never come, and Qt would then call the window unexposed, so
+// no frame would be drawn again. Made current, Qt makes the EGL surface on the new wl_surface. (Once a frame has been
+// swapped the RHI makes its context current again for each frame by itself.)
+void releaseWindowContext(QRhi* rhi) {
+    if (!rhi || rhi->backend() != QRhi::OpenGLES2) return;
+    const auto* h = static_cast<const QRhiGles2NativeHandles*>(rhi->nativeHandles());
+    if (h && h->context && QOpenGLContext::currentContext() == h->context) h->context->doneCurrent();
+}
+#endif
+
 }  // namespace
 
 // The GPU side: the RHI, the swap chain and what is drawn with (the RHI is declared first so it goes last). On Linux
@@ -521,6 +536,10 @@ bool HdrSurface::probe(QString* why) {
     g.psPicture.reset(g.pipeline(shader(kPictureFragQsb, sizeof kPictureFragQsb), g.srbPicture.get(), false, drawn));
     g.psOverlay.reset(g.pipeline(shader(kOverlayFragQsb, sizeof kOverlayFragQsb), g.srbOverlay.get(), true, drawn));
     if (!g.psPicture || !g.psOverlay || (encoded_ && !g.psEncode)) return fail(tr("The graphics device could not make the HDR viewer's shaders"));
+#if defined(MONTAGE_HDR_ENCODED)
+    // (made current on this window by the RHI, before it is placed inside the viewer)
+    if (encoded_) releaseWindowContext(g.rhi.get());
+#endif
     hdrActive_ = true;
     problem_.clear();
     readDisplay();
@@ -836,6 +855,12 @@ bool HdrSurface::event(QEvent* e) {
                 }
             }
             break;
+#if defined(MONTAGE_HDR_ENCODED)
+        case QEvent::ParentWindowChange:
+            // (put inside the viewer, or another window: on Wayland a new wl_surface, so a new EGL surface for it)
+            if (encoded_ && gpu_) releaseWindowContext(gpu_->rhi.get());
+            break;
+#endif
 #if defined(MONTAGE_WAYLAND_COLOR)
         case QEvent::Hide:
             // (Qt lets the wl_surface go with the window hidden: shown again, the new one is described afresh)
