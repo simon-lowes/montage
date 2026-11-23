@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "AudioDeviceInternal.h"
+#include "RtGuard.h"
 #include "DynLib.h"
 
 namespace montage::audiodev {
@@ -268,6 +269,7 @@ private:
 
     static int processCb(jack_nframes_t n, void* arg) {
         auto* self = static_cast<JackStream*>(arg);
+        const rtguard::Scope scope;
         const int frames = int(n);
         if (frames > self->capacity_) return 0;  // (the buffer callback resizes before such a period)
         const int ni = int(self->ins_.size()), no = int(self->outs_.size());

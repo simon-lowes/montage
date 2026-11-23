@@ -322,6 +322,7 @@ add_library(montage_engine STATIC
   audio/ElasticAudio.h audio/ElasticAudio.cpp
   audio/Sampler.h audio/Sampler.cpp
   audio/AudioDevice.h audio/AudioDevice.cpp audio/AudioDeviceInternal.h audio/JackDevice.cpp audio/PortAudioDevice.cpp
+  audio/RtGuard.h audio/RtGuard.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/LtcChase.h audio/LtcChase.cpp
@@ -734,6 +735,17 @@ if(MONTAGE_WITH_THORVG)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_THORVG)
 endif()
 
+# The audio callback's guard (audio/RtGuard.h), on Linux: it counts locks and waits by passing the pthread calls through
+# itself, and allocations by having the linker send the program's own calls through its wrappers (nothing is replaced).
+# Off for builds whose tools define those calls themselves (a thread sanitizer).
+option(MONTAGE_RT_GUARD_INTERPOSE "Count allocations, locks and waits inside the audio device's callback (Linux)" ON)
+if(MONTAGE_RT_GUARD_INTERPOSE AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set_source_files_properties(audio/RtGuard.cpp PROPERTIES COMPILE_DEFINITIONS "MONTAGE_RT_GUARD_INTERPOSE;MONTAGE_RT_GUARD_WRAP")
+  foreach(sym malloc calloc realloc free posix_memalign aligned_alloc _Znwm _Znam _ZnwmRKSt9nothrow_t _ZnamRKSt9nothrow_t
+              _ZdlPv _ZdaPv _ZdlPvm _ZdaPvm)
+    target_link_options(montage_engine INTERFACE "LINKER:--wrap=${sym}")
+  endforeach()
+endif()
 if(MONTAGE_WITH_PORTAUDIO)
   target_link_libraries(montage_engine PRIVATE montage_portaudio)
   target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_PORTAUDIO)

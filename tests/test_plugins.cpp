@@ -33,6 +33,7 @@
 #include "audio/AraHost.h"
 #include "audio/AudioDevice.h"
 #include "audio/PluginEffect.h"
+#include "audio/RtGuard.h"
 #include "audio/PluginHost.h"
 #include "audio/PluginIpc.h"
 #include "audio/Plugins.h"
@@ -3941,6 +3942,266 @@ private slots:
         quit();
     }
 
+    void callbackGuardCounts() {
+        // The guard on the device's callback counts what a thread does inside a scope and nothing outside it: here an
+        // allocation, a lock and a sleep, each made on purpose (where this build can see them at all).
+        const int sees = rtguard::sees();
+#ifdef Q_OS_LINUX
+        QCOMPARE(sees, int(rtguard::Allocations | rtguard::Locks | rtguard::Waits));
+#endif
+        std::mutex m;
+        auto misbehave = [&] {
+            std::vector<float>* v = new std::vector<float>(4096);
+            {
+                std::lock_guard<std::mutex> lock(m);
+                v->at(0) = 1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            delete v;
+        };
+        rtguard::reset();
+        misbehave();
+        rtguard::Counts c = rtguard::counts();
+        QCOMPARE(c.callbacks, int64_t(0));
+        QCOMPARE(c.allocations + c.locks + c.waits, int64_t(0));
+        QVERIFY(!rtguard::inCallback());
+        {
+            const rtguard::Scope scope;
+            QVERIFY(rtguard::inCallback());
+            misbehave();
+        }
+        QVERIFY(!rtguard::inCallback());
+        c = rtguard::counts();
+        QCOMPARE(c.callbacks, int64_t(1));
+        if (sees & rtguard::Allocations) QVERIFY2(c.allocations >= 4, qPrintable(QString::number(c.allocations)));  // (two made, two freed)
+        if (sees & rtguard::Locks) QVERIFY2(c.locks >= 1, qPrintable(QString::number(c.locks)));
+        if (sees & rtguard::Waits) QVERIFY2(c.waits >= 1, qPrintable(QString::number(c.waits)));
+        // Another thread's work while this one is inside a scope is not counted.
+        std::atomic<int> turn{0};
+        std::thread other([&] {
+            while (turn.load() == 0) std::this_thread::yield();
+            misbehave();
+            turn = 2;
+        });
+        rtguard::reset();
+        {
+            const rtguard::Scope scope;
+            turn = 1;
+            while (turn.load() != 2) std::this_thread::yield();
+        }
+        other.join();
+        c = rtguard::counts();
+        QCOMPARE(c.allocations, int64_t(0));
+        QCOMPARE(c.locks, int64_t(0));
+        QCOMPARE(c.waits, int64_t(0));
+        rtguard::reset();
+    }
+
+    void callbackTakesNoLockAndAllocatesNothing() {
+        // Through the loopback: a tone played at the device's rate, a second output at another rate (resampled), a
+        // feed, and an input listening. Over two seconds the device's callbacks count no allocation, no lock and no
+        // wait, while the callers' side adds and removes outputs and asks what has been heard.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        TonePump tone, other;
+        other.rate = 44100;
+        Listener heard;
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        const int out2 = e.addOutput(&other, 44100, 2, [&](float* o, int ch, int n) { return other.render(o, ch, n); });
+        const int in = e.addInput(&tone, 44100, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        QVERIFY(out >= 0 && out2 >= 0 && in >= 0);
+        QTRY_VERIFY(e.heardSeconds(out) > 0);
+        rtguard::reset();
+        QElapsedTimer t;
+        t.start();
+        Clicker extra;
+        while (t.elapsed() < 2000) {
+            const int id = e.addOutput(&extra, 48000, 2, [&](float* o, int ch, int n) { return extra.render(o, ch, n); });
+            QVERIFY(id >= 0);
+            QVERIFY(e.heardSeconds(out) > 0);
+            (void)e.status();
+            QThread::msleep(20);
+            e.removeOutput(id);
+        }
+        const rtguard::Counts c = rtguard::counts();
+        QVERIFY2(c.callbacks > 200, qPrintable(QString::number(c.callbacks)));  // (about 375 blocks of 256 in two seconds)
+        QCOMPARE(c.allocations, int64_t(0));
+        QCOMPARE(c.locks, int64_t(0));
+        QCOMPARE(c.waits, int64_t(0));
+        QVERIFY(heard.size() > 44100);
+        // Both resamplers (the second output's, the input's) were built, on the feed thread.
+        QVERIFY(e.status().resamplers >= 2);
+        e.removeInput(in);
+        e.removeOutput(out2);
+        e.removeOutput(out);
+        audiodev::setLoopbackOptions({});
+    }
+
+    void heldStateLeavesTheToneWhole() {
+        // While another thread holds everything a caller can hold in the engine for 100 ms at a time (as a window's
+        // thread opening a device, or stuck), a 1 kHz tone through the loopback has no gap and no jump in phase: every
+        // sample that comes back is the sine's next one. Judged on a run the computer kept up with (no underrun, no
+        // xrun, nothing lost), of three tries.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        QString last;
+        bool whole = false;
+        for (int attempt = 0; attempt < 3 && !whole; ++attempt) {
+            audiodev::Engine e;
+            audiodev::DeviceSettings s;
+            s.host = audiodev::Host::Loopback;
+            s.bufferFrames = 256;
+            s.sampleRate = 48000;
+            e.setSettings(s);
+            QVERIFY(e.isOpen());
+            TonePump tone;
+            Listener heard;
+            const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+            const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+            QVERIFY(out >= 0 && in >= 0);
+            QThread::msleep(300);  // (settled: the cushion as deep as this computer needs)
+            e.resetXruns();
+            heard.take();
+            std::atomic<bool> stop{false};
+            std::atomic<int> holds{0};
+            std::thread holder([&] {
+                while (!stop.load()) {
+                    e.holdStateForTest(100);
+                    ++holds;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            });
+            QThread::msleep(2000);
+            stop = true;
+            holder.join();
+            QVERIFY(holds.load() >= 10);
+            const std::vector<float> got = heard.take();
+            const audiodev::EngineStatus st = e.status();
+            e.removeInput(in);
+            e.removeOutput(out);
+            QVERIFY2(got.size() > 80000, qPrintable(QString::number(got.size())));
+            // Each sample against the sine's own recurrence, x[n+1] = 2 cos(w) x[n] - x[n-1]: a gap or a jump breaks it.
+            const double k = 2 * std::cos(2 * M_PI * 1000 / 48000.0);
+            double worst = 0;
+            size_t at = 0;
+            for (size_t i = 2; i < got.size(); ++i)
+                if (const double err = std::fabs(double(got[i]) - (k * got[i - 1] - got[i - 2])); err > worst) worst = err, at = i;
+            double peak = 0;
+            for (float v : got) peak = std::max(peak, double(std::fabs(v)));
+            last = QStringLiteral("worst step %1 at %2 of %3, peak %4, %5 underruns, %6 xruns, %7 inputs lost")
+                       .arg(worst).arg(at).arg(got.size()).arg(peak).arg(st.underruns).arg(st.xruns).arg(st.inputsLost);
+            if (st.underruns == 0 && st.xruns == 0 && st.inputsLost == 0) {
+                QVERIFY2(worst < 1e-4 && std::fabs(peak - 0.4) < 1e-3, qPrintable(last));
+                whole = true;
+            }
+        }
+        QVERIFY2(whole, qPrintable(last));
+        audiodev::setLoopbackOptions({});
+    }
+
+    void rateChangeBuildsItsResamplerOutsideTheCallback() {
+        // The device's rate changes in mid-playback: the resamplers for the new rate are built on the feed thread (the
+        // engine counts them), the callbacks go on counting no allocation, lock or wait, and the tone keeps its pitch.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        TonePump tone;
+        Listener heard;
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        QVERIFY(out >= 0 && in >= 0);
+        QThread::msleep(300);
+        QCOMPARE(e.status().resamplers, int64_t(0));  // (48 kHz through a 48 kHz device: none needed)
+        rtguard::reset();
+        audiodev::loopbackChangeRate(96000);
+        QTRY_COMPARE(e.status().rate, 96000);
+        QTRY_VERIFY(e.status().resamplers >= 2);  // (the output's and the input's)
+        QThread::msleep(300);
+        heard.take();
+        QThread::msleep(1000);
+        const std::vector<float> got = heard.take();
+        const double hz = toneHz(got, 48000);
+        QVERIFY2(std::fabs(hz - 1000) < 5, qPrintable(QString::number(hz)));
+        const rtguard::Counts c = rtguard::counts();
+        QVERIFY(c.callbacks > 100);
+        QCOMPARE(c.allocations, int64_t(0));
+        QCOMPARE(c.locks, int64_t(0));
+        QCOMPARE(c.waits, int64_t(0));
+        e.removeInput(in);
+        e.removeOutput(out);
+        audiodev::setLoopbackOptions({});
+    }
+
+    void lostDeviceHandsOnWhatArrivedAndTells() {
+        // The device is pulled out while an input listens: every block it brought before it went reaches the input's
+        // tap, then the listeners are told why, within a second, and the tap is not called again. The engine says why it
+        // is not open, and opens again once the device is back.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        TonePump tone;
+        std::atomic<int64_t> frames{0}, framesWhenTold{-1};
+        std::atomic<int> order{0}, toldAt{0}, lastTapAt{0};
+        std::mutex m;
+        std::string why;
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        const int in = e.addInput(&tone, 48000, [&](const float*, int, int n, int64_t) {
+            frames += n;
+            lastTapAt = ++order;
+        });
+        const int listener = e.addLostListener([&](const std::string& w) {
+            std::lock_guard<std::mutex> lock(m);
+            why = w;
+            framesWhenTold = frames.load();
+            toldAt = ++order;
+        });
+        QVERIFY(out >= 0 && in >= 0 && listener >= 0);
+        QTRY_VERIFY(frames.load() > 24000);
+        QElapsedTimer t;
+        t.start();
+        audiodev::LoopbackOptions gone{256, 256, 0};
+        gone.unplugged = true;
+        audiodev::setLoopbackOptions(gone);
+        while (toldAt.load() == 0 && t.elapsed() < 5000) QThread::msleep(2);
+        QVERIFY2(toldAt.load() > 0 && t.elapsed() < 1000, qPrintable(QString::number(t.elapsed())));
+        {
+            std::lock_guard<std::mutex> lock(m);
+            QVERIFY(!why.empty());
+        }
+        QThread::msleep(200);
+        QVERIFY(lastTapAt.load() < toldAt.load());  // (told after the last block, and none since)
+        QCOMPARE(frames.load(), framesWhenTold.load());
+        QCOMPARE(frames.load() % 256, int64_t(0));  // (whole blocks, to the last the device brought)
+        QVERIFY(!e.isOpen());
+        QVERIFY(!e.status().error.empty());
+        // Back again: the same output and input go on through it.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        e.setSettings(audiodev::DeviceSettings{});
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        const int64_t before = frames.load();
+        QTRY_VERIFY(frames.load() > before + 4800);
+        e.removeLostListener(listener);
+        e.removeInput(in);
+        e.removeOutput(out);
+        audiodev::setLoopbackOptions({});
+    }
+
     void overloadedCallbackIsAnXrun() {
         // A callback held past its period (an overloaded computer) is counted as an xrun, and the count can be reset.
         audiodev::Engine e;
@@ -3963,8 +4224,8 @@ private slots:
     void jackPortsAndLoopback() {
         // Under JACK's dummy driver (a test tool), or a PipeWire server with its JACK library: Montage's ports appear with
         // the monitoring section's names, a click looped from an output port back into an input port is recorded and,
-        // the loop measured, lands where it was played at buffers of 64, 256 and 1024, and an overloaded callback is an
-        // xrun.
+        // the loop measured, lands where it was played at buffers of 64, 256 and 1024, and an output too slow for the
+        // device is an underrun.
         QProcess jackd;
         const QString server = QStringLiteral("montage-test-%1").arg(QCoreApplication::applicationPid());
         const QString exe = QStandardPaths::findExecutable(QStringLiteral("jackd"));
@@ -4016,17 +4277,20 @@ private slots:
             QVERIFY2(trip > 0, why.c_str());
             QCOMPARE(recordClick(e, e.status().rate), int64_t(4800));
         }
-        // A callback that overruns its period.
+        // An output that takes longer than a period over its sound: the device's callback is not held up for it (the
+        // server is not made late); what was mixed ahead runs out, which is counted as an underrun and shown with the
+        // xruns.
         e.resetXruns();
-        const int64_t before = e.status().xruns;
-        std::atomic<int> slow{1};
-        const int id = e.addOutput(&slow, 48000, 2, [&](float* o, int ch, int n) {
+        QCOMPARE(e.status().underruns, int64_t(0));
+        std::atomic<int> calls{0};
+        const int id = e.addOutput(&calls, 48000, 2, [&](float* o, int ch, int n) {
             std::fill(o, o + size_t(n) * size_t(ch), 0.0f);
-            if (slow.exchange(0)) QThread::msleep(100);
+            if (++calls == 50) QThread::msleep(300);
             return int64_t(-1);
         });
         QVERIFY(id >= 0);
-        QTRY_VERIFY_WITH_TIMEOUT(e.status().xruns > before, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(e.status().underruns > 0, 5000);
+        QVERIFY(e.dropouts() > 0);
         e.removeOutput(id);
         e.setSettings(audiodev::DeviceSettings{});
         if (jackd.state() != QProcess::NotRunning) {

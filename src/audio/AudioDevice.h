@@ -9,6 +9,10 @@
 // belongs at: the sample the clock's playback was sending out in that block, less the round trip (the device's
 // reported input and output latencies, or a loopback measured where the user ran one), so a recording lands where
 // what was heard was played. Xruns (the device's own reports, or a callback too late) are counted.
+//
+// The device's callback only copies: sound is mixed a few blocks ahead on the engine's feed thread and waits in a ring,
+// and what the inputs bring is handed on from a ring by the same thread. The callback takes no lock, allocates nothing
+// and waits for nothing (audio/RtGuard.h counts if it ever does); a ring that runs dry is an underrun, counted too.
 #pragma once
 
 #include <QJsonObject>
@@ -170,6 +174,11 @@ struct EngineStatus {
     int roundTrip = 0;      // what recordings are moved by (frames at `rate`)
     bool measured = false;  // from a measured loopback
     int64_t xruns = 0;
+    int64_t underruns = 0;   // callbacks that found less mixed than they asked for (the computer did not keep up)
+    int64_t inputsLost = 0;  // input blocks let go because nothing took them in time
+    int cushion = 0;         // frames mixed ahead of the device
+    int64_t resamplers = 0;  // resamplers built since the engine began (on the feed thread, never in the callback)
+    bool standIn = false;    // the device named is gone: the host's own choice plays until it is back
     int rateChanges = 0;    // times the device's rate changed while open
     std::vector<std::string> ports;
     std::string clock;
@@ -197,7 +206,9 @@ public:
 
     // An output: `render` fills `frames` frames of `channels` channels (interleaved) at `rate`, and returns the timeline
     // sample its first frame is (-1 when nothing of the timeline plays). Summed with the others onto the first outputs.
-    // `owner` names it for the inputs that follow it. -1 when no device is open (with the reason).
+    // `owner` names it for the inputs that follow it. -1 when no device is open (with the reason). `render` is called
+    // on the engine's feed thread, a few blocks ahead of the device, never on the device's own; once removeOutput
+    // returns it is not called again.
     using Render = std::function<int64_t(float* out, int channels, int frames)>;
     int addOutput(const void* owner, int rate, int channels, Render render, std::string* error = nullptr);
     void removeOutput(int id);
@@ -206,13 +217,24 @@ public:
     double heardSeconds(int id) const;
 
     // An input: every block of the device's inputs (all of them, interleaved, at `rate`), with the timeline sample its
-    // first frame belongs at: the newest output of `clockOwner`'s less the round trip (-1 when that plays nothing of
-    // the timeline, or none is named).
+    // first frame belongs at: the output of `clockOwner`'s sent out beside it less the round trip (-1 when that plays
+    // nothing of the timeline, or none is named). `tap` is called on the feed thread; once removeInput returns it is
+    // not called again.
     using Tap = std::function<void(const float* in, int channels, int frames, int64_t sample)>;
     int addInput(const void* clockOwner, int rate, Tap tap, std::string* error = nullptr);
     void removeInput(int id);
     // The round trip in frames at `rate` (resampling included), as inputs are moved by it.
     int roundTripAt(int rate) const;
+    // Told when the device or its server goes away (unplugged, a JACK server stopped), on the feed thread, after the
+    // inputs' taps have been given everything the device brought before it went. The stream is closed by the next
+    // call here; outputs and inputs stay, and go on through whatever opens next.
+    int addLostListener(std::function<void(const std::string& why)> told);
+    void removeLostListener(int id);
+    // Xruns, underruns and input blocks lost since they were last reset (-1 with no device open), without waiting for
+    // a device being opened.
+    int64_t dropouts() const;
+    // Holds everything a caller's thread can hold here for `ms` (tests: the device goes on without it).
+    void holdStateForTest(int ms);
 
     EngineStatus status() const;
     void resetXruns();

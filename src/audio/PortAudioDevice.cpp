@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "AudioDeviceInternal.h"
+#include "RtGuard.h"
 
 #ifdef MONTAGE_WITH_PORTAUDIO
 #include <portaudio.h>
@@ -168,6 +169,7 @@ public:
         watch_.reset(rate_);
         name_ = oi ? oi->name : ii->name;
         in_.assign(size_t(kMaxBuffer) * size_t(std::max(1, inputs_)), 0.0f);
+        none_.assign(size_t(std::max(buffer_, kMaxBuffer)) * 2, 0.0f);  // (made here: the callback allocates nothing)
         // (a stream that ends without being stopped: its device went away, unplugged or taken; the engine is told)
         Pa_SetStreamFinishedCallback(stream_, &PaStreamBox::finished);
         if ((e = Pa_StartStream(stream_)) != paNoError) {
@@ -190,6 +192,7 @@ private:
     static int callback(const void* input, void* output, unsigned long frames, const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags flags,
                         void* arg) {
         auto* self = static_cast<PaStreamBox*>(arg);
+        const rtguard::Scope scope;
         // PortAudio says nothing when the device's rate is changed under it (its control panel, another program): the
         // rate is judged from the frames the callbacks bring, and followed.
         const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -205,10 +208,8 @@ private:
         }
         float* out = static_cast<float*>(output);
         if (!out) {
-            // (an input-only stream: the outputs go nowhere)
-            static thread_local std::vector<float> none;
-            none.resize(size_t(frames) * 2);
-            if (self->cb_.process) self->cb_.process(in, self->inputs_, none.data(), 0, int(frames));
+            // (an input-only stream: the outputs go nowhere; a block longer than the stream was opened for is passed over)
+            if (self->cb_.process && size_t(frames) * 2 <= self->none_.size()) self->cb_.process(in, self->inputs_, self->none_.data(), 0, int(frames));
             return paContinue;
         }
         if (self->cb_.process) self->cb_.process(in, self->inputs_, out, self->outputs_, int(frames));
@@ -228,7 +229,7 @@ private:
     RateWatch watch_;  // (the audio thread's)
     Latency latency_;
     std::string name_;
-    std::vector<float> in_;
+    std::vector<float> in_, none_;
     std::atomic<int64_t> xruns_{0};
 };
 
