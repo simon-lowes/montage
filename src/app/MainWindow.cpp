@@ -22,6 +22,7 @@
 #include "CleanFeed.h"
 #include "Settings.h"
 
+#include "CommandFinder.h"
 #include "CompareDialog.h"
 #include "MergeDialog.h"
 
@@ -3368,6 +3369,13 @@ void MainWindow::buildMenus() {
     syncWorkspaceUi();
     QMenu* help = menuIn(menuBar(), QT_TR_NOOP("&Help"));
     add(help, QT_TR_NOOP("&Keyboard Shortcuts"), QKeySequence(Qt::Key_F1), [this] { showShortcuts(); });
+    add(help, QT_TR_NOOP("&Find Command…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_P), [this] {
+        // (made each time: the commands, effects and presets as they are now)
+        auto* finder = new CommandFinder(this);
+        finder->setAttribute(Qt::WA_DeleteOnClose);
+        connect(finder, &CommandFinder::applyRequested, this, &MainWindow::applyFromBrowser);
+        finder->open();
+    })->setObjectName(QStringLiteral("findCommand"));
     add(help, QT_TR_NOOP("&Licences…"), QKeySequence(), [this] { LicencesDialog(this).exec(); })->setObjectName("showLicences");
     add(help, QT_TR_NOOP("About &Qt"), QKeySequence(), [] { QApplication::aboutQt(); });
     add(help, QT_TR_NOOP("&About Montage"), QKeySequence(), [this] { about(); });

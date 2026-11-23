@@ -239,6 +239,7 @@
 #include "CompareDialog.h"
 #include "MergeDialog.h"
 #include "Keymap.h"
+#include "CommandFinder.h"
 #include "LoudnessReadout.h"
 #include "LiveTake.h"
 #include "audio/RtGuard.h"
@@ -25134,6 +25135,111 @@ print("added " + ui["name"])
         QCOMPARE(state()->history().undoCount(), undos);
         QVERIFY(presets::remove(file));
         browser->reload();
+    }
+
+    void findCommandListsAndRuns() {
+        // Help › Find Command lists the menus' commands, the effects and the saved presets by name, runs the one chosen
+        // and lists what was run last first.
+        loadDemo();
+        CommandFinder::forgetRecent();
+        QAction* show = win_->findChild<QAction*>("findCommand");
+        QAction* nestAction = win_->findChild<QAction*>("nestInToOut");
+        QVERIFY(show && nestAction);
+        const QString nest = keymap::idOf(nestAction);
+        QVERIFY(!nest.isEmpty());
+        QVERIFY(state()->edit("Marks", [](Project&, Sequence& sq) {
+            sq.inPoint = 30;
+            sq.outPoint = 89;
+            return true;
+        }));
+        state()->setSelection({}, false);
+
+        // "nest" lists Nest In to Out, after the command whose name is nearer what was typed.
+        show->trigger();
+        QPointer<CommandFinder> finder = win_->findChild<CommandFinder*>("commandFinder");
+        QVERIFY(finder && finder->isVisible());
+        auto* text = finder->findChild<QLineEdit*>("commandFinderText");
+        QVERIFY(text);
+        QTRY_VERIFY(text->hasFocus());  // (once its window is the active one)
+        QTest::keyClicks(text, QStringLiteral("nest"));
+        QStringList listed = finder->listed();
+        QVERIFY(listed.contains(nest));
+        QVERIFY(listed.indexOf(nest) > 0);
+        for (const QString& id : listed) QVERIFY2(id.contains(QStringLiteral("nest"), Qt::CaseInsensitive), qPrintable(id));
+        // Down to it and Return: the command runs as from its menu (its own dialog asks for the name).
+        for (int i = 0; i < listed.indexOf(nest); ++i) QTest::keyClick(text, Qt::Key_Down);
+        QCOMPARE(finder->chosen(), nest);
+        const size_t undos = state()->history().undoCount();
+        whenModal<QInputDialog>(this, [](QInputDialog* d) {
+            d->setTextValue(QStringLiteral("Found"));
+            d->accept();
+        });
+        QTest::keyClick(text, Qt::Key_Return);
+        QCOMPARE(state()->history().undoCount(), undos + 1);
+        const Track& v1 = state()->sequence()->videoTracks[0];
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(QString::fromStdString(state()->project().findMedia(v1.clips[1].mediaId)->name), QStringLiteral("Found"));
+        QCOMPARE(v1.clips[1].duration, FrameTime(60));
+        state()->undo();
+        QTRY_VERIFY(!finder);  // closed and gone once it has run
+
+        // The next time it is first, and what was not run keeps its place after it.
+        QCOMPARE(CommandFinder::recent(), QStringList{nest});
+        show->trigger();
+        finder = win_->findChild<CommandFinder*>("commandFinder");
+        QVERIFY(finder);
+        finder->setText(QStringLiteral("nest"));
+        QStringList again = finder->listed(), rest = listed;
+        QCOMPARE(again.removeAll(QStringLiteral("Edit/Redo")), 1);  // (Redo is found too now: it names the nest undone)
+        rest.removeAll(nest);
+        QCOMPARE(again.value(0), nest);
+        QCOMPARE(again.mid(1), rest);
+        QCOMPARE(finder->chosen(), nest);
+        // With nothing typed too.
+        finder->setText(QString());
+        QCOMPARE(finder->listed().value(0), nest);
+        QVERIFY(finder->listed().size() > 200);
+
+        // An effect is found by its name or its group and applied to the selected clip, as from the Effects panel.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->setSelection({red}, false);
+        QCOMPARE(finder->find(QStringLiteral("gaussian bl")).value(0), QStringLiteral("effect:gaussian_blur"));
+        QVERIFY(finder->find(QStringLiteral("sharpen")).contains(QStringLiteral("effect:gaussian_blur")));  // (its group: Blur & Sharpen)
+        const size_t had = edit::clipById(*state()->sequence(), red)->effects.size();
+        QVERIFY(finder->run(QStringLiteral("effect:gaussian_blur")));
+        const Clip* c = edit::clipById(*state()->sequence(), red);
+        QCOMPARE(c->effects.size(), had + 1);
+        QCOMPARE(c->effects.back().type, std::string("gaussian_blur"));
+        QCOMPARE(CommandFinder::recent(), (QStringList{QStringLiteral("effect:gaussian_blur"), nest}));
+        state()->undo();
+        // A command that cannot be used now is listed greyed and does not run; one that is not there is refused.
+        QVERIFY(!finder->run(QStringLiteral("Clip/No Such Command")));
+        finder->reject();
+        QTRY_VERIFY(!finder);
+
+        // A preset saved on this computer is listed by its name and applied.
+        EffectPreset preset;
+        preset.name = "Finder Soft Glow";
+        Effect blur;
+        blur.id = 1;
+        blur.type = "gaussian_blur";
+        preset.effects = {blur, blur};
+        const QString file = presets::save(preset);
+        QVERIFY(!file.isEmpty());
+        show->trigger();
+        finder = win_->findChild<CommandFinder*>("commandFinder");
+        QVERIFY(finder);
+        const QStringList glow = finder->find(QStringLiteral("soft glow"));
+        QCOMPARE(glow.size(), 1);
+        QVERIFY(glow[0].startsWith(QStringLiteral("preset:")));
+        state()->setSelection({red}, false);
+        QVERIFY(finder->run(glow[0]));
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->effects.size(), had + 2);
+        state()->undo();
+        finder->reject();
+        QTRY_VERIFY(!finder);
+        QVERIFY(presets::remove(file));
+        CommandFinder::forgetRecent();
     }
 
     void playbackAdvances() {
