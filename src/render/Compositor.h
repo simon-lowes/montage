@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,8 @@
 #include "Stereo.h"
 #include "core/Ambisonics.h"
 #include "core/Model.h"
+#include "media/DepthMap.h"
+#include "media/Faces.h"
 #include "media/Image.h"
 
 class QImage;
@@ -87,6 +90,16 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t);
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 // Same as 8-bit RGBA (as toRgba8 makes it), for showing: from the GPU without a float frame in between when o.gpu.
 QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
+
+// For tests, where the models are not installed: what stands in for them on a clip's picture (the people's matte, the
+// still model's depth, the faces), on the CPU's path and the GPU's alike. An unset one is the model itself. Set before
+// frames are rendered, not while.
+struct ModelStandIns {
+    std::function<std::shared_ptr<const ValueMap>(const Image& shown)> people;
+    std::function<std::shared_ptr<const DepthMap>(const Image& shown)> depth;
+    std::function<std::shared_ptr<const std::vector<FaceBox>>(const Image& shown)> faces;
+};
+void setModelStandInsForTesting(ModelStandIns standIns);
 
 // Maps between a clip's own frame (u, v as fractions of its media frame, as
 // masks use) and the sequence frame (pixels) at timeline frame t, following

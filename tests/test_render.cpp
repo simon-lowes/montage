@@ -26765,7 +26765,7 @@ colorspaces:
         cc.params["mask.y"] = 0.5;
         cc.params["mask.w"] = 0.5;
         cc.params["mask.h"] = 0.5;
-        cc.params["mask.refine"] = 50.0;
+        cc.params["mask.show"] = 1.0;  // (the mask shown in place of the picture: drawn on the CPU)
         masked.effects.push_back(cc);
         const Id maskedId = masked.id;
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, masked).ok);
@@ -30871,6 +30871,293 @@ colorspaces:
         QCOMPARE(gpu::stats().tableBytes, size_t(0));
         QVERIFY(gpu::stats().textureBytes + tables <= withGlare);
         QCOMPARE(out.px.size(), plainSmall.px.size());
+    }
+    // Masks and effects finished from the picture, drawn on the GPU as on the CPU: People masks and a depth worked out
+    // from the picture (the models' places taken by stand-ins), Cryptomatte masks, masks bent with a surface track,
+    // Refine Edges, the Keyer's clean plate made from the picture itself, Mesh Warp over the picture's alpha and a
+    // Lens Blur focused on the nearest face; each at three settings and through a feathered mask.
+    void gpuMasksAndStepsFromThePicture() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        qputenv("MONTAGE_DEPTH_CACHE", (dir.path() + "/depth").toUtf8());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        // The footage: a subject (red, textured) in front of an uneven green screen, cut out of the frame by a soft oval.
+        QImage q(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) {
+                const float subject = std::clamp(1.5f - float(std::hypot((x - 60) / 22.0, (y - 45) / 26.0)) * 1.2f, 0.0f, 1.0f);
+                const float screen = 0.6f + 0.15f * std::sin(x * 0.07f) + 0.1f * std::cos(y * 0.11f);
+                const float r = subject * (0.7f + 0.2f * std::sin(x * 0.9f + y * 0.4f)) + (1 - subject) * 0.12f * screen;
+                const float g = subject * 0.25f + (1 - subject) * screen;
+                const float b = subject * (0.2f + 0.1f * std::cos(y * 0.7f)) + (1 - subject) * 0.18f * screen;
+                const float a = std::clamp(4.0f - float(std::hypot((x - 80) / 70.0, (y - 45) / 38.0)) * 4.0f, 0.0f, 1.0f);
+                q.setPixelColor(x, y, QColor::fromRgbF(r, g, b, a));
+            }
+        QVERIFY(q.save(dir.filePath("subject.png")));
+        MediaItem still;
+        QVERIFY(probeMedia(dir.filePath("subject.png").toStdString(), still));
+        still.id = p.newId();
+        p.media.push_back(still);
+        auto r = edit::placeMedia(p, s, still.id, 0, 0, 60, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(r.ok);
+        const Id clipId = r.created[0];
+        edit::clipById(s, clipId)->motion.params["scale"] = 110.0;
+        edit::clipById(s, clipId)->motion.params["rotation"] = 5.0;
+        // In the models' places: the people are where the picture is red, its depth is its brightness, and one face.
+        ModelStandIns standIns;
+        standIns.people = [](const Image& img) {
+            auto m = std::make_shared<ValueMap>();
+            m->width = img.width, m->height = img.height;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    const float* px = img.at(x, y);
+                    m->values.push_back(px[3] > 0 ? std::clamp((px[0] - px[1]) / px[3] * 3 + 0.5f, 0.0f, 1.0f) : 0.0f);
+                }
+            return std::shared_ptr<const ValueMap>(m);
+        };
+        standIns.depth = [](const Image& img) {
+            auto d = std::make_shared<DepthMap>();
+            d->width = img.width, d->height = img.height;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    const float* px = img.at(x, y);
+                    d->values.push_back(0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2]);
+                }
+            return std::shared_ptr<const DepthMap>(d);
+        };
+        standIns.faces = [](const Image&) {
+            FaceBox f;
+            f.x = 0.3f, f.y = 0.35f, f.w = 0.15f, f.h = 0.3f, f.score = 1;
+            return std::make_shared<const std::vector<FaceBox>>(std::vector<FaceBox>{f});
+        };
+        setModelStandInsForTesting(standIns);
+        const auto standInsOff = qScopeGuard([] { setModelStandInsForTesting({}); });
+        auto compare = [&](FrameTime t, const QString& what) {
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c)
+                        if (const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]); d > worst) worst = d, wx = x, wy = y;
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
+        };
+        compare(1, "the footage alone");
+        RenderOptions plain;
+        plain.gpu = false;
+        const Image untouched = renderProgramFrame(p, s, 2, plain);
+        using Settings = std::vector<std::pair<const char*, double>>;
+        struct Case {
+            const char* type;
+            Settings settings;
+            int readBacks;  // pictures read back from the GPU for it
+        };
+        const std::vector<Case> cases = {
+            // People masks, the last through a qualifier and a range of depths too.
+            {"invert", {{"mask.shape", 4}, {"mask.feather", 6}}, 0},
+            {"gaussian_blur", {{"radius", 4}, {"mask.shape", 4}, {"mask.expansion", 3}, {"mask.invert", 1}}, 0},
+            {"hue_sat", {{"hue", 90}, {"mask.shape", 4}, {"mask.feather", 12}, {"mask.qualify", 1}, {"mask.lum_low", 20}, {"mask.depth", 1},
+                                {"mask.depth_low", 20}, {"mask.depth_high", 70}},
+             0},
+            // Refine Edges, on a drawn shape, through a filter and on the people's.
+            {"invert", {{"mask.shape", 1}, {"mask.x", 0.4}, {"mask.w", 0.4}, {"mask.h", 0.7}, {"mask.feather", 10}, {"mask.refine", 100}, {"mask.refine_radius", 6}}, 1},
+            {"gaussian_blur", {{"radius", 3}, {"mask.shape", 2}, {"mask.x", 0.4}, {"mask.w", 0.45}, {"mask.h", 0.7}, {"mask.feather", 8}, {"mask.refine", 50}}, 1},
+            {"invert", {{"mask.shape", 4}, {"mask.feather", 8}, {"mask.refine", 70}, {"mask.refine_radius", 10}, {"mask.depth", 1}, {"mask.depth_low", 10}}, 1},
+            // The Keyer with a clean plate made from the picture: keyed, its matte shrunk and softened, the plate shown,
+            // and through a feathered mask.
+            {"screen_key", {{"clean_plate", 1}, {"plate_erode", 6}, {"key.r", 0.07}, {"key.g", 0.6}, {"key.b", 0.1}}, 1},
+            {"screen_key", {{"clean_plate", 1}, {"plate_erode", 3}, {"key.r", 0.07}, {"key.g", 0.6}, {"key.b", 0.1}, {"shrink", 2}, {"soften", 3}}, 1},
+            {"screen_key", {{"clean_plate", 1}, {"plate_erode", 6}, {"key.r", 0.07}, {"key.g", 0.6}, {"key.b", 0.1}, {"view", 3}}, 1},
+            {"screen_key",
+             {{"clean_plate", 1}, {"plate_erode", 6}, {"key.r", 0.07}, {"key.g", 0.6}, {"key.b", 0.1}, {"mask.shape", 1}, {"mask.w", 0.6}, {"mask.h", 0.6},
+              {"mask.feather", 10}},
+             1},
+            // Mesh Warp over the picture's alpha, and through a feathered mask.
+            {"mesh_warp", {{"pin1.kind", 0}, {"pin1.x", 0.3}, {"pin1.y", 0.4}, {"pin1.to_x", 0.4}, {"pin1.to_y", 0.47}, {"pin2.kind", 0}, {"pin2.x", 0.7}, {"pin2.y", 0.6}}, 1},
+            {"mesh_warp",
+             {{"density", 500}, {"expand", 6}, {"pin1.kind", 0}, {"pin1.x", 0.25}, {"pin1.y", 0.3}, {"pin1.to_x", 0.2}, {"pin2.kind", 2}, {"pin2.x", 0.6}, {"pin2.y", 0.5},
+              {"pin2.angle", 30}, {"pin2.radius", 40}},
+             1},
+            {"mesh_warp", {{"pin1.kind", 0}, {"pin1.x", 0.5}, {"pin1.y", 0.5}, {"pin1.to_x", 0.7}, {"pin1.to_y", 0.35}, {"pin2.kind", 1}, {"pin2.x", 0.25}, {"pin2.y", 0.7}}, 1},
+            {"mesh_warp",
+             {{"pin1.kind", 0}, {"pin1.x", 0.3}, {"pin1.y", 0.4}, {"pin1.to_x", 0.4}, {"pin1.to_y", 0.47}, {"pin2.kind", 0}, {"pin2.x", 0.7}, {"pin2.y", 0.6},
+              {"mask.shape", 1}, {"mask.w", 0.6}, {"mask.h", 0.6}, {"mask.feather", 10}},
+             1},
+            // Lens Blur focused on the nearest face, its depth worked out from the picture.
+            {"depth_blur", {{"follow", 2}, {"radius", 8}}, 0},
+            {"depth_blur", {{"follow", 2}, {"radius", 12}, {"blades", 6}, {"highlights", 60}}, 0},
+            {"depth_blur", {{"follow", 2}, {"radius", 6}, {"mask.shape", 2}, {"mask.w", 0.6}, {"mask.h", 0.5}, {"mask.feather", 10}}, 0},
+        };
+        for (size_t k = 0; k < cases.size(); ++k) {
+            Effect e = makeEffect(p, cases[k].type);
+            if (std::string(cases[k].type) == "mesh_warp") e.params["mesh_from"] = 0.0;
+            for (const auto& [name, value] : cases[k].settings) e.params[name] = value;
+            edit::clipById(s, clipId)->effects = {e};
+            const QString what = QString("%1 #%2").arg(cases[k].type).arg(k + 1);
+            const long readBacks = gpu::stats().pictureReadBacks;
+            compare(2, what);
+            // (it is drawn: the frame is not the footage alone; and the picture came back only where the step is made from it)
+            RenderOptions o;
+            o.gpu = true;
+            QVERIFY2(renderProgramFrame(p, s, 2, o).px != untouched.px, qPrintable(what + ": nothing drawn"));
+            QVERIFY2(gpu::stats().pictureReadBacks - readBacks == 2 * cases[k].readBacks,
+                     qPrintable(QString("%1: %2 pictures read back").arg(what).arg(gpu::stats().pictureReadBacks - readBacks)));
+        }
+        // The nearest face's depth is what the blur is focused on: with the face elsewhere, another picture.
+        {
+            RenderOptions o;
+            o.gpu = true;
+            const Image there = renderProgramFrame(p, s, 2, o);
+            ModelStandIns moved = standIns;
+            moved.faces = [](const Image&) {
+                FaceBox f;
+                f.x = 0.75f, f.y = 0.1f, f.w = 0.1f, f.h = 0.2f, f.score = 1;
+                return std::make_shared<const std::vector<FaceBox>>(std::vector<FaceBox>{f});
+            };
+            setModelStandInsForTesting(moved);
+            QVERIFY(renderProgramFrame(p, s, 3, o).px != there.px);
+            compare(3, "Lens Blur on a face elsewhere");
+            setModelStandInsForTesting(standIns);
+        }
+        // An adjustment layer's People mask needs the canvas's picture, which is the GPU's: that frame is the CPU's, and says so.
+        {
+            Clip adj = makeGeneratorClip(p, "adjustment", 60);
+            Effect e = makeEffect(p, "invert");
+            e.params["mask.shape"] = 4.0;
+            adj.effects = {e};
+            edit::clipById(s, clipId)->effects.clear();
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, adj).ok);
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, 4, o);
+            o.gpu = true;
+            const Image mixed = renderProgramFrame(p, s, 4, o);
+            double worst = 0;
+            for (size_t i = 0; i < cpu.px.size(); ++i) worst = std::max(worst, std::fabs(double(cpu.px[i]) - mixed.px[i]));
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString::number(worst)));
+            s.videoTracks[1].clips.clear();
+        }
+
+        // A mask bent with a surface track (the track only, nothing shown by the tracker): footage with a media time,
+        // its surface sliding and bulging over the frames.
+        {
+            ExportSettings st;
+            st.path = (dir.path() + "/shot.mkv").toStdString();
+            st.videoCodec = "ffv1";
+            st.pixFmt = "gbrp16le";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            s.videoTracks[0].clips.clear();
+            MediaItem shot;
+            QVERIFY(probeMedia(st.path, shot));
+            shot.id = p.newId();
+            p.media.push_back(shot);
+            auto placed = edit::placeMedia(p, s, shot.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
+            QVERIFY(placed.ok);
+            SurfaceTrack track;
+            track.width = 160, track.height = 90;
+            track.frameSeconds = 1.0 / (shot.fps.valid() ? shot.fps.toDouble() : 25);
+            track.mesh = buildWarpMesh(160, 90, 150);
+            for (int f = 0; f < 20; ++f) {
+                std::vector<MeshPoint> at = track.mesh.rest;
+                for (MeshPoint& v : at) {
+                    const double bulge = std::exp(-(std::pow(v[0] - 70, 2) + std::pow(v[1] - 45, 2)) / 900.0);
+                    v[0] += f * 1.5 + f * 0.4 * bulge, v[1] += f * 0.5 * bulge;
+                }
+                track.frames.push_back(std::move(at));
+            }
+            Effect tracker = makeEffect(p, "surface_track");
+            tracker.params["mode"] = 4.0;
+            tracker.strings["track"] = surfaceTrackToString(track);
+            const std::vector<Settings> bent = {
+                {{"mask.shape", 1}, {"mask.x", 0.4}, {"mask.w", 0.3}, {"mask.h", 0.5}, {"mask.feather", 6}},
+                {{"mask.shape", 2}, {"mask.x", 0.45}, {"mask.w", 0.25}, {"mask.h", 0.4}, {"mask.feather", 12}, {"mask.invert", 1}},
+                {{"mask.shape", 1}, {"mask.x", 0.4}, {"mask.w", 0.3}, {"mask.h", 0.5}, {"mask.feather", 6}, {"mask.refine", 60}},
+            };
+            for (size_t k = 0; k < bent.size(); ++k) {
+                Effect e = makeEffect(p, k == 1 ? "gaussian_blur" : "invert");
+                if (k == 1) e.params["radius"] = 3.0;
+                for (const auto& [name, value] : bent[k]) e.params[name] = value;
+                e.params["mask.surface"] = 1.0;
+                edit::clipById(s, placed.created[0])->effects = {tracker, e};
+                compare(12, QString("a mask bent with the surface #%1").arg(k + 1));
+                // (bent: not where the mask is without the surface)
+                RenderOptions o;
+                o.gpu = true;
+                const Image with = renderProgramFrame(p, s, 12, o);
+                edit::clipById(s, placed.created[0])->effects[1].params["mask.surface"] = 0.0;
+                QVERIFY(renderProgramFrame(p, s, 12, o).px != with.px);
+            }
+            s.videoTracks[0].clips.clear();
+        }
+
+        // Cryptomatte masks: a render whose left half is one object, the right another, with a soft edge between.
+        if (exrAvailable()) {
+            const int W = 160, H = 90;
+            const float ball = cryptomatteId("ball"), floor = cryptomatteId("floor");
+            std::vector<ExrOutLayer> layers(2);
+            layers[0].channels = {"R", "G", "B", "A"};
+            layers[1].name = "CryptoObject00", layers[1].channels = {"R", "G", "B", "A"}, layers[1].fullFloat = true;
+            for (auto& l : layers) l.data.resize(size_t(W) * H * 4);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float left = std::clamp((80.5f + 6 * std::sin(y * 0.2f) - x) / 4 + 0.5f, 0.0f, 1.0f);
+                    const size_t i = (size_t(y) * W + x) * 4;
+                    const float main[4] = {0.2f + 0.5f * float(x) / W, 0.4f, 0.3f + 0.5f * float(y) / H, 1.0f};
+                    const bool ballFirst = left >= 0.5f;
+                    const float ranks[4] = {ballFirst ? ball : floor, ballFirst ? left : 1 - left, ballFirst ? floor : ball, ballFirst ? 1 - left : left};
+                    for (int c = 0; c < 4; ++c) layers[0].data[i + c] = main[c], layers[1].data[i + c] = ranks[c];
+                }
+            const std::map<std::string, std::string> attrs{
+                {"cryptomatte/0a1b2c3/name", "CryptoObject"}, {"cryptomatte/0a1b2c3/hash", "MurmurHash3_32"},
+                {"cryptomatte/0a1b2c3/conversion", "uint32_to_float32"},
+                {"cryptomatte/0a1b2c3/manifest", "{\"ball\":\"" + cryptomatteHex(ball) + "\",\"floor\":\"" + cryptomatteHex(floor) + "\"}"}};
+            std::string err;
+            const std::string file = (dir.path() + "/render.exr").toStdString();
+            QVERIFY2(writeExr(file, W, H, layers, "zip", attrs, &err), err.c_str());
+            MediaItem render;
+            QVERIFY(probeMedia(file, render));
+            render.id = p.newId();
+            p.media.push_back(render);
+            auto placed = edit::placeMedia(p, s, render.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
+            QVERIFY(placed.ok);
+            const std::vector<std::pair<const char*, Settings>> crypto = {
+                {"invert", {{"mask.feather", 0}}},
+                {"gaussian_blur", {{"radius", 4}, {"mask.expansion", 3}, {"mask.invert", 1}}},
+                {"hue_sat", {{"hue", 120}, {"mask.expansion", -2}, {"mask.qualify", 1}, {"mask.lum_low", 30}}},
+                {"invert", {{"mask.refine", 80}, {"mask.refine_radius", 5}}},
+            };
+            for (size_t k = 0; k < crypto.size(); ++k) {
+                Effect e = makeEffect(p, crypto[k].first);
+                e.params["mask.shape"] = 7.0;
+                for (const auto& [name, value] : crypto[k].second) e.params[name] = value;
+                e.strings["mask.crypto_ids"] = cryptomatteHex(ball);
+                edit::clipById(s, placed.created[0])->effects = {e};
+                compare(3, QString("a Cryptomatte mask #%1").arg(k + 1));
+                // (the mask is the object's: the right half, the floor's, is as it was)
+                RenderOptions o;
+                o.gpu = true;
+                const Image masked = renderProgramFrame(p, s, 3, o);
+                edit::clipById(s, placed.created[0])->effects.clear();
+                const Image bare = renderProgramFrame(p, s, 3, o);
+                QVERIFY(std::fabs(masked.at(150, 45)[0] - bare.at(150, 45)[0]) < 1e-3f);
+                if (k == 0) QVERIFY(std::fabs(masked.at(10, 45)[0] - bare.at(10, 45)[0]) > 0.1f);
+            }
+        }
     }
     void footageWordsReadAnswers() {
         // The sentences numbered, shortened when asked, several to a line when asked.

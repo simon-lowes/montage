@@ -1629,6 +1629,15 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     return !src.empty();
 }
 
+// The models that read a clip's picture for its effects and masks, or what tests put in their place.
+ModelStandIns gStandIns;
+bool depthFindable() { return gStandIns.depth || (depthAvailable() && depthModel().installed()); }
+std::shared_ptr<const DepthMap> depthIn(const Image& shown) { return gStandIns.depth ? gStandIns.depth(shown) : cachedDepth(shown); }
+bool peopleFindable() { return gStandIns.people || (mattingAvailable() && mattingModel().installed()); }
+std::shared_ptr<const ValueMap> peopleIn(const Image& shown) { return gStandIns.people ? gStandIns.people(shown) : cachedPersonMatte(shown); }
+bool facesFindable() { return gStandIns.faces || (faceSearchAvailable() && faceModel().installed()); }
+std::shared_ptr<const std::vector<FaceBox>> facesIn(const Image& shown) { return gStandIns.faces ? gStandIns.faces(shown) : cachedFaces(shown); }
+
 // The rest of a clip's layer from its source: its effects (and grade graph), then its transform onto the canvas.
 Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o, ClipSource& cs) {
     const FrameTime lt = cs.lt;
@@ -1658,14 +1667,15 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     // The picture's depth, once, for the effects that work by distance.
     std::shared_ptr<const DepthMap> depth;
     // (The clip's analysed depth where it has one, steady through the shot: not of a reframed view or the other eye.)
-    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); }))
-        depth = frameDepth(scene ? asShown(src, scene->working) : src, reframed ? std::string() : cs.sourcePath, sourceSeconds);
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); })) {
+        if (!reframed && !cs.sourcePath.empty() && sourceSeconds >= 0) depth = analysedDepth(cs.sourcePath, sourceSeconds);
+        if (!depth && depthFindable()) depth = depthIn(scene ? asShown(src, scene->working) : src);
+    }
     DepthScope depthScope(depth);
     // And the people in it, for Remove Background and People masks.
     std::shared_ptr<const ValueMap> people;
-    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsPersonMatte(*e, lt); }) && mattingAvailable() &&
-        mattingModel().installed())
-        people = cachedPersonMatte(scene ? asShown(src, scene->working) : src);
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsPersonMatte(*e, lt); }) && peopleFindable())
+        people = peopleIn(scene ? asShown(src, scene->working) : src);
     PersonScope personScope(people);
     // And the OpenEXR file the frame came from, for Cryptomatte masks.
     CryptomatteScope cryptoScope(std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsCryptomatte(*e, lt); }) ? cs.exrFile : std::string());
@@ -1675,9 +1685,8 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     // (Redact Faces only where its analysis does not reach.)
     if (std::any_of(chain.begin(), chain.end(),
                     [&](const Effect* e) { return e->type == "redact_faces" ? redactNeedsLiveFaces(*e, sourceSeconds) : needsFaces(*e); }) &&
-        faceSearchAvailable() &&
-        faceModel().installed())
-        faces = cachedFaces(scene ? asShown(src, scene->working) : src);
+        facesFindable())
+        faces = facesIn(scene ? asShown(src, scene->working) : src);
     FaceScope faceScope(faces);
     // And its surface track, for masks that bend with it and paint that follows it.
     SurfaceContext surface;
@@ -3039,18 +3048,68 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     canvasSize.width = W, canvasSize.height = H;
     if (!clipSource(p, seq, c, t, o, adjustment ? &canvasSize : nullptr, true, cs)) return GpuLayerResult::Nothing;
     CleanPlateScope plateScope(cleanPlateFor(p, seq, c, t, o));  // (a Keyer's plate track, made here as clipLayer makes it)
-    // The clip's analysed depth, for the depth effects and masks (as clipLayer finds it; the still model's would need
-    // the picture here), and the media time, for object masks.
+    // What the models find in the clip's picture, for the effects and masks that work from it, as finishClipLayer has
+    // them: the source's picture is made on the CPU for a model to read (once, and only when one is asked), while the
+    // GPU draws from the decoded frame. An adjustment layer's picture and a Shape layer's are the GPU's alone: theirs
+    // stay on the CPU when a model must read them.
+    const std::vector<const Effect*> chain = gradeChain(seq, c);
+    const bool readable = !adjustment && !cs.shapes && (cs.frame || !cs.src.empty());
+    Image modelPicture;
+    auto shown = [&]() -> const Image& {
+        if (modelPicture.empty()) {
+            if (cs.frame) {
+                modelPicture = toImage(*cs.frame);
+                inputTransform(modelPicture, *cs.frameSpace, cs.adaptive, seq);
+            } else {
+                modelPicture = cs.src;
+            }
+            if (const SceneGrading* scene = currentSceneGrading()) modelPicture = asShown(std::move(modelPicture), scene->working);
+        }
+        return modelPicture;
+    };
+    // The clip's analysed depth, for the depth effects and masks (as clipLayer finds it), else the still model's, and
+    // the media time, for object masks.
     std::shared_ptr<const DepthMap> depth;
-    {
-        const std::vector<const Effect*> chain = gradeChain(seq, c);
-        if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, cs.lt); })) {
-            if (!cs.reframed && !cs.sourcePath.empty() && cs.sourceSeconds >= 0) depth = analysedDepth(cs.sourcePath, cs.sourceSeconds);
-            if (!depth && depthAvailable() && depthModel().installed()) return cpu("its depth, worked out from the picture");
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, cs.lt); })) {
+        if (!cs.reframed && !cs.sourcePath.empty() && cs.sourceSeconds >= 0) depth = analysedDepth(cs.sourcePath, cs.sourceSeconds);
+        if (!depth && depthFindable()) {
+            if (!readable) return cpu("its depth, worked out from the picture");
+            depth = depthIn(shown());
         }
     }
     DepthScope depthScope(depth);
     SourceSecondsScope sourceTime(cs.sourceSeconds);
+    // The people in it, for People masks.
+    std::shared_ptr<const ValueMap> people;
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsPersonMatte(*e, cs.lt); }) && peopleFindable()) {
+        if (!readable) return cpu("the people in its picture, found on the CPU");
+        people = peopleIn(shown());
+    }
+    PersonScope personScope(people);
+    // The OpenEXR file the frame came from, for Cryptomatte masks.
+    CryptomatteScope cryptoScope(std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsCryptomatte(*e, cs.lt); }) ? cs.exrFile
+                                                                                                                                       : std::string());
+    // The faces, for a Lens Blur focused on the nearest one.
+    TrackedSourceScope trackedSource(cs.sourceMedia, cs.reframed);
+    std::shared_ptr<const std::vector<FaceBox>> faces;
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsFaces(*e); }) && facesFindable()) {
+        if (!readable) return cpu("the faces in its picture, found on the CPU");
+        faces = facesIn(shown());
+    }
+    FaceScope faceScope(faces);
+    // Its surface track, for masks that bend with it.
+    SurfaceContext surface;
+    for (const Effect* e : chain)
+        if (e->enabled && e->type == "surface_track") {
+            surface.track = cachedSurfaceTrack(*e);
+            if (!surface.track) continue;  // (not tracked yet: a later one may be)
+            surface.mediaSeconds = [&c, &seq](FrameTime f) {
+                return c.sourceFrameAt(c.start + std::clamp<FrameTime>(f, 0, std::max<FrameTime>(0, c.duration - 1))) / seq.fpsValue();
+            };
+            break;
+        }
+    SurfaceScope surfaceScope(std::move(surface));
+    modelPicture = {};  // (read; the layer is the GPU's from here)
     int w = 0, h = 0;
     if (adjustment) {
         out.canvas = true;
@@ -5361,5 +5420,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     const float g = dbToLin(seq.masterVolumeDb);
     for (int i = 0; i < frames * nch; ++i) out[i] = master[size_t(i)] * g;
 }
+
+void setModelStandInsForTesting(ModelStandIns standIns) { gStandIns = std::move(standIns); }
 
 }  // namespace montage

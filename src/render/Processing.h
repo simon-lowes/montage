@@ -57,14 +57,17 @@ struct ColorOp;
 // Luma and Screen Key, its matte shrunk, grown or softened too), and the filters (Gaussian, Directional and Channel
 // Blur, Sharpen, Glow, Vignette, Posterize, Letterbox, Mirror, Mosaic, Chromatic Aberration and Noise), through a
 // drawn mask and an HSL qualifier if it has them, appended to `out` (nothing when the effect is off or changes nothing). False for
-// any other effect or mask (people, Refine Edges, Show Mask), which only the CPU draws; object and depth masks from
-// what their models made (the object's segmentation at the SourceSecondsScope's time, currentDepth()). The mask's
-// shape is drawn for a picture `width` by `height` (0: whether it could be, alone).
+// any other effect or mask (Show Mask), which only the CPU draws; object, people, Cryptomatte and depth masks from
+// what the frame holds (the object's segmentation at the SourceSecondsScope's time, currentPersonMatte(),
+// currentCryptomatteFile(), currentDepth()), bent with currentSurface()'s track. The mask's shape is drawn for a
+// picture `width` by `height` (0: whether it could be, alone). A mask with Refine Edges, and a Keyer whose clean plate
+// is made from the picture itself, are finished from the picture read back when the step runs (ColorOp::prepare).
 bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, int width = 0, int height = 0, double pixelScale = 1);
 // An effect's (or a grade node's) mask in that form, into `op`; false when only the CPU can make it. `showing`: Show
-// Mask is the caller's to draw (a grade node's).
+// Mask is the caller's to draw (a grade node's). `reads`: the step is one the compositor gives the picture to before
+// it runs (ColorOp::prepare: any but a grade graph's Pass), so Refine Edges can be done.
 bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width = 0, int height = 0, double pixelScale = 1,
-             bool showing = false);
+             bool showing = false, bool reads = false);
 
 // The depth of the frame being worked on (media/DepthMap.h), for depth
 // effects and depth qualifiers: set by the compositor for the effects of one

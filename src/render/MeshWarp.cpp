@@ -891,13 +891,13 @@ void gridWarp(const Effect& e, FrameTime t, Image& img) {
 }
 
 int warpDrawing(const Effect& e, FrameTime t, int w, int h, double pixelScale, WarpMesh& mesh, std::vector<MeshPoint>& moved,
-                std::vector<double>& depth) {
+                std::vector<double>& depth, const Image* picture) {
     const bool grid = e.type == "grid_warp";
     const bool blur = e.p("motion_blur", t, 0) > 0.5;
     const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
     const bool show = e.p(grid ? "show_grid" : "show_mesh", t, 0) > 0.5;
     const bool overAlpha = !grid && std::lround(e.p("mesh_from", t, 0)) == 0;
-    if (w <= 0 || h <= 0) return show || blur || overAlpha ? -1 : 0;
+    if (w <= 0 || h <= 0) return show || blur ? -1 : overAlpha ? 2 : 0;
     if (grid) {
         const GridWarpSetup g(e, t, w, h);
         if (!show && g.still(g.moves(double(t))) && (!blur || (g.still(g.moves(t - shutter / 2)) && g.still(g.moves(t + shutter / 2)))))
@@ -911,8 +911,10 @@ int warpDrawing(const Effect& e, FrameTime t, int w, int h, double pixelScale, W
     if (!show && pinsStill(meshWarpPins(e, double(t), w, h, pixelScale)) &&
         (!blur || (pinsStill(meshWarpPins(e, t - shutter / 2, w, h, pixelScale)) && pinsStill(meshWarpPins(e, t + shutter / 2, w, h, pixelScale)))))
         return 0;
-    if (show || blur || overAlpha) return -1;
-    mesh = buildWarpMesh(w, h, int(std::lround(e.p("density", t, 2000))), nullptr, std::max(0.0, e.p("expand", t, 3)) * pixelScale);
+    if (show || blur) return -1;
+    if (overAlpha && (!picture || picture->width != w || picture->height != h)) return 2;
+    mesh = buildWarpMesh(w, h, int(std::lround(e.p("density", t, 2000))), overAlpha ? picture : nullptr, std::max(0.0, e.p("expand", t, 3)) * pixelScale);
+    if (overAlpha) rememberMesh(e, w, h, pixelScale, mesh);  // (as meshWarp does: the mesh the monitor's pins are shown on)
     const std::vector<WarpPin> pins = meshWarpPins(e, double(t), w, h, pixelScale);
     moved = solveWarp(mesh, pins);
     depth = warpDepths(mesh, pins);

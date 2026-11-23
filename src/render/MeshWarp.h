@@ -74,11 +74,11 @@ std::vector<WarpPin> meshWarpPins(const Effect& e, double t, int w, int h, doubl
 void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void gridWarp(const Effect& e, FrameTime t, Image& img);
 // What Mesh Warp or Grid Warp `e` draws on clip frame t over a w x h picture, as one drawing (for render/Processing's GPU
-// passes): 1 with its mesh, the vertices moved and the triangles' depths; 0 when it leaves the picture as it is; -1 when
-// it needs more (the picture's alpha for its mesh, motion blur through the shutter, the mesh shown). With w or h 0, only
-// whether it can be drawn so (0 or -1).
+// passes): 1 with its mesh, the vertices moved and the triangles' depths; 0 when it leaves the picture as it is; 2 when
+// its mesh is made over the picture's alpha and `picture` (premultiplied, w x h) was not given; -1 when it needs more
+// (motion blur through the shutter, the mesh shown). With w or h 0, only whether it can be drawn so (0, 2 or -1).
 int warpDrawing(const Effect& e, FrameTime t, int w, int h, double pixelScale, WarpMesh& mesh, std::vector<MeshPoint>& moved,
-                std::vector<double>& depth);
+                std::vector<double>& depth, const Image* picture = nullptr);
 // Points on the picture at rest, where Mesh Warp `e` on clip frame t puts them (pixels of a w x h picture, on the mesh
 // it was last drawn with, or one over the whole frame), and the point at rest it puts at `shown` (false where nothing of the mesh is there): for
 // showing and placing pins on the monitor.
