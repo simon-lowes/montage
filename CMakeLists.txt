@@ -48,6 +48,7 @@ option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColo
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
 option(MONTAGE_REQUIRE_ONNXRUNTIME "Fail to configure without ONNX Runtime (release builds)" OFF)
 option(MONTAGE_REQUIRE_OPENSSL "Fail to configure without OpenSSL 3 (release builds)" OFF)
+set(MONTAGE_REQUIRE_JXL_VERSION "" CACHE STRING "Fail to configure with a libjxl older than this, or none (release builds)")
 option(MONTAGE_WITH_C2PA "Content Credentials (C2PA), when scripts/build-c2pa.sh has built c2pa-rs (C2PA_ROOT or /opt/c2pa)" ON)
 option(MONTAGE_REQUIRE_C2PA "Fail to configure without the C2PA library (release builds)" OFF)
 
@@ -141,8 +142,8 @@ if(MONTAGE_WITH_OPENEXR)
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   FetchContent_Declare(openexr
     GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/openexr.git
-    # v3.5.2, pinned by its commit (a tag can be moved)
-    GIT_TAG 69b2604fc76e370615438bdc8d2cd95b9349c12e)
+    # v3.5.4, pinned by its commit (a tag can be moved)
+    GIT_TAG 86687e5f34e3a164820c5e280259550e3ca87c92)
   FetchContent_MakeAvailable(openexr)
   if(NOT WIN32)
     # zstd marks its API visibility("default") over OpenEXRCore's hidden default, so the executable would export its
