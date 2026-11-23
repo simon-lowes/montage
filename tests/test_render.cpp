@@ -599,6 +599,143 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
     return c;
 }
 
+// A picture with detail down to under four samples across, drifting slowly: what a small rung loses when it is shown
+// large.
+void detailedTestPicture(int frame, int w, int h, std::vector<uint8_t>& y, std::vector<uint8_t>& cb, std::vector<uint8_t>& cr) {
+    for (int r = 0; r < h; ++r)
+        for (int c = 0; c < w; ++c) {
+            const double x = c + 0.5 * frame, v = r + 0.25 * frame;
+            const double s = 0.30 * std::sin(x * 0.011 + v * 0.007) + 0.20 * std::sin(x * 0.13) * std::cos(v * 0.11) +
+                             0.12 * std::sin(x * 0.9 + v * 0.4) + 0.10 * std::sin(x * 1.7 - v * 1.3);
+            y[size_t(r) * w + c] = uint8_t(std::clamp(126 + 110 * s, 16.0, 235.0));
+        }
+    for (int r = 0; r < h / 2; ++r)
+        for (int c = 0; c < w / 2; ++c) {
+            cb[size_t(r) * (w / 2) + c] = uint8_t(128 + int(30 * std::sin((c + frame) * 0.02)));
+            cr[size_t(r) * (w / 2) + c] = uint8_t(128 + int(30 * std::cos((r + frame) * 0.03)));
+        }
+}
+
+// A rendition of a streaming package as one file: its init segment, then its segments in order (CMAF), or its
+// MPEG-TS segments in order (`ts`).
+bool joinStreamingRendition(const QString& rendition, const QString& out, bool ts = false) {
+    QFile all(out);
+    if (!all.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    QStringList files = QDir(rendition).entryList({ts ? "seg*.ts" : "seg*.m4s"}, QDir::Files, QDir::Name);
+    if (files.isEmpty()) return false;
+    if (!ts) files.prepend("init.mp4");
+    for (const QString& name : files) {
+        QFile f(rendition + "/" + name);
+        if (!f.open(QIODevice::ReadOnly)) return false;
+        all.write(f.readAll());
+    }
+    return true;
+}
+
+// The bits of each video sample of a file as its packets carry them, by the frame it is shown at (from the first).
+std::vector<int64_t> videoSampleBits(const QString& file, double fps) {
+    std::vector<std::pair<double, int64_t>> samples;
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, file.toUtf8().constData(), nullptr, nullptr) < 0) return {};
+    const int vs = avformat_find_stream_info(fmt, nullptr) >= 0 ? av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0) : -1;
+    AVPacket* pkt = av_packet_alloc();
+    while (vs >= 0 && av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == vs && pkt->pts != AV_NOPTS_VALUE)
+            samples.push_back({double(pkt->pts) * av_q2d(fmt->streams[vs]->time_base), int64_t(pkt->size) * 8});
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    avformat_close_input(&fmt);
+    double first = std::numeric_limits<double>::max();
+    for (const auto& s : samples) first = std::min(first, s.first);
+    std::vector<int64_t> bits;
+    for (const auto& s : samples) {
+        const size_t frame = size_t(std::llround((s.first - first) * fps));
+        if (frame >= bits.size()) bits.resize(frame + 1);
+        bits[frame] += s.second;
+    }
+    return bits;
+}
+
+// A file's pictures as a Y4M of 8-bit 4:2:0 at w by h, scaled where they are another size by libswscale's bicubic
+// filter with accurate rounding and chroma sited left (the scaler ladder.csv names). Returns the frames written.
+int scaledY4m(const QString& file, int w, int h, const QString& y4m) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, file.toUtf8().constData(), nullptr, nullptr) < 0) return -1;
+    const int vs = avformat_find_stream_info(fmt, nullptr) >= 0 ? av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0) : -1;
+    const AVCodecParameters* par = vs >= 0 ? fmt->streams[vs]->codecpar : nullptr;
+    const AVCodec* codec = par && par->codec_id == AV_CODEC_ID_AV1 ? avcodec_find_decoder_by_name("libdav1d") : nullptr;
+    if (!codec && par) codec = avcodec_find_decoder(par->codec_id);
+    AVCodecContext* dec = codec ? avcodec_alloc_context3(codec) : nullptr;
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    SwsContext* sws = nullptr;
+    QFile out(y4m);
+    int frames = -1;
+    if (dec && avcodec_parameters_to_context(dec, par) >= 0 && avcodec_open2(dec, codec, nullptr) >= 0 && out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        frames = 0;
+        out.write(QStringLiteral("YUV4MPEG2 W%1 H%2 F25:1 Ip A1:1 C420mpeg2\n").arg(w).arg(h).toLatin1());
+        std::vector<uint8_t> plane[3] = {std::vector<uint8_t>(size_t(w) * h), std::vector<uint8_t>(size_t(w / 2) * (h / 2)), std::vector<uint8_t>(size_t(w / 2) * (h / 2))};
+        auto take = [&]() {
+            while (avcodec_receive_frame(dec, frame) >= 0) {
+                uint8_t* data[4] = {plane[0].data(), plane[1].data(), plane[2].data(), nullptr};
+                int lines[4] = {w, w / 2, w / 2, 0};
+                if (frame->width == w && frame->height == h && (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P)) {
+                    for (int c = 0; c < 3; ++c)
+                        for (int r = 0; r < (c ? h / 2 : h); ++r)
+                            std::memcpy(data[c] + size_t(r) * lines[c], frame->data[c] + size_t(r) * frame->linesize[c], size_t(lines[c]));
+                } else {
+                    if (!sws) {
+                        sws = sws_alloc_context();
+                        av_opt_set_int(sws, "srcw", frame->width, 0), av_opt_set_int(sws, "srch", frame->height, 0);
+                        av_opt_set_int(sws, "src_format", frame->format, 0);
+                        av_opt_set_int(sws, "dstw", w, 0), av_opt_set_int(sws, "dsth", h, 0);
+                        av_opt_set_int(sws, "dst_format", AV_PIX_FMT_YUV420P, 0);
+                        av_opt_set_int(sws, "sws_flags", SWS_BICUBIC | SWS_ACCURATE_RND, 0);
+                        av_opt_set_int(sws, "src_h_chr_pos", frame->chroma_location == AVCHROMA_LOC_CENTER ? 128 : 0, 0);
+                        av_opt_set_int(sws, "src_v_chr_pos", 128, 0);
+                        av_opt_set_int(sws, "dst_h_chr_pos", 0, 0), av_opt_set_int(sws, "dst_v_chr_pos", 128, 0);
+                        if (sws_init_context(sws, nullptr, nullptr) < 0) return false;
+                    }
+                    sws_scale(sws, frame->data, frame->linesize, 0, frame->height, data, lines);
+                }
+                out.write("FRAME\n");
+                for (const std::vector<uint8_t>& p : plane) out.write(reinterpret_cast<const char*>(p.data()), qint64(p.size()));
+                ++frames;
+                av_frame_unref(frame);
+            }
+            return true;
+        };
+        bool ok = true;
+        while (ok && av_read_frame(fmt, pkt) >= 0) {
+            if (pkt->stream_index == vs) avcodec_send_packet(dec, pkt);
+            av_packet_unref(pkt);
+            ok = take();
+        }
+        avcodec_send_packet(dec, nullptr);
+        if (!ok || !take()) frames = -1;
+    }
+    sws_freeContext(sws);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&dec);
+    avformat_close_input(&fmt);
+    return frames;
+}
+
+// libvmaf's own tool on a reference and an encode (Y4M): each frame's VMAF with a built-in model; empty when it fails.
+std::vector<double> vmafToolScores(const QString& tool, const QString& ref, const QString& dist, const QString& model, const QString& json) {
+    QProcess pr;
+    pr.start(tool, {"-r", ref, "-d", dist, "--model", "version=" + model, "--json", "-o", json, "-q"});
+    if (!pr.waitForFinished(900000) || pr.exitCode() != 0) return {};
+    QFile jf(json);
+    if (!jf.open(QIODevice::ReadOnly)) return {};
+    std::vector<double> scores;
+    for (const QJsonValue& f : QJsonDocument::fromJson(jf.readAll()).object().value("frames").toArray())
+        scores.push_back(f.toObject().value("metrics").toObject().value("vmaf").toDouble());
+    return scores;
+}
+
 // Talks of ten sentences each, a word every 0.4 s and 0.6 s between sentences, as one transcribed clip in the
 // sequence; `joins` are where each talk after the first begins (timeline seconds).
 void placeTalks(Project& p, const std::vector<std::vector<std::string>>& talks, std::vector<double>& joins) {
@@ -1469,6 +1606,92 @@ private slots:
             QVERIFY(c.vmafNote.find("no HDR model") != std::string::npos);
             QVERIFY(std::none_of(c.warnings.begin(), c.warnings.end(), [](const std::string& w) { return w.find("VMAF") != std::string::npos; }));
         }
+    }
+    void vmafEveryFourthFrame() {
+        // Scoring every fourth frame: the mean within half a VMAF of every frame's on the comparison's test clips (the
+        // drifting texture softened and noisy, and in blocks of four samples), the frames between left unscored while the
+        // other measures still cover them all, and the report saying so. The time VMAF is expected to take: less for
+        // it, in proportion to the frames and the picture's area. And the model goes by the shorter side: an upright
+        // 1080 by 1920 picture takes the 1080 model.
+        if (!vmafAvailable()) QSKIP("Montage is built without libvmaf (MONTAGE_WITH_VMAF)");
+        QTemporaryDir dir;
+        const int w = 320, h = 240, frames = 48;
+        const QString ref = dir.filePath("ref.y4m"), soft = dir.filePath("soft.y4m"), coarse = dir.filePath("coarse.y4m");
+        QVERIFY(writeY4m(ref, w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) { encodeTestPicture(f, w, h, y, cb, cr); }));
+        QVERIFY(writeY4m(soft, w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) {
+            encodeTestPicture(f, w, h, y, cb, cr);
+            const std::vector<uint8_t> sharp = y;
+            uint32_t rnd = 77u + uint32_t(f);
+            for (int r = 0; r < h; ++r)
+                for (int c = 4; c < w - 4; ++c) {
+                    const uint8_t* at = &sharp[size_t(r) * w + c];
+                    rnd = rnd * 1664525u + 1013904223u;
+                    int sum = 0;
+                    for (int k = -4; k <= 4; ++k) sum += at[k];
+                    y[size_t(r) * w + c] = uint8_t(std::clamp(sum / 9 + int(rnd >> 27) - 16, 0, 255));
+                }
+        }));
+        QVERIFY(writeY4m(coarse, w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) {
+            encodeTestPicture(f, w, h, y, cb, cr);
+            // (each block of four by four samples at its mean)
+            for (int r = 0; r + 4 <= h; r += 4)
+                for (int c = 0; c + 4 <= w; c += 4) {
+                    int sum = 0;
+                    for (int k = 0; k < 16; ++k) sum += y[size_t(r + k / 4) * w + c + k % 4];
+                    for (int k = 0; k < 16; ++k) y[size_t(r + k / 4) * w + c + k % 4] = uint8_t(sum / 16);
+                }
+        }));
+        for (const QString& dist : {soft, coarse}) {
+            CompareOptions o;
+            o.search = 0;
+            const EncodeComparison all = compareEncodeFiles(ref.toStdString(), dist.toStdString(), o);
+            o.vmafEvery = 4;
+            const EncodeComparison fourth = compareEncodeFiles(ref.toStdString(), dist.toStdString(), o);
+            QVERIFY2(all.ok && all.vmafScored && fourth.ok && fourth.vmafScored, (all.error + fourth.error).c_str());
+            QVERIFY(all.vmafEvery == 1 && fourth.vmafEvery == 4);
+            QCOMPARE(fourth.frames.size(), size_t(frames));
+            for (size_t i = 0; i < fourth.frames.size(); ++i) {
+                // (a scored frame's score is what full scoring gives it: what runs across frames still saw every frame)
+                if (i % 4 == 0) QVERIFY2(std::fabs(fourth.frames[i].vmaf - all.frames[i].vmaf) < 1e-9, QByteArray::number(int(i)));
+                else QVERIFY2(std::isnan(fourth.frames[i].vmaf), QByteArray::number(int(i)));
+                QVERIFY(sameScore(fourth.frames[i].psnrY, all.frames[i].psnrY));
+            }
+            qInfo("%s: VMAF %.3f on every frame, %.3f on every fourth", qPrintable(QFileInfo(dist).baseName()), all.mean.vmaf, fourth.mean.vmaf);
+            QVERIFY2(all.mean.vmaf > 20 && all.mean.vmaf < 99, QByteArray::number(all.mean.vmaf));
+            QVERIFY2(std::fabs(fourth.mean.vmaf - all.mean.vmaf) < 0.5, qPrintable(QString("%1 %2").arg(fourth.mean.vmaf).arg(all.mean.vmaf)));
+            QVERIFY(sameScore(fourth.mean.psnrY, all.mean.psnrY));
+            // The report says how it was scored (a report of every frame says nothing of it).
+            const QString csv = dir.filePath("fourth.csv"), csvAll = dir.filePath("all.csv");
+            std::string err;
+            QVERIFY2(writeQualityCsv(csv.toStdString(), fourth, nullptr, &err) && writeQualityCsv(csvAll.toStdString(), all, nullptr, &err), err.c_str());
+            QFile f(csv), fa(csvAll);
+            QVERIFY(f.open(QIODevice::ReadOnly) && fa.open(QIODevice::ReadOnly));
+            QVERIFY(f.readAll().contains("# vmaf_every,4\n") && !fa.readAll().contains("vmaf_every"));
+        }
+
+        const double full = vmafSecondsEstimate(1920, 1080, 1000), quick = vmafSecondsEstimate(1920, 1080, 1000, 4);
+        qInfo("VMAF of 1000 frames of 1920x1080 here: about %.0f s, %.0f s scoring every fourth", full, quick);
+        QVERIFY2(full > 0 && quick > 0 && quick <= full, qPrintable(QString("%1 %2").arg(full).arg(quick)));
+        QVERIFY(std::fabs(vmafSecondsEstimate(3840, 2160, 1000) - 4 * full) < 1e-6 * full);
+        QVERIFY(std::fabs(vmafSecondsEstimate(1920, 1080, 4000) - 4 * full) < 1e-6 * full);
+        QVERIFY(vmafSecondsEstimate(1920, 1080, 1000, 1, 1) >= full);
+        QCOMPARE(vmafSecondsEstimate(1920, 1080, 0), 0.0);
+
+        QualityPicture q;
+        q.width = 1080, q.height = 1920;
+        QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v1.0.16_3d0h"));
+        q.width = 1440, q.height = 2560;
+        QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v1.0.16_3d0h"));
+        q.width = 2160, q.height = 3840;
+        QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v1.0.16_3d0h_2160"));
+        // (and a comparison of an upright master says which it used)
+        const QString upright = dir.filePath("upright.y4m");
+        QVERIFY(writeY4m(upright, 1080, 1920, 2, [&](int f, auto& y, auto& cb, auto& cr) { encodeTestPicture(f, 1080, 1920, y, cb, cr); }));
+        CompareOptions o;
+        o.search = 0;
+        const EncodeComparison c = compareEncodeFiles(upright.toStdString(), upright.toStdString(), o);
+        QVERIFY2(c.ok && c.vmafScored, c.error.c_str());
+        QCOMPARE(QString::fromStdString(c.vmafModel), QStringLiteral("vmaf_v1.0.16_3d0h"));
     }
 
     // Phase 15 #3: the sequence an encode is compared with has its chroma made by the export's own scaler, so a
@@ -29434,9 +29657,12 @@ colorspaces:
         QCOMPARE(chooseShotPoints(dip, {50}, {}, 0, 3000), (std::vector<size_t>{2}));
     }
     void streamingPerShot() {
-        // A two-shot programme (fine noise for two seconds, then a flat card), a ladder of two rungs, set per shot to a
-        // VMAF of 90: each shot on each rung within a VMAF of the target, or at the rung's cap, on fewer bits than the
-        // same ladder at fixed rates; every segment starting on a keyframe, and the ladder's report.
+        // A two-shot programme (fine noise for two seconds, then a flat card: an edit between two generators, which
+        // counts as a cut), a ladder of two rungs, set per shot to a VMAF of 90 scored at the top rung's size. Each
+        // shot on each rung is within a VMAF of the target, or held at its cap, the floor or the coarsest setting (the
+        // first two said in the report); no shot's mean rate in the delivered files is past the rung's rate, measured
+        // from the files' packets; the ladder takes fewer bits than at fixed rates; the render is decoded once and a
+        // shot that is settled is not encoded again; every segment starts on a keyframe.
         if (!vmafAvailable()) QSKIP("Built without libvmaf");
         QTemporaryDir dir;
         Project p = makeDefaultProject();
@@ -29448,9 +29674,7 @@ colorspaces:
         bars.effects.push_back(nz);
         s.videoTracks[0].clips.push_back(bars);
         s.videoTracks[0].clips.push_back(colorClip(p, 0.2f, 0.4f, 0.7f, 50, 50));
-        Marker shot;  // (generators' edges are not cuts to shot detection: the change marked, as scene detection would)
-        shot.t = 50, shot.shotChange = true;
-        s.markers.push_back(shot);
+        QCOMPARE(streamingShotChanges(s), (std::vector<FrameTime>{50}));
 
         auto videoBits = [](const QString& folder) {
             int64_t bits = 0;
@@ -29459,10 +29683,31 @@ colorspaces:
                 for (const QFileInfo& f : QDir(pkg.filePath(v)).entryInfoList({"seg*.m4s"}, QDir::Files)) bits += f.size() * 8;
             return bits;
         };
+        // Each shot's bits in a rendition's files, from their packets, against what the result says and the rung's rate.
+        auto withinCaps = [&](const StreamingSettings& st, const StreamingResult& res, QString* why) {
+            for (size_t r = 0; r < res.perShot.size(); ++r) {
+                const StreamingRungShots& rs = res.perShot[r];
+                const QString joined = dir.filePath("joined.mp4");
+                if (!joinStreamingRendition(QString::fromStdString(st.folder + "/" + rs.rendition), joined)) return *why = "no files for " + QString::fromStdString(rs.rendition), false;
+                const std::vector<int64_t> bits = videoSampleBits(joined, 25);
+                if (bits.size() != 100) return *why = QString("%1 packets").arg(bits.size()), false;
+                for (const StreamingShot& sh : rs.shots) {
+                    int64_t sum = 0;
+                    for (FrameTime f = sh.first; f < sh.end; ++f) sum += bits[size_t(f)];
+                    const double seconds = double(sh.end - sh.first) / 25, rate = double(sum) / seconds;
+                    if (sum != sh.bits || rate > double(st.rungs[r].bitrate))
+                        return *why = QString("%1 frames %2-%3: %4 bits in the file, %5 said, %6 b/s of %7")
+                                          .arg(QString::fromStdString(rs.rendition)).arg(sh.first).arg(sh.end).arg(sum).arg(sh.bits).arg(rate).arg(st.rungs[r].bitrate), false;
+                }
+            }
+            return true;
+        };
         std::string err;
-        // H.264 and HEVC (zones), and AV1 (an encoder started afresh at each shot), where there are encoders.
+        // H.264 and HEVC (an encoder for each shot, their parameter sets the same), and AV1 (an encoder started afresh at
+        // each segment), where there are encoders.
         for (const char* codec : {"libx264", "libx265", "libsvtav1"}) {
             if (!avcodec_find_encoder_by_name(codec)) continue;
+            const bool av1 = std::strcmp(codec, "libsvtav1") == 0;
             StreamingSettings st;
             st.segmentSeconds = 2;
             st.rungs = {{320, 180, 700000, codec}, {192, 108, 250000, codec}};
@@ -29471,44 +29716,79 @@ colorspaces:
             const QString name = QString::fromLatin1(codec);
             st.folder = (dir.path() + "/fixed-" + name).toStdString();
             QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &fixed), err.c_str());
-            QVERIFY(fixed.perShot.empty() && fixed.ladderReport.empty());
+            QVERIFY(fixed.perShot.empty() && fixed.ladderReport.empty() && fixed.renderDecodes == 0);
             st.folder = (dir.path() + "/shots-" + name).toStdString();
             st.perShot = true;
             st.vmafTarget = 90;
             QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
             QCOMPARE(res.segments, (std::vector<FrameTime>{0, 50}));
+            // Scored at the top rung's size (the small rung's pictures scaled up to it), every fourth frame in the trials.
+            QVERIFY(res.displayWidth == 320 && res.displayHeight == 180);
+            QCOMPARE(QString::fromStdString(res.scaler), QStringLiteral("bicubic"));
+            QCOMPARE(QString::fromStdString(res.vmafModel), QStringLiteral("vmaf_v1.0.16_3d0h"));
+            QCOMPARE(res.trialVmafEvery, 4);
+            QCOMPARE(res.crfFloor, 18.0);
+            // The render was decoded once for every rung, shot and setting.
+            QCOMPARE(res.renderDecodes, 1);
             QCOMPARE(res.perShot.size(), size_t(2));
+            int64_t encodes = 0;
             for (size_t r = 0; r < res.perShot.size(); ++r) {
                 const StreamingRungShots& rs = res.perShot[r];
                 QCOMPARE(rs.shots.size(), size_t(2));
                 QVERIFY(rs.shots[0].first == 0 && rs.shots[0].end == 50 && rs.shots[1].first == 50 && rs.shots[1].end == 100);
                 for (const StreamingShot& sh : rs.shots) {
-                    qInfo("%s frames %lld-%lld: CRF %.2f, %.0f kb/s, VMAF %.2f (trial %.2f)", rs.rendition.c_str(), (long long)sh.first,
-                          (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.trialVmaf);
-                    const double cap = double(st.rungs[r].bitrate);
-                    // (the rung's cap: its mean within a tenth of the rung's rate, with VBV's give)
-                    QVERIFY2(double(sh.bitrate) <= cap * 1.1, qPrintable(QString::number(sh.bitrate)));
-                    // (or at the best setting tried)
-                    QVERIFY2(sh.vmaf >= st.vmafTarget - 1 || double(sh.bitrate) >= cap * 0.75 || sh.crf <= 20,
-                             qPrintable(QString("%1 %2").arg(sh.vmaf).arg(sh.bitrate)));
-                    // What it delivers is what the trial expected, near enough.
-                    QVERIFY2(std::fabs(sh.vmaf - sh.trialVmaf) < 3, qPrintable(QString("%1 %2").arg(sh.vmaf).arg(sh.trialVmaf)));
+                    qInfo("%s frames %lld-%lld: CRF %.2f, %.0f kb/s, VMAF %.2f (own size %.2f, trial %.2f), %d settings%s%s", rs.rendition.c_str(),
+                          (long long)sh.first, (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.ownVmaf, sh.trialVmaf, sh.trials,
+                          sh.stopped.empty() ? "" : ", stopped at the ", sh.stopped.c_str());
+                    // Within a VMAF of the target; or short of it at the cap or the floor, and said so; or past it
+                    // at the coarsest setting there is to try, or where the shot costs next to nothing at any (the
+                    // still card: the setting that reaches the target in the fewest bits).
+                    const QByteArray what = QString("%1 %2 %3").arg(sh.vmaf).arg(sh.crf).arg(QString::fromStdString(sh.stopped)).toUtf8();
+                    QVERIFY2(sh.vmaf >= st.vmafTarget - 1 || sh.stopped == "cap" || sh.stopped == "floor", what.constData());
+                    QVERIFY2(sh.vmaf <= st.vmafTarget + 1 || sh.crf >= (av1 ? 63 : 48) || sh.bitrate < 30000, what.constData());
+                    QVERIFY2(sh.stopped.empty() || sh.vmaf < st.vmafTarget, what.constData());
+                    // What is delivered is the trial's own encode: its score on every frame is the trial's on every
+                    // fourth, near enough (within one and a half VMAF on 50 frames of noise, 13 of them scored in the
+                    // trial; finer scenes come nearer, as vmafEveryFourthFrame checks).
+                    QVERIFY2(std::fabs(sh.vmaf - sh.trialVmaf) < 1.5, qPrintable(QString("%1 %2").arg(sh.vmaf).arg(sh.trialVmaf)));
+                    // The small rung scores higher at its own size than shown at the display's.
+                    if (r == 0) QCOMPARE(sh.ownVmaf, sh.vmaf);
+                    encodes += sh.trials;
                 }
-                // The flat card takes fewer bits than the noise.
+                // The flat card takes fewer bits than the noise, and is settled by its first six settings: none more.
                 QVERIFY(rs.shots[1].bitrate < rs.shots[0].bitrate);
+                QCOMPARE(rs.shots[1].trials, 6);
+                QVERIFY2(rs.shots[0].trials >= 6 && rs.shots[0].trials <= 13, QByteArray::number(rs.shots[0].trials));
             }
+            // No setting of a shot was encoded twice: as many encodes as settings.
+            QCOMPARE(res.shotEncodes, encodes);
+            QString why;
+            QVERIFY2(withinCaps(st, res, &why), qPrintable(why));
             const int64_t fixedBits = videoBits(dir.path() + "/fixed-" + name), shotBits = videoBits(QString::fromStdString(st.folder));
-            qInfo("%s video: fixed rates %.0f kb, set per shot %.0f kb (%.0f%%)", codec, double(fixedBits) / 1000, double(shotBits) / 1000,
-                  100.0 * double(shotBits) / double(fixedBits));
+            qInfo("%s video: fixed rates %.0f kb, set per shot %.0f kb (%.0f%%), %lld encodes of a shot", codec, double(fixedBits) / 1000,
+                  double(shotBits) / 1000, 100.0 * double(shotBits) / double(fixedBits), (long long)res.shotEncodes);
             QVERIFY2(shotBits < fixedBits, qPrintable(QString("%1 %2").arg(shotBits).arg(fixedBits)));
 
-            // The report: a row for each shot on each rung.
+            // The report: how it was scored, then a row for each shot on each rung.
             QFile csv(QString::fromStdString(res.ladderReport));
             QVERIFY(csv.open(QIODevice::ReadOnly));
             const QStringList rows = QString::fromUtf8(csv.readAll()).split('\n', Qt::SkipEmptyParts);
-            QCOMPARE(rows.size(), 5);
-            QVERIFY(rows[0].startsWith("rendition,shot,first_frame,end_frame,crf,kbps,vmaf"));
-            QVERIFY(rows[1].startsWith(QString::fromStdString(res.perShot[0].rendition) + ",1,0,50,"));
+            QCOMPARE(rows.size(), 11);
+            QCOMPARE(rows[0], QStringLiteral("# display_size,320x180"));
+            QVERIFY2(rows[1].startsWith("# scaler,bicubic (libswscale"), qPrintable(rows[1]));
+            QCOMPARE(rows[2], QStringLiteral("# vmaf_model,vmaf_v1.0.16_3d0h"));
+            QCOMPARE(rows[3], QStringLiteral("# trial_vmaf_every,4"));
+            QCOMPARE(rows[4], QStringLiteral("# crf_floor,18.00"));
+            QCOMPARE(rows[5], QStringLiteral("# vmaf_target,90.00"));
+            QCOMPARE(rows[6], QStringLiteral("rendition,shot,first_frame,end_frame,crf,kbps,vmaf,vmaf_own_size,trial_vmaf,stopped_at,trials"));
+            QVERIFY(rows[7].startsWith(QString::fromStdString(res.perShot[0].rendition) + ",1,0,50,"));
+            for (size_t r = 0; r < 2; ++r)
+                for (size_t k = 0; k < 2; ++k) {
+                    const QStringList cells = rows[int(7 + r * 2 + k)].split(',');
+                    QCOMPARE(cells.size(), 11);
+                    QCOMPARE(cells[9], QString::fromStdString(res.perShot[r].shots[k].stopped));
+                    QCOMPARE(cells[10].toInt(), res.perShot[r].shots[k].trials);
+                }
             // Every segment of every rung starts on a keyframe.
             const QDir pkg(QString::fromStdString(st.folder));
             for (const QString& v : pkg.entryList({"v*"}, QDir::Dirs))
@@ -29530,12 +29810,300 @@ colorspaces:
                 }
         }
 
-        // Refused: a target out of range.
+        // With no target each rung's rate is spent over the shots for the most VMAF: every shot's points are found in
+        // one pass over the render and each shot encoded at its setting in a second, each still within the rung's rate
+        // and the rung within its rate over all.
+        {
+            StreamingSettings st;
+            st.segmentSeconds = 2;
+            st.rungs = {{320, 180, 700000, "libx264"}, {192, 108, 250000, "libx264"}};
+            st.audioCodec = "none";
+            st.perShot = true;
+            st.folder = (dir.path() + "/budget").toStdString();
+            StreamingResult res;
+            QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+            QCOMPARE(res.renderDecodes, 2);
+            QString why;
+            QVERIFY2(withinCaps(st, res, &why), qPrintable(why));
+            int64_t encodes = 0;
+            for (size_t r = 0; r < res.perShot.size(); ++r) {
+                QVERIFY2(res.perShot[r].bitrate <= st.rungs[r].bitrate, QByteArray::number(qlonglong(res.perShot[r].bitrate)));
+                for (const StreamingShot& sh : res.perShot[r].shots) {
+                    qInfo("budget %s frames %lld-%lld: CRF %.2f, %.0f kb/s, VMAF %.2f (trial %.2f), %d settings", res.perShot[r].rendition.c_str(),
+                          (long long)sh.first, (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.trialVmaf, sh.trials);
+                    QVERIFY2(std::fabs(sh.vmaf - sh.trialVmaf) < 3, qPrintable(QString("%1 %2").arg(sh.vmaf).arg(sh.trialVmaf)));
+                    encodes += sh.trials;
+                }
+                // The noise is given what the card leaves: more of the rung's rate than the card.
+                QVERIFY(res.perShot[r].shots[0].bitrate > res.perShot[r].shots[1].bitrate);
+            }
+            QCOMPARE(res.shotEncodes, encodes);
+        }
+
+        // MPEG-TS segments, set per shot too: the same pictures as the CMAF beside them (an access unit delimiter and,
+        // at keyframes, the parameter sets more), each segment starting with a keyframe.
+        {
+            StreamingSettings st;
+            st.segmentSeconds = 2;
+            st.segmentFormat = "ts";
+            st.rungs = {{320, 180, 700000, "libx264"}};
+            st.audioCodec = "none";
+            st.perShot = true;
+            st.vmafTarget = 90;
+            st.folder = (dir.path() + "/ts").toStdString();
+            StreamingResult res;
+            QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+            QString why;
+            QVERIFY2(withinCaps(st, res, &why), qPrintable(why));
+            QCOMPARE(res.perShot.size(), size_t(1));
+            const QString rendition = QString::fromStdString(st.folder + "/" + res.perShot[0].rendition), joined = dir.filePath("joined.ts");
+            QVERIFY(joinStreamingRendition(rendition, joined, true));
+            const std::vector<int64_t> bits = videoSampleBits(joined, 25);
+            QCOMPARE(bits.size(), size_t(100));
+            for (const StreamingShot& sh : res.perShot[0].shots) {
+                int64_t sum = 0;
+                for (FrameTime f = sh.first; f < sh.end; ++f) sum += bits[size_t(f)];
+                qInfo("TS frames %lld-%lld: %lld bits in the TS, %lld in the CMAF", (long long)sh.first, (long long)sh.end, (long long)sum, (long long)sh.bits);
+                QVERIFY2(sum >= sh.bits - 50 * 8 * 4 && sum <= sh.bits + 50 * 8 * 8 + 8 * 256, qPrintable(QString("%1 %2").arg(sum).arg(sh.bits)));
+            }
+            for (int k = 1; k <= 2; ++k) {
+                QFile f(rendition + QString("/seg%1.ts").arg(k, 5, 10, QChar('0')));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                const TsRead t = readTs(f.readAll());
+                QVERIFY(t.synced && t.firstPes.size() == 1);
+                const std::vector<uint8_t>& pes = t.firstPes.begin()->second;
+                int first = -1;
+                for (size_t i = 0; i + 3 < pes.size() && first < 0; ++i)
+                    if (pes[i] == 0 && pes[i + 1] == 0 && pes[i + 2] == 1 && ((pes[i + 3] & 0x1f) == 5 || (pes[i + 3] & 0x1f) == 1)) first = pes[i + 3] & 0x1f;
+                QCOMPARE(first, 5);
+            }
+        }
+
+        // Refused: a target out of range, a floor that is no CRF, a display size too small to score at.
         StreamingSettings st;
         st.rungs = {{320, 180, 700000, "libx264"}};
         st.perShot = true, st.vmafTarget = 120;
         st.folder = (dir.path() + "/bad").toStdString();
         QVERIFY(!exportStreamingPackage(p, s, st, nullptr, nullptr, &err, nullptr) && err.find("VMAF target") != std::string::npos);
+        st.vmafTarget = 90, st.crfFloor = 60;
+        QVERIFY2(!exportStreamingPackage(p, s, st, nullptr, nullptr, &err, nullptr) && err.find("lowest CRF") != std::string::npos, err.c_str());
+        st.crfFloor = 0, st.displayWidth = 32;
+        QVERIFY2(!exportStreamingPackage(p, s, st, nullptr, nullptr, &err, nullptr) && err.find("display size") != std::string::npos, err.c_str());
+    }
+    void streamingDisplaySizeVmaf() {
+        // A detailed 1080-line second and one 360-line rung, set per shot to a VMAF target scored at 1080 lines: what
+        // is delivered is within a VMAF of the target as a 1080-line display shows it, and scores higher at its own
+        // size (both in the report). Both scores are libvmaf's own tool's on the same pictures: the render and the
+        // rendition, each scaled where it is another size by libswscale's bicubic filter as ladder.csv names it.
+        if (!vmafAvailable()) QSKIP("Built without libvmaf");
+        QTemporaryDir dir;
+        const int w = 1920, h = 1080, frames = 25;
+        const QString source = dir.filePath("detail.y4m");
+        QVERIFY(writeY4m(source, w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) { detailedTestPicture(f, w, h, y, cb, cr); }));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = w, s.height = h, s.fps = {25, 1};
+        MediaItem m;
+        QVERIFY(probeMedia(source.toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false).ok);
+        QCOMPARE(s.duration(), FrameTime(frames));
+        StreamingSettings st;
+        st.folder = (dir.path() + "/package").toStdString();
+        st.segmentSeconds = 2;
+        st.rungs = {{640, 360, 4000000, "libx264"}};
+        st.audioCodec = "none";
+        st.perShot = true;
+        st.vmafTarget = 45;  // (where the rate–quality curve of this picture at this size is smooth enough to land within a VMAF)
+        st.displayWidth = 1920;  // (the height follows the picture's shape)
+        st.keepWork = true;
+        std::string err;
+        StreamingResult res;
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        QVERIFY(res.displayWidth == 1920 && res.displayHeight == 1080);
+        QCOMPARE(QString::fromStdString(res.vmafModel), QStringLiteral("vmaf_v1.0.16_3d0h"));
+        QCOMPARE(res.perShot.size(), size_t(1));
+        QCOMPARE(res.perShot[0].shots.size(), size_t(1));
+        const StreamingShot sh = res.perShot[0].shots[0];
+        qInfo("360 lines at 1080: CRF %.2f, %.0f kb/s, VMAF %.3f at the display's size, %.3f at its own (trial %.3f), %d settings%s%s", sh.crf,
+              double(sh.bitrate) / 1000, sh.vmaf, sh.ownVmaf, sh.trialVmaf, sh.trials, sh.stopped.empty() ? "" : ", stopped at the ", sh.stopped.c_str());
+        QVERIFY2(std::fabs(sh.vmaf - st.vmafTarget) <= 1 && sh.stopped.empty(), QByteArray::number(sh.vmaf));
+        QVERIFY2(sh.ownVmaf > sh.vmaf + 5, qPrintable(QString("%1 %2").arg(sh.ownVmaf).arg(sh.vmaf)));
+        QFile csv(QString::fromStdString(res.ladderReport));
+        QVERIFY(csv.open(QIODevice::ReadOnly));
+        const QStringList rows = QString::fromUtf8(csv.readAll()).split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(rows.size(), 8);
+        QCOMPARE(rows[0], QStringLiteral("# display_size,1920x1080"));
+        const QStringList cells = rows[7].split(',');
+        QCOMPARE(cells.size(), 11);
+        QVERIFY(std::fabs(cells[6].toDouble() - sh.vmaf) < 0.001 && std::fabs(cells[7].toDouble() - sh.ownVmaf) < 0.001);
+
+#ifdef MONTAGE_TEST_VMAF_TOOL
+        const QString tool = QStringLiteral(MONTAGE_TEST_VMAF_TOOL);
+#else
+        const QString tool = qEnvironmentVariable("MONTAGE_TEST_VMAF");
+#endif
+        if (tool.isEmpty() || !QFileInfo::exists(tool)) QSKIP("libvmaf's vmaf program was not built (MONTAGE_TEST_VMAF_TOOL)");
+        const QString render = QString::fromStdString(st.folder) + "/work/render.mkv", rendition = dir.filePath("rendition.mp4");
+        QVERIFY(QFileInfo::exists(render));
+        QVERIFY(joinStreamingRendition(QString::fromStdString(st.folder + "/" + res.perShot[0].rendition), rendition));
+        auto mean = [](const std::vector<double>& v) { return v.empty() ? -1.0 : std::accumulate(v.begin(), v.end(), 0.0) / double(v.size()); };
+        // At the display's size: the render as it is, the rendition scaled up.
+        QCOMPARE(scaledY4m(render, 1920, 1080, dir.filePath("ref1080.y4m")), frames);
+        QCOMPARE(scaledY4m(rendition, 1920, 1080, dir.filePath("dist1080.y4m")), frames);
+        const std::vector<double> shown = vmafToolScores(tool, dir.filePath("ref1080.y4m"), dir.filePath("dist1080.y4m"), "vmaf_v1.0.16_3d0h", dir.filePath("shown.json"));
+        QCOMPARE(shown.size(), size_t(frames));
+        QVERIFY2(std::fabs(mean(shown) - sh.vmaf) < 1e-4, qPrintable(QString::number(mean(shown), 'f', 6) + " vs " + QString::number(sh.vmaf, 'f', 6)));
+        QFile::remove(dir.filePath("ref1080.y4m")), QFile::remove(dir.filePath("dist1080.y4m"));
+        // At the rung's own size: the render scaled down, the rendition as it is.
+        QCOMPARE(scaledY4m(render, 640, 360, dir.filePath("ref360.y4m")), frames);
+        QCOMPARE(scaledY4m(rendition, 640, 360, dir.filePath("dist360.y4m")), frames);
+        const std::vector<double> own = vmafToolScores(tool, dir.filePath("ref360.y4m"), dir.filePath("dist360.y4m"), "vmaf_v1.0.16_3d0h", dir.filePath("own.json"));
+        QCOMPARE(own.size(), size_t(frames));
+        QVERIFY2(std::fabs(mean(own) - sh.ownVmaf) < 1e-4, qPrintable(QString::number(mean(own), 'f', 6) + " vs " + QString::number(sh.ownVmaf, 'f', 6)));
+    }
+    void streamingCrfFloor() {
+        // Fine noise needs a finer setting than CRF 18 to reach a high target: at the floor as it comes the shot stops
+        // there, short of the target, and the report says so; with the floor lowered it reaches the target. AV1's
+        // floor is two more.
+        if (!vmafAvailable()) QSKIP("Built without libvmaf");
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        Clip bars = makeGeneratorClip(p, "bars", 50);
+        Effect nz = makeEffect(p, "noise");
+        nz.params["amount"] = 25.0;
+        bars.effects.push_back(nz);
+        s.videoTracks[0].clips.push_back(bars);
+        StreamingSettings st;
+        st.segmentSeconds = 2;
+        st.rungs = {{320, 180, 40000000, "libx264"}};  // (a rate that holds nothing back)
+        st.audioCodec = "none";
+        st.perShot = true;
+        st.vmafTarget = 99;
+        st.folder = (dir.path() + "/floor").toStdString();
+        std::string err;
+        StreamingResult res;
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        QCOMPARE(res.perShot[0].shots.size(), size_t(1));
+        StreamingShot sh = res.perShot[0].shots[0];
+        qInfo("floor 18: CRF %.2f, %.0f kb/s, VMAF %.2f, stopped at \"%s\"", sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.stopped.c_str());
+        QCOMPARE(sh.crf, 18.0);
+        QCOMPARE(QString::fromStdString(sh.stopped), QStringLiteral("floor"));
+        QVERIFY2(sh.vmaf < st.vmafTarget, QByteArray::number(sh.vmaf));
+        QFile csv(QString::fromStdString(res.ladderReport));
+        QVERIFY(csv.open(QIODevice::ReadOnly));
+        const QStringList rows = QString::fromUtf8(csv.readAll()).split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(rows.size(), 8);
+        QCOMPARE(rows[4], QStringLiteral("# crf_floor,18.00"));
+        QCOMPARE(rows[7].split(',').value(9), QStringLiteral("floor"));
+
+        st.crfFloor = 4;
+        st.folder = (dir.path() + "/lower").toStdString();
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        sh = res.perShot[0].shots[0];
+        qInfo("floor 4: CRF %.2f, %.0f kb/s, VMAF %.2f, stopped at \"%s\"", sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.stopped.c_str());
+        QCOMPARE(res.crfFloor, 4.0);
+        QVERIFY2(sh.crf < 18 && sh.crf >= 4, QByteArray::number(sh.crf));
+        QVERIFY2(sh.stopped.empty() && std::fabs(sh.vmaf - st.vmafTarget) <= 1, QByteArray::number(sh.vmaf));
+
+        if (avcodec_find_encoder_by_name("libsvtav1")) {
+            st.crfFloor = 0;
+            st.rungs[0].codec = "libsvtav1";
+            st.folder = (dir.path() + "/av1").toStdString();
+            QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+            sh = res.perShot[0].shots[0];
+            qInfo("AV1, floor 18: CRF %.2f, %.0f kb/s, VMAF %.2f, stopped at \"%s\"", sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.stopped.c_str());
+            QVERIFY2(sh.crf >= 20, QByteArray::number(sh.crf));
+            QVERIFY2(sh.crf > 20 ? sh.stopped.empty() || sh.stopped == "cap" : sh.vmaf >= st.vmafTarget || sh.stopped == "floor", sh.stopped.c_str());
+        }
+    }
+    void streamingShotsFromScenes() {
+        // One clip with three scene changes in it and no cut in the sequence: scene detection on the render gives four
+        // shots, each starting a segment. A shot too long for the memory its frames may take is tried in parts, each
+        // from a segment's start. And which edits count as shot changes: one between two generators with nothing under
+        // them, not one under a title, across a transition or over a clip.
+        if (!vmafAvailable()) QSKIP("Built without libvmaf");
+        QTemporaryDir dir;
+        const int w = 320, h = 180, each = 30;
+        const QString source = dir.filePath("scenes.y4m");
+        QVERIFY(writeY4m(source, w, h, each * 4, [&](int f, auto& y, auto& cb, auto& cr) {
+            // (four scenes: the drifting texture brighter or darker, tinted differently)
+            const int scene = f / each;
+            encodeTestPicture(f + scene * 37, w, h, y, cb, cr);
+            for (uint8_t& v : y) v = uint8_t(scene % 2 ? 40 + v / 3 : v);
+            for (uint8_t& v : cb) v = uint8_t(std::clamp(int(v) + (scene - 1) * 35, 16, 240));
+            for (uint8_t& v : cr) v = uint8_t(std::clamp(int(v) + (scene == 3 ? 50 : scene == 0 ? -40 : 0), 16, 240));
+        }));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = w, s.height = h, s.fps = {25, 1};
+        MediaItem m;
+        QVERIFY(probeMedia(source.toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false).ok);
+        QCOMPARE(s.duration(), FrameTime(each * 4));
+        QVERIFY(streamingShotChanges(s).empty());
+        StreamingSettings st;
+        st.segmentSeconds = 6;
+        st.rungs = {{320, 180, 2000000, "libx264"}};
+        st.audioCodec = "none";
+        st.perShot = true;
+        st.vmafTarget = 85;
+        st.folder = (dir.path() + "/scenes").toStdString();
+        std::string err;
+        StreamingResult res;
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        QCOMPARE(res.perShot.size(), size_t(1));
+        std::vector<FrameTime> starts;
+        for (const StreamingShot& sh : res.perShot[0].shots) starts.push_back(sh.first);
+        QCOMPARE(starts, (std::vector<FrameTime>{0, each, each * 2, each * 3}));
+        QCOMPARE(res.segments, starts);
+
+        // A long shot and little memory: two-second segments, each a part of its own.
+        Project q = makeDefaultProject();
+        Sequence& one = *q.active();
+        one.width = w, one.height = h, one.fps = {25, 1};
+        one.videoTracks[0].clips.push_back(colorClip(q, 0.3f, 0.5f, 0.2f, 0, 150));
+        st.segmentSeconds = 2;
+        st.folder = (dir.path() + "/whole").toStdString();
+        QVERIFY2(exportStreamingPackage(q, one, st, nullptr, nullptr, &err, &res), err.c_str());
+        QCOMPARE(res.segments, (std::vector<FrameTime>{0, 50, 100}));
+        QCOMPARE(res.perShot[0].shots.size(), size_t(1));
+        st.shotMemory = 4 << 20;  // (room for some 45 frames of this size)
+        st.folder = (dir.path() + "/parts").toStdString();
+        QVERIFY2(exportStreamingPackage(q, one, st, nullptr, nullptr, &err, &res), err.c_str());
+        starts.clear();
+        for (const StreamingShot& sh : res.perShot[0].shots) starts.push_back(sh.first);
+        QCOMPARE(starts, (std::vector<FrameTime>{0, 50, 100}));
+        QCOMPARE(res.renderDecodes, 1);
+
+        // Which edits are shot changes.
+        Project g = makeDefaultProject();
+        Sequence& e = *g.active();
+        e.fps = {25, 1};
+        while (e.videoTracks.size() < 2) e.videoTracks.push_back(e.videoTracks[0]);
+        e.videoTracks[0].clips = {colorClip(g, 1, 0, 0, 0, 50), colorClip(g, 0, 1, 0, 50, 50), colorClip(g, 0, 0, 1, 100, 50), colorClip(g, 1, 1, 0, 150, 50)};
+        e.videoTracks[1].clips.clear();
+        QCOMPARE(streamingShotChanges(e), (std::vector<FrameTime>{50, 100, 150}));
+        // (a title over the second edit: the card changes under it, not the shot)
+        Clip title = makeGeneratorClip(g, "title", 40);
+        title.start = 80;
+        e.videoTracks[1].clips.push_back(title);
+        QCOMPARE(streamingShotChanges(e), (std::vector<FrameTime>{50, 150}));
+        // (a dissolve across the third)
+        Transition tr;
+        tr.id = g.newId();
+        tr.clipA = e.videoTracks[0].clips[2].id, tr.clipB = e.videoTracks[0].clips[3].id;
+        tr.duration = 10;
+        e.videoTracks[0].transitions.push_back(tr);
+        QCOMPARE(streamingShotChanges(e), (std::vector<FrameTime>{50}));
+        // (a muted track's edits are not seen)
+        e.videoTracks[0].muted = true;
+        QVERIFY(streamingShotChanges(e).empty());
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the

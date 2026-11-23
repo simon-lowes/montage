@@ -530,6 +530,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
     if (compare && !(cancel && cancel->load())) {
         CompareOptions o;
         o.metrics = q.compareMetrics;
+        o.vmafEvery = q.compareVmafEvery;
         // Checked over a range, the encode is taken to be an export of the range, unless it is as long as the whole
         // sequence (a delivery of it): then it is compared from the range's start on.
         FrameTime startsAt = -1;

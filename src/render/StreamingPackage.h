@@ -47,14 +47,27 @@ struct StreamingSettings {
     FrameTime in = -1, out = -1;
     bool useProxies = false;
     bool keepWork = false;              // keep the render and the sound it encoded from (in folder/work)
-    // Rungs set per shot: each shot (between the sequence's cuts and shot changes, a second at the least) starts a
-    // segment, is encoded first at several quality settings (CRF) for each rung, and scored by VMAF at the rung's
-    // size; the rung then gives each shot the setting from those rate–quality points that reaches vmafTarget for the
+    // Rungs set per shot: each shot (between the sequence's cuts and shot changes, streamingShotChanges, or, where the
+    // range has none, the scene changes found in the render; a second at the least) starts a segment, is encoded
+    // first at several quality settings (CRF) for each rung, and scored by VMAF at the display size: the rung's
+    // pictures scaled to it (bicubic) against the render at that size, so one target is one quality on every rung.
+    // The rung then gives each shot the setting from those rate–quality points that reaches vmafTarget for the
     // fewest bits, or, with no target, that spends the rung's bit rate over the range for the most VMAF. A rung's bit
-    // rate is then its cap: no shot's mean goes past it (and its peaks stay within 1.5 times it). Needs VMAF (and, for
-    // HDR, an HDR VMAF model). The package gets ladder.csv, each shot's rate and score on each rung.
+    // rate is then its cap: no shot's mean in the delivered files goes past it (a shot that would is encoded again,
+    // coarser), and its peaks are held within 1.5 times it. Needs VMAF (and, for HDR, an HDR VMAF model). The package
+    // gets ladder.csv: how it was scored, and each shot's rate and score on each rung.
     bool perShot = false;
     double vmafTarget = 0;              // 0: fill each rung's bit rate instead
+    // The size VMAF is scored at: 0 by 0, the ladder's largest rung; a height of 0, in proportion to the width.
+    int displayWidth = 0, displayHeight = 0;
+    // The lowest CRF a shot may be given (its best quality), for H.264 and HEVC; AV1's, whose scale runs to 63, is two
+    // more. 0: 18.
+    double crfFloor = 0;
+    // The trials score every such frame (what is delivered is scored on every frame). 0: 4.
+    int trialVmafEvery = 0;
+    // A shot's frames are kept in memory while it is tried, up to this many bytes: a longer shot is taken in parts,
+    // each from a segment's start. 0: 1 GiB.
+    int64_t shotMemory = 0;
 };
 
 // One quality setting tried on a shot: the encoder's CRF, the bits it took and the VMAF it scored (its frames' mean).
@@ -76,13 +89,18 @@ struct StreamingAdBreak {
     std::string name;
 };
 
-// A shot of a per-shot rung: its frames (from the range's start), the CRF it was given, its bits a second and VMAF as
-// delivered (decoded from the rendition, against the render at the rung's size), and the VMAF its trial expected.
+// A shot of a per-shot rung: its frames (from the range's start), the CRF it was given, its bits (as the file's samples
+// carry them) and bits a second, its VMAF as delivered (decoded from the rendition and scaled to the display size,
+// against the render at that size, every frame scored), the same at the rung's own size (against the render scaled
+// to the rung: what a viewer of a window that size sees), the VMAF its trial expected, what held it back ("floor": the
+// lowest CRF allowed; "cap": the rung's rate; "": neither), and how many settings it was encoded at.
 struct StreamingShot {
     FrameTime first = 0, end = 0;
     double crf = 0;
-    int64_t bitrate = 0;
-    double vmaf = 0, trialVmaf = 0;
+    int64_t bits = 0, bitrate = 0;
+    double vmaf = 0, ownVmaf = 0, trialVmaf = 0;
+    std::string stopped;
+    int trials = 0;
 };
 struct StreamingRungShots {
     std::string rendition;
@@ -98,12 +116,26 @@ struct StreamingResult {
     std::vector<std::string> renditions;  // folder names, video then audio then captions
     std::vector<StreamingRungShots> perShot;  // each video rung's shots, when set per shot
     std::string ladderReport;            // ladder.csv, when set per shot
+    // Set per shot: the size VMAF was scored at, the scaler to it ("bicubic"), the model, how many frames apart the
+    // trials scored, the CRF floor (H.264 and HEVC's), how many times the render was decoded for the encodes (once to
+    // a target, twice filling the rungs' rates) and how many encodes of a shot were made in all.
+    int displayWidth = 0, displayHeight = 0;
+    std::string scaler, vmafModel;
+    int trialVmafEvery = 0;
+    double crfFloor = 0;
+    int renderDecodes = 0;
+    int64_t shotEncodes = 0;
     std::vector<std::string> warnings;
 };
 
 // A ladder for a picture of this size: rungs from it down to 360 lines (16:9 sizes scaled to its shape), bit rates by
 // pixel count (HEVC and AV1 at about two thirds of H.264's, HDR a quarter more).
 std::vector<StreamingRung> defaultLadder(int width, int height, const std::string& codec = "libx264", bool hdr = false);
+
+// Where the picture changes shot, for rungs set per shot: the cuts and marked shot changes captions keep clear of
+// (core/CaptionTools captionShotChanges), and edits from one generator to another (cards, bars, titles on nothing)
+// where no clip lies under them and no transition crosses them. In time order.
+std::vector<FrameTime> streamingShotChanges(const Sequence& seq);
 
 // The ad-break markers inside [in, out), in time order, numbered.
 std::vector<StreamingAdBreak> streamingAdBreaks(const Sequence& seq, FrameTime in, FrameTime out);
