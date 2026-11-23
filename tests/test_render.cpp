@@ -3195,6 +3195,79 @@ colorspaces:
         QVERIFY(near(c[0], 0.3f, 1e-6f));
     }
 
+    void ocioKeyedControlsBuildOneProcessor() {
+        // A keyed exposure on the CPU: ten frames, and four threads at once on different frames, each come out at the
+        // exposure of their own frame, with one OCIO processor built for all of them.
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        QTemporaryDir dir;
+        const QString cfg = dir.filePath("keyed.ocio");
+        QFile f(cfg);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(R"(ocio_profile_version: 2
+roles:
+  default: linear
+  scene_linear: linear
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  Monitor:
+    - !<View> {name: Half, colorspace: half}
+colorspaces:
+  - !<ColorSpace>
+    name: linear
+  - !<ColorSpace>
+    name: half
+    from_scene_reference: !<MatrixTransform> {matrix: [0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1]}
+)");
+        f.close();
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "ocio");
+        e.strings["config"] = cfg.toStdString();
+        e.strings["src"] = "linear";
+        e.strings["dst"] = "half";
+        e.params["exposure"] = Param(0.0);
+        e.params["exposure"].addKey(0, -2.0);
+        e.params["exposure"].addKey(9, 2.5);
+        QVERIFY(ocioLiveControls(e));
+        auto expected = [&](FrameTime t) { return 0.4 * std::exp2(e.p("exposure", t, 0)) * 0.5; };
+        auto drawn = [&](FrameTime t, std::string* err) {
+            Image img = solid(64, 48, 0.4f, 0.4f, 0.4f);
+            if (!applyOcio(e, img, err, t)) return -1.0;
+            double worst = 0;
+            for (size_t i = 0; i < img.px.size(); i += 4) worst = std::max(worst, std::fabs(double(img.px[i]) - expected(t)) / expected(t));
+            return worst;
+        };
+        const long before = ocioProcessorsBuilt();
+        for (FrameTime t = 0; t < 10; ++t) {
+            std::string err;
+            const double off = drawn(t, &err);
+            QVERIFY2(off >= 0, err.c_str());
+            QVERIFY2(off < 1e-5, qPrintable(QString("frame %1 off by %2").arg(t).arg(off)));
+        }
+        QVERIFY2(expected(0) < 0.06 && expected(9) > 1.1, "the exposure did not change over the frames");
+        QCOMPARE(ocioProcessorsBuilt(), before + 1);
+        // (each thread's processor keeps its own values: none draws with another's exposure)
+        std::atomic<int> wrong{0};
+        std::vector<std::thread> threads;
+        for (int k = 0; k < 4; ++k)
+            threads.emplace_back([&, k] {
+                for (int n = 0; n < 25; ++n)
+                    if (const double off = drawn(FrameTime((k * 3 + n) % 10), nullptr); !(off >= 0 && off < 1e-5)) ++wrong;
+            });
+        for (std::thread& th : threads) th.join();
+        QCOMPARE(wrong.load(), 0);
+        // A value that is set and not keyed, and contrast and gamma, draw with the same processor.
+        Effect fixed = e;
+        fixed.params["exposure"] = Param(1.0);
+        fixed.params["contrast"] = Param(1.5);
+        fixed.params["gamma"] = Param(0.8);
+        Image img = solid(8, 8, 0.4f, 0.4f, 0.4f);
+        QVERIFY(applyOcio(fixed, img, nullptr, 0));
+        // (OCIO's linear style: the value over the pivot, 0.18, raised to contrast times gamma)
+        const double want = 0.18 * std::pow(0.4 * 2 / 0.18, 1.5 * 0.8) * 0.5;
+        QVERIFY2(std::fabs(img.px[0] - want) < 1e-4, qPrintable(QString("%1, not %2").arg(img.px[0]).arg(want)));
+        QCOMPARE(ocioProcessorsBuilt(), before + 1);
+    }
     void colorSpaceTransformEffect() {
         Project p = makeDefaultProject();
         Effect e = makeEffect(p, "color_space_transform");

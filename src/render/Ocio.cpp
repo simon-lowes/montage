@@ -7,6 +7,7 @@
 
 #include <QDateTime>
 #include <QFileInfo>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -60,7 +61,9 @@ OCIO::ConstConfigRcPtr loadConfig(const std::string& name, std::string* error) {
     }
 }
 
-OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool dynamic = false, FrameTime t = 0);
+std::atomic<long> gProcessorsBuilt{0};  // (ocioProcessorsBuilt)
+
+OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool dynamic = false, FrameTime t = 0, bool lent = false);
 
 OCIO::ConstCPUProcessorRcPtr processorFor(const Effect& e, FrameTime t, std::string* error) {
     OCIO::ConstProcessorRcPtr proc = processorOf(e, error, false, t);
@@ -91,8 +94,9 @@ std::string exact(double v) {
 
 // The effect's transform, one processor a transform (kept for the last 64). With its exposure, contrast and gamma
 // (once any is set: liveControls), an ExposureContrastTransform on the input first: at the values at `t`, or (`dynamic`,
-// for OCIO's GPU shader) as dynamic properties, set while the shader runs without building it again.
-OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool dynamic, FrameTime t) {
+// for OCIO's GPU shader and for the CPU) as dynamic properties, set while it runs without building it again. `lent`
+// (with `dynamic`): the one the CPU draws with, whose CPU processors each keep values of their own (liveProcessor).
+OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool dynamic, FrameTime t, bool lent) {
     const std::string configName = e.s("config");
     OCIO::ConstConfigRcPtr cfg = loadConfig(configName, error);
     if (!cfg) return nullptr;
@@ -104,7 +108,9 @@ OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool 
     const std::string key = configName + '\x1f' + std::to_string(reinterpret_cast<uintptr_t>(cfg.get())) + '\x1f' +
                             (display ? "d" : "c") + (inverse ? "i" : "f") + '\x1f' + src + '\x1f' + dst + '\x1f' +
                             disp + '\x1f' + view + '\x1f' + look + '\x1f' +
-                            (!live ? std::string("-") : dynamic ? std::string("dynamic") : exact(exposure) + ' ' + exact(contrast) + ' ' + exact(gamma));
+                            (!live ? std::string("-")
+                                   : dynamic ? std::string(lent ? "dynamic, lent" : "dynamic")
+                                             : exact(exposure) + ' ' + exact(contrast) + ' ' + exact(gamma));
     // (a processor at each value of a keyed control, kept apart so playing one through does not push the rest out)
     static std::map<std::string, OCIO::ConstProcessorRcPtr> fixed, valued;
     std::map<std::string, OCIO::ConstProcessorRcPtr>& cache = live && !dynamic ? valued : fixed;
@@ -147,7 +153,16 @@ OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool 
             whole->appendTransform(ec);
         }
         whole->appendTransform(group);
-        OCIO::ConstProcessorRcPtr proc = cfg->getProcessor(whole, OCIO::TRANSFORM_DIR_FORWARD);
+        // (Lent: from a copy of the config that keeps no CPU processors, so each one asked for is new and has its own
+        // dynamic properties; OCIO's own cache would hand every thread the same one.)
+        OCIO::ConstConfigRcPtr from = cfg;
+        if (live && dynamic && lent) {
+            OCIO::ConfigRcPtr own = cfg->createEditableCopy();
+            own->setProcessorCacheFlags(OCIO::PROCESSOR_CACHE_OFF);
+            from = own;
+        }
+        OCIO::ConstProcessorRcPtr proc = from->getProcessor(whole, OCIO::TRANSFORM_DIR_FORWARD);
+        ++gProcessorsBuilt;
         std::lock_guard lock(ocioMutex());
         if (cache.size() > (&cache == &valued ? 16u : 64u)) cache.clear();
         cache[key] = proc;
@@ -156,6 +171,77 @@ OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool 
         if (error) *error = ex.what();
         return nullptr;
     }
+}
+
+// The effect's CPU processor with its exposure, contrast and gamma set to their values at `t` as OCIO's dynamic
+// properties: built once a transform, however the controls are keyed, and lent to one caller at a time (each has
+// values of its own), given back when the loan goes. Empty where OCIO keeps no such property in the processor (the
+// caller then takes the processor built at the values).
+struct LiveLoan {
+    OCIO::ConstCPUProcessorRcPtr cpu;
+    const OCIO::Processor* owner = nullptr;
+    LiveLoan() = default;
+    LiveLoan(const LiveLoan&) = delete;
+    LiveLoan& operator=(const LiveLoan&) = delete;
+    ~LiveLoan();
+};
+struct LivePool {
+    OCIO::ConstProcessorRcPtr proc;  // (held, so its address is not taken again)
+    std::vector<OCIO::ConstCPUProcessorRcPtr> idle;
+    bool unusable = false;  // (its CPU processors keep no dynamic properties)
+};
+std::map<const OCIO::Processor*, LivePool>& livePools() {
+    static std::map<const OCIO::Processor*, LivePool> pools;
+    return pools;
+}
+LiveLoan::~LiveLoan() {
+    if (!cpu) return;
+    std::lock_guard lock(ocioMutex());
+    if (auto it = livePools().find(owner); it != livePools().end() && it->second.idle.size() < 16) it->second.idle.push_back(std::move(cpu));
+}
+void liveProcessor(const Effect& e, FrameTime t, LiveLoan& loan) {
+    OCIO::ConstProcessorRcPtr proc = processorOf(e, nullptr, true, t, true);
+    if (!proc) return;
+    OCIO::ConstCPUProcessorRcPtr cpu;
+    {
+        std::lock_guard lock(ocioMutex());
+        auto& pools = livePools();
+        if (pools.size() > 64 && !pools.count(proc.get())) pools.clear();
+        LivePool& pool = pools[proc.get()];
+        pool.proc = proc;
+        if (pool.unusable) return;
+        if (!pool.idle.empty()) {
+            cpu = std::move(pool.idle.back());
+            pool.idle.pop_back();
+        }
+    }
+    try {
+        if (!cpu) cpu = proc->getDefaultCPUProcessor();
+        const std::pair<OCIO::DynamicPropertyType, double> values[] = {{OCIO::DYNAMIC_PROPERTY_EXPOSURE, e.p("exposure", t, 0)},
+                                                                      {OCIO::DYNAMIC_PROPERTY_CONTRAST, e.p("contrast", t, 1)},
+                                                                      {OCIO::DYNAMIC_PROPERTY_GAMMA, e.p("gamma", t, 1)}};
+        for (const auto& [type, value] : values) {
+            // (asking a CPU processor for a property it does not keep throws)
+            OCIO::DynamicPropertyRcPtr property;
+            OCIO::DynamicPropertyDoubleRcPtr live;
+            try {
+                property = cpu->getDynamicProperty(type);
+                if (property) live = OCIO::DynamicPropertyValue::AsDouble(property);
+            } catch (const OCIO::Exception&) {
+                live = nullptr;
+            }
+            if (!live) {
+                std::lock_guard lock(ocioMutex());
+                livePools()[proc.get()].unusable = true;
+                return;
+            }
+            live->setValue(value);
+        }
+    } catch (const OCIO::Exception&) {
+        return;
+    }
+    loan.cpu = std::move(cpu);
+    loan.owner = proc.get();
 }
 
 std::vector<std::string> names(int n, const std::function<const char*(int)>& at) {
@@ -208,9 +294,14 @@ bool ocioLiveControls(const Effect& e) {
     return false;
 }
 
+long ocioProcessorsBuilt() { return gProcessorsBuilt; }
+
 bool applyOcio(const Effect& e, Image& img, std::string* error, FrameTime t) {
     if (img.empty()) return true;
-    OCIO::ConstCPUProcessorRcPtr cpu = processorFor(e, t, error);
+    // (Its live controls as values of one processor, so a keyed control builds none as it plays.)
+    LiveLoan loan;
+    if (ocioLiveControls(e)) liveProcessor(e, t, loan);
+    OCIO::ConstCPUProcessorRcPtr cpu = loan.cpu ? loan.cpu : processorFor(e, t, error);
     if (!cpu) return false;
     parallelRows(img.height, [&](int y0, int y1) {
         std::vector<float> row(size_t(img.width) * 4);
@@ -491,6 +582,7 @@ std::string ocioVersion() { return {}; }
 std::vector<std::string> ocioBuiltinConfigs() { return {}; }
 std::vector<std::string> ocioChoices(const Effect&, const std::string&) { return {}; }
 bool ocioLiveControls(const Effect&) { return false; }
+long ocioProcessorsBuilt() { return 0; }
 bool applyOcio(const Effect&, Image&, std::string* error, FrameTime) {
     if (error) *error = "Montage was built without OpenColorIO";
     return false;
