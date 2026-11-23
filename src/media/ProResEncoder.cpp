@@ -351,7 +351,9 @@ bool OwnEncoder::encode(const PlanarPicture& pic, std::vector<uint8_t>& out, std
     const int cw = full ? W : (W + 1) / 2;
     const int pictures = s_.fields ? 2 : 1;
     const uint8_t* scan = s_.fields ? scans().interlaced : scans().progressive;
-    const int qm = matrixValue(s_.profile);
+    // (every entry of both matrices: the profile's, or a finer or coarser one where the frame cannot reach its target
+    // with it; RDD 36 allows 2 to 63)
+    int qm = matrixValue(s_.profile);
 
     // Every slice of every picture, its coefficients worked out once and its alpha coded.
     std::vector<Work> work;
@@ -413,7 +415,9 @@ bool OwnEncoder::encode(const PlanarPicture& pic, std::vector<uint8_t>& out, std
     auto coded = [&](const Work& w, int q, int thread, std::vector<uint8_t>* into, size_t* sizes) {
         std::vector<int32_t>& levels = scratch[size_t(thread)];
         const float inverse = 1.0f / float(qm * qScale(q));
-        const float most = float(32767 / (qm * qScale(q)));
+        // (no level whose coefficient comes back outside the 12-bit signed range RDD 36 7.4 gives the inverse
+        // transform: decoders agree only inside it, and a coarse step can round a large coefficient past it)
+        const float most = float(8 * 2047 / (qm * qScale(q)));
         size_t total = sliceHeader;
         for (int c = 0; c < 3; ++c) {
             levels.resize(w.coef[c].size());
@@ -442,13 +446,23 @@ bool OwnEncoder::encode(const PlanarPicture& pic, std::vector<uint8_t>& out, std
         forEach(n, s_.threads, [&](int i, int t) { bytes[size_t(i)] = coded(work[size_t(i)], q, t, nullptr, nullptr); });
         return std::accumulate(bytes.begin(), bytes.end(), size_t(0));
     };
-    // The finest index one scale for the whole frame keeps within the budget (found by halving: sizes shrink as the
-    // index grows), then the slices that cost least made a step finer while the budget lasts.
+    // Each slice's index searched so the frame lands on its target. First the finest index one scale for the whole
+    // frame keeps within the budget (found by halving: sizes shrink as the index grows). A frame that is under its
+    // target even at the finest index with its profile's matrix (a flat one) is coded with a matrix of twos instead,
+    // the finest the format has, and searched again; one that is over it even at the coarsest index (noise) gets a
+    // matrix twice as coarse, and again up to 63, until it fits. Then slice by slice: the slices that cost least are
+    // made a step finer while the budget lasts, and again from where each now is, until nothing more fits.
     std::vector<uint8_t> q(size_t(n), 1);
-    if (colourAt(1) > budget) {
+    std::vector<size_t> at;  // each slice's bytes at its index in q
+    // (-1: under the budget at the finest index; 1: over it at the coarsest; 0: an index found)
+    auto uniform = [&]() -> int {
+        std::fill(q.begin(), q.end(), uint8_t(1));
+        if (colourAt(1) <= budget) {
+            at = bytes;
+            return -1;
+        }
         // (doubling from 1 until one keeps within it, then halving the gap: a few trials for the usual fine indexes)
         int lo = 1, hi = 2;
-        std::vector<size_t> atHi;
         bool fits = false;
         for (;;) {
             fits = colourAt(hi) <= budget;
@@ -456,30 +470,52 @@ bool OwnEncoder::encode(const PlanarPicture& pic, std::vector<uint8_t>& out, std
             lo = hi;
             hi = std::min(224, hi * 2);
         }
-        atHi = bytes;  // (none keeps within it: the coarsest)
+        at = bytes;  // (none keeps within it: the coarsest)
         if (fits)
             while (hi - lo > 1) {
                 const int mid = (lo + hi) / 2;
                 if (colourAt(mid) <= budget) {
                     hi = mid;
-                    atHi = bytes;
+                    at = bytes;
                 } else {
                     lo = mid;
                 }
             }
         std::fill(q.begin(), q.end(), uint8_t(hi));
-        size_t used = std::accumulate(atHi.begin(), atHi.end(), size_t(0));
-        if (hi > 1 && used < budget) {
-            colourAt(hi - 1);
-            std::vector<int> order(static_cast<size_t>(n));
-            std::iota(order.begin(), order.end(), 0);
-            auto more = [&](int i) { return bytes[size_t(i)] > atHi[size_t(i)] ? bytes[size_t(i)] - atHi[size_t(i)] : size_t(0); };
+        return fits ? 0 : 1;
+    };
+    int found = uniform();
+    if (found < 0 && qm > 2) {
+        qm = 2;
+        uniform();
+    }
+    while (found > 0 && qm < 63) {
+        qm = std::min(63, qm * 2);
+        found = uniform();
+    }
+    {
+        size_t used = std::accumulate(at.begin(), at.end(), size_t(0));
+        std::vector<size_t> finer(static_cast<size_t>(n));
+        std::vector<int> order(static_cast<size_t>(n));
+        // (a few sweeps: after the first, what is left is less than the cheapest slice's next step)
+        for (int sweep = 0; sweep < 4 && used < budget; ++sweep) {
+            forEach(n, s_.threads, [&](int i, int t) {
+                finer[size_t(i)] = q[size_t(i)] > 1 ? coded(work[size_t(i)], q[size_t(i)] - 1, t, nullptr, nullptr) : at[size_t(i)];
+            });
+            auto more = [&](int i) { return finer[size_t(i)] > at[size_t(i)] ? finer[size_t(i)] - at[size_t(i)] : size_t(0); };
+            order.clear();
+            for (int i = 0; i < n; ++i)
+                if (q[size_t(i)] > 1) order.push_back(i);
             std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return more(a) < more(b); });
+            bool stepped = false;
             for (int i : order) {
                 if (used + more(i) > budget) break;
                 used += more(i);
-                q[size_t(i)] = uint8_t(hi - 1);
+                at[size_t(i)] = finer[size_t(i)];
+                q[size_t(i)] = uint8_t(q[size_t(i)] - 1);
+                stepped = true;
             }
+            if (!stepped) break;
         }
     }
     quant_ = q;

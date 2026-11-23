@@ -8,6 +8,13 @@
 // differences between neighbouring blocks, the rest as runs and levels across every block of the slice in scan order,
 // each with the adaptive Rice and exponential Golomb codes RDD 36 gives. Every frame is coded on its own: the same
 // picture always gives the same bytes, on any number of threads.
+//
+// Rate control: each slice's scale is searched so the frame lands on its profile's target size. One scale for the
+// whole frame is found first, then the slices that cost least are made finer, a step at a time, until nothing more
+// fits. A frame that is under its target even at the finest scale with its profile's matrix (a flat one) is coded
+// with a matrix of twos, the finest RDD 36 allows, so it too comes up to the target unless it holds so little that it
+// is coded as finely as the format can (a matte, or anything quiet in 4444 XQ, whose own matrix is already twos). A
+// frame that is over its target even at the coarsest scale (noise) is coded with a coarser matrix, up to 63.
 #pragma once
 
 #include <cstddef>

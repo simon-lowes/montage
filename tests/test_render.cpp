@@ -12215,6 +12215,112 @@ colorspaces:
         QVERIFY(!q.empty() && std::all_of(q.begin(), q.end(), [](uint8_t v) { return v == 1; }));
     }
 
+    void ownProResLandsOnItsTarget() {
+        // Each slice's scale is searched, so a busy frame (noise over half the range: the decoders clamp differently
+        // at its ends, as RDD 36 lets them) and a flat one (a soft ramp with a little grain) both come out within 5% of
+        // each profile's target size, never over it. Where the profile's matrix cannot reach the target a coarser or a
+        // finer one is used, which the frame header says. FFmpeg decodes every one as Montage's own decoder does.
+        const int W = 1920, H = 1080;
+        std::mt19937 rng(23);
+        for (int profile = 1; profile <= 6; ++profile) {
+            const bool full = profile >= 5;
+            const int cw = full ? W : W / 2;
+            std::vector<uint16_t> y(size_t(W) * H), cb(size_t(cw) * H), cr(cb.size());
+            for (const bool busy : {true, false}) {
+                for (int j = 0; j < H; ++j)
+                    for (int i = 0; i < W; ++i)
+                        y[size_t(j) * W + size_t(i)] = busy ? uint16_t(1024 + rng() % 2048) : uint16_t(600 + i + j / 2 + int(rng() % 25));
+                for (int j = 0; j < H; ++j)
+                    for (int i = 0; i < cw; ++i) {
+                        cb[size_t(j) * size_t(cw) + size_t(i)] = busy ? uint16_t(1024 + rng() % 2048) : uint16_t(1800 + j / 4 + int(rng() % 25));
+                        cr[size_t(j) * size_t(cw) + size_t(i)] = busy ? uint16_t(1024 + rng() % 2048) : uint16_t(2200 - i / 8 + int(rng() % 25));
+                    }
+                const QString what = QStringLiteral("profile %1, %2").arg(profile).arg(busy ? "busy" : "flat");
+                prores::PlanarPicture pic;
+                pic.y = y.data(), pic.cb = cb.data(), pic.cr = cr.data();
+                pic.yStride = W, pic.cStride = cw;
+                prores::OwnSettings os;
+                os.width = W, os.height = H, os.profile = profile;
+                os.primaries = os.transfer = os.matrix = 1;
+                prores::OwnEncoder enc;
+                std::string err;
+                std::vector<uint8_t> frame, again;
+                QVERIFY2(enc.open(os, &err) && enc.encode(pic, frame, &err), qPrintable(what + ": " + QString::fromStdString(err)));
+                const size_t target = prores::targetFrameBytes(profile, W, H);
+                QVERIFY2(frame.size() <= target && double(frame.size()) >= 0.95 * double(target),
+                         qPrintable(what + QStringLiteral(": %1 bytes of %2").arg(frame.size()).arg(target)));
+                // (the search is the same on any number of threads)
+                os.threads = 1;
+                prores::OwnEncoder one;
+                QVERIFY(one.open(os) && one.encode(pic, again));
+                QVERIFY2(frame == again, qPrintable(what));
+                // The slices are not all at one index: each was searched.
+                const std::vector<uint8_t> q = enc.lastQuantization();
+                QVERIFY2(!q.empty() && *std::min_element(q.begin(), q.end()) < *std::max_element(q.begin(), q.end()), qPrintable(what));
+                // The matrices in the frame header: one value throughout, the profile's or, where it cannot reach
+                // the target (Proxy's busy frame), a coarser one.
+                const int matrix = frame[8 + 20];
+                QVERIFY(std::all_of(frame.begin() + 8 + 20, frame.begin() + 8 + 148, [&](uint8_t v) { return v == matrix; }));
+                QVERIFY2(matrix >= 2 && matrix <= 63, qPrintable(what));
+                qInfo().noquote() << what << "matrix" << matrix << "bytes" << frame.size() << "of" << target;
+                // FFmpeg's decoder and Montage's agree.
+                prores::OwnDecoded own;
+                QVERIFY2(prores::decodeOwn(frame.data(), frame.size(), own, &err), qPrintable(what + ": " + QString::fromStdString(err)));
+                AVFrame* f = ffmpegProResFrame(frame, full);
+                QVERIFY2(f, qPrintable(what));
+                const bool right = f->format == (full ? AV_PIX_FMT_YUV444P12 : AV_PIX_FMT_YUV422P10) && f->width == W && f->height == H;
+                const int depth = full ? 12 : 10, within = full ? 1 : 4;
+                // (compared inside the levels both decoders keep: past them each clamps as RDD 36 7.5.1 lets it,
+                // FFmpeg's to video levels, and coarsely coded noise overshoots that far)
+                auto apart = [&](int plane, const std::vector<uint16_t>& mine, int width) {
+                    int worst = 0;
+                    for (int j = 0; j < H; ++j) {
+                        const auto* row = reinterpret_cast<const uint16_t*>(f->data[plane] + size_t(j) * size_t(f->linesize[plane]));
+                        for (int i = 0; i < width; ++i)
+                            worst = std::max(worst, std::abs(std::clamp(int(row[i]) << (12 - depth), 16, 4076) -
+                                                             std::clamp(int(mine[size_t(j) * size_t(width) + size_t(i)]), 16, 4076)));
+                    }
+                    return worst;
+                };
+                const int dy = right ? apart(0, own.y, W) : 9999;
+                const int dcb = right ? apart(1, own.cb, own.chromaWidth()) : 9999;
+                const int dcr = right ? apart(2, own.cr, own.chromaWidth()) : 9999;
+                av_frame_free(&f);
+                QVERIFY2(right && dy <= within && dcb <= within && dcr <= within, qPrintable(what + QStringLiteral(": differences %1 %2 %3").arg(dy).arg(dcb).arg(dcr)));
+            }
+        }
+        // A quiet frame (a soft ramp, the least grain) in ProRes 4444: under the target at the finest scale with the
+        // profile's own matrix, so it is coded with the finest matrix the format has (twos) and comes back within a
+        // few codes; never over the target.
+        {
+            std::vector<uint16_t> y(size_t(W) * H), cb(y.size()), cr(y.size());
+            for (int j = 0; j < H; ++j)
+                for (int i = 0; i < W; ++i) {
+                    const size_t at = size_t(j) * W + size_t(i);
+                    y[at] = uint16_t(1200 + i / 2 + j / 4 + int(rng() % 3));
+                    cb[at] = uint16_t(1900 + j / 8 + int(rng() % 3));
+                    cr[at] = uint16_t(2100 - i / 16 + int(rng() % 3));
+                }
+            prores::PlanarPicture pic;
+            pic.y = y.data(), pic.cb = cb.data(), pic.cr = cr.data();
+            pic.yStride = pic.cStride = W;
+            prores::OwnSettings os;
+            os.width = W, os.height = H, os.profile = 5;
+            os.primaries = os.transfer = os.matrix = 1;
+            prores::OwnEncoder enc;
+            std::string err;
+            std::vector<uint8_t> frame;
+            QVERIFY2(enc.open(os, &err) && enc.encode(pic, frame, &err), err.c_str());
+            QVERIFY(frame.size() <= prores::targetFrameBytes(5, W, H));
+            QCOMPARE(int(frame[8 + 20]), 2);
+            prores::OwnDecoded own;
+            QVERIFY2(prores::decodeOwn(frame.data(), frame.size(), own, &err), err.c_str());
+            double worst = 0;
+            for (size_t i = 0; i < y.size(); ++i) worst = std::max(worst, std::fabs(double(own.y[i]) - double(y[i])));
+            QVERIFY2(worst <= 4, qPrintable(QStringLiteral("%1 codes off").arg(worst)));
+        }
+    }
+
     void proRes12BitRamp() {
         // A grey ramp across 2048 pixels, from a quarter to three quarters: coded at 12 bits it keeps four times the
         // distinct codes it keeps at 10 (FFmpeg's encoder), each decoded by FFmpeg (at 12 bits, rounded to 10 for the
