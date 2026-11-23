@@ -30,6 +30,8 @@
 #include "media/LensCalibration.h"
 #include "render/RenderFarm.h"
 #include "render/SegmentedExport.h"
+#include "render/VfxPull.h"
+#include "render/VfxShots.h"
 
 namespace montage {
 
@@ -367,6 +369,110 @@ std::vector<std::string> stringsFrom(const QJsonValue& v) {
     for (const QJsonValue& x : v.toArray()) out.push_back(x.toString().toStdString());
     return out;
 }
+
+// --- VFX pulls ---
+//
+// Each shot finished is kept as it is pulled: taken up after a crash, the pull passes over those (their files are not
+// written again) and goes on from the next.
+
+VfxPullOptions vfxOptionsFrom(const QJsonObject& j) {
+    VfxPullOptions o;
+    auto str = [&](const char* key, std::string& to) { to = j.value(key).toString(QString::fromStdString(to)).toStdString(); };
+    str("folder", o.folder);
+    str("format", o.format);
+    str("colorSpace", o.colorSpace);
+    str("compression", o.compression);
+    str("namePattern", o.namePattern);
+    str("returns", o.returns);
+    str("returnsPattern", o.returnsPattern);
+    o.handles = j.value("handles").toInt(o.handles);
+    o.cutIn = j.value("cutIn").toInt(o.cutIn);
+    o.amf = j.value("amf").toBool(o.amf);
+    o.fdl = j.value("fdl").toBool(o.fdl);
+    o.sourceLayers = j.value("sourceLayers").toBool(o.sourceLayers);
+    o.mattes = j.value("mattes").toBool(o.mattes);
+    o.stMaps = j.value("stMaps").toBool(o.stMaps);
+    o.scripts = j.value("scripts").toBool(o.scripts);
+    return o;
+}
+
+QJsonObject vfxShotJson(const VfxShot& v) {
+    auto q = [](const std::string& x) { return QString::fromStdString(x); };
+    return QJsonObject{{"name", q(v.name)}, {"media", q(v.media)}, {"folder", q(v.folder)}, {"firstFrame", v.firstFrame}, {"lastFrame", v.lastFrame},
+                       {"cutIn", v.cutIn}, {"cutOut", v.cutOut}, {"sourceIn", v.sourceIn}, {"sourceOut", v.sourceOut},
+                       {"headHandle", v.headHandle}, {"tailHandle", v.tailHandle}, {"amf", q(v.amf)}, {"fdl", q(v.fdl)},
+                       {"layers", stringsJson(v.layers)}, {"undistortMap", q(v.undistortMap)}, {"redistortMap", q(v.redistortMap)},
+                       {"overscanWidth", v.overscanWidth}, {"overscanHeight", v.overscanHeight}, {"deep", v.deep},
+                       {"clip", QString::number(v.clip)}, {"plate", q(v.plate)}, {"colorSpace", q(v.colorSpace)}, {"width", v.width},
+                       {"height", v.height}, {"fps", QJsonArray{v.fps.num, v.fps.den}}, {"cutSource", v.cutSource}, {"script", q(v.script)}};
+}
+
+VfxShot vfxShotFrom(const QJsonObject& j) {
+    VfxShot v;
+    auto s = [&](const char* key) { return j.value(key).toString().toStdString(); };
+    v.name = s("name"), v.media = s("media"), v.folder = s("folder");
+    v.firstFrame = j.value("firstFrame").toInt(), v.lastFrame = j.value("lastFrame").toInt();
+    v.cutIn = j.value("cutIn").toInt(), v.cutOut = j.value("cutOut").toInt();
+    v.sourceIn = j.value("sourceIn").toDouble(), v.sourceOut = j.value("sourceOut").toDouble();
+    v.headHandle = j.value("headHandle").toInt(), v.tailHandle = j.value("tailHandle").toInt();
+    v.amf = s("amf"), v.fdl = s("fdl");
+    v.layers = stringsFrom(j.value("layers"));
+    v.undistortMap = s("undistortMap"), v.redistortMap = s("redistortMap");
+    v.overscanWidth = j.value("overscanWidth").toInt(), v.overscanHeight = j.value("overscanHeight").toInt();
+    v.deep = j.value("deep").toBool();
+    v.clip = idOf(j.value("clip"));
+    v.plate = s("plate"), v.colorSpace = s("colorSpace");
+    v.width = j.value("width").toInt(), v.height = j.value("height").toInt();
+    if (const QJsonArray fps = j.value("fps").toArray(); fps.size() == 2) v.fps = Rational{fps.at(0).toInt(), fps.at(1).toInt()};
+    v.cutSource = j.value("cutSource").toDouble();
+    v.script = s("script");
+    return v;
+}
+
+bool runVfxPull(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    const VfxPullOptions o = vfxOptionsFrom(t.input.value("options").toObject());
+    VfxPullResume resume;
+    QJsonValue kept;
+    QJsonArray pulled;
+    if (t.part(QStringLiteral("shots"), &kept)) pulled = kept.toArray();
+    for (const QJsonValue& v : pulled) resume.finished.push_back(vfxShotFrom(v.toObject()));
+    resume.pulled = [&](const VfxShot& shot) {
+        if (std::any_of(resume.finished.begin(), resume.finished.end(), [&](const VfxShot& d) { return d.clip == shot.clip && d.name == shot.name; })) return;
+        pulled.append(vfxShotJson(shot));
+        t.keepPart(QStringLiteral("shots"), pulled);
+    };
+    std::vector<VfxShot> shots;
+    const bool ok = exportVfxPulls(*t.project, *s, idsOf(t.input.value("clips")), o, &shots,
+                                   [&](double f, FrameTime) {
+                                       if (t.progress) t.progress(f);
+                                   },
+                                   t.cancel, &t.error, &resume);
+    if (t.cancelled() || !ok) return false;
+    QJsonArray all;
+    for (const VfxShot& shot : shots) all.append(vfxShotJson(shot));
+    t.result["shots"] = all;
+    t.result["passedOver"] = int(resume.finished.size());
+    return true;
+}
+
+QJsonObject applyVfxPull(EditorState* state, const QJsonObject& input, const QJsonObject& result) {
+    // The shots kept with the sequence, their versions looked for in the returns folder from now on.
+    const VfxPullOptions o = vfxOptionsFrom(input.value("options").toObject());
+    std::vector<VfxShot> shots;
+    for (const QJsonValue& v : result.value("shots").toArray()) shots.push_back(vfxShotFrom(v.toObject()));
+    QDir().mkpath(QString::fromStdString(o.returns));
+    state->edit(WindowText::tr("Export VFX Pulls"), [&](Project&, Sequence& seq) {
+        recordVfxShots(seq, shots);
+        seq.vfxReturns = o.returns;
+        return true;
+    });
+    return QJsonObject{{"message", WindowText::tr("Pulled %n shot(s) with a pull list into %1", "", int(shots.size()))
+                                       .arg(QDir::toNativeSeparators(QString::fromStdString(o.folder)))}};
+}
+
+// --- DCP and IMF masters, again ---
 
 // Codes frames [0, frames) in stretches of `perPart` with `code(folder, from, to, progress)`, passing over those an
 // earlier run finished. `share`: how much of the job's progress this is. `made` lists the stretches: where each
@@ -960,6 +1066,7 @@ void registerDialogTaskKinds() {
         DialogJobs::registerKind(QStringLiteral("auto-mix"), {runMix, applyMixPlan, true, nullptr});
         DialogJobs::registerKind(QStringLiteral("conform-check"), {runConform, nullptr, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("lens-board"), {runLensBoard, nullptr, false, nullptr});
+        DialogJobs::registerKind(QStringLiteral("vfx-pull"), {runVfxPull, applyVfxPull, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("adr-align"), {runAdrAlign, applyAdrAlign, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("captions-translate"), {runTranslateCaptions, applyTranslateCaptions, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("captions-sdh"), {runSdhDraft, applySdhDraft, false, nullptr});

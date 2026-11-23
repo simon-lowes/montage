@@ -4552,29 +4552,20 @@ void MainWindow::vfxPullDialog() {
     // (the returns folder kept, if the sequence has one; else one in the pulls' folder)
     o.returns = !s->vfxReturns.empty() ? s->vfxReturns : QDir(folder).filePath(QStringLiteral("returns")).toStdString();
     o.returnsPattern = s->vfxPattern;
-    QProgressDialog progress(tr("Pulling shots..."), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    std::atomic<bool> cancel{false};
-    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
-    std::vector<VfxShot> shots;
-    std::string err;
-    const bool ok = exportVfxPulls(state_->project(), *s, clips, o, &shots, [&](double f, FrameTime) {
-        progress.setValue(int(f * 1000));
-        QApplication::processEvents();
-    }, &cancel, &err);
-    progress.close();
-    if (!ok) {
-        QMessageBox::warning(this, tr("Export VFX Pulls"), QString::fromStdString(err));
-        return;
-    }
-    // The shots kept with the sequence, their versions looked for in the returns folder from now on.
-    QDir().mkpath(QString::fromStdString(o.returns));
-    state_->edit(tr("Export VFX Pulls"), [&](Project&, Sequence& seq) {
-        recordVfxShots(seq, shots);
-        seq.vfxReturns = o.returns;
-        return true;
-    });
-    statusBar()->showMessage(tr("Pulled %n shot(s) with a pull list into %1", "", int(shots.size())).arg(QDir::toNativeSeparators(folder)), 8000);
+    // A background job (DialogJobs.h): the shots are kept with the sequence as one undo step when it ends
+    // (DialogTasks.cpp), unless the clips have moved meanwhile. Taken up after a crash, the shots it had pulled are
+    // passed over.
+    QJsonArray ids;
+    for (Id c : clips) ids.append(QString::number(c));
+    const QJsonObject options{{"folder", folder}, {"format", QString::fromStdString(o.format)}, {"handles", o.handles}, {"cutIn", o.cutIn},
+                              {"colorSpace", QString::fromStdString(o.colorSpace)}, {"amf", o.amf}, {"fdl", o.fdl},
+                              {"compression", QString::fromStdString(o.compression)}, {"sourceLayers", o.sourceLayers}, {"mattes", o.mattes},
+                              {"stMaps", o.stMaps}, {"namePattern", QString::fromStdString(o.namePattern)}, {"scripts", o.scripts},
+                              {"returns", QString::fromStdString(o.returns)}, {"returnsPattern", QString::fromStdString(o.returnsPattern)}};
+    const TaskOutcome r = dialogJobs_->run(state_, QStringLiteral("vfx-pull"), tr("Pulling shots..."),
+                                           QJsonObject{{"sequence", QString::number(s->id)}, {"clips", ids}, {"options", options}}, this);
+    if (r.how == TaskOutcome::Failed && !r.error.isEmpty()) QMessageBox::warning(this, tr("Export VFX Pulls"), r.error);
+    if (r.done() && r.applied.contains("message")) statusBar()->showMessage(r.applied.value("message").toString(), 8000);
 }
 
 CleanFeedWindow* MainWindow::showCleanFeed(int screenIndex) {

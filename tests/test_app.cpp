@@ -11204,6 +11204,92 @@ private slots:
         state()->newProject();
     }
 
+    void vfxPullsAsABackgroundJob() {
+        // Export VFX Pulls runs as a job in the store: watched, the shots are kept with the sequence as one undo step;
+        // left to run, they are kept when it ends; killed part-way in another process and taken up, the shots it had
+        // pulled are passed over (their frames not written again) and the rest pulled, to the same shots.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 32, gs.height = 18, gs.fps = {25, 1};
+        Clip matte = makeGeneratorClip(gen, "bars", 50);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, matte);
+        ExportSettings st;
+        st.path = (dir_.path() + "/vfx-job-plate.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.fps = Rational{25, 1};
+            for (int k = 0; k < 3; ++k)
+                if (!edit::placeMedia(p, s, ids[0], 20 * k, 4 + 10 * k, 4 + 10 * k + 12, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            return true;
+        }));
+        QJsonArray clips;
+        for (const Clip& c : state()->sequence()->videoTracks[0].clips) clips.append(QString::number(c.id));
+        QCOMPARE(clips.size(), 3);
+        DialogJobs* dialogs = win_->dialogJobs();
+        auto input = [&](const QString& folder) {
+            const QJsonObject options{{"folder", dir_.filePath(folder)}, {"format", "tiff"}, {"handles", 2}, {"namePattern", "{shot}"},
+                                      {"amf", false}, {"fdl", false}, {"returns", dir_.filePath(folder + "-returns")}};
+            return QJsonObject{{"sequence", QString::number(state()->sequence()->id)}, {"clips", clips}, {"options", options}};
+        };
+        // Watched: three shots, kept with the sequence, one undo step.
+        const int steps = int(state()->history().undoCount());
+        const TaskOutcome watched = dialogs->run(state(), "vfx-pull", "Pulling shots...", input("vfx-job-watched"), win_.get());
+        QVERIFY2(watched.done(), qPrintable(watched.error));
+        QVERIFY2(watched.applied.value("message").toString().contains("Pulled 3 shot"), qPrintable(watched.applied.value("message").toString()));
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QCOMPARE(state()->sequence()->vfxShots.size(), size_t(3));
+        QCOMPARE(QString::fromStdString(state()->sequence()->vfxReturns), dir_.filePath("vfx-job-watched-returns"));
+        const QJsonArray shots = watched.result.value("shots").toArray();
+        QCOMPARE(shots.size(), 3);
+        QCOMPARE(shots[0].toObject().value("name").toString(), QString("010"));
+        QVERIFY(QFileInfo::exists(dir_.filePath("vfx-job-watched/pull_list.csv")));
+        QCOMPARE(QDir(dir_.filePath("vfx-job-watched/020")).entryList({"*.tif"}).size(), 16);  // (12 frames and two handles each side)
+        state()->undo();
+        QVERIFY(state()->sequence()->vfxShots.empty());
+        // Left to run: kept with the sequence when it ends.
+        const QString id = startInBackground(dialogs, [&] {
+            const TaskOutcome o = dialogs->run(state(), "vfx-pull", "Pulling shots...", input("vfx-job-closed"), win_.get());
+            QCOMPARE(o.how, TaskOutcome::Background);
+        });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+        QCOMPARE(state()->sequence()->vfxShots.size(), size_t(3));
+        state()->undo();
+        // Killed once it is half way (the first shot pulled), and taken up.
+        QString why;
+        QDateTime firstWritten;
+        const QString job = killedAndTakenUp("vfx-pull", "Pulling shots...", input("vfx-job-killed"), "0.5", &why, 120000, [&](const QString&) {
+            firstWritten = QFileInfo(dir_.filePath("vfx-job-killed/010/010.1002.tif")).lastModified();
+        });
+        QVERIFY2(!job.isEmpty(), qPrintable(why));
+        QVERIFY(firstWritten.isValid());
+        QCOMPARE(QFileInfo(dir_.filePath("vfx-job-killed/010/010.1002.tif")).lastModified(), firstWritten);
+        const QJsonObject taken = taskResult(job);
+        QCOMPARE(taken.value("passedOver").toInt(), 1);
+        const QJsonArray again = taken.value("shots").toArray();
+        QCOMPARE(again.size(), 3);
+        for (int k = 0; k < 3; ++k) {
+            QJsonObject a = again[k].toObject(), w = shots[k].toObject();
+            for (const char* key : {"folder", "plate", "script", "amf", "fdl", "undistortMap", "redistortMap"}) a.remove(key), w.remove(key);
+            QCOMPARE(a, w);
+        }
+        QCOMPARE(QDir(dir_.filePath("vfx-job-killed/030")).entryList({"*.tif"}).size(), 16);
+        QFile list(dir_.filePath("vfx-job-killed/pull_list.csv"));
+        QVERIFY(list.open(QIODevice::ReadOnly));
+        QCOMPARE(list.readAll().count('\n'), 4);  // (the heading, and all three shots)
+        // Offered here (the helpers had no project open): applied, the three shots are kept.
+        QVERIFY(dialogs->applyOffered(job));
+        QCOMPARE(state()->sequence()->vfxShots.size(), size_t(3));
+        state()->newProject();
+    }
+
     void vfxReturnsWatched() {
         // A second of footage on the timeline, pulled as one shot whose versions come back to a watched folder.
         Project gen = makeDefaultProject();
