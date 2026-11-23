@@ -4,6 +4,7 @@
 #include <QtTest>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QScopeGuard>
 #include <QThread>
 #include <QProcess>
 #include <QStandardPaths>
@@ -275,7 +276,9 @@ int64_t recordClick(audiodev::Engine& e, int rate = 48000) {
     Clicker clicker;
     Take take;
     const int out = e.addOutput(&clicker, rate, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
+    auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
     const int in = e.addInput(&clicker, rate, [&](const float* i, int ch, int n, int64_t at) { take.add(i, ch, n, at); });
+    auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
     if (out < 0 || in < 0) return -2;
     QElapsedTimer t;
     t.start();
@@ -3856,7 +3859,9 @@ private slots:
             if (p >= 1200 && !held.exchange(true)) audiodev::loopbackStall(120);  // (a quarter of the way to the click)
             return p;
         });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
         const int in = e.addInput(&clicker, 48000, [&](const float* i, int ch, int n, int64_t at) { take.add(i, ch, n, at); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
         QVERIFY(out >= 0 && in >= 0);
         QElapsedTimer t;
         t.start();
@@ -3891,6 +3896,7 @@ private slots:
         // The playback still runs in real time at its own rate: about 48000 of its samples a second (of the time waited).
         Clicker clicker;
         const int id = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
+        auto unhookId = qScopeGuard([&] { e.removeOutput(id); });
         QVERIFY(id >= 0);
         QElapsedTimer t;
         t.start();
@@ -3903,6 +3909,7 @@ private slots:
         // clock): a second at 96 kHz, then a second at 48 kHz, is two seconds heard.
         Clicker steady;
         const int out = e.addOutput(&steady, 48000, 2, [&](float* o, int ch, int n) { return steady.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
         QVERIFY(out >= 0);
         QTRY_VERIFY(e.heardSeconds(out) > 0);
         QElapsedTimer heard;
@@ -3979,6 +3986,7 @@ private slots:
         QVERIFY(e.isOpen());
         Listener heard;
         const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
         QVERIFY(in >= 0);
         audiodev::Feed f(e);
         QVERIFY2(f.open(44100, 2, 0.25, &why), why.c_str());
@@ -4078,7 +4086,9 @@ private slots:
         TonePump tone;
         Listener heard;
         const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
         const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
         QVERIFY(out >= 0 && in >= 0);
         auto listen = [&](double seconds) {
             heard.take();
@@ -4183,8 +4193,11 @@ private slots:
         other.rate = 44100;
         Listener heard;
         const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
         const int out2 = e.addOutput(&other, 44100, 2, [&](float* o, int ch, int n) { return other.render(o, ch, n); });
+        auto unhookOut2 = qScopeGuard([&] { e.removeOutput(out2); });
         const int in = e.addInput(&tone, 44100, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
         QVERIFY(out >= 0 && out2 >= 0 && in >= 0);
         QTRY_VERIFY(e.heardSeconds(out) > 0);
         rtguard::reset();
@@ -4193,6 +4206,7 @@ private slots:
         Clicker extra;
         while (t.elapsed() < 2000) {
             const int id = e.addOutput(&extra, 48000, 2, [&](float* o, int ch, int n) { return extra.render(o, ch, n); });
+            auto unhookId = qScopeGuard([&] { e.removeOutput(id); });
             QVERIFY(id >= 0);
             QVERIFY(e.heardSeconds(out) > 0);
             (void)e.status();
@@ -4232,7 +4246,9 @@ private slots:
             TonePump tone;
             Listener heard;
             const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+            auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
             const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+            auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
             QVERIFY(out >= 0 && in >= 0);
             QThread::msleep(300);  // (settled: the cushion as deep as this computer needs)
             e.resetXruns();
@@ -4288,7 +4304,9 @@ private slots:
         TonePump tone;
         Listener heard;
         const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
         const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
         QVERIFY(out >= 0 && in >= 0);
         QThread::msleep(300);
         QCOMPARE(e.status().resamplers, int64_t(0));  // (48 kHz through a 48 kHz device: none needed)
@@ -4330,16 +4348,19 @@ private slots:
         std::mutex m;
         std::string why;
         const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
         const int in = e.addInput(&tone, 48000, [&](const float*, int, int n, int64_t) {
             frames += n;
             lastTapAt = ++order;
         });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
         const int listener = e.addLostListener([&](const std::string& w) {
             std::lock_guard<std::mutex> lock(m);
             why = w;
             framesWhenTold = frames.load();
             toldAt = ++order;
         });
+        auto unhookListener = qScopeGuard([&] { e.removeLostListener(listener); });
         QVERIFY(out >= 0 && in >= 0 && listener >= 0);
         QTRY_VERIFY(frames.load() > 24000);
         QElapsedTimer t;
@@ -4511,6 +4532,7 @@ private slots:
             if (++calls == 50) QThread::msleep(300);
             return int64_t(-1);
         });
+        auto unhookId = qScopeGuard([&] { e.removeOutput(id); });
         QVERIFY(id >= 0);
         QTRY_VERIFY_WITH_TIMEOUT(e.status().underruns > 0, 5000);
         QVERIFY(e.dropouts() > 0);
