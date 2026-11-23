@@ -16685,6 +16685,65 @@ colorspaces:
         QVERIFY2(timer.elapsed() < 5000, qPrintable(QString::number(timer.elapsed())));
     }
 
+    void titlePlainAnimatedLettersStayQuick() {
+        // Nightly 23 Nov: a plain title (no styles, no layout of its own) of 60,000 letters in one line, faded in by
+        // letter, half a second into its second. Each letter's place along the line comes from the letter before it,
+        // not from measuring the line from its start again (the letters squared: 1.8 x 10^9 characters measured a
+        // frame), so the frame costs about what the still title's does.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 12.0;
+        t.params["shadow"] = 0.0;
+        const int w = 800, h = 600;
+        // The still title and the title fading in, which shows the line's middle: the letters there are part way in,
+        // and every letter is where the still title has it, so the fading title puts no more ink in any pixel than
+        // the still one does (a letter a pixel out of place would).
+        auto check = [&](const std::string& text, int by, qint64* stillMs, qint64* fadingMs) {
+            t.strings["text"] = text;
+            t.params["text_anim_by"] = double(by);
+            t.params["text_anim"] = 0.0;
+            QElapsedTimer timer;
+            timer.start();
+            const Image still = renderTitle(t, 15, w, h, 1.0, 30, 30);
+            if (stillMs) *stillMs = timer.elapsed();
+            t.params["text_anim"] = 2.0;  // Fade
+            timer.restart();
+            const Image fading = renderTitle(t, 15, w, h, 1.0, 30, 30);
+            if (fadingMs) *fadingMs = timer.elapsed();
+            const size_t mid = (size_t(h / 2) * size_t(w) + size_t(w / 2)) * 4 + 3;
+            size_t most = 3;
+            for (size_t i = 3; i < still.px.size(); i += 4)
+                if (still.px[i] > 0.9f && (still.px[most] <= 0.9f || (i > mid ? i - mid : mid - i) < (most > mid ? most - mid : mid - most))) most = i;
+            QVERIFY2(still.px[most] > 0.9f, qPrintable(QString::number(still.px[most])));
+            const float opacity = fading.px[most] / still.px[most];
+            QVERIFY2(opacity > 0.2f && opacity < 0.95f, qPrintable(QString::number(opacity)));
+            float worst = 0;
+            for (size_t i = 3; i < still.px.size(); i += 4) worst = std::max(worst, fading.px[i] - still.px[i]);
+            QVERIFY2(worst < 0.05f, qPrintable(QString::number(worst)));
+        };
+        qint64 stillMs = 0, fadingMs = 0;
+        check(std::string(60000, 'i'), 0, &stillMs, &fadingMs);
+        qInfo("60,000 plain letters: %lld ms still, %lld ms fading in", static_cast<long long>(stillMs), static_cast<long long>(fadingMs));
+        QVERIFY2(fadingMs < stillMs * 3 + 3000, qPrintable(QString("%1 ms still, %2 ms fading in").arg(stillMs).arg(fadingMs)));
+        // A line short enough to be measured from its start for each letter, as before: 600 letters.
+        check(std::string(600, 'i'), 0, nullptr, nullptr);
+        // Words in a line too long to measure that way (the word "no" 2,000 times, faded in by word).
+        QString words;
+        for (int i = 0; i < 2000; ++i) words += QStringLiteral("no ");
+        words.chop(1);
+        check(words.toStdString(), 1, nullptr, nullptr);
+        // Kerned letters in such a line ("AV" 3,000 times, by letter): each letter starts where the whole line has
+        // it, the kerning between it and the letter before counted.
+        {
+            QFont kf(QStringLiteral("DejaVu Sans"));
+            kf.setPixelSize(12);
+            const QFontMetricsF km(kf);
+            QVERIFY(km.horizontalAdvance(QStringLiteral("AV")) < km.horizontalAdvance(QStringLiteral("A")) + km.horizontalAdvance(QStringLiteral("V")) - 0.1);
+        }
+        check(QString(QStringLiteral("AV")).repeated(3000).toStdString(), 0, nullptr, nullptr);
+    }
+
     void textOnMasksAndShapePaths() {
         // A title set on one of its clip's masks: an ellipse mask drawn as a circle of radius 200 round the middle of
         // an 800 x 600 frame. Every letter's baseline middle on the circle (0.1 px) and its baseline along the circle's

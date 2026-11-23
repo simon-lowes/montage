@@ -829,6 +829,10 @@ struct TitleScene {
 
 bool titleIsStyledAt(const Effect& g, double t);
 
+// A plain title animated by letter or word: the longest line whose units are each placed by measuring the line from
+// its start (see buildTitle). Longer lines are rare, and placing their letters that way costs the letters squared.
+constexpr int kLineMeasuredFromItsStart = 1000;
+
 TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& pathFn,
                       const TitleLayerFn& layerFn) {
     TitleScene sc0;
@@ -1312,14 +1316,33 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
         plain();
     } else {
         bool settled = true;  // every unit in place: drawn as the plain title is, kerned across the units
+        // How far along its line a unit starts: the advance of the line's text before it. In a line of up to
+        // kLineMeasuredFromItsStart characters that text is measured whole for each unit, as it always was. In a
+        // longer line (where that is the letters squared) each stretch from one unit's start to the next is measured
+        // once, with the character after it so that the kerning across the join is counted, and added to the last:
+        // the unit starts where the whole line, laid out at once, has it.
+        const QFontMetricsF fmMain(f), fmSub(fs);
+        int atLine = -1, atFrom = 0;
+        double atX = 0;
+        auto startOf = [&](const Unit& un, const QFontMetricsF& fm) {
+            const QString& ln = lines[un.line];
+            if (ln.size() <= kLineMeasuredFromItsStart) return fm.horizontalAdvance(ln.left(un.from));
+            if (un.line != atLine || un.from < atFrom) atLine = un.line, atFrom = 0, atX = 0;
+            if (un.from > atFrom) {
+                const QString next = ln.mid(un.from, ln.at(un.from).isHighSurrogate() ? 2 : 1);
+                atX += fm.horizontalAdvance(ln.mid(atFrom, un.from - atFrom) + next) - fm.horizontalAdvance(next);
+            }
+            atFrom = un.from;
+            return atX;
+        };
         for (int u = 0; u < n; ++u) {
             const Unit& un = units[size_t(u)];
             const int typedHere = budget - lineStart[size_t(un.line)] - un.from;
             if (typedHere <= 0) continue;  // not typed on yet
             QString shown = lines[un.line].mid(un.from, std::min(un.len, typedHere));
             const QFont& font = fontOfLine(un.line);
-            const QFontMetricsF fm(font);
-            const double x0 = lineX(un.line) + fm.horizontalAdvance(lines[un.line].left(un.from));
+            const QFontMetricsF& fm = un.line > 0 && sub ? fmSub : fmMain;
+            const double x0 = lineX(un.line) + startOf(un, fm);
             const double y = top + tops[size_t(un.line)] + ascents[size_t(un.line)];
             const double uw = fm.horizontalAdvance(shown), uh = heights[size_t(un.line)];
             const double pr = unitProgress(u);
