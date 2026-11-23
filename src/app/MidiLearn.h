@@ -56,7 +56,8 @@ public:
     // What the connection calls, from any thread (queued for the GUI thread), and handling there.
     void receive(const MidiMessage& m);
     void connectionLost();
-    void handle(const MidiMessage& m);
+    // `atUs`: when it arrived (steady clock, microseconds; negative: not known, as from a test).
+    void handle(const MidiMessage& m, int64_t atUs = -1);
 
     // Learning: the next control moved and the next parameter clicked are mapped together (either first).
     void setLearning(bool on);
@@ -126,6 +127,7 @@ private:
     QWidget* widgetFor(const QString& target) const;
     bool inApp(const QWidget* w) const;  // in the main window, one of its floating panels or one of its dialogs
     MidiConnection* outputPort(const std::string& name);
+    void handleEvents(const std::vector<midimap::Event>& events);
 
     EditorState* state_;
     MixerPanel* mixer_;
@@ -134,7 +136,7 @@ private:
     QString device_, output_;
     std::atomic<quint64> generation_{0};
     std::mutex inboxMutex_;
-    std::vector<MidiMessage> inbox_;
+    std::vector<std::pair<MidiMessage, int64_t>> inbox_;  // (each with when it arrived)
     bool drainPending_ = false;
 
     midimap::Decoder decoder_;
@@ -150,6 +152,7 @@ private:
     QString mappingsFrom_;                     // the map file the mappings in use came from
     mutable std::map<QString, QPointer<QWidget>> found_;  // widgets found for targets (the refresh asks often)
     QTimer* learnTimer_ = nullptr;  // a 7-bit controller decided once it stops moving
+    QTimer* pairTimer_ = nullptr;   // an NRPN's half held for its other half: one that came alone once this runs out
     QTimer* refreshTimer_ = nullptr;
     QTimer* reconnectTimer_ = nullptr;
     QFileSystemWatcher* watcher_ = nullptr;

@@ -1882,6 +1882,24 @@ private slots:
             if (f == 30) learn->releaseHolds();
         });
         QCOMPARE(byController, byMouse);
+        // An NRPN's halves are one value: the pair moves the fader once it is whole; a fine half alone moves it a
+        // moment later (nightly 23 Nov: it could be held and never sent), when no coarse half has followed.
+        {
+            midimap::Mapping wide;
+            wide.key = {midimap::Kind::Nrpn, 0, 3 << 7 | 4};
+            wide.target = "strip:2:volume";
+            wide.pickup = false;
+            learn->addMapping(wide);
+            for (const MidiMessage& m : {MidiMessage{0xB0, 99, 3}, MidiMessage{0xB0, 98, 4}, MidiMessage{0xB0, 6, 64}, MidiMessage{0xB0, 38, 0}}) learn->handle(m);
+            const double whole = learn->targetValue("strip:2:volume");
+            QVERIFY2(std::fabs(whole - 8192 / 16383.0) < 0.01, qPrintable(QString::number(whole)));
+            learn->handle({0xB0, 38, 127});
+            QCOMPARE(learn->targetValue("strip:2:volume"), whole);
+            QTRY_VERIFY(learn->targetValue("strip:2:volume") > whole);
+            QVERIFY(std::fabs(learn->targetValue("strip:2:volume") - (8192 + 127) / 16383.0) < 0.01);
+            learn->releaseHolds();
+            learn->removeMapping(learn->mappings().size() - 1);
+        }
 
         // A colour wheel: one axis per control, its last move made final once the control rests.
         QVERIFY(state()->edit("Palette", [red](Project& p, Sequence& s) {
