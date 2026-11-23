@@ -41499,6 +41499,277 @@ private slots:
         }
     }
 
+    void svgTextLengthsBaselinesAndSpans() {
+        // SVG text attributes the test writes, each made a title and drawn within 1/255 of a reference the test paints
+        // with QPainter where SVG puts each letter: textLength by spacing and by stretching the letters too, a
+        // textPath's side="right", dominant-baseline, baseline-shift, and tspans with a fill, size, weight and slant
+        // of their own.
+        Project p = makeDefaultProject();
+        auto write = [&](const char* name, const std::string& body) {
+            const std::string file = path(name);
+            std::ofstream f(file);
+            f << "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"200\" height=\"200\">" << body << "</svg>";
+            return file;
+        };
+        std::vector<std::string> notes;
+        auto textsOf = [&](const std::string& file) {
+            Effect g = makeEffect(p, "shape");
+            double w = 0, h = 0;
+            std::string err;
+            std::vector<SvgText> texts;
+            notes.clear();
+            if (!importSvgShapes(file, g, w, h, &notes, &err, &texts)) qWarning("%s", err.c_str());
+            return texts;
+        };
+        auto font = [](int px, bool bold = false, bool italic = false) {
+            QFont f(QStringLiteral("DejaVu Sans"));
+            f.setPixelSize(px);
+            f.setBold(bold);
+            f.setItalic(italic);
+            f.setHintingPreference(QFont::PreferNoHinting);
+            return f;
+        };
+        // Each letter's outline at the origin (its baseline's start) and its advance, as a line of the text lays them out.
+        struct Letter {
+            QPainterPath path;
+            double advance = 0;
+        };
+        auto letters = [](const QString& text, const QFont& f) {
+            QTextLayout layout(text, f);
+            layout.beginLayout();
+            QTextLine line = layout.createLine();
+            line.setLineWidth(1e7);
+            layout.endLayout();
+            std::vector<Letter> out;
+            for (int i = 0; i < text.size(); ++i) {
+                Letter l;
+                l.advance = line.cursorToX(i + 1) - line.cursorToX(i);
+                for (const QGlyphRun& run : layout.glyphRuns(i, 1)) {
+                    const QRawFont rf = run.rawFont();
+                    for (int g = 0; g < run.glyphIndexes().size(); ++g) {
+                        QPainterPath gp = rf.pathForGlyph(run.glyphIndexes()[g]);
+                        gp.translate(run.positions()[g].x() - line.cursorToX(i), run.positions()[g].y() - line.ascent());
+                        l.path.addPath(gp);
+                    }
+                }
+                out.push_back(l);
+            }
+            return out;
+        };
+        // The reference painted where the letters go, each part in its colour, and 1/64 px each way (QPainter puts a
+        // path's points on a 1/64 px grid): the lowest and highest of those.
+        using Parts = std::vector<std::pair<QPainterPath, QColor>>;
+        auto paint = [](const Parts& parts) {
+            std::pair<Image, Image> range{Image(200, 200), Image(200, 200)};
+            bool first = true;
+            for (int sx = -1; sx <= 1; ++sx)
+                for (int sy = -1; sy <= 1; ++sy) {
+                    QImage q(200, 200, QImage::Format_RGBA8888_Premultiplied);
+                    q.fill(Qt::transparent);
+                    QPainter pa(&q);
+                    pa.setRenderHint(QPainter::Antialiasing);
+                    for (const auto& [all, colour] : parts) {
+                        QPainterPath path = all.translated(sx / 64.0, sy / 64.0);
+                        path.setFillRule(Qt::WindingFill);
+                        pa.fillPath(path, colour);
+                    }
+                    pa.end();
+                    for (int y = 0; y < 200; ++y)
+                        for (int x = 0; x < 800; ++x) {
+                            const float v = q.constScanLine(y)[x] / 255.0f;
+                            float &lo = range.first.row(y)[x], &hi = range.second.row(y)[x];
+                            lo = first ? v : std::min(lo, v), hi = first ? v : std::max(hi, v);
+                        }
+                    first = false;
+                }
+            return range;
+        };
+        auto same = [](const char* what, const Image& ours, const std::pair<Image, Image>& want) {
+            float worst = 0;
+            int at = 0;
+            double ink = 0;
+            for (size_t i = 0; i < ours.px.size(); ++i) {
+                ink += want.first.px[i];
+                const float d = std::max({0.0f, want.first.px[i] - ours.px[i], ours.px[i] - want.second.px[i]});
+                if (d > worst) worst = d, at = int(i);
+            }
+            if (worst > 1.0f / 255 + 1e-6f)
+                qWarning("%s: pixel %d,%d is %g, wants %g to %g", what, (at / 4) % 200, (at / 4) / 200, ours.px[size_t(at)], want.first.px[size_t(at)],
+                         want.second.px[size_t(at)]);
+            return worst <= 1.0f / 255 + 1e-6f && ink > 100;
+        };
+        auto drawn = [&](const SvgText& t) { return renderGenerator(svgTextTitle(t), 0, 200, 200, 1.0, 30, 30); };
+        const QColor white(255, 255, 255);
+        const char* look = "font-family=\"DejaVu Sans\" fill=\"#ffffff\"";
+        const std::vector<Letter> ls = letters(QStringLiteral("HEMN"), font(30));
+        double natural = 0;
+        for (const Letter& l : ls) natural += l.advance;
+
+        // textLength, the letters spaced out: 150 units from the first letter's start, the same gap more after each.
+        {
+            const std::vector<SvgText> texts =
+                textsOf(write("length.svg", std::string("<text x=\"20\" y=\"80\" textLength=\"150\" font-size=\"30\" ") + look + ">HEMN</text>"));
+            QCOMPARE(int(texts.size()), 1);
+            QCOMPARE(texts[0].layout.textLength, 150.0);
+            QVERIFY(!texts[0].layout.adjustGlyphs);
+            QVERIFY(natural < 140);
+            const double gap = (150 - natural) / 3;
+            QPainterPath all;
+            double x = 20;
+            for (const Letter& l : ls) {
+                all.addPath(QTransform::fromTranslate(x, 80).map(l.path));
+                x += l.advance + gap;
+            }
+            QVERIFY(same("textLength by spacing", drawn(texts[0]), paint({{all, white}})));
+            // Shorter than the text is: the letters closed up by the same rule, and with text-anchor="end" the length
+            // asked for ends at x.
+            const std::vector<SvgText> tight = textsOf(write(
+                "tight.svg", std::string("<text x=\"180\" y=\"80\" textLength=\"60\" text-anchor=\"end\" font-size=\"30\" ") + look + ">HEMN</text>"));
+            QCOMPARE(int(tight.size()), 1);
+            const double less = (60 - natural) / 3;
+            QPainterPath closed;
+            x = 180 - 60;
+            for (const Letter& l : ls) {
+                closed.addPath(QTransform::fromTranslate(x, 80).map(l.path));
+                x += l.advance + less;
+            }
+            QVERIFY(same("textLength shorter than the text, anchored at its end", drawn(tight[0]), paint({{closed, white}})));
+        }
+        // lengthAdjust="spacingAndGlyphs": the letters stretched along the line with the gaps, to the same length.
+        {
+            const std::vector<SvgText> texts = textsOf(write(
+                "glyphs.svg", std::string("<text x=\"20\" y=\"80\" textLength=\"150\" lengthAdjust=\"spacingAndGlyphs\" font-size=\"30\" ") + look + ">HEMN</text>"));
+            QCOMPARE(int(texts.size()), 1);
+            QVERIFY(texts[0].layout.adjustGlyphs);
+            const double s = 150 / natural;
+            QPainterPath all;
+            double x = 20;
+            for (const Letter& l : ls) {
+                QTransform m;
+                m.translate(x, 80);
+                m.scale(s, 1);
+                all.addPath(m.map(l.path));
+                x += l.advance * s;
+            }
+            QVERIFY(same("textLength by stretching", drawn(texts[0]), paint({{all, white}})));
+            // The layout kept on the title says the same once read back from its string.
+            const std::optional<SvgTextLayout> back = parseSvgTextLayout(svgTextTitle(texts[0]).s("svg_text"));
+            QVERIFY(back && back->textLength == 150.0 && back->adjustGlyphs && !back->pathRight && back->down == 0);
+        }
+        // side="right" on a textPath: set along the path taken backwards, from its end (here a line from left to right:
+        // the letters run from its right end leftwards, upside down under it).
+        {
+            const std::vector<SvgText> texts = textsOf(write(
+                "side.svg", std::string("<defs><path id=\"line\" d=\"M 20 100 L 180 100\"/></defs><text font-size=\"30\" ") + look +
+                                "><textPath xlink:href=\"#line\" side=\"right\" startOffset=\"10\">HEMN</textPath></text>"));
+            QCOMPARE(int(texts.size()), 1);
+            QVERIFY(texts[0].layout.pathRight);
+            QPainterPath all;
+            double along = 10;
+            for (const Letter& l : ls) {
+                QTransform m;
+                m.translate(180 - (along + l.advance / 2), 100);
+                m.rotate(180);
+                m.translate(-l.advance / 2, 0);
+                all.addPath(m.map(l.path));
+                along += l.advance;
+            }
+            QVERIFY(same("text on the right side of its path", drawn(texts[0]), paint({{all, white}})));
+            const std::optional<SvgTextLayout> back = parseSvgTextLayout(svgTextTitle(texts[0]).s("svg_text"));
+            QVERIFY(back && back->pathRight);
+        }
+        // dominant-baseline: the text's y at the middle of its ascent and descent (central), at its top
+        // (text-before-edge), at half its x-height (middle) and at 0.8 of its ascent (hanging), by the font's measures.
+        {
+            QFont big = font(1000);
+            const QFontMetricsF fm(big);
+            const double em = 30.0 / 1000;
+            const std::pair<const char*, double> kinds[] = {{"central", (fm.ascent() - fm.descent()) / 2 * em},
+                                                            {"text-before-edge", fm.ascent() * em},
+                                                            {"middle", fm.xHeight() / 2 * em},
+                                                            {"hanging", 0.8 * fm.ascent() * em},
+                                                            {"text-after-edge", -fm.descent() * em}};
+            for (const auto& [kind, down] : kinds) {
+                const std::vector<SvgText> texts = textsOf(write(
+                    "baseline.svg", std::string("<text x=\"20\" y=\"100\" dominant-baseline=\"") + kind + "\" font-size=\"30\" " + look + ">HEMN</text>"));
+                QCOMPARE(int(texts.size()), 1);
+                QVERIFY2(std::abs(texts[0].layout.down - down) < 1e-9, kind);
+                QVERIFY(std::abs(down) > 2);
+                QPainterPath all;
+                double x = 20;
+                for (const Letter& l : ls) {
+                    all.addPath(QTransform::fromTranslate(x, 100 + down).map(l.path));
+                    x += l.advance;
+                }
+                QVERIFY2(same(kind, drawn(texts[0]), paint({{all, white}})), kind);
+            }
+        }
+        // baseline-shift on tspans: a length up, a percentage of the size, super and sub (0.4 of the size up and 0.2
+        // down), and a shift inside a shifted tspan added to it; the letters keep their places along the line.
+        {
+            const std::vector<SvgText> texts = textsOf(write(
+                "shift.svg", std::string("<text x=\"20\" y=\"100\" font-size=\"30\" ") + look +
+                                 ">H<tspan baseline-shift=\"6\">E<tspan baseline-shift=\"-50%\">M</tspan></tspan><tspan baseline-shift=\"super\">N</tspan>"
+                                 "<tspan style=\"baseline-shift:sub\">H</tspan></text>"));
+            QCOMPARE(int(texts.size()), 1);
+            QCOMPARE(texts[0].text, std::string("HEMNH"));
+            QCOMPARE(int(texts[0].runs.size()), 4);
+            const double up[] = {0, 6, 6 - 15, 12, -6};
+            for (int i = 0; i < 4; ++i) {
+                QCOMPARE(texts[0].runs[size_t(i)].from, i + 1);
+                QCOMPARE(texts[0].runs[size_t(i)].len, 1);
+                QVERIFY(std::abs(texts[0].runs[size_t(i)].baseline - up[i + 1]) < 1e-9);
+            }
+            const std::vector<Letter> five = letters(QStringLiteral("HEMNH"), font(30));
+            QPainterPath all;
+            double x = 20;
+            for (int i = 0; i < 5; ++i) {
+                all.addPath(QTransform::fromTranslate(x, 100 - up[i]).map(five[size_t(i)].path));
+                x += five[size_t(i)].advance;
+            }
+            QVERIFY(same("baseline shifts", drawn(texts[0]), paint({{all, white}})));
+        }
+        // tspans with a look of their own: red at 20 px, bold and slanted (the size also from a style sheet's rule in
+        // em), then the text's own again; each letter in its font at its place along the line.
+        {
+            const std::vector<SvgText> texts = textsOf(write(
+                "spans.svg", std::string("<style>.small { font-size: 0.5em }</style><text x=\"10\" y=\"100\" font-size=\"30\" ") + look +
+                                 ">HE<tspan fill=\"#ff0000\" font-size=\"20\" font-weight=\"bold\" font-style=\"italic\">MN</tspan>H"
+                                 "<tspan class=\"small\">E</tspan></text>"));
+            QCOMPARE(int(texts.size()), 1);
+            QCOMPARE(texts[0].text, std::string("HEMNHE"));
+            QCOMPARE(int(texts[0].runs.size()), 2);
+            const TextRun& red = texts[0].runs[0];
+            QVERIFY(red.from == 2 && red.len == 2 && red.size == 20 && red.bold == 1 && red.italic == 1 && red.color);
+            QVERIFY((*red.color == std::array<double, 3>{1, 0, 0}));
+            const TextRun& small = texts[0].runs[1];
+            QVERIFY(small.from == 5 && small.len == 1 && small.size == 15 && small.bold == -1 && small.italic == -1 && !small.color);
+            const std::vector<Letter> plain = letters(QStringLiteral("HE"), font(30)), strong = letters(QStringLiteral("MN"), font(20, true, true));
+            const std::vector<Letter> again = letters(QStringLiteral("H"), font(30)), little = letters(QStringLiteral("E"), font(15));
+            QPainterPath whites, reds;
+            double x = 10;
+            for (const Letter& l : plain) whites.addPath(QTransform::fromTranslate(x, 100).map(l.path)), x += l.advance;
+            for (const Letter& l : strong) reds.addPath(QTransform::fromTranslate(x, 100).map(l.path)), x += l.advance;
+            for (const Letter& l : again) whites.addPath(QTransform::fromTranslate(x, 100).map(l.path)), x += l.advance;
+            for (const Letter& l : little) whites.addPath(QTransform::fromTranslate(x, 100).map(l.path)), x += l.advance;
+            QVERIFY(same("tspans in their own look", drawn(texts[0]), paint({{whites, white}, {reds, QColor(255, 0, 0)}})));
+        }
+        // What is not drawn as SVG has it is said: text stretched along its path, and vertical text.
+        {
+            textsOf(write("stretch.svg", std::string("<defs><path id=\"line\" d=\"M 20 100 L 180 100\"/></defs><text font-size=\"30\" ") + look +
+                                             "><textPath xlink:href=\"#line\" method=\"stretch\">HEMN</textPath></text>"));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("stretched along its path") != std::string::npos; }));
+            textsOf(write("vertical.svg", std::string("<text x=\"100\" y=\"20\" writing-mode=\"vertical-rl\" font-size=\"30\" ") + look + ">HEMN</text>"));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Vertical text") != std::string::npos; }));
+        }
+        // A title an earlier version made from SVG text (its layout without the new entries) is laid out as it was.
+        {
+            const std::optional<SvgTextLayout> old = parseSvgTextLayout("{\"m\":[1,0,0,1,0,0],\"x\":[20],\"y\":[80],\"anchor\":1}");
+            QVERIFY(old && old->textLength == 0 && !old->adjustGlyphs && !old->pathRight && old->down == 0 && old->anchor == 1);
+            QCOMPARE(svgTextLayoutJson(*old), std::string("{\"anchor\":1,\"m\":[1,0,0,1,0,0],\"x\":[20],\"y\":[80]}"));
+        }
+    }
+
     void usdCameraAndSolveExport() {
         // A model clip seen through the camera in its USD scene and lit by the scene's light: the camera where the
         // file puts it (8 units down +z, a 50 mm lens on a 16:9 film back), the light a sun of illuminance pi.

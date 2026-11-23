@@ -1087,6 +1087,23 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     chunk[q] = chunks;
                     pen.rx() += adv[q];
                 }
+            // textLength: the letters take that length from the first one's start, by the same gap more (or less)
+            // after each letter, or, with their glyphs adjusted too, by stretching letters and gaps alike.
+            double stretch = 1;
+            if (svg->textLength > 0 && n > 0) {
+                double a = 1e300, b = -1e300;
+                for (int q = 0; q < n; ++q) a = std::min(a, pos[size_t(q)].x()), b = std::max(b, pos[size_t(q)].x() + adv[size_t(q)]);
+                const double natural = b - a;
+                if (svg->adjustGlyphs) {
+                    if (natural > 1e-9) {
+                        stretch = std::clamp(svg->textLength / natural, 1e-3, 1e3);
+                        for (int q = 0; q < n; ++q) pos[size_t(q)].rx() = a + (pos[size_t(q)].x() - a) * stretch, adv[size_t(q)] *= stretch;
+                    }
+                } else if (n > 1) {
+                    const double gap = (svg->textLength - natural) / (n - 1);
+                    for (int q = 0; q < n; ++q) pos[size_t(q)].rx() += q * gap;
+                }
+            }
             if (svg->anchor != 0) {
                 // (each chunk's extent in one pass over the letters: every letter can be a chunk of its own)
                 std::vector<double> lo(size_t(chunks) + 1, 1e300), hi(size_t(chunks) + 1, -1e300);
@@ -1109,7 +1126,8 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     // The glyph at the text's size, turned about its origin (its baseline's start).
                     QTransform turn;
                     turn.rotate(r);
-                    const QTransform own = QTransform::fromTranslate(-cl.x0, 0) * QTransform::fromScale(1 / k, 1 / k) * turn;
+                    const QTransform own = QTransform::fromTranslate(-cl.x0, 0) * QTransform::fromScale(stretch / k, 1 / k) * turn;
+                    const double y = pos[q].y() + svg->down;
                     if (alongPath) {
                         // Its middle at its distance along the path, turned to the path there, dy across it; off the
                         // ends of an open path it is not drawn.
@@ -1120,12 +1138,14 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                         }
                         QPointF pt;
                         double ang = 0;
-                        along.at(mid, pt, ang);
+                        // (side="right": along the path taken backwards, from its end)
+                        along.at(svg->pathRight ? along.length() - mid : mid, pt, ang);
+                        if (svg->pathRight) ang += M_PI;
                         QTransform onIt;
                         onIt.rotateRadians(ang);
-                        svgPlace[q] = own * QTransform::fromTranslate(-adv[q] / 2, pos[q].y()) * onIt * QTransform::fromTranslate(pt.x(), pt.y()) * textTo;
+                        svgPlace[q] = own * QTransform::fromTranslate(-adv[q] / 2, y) * onIt * QTransform::fromTranslate(pt.x(), pt.y()) * textTo;
                     } else {
-                        svgPlace[q] = own * QTransform::fromTranslate(pos[q].x(), pos[q].y()) * textTo;
+                        svgPlace[q] = own * QTransform::fromTranslate(pos[q].x(), y) * textTo;
                     }
                 }
         }
@@ -1603,7 +1623,13 @@ std::string svgTextLayoutJson(const SvgTextLayout& l) {
         o["pm"] = matrix(l.pathMatrix);
         o["start"] = l.start;
         if (l.startPercent) o["start_pct"] = true;
+        if (l.pathRight) o["right"] = true;
     }
+    if (l.textLength > 0) {
+        o["length"] = l.textLength;
+        if (l.adjustGlyphs) o["glyphs"] = true;
+    }
+    if (l.down != 0) o["down"] = l.down;
     if (l.atX != 0 || l.atY != 0) o["at"] = QJsonArray{l.atX, l.atY};
     return QJsonDocument(o).toJson(QJsonDocument::Compact).toStdString();
 }
@@ -1646,6 +1672,10 @@ std::optional<SvgTextLayout> parseSvgTextLayout(const std::string& json) {
     matrix(o.value("pm"), l.pathMatrix);
     l.start = finite(o.value("start").toDouble());
     l.startPercent = o.value("start_pct").toBool();
+    l.pathRight = o.value("right").toBool();
+    l.textLength = std::max(0.0, finite(o.value("length").toDouble()));
+    l.adjustGlyphs = o.value("glyphs").toBool();
+    l.down = finite(o.value("down").toDouble());
     const QJsonArray at = o.value("at").toArray();
     if (at.size() == 2) l.atX = finite(at[0].toDouble()), l.atY = finite(at[1].toDouble());
     return l;
