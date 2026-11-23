@@ -119,6 +119,13 @@ bool submitFarmImf(const std::string& farm, const std::string& name, const Proje
                    const std::string& parent, int segments, std::string* id = nullptr, std::string* error = nullptr);
 bool submitFarmDcp(const std::string& farm, const std::string& name, const Project& project, Id sequence, const DcpSettings& settings,
                    const std::string& parent, int segments, std::string* id = nullptr, std::string* error = nullptr);
+
+// A package's settings as jobs keep them (the farm's, and the app's background jobs): every field, as JSON.
+QJsonObject imfSettingsToJson(const ImfSettings& s);
+bool imfSettingsFromJson(const QJsonObject& o, ImfSettings& s, std::string* error = nullptr);
+QJsonObject dcpSettingsToJson(const DcpSettings& s);
+bool dcpSettingsFromJson(const QJsonObject& o, DcpSettings& s, std::string* error = nullptr);
+
 std::vector<FarmJob> farmJobs(const std::string& farm);  // oldest first
 std::vector<FarmNodeInfo> farmNodes(const std::string& farm);
 // A waiting job is cancelled at once; a rendering one is asked to stop (its node looks every half second; a share's

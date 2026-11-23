@@ -254,8 +254,14 @@ void visitImf(S& s, V& v) {
     v("supplementOf", s.supplementOf);
     v("originalSequence", s.originalSequence);
     v("application", s.application);
+    v("prores", s.prores);
+    v("fields", s.fields);
+    v("segmentedFields", s.segmentedFields);
+    v("ycbcr444", s.ycbcr444);
+    v("fullRange", s.fullRange);
     v("edition", s.edition);
     v("events", s.events);
+    v("eventsJson", s.eventsJson);
     v("graded", s.graded);
     v("immersive", s.immersive);
     v("sadm", s.sadm);
@@ -309,6 +315,9 @@ QJsonObject imfToJson(const ImfSettings& s) {
     for (const ImfText& x : s.texts) texts.append(QJsonObject{{"track", QString::number(x.track)}, {"kind", qs(x.kind)}, {"image", x.image}});
     o["sounds"] = sounds;
     o["texts"] = texts;
+    QJsonArray targets;
+    for (FrameTime f : s.targetFrames) targets.append(double(f));
+    if (!targets.isEmpty()) o["targetFrames"] = targets;
     return o;
 }
 bool imfFromJson(const QJsonObject& o, ImfSettings& s, std::string* error) {
@@ -336,6 +345,8 @@ bool imfFromJson(const QJsonObject& o, ImfSettings& s, std::string* error) {
         if (r.error.empty()) r.error = xr.error;
         s.texts.push_back(std::move(text));
     }
+    s.targetFrames.clear();
+    for (const QJsonValue& v : o.value("targetFrames").toArray()) s.targetFrames.push_back(FrameTime(v.toDouble()));
     if (!r.error.empty() && error) *error = r.error;
     return r.error.empty();
 }
@@ -920,6 +931,11 @@ bool submitFarmDcp(const std::string& farm, const std::string& name, const Proje
     return submitPackage(farm, name, project, sequence, "dcp", settingsFor, frames, parent, dcpFolderName(*seq, settings), segments, id, error,
                          extra);
 }
+
+QJsonObject imfSettingsToJson(const ImfSettings& s) { return imfToJson(s); }
+bool imfSettingsFromJson(const QJsonObject& o, ImfSettings& s, std::string* error) { return imfFromJson(o, s, error); }
+QJsonObject dcpSettingsToJson(const DcpSettings& s) { return dcpToJson(s); }
+bool dcpSettingsFromJson(const QJsonObject& o, DcpSettings& s, std::string* error) { return dcpFromJson(o, s, error); }
 
 std::vector<FarmJob> farmJobs(const std::string& farm) {
     std::vector<FarmJob> out;

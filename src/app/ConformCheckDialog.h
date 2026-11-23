@@ -6,6 +6,7 @@
 #pragma once
 
 #include <QDialog>
+#include <QJsonObject>
 #include <vector>
 
 #include "render/ConformCheck.h"
@@ -27,7 +28,8 @@ public:
 
     void setReference(Id media);
     void setReferenceStart(FrameTime t);
-    // Runs the check (with a progress dialog); false when cancelled or the reference cannot be read.
+    // Runs the check as a background job (DialogJobs.h) behind its progress dialog; false when cancelled, when the
+    // reference cannot be read, or when it was left to run in the background (its shots are listed when it ends).
     bool runCheck();
     const std::vector<ConformShot>& shots() const { return shots_; }
     void activate(int row);       // the playhead to the shot, its clip selected
@@ -38,6 +40,9 @@ public:
 private:
     void updateButtons();
     void forget();  // the results dropped: the sequence changed since the check (an edit, an undo)
+    QJsonObject checkInput(Id reference, FrameTime referenceStart);
+    QString projectToken() const;  // names the project's state as it is now
+    bool showResult(const QJsonObject& result);  // a check's result (DialogTasks.h) listed
 
     EditorState* state_;
     Id sequence_ = 0;
@@ -45,6 +50,8 @@ private:
     std::vector<bool> fixed_;
     bool editing_ = false;  // our own edit (its change does not make the results stale)
     bool marked_ = false;   // markers added for these results
+    bool changed_ = false;  // the project changed since the last check began
+    QString jobToken_;      // names the last check begun here among the jobs in the store
     QComboBox* reference_ = nullptr;
     QLineEdit* start_ = nullptr;
     QLabel* summary_ = nullptr;

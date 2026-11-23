@@ -135,6 +135,8 @@
 #include "render/Titles.h"
 #include "render/DcpFacilities.h"
 #include "render/DcpSecurity.h"
+#include "render/SegmentedExport.h"
+#include "render/DcpMxf.h"
 #include "render/Ofx.h"
 #include "render/OfxRemote.h"
 #include "OfxOverlay.h"
@@ -288,6 +290,7 @@
 #include "render/BackgroundJobs.h"
 #include "render/RenderFarm.h"
 #include "DialogJobs.h"
+#include "DialogTasks.h"
 #include "media/AutoDuck.h"
 #include "render/HrdCheck.h"
 #include <QProgressDialog>
@@ -581,7 +584,7 @@ class TestApp : public QObject {
     // them takes the task up and finishes it. Returns the job's id in the store, "" with `why` when something went
     // otherwise. (The helpers have no project open, so the result is kept and offered here, not applied there.)
     QString killedAndTakenUp(const QString& kind, const QString& title, const QJsonObject& input, const QString& pauseAt, QString* why,
-                             int waitMs = 120000) {
+                             int waitMs = 120000, const std::function<void(const QString& id)>& between = {}) {
         const QString project = dir_.filePath("task-helper-project.json");
         {
             QFile f(project);
@@ -611,6 +614,7 @@ class TestApp : public QObject {
         first->waitForFinished(10000);
         jobs::Record r;
         if (!jobs::load(id, r) || r.status != QLatin1String("interrupted")) return *why = "after the kill the job reads " + r.status, QString();
+        if (between) between(id);
         // Two Montages started together: the job is taken up once.
         const QString marks = dir_.filePath("task-helper-took-" + id);
         QDir().mkpath(marks);
@@ -631,6 +635,39 @@ class TestApp : public QObject {
         if (took != 1) return *why = QStringLiteral("the job was taken up %1 times").arg(took), QString();
         if (!jobs::load(id, r) || r.status != QLatin1String("done")) return *why = "taken up, the job ended " + r.status + ": " + r.error, QString();
         return id;
+    }
+
+    // The pictures of a DCP (its JPEG 2000 codestreams, in order) or of an IMF master, as its track file holds them.
+    static std::vector<std::vector<uint8_t>> dcpPictures(const QString& folder) {
+        std::vector<std::vector<uint8_t>> out;
+        for (const QString& f : QDir(folder).entryList({"*.mxf"})) {
+            dcp::TrackFileReader r;
+            if (!r.open(QDir(folder).filePath(f).toStdString()) || r.timedText() || r.iab() || r.largestEditUnit() < 10000) continue;
+            for (int64_t k = 0; k < r.editUnits(); ++k) {
+                out.emplace_back();
+                if (!r.read(k, 0, out.back())) out.back().clear();
+            }
+            break;
+        }
+        return out;
+    }
+    static std::vector<std::vector<uint8_t>> imfPictures(const QString& folder) {
+        std::vector<std::vector<uint8_t>> out;
+        for (const QString& f : QDir(folder).entryList({"VIDEO_*.mxf"})) {
+            dcp::ImfTrackReader r;
+            if (!r.open(QDir(folder).filePath(f).toStdString())) continue;
+            for (int64_t k = 0; k < r.frames(); ++k) {
+                out.emplace_back();
+                if (!r.frame(k, out.back())) out.back().clear();
+            }
+            break;
+        }
+        return out;
+    }
+    // The one folder in `parent` whose name starts with `prefix` ("" when there is none, or more than one).
+    static QString onlyPackage(const QString& parent, const QString& prefix) {
+        const QStringList found = QDir(parent).entryList({prefix + "*"}, QDir::Dirs | QDir::NoDotAndDotDot);
+        return found.size() == 1 ? QDir(parent).filePath(found.front()) : QString();
     }
 
     static QJsonObject taskResult(const QString& id) {
@@ -5742,6 +5779,331 @@ private slots:
             state()->undo();
         }
         disconnect(dialogs, &DialogJobs::finished, this, nullptr);
+        state()->newProject();
+    }
+
+    void dialogTasksLookedOver() {
+        // Auto Mix and the Conform Check are jobs in the store whose results are looked over in their dialogs. Left to
+        // run, Auto Mix's plan is kept and offered, and looked over from there it mixes as a watched run does; the
+        // check's shots are listed in its dialog when it ends, and again in a dialog opened later on the same project.
+        DialogJobs* dialogs = win_->dialogJobs();
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return edit::placeMedia(p, s, ids[0], 60, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 1}, false);
+        });
+        const auto latest = [](const QString& kind) {
+            jobs::Record found;
+            for (const jobs::Record& r : jobs::all("app"))
+                if (r.kind == kind && r.order >= found.order) found = r;
+            return found;
+        };
+        // (the Auto Mix dialog accepted as it comes, whenever it shows)
+        QTimer accept;
+        int shown = 0;
+        connect(&accept, &QTimer::timeout, this, [&] {
+            for (QWidget* w : QApplication::topLevelWidgets())
+                if (auto* d = qobject_cast<AutoMixDialog*>(w); d && d->isVisible()) {
+                    ++shown;
+                    d->accept();
+                }
+        });
+        accept.start(20);
+        const int mixed = AutoMixDialog::run(state(), win_.get());  // (watched)
+        QVERIFY(mixed > 0);
+        QCOMPARE(shown, 1);
+        QCOMPARE(state()->undoText(), QString("Auto Mix"));
+        const Sequence mix = *state()->sequence();
+        const QJsonObject plan = taskResult(latest("auto-mix").id);
+        QCOMPARE(plan.value("plan").toArray().size(), 2);
+        QCOMPARE(mixPlanToJson(mixPlanFromJson(plan.value("plan"))), plan.value("plan").toArray());
+        state()->undo();
+        // Left to run: nothing pops up over the editor's work. The plan is kept and offered.
+        QString offered;
+        connect(dialogs, &DialogJobs::offered, this, [&](const QString&, const QString&, const QString& note) { offered = note; });
+        QString id = startInBackground(dialogs, [&] { QCOMPARE(AutoMixDialog::run(state(), win_.get()), -1); });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+        QCOMPARE(shown, 1);
+        QVERIFY2(!offered.isEmpty(), qPrintable(offered));
+        QVERIFY(taskResult(id) == plan);
+        QVERIFY(!(*state()->sequence() == mix));
+        // Looked over from the list and accepted: the same mix.
+        QVERIFY(dialogs->applyOffered(id));
+        QCOMPARE(shown, 2);
+        QVERIFY(*state()->sequence() == mix);
+        state()->undo();
+        // Killed in another process once it has listened to half, and taken up: the same plan and mix.
+        {
+            QString why;
+            const QString job = killedAndTakenUp("auto-mix", "Listening to the audio…", QJsonObject{{"sequence", QString::number(state()->sequence()->id)}}, "0.3", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(taskResult(job) == plan);
+            QVERIFY(dialogs->applyOffered(job));
+            QVERIFY(*state()->sequence() == mix);
+            state()->undo();
+        }
+        accept.stop();
+        disconnect(dialogs, &DialogJobs::offered, this, nullptr);
+
+        // The Conform Check: a shot and a reference movie that shows it 10 % larger.
+        const QString shot = dir_.path() + "/task-conform-shot.mp4", reference = dir_.path() + "/task-conform-ref.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 25)).ok);
+            Clip t = makeGeneratorClip(gen, "title", 25);
+            t.generator.strings["text"] = "CONFORM 42";
+            t.generator.params["size"] = 40.0;
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 1}, t).ok);
+            ExportSettings st;
+            st.path = shot.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+            Project ref = makeDefaultProject();
+            Sequence& rs = *ref.active();
+            rs.width = 320, rs.height = 180, rs.fps = {25, 1};
+            MediaItem m;
+            m.id = ref.newId();
+            QVERIFY(probeMedia(shot.toStdString(), m));
+            ref.media.push_back(m);
+            Clip c = makeClip(ref, m, TrackKind::Video, rs);
+            c.motion.params["scale"] = Param(110.0);
+            QVERIFY(edit::overwrite(ref, rs, {TrackKind::Video, 0}, c).ok);
+            st.path = reference.toStdString();
+            QVERIFY2(exportSequence(ref, rs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto media = state()->importFiles({shot, reference});
+        QCOMPARE(media.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, media[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        QJsonObject watchedShots;
+        {
+            ConformCheckDialog dlg(state(), win_.get());
+            QVERIFY(dlg.shots().empty());
+            QVERIFY(dlg.runCheck());  // (watched)
+            QCOMPARE(dlg.shots().size(), size_t(1));
+            QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Reframed);
+            watchedShots = taskResult(latest("conform-check").id);
+            QCOMPARE(conformShotsToJson(dlg.shots()), watchedShots.value("shots").toArray());
+        }
+        // The project is still as it was checked, so a dialog opened now lists that check's shots.
+        {
+            ConformCheckDialog dlg(state(), win_.get());
+            QCOMPARE(dlg.shots().size(), size_t(1));
+            QCOMPARE(dlg.findChild<QTableWidget*>("conformShots")->item(0, 2)->text(), QString("Reframed"));
+        }
+        // After a change it lists nothing: that check was of another state.
+        QVERIFY(state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Reel 2";
+            return true;
+        }));
+        {
+            ConformCheckDialog dlg(state(), win_.get());
+            QVERIFY(dlg.shots().empty());
+            // Left to run with the dialog still open: its shots are listed there when it ends.
+            id = startInBackground(dialogs, [&] { QVERIFY(!dlg.runCheck()); });
+            QVERIFY(!id.isEmpty());
+            QVERIFY(dlg.shots().empty());
+            dialogs->setPaused(id, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+            QTRY_COMPARE(dlg.shots().size(), size_t(1));
+            QVERIFY(taskResult(id).value("shots") == watchedShots.value("shots"));
+        }
+        // Left to run and its dialog closed: the next dialog opened lists them.
+        id = startInBackground(dialogs, [&] {
+            ConformCheckDialog dlg(state(), win_.get());
+            QVERIFY(!dlg.runCheck());
+        });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+        {
+            ConformCheckDialog dlg(state(), win_.get());
+            QCOMPARE(dlg.shots().size(), size_t(1));
+            QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Reframed);
+        }
+        // Killed in another process and taken up: the same shots, kept for the dialog.
+        {
+            const Sequence& s = *state()->sequence();
+            QString why;
+            const QString job = killedAndTakenUp("conform-check", "Comparing the shots with the reference…",
+                                                 QJsonObject{{"sequence", QString::number(s.id)}, {"reference", QString::number(media[1])}, {"referenceStart", 0.0}},
+                                                 "0", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(taskResult(job).value("shots") == watchedShots.value("shots"));
+        }
+        state()->newProject();
+    }
+
+    void packagesAsBackgroundJobs() {
+        // A DCP and an IMF master are made as jobs in the store. With the dialog closed the package holds the same
+        // pictures as a watched one's and is reported when it ends; killed part-way in another process and taken up,
+        // the stretches of pictures already coded are left as they were (their files' times unchanged) and the
+        // package again holds the same pictures and passes its check.
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        DialogJobs* dialogs = win_->dialogJobs();
+        state()->newProject();
+        QVERIFY(state()->edit("Mattes", [&](Project& p, Sequence& s) {
+            s.width = 256, s.height = 108, s.fps = Rational{24, 1};
+            // (four pictures that differ, so a stretch in the wrong place would show)
+            for (int i = 0; i < 4; ++i) {
+                Clip c = makeGeneratorClip(p, "color", 6);
+                c.start = i * 6;
+                c.generator.params["color.r"] = 0.2 * i;
+                c.generator.params["color.g"] = 0.6;
+                if (!edit::overwrite(p, s, V1, c).ok) return false;
+            }
+            return true;
+        }));
+        const QString sequence = QString::number(state()->sequence()->id);
+        const auto stretches = [](const QJsonObject& result) {
+            QStringList out;
+            for (const QJsonValue& v : result.value("pictures").toArray())
+                out << QStringLiteral("%1-%2%3").arg(v["from"].toInt()).arg(v["to"].toInt()).arg(v["passedOver"].toBool() ? " passed over" : "");
+            return out.join(", ");
+        };
+        // When each stretch's last picture was written, as the files in the job's pictures folder say now.
+        const auto written = [](const QString& parent, const QString& id, const QList<int>& lastFrames) {
+            QList<qint64> out;
+            const QString pictures = QDir(parent).filePath(".montage-pictures-" + id);
+            for (int k : lastFrames) out << QFileInfo(QString::fromStdString(codestreamFile(pictures.toStdString(), k))).lastModified().toMSecsSinceEpoch();
+            return out;
+        };
+
+        // ---- The DCP.
+        DcpSettings cinema;
+        cinema.title = "Job Test";
+        cinema.kind = "test";
+        cinema.threads = 2;
+        const auto dcpInput = [&](const QString& parent) {
+            return QJsonObject{{"sequence", sequence}, {"parent", parent}, {"settings", dcpSettingsToJson(cinema)}, {"partFrames", 6}};
+        };
+        // Watched to its end.
+        const TaskOutcome watched = dialogs->run(state(), "dcp", "Making the DCP", dcpInput(dir_.filePath("dcp-watched")), win_.get());
+        QVERIFY2(watched.how == TaskOutcome::Done, qPrintable(watched.error));
+        QCOMPARE(watched.result.value("issues").toArray().size(), 0);
+        QCOMPARE(stretches(watched.result), QString("0-6, 6-12, 12-18, 18-24"));
+        const DcpResult one = dcpResultFromJson(watched.result);
+        QCOMPARE(one.frames, int64_t(24));
+        QVERIFY(dcpResultToJson(one) == dcpResultToJson(dcpResultFromJson(dcpResultToJson(one))));
+        const auto pictures = dcpPictures(QString::fromStdString(one.folder));
+        QCOMPARE(pictures.size(), size_t(24));
+        QVERIFY(!pictures[0].empty() && pictures[0] != pictures[6]);
+        QVERIFY(QDir(dir_.filePath("dcp-watched")).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+        // From the File menu's maker with its dialog closed: nothing is returned then, and the DCP is reported when
+        // it ends as a watched one is.
+        win_->statusBar()->clearMessage();
+        QString id = startInBackground(dialogs, [&] { QVERIFY(win_->exportDcpTo(dir_.filePath("dcp-closed"), cinema).isEmpty()); });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+        QVERIFY2(win_->statusBar()->currentMessage().contains("made and checked"), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY(dcpPictures(onlyPackage(dir_.filePath("dcp-closed"), "JobTest_")) == pictures);
+        // Killed in another process while the third stretch is coded, and taken up by one of two started together.
+        {
+            const QString parent = dir_.filePath("dcp-killed");
+            QList<qint64> before;
+            QString why;
+            const QString job = killedAndTakenUp("dcp", "Making the DCP", dcpInput(parent), "0.45", &why, 300000,
+                                                 [&](const QString& killed) { before = written(parent, killed, {5, 11}); });
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            const QJsonObject result = taskResult(job);
+            QCOMPARE(stretches(result), QString("0-6 passed over, 6-12 passed over, 12-18, 18-24"));
+            // The finished stretches' pictures were not written again.
+            QCOMPARE(before.size(), 2);
+            QVERIFY(before[0] > 0 && before[1] > 0);
+            QCOMPARE(qint64(result.value("pictures").toArray().at(0).toObject().value("written").toDouble()), before[0]);
+            QCOMPARE(qint64(result.value("pictures").toArray().at(1).toObject().value("written").toDouble()), before[1]);
+            QCOMPARE(result.value("issues").toArray().size(), 0);
+            QVERIFY(dcpPictures(QString::fromStdString(dcpResultFromJson(result).folder)) == pictures);
+            QVERIFY(verifyDcp(dcpResultFromJson(result).folder).empty());
+            QVERIFY(QDir(parent).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+        }
+        // Killed while the made package is being checked, and taken up: it is checked again, not made again (one
+        // package in the folder, the one made before the kill).
+        {
+            const QString parent = dir_.filePath("dcp-killed-checking");
+            QStringList madeBefore;
+            QString why;
+            const QString job = killedAndTakenUp("dcp", "Making the DCP", dcpInput(parent), "0.9", &why, 300000, [&](const QString&) {
+                madeBefore = QDir(parent).entryList({"JobTest_*"}, QDir::Dirs | QDir::NoDotAndDotDot);
+            });
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QCOMPARE(madeBefore.size(), 1);
+            QCOMPARE(QDir(parent).entryList({"JobTest_*"}, QDir::Dirs | QDir::NoDotAndDotDot), madeBefore);
+            const QJsonObject result = taskResult(job);
+            QCOMPARE(QFileInfo(QString::fromStdString(dcpResultFromJson(result).folder)).fileName(), madeBefore.front());
+            QCOMPARE(result.value("issues").toArray().size(), 0);
+            QCOMPARE(stretches(result), QString("0-6, 6-12, 12-18, 18-24"));
+        }
+        // Stopped by hand part-way: no pictures are left in the folder.
+        {
+            const QString parent = dir_.filePath("dcp-stopped");
+            qputenv("MONTAGE_JOBS_PAUSE_AT", "0.4");
+            const QString job = dialogs->start(state(), "dcp", "Making the DCP", dcpInput(parent));
+            qunsetenv("MONTAGE_JOBS_PAUSE_AT");
+            QVERIFY(!job.isEmpty());
+            const auto paused = [&] {
+                for (const DialogJobs::TaskInfo& t : dialogs->tasks())
+                    if (t.id == job) return t.paused;
+                return false;
+            };
+            QTRY_VERIFY_WITH_TIMEOUT(paused(), 300000);
+            QCOMPARE(QDir(parent).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).size(), 1);
+            dialogs->stop(job);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+            QVERIFY(QDir(parent).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+        }
+
+        // ---- The IMF master.
+        ImfSettings master;
+        master.title = "Job Master";
+        master.threads = 2;
+        const auto imfInput = [&](const QString& parent) {
+            return QJsonObject{{"sequence", sequence}, {"parent", parent}, {"settings", imfSettingsToJson(master)}, {"partFrames", 6}};
+        };
+        const TaskOutcome watchedImf = dialogs->run(state(), "imf", "Making the IMF master", imfInput(dir_.filePath("imf-watched")), win_.get());
+        QVERIFY2(watchedImf.how == TaskOutcome::Done, qPrintable(watchedImf.error));
+        QCOMPARE(watchedImf.result.value("issues").toArray().size(), 0);
+        QCOMPARE(stretches(watchedImf.result), QString("0-6, 6-12, 12-18, 18-24"));
+        const ImfResult oneImf = imfResultFromJson(watchedImf.result);
+        QVERIFY(imfResultToJson(oneImf) == imfResultToJson(imfResultFromJson(imfResultToJson(oneImf))));
+        const auto imfPicturesWatched = imfPictures(QString::fromStdString(oneImf.folder));
+        QCOMPARE(imfPicturesWatched.size(), size_t(24));
+        QVERIFY(!imfPicturesWatched[0].empty() && imfPicturesWatched[0] != imfPicturesWatched[6]);
+        win_->statusBar()->clearMessage();
+        id = startInBackground(dialogs, [&] { QVERIFY(win_->exportImfTo(dir_.filePath("imf-closed"), master).isEmpty()); });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+        QVERIFY2(win_->statusBar()->currentMessage().contains("made and checked"), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY(imfPictures(onlyPackage(dir_.filePath("imf-closed"), "Job_Master_IMF_")) == imfPicturesWatched);
+        {
+            const QString parent = dir_.filePath("imf-killed");
+            QList<qint64> before;
+            QString why;
+            const QString job = killedAndTakenUp("imf", "Making the IMF master", imfInput(parent), "0.45", &why, 300000,
+                                                 [&](const QString& killed) { before = written(parent, killed, {5, 11}); });
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            const QJsonObject result = taskResult(job);
+            QCOMPARE(stretches(result), QString("0-6 passed over, 6-12 passed over, 12-18, 18-24"));
+            QCOMPARE(before.size(), 2);
+            QVERIFY(before[0] > 0 && before[1] > 0);
+            QCOMPARE(qint64(result.value("pictures").toArray().at(0).toObject().value("written").toDouble()), before[0]);
+            QCOMPARE(qint64(result.value("pictures").toArray().at(1).toObject().value("written").toDouble()), before[1]);
+            QCOMPARE(result.value("issues").toArray().size(), 0);
+            QVERIFY(imfPictures(QString::fromStdString(imfResultFromJson(result).folder)) == imfPicturesWatched);
+        }
         state()->newProject();
     }
 

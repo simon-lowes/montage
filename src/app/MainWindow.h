@@ -329,6 +329,9 @@ public:
     // kept between sessions) and each server certificate given.
     void makeKdmsDialog();
     QString exportImfTo(const QString& parent, const ImfSettings& settings, QStringList* problems = nullptr);
+    // Says what a finished DCP or IMF job made (its result as the job kept it), and returns the package's folder.
+    QString dcpMade(const QJsonObject& made, QStringList* problems);
+    QString imfMade(const QJsonObject& made, QStringList* problems);
     void exportImfDialog();
     // File › Export Immersive Master (ADM BWF)…: the bed and the audio objects (render/Adm.h), in the background.
     bool exportAdmTo(const QString& path, const AdmSettings& settings, AdmResult* result = nullptr);

@@ -61,6 +61,12 @@ struct TaskKind {
     // On the interface thread once it has ended well: makes its edit as one undo step and returns what it did
     // ("message": what to say in the status bar; the rest is the kind's own). May be empty (a result only shown).
     std::function<QJsonObject(EditorState*, const QJsonObject& input, const QJsonObject& result)> apply;
+    // Its result is looked over in a dialog before anything is changed (`apply` shows it): when nobody watched the
+    // task, the result is kept and offered rather than shown in the middle of other work.
+    bool review = false;
+    // When it ends without a result, stopped or failed (not when Montage stops under it: it is taken up again from
+    // there), on the interface thread: removes what it left outside the job's folder. May be empty.
+    std::function<void(const QJsonObject& input, const QString& folder)> discard;
 };
 
 struct TaskOutcome {
@@ -125,6 +131,7 @@ public:
         QString id, kind, title;
         double progress = 0;
         bool running = false, paused = false;
+        QString note;  // an offered result: what moved
     };
     std::vector<TaskInfo> tasks() const;
     void setPaused(const QString& id, bool paused);  // (it waits at its next report of progress)
@@ -134,6 +141,9 @@ public:
     QString offeredNote(const QString& id) const;
     // Applies it now, as one undo step, onto the project as it is. False when there is none or it cannot be applied.
     bool applyOffered(const QString& id, QString* said = nullptr);
+    // The results kept and offered (their `progress` 1), latest first, and one of them set aside.
+    std::vector<TaskInfo> offeredTasks() const;
+    void discardOffered(const QString& id);
     // The result a finished task of this kind left in the store, the latest whose input `matches` (null: any). False
     // when there is none.
     bool latestResult(const QString& kind, const std::function<bool(const QJsonObject& input)>& matches, QJsonObject* result,
@@ -147,6 +157,8 @@ signals:
     // A job taken up again, or a task nobody watched, has ended: `text` says how, for the status bar.
     void finished(const QString& id, bool ok, const QString& text);
     void taskEnded(const QString& id);
+    // A task nobody watched ended well and nothing of it waits to be applied: its result, for whoever reports it.
+    void taskDone(const QString& id, const QString& kind, const QJsonObject& input, const QJsonObject& result);
     // A task's result was kept and not applied: `note` says what moved.
     void offered(const QString& id, const QString& title, const QString& note);
     void tasksChanged();
@@ -172,7 +184,7 @@ private:
         bool started = false, watched = false, resumed = false, saidPaused = false;
     };
     struct Offered {
-        QString kind;
+        QString kind, title;
         QJsonObject input, result;
     };
     void save(const QString& id, const std::function<void(jobs::Record&)>& change);

@@ -382,6 +382,7 @@ void DialogJobs::runEnded() {
     QString text;
     if (ok) {
         text = tr("Taken up again after Montage stopped: the project was copied to %1").arg(QString::fromStdString(run->result->projectPath));
+        if (run->result->passedOver > 0) text += tr(", %n file(s) already whole left as they were", nullptr, run->result->passedOver);
         if (!run->result->missing.empty()) text += tr(", %n file(s) missing", nullptr, int(run->result->missing.size()));
     } else if (cancelled) {
         text = tr("Stopped: %1").arg(title);
@@ -580,7 +581,8 @@ QJsonObject DialogJobs::applyResult(Task& t, const QJsonObject& result, QString*
     EditorState* state = stateFor(t);
     if (!t.watched) {
         // Nobody watched, so the project may have changed under it: what it was made for must still be where it was.
-        const QString moved = state ? movedNote(*t.shared->project, state->project(), t.input) : tr("no project is open");
+        QString moved = state ? movedNote(*t.shared->project, state->project(), t.input) : tr("no project is open");
+        if (moved.isEmpty() && kind.review) moved = tr("it waits to be looked over");
         if (!moved.isEmpty()) {
             if (note) *note = moved;
             return {};
@@ -605,8 +607,9 @@ void DialogJobs::taskFinished(const QString& id) {
         if (!note.isEmpty()) {
             // Kept, not applied: offered from the jobs list.
             save(id, [&](jobs::Record& r) { r.data["offered"] = note; });
-            if (folder_.isEmpty()) offeredHere_[id] = {t->kind, t->input, out.result};
-            text = tr("%1 has finished, but %2: its result was kept and not applied. Apply it from the jobs list.").arg(t->title, note);
+            if (folder_.isEmpty()) offeredHere_[id] = {t->kind, t->title, t->input, out.result};
+            text = tr("%1 has finished, but %2: its result was kept and not applied. Apply it from the Render Queue panel's task list.")
+                       .arg(t->title, note);
         } else if (text.isEmpty()) {
             text = tr("Finished: %1").arg(t->title);
         }
@@ -616,8 +619,10 @@ void DialogJobs::taskFinished(const QString& id) {
         text = t->resumed ? tr("Taken up again after Montage stopped, but it failed: %1").arg(out.error) : out.error;
     }
     if (!folder_.isEmpty()) end(id, ok, cancelled, out.error);
+    if (TaskKind kind; !ok && kindOf(t->kind, &kind) && kind.discard) kind.discard(t->input, t->shared->folder);
     const bool watched = t->watched;
-    const QString title = t->title;
+    const QString title = t->title, kindName = t->kind;
+    const QJsonObject input = t->input;
     for (auto it = tasks_.begin(); it != tasks_.end(); ++it)
         if (it->get() == t) {
             // (its watcher is in the middle of telling us: it goes once we are back in the event loop)
@@ -629,6 +634,7 @@ void DialogJobs::taskFinished(const QString& id) {
     emit taskEnded(id);
     if (!note.isEmpty()) emit offered(id, title, note);
     if (!watched && !text.isEmpty()) emit finished(id, ok, text);
+    if (!watched && ok && note.isEmpty()) emit taskDone(id, kindName, input, out.result);
     emit tasksChanged();
     startWaitingTasks();
 }
@@ -700,7 +706,7 @@ TaskOutcome DialogJobs::watch(const QString& id, QWidget* parent) {
 std::vector<DialogJobs::TaskInfo> DialogJobs::tasks() const {
     std::vector<TaskInfo> out;
     for (const auto& t : tasks_)
-        out.push_back({t->id, t->kind, t->title, t->shared->done.load(), t->started, t->shared->paused.load()});
+        out.push_back({t->id, t->kind, t->title, t->shared->done.load(), t->started, t->shared->paused.load(), {}});
     return out;
 }
 
@@ -770,6 +776,30 @@ bool DialogJobs::applyOffered(const QString& id, QString* said) {
     }
     emit tasksChanged();
     return true;
+}
+
+std::vector<DialogJobs::TaskInfo> DialogJobs::offeredTasks() const {
+    std::vector<TaskInfo> out;
+    if (folder_.isEmpty()) {
+        for (const auto& [id, o] : offeredHere_) out.push_back({id, o.kind, o.title, 1.0, false, false, tr("the project changed while it ran")});
+        return out;
+    }
+    std::vector<jobs::Record> all = jobs::all(kOwner, folder_);
+    std::sort(all.begin(), all.end(), [](const jobs::Record& a, const jobs::Record& b) { return a.order > b.order; });
+    for (const jobs::Record& r : all)
+        if (const QString note = r.data.value("offered").toString(); !note.isEmpty() && r.status == QLatin1String("done"))
+            out.push_back({r.id, r.kind, r.title, 1.0, false, false, note});
+    return out;
+}
+
+void DialogJobs::discardOffered(const QString& id) {
+    if (folder_.isEmpty()) {
+        offeredHere_.erase(id);
+    } else if (jobs::Record r; jobs::load(id, r, folder_) && r.data.contains("offered")) {
+        r.data.remove("offered");
+        jobs::save(r, folder_);
+    }
+    emit tasksChanged();
 }
 
 bool DialogJobs::latestResult(const QString& kind, const std::function<bool(const QJsonObject&)>& matches, QJsonObject* result,

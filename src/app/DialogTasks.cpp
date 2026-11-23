@@ -1,17 +1,26 @@
 // Montage — the kinds of task the app's dialogs run as background jobs (DialogJobs.h): for each, its work off the
 // interface thread, from the project as it was and the task's own input, and how its result is applied.
-#include <QCoreApplication>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <algorithm>
 #include <cmath>
 #include <mutex>
 
+#include <QApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QStorageInfo>
+#include <QTimer>
+
+#include "AutoMixDialog.h"
 #include "DialogJobs.h"
+#include "DialogTasks.h"
 #include "EditorState.h"
 #include "core/EditOps.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
+#include "render/RenderFarm.h"
+#include "render/SegmentedExport.h"
 
 namespace montage {
 
@@ -207,13 +216,426 @@ QJsonObject applySceneCuts(EditorState* state, const QJsonObject& input, const Q
     return out;
 }
 
+// --- Auto Mix ---
+
+QJsonArray pairsJson(const std::vector<std::pair<FrameTime, double>>& pairs) {
+    QJsonArray a;
+    for (const auto& [t, v] : pairs) a.append(QJsonArray{double(t), v});
+    return a;
+}
+
+std::vector<std::pair<FrameTime, double>> pairsFrom(const QJsonValue& v) {
+    std::vector<std::pair<FrameTime, double>> out;
+    for (const QJsonValue& x : v.toArray())
+        if (const QJsonArray pair = x.toArray(); pair.size() == 2) out.emplace_back(FrameTime(pair.at(0).toDouble()), pair.at(1).toDouble());
+    return out;
+}
+
+bool runMix(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    const std::vector<ClipMix> plan = planMix(*t.project, *s, MixOptions{}, t.progress, t.cancel, &t.error);
+    if (t.cancelled()) return false;
+    if (plan.empty() && !t.error.empty()) return false;
+    t.result["plan"] = mixPlanToJson(plan);
+    return true;
+}
+
+// The plan is looked over in the Auto Mix dialog, then written as one undo step.
+QJsonObject applyMixPlan(EditorState* state, const QJsonObject&, const QJsonObject& result) {
+    std::vector<ClipMix> plan = mixPlanFromJson(result.value("plan"));
+    if (plan.empty()) return {{"changed", -1}, {"message", QCoreApplication::translate("montage::AutoMixDialog", "There is no audio to mix")}};
+    AutoMixDialog dlg(state, std::move(plan), QApplication::activeWindow());
+    if (dlg.exec() != QDialog::Accepted) return {{"changed", -1}, {"failed", true}};
+    const int n = AutoMixDialog::apply(state, dlg.plan(), dlg.options());
+    return {{"changed", n}, {"message", QCoreApplication::translate("montage::AutoMixDialog", "Mixed %n clip(s)", "", n)}};
+}
+
+// --- Conform Check ---
+
+bool runConform(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    ConformOptions o;
+    o.referenceStart = FrameTime(t.input.value("referenceStart").toDouble());
+    const std::vector<ConformShot> shots = conformCheck(*t.project, *s, idOf(t.input.value("reference")), o, t.progress, t.cancel, &t.error);
+    if (t.cancelled()) return false;
+    // (a reference that cannot be read is a result too: the dialog says why)
+    t.result["shots"] = conformShotsToJson(shots);
+    t.result["error"] = QString::fromStdString(t.error);
+    t.error.clear();
+    return true;
+}
+
+// --- DCP and IMF masters ---
+//
+// Where the pictures can be coded apart from the package (JPEG 2000, as a render farm's segments are: Dcp.h's and
+// Imf.h's `codestreams`), they are coded a stretch at a time into a folder beside the package, and each finished
+// stretch is noted in the job's folder. Taken up again after a crash, the job passes over those stretches (their
+// files are not touched) and goes on from the one being written; the package is then made from the coded pictures
+// and the folder removed. It needs room for the pictures twice while it is made: without it, or where the pictures
+// cannot be coded apart (an encrypted DCP, IMF applications other than #2E, supplemental packages), the package is
+// made in one go, and starts again when taken up. A package made whose check was cut short is checked again, not
+// made again. A job stopped by hand, or that failed, leaves no pictures behind.
+
+const char* const kPicturesPrefix = ".montage-pictures-";
+
+QJsonArray stringsJson(const std::vector<std::string>& v) {
+    QJsonArray a;
+    for (const std::string& x : v) a.append(QString::fromStdString(x));
+    return a;
+}
+
+std::vector<std::string> stringsFrom(const QJsonValue& v) {
+    std::vector<std::string> out;
+    for (const QJsonValue& x : v.toArray()) out.push_back(x.toString().toStdString());
+    return out;
+}
+
+// Codes frames [0, frames) in stretches of `perPart` with `code(folder, from, to, progress)`, passing over those an
+// earlier run finished. `share`: how much of the job's progress this is. `made` lists the stretches: where each
+// starts and ends, whether it was passed over, and when its last picture was written (as its file says).
+bool codePictures(TaskRun& t, const QString& pictures, int64_t frames, int64_t perPart, double share, QJsonArray* made,
+                  const std::function<bool(const std::string& folder, int64_t from, int64_t to, const std::function<bool(double)>& progress)>& code) {
+    QDir().mkpath(pictures);
+    const int64_t parts = (frames + perPart - 1) / perPart;
+    for (int64_t i = 0; i < parts; ++i) {
+        const int64_t from = i * perPart, to = std::min(frames, from + perPart);
+        const QString name = QStringLiteral("pictures-%1-%2").arg(from).arg(to);
+        const QFileInfo last(QString::fromStdString(codestreamFile(pictures.toStdString(), to - 1)));
+        // (a stretch counts as finished only with its record and its last picture both there)
+        const bool finished = t.part(name, nullptr) && last.exists();
+        if (!finished) {
+            const bool ok = code(pictures.toStdString(), from, to, [&](double f) {
+                t.progress(share * (double(from) + f * double(to - from)) / double(frames));
+                return !t.cancelled();
+            });
+            if (!ok || t.cancelled()) return false;
+            t.keepPart(name, true);
+        }
+        t.progress(share * double(to) / double(frames));
+        if (made)
+            made->append(QJsonObject{{"from", double(from)},
+                                     {"to", double(to)},
+                                     {"passedOver", finished},
+                                     {"written", double(QFileInfo(last.filePath()).lastModified().toMSecsSinceEpoch())}});
+    }
+    return true;
+}
+
+// Whether the folder the package goes in has room for its pictures a second time (`bytes`, a generous guess).
+bool roomFor(const QString& parent, double bytes) {
+    QDir().mkpath(parent);
+    const QStorageInfo disk(parent);
+    return disk.isValid() && double(disk.bytesAvailable()) > 2.2 * bytes;
+}
+
+QString picturesFolder(const QString& jobFolder, const QString& parent) {
+    return jobFolder.isEmpty() || parent.isEmpty() ? QString() : QDir(parent).filePath(QLatin1String(kPicturesPrefix) + QFileInfo(jobFolder).fileName());
+}
+
+void removePictures(const QString& pictures) {
+    if (!pictures.isEmpty() && QFileInfo(pictures).fileName().startsWith(QLatin1String(kPicturesPrefix))) QDir(pictures).removeRecursively();
+}
+
+void discardPictures(const QJsonObject& input, const QString& folder) { removePictures(picturesFolder(folder, input.value("parent").toString())); }
+
+// A package an earlier run of this job made (its check cut short): where it is, if it is still there.
+bool madeBefore(const TaskRun& t, QJsonObject* made) {
+    QJsonValue kept;
+    if (!t.part(QStringLiteral("package"), &kept) || !kept.isObject()) return false;
+    *made = kept.toObject();
+    return QFileInfo(made->value("folder").toString()).isDir();
+}
+
+bool runDcp(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    DcpSettings settings;
+    if (!dcpSettingsFromJson(t.input.value("settings").toObject(), settings, &t.error)) return false;
+    const QString parent = t.input.value("parent").toString();
+    const int64_t frames = dcpPackageFrames(*s, settings);
+    const QString pictures = picturesFolder(t.folder, parent);
+    DcpResult made;
+    QJsonObject before;
+    const bool already = madeBefore(t, &before);
+    if (already) made = dcpResultFromJson(before);
+    const bool apart = !already && !pictures.isEmpty() && !settings.encrypt && settings.codestreams.empty() && frames > 0 &&
+                       (QFileInfo::exists(pictures) ||
+                        roomFor(parent, double(frames) * 1.4e6 * (settings.resolution == "4k" ? 2 : 1) * (settings.stereo ? 2 : 1)));
+    QJsonArray stretches = already ? before.value("pictures").toArray() : QJsonArray();
+    const double share = apart ? 0.75 : 0;
+    if (apart) {
+        const int64_t perPart = std::max<int64_t>(1, t.input.value("partFrames").toInt(10 * std::max(1, dcpFrameRate(*s, settings.fps))));
+        if (!codePictures(t, pictures, frames, perPart, share, &stretches, [&](const std::string& folder, int64_t from, int64_t to, const auto& progress) {
+                DcpSettings part = settings;
+                part.codestreams = folder;
+                part.codeFrom = from, part.codeTo = to;
+                return exportDcp(*t.project, *s, part, parent.toStdString(), nullptr, progress, &t.error);
+            }))
+            return false;
+        settings.codestreams = pictures.toStdString();
+    }
+    if (!already) {
+        if (!exportDcp(*t.project, *s, settings, parent.toStdString(), &made, [&](double f) {
+                t.progress(share + (0.85 - share) * f);
+                return !t.cancelled();
+            }, &t.error))
+            return false;
+        QJsonObject kept = dcpResultToJson(made);
+        kept["pictures"] = stretches;
+        t.keepPart(QStringLiteral("package"), kept);
+    }
+    removePictures(pictures);
+    // Then checked as a server would, reading every file back.
+    std::vector<std::string> advice;
+    const std::vector<std::string> issues = verifyDcp(made.folder, [&](double f) {
+        t.progress(0.85 + 0.15 * f);
+        return !t.cancelled();
+    }, &advice);
+    t.result = dcpResultToJson(made);
+    t.result["issues"] = stringsJson(issues);
+    t.result["advice"] = stringsJson(advice);
+    t.result["pictures"] = stretches;
+    if (t.cancelled()) {
+        // (the package is made: only its check was stopped)
+        t.result["stopped"] = true;
+    }
+    return true;
+}
+
+bool runImf(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    ImfSettings settings;
+    if (!imfSettingsFromJson(t.input.value("settings").toObject(), settings, &t.error)) return false;
+    const QString parent = t.input.value("parent").toString();
+    const QString pictures = picturesFolder(t.folder, parent);
+    std::string why;
+    const int64_t frames = settings.application == 2 && settings.supplementOf.empty() ? imfCompositionFrames(*s, settings, &why) : 0;
+    ImfResult made;
+    QJsonObject before;
+    const bool already = madeBefore(t, &before);
+    if (already) made = imfResultFromJson(before);
+    // (a generous guess: half the uncompressed picture)
+    const bool apart = !already && !pictures.isEmpty() && settings.codestreams.empty() && frames > 0 &&
+                       (QFileInfo::exists(pictures) || roomFor(parent, double(frames) * double(s->width) * double(s->height) * 2.25));
+    QJsonArray stretches = already ? before.value("pictures").toArray() : QJsonArray();
+    const double share = apart ? 0.75 : 0;
+    if (apart) {
+        const int64_t perPart = std::max<int64_t>(1, t.input.value("partFrames").toInt(int(std::max(24.0, 10 * s->fpsValue()))));
+        if (!codePictures(t, pictures, frames, perPart, share, &stretches, [&](const std::string& folder, int64_t from, int64_t to, const auto& progress) {
+                ImfSettings part = settings;
+                part.codestreams = folder;
+                part.codeFrom = from, part.codeTo = to;
+                return exportImf(*t.project, *s, part, parent.toStdString(), nullptr, progress, &t.error);
+            }))
+            return false;
+        settings.codestreams = pictures.toStdString();
+    }
+    if (!already) {
+        if (!exportImf(*t.project, *s, settings, parent.toStdString(), &made, [&](double f) {
+                t.progress(share + (0.85 - share) * f);
+                return !t.cancelled();
+            }, &t.error))
+            return false;
+        QJsonObject kept = imfResultToJson(made);
+        kept["pictures"] = stretches;
+        t.keepPart(QStringLiteral("package"), kept);
+    }
+    removePictures(pictures);
+    std::vector<std::string> advice;
+    const std::vector<std::string> issues = verifyImf(made.folder, [&](double f) {
+        t.progress(0.85 + 0.15 * f);
+        return !t.cancelled();
+    }, &advice);
+    t.result = imfResultToJson(made);
+    t.result["issues"] = stringsJson(issues);
+    t.result["advice"] = stringsJson(advice);
+    t.result["pictures"] = stretches;
+    if (t.cancelled()) t.result["stopped"] = true;
+    return true;
+}
+
 }  // namespace
+
+QJsonObject dcpResultToJson(const DcpResult& r) {
+    return QJsonObject{{"folder", QString::fromStdString(r.folder)}, {"name", QString::fromStdString(r.name)}, {"cpl", QString::fromStdString(r.cpl)},
+                       {"frames", double(r.frames)},       {"fps", r.fps},                 {"width", r.width},
+                       {"height", r.height},               {"channels", r.channels},       {"immersive", r.immersive},
+                       {"iabBedChannels", r.iabBedChannels}, {"iabObjects", r.iabObjects}, {"cinemaProfile", r.cinemaProfile},
+                       {"stereo", r.stereo},               {"encrypted", r.encrypted},     {"signedPackage", r.signedPackage},
+                       {"subtitleCount", r.subtitleCount}, {"cplId", QString::fromStdString(r.cplId)},
+                       {"dkdm", QString::fromStdString(r.dkdm)}, {"leqm", r.leqm},         {"leqmLimit", r.leqmLimit}};
+}
+
+DcpResult dcpResultFromJson(const QJsonObject& o) {
+    DcpResult r;
+    r.folder = o.value("folder").toString().toStdString();
+    r.name = o.value("name").toString().toStdString();
+    r.cpl = o.value("cpl").toString().toStdString();
+    r.frames = int64_t(o.value("frames").toDouble());
+    r.fps = o.value("fps").toInt(24);
+    r.width = o.value("width").toInt();
+    r.height = o.value("height").toInt();
+    r.channels = o.value("channels").toInt(6);
+    r.immersive = o.value("immersive").toBool();
+    r.iabBedChannels = o.value("iabBedChannels").toInt();
+    r.iabObjects = o.value("iabObjects").toInt();
+    r.cinemaProfile = o.value("cinemaProfile").toBool(true);
+    r.stereo = o.value("stereo").toBool();
+    r.encrypted = o.value("encrypted").toBool();
+    r.signedPackage = o.value("signedPackage").toBool();
+    r.subtitleCount = o.value("subtitleCount").toInt();
+    r.cplId = o.value("cplId").toString().toStdString();
+    r.dkdm = o.value("dkdm").toString().toStdString();
+    r.leqm = o.value("leqm").toDouble();
+    r.leqmLimit = o.value("leqmLimit").toDouble();
+    return r;
+}
+
+QJsonObject imfResultToJson(const ImfResult& r) {
+    return QJsonObject{{"folder", QString::fromStdString(r.folder)}, {"cpl", QString::fromStdString(r.cpl)}, {"frames", double(r.frames)},
+                       {"rateNum", double(r.rateNum)},     {"rateDen", double(r.rateDen)}, {"width", r.width},
+                       {"height", r.height},               {"bits", r.bits},               {"channels", r.channels},
+                       {"rsiz", int(r.rsiz)},              {"colour", QString::fromStdString(r.colour)},
+                       {"sounds", r.sounds},               {"texts", r.texts},             {"edition", r.edition},
+                       {"events", r.events},               {"newEvents", r.newEvents},     {"supplemental", r.supplemental},
+                       {"carriedEventTracks", r.carriedEventTracks}, {"leftEventTracks", r.leftEventTracks},
+                       {"codedFrames", double(r.codedFrames)}, {"newSamples", double(r.newSamples)},
+                       {"trackFiles", stringsJson(r.trackFiles)}, {"application", r.application},
+                       {"prores", QString::fromStdString(r.prores)}, {"fields", QString::fromStdString(r.fields)},
+                       {"ycbcr444", r.ycbcr444},           {"fullRange", r.fullRange},
+                       {"outputTransform", QString::fromStdString(r.outputTransform)}, {"targetFrames", r.targetFrames},
+                       {"amf", QString::fromStdString(r.amf)}, {"immersive", r.immersive}, {"iabBedChannels", r.iabBedChannels},
+                       {"iabObjects", r.iabObjects},       {"sadm", r.sadm},               {"adm", r.adm},
+                       {"admBedChannels", r.admBedChannels}, {"admObjects", r.admObjects}};
+}
+
+ImfResult imfResultFromJson(const QJsonObject& o) {
+    ImfResult r;
+    r.folder = o.value("folder").toString().toStdString();
+    r.cpl = o.value("cpl").toString().toStdString();
+    r.frames = int64_t(o.value("frames").toDouble());
+    r.rateNum = uint32_t(o.value("rateNum").toDouble(24));
+    r.rateDen = uint32_t(o.value("rateDen").toDouble(1));
+    r.width = o.value("width").toInt();
+    r.height = o.value("height").toInt();
+    r.bits = o.value("bits").toInt();
+    r.channels = o.value("channels").toInt();
+    r.rsiz = uint16_t(o.value("rsiz").toInt());
+    r.colour = o.value("colour").toString().toStdString();
+    r.sounds = o.value("sounds").toInt();
+    r.texts = o.value("texts").toInt();
+    r.edition = o.value("edition").toInt();
+    r.events = o.value("events").toInt();
+    r.newEvents = o.value("newEvents").toInt();
+    r.carriedEventTracks = o.value("carriedEventTracks").toInt();
+    r.leftEventTracks = o.value("leftEventTracks").toInt();
+    r.supplemental = o.value("supplemental").toBool();
+    r.codedFrames = int64_t(o.value("codedFrames").toDouble());
+    r.newSamples = int64_t(o.value("newSamples").toDouble());
+    r.trackFiles = stringsFrom(o.value("trackFiles"));
+    r.application = o.value("application").toInt(2);
+    r.prores = o.value("prores").toString().toStdString();
+    r.fields = o.value("fields").toString().toStdString();
+    r.ycbcr444 = o.value("ycbcr444").toBool();
+    r.fullRange = o.value("fullRange").toBool();
+    r.outputTransform = o.value("outputTransform").toString().toStdString();
+    r.targetFrames = o.value("targetFrames").toInt();
+    r.amf = o.value("amf").toString().toStdString();
+    r.immersive = o.value("immersive").toBool();
+    r.iabBedChannels = o.value("iabBedChannels").toInt();
+    r.iabObjects = o.value("iabObjects").toInt();
+    r.sadm = o.value("sadm").toBool();
+    r.adm = o.value("adm").toBool();
+    r.admBedChannels = o.value("admBedChannels").toInt();
+    r.admObjects = o.value("admObjects").toInt();
+    return r;
+}
+
+QJsonArray mixPlanToJson(const std::vector<ClipMix>& plan) {
+    QJsonArray a;
+    for (const ClipMix& m : plan)
+        a.append(QJsonObject{{"clip", QString::number(m.clip)},
+                             {"guess", QJsonObject{{"role", int(m.guess.role)}, {"speech", m.guess.speech},     {"music", m.guess.music},
+                                                   {"loudness", m.guess.loudness}, {"pauses", m.guess.pauses}, {"syllabic", m.guess.syllabic},
+                                                   {"beat", m.guess.beat}}},
+                             {"role", int(m.role)},
+                             {"gain", m.gainDb},
+                             {"ride", pairsJson(m.ride)},
+                             {"shortTerm", pairsJson(m.shortTerm)}});
+    return a;
+}
+
+std::vector<ClipMix> mixPlanFromJson(const QJsonValue& v) {
+    std::vector<ClipMix> out;
+    for (const QJsonValue& x : v.toArray()) {
+        const QJsonObject o = x.toObject(), g = o.value("guess").toObject();
+        ClipMix m;
+        m.clip = idOf(o.value("clip"));
+        m.guess.role = AudioRole(g.value("role").toInt());
+        m.guess.speech = g.value("speech").toDouble();
+        m.guess.music = g.value("music").toDouble();
+        m.guess.loudness = g.value("loudness").toDouble(-70);
+        m.guess.pauses = g.value("pauses").toDouble();
+        m.guess.syllabic = g.value("syllabic").toDouble();
+        m.guess.beat = g.value("beat").toDouble();
+        m.role = AudioRole(o.value("role").toInt());
+        m.gainDb = o.value("gain").toDouble();
+        m.ride = pairsFrom(o.value("ride"));
+        m.shortTerm = pairsFrom(o.value("shortTerm"));
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
+QJsonArray conformShotsToJson(const std::vector<ConformShot>& shots) {
+    QJsonArray a;
+    for (const ConformShot& s : shots) {
+        QJsonArray keys;
+        for (const ConformKey& k : s.keys) keys.append(QJsonArray{double(k.at), k.posX, k.posY, k.scale, k.rotation});
+        a.append(QJsonObject{{"clip", QString::number(s.clip)}, {"start", double(s.start)},        {"length", double(s.length)},
+                             {"verdict", int(s.verdict)},       {"score", s.score},                {"slip", double(s.slip)},
+                             {"media", QString::number(s.media)}, {"sourceIn", s.sourceIn},        {"keys", keys},
+                             {"details", QString::fromStdString(s.details)}});
+    }
+    return a;
+}
+
+std::vector<ConformShot> conformShotsFromJson(const QJsonValue& v) {
+    std::vector<ConformShot> out;
+    for (const QJsonValue& x : v.toArray()) {
+        const QJsonObject o = x.toObject();
+        ConformShot s;
+        s.clip = idOf(o.value("clip"));
+        s.start = FrameTime(o.value("start").toDouble());
+        s.length = FrameTime(o.value("length").toDouble());
+        s.verdict = ConformVerdict(o.value("verdict").toInt());
+        s.score = o.value("score").toDouble();
+        s.slip = FrameTime(o.value("slip").toDouble());
+        s.media = idOf(o.value("media"));
+        s.sourceIn = o.value("sourceIn").toDouble();
+        for (const QJsonValue& kv : o.value("keys").toArray()) {
+            const QJsonArray k = kv.toArray();
+            if (k.size() != 5) continue;
+            s.keys.push_back({FrameTime(k.at(0).toDouble()), k.at(1).toDouble(), k.at(2).toDouble(), k.at(3).toDouble(), k.at(4).toDouble()});
+        }
+        s.details = o.value("details").toString().toStdString();
+        out.push_back(std::move(s));
+    }
+    return out;
+}
 
 void registerDialogTaskKinds() {
     static std::once_flag once;
     std::call_once(once, [] {
         DialogJobs::registerKind(QStringLiteral("auto-duck"), {runDuck, applyDuck});
         DialogJobs::registerKind(QStringLiteral("scene-detect"), {runSceneCuts, applySceneCuts});
+        DialogJobs::registerKind(QStringLiteral("auto-mix"), {runMix, applyMixPlan, true});
+        DialogJobs::registerKind(QStringLiteral("conform-check"), {runConform, nullptr});
+        DialogJobs::registerKind(QStringLiteral("dcp"), {runDcp, nullptr, false, discardPictures});
+        DialogJobs::registerKind(QStringLiteral("imf"), {runImf, nullptr, false, discardPictures});
     });
 }
 

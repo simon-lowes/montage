@@ -180,6 +180,7 @@ extern "C" {
 #include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
 #include "DialogJobs.h"
+#include "DialogTasks.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
 #include "render/BackgroundJobs.h"
@@ -252,6 +253,7 @@ extern "C" {
 #include "render/AvidMedia.h"
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
+#include "render/RenderFarm.h"
 #include "render/Compositor.h"
 #include "render/GpuCompositor.h"
 #include "render/AutoBroll.h"
@@ -821,8 +823,16 @@ void MainWindow::buildPanels() {
         statusBar()->showMessage(tr("Taking up again what Montage was doing when it stopped: %1").arg(title), 8000);
     });
     connect(dialogJobs_, &DialogJobs::finished, this, [this](const QString&, bool, const QString& text) { statusBar()->showMessage(text, 10000); });
+    // A package made with its dialog closed is reported when it ends, as a watched one is.
+    connect(dialogJobs_, &DialogJobs::taskDone, this, [this](const QString&, const QString& kind, const QJsonObject&, const QJsonObject& result) {
+        if (kind == QLatin1String("dcp")) dcpMade(result, nullptr);
+        if (kind == QLatin1String("imf")) imfMade(result, nullptr);
+    });
     dialogJobs_->resume();
-    queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
+    auto* queuePanel = new RenderQueuePanel(queue_, this);
+    queuePanel->setDialogJobs(dialogJobs_);
+    connect(queuePanel, &RenderQueuePanel::taskSaid, this, [this](const QString& text) { statusBar()->showMessage(text, 8000); });
+    queueDock_ = makeDock(tr("Render Queue"), "renderqueue", queuePanel);
     production_ = new ProductionPanel(state_, this);
     productionDock_ = makeDock(tr("Production"), "production", production_);
     connect(production_, &ProductionPanel::openRequested, this, [this](const QString& path, bool readOnly) {
@@ -8048,59 +8058,31 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
         state_->message(tr("Nothing to export"));
         return {};
     }
-    // Made from a copy, off the UI thread (a feature takes a while: every frame is compressed to JPEG 2000).
-    const Project project = state_->project();
-    const Sequence seq = *s;
-    QProgressDialog progress(tr("Making the DCP of %1...").arg(QString::fromStdString(seq.name)), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    std::atomic<int> done{0};
-    std::atomic<bool> cancel{false};
-    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
-    DcpResult result;
-    std::string err;
-    QFutureWatcher<bool> watcher;
-    QEventLoop loop;
-    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, this, [&] { progress.setValue(done.load()); });
-    tick.start(100);
-    // Then checked as a server would, reading every file back (also off the UI thread: a feature is many gigabytes).
-    std::vector<std::string> issues, advice;
-    std::atomic<bool> checking{false};
-    connect(&tick, &QTimer::timeout, this, [&] {
-        if (checking.load()) progress.setLabelText(tr("Checking the DCP of %1...").arg(QString::fromStdString(seq.name)));
-    });
-    watcher.setFuture(QtConcurrent::run([&] {
-        if (!exportDcp(project, seq, settings, parent.toStdString(), &result, [&](double f) {
-                done = int(f * 850);
-                return !cancel.load();
-            }, &err))
-            return false;
-        checking = true;
-        issues = verifyDcp(result.folder, [&](double f) {
-            done = 850 + int(f * 150);
-            return !cancel.load();
-        }, &advice);
-        return true;
-    }));
-    if (!watcher.isFinished()) loop.exec();
-    tick.stop();
-    progress.close();
-    if (!watcher.result()) {
-        state_->message(cancel ? tr("DCP cancelled") : tr("No DCP: %1").arg(QString::fromStdString(err)), 8000);
+    // A background job, made from a copy off the UI thread (a feature takes a while: every frame is compressed to
+    // JPEG 2000) and then checked as a server would. Its dialog can be closed: it goes on in the jobs list.
+    const QJsonObject input{{"sequence", QString::number(qulonglong(s->id))}, {"parent", parent}, {"settings", dcpSettingsToJson(settings)}};
+    const TaskOutcome made = dialogJobs_->run(state_, QStringLiteral("dcp"), tr("Making the DCP of %1...").arg(QString::fromStdString(s->name)), input, this);
+    if (made.how == TaskOutcome::Background) return {};
+    if (made.how != TaskOutcome::Done) {
+        state_->message(made.how == TaskOutcome::Cancelled ? tr("DCP cancelled") : tr("No DCP: %1").arg(made.error), 8000);
         return {};
     }
-    if (cancel.load() && !issues.empty() && issues.back() == "Stopped") {
+    return dcpMade(made.result, problems);
+}
+
+QString MainWindow::dcpMade(const QJsonObject& made, QStringList* problems) {
+    const DcpResult result = dcpResultFromJson(made);
+    const QString folder = QString::fromStdString(result.folder);
+    if (made.value("stopped").toBool()) {
         state_->message(tr("DCP %1 made; its check was stopped").arg(QString::fromStdString(result.name)), 8000);
-        return QString::fromStdString(result.folder);
+        return folder;
     }
-    QStringList found;
-    for (const std::string& i : issues) found << QString::fromStdString(i);
+    QStringList found, advice;
+    for (const QJsonValue& i : made.value("issues").toArray()) found << i.toString();
+    for (const QJsonValue& i : made.value("advice").toArray()) advice << i.toString();
     if (result.overLoudnessLimit())
         found << tr("its sound is %1 Leq(M), over the %2 its kind is held to").arg(result.leqm, 0, 'f', 1).arg(result.leqmLimit, 0, 'f', 0);
     if (problems) *problems = found;
-    const QString folder = QString::fromStdString(result.folder);
     if (!found.isEmpty())
         state_->message(tr("DCP %1 made, but the check found: %2").arg(QString::fromStdString(result.name), found.join("; ")), 12000);
     else if (!result.cinemaProfile)
@@ -8112,9 +8094,8 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
         QString more;
         if (result.encrypted) more += tr(" It is encrypted: make KDMs for the cinemas' servers with File › Make KDMs (its keys are kept in %1).")
                                           .arg(QDir::toNativeSeparators(QString::fromStdString(result.dkdm)));
-        if (!advice.empty())
-            more += tr(" Advice: %1").arg(QString::fromStdString(advice.front())) +
-                    (advice.size() > 1 ? tr(" (and %n more)", nullptr, int(advice.size() - 1)) : QString());
+        if (!advice.isEmpty())
+            more += tr(" Advice: %1").arg(advice.front()) + (advice.size() > 1 ? tr(" (and %n more)", nullptr, int(advice.size() - 1)) : QString());
         state_->message(tr("DCP %1 made and checked (%2 fps, %3 x %4, %5 channels): copy the folder to a drive for the cinema.")
                                 .arg(QString::fromStdString(result.name))
                                 .arg(result.fps)
@@ -8134,67 +8115,50 @@ QString MainWindow::exportImfTo(const QString& parent, const ImfSettings& settin
         state_->message(tr("Nothing to export"));
         return {};
     }
-    // Made from a copy, off the UI thread, then checked there too (every frame is compressed, every file read back).
-    const Project project = state_->project();
-    const Sequence seq = *s;
-    QProgressDialog progress(tr("Making the IMF master of %1...").arg(QString::fromStdString(seq.name)), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    std::atomic<int> done{0};
-    std::atomic<bool> cancel{false}, checking{false};
-    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
-    ImfResult result;
-    std::string err;
-    std::vector<std::string> issues;
-    QFutureWatcher<bool> watcher;
-    QEventLoop loop;
-    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, this, [&] {
-        progress.setValue(done.load());
-        if (checking.load()) progress.setLabelText(tr("Checking the IMF master of %1...").arg(QString::fromStdString(seq.name)));
-    });
-    tick.start(100);
-    watcher.setFuture(QtConcurrent::run([&] {
-        if (!exportImf(project, seq, settings, parent.toStdString(), &result, [&](double f) {
-                done = int(f * 850);
-                return !cancel.load();
-            }, &err))
-            return false;
-        checking = true;
-        issues = verifyImf(result.folder, [&](double f) {
-            done = 850 + int(f * 150);
-            return !cancel.load();
-        });
-        return true;
-    }));
-    if (!watcher.isFinished()) loop.exec();
-    tick.stop();
-    progress.close();
-    if (!watcher.result()) {
-        state_->message(cancel ? tr("IMF master cancelled") : tr("No IMF master: %1").arg(QString::fromStdString(err)), 8000);
+    // A background job, made from a copy off the UI thread, then checked there too (every frame is compressed, every
+    // file read back). Its dialog can be closed: it goes on in the jobs list.
+    const QJsonObject input{{"sequence", QString::number(qulonglong(s->id))}, {"parent", parent}, {"settings", imfSettingsToJson(settings)}};
+    const TaskOutcome made =
+        dialogJobs_->run(state_, QStringLiteral("imf"), tr("Making the IMF master of %1...").arg(QString::fromStdString(s->name)), input, this);
+    if (made.how == TaskOutcome::Background) return {};
+    if (made.how != TaskOutcome::Done) {
+        state_->message(made.how == TaskOutcome::Cancelled ? tr("IMF master cancelled") : tr("No IMF master: %1").arg(made.error), 8000);
         return {};
     }
+    return imfMade(made.result, problems);
+}
+
+QString MainWindow::imfMade(const QJsonObject& made, QStringList* problems) {
+    const ImfResult result = imfResultFromJson(made);
     const QString folder = QString::fromStdString(result.folder);
     const QString name = QFileInfo(folder).fileName();
-    if (cancel.load() && !issues.empty() && issues.back() == "Stopped") {
+    if (made.value("stopped").toBool()) {
         state_->message(tr("IMF master %1 made; its check was stopped").arg(name), 8000);
         return folder;
     }
     QStringList found;
-    for (const std::string& i : issues) found << QString::fromStdString(i);
+    for (const QJsonValue& i : made.value("issues").toArray()) found << i.toString();
     if (problems) *problems = found;
     if (!found.isEmpty())
         state_->message(tr("IMF master %1 made, but the check found: %2").arg(name, found.join("; ")), 12000);
-    else
+    else {
+        // What else to know: what the check advises (for a DPP master, what the DPP's own checks may still ask for).
+        QString more;
+        const QJsonArray advice = made.value("advice").toArray();
+        if (!advice.isEmpty())
+            more = tr(" Advice: %1").arg(advice.first().toString()) + (advice.size() > 1 ? tr(" (and %n more)", nullptr, int(advice.size() - 1)) : QString());
+        if (result.leftEventTracks > 0)
+            more += tr(" %n events track(s) of the earlier package end before this one does and were left out.", nullptr, result.leftEventTracks);
         state_->message(tr("IMF master %1 made and checked (%2 x %3, %4-bit %5, %6 channels)")
-                            .arg(name)
-                            .arg(result.width)
-                            .arg(result.height)
-                            .arg(result.bits)
-                            .arg(QString::fromStdString(result.colour))
-                            .arg(result.channels),
-                        12000);
+                                .arg(name)
+                                .arg(result.width)
+                                .arg(result.height)
+                                .arg(result.bits)
+                                .arg(QString::fromStdString(result.colour))
+                                .arg(result.channels) +
+                            more,
+                        15000);
+    }
     return folder;
 }
 
@@ -8578,6 +8542,11 @@ void MainWindow::exportImfDialog() {
     events->setChecked(true);
     events->setToolTip(tr("Event-based metadata (SMPTE ST 2067-206) on a track of its own, read back as markers when the package is imported"));
     form->addRow(QString(), events);
+    auto* eventsJson = new QCheckBox(tr("Markers document as JSON"), &dlg);
+    eventsJson->setObjectName(QStringLiteral("imfEventsJson"));
+    eventsJson->setToolTip(tr("The events document as JSON instead of XML; a supplemental keeps the earlier package's form"));
+    form->addRow(QString(), eventsJson);
+    connect(events, &QCheckBox::toggled, eventsJson, [events, eventsJson] { eventsJson->setEnabled(events->isEnabled() && events->isChecked()); });
     // Application ProRes: the profile (4:2:2 Y'CbCr, or 4:4:4 R'G'B').
     auto* proresProfile = new QComboBox(&dlg);
     proresProfile->setObjectName(QStringLiteral("imfProResProfile"));
@@ -8774,7 +8743,9 @@ void MainWindow::exportImfDialog() {
         const bool eightK = app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026);
         offer(size, "8k", eightK);
         if (!eightK && size->currentData().toString() == "8k") size->setCurrentIndex(size->findData("uhd"));
-        events->setEnabled(app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026));
+        // (markers travel in every application; in #2E from the 2026 edition)
+        events->setEnabled(!app2 || supplemental->isChecked() || edition->currentData().toInt() == 2026);
+        eventsJson->setEnabled(events->isEnabled() && events->isChecked());
         offer(colour, "p3d65-pq", !dpp);
         offer(proresProfile, "422", !dpp);
         offer(proresProfile, "lt", !dpp);
@@ -8866,6 +8837,7 @@ void MainWindow::exportImfDialog() {
     st.application = application->currentData().toInt();
     st.edition = edition->currentData().toInt();
     st.events = events->isEnabled() && events->isChecked();
+    st.eventsJson = eventsJson->isEnabled() && eventsJson->isChecked();
     if (st.application == 45 || st.application == 59) {
         st.prores = proresProfile->currentData().toString().toStdString();
         if (fields->isEnabled()) st.fields = fields->currentData().toString().toStdString();

@@ -2,26 +2,27 @@
 
 #include <QComboBox>
 #include <QDialogButtonBox>
-#include <QEventLoop>
+#include <QCryptographicHash>
+#include <QDateTime>
 #include <QFormLayout>
-#include <QFutureWatcher>
 #include <QHeaderView>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
-#include <QProgressDialog>
 #include <QPushButton>
 #include <QTableWidget>
-#include <QTimer>
 #include <QVBoxLayout>
-#include <QtConcurrent>
 #include <map>
 #include <memory>
 #include <set>
 
+#include "DialogJobs.h"
+#include "DialogTasks.h"
 #include "EditorState.h"
 #include "Theme.h"
 #include "core/EditOps.h"
 #include "core/History.h"
+#include "core/ProjectIO.h"
 #include "core/MediaLog.h"
 
 namespace montage {
@@ -110,8 +111,22 @@ ConformCheckDialog::ConformCheckDialog(EditorState* state, QWidget* parent) : QD
     lay->addWidget(buttons);
     updateButtons();
     connect(state_, &EditorState::projectChanged, this, [this] {
+        if (!editing_) changed_ = true;
         if (!editing_ && !shots_.empty()) forget();
     });
+    // The last check of this sequence, where the project is still as it was checked (a check left to run in the
+    // background, its dialog closed): its shots are listed again.
+    QJsonObject result, input;
+    QString now;  // (worked out only if there is a check of this sequence to compare with)
+    if (seq && DialogJobs::of(this)->latestResult(QStringLiteral("conform-check"), [&](const QJsonObject& in) {
+            if (in.value("sequence").toString() != QString::number(sequence_)) return false;
+            if (now.isEmpty()) now = projectToken();
+            return in.value("state").toString() == now;
+        }, &result, &input)) {
+        setReference(Id(input.value("reference").toString().toULongLong()));
+        setReferenceStart(FrameTime(input.value("referenceStart").toDouble()));
+        showResult(result);
+    }
 }
 
 void ConformCheckDialog::forget() {
@@ -141,41 +156,53 @@ bool ConformCheckDialog::runCheck() {
         return false;
     }
     const Id ref = Id(reference_->currentData().toLongLong());
-    const Project project = state_->project();
-    const Sequence sequence = *seq;
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    auto done = std::make_shared<std::atomic<int>>(0);
-    QProgressDialog progress(tr("Comparing the shots with the reference…"), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(done->load()); });
-    tick.start(100);
-    struct Outcome {
-        std::vector<ConformShot> shots;
-        std::string error;
-    };
-    QFutureWatcher<Outcome> watcher;
-    QEventLoop wait;
-    connect(&watcher, &QFutureWatcher<Outcome>::finished, &wait, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([project, sequence, ref, o, cancel, done] {
-        Outcome out;
-        out.shots = conformCheck(project, sequence, ref, o, [done](double f) { *done = int(f * 999); }, cancel.get(), &out.error);
-        return out;
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    tick.stop();
-    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
-    progress.close();
-    if (*cancel) return false;
-    const Outcome out = watcher.result();
+    // A background job (DialogJobs.h). Watched, its shots are listed when it ends. Left to run, they are listed when
+    // it ends if this dialog is still open and nothing has changed, and are kept in the job store either way: the
+    // dialog opened again on the project as it was checked lists them.
+    DialogJobs* jobs = DialogJobs::of(this);
+    const QString id = jobs->start(state_, QStringLiteral("conform-check"), tr("Comparing the shots with the reference…"), checkInput(ref, o.referenceStart));
+    changed_ = false;
+    const TaskOutcome out = jobs->watch(id, this);
+    if (out.how == TaskOutcome::Background) {
+        summary_->setText(tr("Checking in the background: the shots are listed here when it is done."));
+        connect(jobs, &DialogJobs::taskEnded, this, [this, id, jobs](const QString& ended) {
+            if (ended != id) return;
+            QJsonObject result;
+            const bool found = jobs->latestResult(QStringLiteral("conform-check"), [&](const QJsonObject& in) { return in.value("job").toString() == jobToken_; }, &result);
+            if (changed_) summary_->setText(tr("The project has changed since the check: check again."));
+            else if (found) showResult(result);
+        });
+        return false;
+    }
+    if (!out.done()) return false;
     if (!state_->project().findSequence(sequence_)) return false;  // (deleted while it ran)
-    shots_ = out.shots;
+    return showResult(out.result);
+}
+
+QJsonObject ConformCheckDialog::checkInput(Id reference, FrameTime referenceStart) {
+    // (what it was asked, and the project's state then: results are shown again only for the same state)
+    jobToken_ = QStringLiteral("%1-%2").arg(QDateTime::currentMSecsSinceEpoch()).arg(quintptr(this));
+    return QJsonObject{{"sequence", QString::number(sequence_)},
+                       {"reference", QString::number(reference)},
+                       {"referenceStart", double(referenceStart)},
+                       {"state", projectToken()},
+                       {"job", jobToken_}};
+}
+
+QString ConformCheckDialog::projectToken() const {
+    return QString::fromLatin1(QCryptographicHash::hash(QByteArray::fromStdString(projectToJson(state_->project())), QCryptographicHash::Sha1).toHex());
+}
+
+bool ConformCheckDialog::showResult(const QJsonObject& result) {
+    const Sequence* seq = state_->project().findSequence(sequence_);
+    if (!seq) return false;
+    const Sequence& sequence = *seq;
+    shots_ = conformShotsFromJson(result.value("shots"));
+    const std::string error = result.value("error").toString().toStdString();
     fixed_.assign(shots_.size(), false);
     marked_ = false;
-    if (shots_.empty() && !out.error.empty()) {
-        summary_->setText(QString::fromStdString(out.error));
+    if (shots_.empty() && !error.empty()) {
+        summary_->setText(QString::fromStdString(error));
         table_->setRowCount(0);
         updateButtons();
         return false;
