@@ -27047,6 +27047,26 @@ colorspaces:
         d = worst(pixels(plain), cpu);
         QVERIFY2(d <= 1e-6f, qPrintable(QString("switched off: %1").arg(d)));
         QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
+        // (nightly 23 Nov) An OpenGL render that fails now and then (twice in a row here, as on a card short of memory)
+        // is made in memory into the texture, and the plug-in is still given textures; the next render goes on the GPU
+        // again, and it starts the count again. (One failure kept textures from the plug-in for the session.)
+        for (int round = 0; round < 2; ++round) {
+            qputenv("MONTAGE_TEST_PLUGIN_FAULT", round ? "fail:glrender:0:2" : "fail:glrender:0:2 ");
+            for (int miss = 0; miss < 2; ++miss) {
+                direct = ofx::gpuTextureRenders();
+                QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
+                QCOMPARE(ofx::gpuTextureRenders(), direct);
+                d = worst(pixels(plain), cpu);
+                QVERIFY2(d <= 1e-6f, qPrintable(QString("OpenGL failed: %1").arg(d)));
+                QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
+            }
+            direct = ofx::gpuTextureRenders();
+            QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
+            QCOMPARE(ofx::gpuTextureRenders(), direct + 1);
+            QVERIFY(worst(pixels(plain), cpu) <= 1.0f / 1023);
+        }
+        qunsetenv("MONTAGE_TEST_PLUGIN_FAULT");
+        QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
         // Textures of two sizes are refused.
         QVERIFY(!ofx::applyEffectTexture(e, 0, in, ofx::GlPicture{out.texture, W, H - 2}, 1.0, {}, &err));
         f->glDeleteTextures(GLsizei(textures.size()), textures.data());

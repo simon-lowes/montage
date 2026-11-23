@@ -405,7 +405,11 @@ static OfxStatus mainInvert(const char* action, const void* handle, OfxPropertyS
         if (montage_test_fault_fails("render")) return kOfxStatFailed;
         int enabled = 0;
         gProp->propGetInt(in, kOfxImageEffectPropOpenGLEnabled, 0, &enabled);
-        if (enabled) return renderInvertGl(effect, in);
+        if (enabled) {
+            /* (the OpenGL render alone fails, as on a card short of memory: the host renders it in memory instead) */
+            if (montage_test_fault_fails("glrender")) return kOfxStatGLOutOfMemory;
+            return renderInvertGl(effect, in);
+        }
     }
 #endif
     if (!strcmp(action, kOfxActionDescribe)) return describe(effect, "Test Invert", 0);
