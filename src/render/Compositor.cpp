@@ -1160,7 +1160,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             return true;
         }
         src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError,
-                                                                      modelLayerAt(p, seq, o))
+                                                                      modelLayerAt(p, seq, o), !o.highQuality)
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
@@ -2408,7 +2408,7 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         Geometry g;
         if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
         Image layer = renderModelClip(p, seq, c, t, W, H, double(W) / seq.width, modelLightLayer(p, seq, t, o), &depth, &error,
-                                      modelLayerAt(p, seq, o));
+                                      modelLayerAt(p, seq, o), !o.highQuality);
         if (!error.empty() && o.issues) o.issues->note(error);
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         intoWorking(layer, rec709Space(), seq, true);

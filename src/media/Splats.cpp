@@ -7,14 +7,20 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QRegularExpression>
+#include <QUrl>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <list>
+#include <map>
 #include <mutex>
+#include <numeric>
 
 #include "core/Zip.h"
 #include "media/Image.h"
@@ -629,11 +635,168 @@ std::string fileStamp(const std::string& path) {
     return std::to_string(fi.exists() ? fi.size() : -1) + "|" + std::to_string(fi.exists() ? fi.lastModified().toMSecsSinceEpoch() : 0);
 }
 
+// ---- glTF ----------------------------------------------------------------------------------------------------------
+
+constexpr char kGltfSplats[] = "KHR_gaussian_splatting";
+
+float srgbToLinear(float v) {
+    v = std::clamp(v, 0.0f, 1.0f);
+    return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+}
+
+// One point primitive with the extension: every attribute a float accessor in a view of its own, and a COLOR_0 (linear,
+// 8 bits, the opacity as its alpha) for readers that draw it as points.
+bool saveGltf(const SplatCloud& c, const std::string& path, bool binary, std::string* error) {
+    if (c.count == 0) return fail(error, "There are no splats to write");
+    const size_t K = size_t(c.shCoefficients());
+    struct Attribute {
+        QString name;
+        const char* type;
+        size_t components;
+        std::vector<float> values;  // (empty: the cloud's own array)
+        const std::vector<float>* own = nullptr;
+    };
+    std::vector<Attribute> attributes;
+    attributes.push_back({QStringLiteral("POSITION"), "VEC3", 3, {}, &c.positions});
+    attributes.push_back({QStringLiteral("KHR_gaussian_splatting:ROTATION"), "VEC4", 4, {}, &c.rotations});
+    {
+        Attribute a{QStringLiteral("KHR_gaussian_splatting:SCALE"), "VEC3", 3, c.scales, nullptr};
+        for (float& v : a.values) v = std::isfinite(v) ? std::max(0.0f, v) : 0.0f;
+        attributes.push_back(std::move(a));
+        Attribute o{QStringLiteral("KHR_gaussian_splatting:OPACITY"), "SCALAR", 1, c.opacities, nullptr};
+        for (float& v : o.values) v = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+        attributes.push_back(std::move(o));
+    }
+    attributes.push_back({QStringLiteral("KHR_gaussian_splatting:SH_DEGREE_0_COEF_0"), "VEC3", 3, {}, &c.colors});
+    for (int degree = 1, j = 0; degree <= c.shDegree; ++degree)
+        for (int n = 0; n < 2 * degree + 1; ++n, ++j) {
+            Attribute a{QStringLiteral("KHR_gaussian_splatting:SH_DEGREE_%1_COEF_%2").arg(degree).arg(n), "VEC3", 3, {}, nullptr};
+            a.values.resize(c.count * 3);
+            for (size_t i = 0; i < c.count; ++i)
+                for (size_t ch = 0; ch < 3; ++ch) a.values[i * 3 + ch] = c.sh[(i * K + size_t(j)) * 3 + ch];
+            attributes.push_back(std::move(a));
+        }
+    std::vector<uint8_t> fallback(c.count * 4);
+    for (size_t i = 0; i < c.count; ++i) {
+        for (size_t ch = 0; ch < 3; ++ch) {
+            const float v = float(0.5 + kSplatSh0 * c.colors[i * 3 + ch]);
+            const float lin = !std::isfinite(v) ? 0.0f : c.linearColor ? std::clamp(v, 0.0f, 1.0f) : srgbToLinear(v);
+            fallback[i * 4 + ch] = uint8_t(std::lround(lin * 255));
+        }
+        const float o = c.opacities[i];
+        fallback[i * 4 + 3] = uint8_t(std::lround((std::isfinite(o) ? std::clamp(o, 0.0f, 1.0f) : 0.0f) * 255));
+    }
+    uint64_t bytes = 0;
+    for (const Attribute& a : attributes) bytes += uint64_t(c.count) * a.components * 4;
+    bytes += fallback.size();
+    if (bytes > 0xfff00000ull) return fail(error, "The splats are more than a glTF file can hold");
+
+    const QFileInfo fi(QString::fromStdString(path));
+    QJsonArray views, accessors;
+    QJsonObject semantic;
+    uint64_t at = 0;
+    for (const Attribute& a : attributes) {
+        const uint64_t size = uint64_t(c.count) * a.components * 4;
+        views.append(QJsonObject{{"buffer", 0}, {"byteOffset", double(at)}, {"byteLength", double(size)}, {"target", 34962}});
+        QJsonObject acc{{"bufferView", views.size() - 1}, {"componentType", 5126}, {"count", double(c.count)}, {"type", a.type}};
+        if (a.own == &c.positions) {
+            float lo[3] = {c.positions[0], c.positions[1], c.positions[2]}, hi[3] = {lo[0], lo[1], lo[2]};
+            for (size_t i = 0; i < c.count; ++i)
+                for (size_t k = 0; k < 3; ++k) lo[k] = std::min(lo[k], c.positions[i * 3 + k]), hi[k] = std::max(hi[k], c.positions[i * 3 + k]);
+            acc["min"] = QJsonArray{double(lo[0]), double(lo[1]), double(lo[2])};
+            acc["max"] = QJsonArray{double(hi[0]), double(hi[1]), double(hi[2])};
+        }
+        accessors.append(acc);
+        semantic[a.name] = accessors.size() - 1;
+        at += size;
+    }
+    views.append(QJsonObject{{"buffer", 0}, {"byteOffset", double(at)}, {"byteLength", double(fallback.size())}, {"target", 34962}});
+    accessors.append(QJsonObject{{"bufferView", views.size() - 1}, {"componentType", 5121}, {"normalized", true}, {"count", double(c.count)}, {"type", "VEC4"}});
+    semantic[QStringLiteral("COLOR_0")] = accessors.size() - 1;
+    QJsonObject primitive{{"attributes", semantic},
+                          {"mode", 0},
+                          {"extensions", QJsonObject{{kGltfSplats, QJsonObject{{"kernel", "ellipse"},
+                                                                               {"colorSpace", c.linearColor ? "lin_rec709_display" : "srgb_rec709_display"},
+                                                                               {"projection", "perspective"},
+                                                                               {"sortingMethod", "cameraDistance"}}}}}};
+    if (c.antialiased) primitive["extras"] = QJsonObject{{"antialiased", true}};
+    QJsonObject buffer{{"byteLength", double(bytes)}};
+    if (!binary) buffer["uri"] = QString::fromUtf8(QUrl::toPercentEncoding(fi.completeBaseName() + QStringLiteral(".bin")));
+    const QJsonObject root{{"asset", QJsonObject{{"version", "2.0"}, {"generator", "Montage"}}},
+                           {"extensionsUsed", QJsonArray{kGltfSplats}},
+                           {"scene", 0},
+                           {"scenes", QJsonArray{QJsonObject{{"nodes", QJsonArray{0}}}}},
+                           {"nodes", QJsonArray{QJsonObject{{"mesh", 0}}}},
+                           {"meshes", QJsonArray{QJsonObject{{"primitives", QJsonArray{primitive}}}}},
+                           {"buffers", QJsonArray{buffer}},
+                           {"bufferViews", views},
+                           {"accessors", accessors}};
+    QByteArray json = QJsonDocument(root).toJson(QJsonDocument::Compact);
+    auto writeData = [&](QFile& f) {
+        for (const Attribute& a : attributes) {
+            const std::vector<float>& v = a.own ? *a.own : a.values;  // (floats little-endian on every platform built for)
+            const qint64 n = qint64(v.size() * sizeof(float));
+            if (f.write(reinterpret_cast<const char*>(v.data()), n) != n) return false;
+        }
+        return f.write(reinterpret_cast<const char*>(fallback.data()), qint64(fallback.size())) == qint64(fallback.size());
+    };
+    QFile f(QString::fromStdString(path));
+    if (!f.open(QIODevice::WriteOnly)) return fail(error, "Cannot write " + path);
+    if (!binary) {
+        QFile bin(fi.absoluteDir().filePath(fi.completeBaseName() + QStringLiteral(".bin")));
+        if (f.write(json) != json.size() || !bin.open(QIODevice::WriteOnly) || !writeData(bin)) return fail(error, "Cannot write " + path);
+        return true;
+    }
+    while (json.size() % 4) json += ' ';
+    const uint64_t pad = (4 - bytes % 4) % 4, total = 12 + 8 + uint64_t(json.size()) + 8 + bytes + pad;
+    if (total > 0xffffffffull) return fail(error, "The splats are more than a glTF file can hold");
+    auto put32 = [](std::string& to, uint32_t v) {
+        for (int i = 0; i < 4; ++i) to += char((v >> (8 * i)) & 0xff);
+    };
+    std::string head;
+    put32(head, 0x46546c67), put32(head, 2), put32(head, uint32_t(total));
+    put32(head, uint32_t(json.size())), put32(head, 0x4e4f534a);
+    std::string binHead;
+    put32(binHead, uint32_t(bytes + pad)), put32(binHead, 0x004e4942);
+    const char zeros[4] = {0, 0, 0, 0};
+    if (f.write(head.data(), qint64(head.size())) != qint64(head.size()) || f.write(json) != json.size() ||
+        f.write(binHead.data(), qint64(binHead.size())) != qint64(binHead.size()) || !writeData(f) || f.write(zeros, qint64(pad)) != qint64(pad))
+        return fail(error, "Cannot write " + path);
+    return true;
+}
+
+// Whether a .gltf or .glb names the splat extension: looked for in its JSON (the first 64 MB of it), once while the
+// file is the same.
+bool gltfHasSplats(const std::string& path) {
+    static std::mutex m;
+    static std::map<std::string, std::pair<std::string, bool>> known;
+    const std::string stamp = fileStamp(path);
+    {
+        std::lock_guard lock(m);
+        if (const auto it = known.find(path); it != known.end() && it->second.first == stamp) return it->second.second;
+    }
+    bool has = false;
+    QFile f(QString::fromStdString(path));
+    if (f.open(QIODevice::ReadOnly)) {
+        constexpr qint64 kMost = qint64(64) << 20;
+        QByteArray json;
+        const QByteArray head = f.read(20);
+        if (head.size() == 20 && le32(reinterpret_cast<const uint8_t*>(head.constData())) == 0x46546c67)
+            json = f.read(std::min<qint64>(kMost, le32(reinterpret_cast<const uint8_t*>(head.constData()) + 12)));
+        else json = head + f.read(kMost);
+        has = json.contains(kGltfSplats);
+    }
+    std::lock_guard lock(m);
+    if (known.size() > 256) known.clear();
+    known[path] = {stamp, has};
+    return has;
+}
+
 }  // namespace
 
 bool isSplatFile(const std::string& path) {
     const std::string s = suffixOf(path);
-    return s == "ply" || s == "spz";
+    return s == "ply" || s == "spz" || ((s == "gltf" || s == "glb") && gltfHasSplats(path));
 }
 
 bool loadSplats(const std::string& path, SplatCloud& out, std::string* error) {
@@ -642,7 +805,12 @@ bool loadSplats(const std::string& path, SplatCloud& out, std::string* error) {
     QFile f(QString::fromStdString(path));
     if (!f.open(QIODevice::ReadOnly)) return fail(error, "Cannot read " + path);
     bool ok;
-    if (suffixOf(path) == "spz") {
+    const std::string suffix = suffixOf(path);
+    if (suffix == "gltf" || suffix == "glb") {
+        f.close();
+        ok = loadGltfSplats(path, out, error);
+        out.path = path;
+    } else if (suffix == "spz") {
         if (f.size() > qint64(kMaxUnpacked)) return fail(error, path + " is too large");
         const QByteArray b = f.readAll();
         ok = loadSpz(path, b.toStdString(), out, error);
@@ -667,7 +835,338 @@ bool loadSplats(const std::string& path, SplatCloud& out, std::string* error) {
 bool saveSplats(const SplatCloud& cloud, const std::string& path, std::string* error, int spzVersion) {
     if (cloud.positions.size() != cloud.count * 3 || cloud.sh.size() != cloud.count * size_t(cloud.shCoefficients()) * 3)
         return fail(error, "The splats are not whole");
-    return suffixOf(path) == "spz" ? saveSpz(cloud, path, spzVersion, error) : savePly(cloud, path, error);
+    if (cloud.scales.size() != cloud.count * 3 || cloud.rotations.size() != cloud.count * 4 || cloud.opacities.size() != cloud.count ||
+        cloud.colors.size() != cloud.count * 3)
+        return fail(error, "The splats are not whole");
+    const std::string suffix = suffixOf(path);
+    if (suffix == "glb" || suffix == "gltf") return saveGltf(cloud, path, suffix == "glb", error);
+    return suffix == "spz" ? saveSpz(cloud, path, spzVersion, error) : savePly(cloud, path, error);
+}
+
+void rotateSplatHarmonics(SplatCloud& c, const std::array<double, 9>& r) {
+    const int K = c.shCoefficients();
+    if (K == 0 || c.count == 0) return;
+    // Each degree's functions turn among themselves. For a degree, the matrix M with b(d)·M = b(rᵀ d) for every d is
+    // found by least squares over a fixed spread of directions (exact, since such an M exists); the turned
+    // coefficients are M c.
+    constexpr int kDirs = 48;
+    double dirs[kDirs][3], turned[kDirs][3], B[kDirs][15], Z[kDirs][15];
+    for (int i = 0; i < kDirs; ++i) {
+        const double z = 1 - 2 * (i + 0.5) / kDirs, rad = std::sqrt(std::max(0.0, 1 - z * z)), phi = i * 2.399963229728653;
+        dirs[i][0] = rad * std::cos(phi), dirs[i][1] = rad * std::sin(phi), dirs[i][2] = z;
+        for (int k = 0; k < 3; ++k) turned[i][k] = r[size_t(k)] * dirs[i][0] + r[size_t(3 + k)] * dirs[i][1] + r[size_t(6 + k)] * dirs[i][2];
+        shBasis(dirs[i][0], dirs[i][1], dirs[i][2], B[i]);
+        shBasis(turned[i][0], turned[i][1], turned[i][2], Z[i]);
+    }
+    double M[15][7] = {};  // row j (a coefficient), its degree's columns
+    for (int degree = 1, off = 0; degree <= c.shDegree; off += 2 * degree + 1, ++degree) {
+        const int n = 2 * degree + 1;
+        // (BᵀB) M = BᵀZ, by elimination with pivoting.
+        double A[7][14] = {};
+        for (int a = 0; a < n; ++a)
+            for (int b = 0; b < n; ++b)
+                for (int i = 0; i < kDirs; ++i) A[a][b] += B[i][off + a] * B[i][off + b], A[a][n + b] += B[i][off + a] * Z[i][off + b];
+        for (int col = 0; col < n; ++col) {
+            int best = col;
+            for (int row = col + 1; row < n; ++row)
+                if (std::abs(A[row][col]) > std::abs(A[best][col])) best = row;
+            if (best != col) std::swap_ranges(A[col], A[col] + 2 * n, A[best]);
+            if (std::abs(A[col][col]) < 1e-12) return;  // (not reached: the functions of a degree are independent)
+            for (int row = 0; row < n; ++row) {
+                if (row == col) continue;
+                const double f = A[row][col] / A[col][col];
+                for (int k = col; k < 2 * n; ++k) A[row][k] -= f * A[col][k];
+            }
+        }
+        for (int a = 0; a < n; ++a)
+            for (int b = 0; b < n; ++b) M[off + a][b] = A[a][n + b] / A[a][a];
+    }
+    // The colour along d is Σ b_j(d) c_j; turned, it must be Σ b_j(rᵀ d) c_j = Σ_j Σ_a b_a(d) M[a][j] c_j.
+    for (size_t i = 0; i < c.count; ++i) {
+        float* sh = &c.sh[i * size_t(K) * 3];
+        for (int degree = 1, off = 0; degree <= c.shDegree; off += 2 * degree + 1, ++degree) {
+            const int n = 2 * degree + 1;
+            double v[7][3];
+            for (int a = 0; a < n; ++a)
+                for (int ch = 0; ch < 3; ++ch) {
+                    double sum = 0;
+                    for (int j = 0; j < n; ++j) sum += M[off + a][j] * sh[(off + j) * 3 + ch];
+                    v[a][ch] = sum;
+                }
+            for (int a = 0; a < n; ++a)
+                for (int ch = 0; ch < 3; ++ch) sh[(off + a) * 3 + ch] = float(v[a][ch]);
+        }
+    }
+}
+
+// ---- Cleaning --------------------------------------------------------------------------------------------------------
+
+bool SplatFilter::any() const {
+    return minOpacity > 0 || maxSize > 0 || (neighbourDistance > 0 && neighbours > 0) || box != 0 || sphere != 0 || color != 0 ||
+           !removed.empty() || share < 1;
+}
+
+std::string SplatFilter::key() const {
+    if (!any()) return {};
+    auto bits = [](float v) {
+        uint32_t u;
+        std::memcpy(&u, &v, 4);
+        return std::to_string(u);
+    };
+    std::string k = bits(minOpacity) + "|" + bits(maxSize) + "|";
+    if (neighbourDistance > 0 && neighbours > 0) k += bits(neighbourDistance) + "n" + std::to_string(neighbours);
+    k += "|";
+    if (box) {
+        k += std::to_string(box);
+        for (int a = 0; a < 3; ++a) k += "," + bits(boxLo[size_t(a)]) + "," + bits(boxHi[size_t(a)]);
+    }
+    k += "|";
+    if (sphere) k += std::to_string(sphere) + "," + bits(sphereCentre[0]) + "," + bits(sphereCentre[1]) + "," + bits(sphereCentre[2]) + "," + bits(sphereRadius);
+    k += "|";
+    if (color) k += std::to_string(color) + "," + bits(colorValue[0]) + "," + bits(colorValue[1]) + "," + bits(colorValue[2]) + "," + bits(colorRange);
+    k += "|" + (share < 1 ? std::to_string(std::max(0.0, share)) : std::string()) + "|" + removed;
+    return k;
+}
+
+std::string splatRanges(const std::vector<uint8_t>& set) {
+    std::string out;
+    for (size_t i = 0; i < set.size();) {
+        if (!set[i]) {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        while (j + 1 < set.size() && set[j + 1]) ++j;
+        if (!out.empty()) out += ',';
+        out += std::to_string(i);
+        if (j > i) out += '-' + std::to_string(j);
+        i = j + 1;
+    }
+    return out;
+}
+
+std::vector<uint8_t> splatRangeSet(const std::string& ranges, size_t count) {
+    std::vector<uint8_t> set(count, 0);
+    size_t at = 0;
+    auto number = [&](uint64_t& v) {
+        if (at >= ranges.size() || ranges[at] < '0' || ranges[at] > '9') return false;
+        v = 0;
+        while (at < ranges.size() && ranges[at] >= '0' && ranges[at] <= '9') {
+            if (v > (uint64_t(1) << 40)) return false;
+            v = v * 10 + uint64_t(ranges[at++] - '0');
+        }
+        return true;
+    };
+    while (at < ranges.size()) {
+        uint64_t a = 0, b = 0;
+        if (!number(a)) break;
+        b = a;
+        if (at < ranges.size() && ranges[at] == '-') {
+            ++at;
+            if (!number(b)) break;
+        }
+        if (b >= a && a < count) std::fill(set.begin() + std::ptrdiff_t(a), set.begin() + std::ptrdiff_t(std::min<uint64_t>(b, count - 1) + 1), uint8_t(1));
+        if (at < ranges.size()) {
+            if (ranges[at] != ',') break;
+            ++at;
+        }
+    }
+    return set;
+}
+
+namespace {
+
+// For each splat still kept, whether at least `need` others (kept or not: a speck is one whatever else is dropped)
+// have their centres within `dist`: the centres are put in a grid of cells `dist` across, and each splat looks through
+// its own cell and the 26 round it, stopping at the first `need` it finds.
+void dropLonely(const SplatCloud& c, float dist, int need, std::vector<uint8_t>& keep, size_t& dropped) {
+    const size_t n = c.count;
+    if (n == 0 || !(dist > 0) || need <= 0) return;
+    constexpr int64_t kEdge = int64_t(1) << 20;  // cells each way of the origin; what lies farther shares the last cell
+    auto cellOf = [&](float v) {
+        const double q = std::floor(double(v) / double(dist));
+        return int64_t(std::clamp(q, double(-kEdge), double(kEdge - 1))) + kEdge;
+    };
+    auto keyOf = [](int64_t x, int64_t y, int64_t z) { return uint64_t(x) << 42 | uint64_t(y) << 21 | uint64_t(z); };
+    std::vector<uint64_t> keys(n);
+    for (size_t i = 0; i < n; ++i) keys[i] = keyOf(cellOf(c.positions[i * 3]), cellOf(c.positions[i * 3 + 1]), cellOf(c.positions[i * 3 + 2]));
+    std::vector<uint32_t> order(n);
+    std::iota(order.begin(), order.end(), uint32_t(0));
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return keys[a] < keys[b] || (keys[a] == keys[b] && a < b); });
+    // An open-addressed table from a cell's key to where its splats start in `order`.
+    size_t buckets = 16;
+    while (buckets < n * 2) buckets <<= 1;
+    std::vector<uint32_t> table(buckets, UINT32_MAX);
+    auto slotOf = [&](uint64_t key) { return size_t((key * 0x9e3779b97f4a7c15ull) >> 20) & (buckets - 1); };
+    for (size_t i = 0; i < n; ++i)
+        if (i == 0 || keys[order[i]] != keys[order[i - 1]]) {
+            size_t s = slotOf(keys[order[i]]);
+            while (table[s] != UINT32_MAX) s = (s + 1) & (buckets - 1);
+            table[s] = uint32_t(i);
+        }
+    const double d2 = double(dist) * double(dist);
+    std::vector<uint8_t> lonely(n, 0);
+    constexpr size_t kChunk = 4096;
+    parallelRows(int((n + kChunk - 1) / kChunk) * 16, [&](int r0, int r1) {
+        for (int task = (r0 + 15) / 16; task < (r1 + 15) / 16; ++task)
+            for (size_t i = size_t(task) * kChunk; i < std::min(n, (size_t(task) + 1) * kChunk); ++i) {
+                if (!keep[i]) continue;
+                const float* p = &c.positions[i * 3];
+                const int64_t cx = cellOf(p[0]), cy = cellOf(p[1]), cz = cellOf(p[2]);
+                int found = 0;
+                for (int64_t x = std::max<int64_t>(0, cx - 1); x <= std::min(2 * kEdge - 1, cx + 1) && found < need; ++x)
+                    for (int64_t y = std::max<int64_t>(0, cy - 1); y <= std::min(2 * kEdge - 1, cy + 1) && found < need; ++y)
+                        for (int64_t z = std::max<int64_t>(0, cz - 1); z <= std::min(2 * kEdge - 1, cz + 1) && found < need; ++z) {
+                            const uint64_t key = keyOf(x, y, z);
+                            size_t s = slotOf(key);
+                            while (table[s] != UINT32_MAX && keys[order[table[s]]] != key) s = (s + 1) & (buckets - 1);
+                            if (table[s] == UINT32_MAX) continue;
+                            for (size_t k = table[s]; k < n && keys[order[k]] == key && found < need; ++k) {
+                                const uint32_t j = order[k];
+                                if (j == i) continue;
+                                const float* q = &c.positions[size_t(j) * 3];
+                                const double dx = double(q[0]) - p[0], dy = double(q[1]) - p[1], dz = double(q[2]) - p[2];
+                                if (dx * dx + dy * dy + dz * dz <= d2) ++found;
+                            }
+                        }
+                lonely[i] = found < need;
+            }
+    });
+    for (size_t i = 0; i < n; ++i)
+        if (lonely[i]) keep[i] = 0, ++dropped;
+}
+
+}  // namespace
+
+std::vector<uint8_t> splatKeep(const SplatCloud& c, const SplatFilter& f, SplatFilterCounts* counts) {
+    SplatFilterCounts n;
+    std::vector<uint8_t> keep(c.count, 1);
+    auto drop = [&](size_t i, size_t& counter) { keep[i] = 0, ++counter; };
+    const bool lonely = f.neighbourDistance > 0 && f.neighbours > 0;
+    for (size_t i = 0; i < c.count; ++i) {
+        if (f.minOpacity > 0 && !(c.opacities[i] >= f.minOpacity)) {
+            drop(i, n.opacity);
+        } else if (f.maxSize > 0 && !(std::max({c.scales[i * 3], c.scales[i * 3 + 1], c.scales[i * 3 + 2]}) <= f.maxSize)) {
+            drop(i, n.size);
+        }
+    }
+    if (lonely) dropLonely(c, f.neighbourDistance, f.neighbours, keep, n.neighbours);
+    const std::vector<uint8_t> removed = f.removed.empty() ? std::vector<uint8_t>() : splatRangeSet(f.removed, c.count);
+    for (size_t i = 0; i < c.count; ++i) {
+        if (!keep[i]) continue;
+        const float* p = &c.positions[i * 3];
+        if (f.box) {
+            const bool inside = p[0] >= f.boxLo[0] && p[0] <= f.boxHi[0] && p[1] >= f.boxLo[1] && p[1] <= f.boxHi[1] && p[2] >= f.boxLo[2] && p[2] <= f.boxHi[2];
+            if (inside != (f.box == 1)) {
+                drop(i, n.box);
+                continue;
+            }
+        }
+        if (f.sphere) {
+            const double dx = double(p[0]) - f.sphereCentre[0], dy = double(p[1]) - f.sphereCentre[1], dz = double(p[2]) - f.sphereCentre[2];
+            const bool inside = dx * dx + dy * dy + dz * dz <= double(f.sphereRadius) * f.sphereRadius;
+            if (inside != (f.sphere == 1)) {
+                drop(i, n.sphere);
+                continue;
+            }
+        }
+        if (f.color) {
+            bool within = true;
+            for (size_t ch = 0; ch < 3; ++ch) {
+                const double v = std::clamp(0.5 + kSplatSh0 * c.colors[i * 3 + ch], 0.0, 1.0);
+                within = within && std::abs(v - f.colorValue[ch]) <= f.colorRange;
+            }
+            if (within == (f.color == 1)) {
+                drop(i, n.color);
+                continue;
+            }
+        }
+        if (!removed.empty() && removed[i]) drop(i, n.removed);
+    }
+    n.kept = size_t(std::count(keep.begin(), keep.end(), uint8_t(1)));
+    if (f.share < 1 && n.kept > 0) {
+        // The share drawn: the splats that cover and hide the most first, by opacity times the area of their two
+        // largest axes (equal ones in the file's order).
+        const size_t want = size_t(std::clamp(std::ceil(std::max(0.0, f.share) * double(n.kept)), 1.0, double(n.kept)));
+        std::vector<uint32_t> order;
+        order.reserve(n.kept);
+        for (size_t i = 0; i < c.count; ++i)
+            if (keep[i]) order.push_back(uint32_t(i));
+        std::vector<float> weight(c.count, 0);
+        for (const uint32_t i : order) {
+            const float a = c.scales[size_t(i) * 3], b = c.scales[size_t(i) * 3 + 1], d = c.scales[size_t(i) * 3 + 2];
+            const float area = a * b * d / std::max(1e-30f, std::min({a, b, d}));
+            weight[i] = std::isfinite(area) ? c.opacities[i] * area : 0;
+        }
+        if (want < order.size()) {
+            std::nth_element(order.begin(), order.begin() + std::ptrdiff_t(want), order.end(),
+                             [&](uint32_t a, uint32_t b) { return weight[a] > weight[b] || (weight[a] == weight[b] && a < b); });
+            for (size_t k = want; k < order.size(); ++k) keep[order[k]] = 0;
+            n.thinned = order.size() - want;
+            n.kept = want;
+        }
+    }
+    if (counts) *counts = n;
+    return keep;
+}
+
+std::shared_ptr<const std::vector<uint8_t>> cachedSplatKeep(const std::shared_ptr<const SplatCloud>& cloud, const SplatFilter& filter,
+                                                            SplatFilterCounts* counts) {
+    if (!cloud) return nullptr;
+    if (!filter.any()) {
+        if (counts) *counts = SplatFilterCounts{}, counts->kept = cloud->count;
+        return nullptr;
+    }
+    struct Entry {
+        std::weak_ptr<const SplatCloud> cloud;
+        std::string key;
+        std::shared_ptr<const std::vector<uint8_t>> keep;
+        SplatFilterCounts counts;
+    };
+    static std::mutex m;
+    static std::list<Entry> recent;
+    const std::string key = filter.key();
+    {
+        std::lock_guard lock(m);
+        for (auto it = recent.begin(); it != recent.end();) {
+            const std::shared_ptr<const SplatCloud> held = it->cloud.lock();
+            if (!held) {
+                it = recent.erase(it);
+            } else if (held == cloud && it->key == key) {
+                recent.splice(recent.begin(), recent, it);
+                if (counts) *counts = it->counts;
+                return it->keep;
+            } else {
+                ++it;
+            }
+        }
+    }
+    Entry e;
+    e.cloud = cloud, e.key = key;
+    e.keep = std::make_shared<const std::vector<uint8_t>>(splatKeep(*cloud, filter, &e.counts));
+    if (counts) *counts = e.counts;
+    std::lock_guard lock(m);
+    recent.push_front(e);
+    if (recent.size() > 6) recent.pop_back();
+    return e.keep;
+}
+
+SplatCloud keptSplats(const SplatCloud& c, const std::vector<uint8_t>& keep) {
+    SplatCloud out;
+    out.path = c.path, out.shDegree = c.shDegree, out.antialiased = c.antialiased, out.linearColor = c.linearColor, out.notes = c.notes;
+    const size_t K = size_t(c.shCoefficients()) * 3;
+    for (size_t i = 0; i < c.count; ++i) {
+        if (i < keep.size() && !keep[i]) continue;
+        out.positions.insert(out.positions.end(), c.positions.begin() + std::ptrdiff_t(i * 3), c.positions.begin() + std::ptrdiff_t(i * 3 + 3));
+        out.scales.insert(out.scales.end(), c.scales.begin() + std::ptrdiff_t(i * 3), c.scales.begin() + std::ptrdiff_t(i * 3 + 3));
+        out.rotations.insert(out.rotations.end(), c.rotations.begin() + std::ptrdiff_t(i * 4), c.rotations.begin() + std::ptrdiff_t(i * 4 + 4));
+        out.opacities.push_back(c.opacities[i]);
+        out.colors.insert(out.colors.end(), c.colors.begin() + std::ptrdiff_t(i * 3), c.colors.begin() + std::ptrdiff_t(i * 3 + 3));
+        out.sh.insert(out.sh.end(), c.sh.begin() + std::ptrdiff_t(i * K), c.sh.begin() + std::ptrdiff_t(i * K + K));
+        ++out.count;
+    }
+    finish(out);
+    return out;
 }
 
 std::shared_ptr<const SplatCloud> cachedSplats(const std::string& path, std::string* error) {

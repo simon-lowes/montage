@@ -5,6 +5,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -19,6 +21,7 @@
 #include "cgltf.h"
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
+#include "media/Splats.h"
 
 namespace montage {
 
@@ -816,6 +819,203 @@ std::string readModelFile(const std::string& path) { return readWhole(QString::f
 
 bool decodeModelTexture(const std::string& bytes, bool srgb, ModelTexture& out) {
     return decodeTexture(QByteArray::fromStdString(bytes), srgb, out);
+}
+
+// Gaussian splats in a glTF file: its point primitives with the KHR_gaussian_splatting extension's ellipse kernel,
+// each placed by its node. Unpacked through the accessors (floats, or the whole-number types the extension allows).
+bool loadGltfSplats(const std::string& path, SplatCloud& out, std::string* error) {
+    out = SplatCloud{};
+    out.path = path;
+    cgltf_data* data = nullptr;
+    auto fail = [&](const std::string& why) {
+        if (data) cgltf_free(data);
+        out = SplatCloud{};
+        out.path = path;
+        if (error) *error = why;
+        return false;
+    };
+    const QByteArray bytes = readWhole(QString::fromStdString(path));
+    if (bytes.isEmpty()) return fail("Cannot read " + path);
+    cgltf_options options{};
+    options.file.read = readFile;
+    options.file.release = releaseFile;
+    if (cgltf_parse(&options, bytes.constData(), cgltf_size(bytes.size()), &data) != cgltf_result_success)
+        return fail(path + " is not a glTF file Montage can read");
+    std::map<const void*, size_t> sizes;
+    buffersRead = &sizes;
+    const cgltf_result loaded = cgltf_load_buffers(&options, data, path.c_str());
+    buffersRead = nullptr;
+    if (loaded != cgltf_result_success) return fail("The buffers of " + path + " cannot be read");
+    for (cgltf_size i = 0; i < data->buffers_count; ++i)
+        if (const auto it = sizes.find(data->buffers[i].data); it != sizes.end() && it->second < data->buffers[i].size)
+            return fail("A buffer of " + path + " is shorter than the file says");
+    if (cgltf_validate(data) != cgltf_result_success) return fail(path + " is not a valid glTF file");
+    constexpr cgltf_size kMostSplats = cgltf_size(1) << 24;
+
+    std::vector<SplatCloud> parts;
+    std::vector<std::string> notes;
+    auto note = [&](const std::string& n) {
+        if (std::find(notes.begin(), notes.end(), n) == notes.end()) notes.push_back(n);
+    };
+    size_t total = 0;
+    bool linear = false, spaceKnown = false;
+    for (cgltf_size ni = 0; ni < data->nodes_count; ++ni) {
+        const cgltf_node& node = data->nodes[ni];
+        if (!node.mesh) continue;
+        for (cgltf_size pi = 0; pi < node.mesh->primitives_count; ++pi) {
+            const cgltf_primitive& gp = node.mesh->primitives[pi];
+            const cgltf_extension* ext = nullptr;
+            for (cgltf_size e = 0; e < gp.extensions_count; ++e)
+                if (gp.extensions[e].name && std::strcmp(gp.extensions[e].name, "KHR_gaussian_splatting") == 0) ext = &gp.extensions[e];
+            if (!ext) continue;
+            const QJsonObject about = QJsonDocument::fromJson(QByteArray(ext->data ? ext->data : "{}")).object();
+            if (about.value("kernel").toString() != QLatin1String("ellipse")) {
+                note("Splats of a kernel not known here are left out");
+                continue;
+            }
+            if (gp.type != cgltf_primitive_type_points) {
+                note("Splats that are not a point primitive are left out");
+                continue;
+            }
+            const QString space = about.value("colorSpace").toString();
+            const bool partLinear = space == QLatin1String("lin_rec709_display");
+            if (!partLinear && space != QLatin1String("srgb_rec709_display")) note("A colour space not known here is read as sRGB");
+            if (spaceKnown && partLinear != linear) {
+                note("Splats in a second colour space are left out");
+                continue;
+            }
+            auto find = [&](const char* name, cgltf_type type) -> const cgltf_accessor* {
+                for (cgltf_size a = 0; a < gp.attributes_count; ++a)
+                    if (gp.attributes[a].name && std::strcmp(gp.attributes[a].name, name) == 0 && gp.attributes[a].data &&
+                        gp.attributes[a].data->type == type)
+                        return gp.attributes[a].data;
+                return nullptr;
+            };
+            const cgltf_accessor* position = find("POSITION", cgltf_type_vec3);
+            const cgltf_accessor* rotation = find("KHR_gaussian_splatting:ROTATION", cgltf_type_vec4);
+            const cgltf_accessor* scale = find("KHR_gaussian_splatting:SCALE", cgltf_type_vec3);
+            const cgltf_accessor* opacity = find("KHR_gaussian_splatting:OPACITY", cgltf_type_scalar);
+            const cgltf_accessor* constant = find("KHR_gaussian_splatting:SH_DEGREE_0_COEF_0", cgltf_type_vec3);
+            if (!position || !rotation || !scale || !opacity || !constant) {
+                note("Splats without a position, rotation, scale, opacity or colour are left out");
+                continue;
+            }
+            const cgltf_size n = position->count;
+            if (n == 0) continue;
+            if (n > kMostSplats || total + n > kMostSplats) return fail(path + " has more than 16,777,216 splats");
+            if (rotation->count != n || scale->count != n || opacity->count != n || constant->count != n)
+                return fail(path + " has splats whose values are not all there");
+            // The harmonics: every coefficient of a degree and of those below it, or the degree is left out.
+            std::vector<const cgltf_accessor*> higher;
+            int degree = 0;
+            for (int d = 1; d <= 3; ++d) {
+                std::vector<const cgltf_accessor*> these;
+                for (int k = 0; k < 2 * d + 1; ++k) {
+                    const std::string name = "KHR_gaussian_splatting:SH_DEGREE_" + std::to_string(d) + "_COEF_" + std::to_string(k);
+                    const cgltf_accessor* a = find(name.c_str(), cgltf_type_vec3);
+                    if (a && a->count == n) these.push_back(a);
+                }
+                if (int(these.size()) != 2 * d + 1) break;
+                higher.insert(higher.end(), these.begin(), these.end());
+                degree = d;
+            }
+            if (find("KHR_gaussian_splatting:SH_DEGREE_4_COEF_0", cgltf_type_vec3)) note("The colour's fourth-degree harmonics are left out");
+            SplatCloud part;
+            part.count = size_t(n), part.shDegree = degree;
+            auto unpack = [&](const cgltf_accessor* a, size_t components, std::vector<float>& to) {
+                to.assign(size_t(n) * components, 0.0f);
+                return cgltf_accessor_unpack_floats(a, to.data(), cgltf_size(to.size())) == cgltf_size(to.size());
+            };
+            bool whole = unpack(position, 3, part.positions) && unpack(rotation, 4, part.rotations) && unpack(scale, 3, part.scales) &&
+                         unpack(opacity, 1, part.opacities) && unpack(constant, 3, part.colors);
+            const size_t K = size_t(part.shCoefficients());
+            part.sh.assign(size_t(n) * K * 3, 0.0f);
+            std::vector<float> one;
+            for (size_t j = 0; j < higher.size() && whole; ++j) {
+                whole = unpack(higher[j], 3, one);
+                for (size_t i = 0; i < size_t(n) && whole; ++i)
+                    for (size_t ch = 0; ch < 3; ++ch) part.sh[(i * K + j) * 3 + ch] = one[i * 3 + ch];
+            }
+            if (!whole) return fail(path + " has splats whose values cannot be read");
+            for (float& v : part.scales) v = v >= 0 ? v : 0.0f;                              // (never negative; not a number hidden later)
+            for (float& v : part.opacities) v = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+            if (gp.extras.data && QJsonDocument::fromJson(QByteArray(gp.extras.data)).object().value("antialiased").toBool()) part.antialiased = true;
+
+            // Its node's place: the centres through the whole matrix; the axes turned and (by an even scale) sized.
+            float m[16];
+            cgltf_node_transform_world(&node, m);
+            static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            if (!std::equal(m, m + 16, identity)) {
+                double len[3], r[9];
+                for (int c = 0; c < 3; ++c) len[c] = std::sqrt(double(m[c * 4]) * m[c * 4] + double(m[c * 4 + 1]) * m[c * 4 + 1] + double(m[c * 4 + 2]) * m[c * 4 + 2]);
+                const double det = double(m[0]) * (double(m[5]) * m[10] - double(m[6]) * m[9]) - double(m[4]) * (double(m[1]) * m[10] - double(m[2]) * m[9]) +
+                                   double(m[8]) * (double(m[1]) * m[6] - double(m[2]) * m[5]);
+                if (!(len[0] > 0 && len[1] > 0 && len[2] > 0) || !std::isfinite(det) || !(det > 0)) {
+                    note("Splats under a node that flattens or mirrors them are left out");
+                    continue;
+                }
+                const double size = std::cbrt(det);
+                if (std::abs(len[0] - size) > 1e-4 * size || std::abs(len[1] - size) > 1e-4 * size || std::abs(len[2] - size) > 1e-4 * size)
+                    note("A node's uneven scale moves its splats but sizes them evenly");
+                for (int row = 0; row < 3; ++row)
+                    for (int c = 0; c < 3; ++c) r[row * 3 + c] = m[c * 4 + row] / len[c];
+                // The rotation as a quaternion (x, y, z, w).
+                double q[4];
+                const double trace = r[0] + r[4] + r[8];
+                if (trace > 0) {
+                    const double k = std::sqrt(trace + 1) * 2;
+                    q[3] = k / 4, q[0] = (r[7] - r[5]) / k, q[1] = (r[2] - r[6]) / k, q[2] = (r[3] - r[1]) / k;
+                } else if (r[0] > r[4] && r[0] > r[8]) {
+                    const double k = std::sqrt(1 + r[0] - r[4] - r[8]) * 2;
+                    q[3] = (r[7] - r[5]) / k, q[0] = k / 4, q[1] = (r[1] + r[3]) / k, q[2] = (r[2] + r[6]) / k;
+                } else if (r[4] > r[8]) {
+                    const double k = std::sqrt(1 + r[4] - r[0] - r[8]) * 2;
+                    q[3] = (r[2] - r[6]) / k, q[0] = (r[1] + r[3]) / k, q[1] = k / 4, q[2] = (r[5] + r[7]) / k;
+                } else {
+                    const double k = std::sqrt(1 + r[8] - r[0] - r[4]) * 2;
+                    q[3] = (r[3] - r[1]) / k, q[0] = (r[2] + r[6]) / k, q[1] = (r[5] + r[7]) / k, q[2] = k / 4;
+                }
+                for (size_t i = 0; i < part.count; ++i) {
+                    float* p = &part.positions[i * 3];
+                    const double x = p[0], y = p[1], z = p[2];
+                    for (int row = 0; row < 3; ++row) p[row] = float(m[row] * x + m[4 + row] * y + m[8 + row] * z + m[12 + row]);
+                    float* s = &part.rotations[i * 4];
+                    const double bx = s[0], by = s[1], bz = s[2], bw = s[3];  // q ⊗ s
+                    s[0] = float(q[3] * bx + q[0] * bw + q[1] * bz - q[2] * by);
+                    s[1] = float(q[3] * by - q[0] * bz + q[1] * bw + q[2] * bx);
+                    s[2] = float(q[3] * bz + q[0] * by - q[1] * bx + q[2] * bw);
+                    s[3] = float(q[3] * bw - q[0] * bx - q[1] * by - q[2] * bz);
+                    for (int a = 0; a < 3; ++a) part.scales[i * 3 + size_t(a)] = float(part.scales[i * 3 + size_t(a)] * size);
+                }
+                rotateSplatHarmonics(part, {r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]});
+            }
+            linear = partLinear, spaceKnown = true;
+            total += part.count;
+            parts.push_back(std::move(part));
+        }
+    }
+    cgltf_free(data);
+    data = nullptr;
+    if (parts.empty()) return fail(notes.empty() ? path + " has no Gaussian splats" : path + " has no Gaussian splats Montage can read: " + notes.front());
+    int degree = 0;
+    for (const SplatCloud& part : parts) degree = std::max(degree, part.shDegree);
+    out.count = total, out.shDegree = degree, out.linearColor = linear, out.notes = notes;
+    out.antialiased = std::all_of(parts.begin(), parts.end(), [](const SplatCloud& part) { return part.antialiased; });
+    const size_t K = size_t(out.shCoefficients());
+    out.sh.assign(total * K * 3, 0.0f);
+    size_t at = 0;
+    for (const SplatCloud& part : parts) {
+        out.positions.insert(out.positions.end(), part.positions.begin(), part.positions.end());
+        out.rotations.insert(out.rotations.end(), part.rotations.begin(), part.rotations.end());
+        out.scales.insert(out.scales.end(), part.scales.begin(), part.scales.end());
+        out.opacities.insert(out.opacities.end(), part.opacities.begin(), part.opacities.end());
+        out.colors.insert(out.colors.end(), part.colors.begin(), part.colors.end());
+        const size_t k = size_t(part.shCoefficients());
+        for (size_t i = 0; i < part.count; ++i)
+            std::copy(part.sh.begin() + std::ptrdiff_t(i * k * 3), part.sh.begin() + std::ptrdiff_t((i + 1) * k * 3), out.sh.begin() + std::ptrdiff_t((at + i) * K * 3));
+        at += part.count;
+    }
+    return true;
 }
 
 bool loadModel(const std::string& path, Model& out, std::string* error) {

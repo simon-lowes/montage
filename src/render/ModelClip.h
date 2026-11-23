@@ -33,15 +33,19 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
                     const std::function<Image(int track, FrameTime at)>& trackLayerAt = {});
 
 // The same for a clip of Gaussian splats: the cloud showing at t, where it is placed, the camera and how it is drawn.
+// `draft`: the clip's While Editing setting thins the splats or draws their centres (a delivery never asks for it).
 bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double scale,
                     std::shared_ptr<const SplatCloud>& cloud, Mat4& place, ModelCamera& camera, SplatRenderOptions& options,
-                    std::string* error = nullptr);
+                    std::string* error = nullptr, bool draft = false);
+// What a splat clip's cleaning settings keep at its frame `lt` (its crop box among them; the draft share not).
+SplatFilter splatClipFilter(const Clip& c, FrameTime lt);
 
 // The clip's picture (premultiplied, in Rec.709 as other generators draw) and the depth of what is drawn (in front of
 // the camera: pixels for its own camera, the scene's units for a solved or a file's one; 0 where nothing), w x h.
 Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
                       const std::function<Image(int track)>& trackLayer, std::vector<float>* depth = nullptr,
-                      std::string* error = nullptr, const std::function<Image(int track, FrameTime at)>& trackLayerAt = {});
+                      std::string* error = nullptr, const std::function<Image(int track, FrameTime at)>& trackLayerAt = {},
+                      bool draft = false);
 
 // The video track whose solved camera the clip uses at t (-1: none): its "camera_track" (1-based), else the nearest
 // track below it whose clip at t carries a solve.

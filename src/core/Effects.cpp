@@ -1422,10 +1422,27 @@ std::vector<EffectInfo> buildCatalog() {
                          num("crop_y1", "Crop Box Top (Y)", -100000, 100000, 10, 0.01),
                          num("crop_z0", "Crop Box Back (Z)", -100000, 100000, -10, 0.01),
                          num("crop_z1", "Crop Box Front (Z)", -100000, 100000, 10, 0.01),
+                         // Cleaning a capture (media/Splats.h SplatFilter): every test that is set must pass.
+                         choice("clean_box", "The Crop Box Keeps", {"The Splats Inside It", "The Splats Outside It"}, 0),
+                         pct("clean_opacity", "Drop Splats Fainter Than (opacity)", 0, 100, 0),
+                         num("clean_size", "Drop Splats Larger Than (the file's units, 0: none)", 0, 100000, 0, 0.001),
+                         num("clean_near", "Drop Splats Farther From Their Neighbours Than (0: none)", 0, 100000, 0, 0.001),
+                         num("clean_near_count", "Neighbours a Splat Needs Within That Distance", 1, 64, 3, 1),
+                         choice("clean_sphere", "Sphere", {"Off", "Keep the Splats Inside It", "Keep the Splats Outside It"}, 0),
+                         num("clean_sphere_x", "Sphere Centre X", -100000, 100000, 0, 0.01),
+                         num("clean_sphere_y", "Sphere Centre Y", -100000, 100000, 0, 0.01),
+                         num("clean_sphere_z", "Sphere Centre Z", -100000, 100000, 0, 0.01),
+                         num("clean_sphere_radius", "Sphere Radius (distance from its centre)", 0, 100000, 1, 0.01),
+                         choice("clean_color", "Colour Range", {"Off", "Drop the Splats in It", "Keep Only the Splats in It"}, 0),
+                         color("clean_color_value", "Colour Range Middle", 0, 0, 0),
+                         pct("clean_color_range", "Colour Range Width (each channel)", 0, 100, 10),
+                         choice("draft", "While Editing, Draw",
+                                {"Every Splat", "Half the Splats", "A Quarter of the Splats", "An Eighth of the Splats", "Their Centres as Points"}, 0),
                      },
-                     {str("file", "Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ)", StringKind::File),
+                     {str("file", "Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ, glTF)", StringKind::File),
                       str("camera_file", "Take The File's Camera From (USD, glTF; else the model)", StringKind::File),
-                      str("proj_camera_file", "Projector: Take The Camera From (USD, glTF)", StringKind::File)}});
+                      str("proj_camera_file", "Projector: Take The Camera From (USD, glTF)", StringKind::File),
+                      str("clean_removed", "Splats Removed by Hand (their numbers in the file)", StringKind::Text)}});
         // The scene's camera (render/ModelClip.h): 3D layers, models and splats that choose The Scene's Camera are seen
         // through the one on the highest track at the time. Draws nothing itself.
         c.push_back({"camera3d", "Camera", EffectCategory::Generator, "Titles",

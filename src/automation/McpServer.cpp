@@ -3814,9 +3814,10 @@ void McpServer::Impl::addTools() {
     add("montage_add_model", "Add a 3D model",
         "Add a 3D model (glTF 2.0 .gltf or .glb, OBJ with its MTL, or a USD scene .usd/.usda/.usdc/.usdz) to the picture, "
         "lit, shaded (metallic-roughness, its textures), casting shadows onto the ground and playing one of its "
-        "animations; or Gaussian splats, a captured 3D scene (.ply as the training tools write it, or .spz; a numbered "
+        "animations; or Gaussian splats, a captured 3D scene (.ply as the training tools write it, .spz, or a .gltf or "
+        ".glb whose points carry KHR_gaussian_splatting; a numbered "
         "run of files, scene_0001.ply on, plays a file a frame), lit by its own colours and cropped by the crop_* "
-        "settings (a box in the file's units, with crop 1). With camera (a number, 1 for the file's first) it is seen "
+        "settings (a box in the file's units, with crop 1; montage_clean_splats takes stray splats out). With camera (a number, 1 for the file's first) it is seen "
         "through a camera in the file, or in camera_file (a USD or glTF file) when given, everything where the file puts "
         "it and a model lit by the file's own lights (and its dome light) when it has some; a USD file with a camera, or "
         "a camera_file, is seen through it unless camera is 0. Otherwise, without over it is seen through its own camera in "
@@ -4025,18 +4026,187 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)), out);
         });
 
+    add("montage_clean_splats", "Clean a capture of splats",
+        "Clean a Gaussian splat clip (montage_add_model): drop splats by what they are, select them through the camera, "
+        "thin them while editing, and save what is left. Every test given must pass for a splat to stay; each is a "
+        "setting of the clip, so it shows at once and can be changed back. opacity: splats fainter than this (0 to 1) "
+        "go. size: splats whose largest axis is longer than this (the file's units) go. neighbours {distance, count}: "
+        "splats with fewer than count (3) other splats within distance go (floating specks). sphere {centre [x, y, z], "
+        "radius, keep \"inside\" or \"outside\"} and box {min [x, y, z], max [x, y, z], keep}: by where their centres "
+        "are, in the file's units (the box is the clip's crop box). color {color \"#rrggbb\", range (0 to 1 a channel), "
+        "keep (true: only those colours stay; false, the default: they go)}. select picks splats on the picture as the "
+        "clip's camera sees them at the time at (the clip's first frame when left out): {lasso [[x, y], ...]} (an outline "
+        "in sequence pixels from the top left, on the clip's own picture before its transform) or {brush [[x, y], ...], "
+        "radius}, with action \"delete\" (the default: those picked are removed), \"keep_only\" (the rest are removed) "
+        "or \"count\" (nothing changes); only splats still kept can be picked. restore true puts back every splat "
+        "removed by hand first. draft sets what is drawn while editing: full, half, quarter, eighth or points (their "
+        "centres only); deliveries always draw every splat. save writes the cleaned capture (a .ply, .spz, .gltf or "
+        ".glb file; of a numbered run, the file showing at at). off true clears every test. Returns how many splats each test dropped, "
+        "how many were picked and how many are kept.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "opacity":{"type":"number","minimum":0,"maximum":1},"size":{"type":"number","minimum":0},
+            "neighbours":{"type":"object","properties":{"distance":{"type":"number","minimum":0},"count":{"type":"integer","minimum":1,"maximum":64}},"required":["distance"]},
+            "sphere":{"type":["object","null"],"properties":{"centre":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+                "radius":{"type":"number","minimum":0},"keep":{"type":"string","enum":["inside","outside"]}},"required":["centre","radius"]},
+            "box":{"type":["object","null"],"properties":{"min":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+                "max":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"keep":{"type":"string","enum":["inside","outside"]}},"required":["min","max"]},
+            "color":{"type":["object","null"],"properties":{"color":{"type":"string"},"range":{"type":"number","minimum":0,"maximum":1},"keep":{"type":"boolean"}},"required":["color"]},
+            "select":{"type":"object","properties":{"lasso":{"type":"array","items":{"type":"array","items":{"type":"number"}}},
+                "brush":{"type":"array","items":{"type":"array","items":{"type":"number"}}},"radius":{"type":"number","minimum":0},
+                "action":{"type":"string","enum":["delete","keep_only","count"],"default":"delete"}}},
+            "at":{"type":["number","string"]},"restore":{"type":"boolean"},"off":{"type":"boolean"},
+            "draft":{"type":"string","enum":["full","half","quarter","eighth","points"]},"save":{"type":"string"}},
+            "required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip& c = clipArg(l, a);
+            if (c.generator.type != "model3d" || std::lround(c.generator.p("shape", 0, 0)) != 0 || !isSplatFile(c.generator.s("file")))
+                throw ArgError{"That clip is not Gaussian splats"};
+            auto three = [](const QJsonValue& v, const char* what) {
+                const QJsonArray arr = v.toArray();
+                if (arr.size() != 3 || !arr[0].isDouble() || !arr[1].isDouble() || !arr[2].isDouble()) throw ArgError{QStringLiteral("\"%1\" is three numbers").arg(what)};
+                return std::array<double, 3>{arr[0].toDouble(), arr[1].toDouble(), arr[2].toDouble()};
+            };
+            auto set = [&](const char* name, double v) { c.generator.params[name] = Param(v); };
+            auto keepOf = [](const QJsonObject& o, const char* what) {
+                const QString k = o.value("keep").toString("inside");
+                if (k != "inside" && k != "outside") throw ArgError{QStringLiteral("%1 \"keep\" is \"inside\" or \"outside\"").arg(what)};
+                return k == "outside" ? 2 : 1;
+            };
+            if (a.value("off").toBool()) {
+                for (const char* name : {"crop", "clean_box", "clean_opacity", "clean_size", "clean_near", "clean_sphere", "clean_color"}) set(name, 0);
+                c.generator.strings["clean_removed"].clear();
+            }
+            if (a.value("restore").toBool()) c.generator.strings["clean_removed"].clear();
+            if (a.contains("opacity")) set("clean_opacity", std::clamp(a.value("opacity").toDouble(), 0.0, 1.0) * 100);
+            if (a.contains("size")) set("clean_size", std::clamp(a.value("size").toDouble(), 0.0, 100000.0));
+            if (a.contains("neighbours")) {
+                const QJsonObject o = a.value("neighbours").toObject();
+                if (!o.value("distance").isDouble()) throw ArgError{"\"neighbours\" is {distance, count}"};
+                set("clean_near", std::clamp(o.value("distance").toDouble(), 0.0, 100000.0));
+                set("clean_near_count", std::clamp(o.value("count").toInt(3), 1, 64));
+            }
+            if (a.contains("sphere")) {
+                if (a.value("sphere").isNull()) {
+                    set("clean_sphere", 0);
+                } else {
+                    const QJsonObject o = a.value("sphere").toObject();
+                    const auto centre = three(o.value("centre"), "centre");
+                    if (!o.value("radius").isDouble()) throw ArgError{"The sphere has a \"radius\""};
+                    set("clean_sphere", keepOf(o, "The sphere's"));
+                    set("clean_sphere_x", centre[0]), set("clean_sphere_y", centre[1]), set("clean_sphere_z", centre[2]);
+                    set("clean_sphere_radius", std::clamp(o.value("radius").toDouble(), 0.0, 100000.0));
+                }
+            }
+            if (a.contains("box")) {
+                if (a.value("box").isNull()) {
+                    set("crop", 0);
+                } else {
+                    const QJsonObject o = a.value("box").toObject();
+                    const auto lo = three(o.value("min"), "min"), hi = three(o.value("max"), "max");
+                    set("crop", 1), set("clean_box", keepOf(o, "The box's") - 1);
+                    set("crop_x0", lo[0]), set("crop_x1", hi[0]), set("crop_y0", lo[1]), set("crop_y1", hi[1]), set("crop_z0", lo[2]), set("crop_z1", hi[2]);
+                }
+            }
+            if (a.contains("color")) {
+                if (a.value("color").isNull()) {
+                    set("clean_color", 0);
+                } else {
+                    const QJsonObject o = a.value("color").toObject();
+                    static const QRegularExpression hex(QStringLiteral("^#[0-9a-fA-F]{6}$"));
+                    const QString text = o.value("color").toString();
+                    if (!hex.match(text).hasMatch()) throw ArgError{"The colour is \"#rrggbb\""};
+                    set("clean_color", o.value("keep").toBool() ? 2 : 1);
+                    set("clean_color_value.r", text.mid(1, 2).toInt(nullptr, 16) / 255.0);
+                    set("clean_color_value.g", text.mid(3, 2).toInt(nullptr, 16) / 255.0);
+                    set("clean_color_value.b", text.mid(5, 2).toInt(nullptr, 16) / 255.0);
+                    set("clean_color_range", std::clamp(o.value("range").toDouble(0.1), 0.0, 1.0) * 100);
+                }
+            }
+            if (a.contains("draft")) {
+                const int q = int(QStringList{"full", "half", "quarter", "eighth", "points"}.indexOf(str(a, "draft")));
+                if (q < 0) throw ArgError{"\"draft\" is full, half, quarter, eighth or points"};
+                set("draft", q);
+            }
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+            if (at < c.start || at >= c.start + c.duration) throw ArgError{"\"at\" is outside the clip"};
+            std::shared_ptr<const SplatCloud> cloud;
+            Mat4 place;
+            ModelCamera cam;
+            SplatRenderOptions options;
+            std::string err;
+            QJsonObject out;
+            auto scene = [&] {
+                if (!splatClipScene(l.project, s, c, at, 1.0, cloud, place, cam, options, &err)) throw ArgError{QString::fromStdString(err)};
+            };
+            scene();
+            if (a.contains("select")) {
+                const QJsonObject sel = a.value("select").toObject();
+                const QString action = sel.value("action").toString("delete");
+                if (action != "delete" && action != "keep_only" && action != "count") throw ArgError{"select \"action\" is delete, keep_only or count"};
+                if (sel.contains("lasso") == sel.contains("brush")) throw ArgError{"\"select\" takes a \"lasso\" or a \"brush\""};
+                std::vector<std::array<double, 2>> points;
+                for (const QJsonValue& v : sel.value(sel.contains("lasso") ? "lasso" : "brush").toArray()) {
+                    const QJsonArray xy = v.toArray();
+                    if (xy.size() != 2 || !xy[0].isDouble() || !xy[1].isDouble()) throw ArgError{"Each point is [x, y]"};
+                    points.push_back({xy[0].toDouble(), xy[1].toDouble()});
+                    if (points.size() > 100000) throw ArgError{"The outline has too many points"};
+                }
+                if (sel.contains("lasso") && points.size() < 3) throw ArgError{"A lasso has three points or more"};
+                if (sel.contains("brush") && (points.empty() || !(sel.value("radius").toDouble() > 0))) throw ArgError{"A brush has points and a \"radius\""};
+                const std::vector<uint8_t> kept = options.keep ? *options.keep : splatKeep(*cloud, splatClipFilter(c, at - c.start));
+                const std::vector<uint8_t> picked = sel.contains("lasso") ? splatsInOutline(*cloud, place, cam, points, &kept)
+                                                                        : splatsUnderBrush(*cloud, place, cam, points, sel.value("radius").toDouble(), &kept);
+                size_t n = 0;
+                for (const uint8_t b : picked) n += b != 0;
+                out["picked"] = double(n);
+                if (action != "count") {
+                    std::vector<uint8_t> removed = splatRangeSet(c.generator.s("clean_removed"), cloud->count);
+                    for (size_t i = 0; i < cloud->count; ++i)
+                        if (kept[i] && (picked[i] != 0) == (action == "delete")) removed[i] = 1;
+                    c.generator.strings["clean_removed"] = splatRanges(removed);
+                    scene();
+                }
+            }
+            SplatFilterCounts counts;
+            const std::vector<uint8_t> keep = splatKeep(*cloud, splatClipFilter(c, at - c.start), &counts);
+            out["splats"] = double(cloud->count);
+            out["kept"] = double(counts.kept);
+            out["dropped"] = QJsonObject{{"opacity", double(counts.opacity)}, {"size", double(counts.size)}, {"neighbours", double(counts.neighbours)},
+                                         {"box", double(counts.box)},         {"sphere", double(counts.sphere)}, {"color", double(counts.color)},
+                                         {"by_hand", double(counts.removed)}};
+            if (a.contains("save")) {
+                const QString to = absolute(need(a, "save"));
+                const QString suffix = QFileInfo(to).suffix().toLower();
+                if (suffix != "ply" && suffix != "spz" && suffix != "glb" && suffix != "gltf") throw ArgError{"Splats are saved as .ply, .spz, .gltf or .glb"};
+                if (counts.kept == 0) throw ArgError{"No splats are left to save"};
+                if (QFileInfo(to) == QFileInfo(QString::fromStdString(cloud->path))) throw ArgError{"Save the cleaned capture under another name than the clip's file"};
+                if (!saveSplats(keptSplats(*cloud, keep), to.toStdString(), &err)) return fail(QString::fromStdString(err));
+                out["saved"] = to;
+            }
+            save(l);
+            return ok(QStringLiteral("%1 of %2 splats kept").arg(qulonglong(counts.kept)).arg(qulonglong(cloud->count)), out);
+        });
+
     add("montage_add_camera", "Add a 3D camera",
         "Add the scene's Camera: 3D layers (montage_add_effect layer_3d), models and splats whose camera is The Scene's "
         "Camera (camera 3) are seen through it, the one on the highest track when there are several (or the track their "
         "camera_track names). Left as it is it sees the frame as a 2D view does (its lens fov across the width, the "
         "frame's plane a pixel a unit, y up); position [x, y, z] moves it (z back from the frame), turn [pan, tilt, roll] "
-        "in degrees turns it, or aim [x, y, z] points it at a point (roll still applies). keys animates it: [{frame, "
-        "position?, turn?, aim?, fov?}], frames from the clip's start. It draws nothing itself.",
+        "in degrees turns it, or aim [x, y, z] points it at a point (roll still applies). lens sets its lens: {focal_length "
+        "(mm on a 36 mm sensor, in place of fov; 0: from fov), depth_of_field (true: what is off the focus distance is "
+        "blurred), focus_distance (scene units; 0: what is at the picture's middle), fstop, units_per_metre, blades (0 "
+        "round, 3 to 12), blade_rotation (degrees), squeeze (anamorphic, 1 to 4)}. keys animates it: [{frame, "
+        "position?, turn?, aim?, fov?, lens?}], frames from the clip's start. It draws nothing itself.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "duration":{"type":["number","string"],"default":5},"track":{"type":"string"},"fov":{"type":"number"},
             "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
             "turn":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
             "aim":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "lens":{"type":"object","properties":{"focal_length":{"type":"number"},"depth_of_field":{"type":"boolean"},
+                "focus_distance":{"type":"number"},"fstop":{"type":"number"},"units_per_metre":{"type":"number"},
+                "blades":{"type":"number"},"blade_rotation":{"type":"number"},"squeeze":{"type":"number"}}},
             "keys":{"type":"array","items":{"type":"object"}}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -4068,6 +4238,35 @@ void McpServer::Impl::addTools() {
                     const auto v = three(o.value("aim"), "aim");
                     c.generator.params["aim"] = Param(1.0);
                     set("aim_x", v[0]), set("aim_y", v[1]), set("aim_z", v[2]);
+                }
+                // The lens (the Camera clip's own settings and ranges).
+                if (o.contains("lens")) {
+                    if (!o.value("lens").isObject()) throw ArgError{"\"lens\" is an object: {focal_length, depth_of_field, focus_distance, fstop, units_per_metre, blades, blade_rotation, squeeze}"};
+                    const QJsonObject lens = o.value("lens").toObject();
+                    struct Setting {
+                        const char* key;
+                        const char* param;
+                        double lo, hi;
+                    };
+                    static const Setting settings[] = {{"focal_length", "focal_length", 0, 2000},  {"focus_distance", "focus_distance", 0, 10000000},
+                                                       {"fstop", "fstop", 0.7, 64},               {"units_per_metre", "units_m", 0.001, 1000000},
+                                                       {"blades", "blades", 0, 12},               {"blade_rotation", "blade_rotation", -180, 180},
+                                                       {"squeeze", "squeeze", 1, 4}};
+                    for (auto it = lens.begin(); it != lens.end(); ++it) {
+                        if (it.key() == QLatin1String("depth_of_field")) {
+                            if (!it.value().isBool()) throw ArgError{"lens \"depth_of_field\" is true or false"};
+                            c.generator.params["dof"] = Param(it.value().toBool() ? 1.0 : 0.0);
+                            continue;
+                        }
+                        const Setting* found = nullptr;
+                        for (const Setting& st : settings)
+                            if (it.key() == QLatin1String(st.key)) found = &st;
+                        if (!found) throw ArgError{QStringLiteral("The lens has no \"%1\"").arg(it.key())};
+                        if (!it.value().isDouble()) throw ArgError{QStringLiteral("lens \"%1\" is a number").arg(it.key())};
+                        double v = std::clamp(it.value().toDouble(), found->lo, found->hi);
+                        if (std::strcmp(found->key, "blades") == 0) v = v < 3 ? 0 : std::round(v);  // (round, or three blades and up)
+                        set(found->param, v);
+                    }
                 }
             };
             apply(a, 0, false);
