@@ -463,7 +463,7 @@ private slots:
 
     void findsPluginFiles() {
         auto files = findPluginFiles(Format::Clap, {kClapDir.toStdString()});
-        QCOMPARE(files.size(), size_t(6));  // good, hang, crash, latency, sidechain, convolver
+        QCOMPARE(files.size(), size_t(8));  // good, hang, crash, latency, the two long ids, sidechain, convolver
         auto good = findPluginFiles(Format::Clap, {clapDir("good")});
         QCOMPARE(good.size(), size_t(1));
         QVERIFY(QString::fromStdString(good[0]).endsWith("MontageTestPlugins.clap"));
