@@ -1014,6 +1014,22 @@ std::vector<EffectInfo> buildCatalog() {
                      {angle("direction", "Direction", 135), num("relief", "Relief (px)", 0.25, 50, 2, 0.25), pct("contrast", "Contrast", 0, 500, 100),
                       pct("blend", "Blend With Original", 0, 100, 0)},
                      {}});
+        // Bevels on a layer's alpha (render/BevelFx.h): a lit chamfer along its edge, and the layer raised from what is
+        // behind it, with a blend mode each for the lit and the shaded side.
+        c.push_back({"edge_bevel", "Edge Bevel", EffectCategory::VideoFilter, "Stylize",
+                     {angle("angle", "Light Angle", 45), num("height", "Height (px)", 0, 500, 8, 0.5),
+                      num("thickness", "Thickness (px)", 0.5, 500, 8, 0.5), color("light", "Light Color", 1, 1, 1),
+                      pct("strength", "Light Strength", 0, 100, 40)},
+                     {}});
+        c.push_back({"layer_bevel", "Layer Bevel", EffectCategory::VideoFilter, "Stylize",
+                     {choice("style", "Style", {"Inner Bevel", "Outer Bevel", "Emboss", "Pillow Emboss"}, 0), pct("depth", "Depth", 1, 1000, 100),
+                      num("size", "Size (px)", 0.5, 500, 5, 0.5), num("soften", "Soften (px)", 0, 100, 0, 0.5), angle("angle", "Light Angle", 120),
+                      num("altitude", "Light Altitude (°)", 1, 89, 30, 1), color("highlight", "Highlight Color", 1, 1, 1),
+                      choice("highlight_mode", "Highlight Blend", {"Normal", "Screen", "Add", "Multiply", "Overlay"}, 1),
+                      pct("highlight_opacity", "Highlight Opacity", 0, 100, 75), color("shadow", "Shadow Color", 0, 0, 0),
+                      choice("shadow_mode", "Shadow Blend", {"Normal", "Screen", "Add", "Multiply", "Overlay"}, 3),
+                      pct("shadow_opacity", "Shadow Opacity", 0, 100, 75)},
+                     {}});
         // Paint (render/PaintFx.h): oil paint by the anisotropic Kuwahara filter, or a smear along the contours.
         c.push_back({"painterly", "Painterly", EffectCategory::VideoFilter, "Stylize",
                      {choice("style", "Style", {"Oil Paint", "Contour Smear"}, 0), num("radius", "Brush Size (px)", 1, 40, 6, 0.5),

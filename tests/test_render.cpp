@@ -65,6 +65,7 @@
 #include "render/AudioFx.h"
 #include "render/ShotGroups.h"
 #include "render/PaintFx.h"
+#include "render/BevelFx.h"
 #include "render/StyleFx.h"
 #include "render/Particles.h"
 #include "render/Titles.h"
@@ -6312,6 +6313,227 @@ colorspaces:
         applyVideoEffect(fx("camera_shake", {{"amplitude", 20.0}, {"rotation", 3.0}}), 9, frame, 1);
         rgb(frame, 0, 0, c);
         QVERIFY(near(c[3], 1) && near(c[1], 0.6f));
+    }
+
+    void bevelsOnALayersAlpha() {
+        // Edge Bevel and Layer Bevel (Effects > Stylize) work from the distance to the alpha's edge. On a white disc lit
+        // from 45 degrees the lit edge is as wide as Thickness, the side facing the light is the brightest, and inside
+        // the bevel nothing changes. Layer Bevel's four styles light and shade the right sides of the edge, each side
+        // with its colour and blend mode. Drawn through the GPU compositor, they are the same pixels.
+        Project p;
+        auto fx = [&](const char* type, std::initializer_list<std::pair<const char*, double>> params) {
+            if (!findEffectInfo(type)) qFatal("no effect %s", type);
+            Effect e = makeEffect(p, type);
+            for (const auto& [k, v] : params) e.params[k] = v;
+            return e;
+        };
+        for (const char* type : {"edge_bevel", "layer_bevel"}) {
+            QCOMPARE(findEffectInfo(type)->group, std::string("Stylize"));
+            QVERIFY(findEffectInfo(type)->category == EffectCategory::VideoFilter);
+        }
+        QCOMPARE(findEffectInfo("edge_bevel")->displayName, std::string("Edge Bevel"));
+        QCOMPARE(findEffectInfo("layer_bevel")->displayName, std::string("Layer Bevel"));
+        // A disc of one colour with a smooth edge (premultiplied), its centre on a pixel's centre.
+        auto disc = [](int size, double radius, float level) {
+            Image img(size, size);
+            const double c = size / 2;
+            for (int y = 0; y < size; ++y)
+                for (int x = 0; x < size; ++x) {
+                    const float a = float(std::clamp(radius + 0.5 - std::hypot(x - c, y - c), 0.0, 1.0));
+                    float* px = img.at(x, y);
+                    px[0] = px[1] = px[2] = level * a;
+                    px[3] = a;
+                }
+            return img;
+        };
+        // A channel read between pixel centres, `r` pixels from the disc's centre towards `degrees` (anticlockwise, up
+        // the page).
+        auto along = [](const Image& img, double degrees, double r, int ch) {
+            const double c = img.width / 2, x = c + std::cos(degrees * M_PI / 180) * r, y = c - std::sin(degrees * M_PI / 180) * r;
+            const int x0 = int(std::floor(x)), y0 = int(std::floor(y));
+            const double fx = x - x0, fy = y - y0;
+            auto at = [&](int xi, int yi) { return double(img.at(std::clamp(xi, 0, img.width - 1), std::clamp(yi, 0, img.height - 1))[ch]); };
+            return (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) + (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+        };
+        // The distance to the edge is right to a fraction of a pixel, inside and out, whichever way the edge runs.
+        {
+            const Image d = disc(200, 60, 1);
+            const std::vector<float> sd = bevel::edgeDistance(d);
+            QCOMPARE(sd.size(), size_t(200 * 200));
+            double worst = 0;
+            for (int y = 20; y < 180; ++y)
+                for (int x = 20; x < 180; ++x) worst = std::max(worst, std::fabs(sd[size_t(y) * 200 + size_t(x)] - (60 - std::hypot(x - 100, y - 100))));
+            QVERIFY2(worst < 0.35, qPrintable(QString::number(worst)));
+        }
+        // The width of the lit band on the side facing `degrees`: from where the added light falls to half its most (the
+        // band's inner end) out to where the disc's own edge is (its alpha a half).
+        auto litWidth = [&](const Image& img, double degrees, double radius, double reach) {
+            double most = 0;
+            for (double r = radius - reach; r < radius - 1; r += 0.25) most = std::max(most, along(img, degrees, r, 0) - 1);
+            double inner = -1, outer = -1;
+            for (double r = radius - reach; r < radius + 2; r += 0.05) {
+                if (inner < 0 && along(img, degrees, r, 0) - 1 >= most / 2) inner = r;
+                if (outer < 0 && inner >= 0 && r > inner + 1 && along(img, degrees, r, 3) <= 0.5) outer = r;
+            }
+            return most > 0.2 && inner > 0 && outer > 0 ? outer - inner : -1.0;
+        };
+        const Image white = disc(200, 60, 1);
+        for (double thickness : {10.0, 20.0, 4.5}) {
+            Image lit = white;
+            applyVideoEffect(fx("edge_bevel", {{"angle", 45.0}, {"thickness", thickness}, {"height", thickness}, {"strength", 100.0}}), 0, lit, 1);
+            const double width = litWidth(lit, 45, 60, thickness + 8);
+            QVERIFY2(std::fabs(width - thickness) < 0.5, qPrintable(QString("thickness %1: lit over %2 px").arg(thickness).arg(width)));
+            // Inside the bevel, and outside the disc, nothing changed at all.
+            for (int y = 0; y < 200; ++y)
+                for (int x = 0; x < 200; ++x) {
+                    const double r = std::hypot(x - 100, y - 100);
+                    if (r < 60 - thickness - 1.5 || r > 61.5)
+                        for (int c = 0; c < 4; ++c) QCOMPARE(lit.at(x, y)[c], white.at(x, y)[c]);
+                }
+            // The side facing the light is the brightest, the sides at right angles to it are as they were, and the far
+            // side is in shade.
+            const double mid = 60 - thickness / 2;
+            const double facing = along(lit, 45, mid, 0), side = along(lit, 135, mid, 0), far = along(lit, 225, mid, 0);
+            QVERIFY2(facing > 1.5 && std::fabs(side - 1) < 0.05 && far < 0.5, qPrintable(QString("%1 %2 %3").arg(facing).arg(side).arg(far)));
+            double best = 0, bestAt = 0;
+            for (int deg = 0; deg < 360; deg += 5)
+                if (const double v = along(lit, deg, mid, 0); v > best) best = v, bestAt = deg;
+            QVERIFY2(std::fabs(bestAt - 45) <= 10, qPrintable(QString::number(bestAt)));
+        }
+        // The light's colour and strength: a red light at half strength adds half as much, to red alone.
+        {
+            Image lit = white, half = white;
+            applyVideoEffect(fx("edge_bevel", {{"angle", 45.0}, {"thickness", 10.0}, {"height", 10.0}, {"strength", 100.0}}), 0, lit, 1);
+            applyVideoEffect(fx("edge_bevel", {{"angle", 45.0}, {"thickness", 10.0}, {"height", 10.0}, {"strength", 50.0}, {"light.g", 0.0}, {"light.b", 0.0}}), 0, half, 1);
+            const double full = along(lit, 45, 55, 0) - 1, red = along(half, 45, 55, 0) - 1;
+            QVERIFY2(std::fabs(red - full / 2) < 0.01 && std::fabs(along(half, 45, 55, 1) - 1) < 1e-6, qPrintable(QString("%1 %2").arg(full).arg(red)));
+            // No height, or no strength: the picture as it was.
+            Image flat = white;
+            applyVideoEffect(fx("edge_bevel", {{"height", 0.0}}), 0, flat, 1);
+            QVERIFY(flat.px == white.px);
+            applyVideoEffect(fx("edge_bevel", {{"strength", 0.0}}), 0, flat, 1);
+            QVERIFY(flat.px == white.px);
+            // At half resolution the bevel is half as wide in pixels: the same on the picture.
+            Image small = disc(100, 30, 1);
+            applyVideoEffect(fx("edge_bevel", {{"angle", 45.0}, {"thickness", 10.0}, {"height", 10.0}, {"strength", 100.0}}), 0, small, 0.5);
+            const double width = litWidth(small, 45, 30, 12);
+            QVERIFY2(std::fabs(width - 5) < 0.5, qPrintable(QString::number(width)));
+        }
+        // An opaque picture is bevelled along the frame's sides: lit from above, the top is lighter and the bottom darker.
+        {
+            Image full(40, 30);
+            full.fill(0.5f, 0.5f, 0.5f, 1.0f);
+            applyVideoEffect(fx("edge_bevel", {{"angle", 90.0}, {"thickness", 4.0}, {"height", 4.0}, {"strength", 100.0}}), 0, full, 1);
+            QVERIFY(full.at(20, 1)[0] > 0.9f && full.at(20, 28)[0] < 0.2f);
+            QCOMPARE(full.at(20, 15)[0], 0.5f);
+            QVERIFY(std::fabs(full.at(1, 15)[0] - 0.5f) < 0.02f);  // (a side the light runs along)
+        }
+
+        // Layer Bevel on a grey disc, lit from the upper left (120 degrees). Straight colour at a place, and its alpha.
+        const Image grey = disc(200, 60, 0.5f);
+        auto straight = [&](const Image& img, double degrees, double r) {
+            const double a = along(img, degrees, r, 3);
+            return a > 1e-6 ? along(img, degrees, r, 0) / a : 0.0;
+        };
+        auto styled = [&](double style, std::initializer_list<std::pair<const char*, double>> more = {}) {
+            Effect e = fx("layer_bevel", {{"style", style}, {"size", 8.0}, {"highlight_opacity", 100.0}, {"shadow_opacity", 100.0}});
+            for (const auto& [k, v] : more) e.params[k] = v;
+            Image img = grey;
+            applyVideoEffect(e, 0, img, 1);
+            return img;
+        };
+        // Inner Bevel: inside the edge, lighter towards the light and darker away from it; nothing beyond the layer, and
+        // nothing further in than its size.
+        {
+            const Image img = styled(0);
+            QVERIFY2(straight(img, 120, 56) > 0.8 && straight(img, 300, 56) < 0.2, qPrintable(QString("%1 %2").arg(straight(img, 120, 56)).arg(straight(img, 300, 56))));
+            for (int y = 0; y < 200; ++y)
+                for (int x = 0; x < 200; ++x) {
+                    const double r = std::hypot(x - 100, y - 100);
+                    if (r < 60 - 8 - 1.5 || r > 61.5)
+                        for (int c = 0; c < 4; ++c) QCOMPARE(img.at(x, y)[c], grey.at(x, y)[c]);
+                    QCOMPARE(img.at(x, y)[3], grey.at(x, y)[3]);  // (the layer's alpha is as it was everywhere)
+                }
+        }
+        // Outer Bevel: the layer itself untouched; round it, the highlight colour towards the light and the shadow colour
+        // away from it, as far out as its size.
+        {
+            const Image img = styled(1);
+            for (int y = 0; y < 200; ++y)
+                for (int x = 0; x < 200; ++x)
+                    if (std::hypot(x - 100, y - 100) < 58.5)
+                        for (int c = 0; c < 4; ++c) QCOMPARE(img.at(x, y)[c], grey.at(x, y)[c]);
+            QVERIFY2(along(img, 120, 64, 3) > 0.5 && straight(img, 120, 64) > 0.95, qPrintable(QString("%1 %2").arg(along(img, 120, 64, 3)).arg(straight(img, 120, 64))));
+            QVERIFY2(along(img, 300, 64, 3) > 0.5 && straight(img, 300, 64) < 0.05, qPrintable(QString("%1 %2").arg(along(img, 300, 64, 3)).arg(straight(img, 300, 64))));
+            QVERIFY(along(img, 120, 71, 3) < 1e-6 && along(img, 300, 71, 3) < 1e-6);
+        }
+        // Emboss: half its size each side of the edge, lit towards the light inside and out.
+        {
+            const Image img = styled(2);
+            QVERIFY(straight(img, 120, 58) > 0.8 && along(img, 120, 62, 3) > 0.5 && straight(img, 120, 62) > 0.95);
+            QVERIFY(straight(img, 300, 58) < 0.2 && along(img, 300, 62, 3) > 0.5 && straight(img, 300, 62) < 0.05);
+            QVERIFY(std::fabs(straight(img, 120, 54) - 0.5) < 1e-6 && along(img, 120, 66, 3) < 1e-6);
+        }
+        // Pillow Emboss: a groove along the edge, so towards the light the layer's side of it is lit and the far side of
+        // it, outside, is in shade; away from the light the other way round.
+        {
+            const Image img = styled(3);
+            QVERIFY2(straight(img, 120, 58) > 0.8 && along(img, 120, 62, 3) > 0.5 && straight(img, 120, 62) < 0.05,
+                     qPrintable(QString("%1 %2 %3").arg(straight(img, 120, 58)).arg(along(img, 120, 62, 3)).arg(straight(img, 120, 62))));
+            QVERIFY(straight(img, 300, 58) < 0.2 && along(img, 300, 62, 3) > 0.5 && straight(img, 300, 62) > 0.95);
+        }
+        // A blend mode and a colour for each side: the highlight added goes past white where screened it cannot, and a
+        // red shadow laid on as it is (Normal) turns the shaded side red where multiplied it would only darken it.
+        {
+            const Image screened = styled(0), added = styled(0, {{"highlight_mode", 2.0}});
+            QVERIFY(straight(screened, 120, 56) <= 1.0 + 1e-6 && straight(added, 120, 56) > 1.2);
+            const Image red = styled(0, {{"shadow_mode", 0.0}, {"shadow.r", 1.0}});
+            QVERIFY(straight(red, 300, 56) > 0.8 && along(red, 300, 56, 1) < 0.2);
+            // Half the opacity, half the change.
+            const Image halfLit = styled(0, {{"highlight_opacity", 50.0}});
+            QVERIFY(std::fabs((straight(halfLit, 120, 56) - 0.5) - (straight(screened, 120, 56) - 0.5) / 2) < 0.01);
+            // Depth makes the slope steeper, so more light at the same place; softened, the slope is gentler and reaches
+            // further in.
+            const Image shallow = styled(0, {{"depth", 30.0}}), soft = styled(0, {{"soften", 4.0}});
+            QVERIFY(straight(shallow, 120, 56) < straight(screened, 120, 56) - 0.05);
+            QVERIFY(std::fabs(straight(screened, 120, 49) - 0.5) < 1e-6 && straight(soft, 120, 49) > 0.51);
+        }
+
+        // In a sequence, over another picture, with the GPU compositor asked for: the same pixels as without it.
+        {
+            Project q = makeDefaultProject();
+            Sequence& s = *q.active();
+            s.width = 160, s.height = 90;
+            Clip back = makeGeneratorClip(q, "color", 20), top = makeGeneratorClip(q, "color", 20);
+            back.generator.params["color.r"] = 0.1, back.generator.params["color.g"] = 0.3, back.generator.params["color.b"] = 0.6;
+            top.generator.params["color.r"] = 0.8, top.generator.params["color.g"] = 0.7, top.generator.params["color.b"] = 0.2;
+            top.motion.params["scale"] = 50.0;
+            top.motion.params["rotation"] = 15.0;
+            QVERIFY(edit::overwrite(q, s, {TrackKind::Video, 0}, back).ok);
+            edit::addTrack(q, s, TrackKind::Video);
+            const auto placed = edit::overwrite(q, s, {TrackKind::Video, 1}, top);
+            QVERIFY(placed.ok);
+            int n = 0;
+            for (const Effect& e : {fx("edge_bevel", {{"thickness", 6.0}, {"height", 6.0}}), fx("layer_bevel", {{"style", 2.0}, {"size", 6.0}}),
+                                    fx("layer_bevel", {{"style", 3.0}, {"size", 8.0}, {"soften", 1.5}})}) {
+                Effect own = e;
+                own.id = q.newId();
+                s.videoTracks[1].clips[0].effects = {own};
+                RenderOptions o;
+                o.gpu = false;
+                const Image cpu = renderProgramFrame(q, s, 5, o);
+                o.gpu = true;
+                const Image gpuFrame = renderProgramFrame(q, s, 5, o);
+                QCOMPARE(gpuFrame.width, cpu.width);
+                double worst = 0;
+                for (size_t i = 0; i < cpu.px.size(); ++i) worst = std::max(worst, std::fabs(double(cpu.px[i]) - gpuFrame.px[i]));
+                QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("effect %1: off by %2").arg(n).arg(worst)));
+                // (and the bevel is in the picture)
+                s.videoTracks[1].clips[0].effects.clear();
+                QVERIFY(renderProgramFrame(q, s, 5, o).px != cpu.px);
+                ++n;
+            }
+        }
     }
 
     void stopMotion() {

@@ -33,6 +33,7 @@
 #include "Relight.h"
 #include "FilmLook.h"
 #include "PaintFx.h"
+#include "BevelFx.h"
 #include "StyleFx.h"
 #include "Deconvolve.h"
 #include "GpuCompositor.h"
@@ -2062,7 +2063,7 @@ EffectDomain effectDomain(const std::string& type) {
                               "rgb_mixer", "mosaic", "focus_repair"})
             m[t] = EffectDomain::Linear;
         for (const char* t : {"posterize", "painterly", "halftone", "duotone", "vhs", "find_edges", "emboss", "invert", "chroma_key", "luma_key",
-                              "screen_key", "clean_plate", "broadcast_safe", "noise", "depth_map"})
+                              "screen_key", "clean_plate", "broadcast_safe", "noise", "depth_map", "edge_bevel", "layer_bevel"})
             m[t] = EffectDomain::Display;
         return m;
     }();
@@ -2562,6 +2563,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "motion_tile") sfx::motionTile(e, t, img, pixelScale);
     else if (ty == "find_edges") sfx::findEdges(e, t, img);
     else if (ty == "emboss") sfx::emboss(e, t, img, pixelScale);
+    else if (ty == "edge_bevel") bevel::edgeBevel(e, t, img, pixelScale);
+    else if (ty == "layer_bevel") bevel::layerBevel(e, t, img, pixelScale);
     else if (ty == "halftone") sfx::halftone(e, t, img, pixelScale);
     else if (ty == "painterly") paintEffect(e, t, img, pixelScale);
     else if (ty == "duotone") sfx::duotone(e, t, img);
