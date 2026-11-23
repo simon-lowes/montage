@@ -413,7 +413,7 @@ void MediaBinWidget::setView(View v) {
     listBtn_->setChecked(v == View::List);
     boardBtn_->setChecked(v == View::Board);
     if (v == View::Board) board_->applyBoard();
-    QSettings("Montage", "Montage").setValue("mediaBin/view", v == View::List ? "list" : v == View::Board ? "board" : "icons");
+    appSettings().setValue("mediaBin/view", v == View::List ? "list" : v == View::Board ? "board" : "icons");
 }
 
 QAbstractItemView* MediaBinWidget::currentView() const {
@@ -1248,7 +1248,7 @@ void MediaBinWidget::saveColumns() {
     QStringList visible;
     for (int c = 0; c < model_->columnCount(); ++c)
         if (!list_->isColumnHidden(c)) visible << QString::fromStdString(MediaBinModel::columnKeys()[size_t(c)]);
-    QSettings("Montage", "Montage").setValue("mediaBin/columns", visible);
+    appSettings().setValue("mediaBin/columns", visible);
 }
 
 void MediaBinWidget::showBinMenu(const QPoint& pos) {

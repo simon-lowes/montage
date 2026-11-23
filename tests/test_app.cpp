@@ -686,7 +686,10 @@ class TestApp : public QObject {
 private slots:
     void initTestCase() {
         QVERIFY(dir_.isValid());
-        // Settings of their own: nothing the app saved (window layout, workspace, presets) leaks into the tests.
+        // Settings of their own: nothing the app saved (window layout, workspace, presets) leaks into the tests, nor
+        // what one run of them saved into the next. In a file: the system's own store on Windows and macOS is not moved
+        // by setPath.
+        QSettings::setDefaultFormat(QSettings::IniFormat);
         for (auto format : {QSettings::NativeFormat, QSettings::IniFormat})
             QSettings::setPath(format, QSettings::UserScope, dir_.filePath(QStringLiteral("settings")));
         // DCP signing certificates and DKDMs of their own too.

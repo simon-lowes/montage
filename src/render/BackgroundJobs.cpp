@@ -215,10 +215,10 @@ bool runningElsewhere(const Record& r, const QString& folder) {
 }
 
 int atOnce() {
-    const int n = QSettings(QStringLiteral("Montage"), QStringLiteral("Montage")).value(QStringLiteral("jobs/at_once"), 2).toInt();
+    const int n = QSettings(QSettings::defaultFormat(), QSettings::UserScope, QStringLiteral("Montage"), QStringLiteral("Montage")).value(QStringLiteral("jobs/at_once"), 2).toInt();
     return std::clamp(n, 1, 16);
 }
 
-void setAtOnce(int n) { QSettings(QStringLiteral("Montage"), QStringLiteral("Montage")).setValue(QStringLiteral("jobs/at_once"), std::clamp(n, 1, 16)); }
+void setAtOnce(int n) { QSettings(QSettings::defaultFormat(), QSettings::UserScope, QStringLiteral("Montage"), QStringLiteral("Montage")).setValue(QStringLiteral("jobs/at_once"), std::clamp(n, 1, 16)); }
 
 }  // namespace montage::jobs
