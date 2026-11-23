@@ -391,3 +391,62 @@ jobs:
           name: wayland-hdr-logs
           path: ${{ runner.temp }}/wayland-hdr
           if-no-files-found: ignore
+
+
+  # HDR viewing on Linux as Qt itself describes it: the same checks under the same Weston, built against Qt 6.12
+  # (installed by aqtinstall, cached) with Montage's own binding of the protocol switched off, so the window's colour
+  # space is what the compositor is told. Only the app tests are built.
+  wayland-hdr-qt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: |
+          ./scripts/setup-deps.sh
+          # (as the wayland-hdr job: what Weston's build, its GL renderer and Qt's Wayland platform need)
+          sudo apt-get install -y -q --no-install-recommends meson ninja-build libwayland-dev libwayland-bin libpixman-1-dev \
+            libxkbcommon-dev libinput-dev libevdev-dev libudev-dev libdrm-dev liblcms2-dev libegl-dev libgles-dev libgbm-dev \
+            libcairo2-dev libpng-dev hwdata libegl-mesa0 libgl1-mesa-dri libwayland-egl1 libwayland-cursor0 libxkbcommon0 \
+            libxcb-cursor0 libxkbcommon-x11-0 > /dev/null
+      - name: Cache Weston
+        uses: actions/cache@v4
+        with:
+          path: ~/weston
+          key: weston-${{ runner.os }}-${{ hashFiles('scripts/build-weston.sh') }}
+      - name: Weston with colour management, and wayland-protocols 1.46
+        run: scripts/build-weston.sh ~/weston
+      - name: Cache Qt 6.12
+        uses: actions/cache@v4
+        with:
+          path: ~/Qt
+          key: qt-6.12.0-linux_gcc_64-multimedia
+      - name: Qt 6.12 with Qt Multimedia (aqtinstall)
+        run: |
+          if [ ! -d ~/Qt/6.12.0/gcc_64 ]; then
+            python3 -m venv ~/aqt && ~/aqt/bin/pip install -q aqtinstall==3.3.0
+            ~/aqt/bin/aqt install-qt linux desktop 6.12.0 linux_gcc_64 -m qtmultimedia -O ~/Qt
+          fi
+          # (its Wayland platform, whatever this Qt names the plug-in)
+          ls ~/Qt/6.12.0/gcc_64/plugins/platforms/ | grep -i wayland
+      - name: Configure
+        run: |
+          set -o pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="$HOME/Qt/6.12.0/gcc_64" \
+            -DMONTAGE_WAYLAND_BINDING=OFF | tee "$RUNNER_TEMP/configure.log"
+          # (Qt's handling of the protocol, not Montage's binding)
+          grep -q "HDR viewer on Wayland: Qt's colour management" "$RUNNER_TEMP/configure.log"
+      - name: Build the app tests
+        run: cmake --build build --target test_app
+      - name: The HDR viewer under Weston, described by Qt
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: scripts/wayland-hdr-check.sh ~/weston build/tests/test_app "$RUNNER_TEMP/wayland-hdr-qt"
+      - name: Weston's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-hdr-qt-logs
+          path: ${{ runner.temp }}/wayland-hdr-qt
+          if-no-files-found: ignore
