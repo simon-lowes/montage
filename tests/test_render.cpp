@@ -30726,6 +30726,70 @@ colorspaces:
         QCOMPARE(steadyBody, qint64(size));
     }
 
+    // Nightly 23 Nov: clients that ask for a file, or for the segment being made, and read none of it make the origin
+    // hold a quarter of a megabyte each, not the files they asked for; and 256 of them on the growing segment do not
+    // keep the next player out.
+    void liveOriginUnreadFilesAndSegments() {
+        QTemporaryDir dir;
+        const int size = 24 << 20;  // (more than a loopback connection holds on its way, on any of the systems)
+        for (const char* name : {"big.mp4", "seg_7.m4s"}) {
+            QFile f(dir.filePath(name));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const QByteArray block(1 << 20, 'x');
+            for (int i = 0; i < size / block.size(); ++i) f.write(block);
+        }
+        LiveOrigin origin;
+        std::string err;
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, [](const std::string& rel) { return rel == "seg_7.m4s"; }, &err), err.c_str());
+        auto ask = [&](QTcpSocket& s, const QByteArray& path) {
+            s.setReadBufferSize(1024);
+            s.connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            if (!s.waitForConnected(5000)) return false;
+            s.setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 64 << 10);
+            s.write("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n");
+            return s.flush() || s.bytesToWrite() == 0;
+        };
+        // What waits in the origin, once it has stopped rising (the largest seen over a second and a half).
+        auto waiting = [&] {
+            qint64 most = 0;
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 1500) {
+                QTest::qWait(50);
+                most = std::max<qint64>(most, origin.bytesWaiting());
+            }
+            return most;
+        };
+        // Forty clients that take nothing of a 24 MB file: what waits for each is a piece of it.
+        std::vector<std::unique_ptr<QTcpSocket>> idle;
+        for (int i = 0; i < 40; ++i) {
+            idle.push_back(std::make_unique<QTcpSocket>());
+            QVERIFY(ask(*idle.back(), "/big.mp4"));
+        }
+        const qint64 forFiles = waiting();
+        QVERIFY2(forFiles > 0 && forFiles <= 40 * ((256 << 10) + 4096), qPrintable(QString::number(forFiles)));
+        idle.clear();
+        QTest::qWait(300);
+        // 256 that ask for the segment being made and read nothing: the same, and the next client is answered.
+        for (int i = 0; i < 256; ++i) {
+            idle.push_back(std::make_unique<QTcpSocket>());
+            QVERIFY(ask(*idle.back(), "/seg_7.m4s"));
+        }
+        const qint64 forSegments = waiting();
+        QVERIFY2(forSegments > 0 && forSegments <= 256 * ((256 << 10) + 4096), qPrintable(QString::number(forSegments)));
+        for (int i = 0; i < 3; ++i) {
+            QTcpSocket s;
+            s.connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            QVERIFY(s.waitForConnected(5000));
+            s.write("GET /time HTTP/1.1\r\nHost: x\r\n\r\n");
+            QByteArray in;
+            QElapsedTimer t;
+            t.start();
+            while (!in.contains("\r\n\r\n") && t.elapsed() < 5000 && (s.waitForReadyRead(200) || s.state() == QAbstractSocket::ConnectedState)) in += s.readAll();
+            QVERIFY2(in.startsWith("HTTP/1.1 200"), in.left(40).constData());
+        }
+    }
+
     // Nightly 15 Nov: low latency HLS as a player is promised it. The preload hint after a segment's last part
     // names the next segment's first; every part but a segment's last is 85% of its playlist's PART-TARGET at least
     // (with sound, a part asked shorter than 13 coded frames is made that long); a blocking reload for what is too
