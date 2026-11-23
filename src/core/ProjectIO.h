@@ -15,6 +15,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath = {})
 // One clip as JSON (as in project files).
 std::string clipToJsonString(const Clip& c);
 std::string captionTrackToJsonString(const CaptionTrack& t);
+bool captionTrackFromJsonString(const std::string& json, CaptionTrack& out);
 // A caption style alone (for saved looks), as in project files.
 std::string captionStyleToJsonString(const CaptionStyle& st);
 bool captionStyleFromJsonString(const std::string& json, CaptionStyle& out);

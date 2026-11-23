@@ -19781,6 +19781,40 @@ const auto seq = [this] { return state()->sequence(); };
                 yellow = c.redF() > 0.8 && c.greenF() > 0.8 && c.blueF() < 0.3 && c.alphaF() > 0.9;
             }
         QVERIFY(yellow);
+        // Drafting is a background job (DialogJobs.h): left to run, its dialog closed, the same track is added when it
+        // ends; killed in another Montage at its start and taken up by one of two started together, the same again,
+        // offered here (the helpers have no project open) and added when it is applied.
+        {
+            const CaptionTrack watched = sdh;
+            auto same = [&] {
+                const Sequence* now = state()->sequence();
+                if (now->captionTracks.size() != 1) return false;
+                const CaptionTrack& t = now->captionTracks[0];
+                return t.name == watched.name && t.language == watched.language && t.style == watched.style && t.captions == watched.captions;
+            };
+            state()->undo();
+            QVERIFY(state()->sequence()->captionTracks.empty());
+            DialogJobs* dialogs = DialogJobs::of(win_.get());
+            const QString id = startInBackground(dialogs, [&] { QCOMPARE(panel->draftSdh(o, &error), 0); });
+            QVERIFY(!id.isEmpty());
+            QVERIFY(state()->sequence()->captionTracks.empty());
+            dialogs->setPaused(id, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+            QVERIFY(same());
+            state()->undo();
+            const QJsonObject input{{"sequence", QString::number(state()->sequence()->id)},
+                                    {"options", QJsonObject{{"sdh", QJsonObject{{"style", int(kSdhColours)}, {"lyrics", false}}},
+                                                            {"sounds", false},
+                                                            {"faces", false},
+                                                            {"readText", false}}}};
+            QString why;
+            const QString job = killedAndTakenUp("captions-sdh", "Drafting captions for the deaf and hard of hearing…", input, "0", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(!dialogs->offeredNote(job).isEmpty());
+            QVERIFY(dialogs->applyOffered(job));
+            QCOMPARE(state()->sequence()->captionTracks.size(), size_t(1));
+            QVERIFY(same());
+        }
         // In the brackets style, a second track, the speakers named (no faces were looked for). It takes the style of the
         // track that was shown and becomes the one shown, the first hidden.
         QVERIFY(state()->edit("Style", [](Project&, Sequence& sq) {

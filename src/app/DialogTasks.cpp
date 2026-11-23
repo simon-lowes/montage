@@ -20,6 +20,10 @@
 #include "core/EditOps.h"
 #include "core/ProjectIO.h"
 #include "audio/DialogueAlign.h"
+#include "core/Captions.h"
+#include "media/Translator.h"
+#include "render/ImageSubtitles.h"
+#include "render/SdhDraft.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
 #include "render/RenderFarm.h"
@@ -38,6 +42,9 @@ struct WindowText {
 };
 struct AdrText {
     Q_DECLARE_TR_FUNCTIONS(montage::AdrPanel)
+};
+struct CaptionText {
+    Q_DECLARE_TR_FUNCTIONS(montage::CaptionsPanel)
 };
 
 Id idOf(const QJsonValue& v) { return Id(v.toString().toULongLong()); }
@@ -556,6 +563,162 @@ QJsonObject applyAdrAlign(EditorState* state, const QJsonObject& input, const QJ
                             .arg(std::lround(100 * result.value("maxRate").toDouble()))}};
 }
 
+// --- Captions: translate a track, draft SDH captions, read subtitles that are pictures ---
+//
+// Each makes a caption track, kept in the result as the project file keeps one, and added to the sequence as one
+// undo step when it ends ("track": its id, for the panel to show).
+
+QJsonObject trackResult(const CaptionTrack& t) { return {{"track", QString::fromStdString(captionTrackToJsonString(t))}}; }
+
+bool trackFrom(const QJsonObject& result, CaptionTrack& t) { return captionTrackFromJsonString(result.value("track").toString().toStdString(), t); }
+
+// Adds `t` (a new id) to the input's sequence; `hideOthers`: it becomes the one shown. Returns its id, 0 when the
+// sequence is gone.
+Id addCaptionTrack(EditorState* state, const QJsonObject& input, const QString& label, CaptionTrack t, bool hideOthers, int* hidden = nullptr) {
+    Id id = 0;
+    const Id seq = idOf(input.value("sequence"));
+    state->edit(label, [&](Project& p, Sequence& sq) {
+        if (sq.id != seq) return false;
+        t.id = id = p.newId();
+        if (hideOthers)
+            for (CaptionTrack& o : sq.captionTracks)
+                if (o.visible) o.visible = false, hidden && ++*hidden;
+        sq.captionTracks.push_back(std::move(t));
+        return true;
+    });
+    return id;
+}
+
+bool failed(TaskRun& t, const std::string& error) {
+    if (!t.cancelled()) t.error = error.empty() ? "Cancelled" : error;
+    return false;
+}
+
+bool runTranslateCaptions(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    const Id id = idOf(t.input.value("track"));
+    const auto source = std::find_if(s->captionTracks.begin(), s->captionTracks.end(), [&](const CaptionTrack& c) { return c.id == id; });
+    if (source == s->captionTracks.end()) {
+        t.error = "The caption track is gone";
+        return false;
+    }
+    const std::string from = source->language.empty() ? "en" : source->language, to = t.input.value("to").toString().toStdString();
+    std::vector<std::string> texts;
+    std::string err;
+    t.progress(0);
+    if (!translateTexts(captionTexts(*source), from, to, texts, t.progress, t.cancel, &err)) return failed(t, err);
+    CaptionTrack made = translatedTrack(*source, texts, 0, to, translationLanguageName(to));
+    made.visible = false;  // the original stays the one shown until this is chosen
+    t.result = trackResult(made);
+    return true;
+}
+
+QJsonObject applyTranslateCaptions(EditorState* state, const QJsonObject& input, const QJsonObject& result) {
+    CaptionTrack t;
+    if (!trackFrom(result, t)) return {{"changed", false}, {"failed", true}};
+    const Id id = addCaptionTrack(state, input, CaptionText::tr("Translate Captions"), t, false);
+    if (!id) return {{"changed", false}, {"failed", true}};
+    return {{"changed", true}, {"track", QString::number(id)}, {"message", CaptionText::tr("Translated into %1").arg(QString::fromStdString(translationLanguageName(t.language)))}};
+}
+
+SdhDraftOptions sdhOptionsFrom(const QJsonObject& j) {
+    SdhDraftOptions o;
+    const QJsonObject sdh = j.value("sdh").toObject(), rules = j.value("rules").toObject();
+    o.sdh.style = SdhStyle(sdh.value("style").toInt(int(o.sdh.style)));
+    o.sdh.minSeconds = sdh.value("minSeconds").toDouble(o.sdh.minSeconds);
+    o.sdh.maxSeconds = sdh.value("maxSeconds").toDouble(o.sdh.maxSeconds);
+    o.sdh.gapFrames = sdh.value("gapFrames").toInt(o.sdh.gapFrames);
+    o.sdh.mergeSeconds = sdh.value("mergeSeconds").toDouble(o.sdh.mergeSeconds);
+    o.sdh.speakerLabels = sdh.value("speakerLabels").toBool(o.sdh.speakerLabels);
+    o.sdh.lyrics = sdh.value("lyrics").toBool(o.sdh.lyrics);
+    o.sdh.lineChars = sdh.value("lineChars").toInt(o.sdh.lineChars);
+    o.sdh.maxLines = sdh.value("maxLines").toInt(o.sdh.maxLines);
+    o.rules.lineChars = rules.value("lineChars").toInt(o.rules.lineChars);
+    o.rules.maxLines = rules.value("maxLines").toInt(o.rules.maxLines);
+    o.rules.maxSeconds = rules.value("maxSeconds").toDouble(o.rules.maxSeconds);
+    o.rules.minSeconds = rules.value("minSeconds").toDouble(o.rules.minSeconds);
+    o.threshold = j.value("threshold").toDouble(o.threshold);
+    o.loudDb = j.value("loudDb").toDouble(o.loudDb);
+    o.minSoundSeconds = j.value("minSoundSeconds").toDouble(o.minSoundSeconds);
+    o.sounds = j.value("sounds").toBool(o.sounds);
+    o.faces = j.value("faces").toBool(o.faces);
+    o.readText = j.value("readText").toBool(o.readText);
+    return o;
+}
+
+bool runSdhDraft(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    SdhDraft draft;
+    std::string err;
+    t.progress(0);
+    if (!draftSdhCaptions(*t.project, *s, sdhOptionsFrom(t.input.value("options").toObject()), draft, t.progress, t.cancel, &err))
+        return failed(t, err);
+    CaptionTrack made;
+    made.name = CaptionText::tr("SDH").toStdString();
+    if (!draft.language.empty()) made.language = draft.language;
+    made.style = draft.look;  // the captions were placed for it
+    made.captions = draft.captions;
+    t.result = trackResult(made);
+    QJsonArray notes;
+    for (const std::string& n : draft.notes) notes.append(QString::fromStdString(n));
+    t.result["sounds"] = draft.summary.sounds, t.result["lyrics"] = draft.summary.lyrics;
+    t.result["speakers"] = draft.summary.speakers, t.result["raised"] = draft.summary.raised;
+    t.result["notes"] = notes;
+    return true;
+}
+
+QJsonObject applySdhDraft(EditorState* state, const QJsonObject& input, const QJsonObject& result) {
+    CaptionTrack t;
+    if (!trackFrom(result, t)) return {{"changed", false}, {"failed", true}};
+    // The new track is the one shown (the first visible), so the other tracks are hidden.
+    int hidden = 0;
+    const int n = int(t.captions.size());
+    const Id id = addCaptionTrack(state, input, CaptionText::tr("Generate SDH Captions"), std::move(t), true, &hidden);
+    if (!id) return {{"changed", false}, {"failed", true}};
+    QString text = CaptionText::tr("%n SDH caption(s): ", "", n) + CaptionText::tr("%1 sound(s), %2 sung, %3 with the speaker shown, %4 moved off text")
+                                                                     .arg(result.value("sounds").toInt())
+                                                                     .arg(result.value("lyrics").toInt())
+                                                                     .arg(result.value("speakers").toInt())
+                                                                     .arg(result.value("raised").toInt());
+    if (hidden) text += QStringLiteral(". ") + CaptionText::tr("%n other caption track(s) hidden", "", hidden);
+    for (const QJsonValue& note : result.value("notes").toArray()) text += QStringLiteral(". ") + note.toString();
+    return {{"changed", true}, {"track", QString::number(id)}, {"captions", n}, {"message", text}};
+}
+
+bool runReadSubtitles(TaskRun& t) {
+    const Sequence* s = sequenceOf(t);
+    if (!s) return noSequence(t);
+    ImageSubtitleImport read;
+    std::string err;
+    t.progress(0);
+    if (!readImageSubtitles(t.input.value("file").toString().toStdString(), s->fps, read, -1, {}, t.progress, t.cancel, &err)) return failed(t, err);
+    t.result = trackResult(read.track);
+    QJsonArray review;
+    for (const OcrReview& r : read.review) {
+        QJsonArray suggestions;
+        for (const std::string& w : r.suggestions) suggestions.append(QString::fromStdString(w));
+        review.append(QJsonObject{{"caption", double(r.caption)}, {"word", QString::fromStdString(r.word)}, {"suggestions", suggestions},
+                                  {"confidence", double(r.confidence)}});
+    }
+    t.result["review"] = review;
+    return true;
+}
+
+QJsonObject applyReadSubtitles(EditorState* state, const QJsonObject& input, const QJsonObject& result) {
+    CaptionTrack t;
+    if (!trackFrom(result, t)) return {{"changed", false}, {"failed", true}};
+    const int n = int(t.captions.size()), unsure = int(result.value("review").toArray().size());
+    const Id id = addCaptionTrack(state, input, CaptionText::tr("Import Captions"), std::move(t), false);
+    if (!id) return {{"changed", false}, {"failed", true}};
+    // The words read with little confidence are underlined by the spell check: say how many.
+    return {{"changed", true},
+            {"track", QString::number(id)},
+            {"message", unsure ? CaptionText::tr("%n subtitle(s) read from their pictures; %1 word(s) to check (underlined)", "", n).arg(unsure)
+                               : CaptionText::tr("%n subtitle(s) read from their pictures", "", n)}};
+}
+
 }  // namespace
 
 QJsonObject dcpResultToJson(const DcpResult& r) {
@@ -734,6 +897,9 @@ void registerDialogTaskKinds() {
         DialogJobs::registerKind(QStringLiteral("auto-mix"), {runMix, applyMixPlan, true, nullptr});
         DialogJobs::registerKind(QStringLiteral("conform-check"), {runConform, nullptr, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("adr-align"), {runAdrAlign, applyAdrAlign, false, nullptr});
+        DialogJobs::registerKind(QStringLiteral("captions-translate"), {runTranslateCaptions, applyTranslateCaptions, false, nullptr});
+        DialogJobs::registerKind(QStringLiteral("captions-sdh"), {runSdhDraft, applySdhDraft, false, nullptr});
+        DialogJobs::registerKind(QStringLiteral("captions-read"), {runReadSubtitles, applyReadSubtitles, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("dcp"), {runDcp, nullptr, false, discardPictures});
         DialogJobs::registerKind(QStringLiteral("imf"), {runImf, nullptr, false, discardPictures});
     });

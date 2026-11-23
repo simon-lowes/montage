@@ -1361,6 +1361,13 @@ std::string captionTrackToJsonString(const CaptionTrack& t) {
     return QJsonDocument(captionTrackToJson(t)).toJson(QJsonDocument::Compact).toStdString();
 }
 
+bool captionTrackFromJsonString(const std::string& json, CaptionTrack& out) {
+    const QJsonDocument d = QJsonDocument::fromJson(QByteArray::fromStdString(json));
+    if (!d.isObject()) return false;
+    out = captionTrackFromJson(d.object());
+    return true;
+}
+
 std::string objectMaskToJsonString(const ObjectMask& m) {
     return QJsonDocument(objectMaskToJson(m)).toJson(QJsonDocument::Compact).toStdString();
 }

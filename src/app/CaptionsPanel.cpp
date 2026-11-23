@@ -8,10 +8,6 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
-#include <QEventLoop>
-#include <QFutureWatcher>
-#include <QProgressDialog>
-#include <QtConcurrent>
 #include <QDoubleSpinBox>
 #include <QFile>
 #include <QFileDialog>
@@ -21,6 +17,8 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
@@ -37,6 +35,7 @@
 #include <QVBoxLayout>
 #include <algorithm>
 
+#include "DialogJobs.h"
 #include "EditorState.h"
 #include "core/ProjectIO.h"
 #include "ModelPacks.h"
@@ -448,45 +447,13 @@ Id CaptionsPanel::translateTrack(const std::string& to, QString* error) {
                          .arg(QString::fromStdString(translationLanguageName(from)), QString::fromStdString(translationLanguageName(to)));
         return 0;
     }
-    const CaptionTrack source = *src;
-    const std::vector<std::string> texts = captionTexts(source);
-    // Translating takes a while: in the background, with progress.
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    auto done = std::make_shared<std::atomic<double>>(0.0);
-    QProgressDialog progress(tr("Translating captions…"), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
-    tick.start(100);
-    using Out = std::pair<std::vector<std::string>, std::string>;
-    QFutureWatcher<Out> watcher;
-    QEventLoop wait;
-    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([texts, from, to, cancel, done] {
-        Out out;
-        std::string err;
-        if (!translateTexts(texts, from, to, out.first, [done](double f) { *done = f; }, cancel.get(), &err)) out.second = err.empty() ? "Cancelled" : err;
-        return out;
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    tick.stop();
-    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
-    progress.close();
-    const Out r = watcher.result();
-    if (*cancel || !r.second.empty()) {
-        if (error) *error = *cancel ? QString() : QString::fromStdString(r.second);
-        return 0;
-    }
-    Id created = 0;
-    state_->edit(tr("Translate Captions"), [&](Project& p, Sequence& sq) {
-        CaptionTrack t = translatedTrack(source, r.first, p.newId(), to, translationLanguageName(to));
-        t.visible = false;  // the original stays the one shown until this is chosen
-        created = t.id;
-        sq.captionTracks.push_back(std::move(t));
-        return true;
-    });
+    // Translating takes a while: a background job (DialogJobs.h, "captions-translate" in DialogTasks.cpp), watched
+    // behind its progress dialog or left to run; the new track is added as one undo step when it ends.
+    const QJsonObject input{{"sequence", QString::number(state_->sequence()->id)}, {"track", QString::number(src->id)}, {"to", QString::fromStdString(to)}};
+    const TaskOutcome r = DialogJobs::of(this)->run(state_, QStringLiteral("captions-translate"), tr("Translating captions…"), input, this);
+    if (r.how == TaskOutcome::Failed && error) *error = r.error;
+    if (!r.done() || !r.applied.value("changed").toBool()) return 0;
+    const Id created = Id(r.applied.value("track").toString().toULongLong());
     if (created) setCurrentTrack(created);
     return created;
 }
@@ -846,60 +813,34 @@ void CaptionsPanel::generateDialog() {
 int CaptionsPanel::draftSdh(const SdhDraftOptions& options, QString* error) {
     const Sequence* s = state_->sequence();
     if (!s) return 0;
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    auto done = std::make_shared<std::atomic<double>>(0.0);
-    QProgressDialog progress(tr("Drafting captions for the deaf and hard of hearing…"), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
-    tick.start(100);
-    using Out = std::pair<SdhDraft, std::string>;
-    QFutureWatcher<Out> watcher;
-    QEventLoop wait;
-    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
-    const Project project = state_->project();
-    const Sequence seq = *s;
-    watcher.setFuture(QtConcurrent::run([project, seq, options, cancel, done] {
-        Out out;
-        std::string err;
-        if (!draftSdhCaptions(project, seq, options, out.first, [done](double f) { *done = f; }, cancel.get(), &err))
-            out.second = err.empty() ? "Cancelled" : err;
-        return out;
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    tick.stop();
-    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
-    progress.close();
-    const Out r = watcher.result();
-    if (*cancel || !r.second.empty()) {
-        if (error) *error = *cancel ? QString() : QString::fromStdString(r.second);
-        return 0;
-    }
-    Id id = 0;
-    int hidden = 0;
-    state_->edit(tr("Generate SDH Captions"), [&](Project& p, Sequence& sq) {
-        CaptionTrack t;
-        t.id = id = p.newId();
-        t.name = tr("SDH").toStdString();
-        if (!r.first.language.empty()) t.language = r.first.language;
-        t.style = r.first.look;  // the captions were placed for it
-        t.captions = r.first.captions;
-        // The new track is the one shown (the first visible), so the other tracks are hidden.
-        for (CaptionTrack& o : sq.captionTracks)
-            if (o.visible) o.visible = false, ++hidden;
-        sq.captionTracks.push_back(std::move(t));
-        return true;
-    });
-    setCurrentTrack(id);
-    const SdhSummary& sum = r.first.summary;
-    QString text = tr("%n SDH caption(s): ", "", int(r.first.captions.size())) +
-                   tr("%1 sound(s), %2 sung, %3 with the speaker shown, %4 moved off text").arg(sum.sounds).arg(sum.lyrics).arg(sum.speakers).arg(sum.raised);
-    if (hidden) text += QStringLiteral(". ") + tr("%n other caption track(s) hidden", "", hidden);
-    for (const std::string& n : r.first.notes) text += QStringLiteral(". ") + QString::fromStdString(n);
-    state_->message(text, 8000);
-    return int(r.first.captions.size());
+    // Listening, looking and reading take a while: a background job (DialogJobs.h, "captions-sdh" in DialogTasks.cpp),
+    // watched behind its progress dialog or left to run; the SDH track is added as one undo step when it ends.
+    const SdhOptions& sdh = options.sdh;
+    const CaptionRules& rules = options.rules;
+    const QJsonObject o{{"sdh", QJsonObject{{"style", int(sdh.style)},
+                                            {"minSeconds", sdh.minSeconds},
+                                            {"maxSeconds", sdh.maxSeconds},
+                                            {"gapFrames", sdh.gapFrames},
+                                            {"mergeSeconds", sdh.mergeSeconds},
+                                            {"speakerLabels", sdh.speakerLabels},
+                                            {"lyrics", sdh.lyrics},
+                                            {"lineChars", sdh.lineChars},
+                                            {"maxLines", sdh.maxLines}}},
+                        {"rules", QJsonObject{{"lineChars", rules.lineChars}, {"maxLines", rules.maxLines}, {"maxSeconds", rules.maxSeconds}, {"minSeconds", rules.minSeconds}}},
+                        {"threshold", options.threshold},
+                        {"loudDb", options.loudDb},
+                        {"minSoundSeconds", options.minSoundSeconds},
+                        {"sounds", options.sounds},
+                        {"faces", options.faces},
+                        {"readText", options.readText}};
+    const QJsonObject input{{"sequence", QString::number(s->id)}, {"options", o}};
+    const TaskOutcome r =
+        DialogJobs::of(this)->run(state_, QStringLiteral("captions-sdh"), tr("Drafting captions for the deaf and hard of hearing…"), input, this);
+    if (r.how == TaskOutcome::Failed && error) *error = r.error;
+    if (!r.done() || !r.applied.value("changed").toBool()) return 0;
+    setCurrentTrack(Id(r.applied.value("track").toString().toULongLong()));
+    state_->message(r.applied.value("message").toString(), 8000);
+    return r.applied.value("captions").toInt();
 }
 
 void CaptionsPanel::editSoundCaptions() {
@@ -979,52 +920,24 @@ bool CaptionsPanel::importPictures(const QString& path, QString* error) {
     if (!ensureModelPack(this, ocrModel(), tr("Import Captions"),
                          tr("Subtitles that are pictures (Blu-ray, DVB, DVD) are read with PP-OCR (PaddlePaddle, Apache-2.0), which runs on this computer.")))
         return false;
-    // Reading every picture takes a while: in the background, with progress.
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    auto done = std::make_shared<std::atomic<double>>(0.0);
-    QProgressDialog progress(tr("Reading the subtitles…"), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
-    tick.start(100);
-    using Out = std::pair<ImageSubtitleImport, std::string>;
-    QFutureWatcher<Out> watcher;
-    QEventLoop wait;
-    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
-    const std::string file = path.toStdString();
-    const Rational fps = s->fps;
-    watcher.setFuture(QtConcurrent::run([file, fps, cancel, done] {
-        Out out;
-        std::string err;
-        if (!readImageSubtitles(file, fps, out.first, -1, {}, [done](double f) { *done = f; }, cancel.get(), &err))
-            out.second = err.empty() ? "Cancelled" : err;
-        return out;
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    tick.stop();
-    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
-    progress.close();
-    const Out r = watcher.result();
-    if (*cancel || !r.second.empty()) {
-        if (error) *error = *cancel ? QString() : QString::fromStdString(r.second);
-        return false;
+    // Reading every picture takes a while: a background job (DialogJobs.h, "captions-read" in DialogTasks.cpp), watched
+    // behind its progress dialog or left to run; the track is added as one undo step when it ends.
+    const QJsonObject input{{"sequence", QString::number(s->id)}, {"file", path}};
+    const TaskOutcome r = DialogJobs::of(this)->run(state_, QStringLiteral("captions-read"), tr("Reading the subtitles…"), input, this);
+    if (r.how == TaskOutcome::Failed && error) *error = r.error;
+    if (!r.done() || !r.applied.value("changed").toBool()) return false;
+    setCurrentTrack(Id(r.applied.value("track").toString().toULongLong()));
+    state_->message(r.applied.value("message").toString(), 6000);
+    lastReview_.clear();
+    for (const QJsonValue& v : r.result.value("review").toArray()) {
+        const QJsonObject o = v.toObject();
+        OcrReview w;
+        w.caption = size_t(o.value("caption").toDouble());
+        w.word = o.value("word").toString().toStdString();
+        for (const QJsonValue& x : o.value("suggestions").toArray()) w.suggestions.push_back(x.toString().toStdString());
+        w.confidence = float(o.value("confidence").toDouble());
+        lastReview_.push_back(std::move(w));
     }
-    Id id = 0;
-    state_->edit(tr("Import Captions"), [&](Project& p, Sequence& sq) {
-        CaptionTrack t = r.first.track;
-        t.id = id = p.newId();
-        sq.captionTracks.push_back(std::move(t));
-        return true;
-    });
-    setCurrentTrack(id);
-    // The words read with little confidence are underlined by the spell check: say how many.
-    const int n = int(r.first.track.captions.size()), unsure = int(r.first.review.size());
-    state_->message(unsure ? tr("%n subtitle(s) read from their pictures; %1 word(s) to check (underlined)", "", n).arg(unsure)
-                           : tr("%n subtitle(s) read from their pictures", "", n),
-                    6000);
-    lastReview_ = r.first.review;
     return true;
 }
 
