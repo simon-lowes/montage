@@ -1980,7 +1980,7 @@ Image transitionLayer(const Project& p, const Sequence& seq, const Track& track,
                       const std::function<void(const Clip&, FrameTime, Image&)>& finish = {}, bool* displayReferred = nullptr) {
     const Clip* A = findClip(track, tr.clipA);
     const Clip* B = findClip(track, tr.clipB);
-    const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+    const double u = std::min(1.0, (double(t - from) + tr.phase) / double(std::max<FrameTime>(1, to - from)));
     bool shown = false;
     auto layerOf = [&](const Clip& c, FrameTime at) {
         bool display = false;
@@ -3292,7 +3292,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             const Clip* top = B ? B : A;
             gpu::Item item;
             item.blendMode = blendModeIndex(top ? top->blendMode : "normal");
-            const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+            const double u = std::min(1.0, (double(t - from) + active->phase) / double(std::max<FrameTime>(1, to - from)));
             const int kind = active->type == "cross_dissolve" ? 0 : gpuTransitionParams(active->type, active->params, u, W, H, item.transitionParams);
             // Smooth Cut: the transition's first frame of A and last of B, each drawn here, morphed along their flow (as
             // transitionLayer does: measured once from the pair, on the CPU, and kept), gpumix.frag's 18.

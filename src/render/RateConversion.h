@@ -61,7 +61,8 @@ Sequence deliveredSequence(const Sequence& seq, const RateConversion& c, FrameTi
 // The sequence at twice its frame rate, every time in it on the new frames (its clips, their sources, keyframes and
 // expressions' starts, its transitions, markers, captions and grades' keys): its frame 2f is the sequence's frame f,
 // 2f + 1 the moment half a frame after it. An interlaced delivery's second fields are rendered from it, each at its
-// own time. (Effects that count in frames rather than keys, such as an echo's, count fields there.)
+// own time: a transition's mix too (Transition::phase), so a dissolve's second field is halfway between the first
+// fields either side. (Effects that count in frames rather than keys, such as an echo's, count fields there.)
 Sequence fieldRateSequence(const Sequence& seq);
 // The project with every sequence at twice its rate, so a sequence nested in one at twice its rate shows its own
 // moments half a frame on too (the second fields' pictures are rendered from it).

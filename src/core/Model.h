@@ -573,6 +573,10 @@ struct Transition {
     Id clipB = 0;               // incoming clip (0 = fade out to nothing)
     FrameTime duration = 15;    // centred on the edit point
     Effect params;              // type-specific parameters (e.g. wipe softness)
+    // Where in a frame its mix is reckoned, in frames from the frame's start: the middle. Not saved: a sequence made
+    // at twice its rate for an interlaced delivery's second fields (render/RateConversion's fieldRateSequence) has
+    // 1, so each field is mixed at its own moment, the second halfway between the first fields either side.
+    double phase = 0.5;
     bool operator==(const Transition&) const = default;
 };
 

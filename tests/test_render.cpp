@@ -12265,6 +12265,66 @@ colorspaces:
         }
     }
 
+    void interlacedDissolveAtFieldMoments() {
+        // A dissolve from black to white over ten frames. A frame is mixed at its middle, so the first fields step a
+        // tenth each; a second field belongs half a frame later, halfway between the first fields either side (it was
+        // a quarter of a step short of that, mixed at the middle of its own field).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        s.videoTracks[0].clips = {colorClip(p, 0, 0, 0, 0, 12), colorClip(p, 1, 1, 1, 12, 12)};
+        QVERIFY(edit::addTransition(p, s, s.videoTracks[0].clips[1].id, edit::Edge::In, "cross_dissolve", 10).ok);
+        QCOMPARE(s.videoTracks[0].transitions.size(), size_t(1));
+        QCOMPARE(s.videoTracks[0].transitions[0].phase, 0.5);
+        const Sequence twice = fieldRateSequence(s);
+        QCOMPARE(twice.videoTracks[0].transitions[0].duration, FrameTime(20));
+        QCOMPARE(twice.videoTracks[0].transitions[0].phase, 1.0);
+        RenderOptions ro;
+        ro.highQuality = true;
+        auto level = [&](const Sequence& on, FrameTime t) { return double(renderProgramFrame(p, on, t, ro).at(160, 90)[1]); };
+        // (the transition runs from frame 7 to 17)
+        for (int k = 5; k < 18; ++k) {
+            const double first = level(s, k), next = level(s, k + 1);
+            if (k >= 7 && k < 16) QVERIFY2(std::fabs(next - first - 0.1) < 0.01, qPrintable(QStringLiteral("frame %1: %2 then %3").arg(k).arg(first).arg(next)));
+            QVERIFY2(std::fabs(level(twice, 2 * k) - first) < 1e-4, qPrintable(QString::number(k)));
+            // (halfway where both first fields are inside the dissolve; at its ends, where the ramp stops, between them)
+            const double second = level(twice, 2 * k + 1);
+            QVERIFY2(k >= 7 && k < 16 ? std::fabs(second - (first + next) / 2) < 0.005 : second >= first - 1e-4 && second <= next + 1e-4,
+                     qPrintable(QStringLiteral("frame %1: %2 between %3 and %4").arg(k).arg(second).arg(first).arg(next)));
+        }
+        // The same in an interlaced export (12-bit ProRes, the top field first): line 91, the second field's, is
+        // halfway between line 90 of its frame and of the next; segmented, both lines are the frame's.
+        auto luma = [](const AVFrame* f, int y) { return int(reinterpret_cast<const uint16_t*>(f->data[0] + size_t(y) * size_t(f->linesize[0]))[160]); };
+        QTemporaryDir dir;
+        std::string err;
+        for (const bool segmented : {false, true}) {
+            ExportSettings st;
+            st.videoCodec = "prores_ks";
+            st.profile = "4444";
+            st.pixFmt = "yuv444p12le";
+            st.audioCodec = "none";
+            st.interlaced = true;
+            st.segmentedFields = segmented;
+            st.path = dir.filePath(QStringLiteral("dissolve%1.mov").arg(segmented)).toStdString();
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            std::vector<int> first, second;
+            const int64_t n = decodeMxfPictures(st.path, [&](const AVFrame* f, const AVPacket*) {
+                first.push_back(luma(f, 90));
+                second.push_back(luma(f, 91));
+                return true;
+            });
+            QCOMPARE(n, int64_t(24));
+            // (a tenth of the 12-bit video range a frame: about 350 codes)
+            const int step = first[12] - first[11];
+            QVERIFY2(step > 300 && step < 400, qPrintable(QString::number(step)));
+            for (size_t k = 7; k < 16; ++k) {
+                const int want = segmented ? first[k] : (first[k] + first[k + 1]) / 2;
+                QVERIFY2(std::abs(second[k] - want) <= 12,
+                         qPrintable(QStringLiteral("segmented %1, frame %2: %3, first fields %4 and %5").arg(segmented).arg(k).arg(second[k]).arg(first[k]).arg(first[k + 1])));
+            }
+        }
+    }
+
     void exportsImfSupplementalAt2997() {
         if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
         // A lossy 29.97 master of 7 frames (padded to 10, so the sound fills whole frames), then a supplemental with
