@@ -11,6 +11,12 @@
 // MONTAGE_GPU_LOG=1 prints why frames fall back and how each layer was drawn. Where it draws with OpenGL its context
 // shares its textures with the OpenFX plug-ins' (render/OfxGl.h), so that a plug-in rendering with OpenGL draws from
 // and into the compositor's own textures (TextureStep); MONTAGE_GPU_SHARE=off keeps the two apart.
+//
+// Texture memory: every texture the compositor makes is counted (Stats::textureBytes) against a budget, half the
+// card's memory where the device says how much it has (Vulkan's device-local heaps; OpenGL's memory-info extensions),
+// or MONTAGE_GPU_MEMORY megabytes. A frame that would hold more than the budget is not drawn on the GPU (and not tried
+// again while nothing about it changes); where no budget is known, nothing is refused. Between frames it keeps the
+// textures the last frame used, and of the others up to 768 MB (or the budget, if less) for a few frames.
 
 #include <functional>
 #include <memory>
@@ -37,6 +43,7 @@ int maxTextureSize();      // the widest picture it takes (0 without a GPU)
 bool takesPlanes();        // it converts decoded Y′CbCr planes itself (Frame16::planes)
 bool takesShaders(const std::string& key = {});  // it compiles shader steps (ShaderStep) while running (that one, too)
 bool sharesOpenGl();       // it runs texture steps (TextureStep): its OpenGL textures are the OpenFX plug-ins' context's too
+size_t textureBudget();    // the most texture memory a frame may hold, bytes (0: no budget known, nothing is refused)
 void shutdown();           // (before the application goes; initialize() again is allowed)
 
 // A colour step written in GLSL at run time (render/Ocio's OpenColorIO transforms, from OCIO's own GPU shaders):
@@ -116,6 +123,11 @@ struct ColorOp {
     std::vector<float> mask;
     float maskParams[12] = {};
     std::vector<float> plate;  // ScreenKey: its clean plate (RGBA, the layer's size), or none
+    // A step finished from the picture as it is when the step runs (a mask's edge settled on the picture's own, a
+    // Keyer's plate made from the picture itself): the picture is read back (premultiplied float, the layer's size;
+    // a Mix's is the picture marked) and given to `prepare` with a copy of this step to complete (its mask, its
+    // plate), on the thread that asked for the frame. False: the frame is not drawn on the GPU.
+    std::function<bool(const Image& picture, ColorOp& op)> prepare;
 };
 
 // Where a layer goes on the canvas (render/Compositor's Geometry, worked out on the CPU).
@@ -176,8 +188,8 @@ struct Frame {
 };
 
 // Draws the frame into `out` (premultiplied float) or `out8` (8-bit RGBA, as toRgba8 gives). False when the GPU
-// could not, so the caller renders on the CPU.
-bool execute(const Frame& frame, Image* out, QImage* out8 = nullptr);
+// could not (`why`, where it knows: the texture budget), so the caller renders on the CPU.
+bool execute(const Frame& frame, Image* out, QImage* out8 = nullptr, std::string* why = nullptr);
 
 struct Stats {
     long gpuFrames = 0, cpuFrames = 0;  // frames asked of the GPU path: drawn there, or fallen back
@@ -186,7 +198,15 @@ struct Stats {
     long shaderBuilds = 0;                 // shader steps built (ShaderStep, once a key), since resetStats
     long shapeLayers = 0;                  // Shape layers drawn on the GPU (Layer::shapes)
     long textureSteps = 0;                 // texture steps run (TextureStep: plug-ins drawing into the compositor's textures)
+    long pictureReadBacks = 0;             // pictures read back part way through a layer, for steps finished from them (ColorOp::prepare)
     long texturesMade = 0;                 // textures made for frames, since resetStats (one kept from an earlier frame and lent again is not made)
+    // Texture memory by the compositor's own count, in bytes: every texture it holds after the last frame (those lent
+    // to frames and kept for later ones, LUTs, filters' tables kept on the GPU, shader steps' tables; not decoders'
+    // frames mapped or copied by render/GpuHardware, which the frame cache's cap on kept frames bounds), the most a
+    // frame held at once since resetStats, the filters' tables among them (Aperture Glare's spectra and twiddles: gone
+    // a few frames after the last frame drawn with them), and the budget (0: none known).
+    size_t textureBytes = 0, textureBytesPeak = 0, tableBytes = 0, textureBudget = 0;
+    long overBudget = 0;  // frames not drawn because they would have held more than the budget, since resetStats
     std::string lastFallback;
     std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
     // Hardware-decoded frames (render/GpuHardware): drawn from the decoding device's memory (hwGpuCopies of them
@@ -210,6 +230,8 @@ void refuseHardwareFramesForTesting(bool refuse);
 // Tests: how many bytes of textures the last frame did not use are kept for later ones (0: the compositor's own
 // budget).
 void setTextureBudgetForTesting(size_t bytes);
+// Tests: the budget itself (0: the device's own again).
+void setTextureLimitForTesting(size_t bytes);
 void countFallback(const std::string& why);  // (render/Compositor's bookkeeping)
 void countLayer(bool onGpu, const std::string& how = {});  // (and with MONTAGE_GPU_LOG, says how it was drawn)
 

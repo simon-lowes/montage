@@ -3296,7 +3296,8 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                     gpu::Frame part;
                     part.width = W, part.height = H, part.flatten = false, part.part = true;
                     part.items = std::move(frame.items);
-                    if (!gpu::execute(part, &below)) return fallback("the GPU could not draw it");
+                    if (std::string cause; !gpu::execute(part, &below, nullptr, &cause))
+                        return fallback("the GPU could not draw it" + (cause.empty() ? std::string() : ": " + cause));
                     frame.items.clear();
                     gpu::Item canvasItem;
                     canvasItem.a = cpuLayer(Image(below));
@@ -3398,7 +3399,8 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
     const ColorSpace* display = opts.displaySpace.empty() ? nullptr : findColorSpace(opts.displaySpace);
     if (display && !captions) frame.display = conversionLut(trimTargetSpace(seq, {}), *display, trimTargetPeak(seq, {}));
     Image img;
-    if (!gpu::execute(frame, captions || !out8 ? &img : nullptr, captions ? nullptr : out8)) return fallback("the GPU could not draw it");
+    if (std::string cause; !gpu::execute(frame, captions || !out8 ? &img : nullptr, captions ? nullptr : out8, &cause))
+        return fallback("the GPU could not draw it" + (cause.empty() ? std::string() : ": " + cause));
     if (captions) {
         drawCaption(img, *captions, t, &trimTargetSpace(seq, {}));
         if (display) convertColor(img, trimTargetSpace(seq, {}), *display, trimTargetPeak(seq, {}));

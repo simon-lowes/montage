@@ -30764,6 +30764,114 @@ colorspaces:
             qInfo("size %g at scale %g: GPU within %.2g of the CPU", k.size, k.scale, worst);
         }
     }
+    void gpuTextureBudget() {
+        // The compositor counts every texture it holds against a budget: what frames hold is told, a frame that would
+        // hold more than the budget is refused once and not tried again, textures of earlier frames make way for a
+        // frame of another size, and Aperture Glare's tables go once no frame is drawn with them.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        Project p = makeDefaultProject();
+        auto picture = [](int w, int h) {
+            Image img(w, h, Image::Uninitialized{});
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    float* px = img.at(x, y);
+                    const bool spot = x % 61 == 30 && y % 47 == 20;
+                    for (int c = 0; c < 3; ++c) px[c] = spot ? 5.0f + float(c) : 0.3f + 0.3f * float(std::sin(x * 0.05 + y * 0.03 + c));
+                    px[3] = 1;
+                }
+            return img;
+        };
+        auto frameOf = [&](const Image& in, const char* effect, std::initializer_list<std::pair<const char*, double>> settings = {}) {
+            gpu::Frame frame;
+            frame.width = in.width, frame.height = in.height;
+            frame.flatten = false;
+            gpu::Item item;
+            item.a.image = in;
+            item.a.place.full = true;
+            if (effect) {
+                Effect e = makeEffect(p, effect);
+                for (const auto& [name, value] : settings) e.params[name] = value;
+                if (!gpuColorOps(e, 0, item.a.ops, in.width, in.height)) frame.width = 0;  // (not the GPU's: the caller sees nothing drawn)
+            }
+            frame.items.push_back(std::move(item));
+            return frame;
+        };
+        const Image small = picture(640, 360), square = picture(512, 512);
+        const size_t smallBytes = size_t(640) * 360 * 16, squareBytes = size_t(512) * 512 * 16;
+        gpu::setTextureLimitForTesting(0);
+        gpu::resetStats();
+        Image out;
+        // What a frame holds is counted: its picture, the canvas and what is read back at the least.
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        gpu::Stats st = gpu::stats();
+        QVERIFY2(st.textureBytes >= 3 * smallBytes, qPrintable(QString::number(st.textureBytes)));
+        QVERIFY(st.textureBytesPeak >= st.textureBytes);
+        QCOMPARE(st.tableBytes, size_t(0));
+        QCOMPARE(st.textureBudget, gpu::textureBudget());
+        qInfo("texture budget of %s: %zu MB", gpu::deviceName().c_str(), st.textureBudget >> 20);
+        // What each of two frames holds by itself (nothing kept from the frame before).
+        gpu::setTextureBudgetForTesting(1);
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        const size_t needSmall = gpu::stats().textureBytes;
+        QVERIFY(gpu::execute(frameOf(square, "gaussian_blur", {{"radius", 6}}), &out));
+        const size_t needSquare = gpu::stats().textureBytes;
+        gpu::setTextureBudgetForTesting(0);
+        QVERIFY(needSmall >= 3 * smallBytes && needSquare >= 3 * squareBytes);
+        // Under a budget both fit alone but not together: each is drawn, the other's textures making way, and no more
+        // than the budget is ever held.
+        const size_t limit = std::max(needSmall, needSquare) + std::min(needSmall, needSquare) / 4;
+        gpu::setTextureLimitForTesting(limit);
+        QCOMPARE(gpu::textureBudget(), limit);
+        gpu::resetStats();
+        const Image plainSmall = [&] {
+            Image img;
+            return gpu::execute(frameOf(small, nullptr), &img) ? img : Image();
+        }();
+        QVERIFY(!plainSmall.empty());
+        for (int n = 0; n < 6; ++n) {
+            std::string cause;
+            QVERIFY2(gpu::execute(frameOf(n % 2 ? square : small, "gaussian_blur", {{"radius", 6}}), &out, nullptr, &cause), cause.c_str());
+        }
+        st = gpu::stats();
+        QCOMPARE(st.overBudget, 0L);
+        QVERIFY2(st.textureBytesPeak <= limit, qPrintable(QString("%1 held under a budget of %2").arg(st.textureBytesPeak).arg(limit)));
+        QVERIFY(st.textureBytesPeak >= std::max(needSmall, needSquare));
+        // A frame that would hold more than the budget is not drawn, says so, and is not tried a second time (no
+        // texture is made for it); the picture then comes from the CPU as any fallback's does.
+        gpu::setTextureLimitForTesting(needSmall - smallBytes);
+        std::string cause;
+        QVERIFY(!gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out, nullptr, &cause));
+        QVERIFY2(QString::fromStdString(cause).contains("budget"), cause.c_str());
+        const gpu::Stats refused = gpu::stats();
+        QCOMPARE(refused.overBudget, st.overBudget + 1);
+        cause.clear();
+        QVERIFY(!gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out, nullptr, &cause));
+        QVERIFY2(QString::fromStdString(cause).contains("a frame like it"), cause.c_str());
+        QCOMPARE(gpu::stats().texturesMade, refused.texturesMade);
+        QCOMPARE(gpu::stats().overBudget, refused.overBudget + 1);
+        // (a frame of another shape is still tried, and the same one again once the budget has changed)
+        const Image tiny = picture(64, 48);
+        QVERIFY(gpu::execute(frameOf(tiny, nullptr), &out));
+        gpu::setTextureLimitForTesting(0);
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        // Aperture Glare keeps its kernel's spectra and twiddles on the GPU while frames are drawn with it; a few
+        // frames after the last one, none of them is held any more.
+        gpu::resetStats();
+        const gpu::Frame glare = frameOf(small, "aperture_glare", {{"size", 40}, {"threshold", 1.0}});
+        QVERIFY(glare.width > 0);
+        QVERIFY(gpu::execute(glare, &out));
+        const size_t tables = gpu::stats().tableBytes;
+        QVERIFY2(tables > 0, "Aperture Glare kept no tables on the GPU");
+        QVERIFY(gpu::execute(glare, &out));
+        QCOMPARE(gpu::stats().tableBytes, tables);  // (kept, not made again)
+        QVERIFY(out.px != plainSmall.px);
+        const size_t withGlare = gpu::stats().textureBytes;
+        for (int n = 0; n < 10; ++n) QVERIFY(gpu::execute(frameOf(small, nullptr), &out));
+        QCOMPARE(gpu::stats().tableBytes, size_t(0));
+        QVERIFY(gpu::stats().textureBytes + tables <= withGlare);
+        QCOMPARE(out.px.size(), plainSmall.px.size());
+    }
     void footageWordsReadAnswers() {
         // The sentences numbered, shortened when asked, several to a line when asked.
         QCOMPARE(numberedSentences({"First thing said here today.", "Second one."}, 3), std::string("[1] First thing said\n[2] Second one.\n"));
