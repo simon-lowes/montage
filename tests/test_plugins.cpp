@@ -268,6 +268,8 @@ struct Take {
     }
 };
 
+using DeviceTake = Take;  // (the name for it inside the test class, where montage's Take is seen too)
+
 // Records a click through `e` (open): where it lands in the take.
 int64_t recordClick(audiodev::Engine& e, int rate = 48000) {
     Clicker clicker;
@@ -3829,6 +3831,42 @@ private slots:
         QCOMPARE(e.measureLoopback(1, 0, 0.2, &why), -1);
         QVERIFY(!why.empty());
         QCOMPARE(e.settings().loopbackFrames, 3 * buffer + 300);
+        audiodev::setLoopbackOptions({});
+    }
+
+    void recordingLandsWherePlayedAfterADropout() {
+        // The device held up for 120 ms (a busy computer) catches up at once, block after block, faster than sound is
+        // made ahead for it: the output runs dry and the timeline stands still while the device goes on. A click played
+        // after that is recorded where it was played, not later by what ran dry.
+        audiodev::setLoopbackOptions({256, 512, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QTest::qWait(100);
+        e.resetXruns();
+        Clicker clicker;
+        DeviceTake take;
+        std::atomic<bool> held{false};
+        const int out = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) {
+            const int64_t p = clicker.render(o, ch, n);
+            if (p >= 1200 && !held.exchange(true)) audiodev::loopbackStall(120);  // (a quarter of the way to the click)
+            return p;
+        });
+        const int in = e.addInput(&clicker, 48000, [&](const float* i, int ch, int n, int64_t at) { take.add(i, ch, n, at); });
+        QVERIFY(out >= 0 && in >= 0);
+        QElapsedTimer t;
+        t.start();
+        while (take.size() < size_t(clicker.clickAt + 4800) && t.elapsed() < 10000) QThread::msleep(10);
+        const audiodev::EngineStatus st = e.status();
+        e.removeInput(in);
+        e.removeOutput(out);
+        QVERIFY(held.load());
+        QVERIFY2(st.underruns > 0, "the device's catching up did not run the output dry");
+        QCOMPARE(take.click(), clicker.clickAt);
         audiodev::setLoopbackOptions({});
     }
 

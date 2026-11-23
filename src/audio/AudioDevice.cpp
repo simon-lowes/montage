@@ -16,6 +16,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
 
 #include <QtGlobal>
 
@@ -196,10 +199,13 @@ LoopbackStream* gLoop = nullptr;  // (the one open, under gLoopM)
 
 // The calling thread put ahead of the programs it shares the computer with, where the system allows it (a busy computer
 // otherwise keeps it waiting past the cushion of sound made ahead); never real-time, which a plug-in that ran away would
-// keep the computer for.
+// keep the computer for. On macOS: the class of work the user is waiting on, run first and woken from its timed waits
+// with the least slack.
 void aheadOfOthers() {
 #ifdef __linux__
     setpriority(PRIO_PROCESS, id_t(syscall(SYS_gettid)), -10);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
 }
 
@@ -449,6 +455,28 @@ struct Io {
         return false;
     }
 
+    // The stretches of `frames` device frames from `from` that heard the output ring's sound, as (offset, length):
+    // not those where the ring had run dry and silence went out. Frames from before what is kept count as heard.
+    void heardRuns(int64_t from, int frames, std::vector<uint8_t>& dry, std::vector<std::pair<int, int>>& runs) const {
+        dry.assign(size_t(std::max(0, frames)), 0);
+        for (auto it = sent.rbegin(); it != sent.rend(); ++it) {
+            if (it->device + it->frames <= from) break;
+            const int64_t lo = std::max(from, it->device + it->ready), hi = std::min(from + frames, it->device + int64_t(it->frames));
+            for (int64_t d = lo; d < hi; ++d) dry[size_t(d - from)] = 1;
+        }
+        runs.clear();
+        for (int i = 0; i < frames;) {
+            if (dry[size_t(i)]) {
+                ++i;
+                continue;
+            }
+            int j = i;
+            while (j < frames && !dry[size_t(j)]) ++j;
+            runs.emplace_back(i, j - i);
+            i = j;
+        }
+    }
+
     Io(int outputs, int inputs, std::shared_ptr<rtguard::Wake> w) : outCh(std::max(1, outputs)), inCh(std::max(0, inputs)), wake(std::move(w)) {
         outCap = 65536;
         out.assign(size_t(outCap) * size_t(outCh), 0.0f);
@@ -668,6 +696,8 @@ struct Engine::Impl {
     std::atomic<bool> quit{false};
     std::atomic<uint64_t> pass{0};  // odd while a pass is under way
     std::vector<float> mix, heard;
+    std::vector<uint8_t> dryFrames;
+    std::vector<std::pair<int, int>> heardRuns;
 
     Impl() {
         clients.set(std::make_shared<const Clients>());
@@ -696,6 +726,7 @@ struct Engine::Impl {
     void feed();
     void feedOutputs(Io& io, const Clients& c, int rate);
     void feedInputs(Io& io, const Clients& c, int rate);
+    void deliver(InputClient& t, const float* data, int ch, int frames, int64_t sample, int rate);
     bool openLocked(std::string* why);
     bool openWith(const DeviceSettings& s, std::string* why);
     void closeLocked();
@@ -870,43 +901,67 @@ void Engine::Impl::feedInputs(Io& io, const Clients& c, int rate) {
         while (io.sent.size() > 512) io.sent.pop_front();
         // What this block heard went out a round trip of the device's frames before it: its place in the output ring
         // (kept block by block, so a ring that ran dry in between does not move it).
+        const int64_t from = b.device - rt;
         int64_t heardPos = 0, heardBack = 0;
-        const bool placed = io.placeAt(b.device - rt, heardPos, heardBack);
+        const bool placed = io.placeAt(from, heardPos, heardBack);
+        // Where the ring ran dry (the feed thread fell behind) the timeline stood still while the device went on: a
+        // clocked input takes only the stretches that heard it move, each at its own place, so a take lands where it
+        // was played. (One stretch, the whole block, where nothing ran dry or what was sent is not known.)
+        io.heardRuns(from, b.frames, dryFrames, heardRuns);
+        const bool whole = heardRuns.size() == 1 && heardRuns[0].first == 0 && heardRuns[0].second == b.frames;
         for (const auto& t : c.inputs) {
-            // Where this block belongs: its clock's output at that place; where that is not known (the input began
-            // listening less than a round trip ago), the output sent out beside the block less the round trip. Both at
-            // the input's rate; before the output's first sample it is negative (nothing of the timeline yet).
-            int64_t sample = -1;
+            const OutputClient* clock = nullptr;
             if (t->owner)
-                for (const auto& o : c.outputs) {
-                    if (o->owner != t->owner) continue;
-                    double at = -1, step = 1;
-                    if (placed && o->at(heardPos, at, step)) sample = int64_t(std::llround((at - double(heardBack) * step) * t->rate / o->rate));
-                    else if (o->at(b.outPos, at, step)) sample = int64_t(std::llround((at - double(rt) * step) * t->rate / o->rate));
-                }
-            if (t->rate == rate || rate <= 0 || ch <= 0) {
-                if (t->swr) swr_free(&t->swr);
-                if (t->tap) t->tap(heard.data(), ch, b.frames, sample);
+                for (const auto& o : c.outputs)
+                    if (o->owner == t->owner) clock = o.get();
+            if (!clock || whole) {
+                // Where this block belongs: its clock's output at that place; where that is not known (the input began
+                // listening less than a round trip ago), the output sent out beside the block less the round trip. Both
+                // at the input's rate; before the output's first sample it is negative (nothing of the timeline yet).
+                int64_t sample = -1;
+                double at = -1, step = 1;
+                if (clock && placed && clock->at(heardPos, at, step))
+                    sample = int64_t(std::llround((at - double(heardBack) * step) * t->rate / clock->rate));
+                else if (clock && clock->at(b.outPos, at, step))
+                    sample = int64_t(std::llround((at - double(rt) * step) * t->rate / clock->rate));
+                deliver(*t, heard.data(), ch, b.frames, sample, rate);
                 continue;
             }
-            if (!t->swr || t->swrFrom != rate || t->swrTo != t->rate || t->channels != ch) {
-                swr_free(&t->swr);
-                t->swr = makeResampler(ch, rate, t->rate);
-                ++resamplers;
-                t->swrFrom = rate, t->swrTo = t->rate, t->channels = ch;
+            for (const auto& [off, len] : heardRuns) {
+                int64_t pos = 0, back = 0, sample = -1;
+                double at = -1, step = 1;
+                if (io.placeAt(from + off, pos, back) && clock->at(pos, at, step))
+                    sample = int64_t(std::llround((at - double(back) * step) * t->rate / clock->rate));
+                deliver(*t, heard.data() + size_t(off) * size_t(std::max(1, ch)), ch, len, sample, rate);
             }
-            if (!t->swr) continue;
-            const int cap = swr_get_out_samples(t->swr, b.frames);
-            if (cap <= 0) continue;
-            if (t->conv.size() < size_t(cap) * size_t(ch)) t->conv.resize(size_t(cap) * size_t(ch));
-            uint8_t* o = reinterpret_cast<uint8_t*>(t->conv.data());
-            const uint8_t* i = reinterpret_cast<const uint8_t*>(heard.data());
-            const int got = swr_convert(t->swr, &o, cap, &i, b.frames);
-            if (got <= 0) continue;
-            if (sample >= 0) sample -= int64_t(std::llround(double(swr_get_delay(t->swr, t->rate))));
-            if (t->tap) t->tap(t->conv.data(), ch, got, sample);
         }
     }
+}
+
+void Engine::Impl::deliver(InputClient& t, const float* data, int ch, int frames, int64_t sample, int rate) {
+    // At the device's rate as it is; else through the input's resampler (built here, on the feed thread), its first
+    // frame that much earlier.
+    if (t.rate == rate || rate <= 0 || ch <= 0) {
+        if (t.swr) swr_free(&t.swr);
+        if (t.tap) t.tap(data, ch, frames, sample);
+        return;
+    }
+    if (!t.swr || t.swrFrom != rate || t.swrTo != t.rate || t.channels != ch) {
+        swr_free(&t.swr);
+        t.swr = makeResampler(ch, rate, t.rate);
+        ++resamplers;
+        t.swrFrom = rate, t.swrTo = t.rate, t.channels = ch;
+    }
+    if (!t.swr) return;
+    const int cap = swr_get_out_samples(t.swr, frames);
+    if (cap <= 0) return;
+    if (t.conv.size() < size_t(cap) * size_t(ch)) t.conv.resize(size_t(cap) * size_t(ch));
+    uint8_t* o = reinterpret_cast<uint8_t*>(t.conv.data());
+    const uint8_t* i = reinterpret_cast<const uint8_t*>(data);
+    const int got = swr_convert(t.swr, &o, cap, &i, frames);
+    if (got <= 0) return;
+    if (sample >= 0) sample -= int64_t(std::llround(double(swr_get_delay(t.swr, t.rate))));
+    if (t.tap) t.tap(t.conv.data(), ch, got, sample);
 }
 
 int Engine::Impl::outputChannelsWanted() const {
