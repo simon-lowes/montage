@@ -10,6 +10,12 @@
 #include <mutex>
 #include <thread>
 
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include <QtGlobal>
 
 extern "C" {
@@ -187,6 +193,15 @@ LoopbackOptions gLoopOptions;
 class LoopbackStream;
 LoopbackStream* gLoop = nullptr;  // (the one open, under gLoopM)
 
+// The calling thread put ahead of the programs it shares the computer with, where the system allows it (a busy computer
+// otherwise keeps it waiting past the cushion of sound made ahead); never real-time, which a plug-in that ran away would
+// keep the computer for.
+void aheadOfOthers() {
+#ifdef __linux__
+    setpriority(PRIO_PROCESS, id_t(syscall(SYS_gettid)), -10);
+#endif
+}
+
 class LoopbackStream : public Stream {
 public:
     LoopbackStream(const DeviceSettings& s, int rate, int inputs, int outputs, StreamCallbacks cb)
@@ -234,6 +249,7 @@ public:
 
 private:
     void run() {
+        aheadOfOthers();  // (as a driver's thread is)
         std::vector<float> in(size_t(buffer_) * size_t(std::max(1, inputs_))), out(size_t(buffer_) * size_t(std::max(1, outputs_)));
         auto next = std::chrono::steady_clock::now();
         bool wasLate = false;
@@ -737,6 +753,7 @@ double produce(OutputClient& c, int devRate, int frames, float* dst, std::atomic
 
 void Engine::Impl::feed() {
     feederId = std::this_thread::get_id();
+    aheadOfOthers();
     std::shared_ptr<Io> held;
     while (!quit.load()) {
         ++pass;
@@ -773,13 +790,13 @@ void Engine::Impl::feedOutputs(Io& io, const Clients& c, int rate) {
         return;
     }
     const int block = std::max(32, io.maxBlock.load() > 0 ? io.maxBlock.load() : devBuffer.load());
-    // The cushion: two of the device's blocks and no less than 10 ms; a block more each time the ring runs dry (a busy
-    // computer), up to 100 ms.
-    const int floor = std::max(2 * block, rate > 0 ? rate / 100 : 480);
+    // The cushion: two of the device's blocks and no less than 20 ms; twice as much each time the ring runs dry (a
+    // busy computer: after one dropout the next is a long way off), up to 100 ms.
+    const int floor = std::max(2 * block, rate > 0 ? rate / 50 : 960);
     if (io.cushion < floor) io.cushion = floor;
     if (const int64_t u = io.underruns.load(); u != io.seenUnderruns) {
         io.seenUnderruns = u;
-        io.cushion = std::min(io.cushion + block, std::max(4 * block, rate > 0 ? rate / 10 : 4800));
+        io.cushion = std::min(io.cushion * 2, std::max(4 * block, rate > 0 ? rate / 10 : 4800));
     }
     io.cushion = int(std::min<int64_t>(io.cushion, io.outCap / 2));
     if (rate != io.feedRate) {
