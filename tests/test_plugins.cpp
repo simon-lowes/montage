@@ -2814,6 +2814,20 @@ private slots:
             QVERIFY(!ofx::gl::dmaBufFits(b, &why));
             b.stride = 0xffffffffu;
             QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            // (nightly 23 Nov) A row holds its pixels at the format's size, eight bytes each here, not a byte a pixel
+            // (rows as long as the picture is wide were taken, and read past their ends); a format of four bytes a
+            // pixel is held to that; and a format Montage does not know the size of is not taken.
+            b.stride = 16;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.stride = 16 * 8 - 1;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.fourcc = 0x34324241, b.stride = 16 * 4;  // (AB24)
+            QVERIFY2(ofx::gl::dmaBufFits(b, &why), why.c_str());
+            b.stride = 16 * 4 - 1;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.fourcc = 0x3231564e, b.stride = 16 * 8;  // (NV12: not one plane of four channels)
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why) && why.find("format") != std::string::npos);
+            b.fourcc = 0x48344241;
             int fence[2] = {-1, -1};
             QCOMPARE(::pipe(fence), 0);
             b.stride = 16 * 8, b.fence = fence[0];
@@ -2822,6 +2836,13 @@ private slots:
             QVERIFY(ofx::gl::awaitDrawn(b, &why, 50));
             ::close(fence[0]);
             ::close(fence[1]);
+            // (nightly 23 Nov) A fence whose other end has gone says so at once, and that is not a picture drawn.
+            int gone[2] = {-1, -1};
+            QCOMPARE(::pipe(gone), 0);
+            ::close(gone[1]);
+            b.fence = gone[0];
+            QVERIFY(!ofx::gl::awaitDrawn(b, &why, 50) && why.find("cannot be waited for") != std::string::npos);
+            ::close(gone[0]);
             QVERIFY(!ofx::gl::sendDmaBuf(name, sent));  // (the post is gone with its socket)
         }
 #endif
