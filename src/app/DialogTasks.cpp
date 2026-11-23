@@ -13,6 +13,7 @@
 #include <QTimer>
 
 #include "AutoMixDialog.h"
+#include "LensCalibrationDialog.h"
 #include "DialogJobs.h"
 #include "DialogTasks.h"
 #include "EditorState.h"
@@ -26,6 +27,7 @@
 #include "render/SdhDraft.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
+#include "media/LensCalibration.h"
 #include "render/RenderFarm.h"
 #include "render/SegmentedExport.h"
 
@@ -277,6 +279,67 @@ bool runConform(TaskRun& t) {
     t.result["shots"] = conformShotsToJson(shots);
     t.result["error"] = QString::fromStdString(t.error);
     t.error.clear();
+    return true;
+}
+
+// --- Lens calibration from a clip of a checkerboard ---
+//
+// The boards found so far are kept as the frames are read: taken up after a crash, it goes on from the next frame.
+
+QJsonArray pointsJson(const std::vector<Point2>& v) {
+    QJsonArray a;
+    for (const Point2& p : v) a.append(QJsonArray{p.x, p.y});
+    return a;
+}
+
+std::vector<Point2> pointsFrom(const QJsonValue& v) {
+    std::vector<Point2> out;
+    for (const QJsonValue& x : v.toArray())
+        if (const QJsonArray pair = x.toArray(); pair.size() == 2) out.push_back({pair.at(0).toDouble(), pair.at(1).toDouble()});
+    return out;
+}
+
+QJsonObject boardsJson(const ClipBoards& b) {
+    QJsonArray views, times;
+    for (const auto& v : b.views) views.append(pointsJson(v));
+    for (double t : b.times) times.append(t);
+    return QJsonObject{{"width", b.width}, {"height", b.height}, {"frames", b.frames}, {"next", b.nextFrame},
+                       {"read", b.framesRead}, {"found", b.boardsFound}, {"views", views}, {"times", times}};
+}
+
+ClipBoards boardsFrom(const QJsonObject& j) {
+    ClipBoards b;
+    b.width = j.value("width").toInt(), b.height = j.value("height").toInt(), b.frames = j.value("frames").toInt();
+    b.nextFrame = j.value("next").toInt(), b.framesRead = j.value("read").toInt(), b.boardsFound = j.value("found").toInt();
+    for (const QJsonValue& v : j.value("views").toArray()) b.views.push_back(pointsFrom(v));
+    for (const QJsonValue& t : j.value("times").toArray()) b.times.push_back(t.toDouble());
+    return b;
+}
+
+bool runLensBoard(TaskRun& t) {
+    const QJsonObject& in = t.input;
+    LensFitOptions o;
+    o.model = lens::Distortion::Model(in.value("model").toInt(int(o.model)));
+    o.fitSqueeze = in.value("fitSqueeze").toBool();
+    o.fitCenter = in.value("fitCenter").toBool(true);
+    ClipBoards boards;
+    QJsonValue kept;
+    if (t.part(QStringLiteral("boards"), &kept)) boards = boardsFrom(kept.toObject());
+    const int passedOver = boards.nextFrame;
+    ClipCalibration cc;
+    const bool fitted = calibrateClip(in.value("path").toString().toStdString(), in.value("from").toDouble(), in.value("to").toDouble(),
+                                      in.value("cols").toInt(), in.value("rows").toInt(), o, cc, &t.error, t.progress, t.cancel, 40, &boards,
+                                      [&](const ClipBoards& b) { t.keepPart(QStringLiteral("boards"), boardsJson(b)); });
+    if (t.cancelled()) return false;
+    t.result = QJsonObject{{"width", cc.width}, {"height", cc.height}, {"framesRead", cc.framesRead}, {"boardsFound", cc.boardsFound},
+                           {"passedOver", std::min(passedOver, boards.nextFrame)}};
+    // (a fit that could not be made is a result too: the dialog says why)
+    if (!fitted) {
+        t.result["error"] = QString::fromStdString(t.error);
+        t.error.clear();
+        return true;
+    }
+    t.result["fit"] = lensFitToJson(cc.fit);
     return true;
 }
 
@@ -896,6 +959,7 @@ void registerDialogTaskKinds() {
         DialogJobs::registerKind(QStringLiteral("scene-detect"), {runSceneCuts, applySceneCuts, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("auto-mix"), {runMix, applyMixPlan, true, nullptr});
         DialogJobs::registerKind(QStringLiteral("conform-check"), {runConform, nullptr, false, nullptr});
+        DialogJobs::registerKind(QStringLiteral("lens-board"), {runLensBoard, nullptr, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("adr-align"), {runAdrAlign, applyAdrAlign, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("captions-translate"), {runTranslateCaptions, applyTranslateCaptions, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("captions-sdh"), {runSdhDraft, applySdhDraft, false, nullptr});

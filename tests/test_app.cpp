@@ -13377,6 +13377,165 @@ private slots:
                 edit::clipById(*state()->sequence(), clip)->effects[0].type != "lens_correction");
     }
 
+    void lensBoardAsABackgroundJob() {
+        // Calibrate Lens finds the board as a job in the store. Watched, the dialog shows its fit; left to run, the
+        // dialog still open shows it when it ends, and one opened later on the same clip shows the last; killed
+        // part-way in another process and taken up, it goes on from the frames already read, to the same fit.
+        QTemporaryDir own;
+        qputenv("MONTAGE_USER_LENSES", own.path().toUtf8());
+        qputenv("MONTAGE_LENS_DB", QFile::encodeName(own.filePath("no-lensfun")));
+        reloadLensDatabase();
+        auto restore = qScopeGuard([] {
+            qunsetenv("MONTAGE_USER_LENSES");
+            qunsetenv("MONTAGE_LENS_DB");
+            reloadLensDatabase();
+            lensCalibrationDialogHook() = nullptr;
+        });
+        // A board of 9 x 6 inner corners at six poses before a lens that bends nothing, each for two frames.
+        const int W = 480, H = 360, cols = 9, rows = 6;
+        const double F = 1.5 * H / 2;
+        struct Pose {
+            double R[9], t[3];
+        };
+        auto pose = [&](double wx, double wy, double wz, double X, double Y, double Z) {
+            Pose p;
+            const double th = std::sqrt(wx * wx + wy * wy + wz * wz);
+            const double kx = th > 0 ? wx / th : 0, ky = th > 0 ? wy / th : 0, kz = th > 0 ? wz / th : 0;
+            const double co = std::cos(th), si = std::sin(th), v = 1 - co;
+            const double R[9] = {co + kx * kx * v,      kx * ky * v - kz * si, kx * kz * v + ky * si,
+                                 ky * kx * v + kz * si, co + ky * ky * v,      ky * kz * v - kx * si,
+                                 kz * kx * v - ky * si, kz * ky * v + kx * si, co + kz * kz * v};
+            std::copy(R, R + 9, p.R);
+            const double mx = (cols - 1) / 2.0, my = (rows - 1) / 2.0;
+            p.t[0] = X - (R[0] * mx + R[1] * my), p.t[1] = Y - (R[3] * mx + R[4] * my), p.t[2] = Z - (R[6] * mx + R[7] * my);
+            return p;
+        };
+        const Pose poses[] = {pose(0.4, 0, 0, 0, 0, 11),    pose(-0.4, 0, 0, 0, 0, 11),          pose(0, 0.5, 0, 0, 0, 11),
+                              pose(0, -0.5, 0, 0, 0, 11),   pose(0.3, 0.35, 0.1, -2.5, -1, 12), pose(-0.25, -0.35, -0.1, 2.5, 1, 12)};
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = W, gs.height = H, gs.fps = {25, 1};
+        for (size_t k = 0; k < std::size(poses); ++k) {
+            const Pose& p = poses[k];
+            QImage img(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    int sum = 0;
+                    for (int s = 0; s < 9; ++s) {
+                        // (the ray through the sample, met with the board's plane, in the board's squares)
+                        const double d[3] = {(x + (s % 3 + 0.5) / 3 - W / 2.0) / F, (y + (s / 3 + 0.5) / 3 - H / 2.0) / F, 1};
+                        const double n[3] = {p.R[2], p.R[5], p.R[8]};
+                        const double at = (n[0] * p.t[0] + n[1] * p.t[1] + n[2] * p.t[2]) / (n[0] * d[0] + n[1] * d[1] + n[2] * d[2]);
+                        const double q[3] = {at * d[0] - p.t[0], at * d[1] - p.t[1], at * d[2] - p.t[2]};
+                        const double u = p.R[0] * q[0] + p.R[3] * q[1] + p.R[6] * q[2], v = p.R[1] * q[0] + p.R[4] * q[1] + p.R[7] * q[2];
+                        int g = 110;  // (the wall)
+                        if (u > -1.6 && u < cols + 0.6 && v > -1.6 && v < rows + 0.6) g = 225;  // (the card)
+                        if (u > -1 && u < cols && v > -1 && v < rows) g = (int(std::floor(u)) + int(std::floor(v))) & 1 ? 30 : 225;
+                        sum += g;
+                    }
+                    img.setPixel(x, y, qRgb(sum / 9, sum / 9, sum / 9));
+                }
+            const QString png = dir_.filePath(QStringLiteral("lens-board-%1.png").arg(k));
+            QVERIFY(img.save(png));
+            MediaItem m;
+            m.id = gen.newId();
+            QVERIFY(probeMedia(png.toStdString(), m));
+            gen.media.push_back(m);
+            Clip c = makeClip(gen, m, TrackKind::Video, gs);
+            c.start = FrameTime(2 * k);
+            c.duration = 2;
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, c).ok);
+        }
+        const QString file = dir_.filePath("lens-board.mp4");
+        {
+            ExportSettings st;
+            st.path = file.toStdString();
+            st.audioCodec = "none";
+            st.crf = 0;
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({file});
+        QCOMPARE(ids.size(), size_t(1));
+        Id clip = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = W, s.height = H, s.fps = {25, 1};
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            clip = s.videoTracks[0].clips[0].id;
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        DialogJobs* dialogs = win_->dialogJobs();
+        QAction* action = win_->findChild<QAction*>("calibrateLens");
+        QVERIFY(action);
+        // Each time the dialog is shown, `check` is run on it, and it is closed.
+        std::function<void(LensCalibrationDialog*)> check;
+        lensCalibrationDialogHook() = [&](LensCalibrationDialog* dlg) {
+            check(dlg);
+            QTimer::singleShot(0, dlg, [dlg] { dlg->reject(); });  // (once it has run: its own waits would close it)
+        };
+        // Watched: the fit, nothing bent, from all six boards.
+        LensFit watched;
+        QJsonObject input;
+        check = [&](LensCalibrationDialog* dlg) {
+            QVERIFY(!dlg->fitted());
+            dlg->setBoard(cols, rows);
+            QVERIFY2(dlg->calibrate(), qPrintable(dlg->resultText()));
+            watched = dlg->fit();
+            QCOMPARE(watched.views, 6);
+            QVERIFY2(watched.rms < 0.2 && std::fabs(watched.terms[0]) < 0.01, qPrintable(dlg->resultText()));
+            QVERIFY(dlg->findChild<QPushButton*>("calibrateSave")->isEnabled());
+        };
+        action->trigger();
+        jobs::Record r;
+        for (const jobs::Record& x : jobs::all("app"))
+            if (x.kind == "lens-board" && x.order >= r.order) r = x;
+        QCOMPARE(r.status, QString("done"));
+        QCOMPARE(lensFitFromJson(taskResult(r.id).value("fit").toObject()).terms[0], watched.terms[0]);
+        // Opened again on the clip: the last fit, ready to save.
+        check = [&](LensCalibrationDialog* dlg) {
+            QVERIFY(dlg->fitted());
+            QCOMPARE(dlg->fit().terms[0], watched.terms[0]);
+            QCOMPARE(dlg->fit().viewRms, watched.viewRms);
+            QCOMPARE(dlg->findChild<QSpinBox*>("calibrateCols")->value(), cols);
+            QVERIFY(dlg->resultText().contains("Corners from 6 frame"));
+        };
+        action->trigger();
+        // Left to run with the dialog open: its fit is shown there when it ends; while it runs the dialog says so.
+        check = [&](LensCalibrationDialog* dlg) {
+            dlg->setBoard(cols, rows);
+            const QString id = startInBackground(dialogs, [&] { QVERIFY(!dlg->calibrate()); });
+            QVERIFY(!id.isEmpty());
+            QVERIFY(!dlg->fitted() && dlg->resultText().contains("in the background"));
+            dialogs->setPaused(id, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dlg->fitted(), 120000);
+            QCOMPARE(dlg->fit().terms[0], watched.terms[0]);
+            input = QJsonObject();
+            QJsonObject result;
+            QVERIFY(dialogs->latestResult("lens-board", nullptr, &result, &input));
+        };
+        action->trigger();
+        // Killed in another process once it has read half the frames, and taken up: it goes on from there (those
+        // frames are not read again), to the same fit.
+        QString why;
+        int keptBefore = 0;
+        const QString job = killedAndTakenUp("lens-board", "Finding the board…", input, "0.5", &why, 120000, [&](const QString& id) {
+            QFile f(jobs::jobFolder(id) + "/part-boards.json");
+            if (f.open(QIODevice::ReadOnly)) keptBefore = QJsonDocument::fromJson(f.readAll()).object().value("v").toObject().value("next").toInt();
+        });
+        QVERIFY2(!job.isEmpty(), qPrintable(why));
+        QVERIFY2(keptBefore >= 6 && keptBefore < 12, qPrintable(QString::number(keptBefore)));
+        const QJsonObject taken = taskResult(job);
+        QCOMPARE(taken.value("passedOver").toInt(), keptBefore);
+        const LensFit again = lensFitFromJson(taken.value("fit").toObject());
+        QCOMPARE(again.views, watched.views);
+        QCOMPARE(again.terms[0], watched.terms[0]);
+        QCOMPARE(again.viewRms, watched.viewRms);
+        state()->newProject();
+    }
+
     void contentCredentialsInTheApp() {
         // The Export dialog offers signing for files that can hold credentials, and not for MKV.
         state()->newProject();

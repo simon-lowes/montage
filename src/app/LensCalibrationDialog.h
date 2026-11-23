@@ -7,6 +7,7 @@
 
 #include <QDialog>
 #include <QImage>
+#include <QJsonObject>
 #include <functional>
 #include <string>
 #include <vector>
@@ -61,6 +62,10 @@ public:
 private:
     void modeChanged();
     void updateResult();
+    // What a board's calibration is asked (with a name of its own among the jobs in the store, when `newJob`).
+    QJsonObject boardInput(bool newJob = true) const;
+    bool showBoardResult(const QJsonObject& result);
+    void showLastBoard();
     Source src_;
     LensFit fit_;
     int fitWidth_ = 0, fitHeight_ = 0;
@@ -83,6 +88,10 @@ private:
     QCheckBox* sameMedia_;
     QPushButton* save_;
 };
+
+// A fit as a task's result holds it (DialogTasks.cpp's "lens-board"), and back.
+QJsonObject lensFitToJson(const LensFit& fit);
+LensFit lensFitFromJson(const QJsonObject& j);
 
 // The dialog for a picture clip; on Save and Apply the lens is saved and applied. True when a Lens Correction was put on.
 bool calibrateLens(QWidget* parent, EditorState* state, Id clip);

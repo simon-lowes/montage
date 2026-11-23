@@ -3,25 +3,25 @@
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
-#include <QCoreApplication>
+#include <QDateTime>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QJsonArray>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
-#include <QProgressDialog>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QSpinBox>
 #include <QVBoxLayout>
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 
+#include "DialogJobs.h"
 #include "EditorState.h"
 #include "core/EditOps.h"
 #include "core/Interpretation.h"
@@ -260,6 +260,7 @@ LensCalibrationDialog::LensCalibrationDialog(Source source, QWidget* parent) : Q
     connect(centre_, &QCheckBox::toggled, this, stale);
     canvas_->changed = stale;
     modeChanged();
+    showLastBoard();
     resize(860, 720);
 }
 
@@ -299,24 +300,96 @@ bool LensCalibrationDialog::calibrate() {
         fitWidth_ = src_.frame.width(), fitHeight_ = src_.frame.height();
         fitted_ = calibrateFromLines(canvas_->snapped, fitWidth_, fitHeight_, o, fit_, &error);
     } else {
-        QProgressDialog progress(tr("Finding the board…"), tr("Cancel"), 0, 1000, this);
-        progress.setWindowModality(Qt::WindowModal);
-        progress.setMinimumDuration(300);
-        std::atomic<bool> cancel{false};
-        ClipCalibration cc;
-        fitted_ = calibrateClip(src_.path, src_.from, src_.to, cols_->value(), rows_->value(), o, cc, &error,
-                                [&](double f) {
-                                    progress.setValue(int(f * 1000));
-                                    QCoreApplication::processEvents();
-                                    if (progress.wasCanceled()) cancel = true;
-                                },
-                                &cancel);
-        fit_ = cc.fit;
-        fitWidth_ = cc.width, fitHeight_ = cc.height;
+        // A background job (DialogJobs.h). Watched, its fit is shown when it ends. Left to run, it is shown here when
+        // it ends if this dialog is still open and nothing that is fitted has changed meanwhile, and it is kept in the
+        // job store either way: the dialog opened again on the same part of the media shows it.
+        DialogJobs* jobs = DialogJobs::of(this);
+        const QJsonObject in = boardInput();
+        const QString id = jobs->start(nullptr, QStringLiteral("lens-board"), tr("Finding the board…"), in);
+        const TaskOutcome out = jobs->watch(id, this);
+        if (out.how == TaskOutcome::Background) {
+            updateResult();
+            result_->setText(tr("Finding the board in the background: the fit is shown here when it is done."));
+            const QString job = in.value("job").toString();
+            connect(jobs, &DialogJobs::taskEnded, this, [this, id, jobs, job](const QString& ended) {
+                if (ended != id || fitted_) return;
+                QJsonObject result, input;
+                if (!jobs->latestResult(QStringLiteral("lens-board"), [&](const QJsonObject& i) { return i.value("job").toString() == job; }, &result, &input))
+                    return updateResult();
+                // (shown while the board and the fit asked for are still the ones set)
+                QJsonObject now = boardInput(false);
+                for (const QString& key : now.keys())
+                    if (now.value(key) != input.value(key)) return updateResult();
+                showBoardResult(result);
+            });
+            return false;
+        }
+        if (!out.done()) {
+            updateResult();
+            if (out.how == TaskOutcome::Failed) result_->setText(out.error);
+            return false;
+        }
+        return showBoardResult(out.result);
     }
     updateResult();
     if (!fitted_) result_->setText(qs(error));
     return fitted_;
+}
+
+QJsonObject LensCalibrationDialog::boardInput(bool newJob) const {
+    QJsonObject in{{"path", qs(src_.path)}, {"from", src_.from}, {"to", src_.to}, {"cols", cols_->value()}, {"rows", rows_->value()},
+                   {"model", model_->currentData().toInt()}, {"fitSqueeze", anamorphic_->isChecked()}, {"fitCenter", centre_->isChecked()}};
+    // (names this calibration among the jobs in the store)
+    if (newJob) in["job"] = QStringLiteral("%1-%2").arg(QDateTime::currentMSecsSinceEpoch()).arg(quintptr(this));
+    return in;
+}
+
+bool LensCalibrationDialog::showBoardResult(const QJsonObject& result) {
+    fitted_ = !result.contains("error") && result.value("fit").isObject();
+    if (fitted_) {
+        fit_ = lensFitFromJson(result.value("fit").toObject());
+        fitWidth_ = result.value("width").toInt(), fitHeight_ = result.value("height").toInt();
+    }
+    updateResult();
+    if (!fitted_) result_->setText(result.value("error").toString());
+    return fitted_;
+}
+
+void LensCalibrationDialog::showLastBoard() {
+    // The latest calibration from this part of the media (one left to run, its dialog closed), as it was set.
+    QJsonObject result, input;
+    if (!DialogJobs::of(this)->latestResult(QStringLiteral("lens-board"), [&](const QJsonObject& in) {
+            return in.value("path").toString() == qs(src_.path) && in.value("from").toDouble() == src_.from && in.value("to").toDouble() == src_.to;
+        }, &result, &input) || result.contains("error"))
+        return;
+    setLinesMode(false);
+    setBoard(input.value("cols").toInt(), input.value("rows").toInt());
+    if (const int i = model_->findData(input.value("model").toInt()); i >= 0) model_->setCurrentIndex(i);
+    anamorphic_->setChecked(input.value("fitSqueeze").toBool());
+    centre_->setChecked(input.value("fitCenter").toBool(true));
+    showBoardResult(result);
+}
+
+QJsonObject lensFitToJson(const LensFit& f) {
+    QJsonArray viewRms;
+    for (double r : f.viewRms) viewRms.append(r);
+    return QJsonObject{{"model", int(f.model)}, {"terms", QJsonArray{f.terms[0], f.terms[1], f.terms[2]}}, {"focal", f.focal},
+                       {"centerX", f.centerX}, {"centerY", f.centerY}, {"squeeze", f.squeeze}, {"rms", f.rms}, {"worst", f.worst},
+                       {"views", f.views}, {"points", f.points}, {"viewRms", viewRms}};
+}
+
+LensFit lensFitFromJson(const QJsonObject& j) {
+    LensFit f;
+    f.model = lens::Distortion::Model(j.value("model").toInt(int(f.model)));
+    const QJsonArray terms = j.value("terms").toArray();
+    for (int i = 0; i < 3 && i < terms.size(); ++i) f.terms[i] = terms.at(i).toDouble();
+    f.focal = j.value("focal").toDouble();
+    f.centerX = j.value("centerX").toDouble(), f.centerY = j.value("centerY").toDouble();
+    f.squeeze = j.value("squeeze").toDouble(1);
+    f.rms = j.value("rms").toDouble(), f.worst = j.value("worst").toDouble();
+    f.views = j.value("views").toInt(), f.points = j.value("points").toInt();
+    for (const QJsonValue& r : j.value("viewRms").toArray()) f.viewRms.push_back(r.toDouble());
+    return f;
 }
 
 QString LensCalibrationDialog::resultText() const { return result_->text(); }

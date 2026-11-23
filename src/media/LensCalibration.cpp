@@ -1060,7 +1060,8 @@ lens::Lens calibratedLens(const LensFit& fit, int width, int height, const LensI
 
 bool calibrateClip(const std::string& path, double from, double to, int cols, int rows, const LensFitOptions& options,
                    ClipCalibration& out, std::string* error, const std::function<void(double)>& progress,
-                   const std::atomic<bool>* cancel, int maxViews) {
+                   const std::atomic<bool>* cancel, int maxViews, ClipBoards* boards,
+                   const std::function<void(const ClipBoards&)>& read) {
     out = ClipCalibration();
     VideoDecoder dec;
     if (!dec.open(path, error)) return false;
@@ -1075,8 +1076,17 @@ bool calibrateClip(const std::string& path, double from, double to, int cols, in
     const double fps = dec.fps() > 0 ? dec.fps() : 25;
     // Frames across the range (at most four times the views wanted, at most every frame).
     const int frames = dec.isStill() ? 1 : std::max(1, std::min(int((to - from) * fps), std::max(1, maxViews) * 4));
-    std::vector<std::vector<Point2>> views;
-    for (int f = 0; f < frames; ++f) {
+    ClipBoards own;
+    ClipBoards& b = boards ? *boards : own;
+    // (What an earlier run read, where it read these frames.)
+    const size_t corners = size_t(std::max(0, cols) * std::max(0, rows));
+    bool same = b.width == W && b.height == H && b.frames == frames && b.nextFrame >= 0 && b.nextFrame <= frames &&
+                b.views.size() == b.times.size() && b.views.size() <= size_t(b.boardsFound);
+    for (const std::vector<Point2>& v : b.views) same = same && v.size() == corners;
+    if (!same) b = ClipBoards();
+    b.width = W, b.height = H, b.frames = frames;
+    std::vector<std::vector<Point2>>& views = b.views;
+    for (int f = b.nextFrame; f < frames && int(views.size()) < maxViews; ++f) {
         if (cancel && cancel->load()) {
             if (error) *error = "Cancelled";
             return false;
@@ -1084,23 +1094,28 @@ bool calibrateClip(const std::string& path, double from, double to, int cols, in
         const double t = frames == 1 ? from : from + (to - from) * (f + 0.5) / frames;
         if (progress) progress(0.8 * f / frames);
         Frame16Ptr fr = dec.frameAt(t, W, H, true);
-        if (!fr) continue;
-        ++out.framesRead;
-        std::vector<Point2> corners;
-        if (!findCheckerboard(toGray(*fr), cols, rows, corners)) continue;
-        ++out.boardsFound;
-        // (A board that has hardly moved since the last kept adds nothing.)
-        if (!views.empty()) {
-            double moved = 0;
-            for (size_t k = 0; k < corners.size(); ++k)
-                moved = std::max(moved, std::hypot(corners[k].x - views.back()[k].x, corners[k].y - views.back()[k].y));
-            if (moved < 0.02 * std::min(W, H)) continue;
+        b.nextFrame = f + 1;
+        if (fr) {
+            ++b.framesRead;
+            std::vector<Point2> found;
+            if (findCheckerboard(toGray(*fr), cols, rows, found)) {
+                ++b.boardsFound;
+                // (A board that has hardly moved since the last kept adds nothing.)
+                double moved = views.empty() ? 1e9 : 0;
+                if (!views.empty())
+                    for (size_t k = 0; k < found.size(); ++k)
+                        moved = std::max(moved, std::hypot(found[k].x - views.back()[k].x, found[k].y - views.back()[k].y));
+                if (moved >= 0.02 * std::min(W, H)) {
+                    views.push_back(std::move(found));
+                    b.times.push_back(t);
+                }
+            }
         }
-        views.push_back(std::move(corners));
-        out.times.push_back(t);
-        if (int(views.size()) >= maxViews) break;
+        if (read) read(b);
     }
     out.width = W, out.height = H;
+    out.framesRead = b.framesRead, out.boardsFound = b.boardsFound;
+    out.times = b.times;
     if (cancel && cancel->load()) {
         if (error) *error = "Cancelled";
         return false;
