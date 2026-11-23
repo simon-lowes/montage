@@ -100,6 +100,7 @@ output::StreamSettings RemoteReviewController::loadSettings() {
     c.turnSecret = s.value("review/turnSecret").toString().toStdString();
     c.turnExpirySeconds = std::clamp(s.value("review/turnExpiry", c.turnExpirySeconds).toInt(), 30, 30 * 86400);
     c.relayOnly = s.value("review/relayOnly", false).toBool() && !c.turnServer.empty();
+    c.turnPin = s.value("review/turnPin").toString().toStdString();
     c.rungs = std::clamp(s.value("review/rungs", c.rungs).toInt(), 1, 3);
     c.hdr = s.value("review/hdr", true).toBool();
     return c;
@@ -137,6 +138,7 @@ void RemoteReviewController::saveSettings(const output::StreamSettings& c, const
     s.setValue("review/turnSecret", qs(c.turnSecret));
     s.setValue("review/turnExpiry", c.turnExpirySeconds);
     s.setValue("review/relayOnly", c.relayOnly);
+    s.setValue("review/turnPin", qs(c.turnPin));
     s.setValue("review/rungs", c.rungs);
     s.setValue("review/hdr", c.hdr);
     s.setValue("review/maxHeight", o.maxHeight);
@@ -349,6 +351,17 @@ QString RemoteReviewController::status() const {
         if (st.hdrViewers > 0) text += tr(", %n in HDR", "", st.hdrViewers);
         if (st.skipped > 0) text += tr(", %n frame(s) skipped (encoding fell behind)", "", int(std::min<int64_t>(st.skipped, 1 << 30)));
         if (!st.error.empty()) text += QStringLiteral(" (%1)").arg(qs(st.error));
+        // (only through the relay: where each viewer's way through it has got to, and what the relay last refused it)
+        if (!st.bridges.empty()) {
+            QStringList ways;
+            for (const output::ReviewStats::Bridge& b : st.bridges) {
+                QString way = tr("%1: %2").arg(qs(b.viewer), qs(b.state));
+                if (!b.lastRefusal.empty()) way += QStringLiteral(" (%1)").arg(qs(b.lastRefusal));
+                if (b.answersRefused > 0) way += tr(", %n answer(s) of the relay's not signed with the login and not used", "", int(std::min<uint64_t>(b.answersRefused, 1 << 30)));
+                ways << way;
+            }
+            text += tr("; through the relay: %1").arg(ways.join(tr("; ")));
+        }
         // (a link made with a relay's secret ends at its time, for everyone watching too)
         if (st.linkExpires > 0)
             text += st.linkExpires > QDateTime::currentSecsSinceEpoch()
@@ -385,7 +398,7 @@ QByteArray RemoteReviewController::toolJson() {
 "key":{"type":"string","description":"Browsers: the certificate's private key (PEM, without a password)"},
 "max_viewers":{"type":"number","description":"Browsers: viewers at once (1 to 64)"},
 "simulcast":{"type":["boolean","integer"],"description":"Browsers: the picture at several sizes at once, each viewer moved between them by their own connection: true (full, half and quarter size, the default), false (full size only), or the number of sizes, 1 to 3"},
-"turn":{"type":"object","description":"Browsers: a TURN relay the user runs (RFC 8656), given to viewers' pages with the passphrase; url \"\" for none","properties":{"url":{"type":"string","description":"turn:host:3478, or turns:host:5349 over TLS"},"username":{"type":"string"},"password":{"type":"string"},"secret":{"type":"string","description":"In place of username and password: the secret the relay shares with Montage (a relay set to make logins from a shared secret). Each review then has a login of its own that runs out; \"\" for none"},"expiry":{"type":"integer","description":"With secret: how long the review link and its login last from the start, in seconds (30 to 2592000; 86400 unless given)"},"relay_only":{"type":"boolean","description":"Every viewer's media through the relay, never directly: Montage then sends media to no address but the relay's (the page and its signalling still go over HTTPS between each viewer and Montage)"}}},
+"turn":{"type":"object","description":"Browsers: a TURN relay the user runs (RFC 8656), given to viewers' pages with the passphrase; url \"\" for none","properties":{"url":{"type":"string","description":"turn:host:3478, turn:host:3478?transport=tcp over TCP, or turns:host:5349 over TLS; an IPv6 address in square brackets"},"pin":{"type":"string","description":"With turns: and a relay whose certificate is of its own making: the certificate's SHA-256 fingerprint (64 hexadecimal digits, colons allowed). That certificate and no other is then taken; \"\" to check against the system's trusted certificates"},"username":{"type":"string"},"password":{"type":"string"},"secret":{"type":"string","description":"In place of username and password: the secret the relay shares with Montage (a relay set to make logins from a shared secret). Each review then has a login of its own that runs out; \"\" for none"},"expiry":{"type":"integer","description":"With secret: how long the review link and its login last from the start, in seconds (30 to 2592000; 86400 unless given)"},"relay_only":{"type":"boolean","description":"Every viewer's media through the relay, never directly: Montage then sends media to no address but the relay's (the page and its signalling still go over HTTPS between each viewer and Montage)"}}},
 "hdr":{"type":"boolean","description":"Browsers: an HDR sequence (PQ or HLG) as 10-bit HDR to browsers that decode it, tone mapped to Rec. 709 for the rest (default true); false: SDR for everyone"},
 "hardware":{"type":"boolean","description":"Encode on NVENC where there is one"},
 "bitrate_kbps":{"type":"number","description":"250 to 200000"},
@@ -460,10 +473,12 @@ QString RemoteReviewController::runTool(const QJsonObject& args, QJsonObject& st
                 c.turnExpirySeconds = t.value("expiry").toInt(-1);  // (one out of range is refused below)
             }
             if (t.contains("relay_only")) c.relayOnly = t.value("relay_only").toBool();
+            if (t.contains("pin")) c.turnPin = t.value("pin").toString().trimmed().toStdString();
             if (c.turnServer.empty()) {
                 c.turnUser.clear();
                 c.turnPassword.clear();
                 c.turnSecret.clear();
+                c.turnPin.clear();
                 if (!t.contains("relay_only")) c.relayOnly = false;
             }
         }
@@ -513,6 +528,20 @@ QString RemoteReviewController::runTool(const QJsonObject& args, QJsonObject& st
                 if (st.linkExpires > 0) {
                     turn["expires"] = QDateTime::fromSecsSinceEpoch(st.linkExpires, Qt::UTC).toString(Qt::ISODate);
                     turn["expires_in"] = double(std::max<qint64>(0, st.linkExpires - QDateTime::currentSecsSinceEpoch()));
+                }
+                if (!settings_.turnPin.empty()) turn["pin"] = qs(settings_.turnPin);
+                // (only through the relay: each viewer's way through it, and the one thread they share)
+                if (settings_.relayOnly) {
+                    QJsonArray bridges;
+                    for (const output::ReviewStats::Bridge& b : st.bridges)
+                        bridges.append(QJsonObject{{"viewer", qs(b.viewer)},
+                                                   {"state", qs(b.state)},
+                                                   {"last_refusal", qs(b.lastRefusal)},
+                                                   {"to_relay", double(b.toRelay)},
+                                                   {"from_relay", double(b.fromRelay)},
+                                                   {"answers_refused", double(b.answersRefused)}});
+                    turn["bridges"] = bridges;
+                    turn["bridge_threads"] = st.bridgeThreads;
                 }
                 structured["turn"] = turn;
             }
@@ -654,8 +683,9 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     turn_ = new QLineEdit(qs(st.turnServer), this);
     turn_->setObjectName(QStringLiteral("reviewStreamTurn"));
     turn_->setPlaceholderText(tr("None"));
-    turn_->setToolTip(tr("A TURN relay you run (turn:host:3478, or turns:host:5349 over TLS), for viewers whose networks let nothing "
-                         "through directly. Reviewers' pages are given it, with its user name and password, once they give the passphrase."));
+    turn_->setToolTip(tr("A TURN relay you run (turn:host:3478, turn:host:3478?transport=tcp over TCP, or turns:host:5349 over TLS; an IPv6 "
+                         "address goes in square brackets), for viewers whose networks let nothing through directly. Reviewers' pages are "
+                         "given it, with its user name and password, once they give the passphrase."));
     form->addRow(tr("TURN relay:"), turn_);
     auto* turnLogin = new QWidget(this);
     turnLogin->setObjectName(QStringLiteral("reviewStreamTurnLogin"));
@@ -699,6 +729,12 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     relayOnly_->setObjectName(QStringLiteral("reviewStreamRelayOnly"));
     relayOnly_->setChecked(st.relayOnly);
     form->addRow(QString(), relayOnly_);
+    turnPin_ = new QLineEdit(qs(st.turnPin), this);
+    turnPin_->setObjectName(QStringLiteral("reviewStreamTurnPin"));
+    turnPin_->setPlaceholderText(tr("Checked against this computer's trusted certificates"));
+    turnPin_->setToolTip(tr("For a relay reached over TLS (turns:) with a certificate of its own making: the certificate's SHA-256 "
+                            "fingerprint. Montage then takes that certificate and no other, whoever signed it."));
+    form->addRow(tr("Relay certificate:"), turnPin_);
     rungs_ = new QComboBox(this);
     rungs_->setObjectName(QStringLiteral("reviewStreamRungs"));
     rungs_->addItem(tr("Full, half and quarter size"), 3);
@@ -716,6 +752,7 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     auto relayChanged = [this] {
         relayOnly_->setEnabled(!controller_->running() && !turn_->text().trimmed().isEmpty());
         turnExpiry_->setEnabled(!controller_->running() && !turnSecret_->text().isEmpty());
+        turnPin_->setEnabled(!controller_->running() && turn_->text().trimmed().startsWith(QLatin1String("turns:")));
     };
     connect(turn_, &QLineEdit::textChanged, this, relayChanged);
     connect(turnSecret_, &QLineEdit::textChanged, this, relayChanged);
@@ -725,6 +762,11 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     turnFor_ = turn_->text().trimmed();
     for (QLineEdit* login : {turnUser_, turnPassword_, turnSecret_})
         connect(login, &QLineEdit::textEdited, this, [this] { turnFor_ = turn_->text().trimmed(); });
+    // (a login typed before any relay is named is for the relay entered next: from when that one has been entered,
+    // it is that relay's)
+    connect(turn_, &QLineEdit::editingFinished, this, [this] {
+        if (turnFor_.isEmpty()) turnFor_ = turn_->text().trimmed();
+    });
     connect(turn_, &QLineEdit::textEdited, this, [this](const QString& text) {
         if (turnFor_.isEmpty() || text.trimmed() == turnFor_) return;
         turnUser_->clear();
@@ -808,7 +850,7 @@ void RemoteReviewPanel::viewersChanged() {
                                   "relay; udp://host:port sends unencrypted on a local network"));
     for (QWidget* w : std::initializer_list<QWidget*>{direction_, latency_}) form_->setRowVisible(w, !web);
     form_->setRowVisible(findChild<QWidget*>(QStringLiteral("reviewStreamMarkersRow")), !web);
-    for (QWidget* w : std::initializer_list<QWidget*>{certificate_, key_, ice_, maxViewers_, turn_, relayOnly_, rungs_, hdr_}) form_->setRowVisible(w, web);
+    for (QWidget* w : std::initializer_list<QWidget*>{certificate_, key_, ice_, maxViewers_, turn_, relayOnly_, turnPin_, rungs_, hdr_}) form_->setRowVisible(w, web);
     form_->setRowVisible(findChild<QWidget*>(QStringLiteral("reviewStreamTurnLogin")), web);
     form_->setRowVisible(findChild<QWidget*>(QStringLiteral("reviewStreamTurnSecretRow")), web);
     if (web) colour_->setCurrentIndex(0);
@@ -836,6 +878,8 @@ output::StreamSettings RemoteReviewPanel::chosenSettings() const {
     s.turnSecret = turnSecret_->text().toStdString();
     s.turnExpirySeconds = turnExpiry_->currentData().toInt();
     s.relayOnly = relayOnly_->isChecked() && !s.turnServer.empty();
+    // (a pin is for a relay over TLS: one left from another relay is not kept)
+    if (s.turnServer.rfind("turns:", 0) == 0) s.turnPin = turnPin_->text().trimmed().toStdString();
     s.rungs = rungs_->currentData().toInt();
     s.hdr = hdr_->isChecked();
     return s;
@@ -857,6 +901,7 @@ void RemoteReviewPanel::refresh() {
         w->setEnabled(!on);
     relayOnly_->setEnabled(!on && !turn_->text().trimmed().isEmpty());
     turnExpiry_->setEnabled(!on && !turnSecret_->text().isEmpty());
+    turnPin_->setEnabled(!on && turn_->text().trimmed().startsWith(QLatin1String("turns:")));
     markersPort_->setEnabled(!on && markers_->isChecked());
     colour_->setEnabled(!on && !viewers_->currentData().toBool());
     status_->setText(controller_->status());

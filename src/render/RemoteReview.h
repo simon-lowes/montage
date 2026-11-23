@@ -44,9 +44,14 @@ struct StreamSettings {
     // directly: browsers use only the relay, Montage offers only its own address there, and Montage sends no media
     // to any address but the relay's, whatever addresses a viewer offers (render/TurnRelay.h's bridge; its ICE is
     // then told of no STUN or TURN server either). The page and its signalling (HTTPS, WHEP) still go between each
-    // viewer and Montage's own address.
+    // viewer and Montage's own address. With relayOnly Montage reaches the relay as its address says: over UDP
+    // ("turn:host"), over TCP ("turn:host?transport=tcp") or over TLS ("turns:host"), at an IPv4 or an IPv6 address
+    // ("turn:[2001:db8::1]:3478"). Over TLS the relay's certificate is checked against the system's roots and the
+    // relay's name, or is the one whose SHA-256 fingerprint turnPin gives (for a relay with a certificate of its own
+    // making).
     std::string turnServer, turnUser, turnPassword;
     bool relayOnly = false;
+    std::string turnPin;
     // In place of the user name and password, the secret the relay shares with Montage (coturn's use-auth-secret):
     // each review then has a login of its own that the relay takes for turnExpirySeconds from when the review starts
     // (render/TurnRelay.h), and once that has passed the review link ends: nobody new is let in, and viewers still
@@ -134,6 +139,16 @@ struct ReviewStats {
     int probes = 0;                // a browser review: padding bursts sent to see whether a viewer's link takes the size above
     int queueMoves = 0;            // and viewers moved down a size because their link queued, before it lost anything
     int64_t linkExpires = 0;       // when the review link stops letting viewers in (seconds since 1970, UTC; 0: it does not)
+    // Only through a relay: each viewer's way through it (render/TurnRelay.h's bridge), and the threads they share.
+    struct Bridge {
+        std::string viewer;        // the address the viewer's offer came from
+        std::string state;         // "Carrying over TLS", "Asking the relay for an address", "Ended"
+        std::string lastRefusal;   // what the relay last refused, or why the way through it ended ("" nothing)
+        uint64_t toRelay = 0, fromRelay = 0;  // packets carried each way
+        uint64_t answersRefused = 0;          // the relay's answers not used because they were not signed with the login
+    };
+    std::vector<Bridge> bridges;
+    int bridgeThreads = 0;
 };
 
 // Where a reviewer in a browser points, in 0..1 of the picture.

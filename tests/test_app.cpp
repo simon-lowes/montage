@@ -26048,6 +26048,24 @@ print("added " + ui["name"])
         QCOMPARE(turn->text(), QStringLiteral("turn:relay.example.com:34780"));
         QVERIFY(user->text().isEmpty() && password->text().isEmpty() && secret->text().isEmpty());
         QTest::keyClick(turn, Qt::Key_Backspace);
+        // A secret typed while no relay is named is the relay's that is entered next: typing another relay in that
+        // one's place clears it as well.
+        turn->selectAll();
+        QTest::keyClick(turn, Qt::Key_Delete);
+        QVERIFY(turn->text().isEmpty());
+        QTest::keyClicks(secret, QStringLiteral("typed before the relay"));
+        QTest::keyClicks(turn, QStringLiteral("turn:first.example.com:3478"));
+        QCOMPARE(secret->text(), QStringLiteral("typed before the relay"));
+        emit turn->editingFinished();
+        QTest::keyClicks(turn, QStringLiteral("9"));
+        QVERIFY2(secret->text().isEmpty(), "the first relay's secret was kept for another");
+        // The relay's certificate can be pinned only for a relay reached over TLS.
+        auto* pin = dlg->findChild<QLineEdit*>("reviewStreamTurnPin");
+        QVERIFY(pin && pin->isVisibleTo(dlg) && !pin->isEnabled());
+        turn->setText(QStringLiteral("turns:relay.example.com:5349"));
+        QVERIFY(pin->isEnabled());
+        turn->setText(QStringLiteral("turn:relay.example.com:3478"));
+        QVERIFY(!pin->isEnabled());
         user->setText(QStringLiteral("ana"));
         password->setText(QStringLiteral("relay-secret"));
         secret->clear();

@@ -1,5 +1,7 @@
 #include "render/RemoteReview.h"
 
+#include "render/TurnRelay.h"
+
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QEventLoop>
@@ -153,9 +155,10 @@ std::string checkStreamSettings(const StreamSettings& s) {
             return "A shared secret needs the TURN relay it is for";
         }
         if (s.relayOnly && s.turnServer.empty()) return "Only through a relay needs a TURN relay";
-        if (s.relayOnly && !s.turnServer.empty() &&
-            (s.turnServer.rfind("turns:", 0) == 0 || QString::fromStdString(s.turnServer).toLower().contains(QLatin1String("transport=tcp"))))
-            return "Only through a relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)";
+        if (!s.turnPin.empty()) {
+            if (s.turnServer.rfind("turns:", 0) != 0) return "A pinned certificate is for a relay reached over TLS (turns:)";
+            if (relayPin(s.turnPin).empty()) return "The relay's pinned certificate is its SHA-256 fingerprint: 64 hexadecimal digits, with or without colons";
+        }
         // (they go to browsers in a header too)
         for (const std::string& part : {s.turnServer, s.turnUser, s.turnPassword})
             if (std::any_of(part.begin(), part.end(), [](char c) { return uint8_t(c) < 0x20 || c == 0x7f || c == '"' || c == '<' || c == '>'; }))

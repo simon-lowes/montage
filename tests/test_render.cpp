@@ -123,6 +123,7 @@
 #include "render/TurnRelay.h"
 #include "render/HeadlessBrowser.h"
 #include "render/OGraf.h"
+#include "RelayFake.h"
 #include "ReviewBrowsers.h"
 #ifdef MONTAGE_TEST_TURN
 #include <juice/juice.h>
@@ -24082,10 +24083,10 @@ colorspaces:
         bad = rig.settings;
         bad.turnPassword.clear();
         QVERIFY(!checkStreamSettings(bad).empty());
-        // (Montage reaches the relay over UDP: one over TLS or TCP only is the browsers', never relay only)
+        // (a relay reached over TCP is taken, only through it or not: reviewRelayThreadFamilyAndExpiry has the rest)
         bad = rig.settings;
         bad.turnServer = "turn:127.0.0.1:3478?transport=tcp";
-        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("UDP"));
+        QVERIFY(checkStreamSettings(bad).empty());
         bad.relayOnly = false;
         QVERIFY(checkStreamSettings(bad).empty());
 #endif
@@ -25010,9 +25011,10 @@ colorspaces:
         std::vector<std::string> asked;
         const std::string moved = offerThroughRelay(offer, [&](const std::string& ip, uint16_t port) {
             asked.push_back(ip + ":" + std::to_string(port));
-            return uint16_t(ip == "192.0.2.8" ? 0 : 40000 + asked.size());
+            return uint16_t(ip == "192.0.2.8" || ip == "2001:db8::7" ? 0 : 40000 + asked.size() - (asked.size() > 4));
         });
-        QCOMPARE(asked, (std::vector<std::string>{"192.0.2.7:50001", "198.51.100.9:50002", "203.0.113.5:50003", "192.0.2.8:50007"}));
+        // (an IPv6 one is asked about too, and left out here as the test gives it no port)
+        QCOMPARE(asked, (std::vector<std::string>{"192.0.2.7:50001", "198.51.100.9:50002", "203.0.113.5:50003", "2001:db8::7:50005", "192.0.2.8:50007"}));
         QCOMPARE(moved, std::string("v=0\r\na=ice-ufrag:abcd\r\n"
                                     "a=candidate:1 1 UDP 2122260223 127.0.0.1 40001 typ host\r\n"
                                     "a=candidate:2 1 UDP 1686052607 127.0.0.1 40002 typ host\r\n"
@@ -25914,6 +25916,874 @@ colorspaces:
             RelayBridge late("127.0.0.1", uint16_t(turnPort), login);
             const std::string refused = allocateAt(late);
             QVERIFY2(QString::fromStdString(refused).contains("login"), (refused + " " + serverLog().toStdString()).c_str());
+        }
+    }
+
+    // Phase 16: the bridge reaches a relay over TCP, over TLS and at an IPv6 address, and carries to IPv6 viewers.
+    // Against a relay of the test's own (tests/RelayFake.h). "as IPv6" rows run on 127.0.0.1 with a relay that
+    // speaks as one whose addresses are IPv6, so everything about IPv6 but the sockets is checked on computers
+    // with none; the "::1" rows need an IPv6 loopback.
+    void reviewRelayTransports_data() {
+        QTest::addColumn<QString>("transport");  // "udp", "tcp", "tls"
+        QTest::addColumn<int>("ipv6");           // 0: IPv4, 1: IPv6 addresses over IPv4 sockets, 2: on ::1
+        QTest::newRow("tcp") << "tcp" << 0;
+        QTest::newRow("tls") << "tls" << 0;
+        QTest::newRow("udp as IPv6") << "udp" << 1;
+        QTest::newRow("tls as IPv6") << "tls" << 1;
+        QTest::newRow("udp on ::1") << "udp" << 2;
+        QTest::newRow("tcp on ::1") << "tcp" << 2;
+        QTest::newRow("tls on ::1") << "tls" << 2;
+    }
+    void reviewRelayTransports() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        QFETCH(QString, transport);
+        QFETCH(int, ipv6);
+        if (ipv6 == 2 && !FakeRelay::hasIpv6()) QSKIP("This computer has no IPv6 loopback address");
+        const bool stream = transport != "udp";
+        FakeRelay::Config config;
+        config.v6 = ipv6 == 2;
+        config.pretendV6 = ipv6 == 1;
+        config.udp = transport == "udp";
+        config.tcp = transport == "tcp";
+        config.tls = transport == "tls";
+        config.user = "reviewer";
+        config.password = "relay-password-16";
+        std::string why;
+        QByteArray fingerprint;
+        if (config.tls) {
+            QVERIFY2(makeReviewCertificate({"127.0.0.1", "::1", "localhost"}, config.certificatePem, config.keyPem, &why), why.c_str());
+            fingerprint = QSslCertificate(QByteArray::fromStdString(config.certificatePem), QSsl::Pem).digest(QCryptographicHash::Sha256).toHex(':').toUpper();
+        }
+        FakeRelay relay(config);
+        QVERIFY2(relay.start(&why), why.c_str());
+        // The relay's address as the settings have it.
+        RelayAddress at;
+        QVERIFY(parseRelayAddress(relay.url(), at));
+        QCOMPARE(at.host, std::string(config.v6 ? "::1" : "127.0.0.1"));
+        QCOMPARE(int(at.port), relay.port());
+        QCOMPARE(int(at.transport), int(config.tls ? RelayAddress::Transport::Tls : config.tcp ? RelayAddress::Transport::Tcp : RelayAddress::Transport::Udp));
+        at.pin = fingerprint.toStdString();
+        const TurnLogin login{"reviewer", "relay-password-16"};
+        const QString over = transport.toUpper();
+        auto allocate = [&](RelayBridge& b) {
+            struct Said {
+                std::mutex m;
+                std::condition_variable cv;
+                bool done = false;
+                std::string error;
+            };
+            auto said = std::make_shared<Said>();
+            b.allocate(ipv6 ? 6 : 4, [said](const std::string& error) {
+                std::lock_guard lock(said->m);
+                said->done = true;
+                said->error = error;
+                said->cv.notify_all();
+            });
+            std::unique_lock lock(said->m);
+            return said->cv.wait_for(lock, std::chrono::seconds(15), [&] { return said->done; }) ? said->error : std::string("nothing said");
+        };
+        const QHostAddress loopback(config.v6 ? QHostAddress::LocalHostIPv6 : QHostAddress::LocalHost);
+        auto socket = [&](const QHostAddress& on) {
+            auto s = std::make_unique<QUdpSocket>();
+            s->setProxy(QNetworkProxy::NoProxy);
+            s->bind(on, 0);
+            return s;
+        };
+        struct Got {
+            QByteArray data;
+            quint16 from = 0;
+        };
+        auto read = [](QUdpSocket& s, int ms) {
+            Got g;
+            if (!s.hasPendingDatagrams() && !s.waitForReadyRead(ms)) return g;
+            g.data.resize(int(s.pendingDatagramSize()));
+            s.readDatagram(g.data.data(), g.data.size(), nullptr, &g.from);
+            return g;
+        };
+        const quint64 threadsBefore = RelayBridge::threadsStarted();
+        {
+            RelayBridge bridge(at, login);
+            QCOMPARE(RelayBridge::threads(), 1);
+            QCOMPARE(allocate(bridge), std::string());
+            QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over %1").arg(over));
+            QCOMPARE(QHostAddress(QString::fromStdString(bridge.relayedAddress())), relay.relayedAddress());
+            const uint16_t relayed = bridge.relayedPort();
+            QVERIFY(relayed != 0);
+            QCOMPARE(relay.allocations.load(), 1);
+            // A viewer at an address of the relay's family has a port standing for it; one of the other family none.
+            auto viewer = socket(loopback), end = socket(QHostAddress(QHostAddress::LocalHost));
+            const std::string viewerAt = relay.peerAddress().toString().toStdString();
+            const uint16_t alias = bridge.peer(viewerAt, viewer->localPort());
+            QVERIFY(alias != 0);
+            QCOMPARE(bridge.peer(viewerAt, viewer->localPort()), alias);
+            QCOMPARE(bridge.peer(ipv6 ? "192.0.2.7" : "2001:db8::7", 5000), uint16_t(0));
+            QCOMPARE(bridge.peer("fe80::1%lo", 5000), uint16_t(0));
+            // Montage's end to the viewer arrives from Montage's address at the relay, and the viewer's answer at
+            // Montage's end from the port that stands for the viewer.
+            Got got;
+            for (int i = 0; i < 50 && got.data.isEmpty(); ++i) {
+                end->writeDatagram("to the viewer", QHostAddress::LocalHost, alias);
+                got = read(*viewer, 100);
+            }
+            QCOMPARE(got.data, QByteArray("to the viewer"));
+            QCOMPARE(got.from, quint16(relayed));
+            while (!read(*viewer, 200).data.isEmpty()) {}
+            viewer->writeDatagram("to Montage", loopback, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("to Montage"));
+            QCOMPARE(got.from, quint16(alias));
+            QVERIFY(relay.sendIndications.load() >= 1);
+            QCOMPARE(relay.channelData.load(), quint64(0));
+            if (stream) QVERIFY(relay.bytesOverStream.load() > 0);
+            QCOMPARE(relay.bytesOverUdp.load() > 0, !stream);
+            // An answer to the viewer's connectivity check names the viewer's own address when it leaves: an IPv6
+            // address takes twelve bytes more than the loopback port it replaces, and the answer is signed and
+            // fingerprinted as if Montage's end had made it so.
+            const QByteArray icePassword = "an ICE password of the test";
+            const QByteArray id(12, 't');
+            bridge.setLocal(end->localPort(), icePassword.toStdString());
+            QThread::msleep(100);
+            end->writeDatagram(FakeRelay::bindingAnswer(QHostAddress(QHostAddress::LocalHost), alias, id, icePassword), QHostAddress::LocalHost, alias);
+            got = read(*viewer, 3000);
+            QCOMPARE(got.data.toHex(), FakeRelay::bindingAnswer(relay.peerAddress(), viewer->localPort(), id, icePassword).toHex());
+            QCOMPARE(got.data.size(), ipv6 ? 76 : 64);
+            // A viewer's check from the controlling end with a tiebreaker of 0 (Chrome's from a relay over TCP or TLS)
+            // reaches Montage's end with 1 in its place, signed again with Montage's ICE password; one with a
+            // tiebreaker of its own reaches it as it was sent.
+            const QByteArray checkId(12, 'c');
+            viewer->writeDatagram(FakeRelay::bindingRequest(checkId, 0, icePassword), loopback, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data.toHex(), FakeRelay::bindingRequest(checkId, 1, icePassword).toHex());
+            const QByteArray own = FakeRelay::bindingRequest(checkId, 0x0123456789abcdefULL, icePassword);
+            viewer->writeDatagram(own, loopback, relayed);
+            QCOMPARE(read(*end, 3000).data.toHex(), own.toHex());
+            // A stream's answers a byte at a time, with a channel's data between them, are read all the same: a
+            // second viewer's address is let in and carried to.
+            relay.trickle = true;
+            relay.channelNoise = true;
+            auto second = socket(loopback);
+            const int permissionsBefore = relay.permissions;
+            viewer->writeDatagram("again", loopback, relayed);
+            QCOMPARE(read(*end, 3000).data, QByteArray("again"));
+            second->writeDatagram("from elsewhere", loopback, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("from elsewhere"));
+            QVERIFY(got.from != 0);
+            end->writeDatagram("and back", QHostAddress::LocalHost, got.from);
+            QCOMPARE(read(*second, 3000).data, QByteArray("and back"));
+            QVERIFY(relay.permissions >= permissionsBefore);
+            relay.trickle = false;
+            relay.channelNoise = false;
+            QCOMPARE(bridge.lastError(), std::string());
+            QCOMPARE(bridge.answersRefused(), uint64_t(0));
+        }
+        // Let go of, the bridge gave its address back, and its thread ended with it.
+        QCOMPARE(relay.released.load(), 1);
+        QCOMPARE(RelayBridge::threads(), 0);
+        QCOMPARE(RelayBridge::threadsStarted(), threadsBefore + 1);
+        // An answer changed by one byte on its way is not used, and is said: over UDP each sending's answer, over a
+        // stream the one.
+        {
+            relay.corruptAnswers = true;
+            RelayBridge changed(at, login);
+            QElapsedTimer waited;
+            waited.start();
+            const std::string said = allocate(changed);
+            relay.corruptAnswers = false;
+            QVERIFY2(QString::fromStdString(said).contains("did not answer") && QString::fromStdString(said).contains("not signed with this review's login"), said.c_str());
+            QVERIFY2(waited.elapsed() >= 4000 && waited.elapsed() < 12000, std::to_string(waited.elapsed()).c_str());
+            QCOMPARE(changed.lastError(), said);
+            QVERIFY(changed.answersRefused() >= 1);
+            if (stream) QCOMPARE(changed.answersRefused(), uint64_t(1));
+            QCOMPARE(changed.relayedPort(), uint16_t(0));
+            QCOMPARE(QString::fromStdString(changed.state()), QStringLiteral("Ended"));
+        }
+        if (stream) {
+            // Bytes that are not TURN end the connection, and so does the relay's closing it: both are said.
+            relay.garbage = true;
+            RelayBridge lost(at, login);
+            std::string said = allocate(lost);
+            QVERIFY2(QString::fromStdString(said).contains("not TURN"), said.c_str());
+            RelayBridge closed(at, login);
+            QCOMPARE(allocate(closed), std::string());
+            relay.hangUp = true;
+            auto viewer = socket(loopback);
+            QVERIFY(closed.peer(relay.peerAddress().toString().toStdString(), viewer->localPort()) != 0);
+            QTRY_COMPARE_WITH_TIMEOUT(QString::fromStdString(closed.state()), QStringLiteral("Ended"), 5000);
+            said = closed.lastError();
+            QVERIFY2(QString::fromStdString(said).contains(QStringLiteral("The connection to the TURN relay over %1 ended").arg(over)), said.c_str());
+            relay.hangUp = false;
+        }
+        if (config.tls) {
+            // The certificate: one that is not the pinned one is not taken, and neither is one no root signed when
+            // none is pinned.
+            const int allocationsBefore = relay.allocations;
+            RelayAddress other = at;
+            other.pin = std::string(64, 'a');
+            RelayBridge wrongPin(other, login);
+            std::string said = allocate(wrongPin);
+            QVERIFY2(QString::fromStdString(said).contains("not the one pinned"), said.c_str());
+            other.pin.clear();
+            RelayBridge unpinned(other, login);
+            said = allocate(unpinned);
+            QVERIFY2(QString::fromStdString(said).contains("certificate was not accepted"), said.c_str());
+            // (neither got as far as asking the relay for anything)
+            QCOMPARE(relay.allocations.load(), allocationsBefore);
+        }
+        // A wrong login is refused over this transport as over UDP.
+        {
+            RelayBridge wrong(at, {"reviewer", "not the password"});
+            const std::string said = allocate(wrong);
+            QVERIFY2(QString::fromStdString(said).contains("login"), said.c_str());
+        }
+    }
+
+    // Phase 16: what the relay code reads and writes that needs no relay; sixteen bridges on one thread; a relay
+    // with only IPv6 addresses asked for IPv4 first; and a login whose time is up refused at the next refresh.
+    void reviewRelayThreadFamilyAndExpiry() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        // Addresses: RFC 7065's forms.
+        RelayAddress at;
+        QVERIFY(parseRelayAddress("turn:relay.example.com", at));
+        QCOMPARE(at.host, std::string("relay.example.com"));
+        QCOMPARE(int(at.port), 3478);
+        QVERIFY(at.transport == RelayAddress::Transport::Udp);
+        QVERIFY(parseRelayAddress("turn:relay.example.com:443?transport=tcp", at));
+        QCOMPARE(int(at.port), 443);
+        QVERIFY(at.transport == RelayAddress::Transport::Tcp);
+        QVERIFY(parseRelayAddress("turns:relay.example.com", at));
+        QCOMPARE(int(at.port), 5349);
+        QVERIFY(at.transport == RelayAddress::Transport::Tls);
+        QVERIFY(parseRelayAddress("turns:[2001:db8::1]:443?transport=tcp", at));
+        QCOMPARE(at.host, std::string("2001:db8::1"));
+        QCOMPARE(int(at.port), 443);
+        QVERIFY(at.transport == RelayAddress::Transport::Tls);
+        QVERIFY(parseRelayAddress("turn:[::1]", at));
+        QCOMPARE(at.host, std::string("::1"));
+        QCOMPARE(int(at.port), 3478);
+        for (const char* bad : {"stun:relay.example.com", "turn:", "turn:[::1", "turn:[::1]x", "turn:host:0", "turn:host:65536", "relay.example.com"})
+            QVERIFY2(!parseRelayAddress(bad, at), bad);
+        // A pinned certificate's fingerprint, as OpenSSL prints it or bare.
+        const std::string digits(64, 'b');
+        QCOMPARE(relayPin(digits), digits);
+        std::string printed = "sha256 Fingerprint=AB", bare = "ab";
+        for (int k = 0; k < 31; ++k) printed += ":CD", bare += "cd";
+        QCOMPARE(relayPin(printed), bare);
+        QCOMPARE(relayPin("abcd"), std::string());
+        QCOMPARE(relayPin(std::string(64, 'g')), std::string());
+        // The settings: TCP, TLS and IPv6 relays are taken only through the relay too; a pin is a fingerprint, for TLS.
+        StreamSettings st;
+        st.address = "https://127.0.0.1:8443";
+        st.passphrase = generatePassphrase();
+        st.turnUser = "reviewer";
+        st.turnPassword = "relay-password-16";
+        st.relayOnly = true;
+        for (const char* url : {"turn:127.0.0.1:3478?transport=tcp", "turns:relay.example.com", "turn:[2001:db8::1]:3478", "turns:[::1]:5349"}) {
+            st.turnServer = url;
+            QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        }
+        st.turnPin = "not a fingerprint";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("fingerprint"));
+        st.turnPin = digits;
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        st.turnServer = "turn:127.0.0.1:3478";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("TLS"));
+        // An offer with IPv6 candidates alone needs an IPv6 address at the relay; with any IPv4 one, an IPv4 one.
+        const std::string six = "v=0\r\na=candidate:1 1 udp 41885439 2001:db8::5 50003 typ relay raddr :: rport 0\r\n"
+                                "a=candidate:2 1 udp 2122260223 4f0c2b1e.local 50006 typ host\r\na=candidate:3 1 tcp 1518280447 192.0.2.7 9 typ host tcptype active\r\n";
+        QCOMPARE(offerFamily(six), 6);
+        QCOMPARE(offerFamily(six + "a=candidate:4 1 udp 41885439 203.0.113.5 50004 typ relay raddr 0.0.0.0 rport 0\r\n"), 4);
+        QCOMPARE(offerFamily("v=0\r\n"), 4);
+        QCOMPARE(offerThroughRelay(six, [](const std::string& ip, uint16_t port) { return uint16_t(ip == "2001:db8::5" && port == 50003 ? 40001 : 0); }),
+                 std::string("v=0\r\na=candidate:1 1 UDP 41885439 127.0.0.1 40001 typ host\r\n"));
+        uint16_t local = 0;
+        QCOMPARE(answerThroughRelay("v=0\r\na=candidate:1 1 UDP 2122317823 127.0.0.1 51234 typ host\r\n", "2001:db8::20", 49160, &local),
+                 std::string("v=0\r\na=candidate:1 1 UDP 2122317823 2001:db8::20 49160 typ relay raddr :: rport 0\r\n"));
+        QCOMPARE(local, uint16_t(51234));
+
+        auto allocate = [](RelayBridge& b, int prefer) {
+            struct Said {
+                std::mutex m;
+                std::condition_variable cv;
+                bool done = false;
+                std::string error;
+            };
+            auto said = std::make_shared<Said>();
+            b.allocate(prefer, [said](const std::string& error) {
+                std::lock_guard lock(said->m);
+                said->done = true;
+                said->error = error;
+                said->cv.notify_all();
+            });
+            std::unique_lock lock(said->m);
+            return said->cv.wait_for(lock, std::chrono::seconds(15), [&] { return said->done; }) ? said->error : std::string("nothing said");
+        };
+        std::string why;
+        {
+            // Sixteen viewers' bridges, each carrying, on one thread: counted by the bridges and, on Linux, by the
+            // system. When the last is let go the thread ends.
+            FakeRelay::Config config;
+            config.tcp = true;
+            config.user = "reviewer";
+            config.password = "relay-password-16";
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            QVERIFY(parseRelayAddress(relay.url(), at));
+            auto systemThreads = [] {
+#ifdef Q_OS_LINUX
+                return int(QDir("/proc/self/task").entryList(QDir::Dirs | QDir::NoDotAndDotDot).size());
+#else
+                return 0;
+#endif
+            };
+            QCOMPARE(RelayBridge::threads(), 0);
+            const quint64 started = RelayBridge::threadsStarted();
+            const int before = systemThreads();
+            std::vector<std::unique_ptr<RelayBridge>> bridges;
+            std::vector<std::unique_ptr<QUdpSocket>> viewers, ends;
+            for (int k = 0; k < 16; ++k) {
+                bridges.push_back(std::make_unique<RelayBridge>(at, TurnLogin{"reviewer", "relay-password-16"}));
+                QCOMPARE(allocate(*bridges.back(), 4), std::string());
+                for (auto* list : {&viewers, &ends}) {
+                    list->push_back(std::make_unique<QUdpSocket>());
+                    list->back()->setProxy(QNetworkProxy::NoProxy);
+                    QVERIFY(list->back()->bind(QHostAddress::LocalHost, 0));
+                }
+            }
+            QCOMPARE(relay.allocations.load(), 16);
+            QCOMPARE(RelayBridge::threads(), 1);
+            QCOMPARE(RelayBridge::threadsStarted(), started + 1);
+#ifdef Q_OS_LINUX
+            QCOMPARE(systemThreads(), before + 1);
+#endif
+            for (int k = 0; k < 16; ++k) {
+                const uint16_t alias = bridges[size_t(k)]->peer("127.0.0.1", viewers[size_t(k)]->localPort());
+                QVERIFY(alias != 0);
+                QByteArray got;
+                for (int i = 0; i < 50 && got.isEmpty(); ++i) {
+                    ends[size_t(k)]->writeDatagram("picture " + QByteArray::number(k), QHostAddress::LocalHost, alias);
+                    if (viewers[size_t(k)]->waitForReadyRead(100)) {
+                        got.resize(int(viewers[size_t(k)]->pendingDatagramSize()));
+                        viewers[size_t(k)]->readDatagram(got.data(), got.size());
+                    }
+                }
+                QCOMPARE(got, "picture " + QByteArray::number(k));
+            }
+            bridges.resize(1);
+            QCOMPARE(RelayBridge::threads(), 1);
+            bridges.clear();
+            QCOMPARE(RelayBridge::threads(), 0);
+            QCOMPARE(relay.released.load(), 16);
+#ifdef Q_OS_LINUX
+            QTRY_COMPARE_WITH_TIMEOUT(systemThreads(), before, 5000);
+#endif
+        }
+        {
+            // A relay whose addresses are all IPv6, which takes an Allocate that names no family as one for IPv4
+            // (RFC 8656): asked for IPv4 first, it refuses (440), and is asked for IPv6.
+            FakeRelay::Config config;
+            config.udp = true;
+            config.pretendV6 = true;
+            config.strictFamily = true;
+            config.user = "reviewer";
+            config.password = "relay-password-16";
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            RelayBridge bridge("127.0.0.1", uint16_t(relay.port()), {"reviewer", "relay-password-16"});
+            QCOMPARE(allocate(bridge, 4), std::string());
+            QCOMPARE(relay.familiesRefused.load(), 1);
+            QCOMPARE(bridge.relayedAddress(), std::string("2001:db8::7e1a"));
+            QCOMPARE(bridge.peer("127.0.0.1", 5000), uint16_t(0));
+            QVERIFY(bridge.peer("2001:db8::1", 5000) != 0);
+        }
+        {
+            // A login made from a secret, whose time is up four seconds on, and a relay that gives addresses for
+            // twenty seconds: the bridge asks to keep its address half way through, the relay refuses the login
+            // (401), which the bridge says, and when the twenty seconds are up the address has run out and the
+            // bridge has ended, saying the relay refused to keep it.
+            const std::string secret = "a secret of the test's";
+            FakeRelay::Config config;
+            config.tls = true;
+            config.secret = secret;
+            config.lifetime = 20;
+            QVERIFY2(makeReviewCertificate({"127.0.0.1"}, config.certificatePem, config.keyPem, &why), why.c_str());
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            QVERIFY(parseRelayAddress(relay.url(), at));
+            at.pin = QSslCertificate(QByteArray::fromStdString(config.certificatePem), QSsl::Pem).digest(QCryptographicHash::Sha256).toHex().toStdString();
+            RelayBridge bridge(at, turnRestLogin(secret, QDateTime::currentSecsSinceEpoch() + 4));
+            QElapsedTimer clock;
+            clock.start();
+            QCOMPARE(allocate(bridge, 4), std::string());
+            QCOMPARE(relay.loginsExpired.load(), 0);
+            while (clock.elapsed() < 16000 && bridge.lastError().empty()) QThread::msleep(100);
+            QVERIFY2(clock.elapsed() >= 9000 && clock.elapsed() < 14000, std::to_string(clock.elapsed()).c_str());
+            QVERIFY2(QString::fromStdString(bridge.lastError()).contains("did not take Montage's login (401)"), bridge.lastError().c_str());
+            QVERIFY(relay.loginsExpired.load() >= 1);
+            QCOMPARE(relay.refreshes.load(), 0);
+            QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over TLS"));
+            while (clock.elapsed() < 26000 && bridge.state() != "Ended") QThread::msleep(100);
+            QVERIFY2(clock.elapsed() >= 19000 && clock.elapsed() < 24000, std::to_string(clock.elapsed()).c_str());
+            const QString ended = QString::fromStdString(bridge.lastError());
+            QVERIFY2(ended.contains("ran out") && ended.contains("the relay refused to keep it"), qPrintable(ended));
+        }
+    }
+
+    // A relay that goes quiet, refuses and takes again, forgets an address, and answers well formed, rightly signed
+    // nonsense.
+    void reviewRelayQuietRecoveredLapsedAndMangled() {
+        using namespace montage::output;
+        using montage::reviewtest::FakeRelay;
+        struct Said {
+            std::mutex m;
+            std::condition_variable cv;
+            bool done = false;
+            std::string error;
+        };
+        auto ask = [](RelayBridge& b) {
+            auto said = std::make_shared<Said>();
+            b.allocate(4, [said](const std::string& error) {
+                std::lock_guard lock(said->m);
+                said->done = true;
+                said->error = error;
+                said->cv.notify_all();
+            });
+            return said;
+        };
+        auto answer = [](const std::shared_ptr<Said>& said, int seconds) {
+            std::unique_lock lock(said->m);
+            return said->cv.wait_for(lock, std::chrono::seconds(seconds), [&] { return said->done; }) ? said->error : std::string("nothing said");
+        };
+        std::string why;
+        FakeRelay::Config config;
+        config.udp = true;
+        config.tcp = true;
+        config.user = "reviewer";
+        config.password = "relay-password-23";
+        config.lifetime = 20;
+        const TurnLogin login{"reviewer", "relay-password-23"};
+        QElapsedTimer clock;
+        {
+            // Sixty-four viewers through a relay that then goes quiet: let go together, their addresses are all
+            // given back at once and the relay's silence is waited out once, not once for each of them.
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            RelayAddress overTcp;
+            QVERIFY(parseRelayAddress("turn:127.0.0.1:" + std::to_string(relay.port()) + "?transport=tcp", overTcp));
+            std::vector<std::unique_ptr<RelayBridge>> bridges;
+            std::vector<std::shared_ptr<Said>> said;
+            for (int k = 0; k < 64; ++k) {
+                bridges.push_back(k % 2 ? std::make_unique<RelayBridge>(overTcp, login) : std::make_unique<RelayBridge>("127.0.0.1", uint16_t(relay.port()), login));
+                said.push_back(ask(*bridges.back()));
+            }
+            for (const auto& one : said) QCOMPARE(answer(one, 15), std::string());
+            QCOMPARE(relay.allocations.load(), 64);
+            relay.silent = true;
+            clock.start();
+            for (const auto& b : bridges) b->letGo();
+            bridges.clear();
+            const qint64 took = clock.elapsed();
+            QVERIFY2(took < 1500, qPrintable(QString("letting 64 bridges go took %1 ms").arg(took)));
+            QCOMPARE(RelayBridge::threads(), 0);
+            qInfo("64 bridges let go of a silent relay in %lld ms", (long long)took);
+            // (and a relay that answers is told of every one)
+            relay.silent = false;
+            said.clear();
+            for (int k = 0; k < 8; ++k) {
+                bridges.push_back(std::make_unique<RelayBridge>("127.0.0.1", uint16_t(relay.port()), login));
+                said.push_back(ask(*bridges.back()));
+            }
+            for (const auto& one : said) QCOMPARE(answer(one, 15), std::string());
+            const int releasedBefore = relay.released.load();
+            for (const auto& b : bridges) b->letGo();
+            bridges.clear();
+            QCOMPARE(relay.released.load(), releasedBefore + 8);
+        }
+        {
+            // A relay that refuses to keep an address once and then takes the asking again: the bridge says the
+            // refusal while it stands and no longer once the address is kept. Then the relay forgets the address
+            // (as one restarted does): the next asking is answered 437, and the bridge has ended and says so; it
+            // asks for no other address, which the viewer would not know.
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            RelayBridge bridge("127.0.0.1", uint16_t(relay.port()), login);
+            clock.start();
+            QCOMPARE(answer(ask(bridge), 15), std::string());
+            relay.refuseRefresh = true;
+            while (clock.elapsed() < 16000 && bridge.lastError().empty()) QThread::msleep(50);
+            QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (508"), bridge.lastError().c_str());
+            QVERIFY(!bridge.ended());
+            relay.refuseRefresh = false;
+            while (clock.elapsed() < 24000 && !bridge.lastError().empty()) QThread::msleep(50);
+            QVERIFY2(bridge.lastError().empty(), bridge.lastError().c_str());
+            QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over UDP"));
+            // Nightly 23 November: a viewer the relay refuses to let in (403) is the bridge's error while the refusal
+            // stands; the bridge asks again a few seconds on, and once the relay lets the viewer in the error is gone
+            // and the viewer has its pictures.
+            {
+                relay.refusePermission = true;
+                QUdpSocket viewer, end;
+                for (auto* s : {&viewer, &end}) {
+                    s->setProxy(QNetworkProxy::NoProxy);
+                    QVERIFY(s->bind(QHostAddress::LocalHost, 0));
+                }
+                const uint16_t alias = bridge.peer("127.0.0.1", viewer.localPort());
+                QVERIFY(alias != 0);
+                QElapsedTimer refused;
+                refused.start();
+                while (refused.elapsed() < 8000 && bridge.lastError().empty()) QThread::msleep(50);
+                QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (403"), bridge.lastError().c_str());
+                relay.refusePermission = false;
+                refused.restart();
+                while (refused.elapsed() < 12000 && !bridge.lastError().empty()) QThread::msleep(50);
+                QVERIFY2(bridge.lastError().empty(), bridge.lastError().c_str());
+                QVERIFY2(refused.elapsed() < 7000, std::to_string(refused.elapsed()).c_str());
+                QByteArray heard;
+                for (int i = 0; i < 50 && heard.isEmpty(); ++i) {
+                    end.writeDatagram("let in at last", QHostAddress::LocalHost, alias);
+                    if (viewer.waitForReadyRead(100)) {
+                        heard.resize(int(viewer.pendingDatagramSize()));
+                        viewer.readDatagram(heard.data(), heard.size());
+                    }
+                }
+                QCOMPARE(heard, QByteArray("let in at last"));
+            }
+            const qint64 recovered = clock.elapsed();
+            relay.forget = true;
+            while (clock.elapsed() < recovered + 16000 && !bridge.ended()) QThread::msleep(50);
+            QVERIFY(bridge.ended());
+            QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (437"), bridge.lastError().c_str());
+            QCOMPARE(relay.allocations.load(), 1);
+        }
+        {
+            // Answers that are well formed and signed with the login's key, and say something else each time: an
+            // attribute's value changed, cut or longer, an attribute missing, twice or under another's name, over
+            // UDP and over TCP; and what peers send changed the same way. These pass the checks that unsigned
+            // nonsense fails. Every asking is told its end, the bridges that got an address carry or drop what
+            // comes, and afterwards a relay that answers straight is used as before.
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            RelayAddress overTcp;
+            QVERIFY(parseRelayAddress("turn:127.0.0.1:" + std::to_string(relay.port()) + "?transport=tcp", overTcp));
+            int got = 0, told = 0, unanswered = 0;
+            quint64 passedOn = 0;
+            for (int round = 0; round < 3; ++round) {
+                relay.mangle = quint32(23112026 + 1000 * round);
+                std::vector<std::unique_ptr<RelayBridge>> bridges;
+                std::vector<std::shared_ptr<Said>> said;
+                std::vector<std::unique_ptr<QUdpSocket>> viewers, ends;
+                std::vector<uint16_t> aliases;
+                for (int k = 0; k < 48; ++k) {
+                    bridges.push_back(k % 2 ? std::make_unique<RelayBridge>(overTcp, login) : std::make_unique<RelayBridge>("127.0.0.1", uint16_t(relay.port()), login));
+                    said.push_back(ask(*bridges.back()));
+                    for (auto* list : {&viewers, &ends}) {
+                        list->push_back(std::make_unique<QUdpSocket>());
+                        list->back()->setProxy(QNetworkProxy::NoProxy);
+                        QVERIFY(list->back()->bind(QHostAddress::LocalHost, 0));
+                    }
+                }
+                for (size_t k = 0; k < bridges.size(); ++k) {
+                    const std::string error = answer(said[k], 20);
+                    QVERIFY2(error != "nothing said", qPrintable(QString("bridge %1 of round %2 was told nothing").arg(k).arg(round)));
+                    got += error.empty();
+                    told += !error.empty() && !QString::fromStdString(error).contains("did not answer");
+                    unanswered += QString::fromStdString(error).contains("did not answer");
+                    aliases.push_back(error.empty() ? bridges[k]->peer("127.0.0.1", viewers[k]->localPort()) : uint16_t(0));
+                    if (aliases.back()) bridges[k]->setLocal(ends[k]->localPort(), "an ICE password of the test");
+                }
+                // (both ways through each that has an address, for a second: the relay's answers to the permissions
+                // and channels asked for meanwhile are changed too, and the viewers' packets as they are passed on)
+                QElapsedTimer run;
+                run.start();
+                while (run.elapsed() < 1000) {
+                    for (size_t k = 0; k < bridges.size(); ++k) {
+                        if (!aliases[k]) continue;
+                        ends[k]->writeDatagram(QByteArray(200, 'p'), QHostAddress::LocalHost, aliases[k]);
+                        const std::string at = bridges[k]->relayedAddress();
+                        if (QHostAddress(QString::fromStdString(at)).protocol() == QAbstractSocket::IPv4Protocol && bridges[k]->relayedPort())
+                            viewers[k]->writeDatagram(QByteArray(120, 'v'), QHostAddress(QString::fromStdString(at)), bridges[k]->relayedPort());
+                        while (ends[k]->hasPendingDatagrams()) ends[k]->receiveDatagram();
+                        while (viewers[k]->hasPendingDatagrams()) viewers[k]->receiveDatagram();
+                    }
+                    QThread::msleep(20);
+                }
+                for (const auto& b : bridges) passedOn += b->fromRelay();
+                for (const auto& b : bridges) b->letGo();
+                bridges.clear();
+                QCOMPARE(RelayBridge::threads(), 0);
+            }
+            qInfo("144 bridges against changed, signed answers: %d got an address, %d were told a refusal, %d no usable answer; %llu packets from viewers passed on",
+                  got, told, unanswered, (unsigned long long)passedOn);
+            // (most changes leave an address that can be used, about one asking in ten is refused or goes unanswered:
+            // both kinds of ending are reached, and every asking had one)
+            QCOMPARE(got + told + unanswered, 144);
+            QVERIFY2(got >= 20 && got < 144, qPrintable(QString::number(got)));
+            QVERIFY2(told + unanswered >= 5, qPrintable(QString("%1 + %2").arg(told).arg(unanswered)));
+            QVERIFY(passedOn > 0);
+            relay.mangle = 0;
+            RelayBridge bridge("127.0.0.1", uint16_t(relay.port()), login);
+            QCOMPARE(answer(ask(bridge), 15), std::string());
+            QUdpSocket viewer, end;
+            for (auto* s : {&viewer, &end}) {
+                s->setProxy(QNetworkProxy::NoProxy);
+                QVERIFY(s->bind(QHostAddress::LocalHost, 0));
+            }
+            const uint16_t alias = bridge.peer("127.0.0.1", viewer.localPort());
+            QVERIFY(alias != 0);
+            QByteArray heard;
+            for (int i = 0; i < 50 && heard.isEmpty(); ++i) {
+                end.writeDatagram("a picture after it all", QHostAddress::LocalHost, alias);
+                if (viewer.waitForReadyRead(100)) {
+                    heard.resize(int(viewer.pendingDatagramSize()));
+                    viewer.readDatagram(heard.data(), heard.size());
+                }
+            }
+            QCOMPARE(heard, QByteArray("a picture after it all"));
+        }
+    }
+
+    // Phase 16: a review only through a relay that is reached over TCP, over TLS, or on ::1 alone, played in Chrome
+    // (and Firefox where there is one and the relay's certificate does not stand in its way). The "fake" rows use the
+    // test's own relay, which counts what it carries: every picture Montage sends goes to it over that transport,
+    // as Send indications in the one connection. The "coturn" rows run coturn listening that one way only (Linux,
+    // MONTAGE_TEST_TURNSERVER).
+    void browserReviewRelayTransports_data() {
+        QTest::addColumn<bool>("coturn");
+        QTest::addColumn<QString>("transport");
+        QTest::addColumn<bool>("ipv6");
+        QTest::newRow("fake udp") << false << "udp" << false;
+        QTest::newRow("fake tcp") << false << "tcp" << false;
+        QTest::newRow("fake tls") << false << "tls" << false;
+        QTest::newRow("fake ::1") << false << "udp" << true;
+        QTest::newRow("fake tls on ::1") << false << "tls" << true;
+        QTest::newRow("coturn tcp") << true << "tcp" << false;
+        QTest::newRow("coturn tls") << true << "tls" << false;
+        QTest::newRow("coturn ::1") << true << "udp" << true;
+    }
+    void browserReviewRelayTransports() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        QFETCH(bool, coturn);
+        QFETCH(QString, transport);
+        QFETCH(bool, ipv6);
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        if (ipv6 && !FakeRelay::hasIpv6()) QSKIP("This computer has no IPv6 loopback address");
+        const std::string secret = "a shared secret made up for this test";
+        const QString host = ipv6 ? QStringLiteral("::1") : QStringLiteral("127.0.0.1");
+        const QHostAddress loopback(ipv6 ? QHostAddress::LocalHostIPv6 : QHostAddress::LocalHost);
+        QTemporaryDir dir;
+        // A certificate for the relay made here and thrown away: by OpenSSL's tool where there is one (an RSA key,
+        // which every coturn reads), else by Montage.
+        std::string certificatePem, keyPem;
+        if (transport == "tls") {
+            const QString openssl = QStandardPaths::findExecutable(QStringLiteral("openssl"));
+            QProcess make;
+            if (!openssl.isEmpty()) {
+                make.start(openssl, {"req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", dir.path() + "/relay-key.pem", "-out", dir.path() + "/relay-cert.pem",
+                                     "-days", "2", "-subj", "/CN=montage-test-relay", "-addext", "subjectAltName=IP:127.0.0.1,IP:::1,DNS:localhost"});
+                make.waitForFinished(60000);
+            }
+            QFile cert(dir.path() + "/relay-cert.pem"), key(dir.path() + "/relay-key.pem");
+            if (cert.open(QIODevice::ReadOnly) && key.open(QIODevice::ReadOnly)) {
+                certificatePem = cert.readAll().toStdString();
+                keyPem = key.readAll().toStdString();
+            } else {
+                QVERIFY2(makeReviewCertificate({"127.0.0.1", "::1", "localhost"}, certificatePem, keyPem, &why), why.c_str());
+                QVERIFY(cert.open(QIODevice::WriteOnly) && key.open(QIODevice::WriteOnly));
+                cert.write(QByteArray::fromStdString(certificatePem));
+                key.write(QByteArray::fromStdString(keyPem));
+            }
+            cert.close();
+            key.close();
+            QVERIFY(!QSslCertificate(QByteArray::fromStdString(certificatePem), QSsl::Pem).isNull());
+        }
+        QProcess server;
+        auto endServer = qScopeGuard([&] {
+            if (server.state() == QProcess::NotRunning) return;
+            server.terminate();
+            if (!server.waitForFinished(5000)) server.kill();
+            server.waitForFinished(3000);
+        });
+        auto serverLog = [&] {
+            QFile f(dir.path() + "/turnserver.log");
+            return f.open(QIODevice::ReadOnly) ? f.readAll().right(3000) : QByteArray();
+        };
+        std::unique_ptr<FakeRelay> fake;
+        int turnPort = 0;
+        if (coturn) {
+#ifndef Q_OS_LINUX
+            QSKIP("coturn is run for this test on Linux only");
+#else
+            QString exe = QString::fromLocal8Bit(qgetenv("MONTAGE_TEST_TURNSERVER"));
+            if (exe.isEmpty()) exe = QStandardPaths::findExecutable(QStringLiteral("turnserver"));
+            if (exe.isEmpty()) QSKIP("Needs coturn's turnserver (MONTAGE_TEST_TURNSERVER, or turnserver on the PATH)");
+            for (int tries = 0; tries < 20 && !turnPort; ++tries) {
+                QUdpSocket udp;
+                QTcpServer tcp;
+                if (udp.bind(loopback, 0) && tcp.listen(loopback, udp.localPort())) turnPort = udp.localPort();
+            }
+            QVERIFY(turnPort != 0);
+            // It listens the one way: over TCP alone, over TLS alone (on the port given, with the certificate), or
+            // on ::1 alone (over UDP and TCP, giving addresses there, of the family its clients reach it by).
+            QStringList args{"-n", "--log-file=stdout", "--no-cli", "--no-dtls", "--listening-ip=" + host, "--relay-ip=" + host, "--min-port=49160", "--max-port=49260",
+                             "--allow-loopback-peers", "--use-auth-secret", "--static-auth-secret=" + QString::fromStdString(secret), "--realm=montage-test",
+                             "--pidfile=" + dir.path() + "/turnserver.pid", "--userdb=" + dir.path() + "/turndb"};
+            if (transport == "tcp") args << "--no-udp" << "--no-tls" << "--listening-port=" + QString::number(turnPort);
+            if (transport == "tls")
+                args << "--no-udp" << "--no-tcp" << "--tls-listening-port=" + QString::number(turnPort) << "--cert=" + dir.path() + "/relay-cert.pem"
+                     << "--pkey=" + dir.path() + "/relay-key.pem";
+            if (transport == "udp") args << "--no-tls" << "--listening-port=" + QString::number(turnPort) << "--keep-address-family";
+            server.setProcessChannelMode(QProcess::MergedChannels);
+            server.setStandardOutputFile(dir.path() + "/turnserver.log");
+            server.start(exe, args);
+            QVERIFY2(server.waitForStarted(15000), qPrintable(server.errorString()));
+            // It is up once it takes a connection (or, over UDP, answers a STUN binding request).
+            bool up = false;
+            QElapsedTimer waited;
+            waited.start();
+            while (!up && waited.elapsed() < 30000 && server.state() != QProcess::NotRunning) {
+                if (transport == "udp") {
+                    QUdpSocket ask;
+                    ask.setProxy(QNetworkProxy::NoProxy);
+                    QVERIFY(ask.bind(loopback, 0));
+                    ask.writeDatagram(QByteArray::fromHex("000100002112a442") + QByteArray(12, 'q'), loopback, quint16(turnPort));
+                    if (ask.waitForReadyRead(300)) {
+                        QByteArray d(int(ask.pendingDatagramSize()), 0);
+                        ask.readDatagram(d.data(), d.size());
+                        up = d.startsWith(QByteArray::fromHex("0101"));
+                    }
+                } else {
+                    QTcpSocket ask;
+                    ask.setProxy(QNetworkProxy::NoProxy);
+                    ask.connectToHost(loopback, quint16(turnPort));
+                    up = ask.waitForConnected(300);
+                    if (!up) QThread::msleep(200);
+                }
+            }
+            QVERIFY2(up, serverLog().constData());
+#endif
+        } else {
+            FakeRelay::Config config;
+            config.v6 = ipv6;
+            config.udp = transport == "udp";
+            config.tcp = transport == "tcp";
+            config.tls = transport == "tls";
+            config.secret = secret;
+            config.certificatePem = certificatePem;
+            config.keyPem = keyPem;
+            fake = std::make_unique<FakeRelay>(config);
+            QVERIFY2(fake->start(&why), why.c_str());
+            turnPort = fake->port();
+        }
+        const bool firefox = transport != "tls" && !GeckoBrowser::firefox().empty() && !GeckoBrowser::geckodriver().empty();
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why, {"--allow-loopback-in-peer-connection"}), why.c_str());
+        GeckoBrowser fx;
+        if (firefox) QVERIFY2(fx.start(&why), why.c_str());
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.settings.turnServer = ((transport == "tls" ? "turns:" : "turn:") + (ipv6 ? "[::1]" : host) + ":" + QString::number(turnPort) + (transport == "tcp" ? "?transport=tcp" : ""))
+                                      .toStdString();
+        rig.settings.turnSecret = secret;
+        rig.settings.turnExpirySeconds = 600;
+        rig.settings.relayOnly = true;
+        if (transport == "tls")
+            rig.settings.turnPin = QSslCertificate(QByteArray::fromStdString(certificatePem), QSsl::Pem).digest(QCryptographicHash::Sha256).toHex(':').toStdString();
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        rig.picture = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        // (what went wrong, for a failure's message: the page's stage, the review's last error, each bridge's state,
+        // and what the relay says or counted)
+        auto said = [&] {
+            const ReviewStats now = rig.review->stats();
+            QString text = tab.js("__montage.stage").toString() + " " + QString::fromStdString(now.error) + " (Chrome: " +
+                           tab.js("__montage.pc ? __montage.pc.iceConnectionState + ' ' + __montage.pc.connectionState : 'no connection'").toString() + ")";
+            for (const auto& b : now.bridges) text += QStringLiteral(" [%1: %2 %3]").arg(QString::fromStdString(b.viewer), QString::fromStdString(b.state), QString::fromStdString(b.lastRefusal));
+            if (fake)
+                text += QStringLiteral(" relay: %1 connections, %2 addresses, %3 logins refused, %4 permissions, %5 Send indications, %6 channel data, %7 to peers, %8 from peers")
+                            .arg(fake->connections.load())
+                            .arg(fake->allocations.load())
+                            .arg(fake->loginsRefused.load())
+                            .arg(fake->permissions.load())
+                            .arg(fake->sendIndications.load())
+                            .arg(fake->channelData.load())
+                            .arg(fake->toPeers.load())
+                            .arg(fake->fromPeers.load());
+            // (what the relay did, in order: too long for a failure's message, so told beside it)
+            if (fake)
+                for (const QByteArray& part : fake->told().split(';')) qInfo().noquote() << "relay:" << part.trimmed();
+            return (text + " " + QString::fromUtf8(serverLog())).toUtf8();
+        };
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        const QString joined = tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString();
+        QVERIFY2(joined == QStringLiteral("joined"), (joined.toUtf8() + " " + said()).constData());
+        QVERIFY2(tab.until("__montage.stage === 'connected' && __montage.presented > 10", 30), said().constData());
+        QCOMPARE(tab.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
+        const QString pair = tab.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
+                                    "return p ? r.get(p.localCandidateId).candidateType + ' ' + r.get(p.remoteCandidateId).candidateType + ' ' + r.get(p.localCandidateId).relayProtocol : ''; })")
+                                 .toString();
+        QCOMPARE(pair, QStringLiteral("relay relay %1").arg(transport));
+        // Montage's way through the relay, as the panel is told it: one bridge, carrying over that transport, with
+        // nothing refused, on the one thread.
+        ReviewStats st = rig.review->stats();
+        QCOMPARE(st.bridges.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(st.bridges[0].state), QStringLiteral("Carrying over %1").arg(transport.toUpper()));
+        QCOMPARE(st.bridges[0].lastRefusal, std::string());
+        QCOMPARE(st.bridges[0].answersRefused, uint64_t(0));
+        QCOMPARE(st.bridgeThreads, 1);
+        if (firefox) {
+            auto until = [&](const QString& expression, int seconds) {
+                QElapsedTimer t;
+                t.start();
+                while (t.elapsed() < seconds * 1000) {
+                    if (fx.js(expression).toBool()) return true;
+                    QThread::msleep(100);
+                }
+                return false;
+            };
+            QVERIFY2(fx.navigate(rig.page(), &why), why.c_str());
+            QVERIFY2(until("document.readyState === 'complete' && !!window.__montage", 20), fx.log().right(2000).constData());
+            QCOMPARE(fx.js("__montage.join('Bo', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+            QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30),
+                     (fx.js("__montage.stage").toString() + " " + fx.js("__montage.pc.iceConnectionState").toString() + " " + QString::fromUtf8(said())).toUtf8().constData());
+            st = rig.review->stats();
+            QCOMPARE(st.bridges.size(), size_t(2));
+            QCOMPARE(st.bridgeThreads, 1);
+        } else {
+            qInfo("Chrome alone through the relay over %s%s", qPrintable(transport), transport == "tls" ? " (Firefox does not take a relay's certificate no root signed)" : "");
+        }
+        if (fake) {
+            // What the test's relay carried while Chrome played two seconds more: Montage's pictures came to it as
+            // Send indications (Chrome uses channels), over the stream when the transport is one and over UDP when
+            // it is not, and as many as the bridge says it sent.
+            const quint64 before = fake->sendIndications;
+            const quint64 presented = quint64(tab.js("__montage.presented").toDouble());
+            QThread::msleep(2000);
+            QVERIFY(quint64(tab.js("__montage.presented").toDouble()) > presented + 20);
+            const quint64 carried = fake->sendIndications - before;
+            QVERIFY2(carried > 40, std::to_string(carried).c_str());
+            st = rig.review->stats();
+            quint64 sent = 0;
+            for (const auto& b : st.bridges) sent += b.toRelay;
+            // (Chrome's own Send indications, before its channels are bound, are counted by the relay too)
+            QVERIFY2(fake->sendIndications <= sent + 64 && fake->sendIndications + 64 >= sent, (std::to_string(fake->sendIndications) + " of " + std::to_string(sent)).c_str());
+            QCOMPARE(fake->bytesOverUdp.load() > 0, transport == "udp");
+            QCOMPARE(fake->bytesOverStream.load() > 0, transport != "udp");
+            QVERIFY(fake->channelData.load() > 0);
+            QCOMPARE(fake->loginsRefused.load(), 0);
         }
     }
 
