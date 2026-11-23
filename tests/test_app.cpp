@@ -2686,6 +2686,17 @@ private slots:
         auto* program = win_->findChild<PlaybackController*>("programPlayback");
         QVERIFY(program);
         if (!jack) audiodev::setLoopbackOptions({256, 512, 0});
+        // (playback stopped, the usual device back and the server gone however the test ends: a test after it that
+        // records by hand would otherwise record through the device)
+        auto putBack = qScopeGuard([&] {
+            program->pause();
+            setAudioDevice({{"host", "qt"}});
+            audiodev::setLoopbackOptions({});
+            if (jackd.state() != QProcess::NotRunning) {
+                jackd.kill();
+                jackd.waitForFinished(5000);
+            }
+        });
         QVERIFY2(openAudioDevice(host), audiodev::Engine::shared().status().error.c_str());
         {
             VoiceoverRecorder rec(state());
@@ -2819,6 +2830,16 @@ private slots:
         auto* program = win_->findChild<PlaybackController*>("programPlayback");
         QVERIFY(program);
         if (!jack) audiodev::setLoopbackOptions({256, 512, 0});
+        // (playback stopped, the usual device back and the server gone however the test ends)
+        auto putBack = qScopeGuard([&] {
+            if (auto* p = win_->findChild<PlaybackController*>("programPlayback")) p->pause();
+            setAudioDevice({{"host", "qt"}});
+            audiodev::setLoopbackOptions({});
+            if (jackd.state() != QProcess::NotRunning) {
+                jackd.terminate();
+                jackd.waitForFinished(5000);
+            }
+        });
         QVERIFY2(openAudioDevice(host), audiodev::Engine::shared().status().error.c_str());
         win_->findChild<QAction*>("showSampler")->trigger();
         auto* panel = win_->findChild<SamplerPanel*>();
