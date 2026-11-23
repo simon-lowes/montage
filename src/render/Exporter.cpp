@@ -494,9 +494,10 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
             a.settings.alpha = true;
             v.push_back(a);
         }
-        if (everyBuild || jpegXsAvailable()) {
+        if (everyBuild || (jpegXsAvailable() && broadcastMxfAvailable())) {
             // JPEG XS (SVT-JPEG-XS, media/JpegXs.h): a light intra codec at a constant number of bytes a picture, in MXF
-            // (ST 2124) with 24-bit sound; the rate is its bits a pixel.
+            // (ST 2124, written through bmx: not offered in a build without it) with 24-bit sound; the rate is its bits
+            // a pixel.
             ExportPreset x = preset("JPEG XS 4:2:2 10-bit (MXF)", "mxf", "Light intra-frame mezzanine at 5 bits a pixel, for live production and contribution",
                                     "jpegxs", "pcm_s24le", 0, "", "", "yuv422p10le");
             x.settings.jpegXsBpp = 5;

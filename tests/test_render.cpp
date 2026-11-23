@@ -20519,6 +20519,13 @@ colorspaces:
         QVERIFY(!decoder.decode(huge.data(), huge.size(), picture, &why));
         QVERIFY(picture.planes[0].empty());
         if (montage::jpegXsAvailable()) QVERIFY2(why.find("larger") != std::string::npos, why.c_str());
+        // JPEG XS files in MXF are written through bmx: its export presets and Capture's JPEG XS are offered only in a
+        // build with both.
+        const bool presets = std::any_of(exportPresets().begin(), exportPresets().end(), [](const ExportPreset& p) { return p.settings.videoCodec == "jpegxs"; });
+        const auto codecs = captureCodecs();
+        const bool recorded = std::any_of(codecs.begin(), codecs.end(), [](const auto& c) { return c.first == "jpeg_xs"; });
+        QCOMPARE(presets, montage::jpegXsAvailable() && broadcastMxfAvailable());
+        QCOMPARE(recorded, montage::jpegXsAvailable() && broadcastMxfAvailable());
     }
 
     // ST 2110-22's JPEG XS (RFC 9134), in both packetization modes: packets as the RFC lays them out (a constant number

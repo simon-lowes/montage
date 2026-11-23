@@ -698,7 +698,8 @@ AVRational standardRate(AVRational r, bool* standard) {
 std::vector<std::pair<std::string, std::string>> captureCodecs() {
     std::vector<std::pair<std::string, std::string>> out;
     for (const Codec& c : kCodecs)
-        if (avcodec_find_encoder_by_name(c.encoder) && (!isJpegXs(c.id) || jpegXsAvailable())) out.push_back({c.id, c.name});
+        // (JPEG XS is recorded in MXF, written through bmx)
+        if (avcodec_find_encoder_by_name(c.encoder) && (!isJpegXs(c.id) || (jpegXsAvailable() && broadcastMxfAvailable()))) out.push_back({c.id, c.name});
     return out;
 }
 
