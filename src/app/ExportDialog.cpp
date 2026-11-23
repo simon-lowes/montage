@@ -353,6 +353,13 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     segmentedFields_->setToolTip(tr("Each frame's two halves as its fields, as progressive pictures are carried in 1080i, instead of each field rendered at its own moment"));
     segmentedFields_->setChecked(appSettings().value("export/segmentedFields", false).toBool());
     form->addRow(QString(), segmentedFields_);
+    proResBits_ = new QComboBox(form_);
+    proResBits_->setObjectName(QStringLiteral("exportProResBits"));
+    proResBits_->addItem(tr("12 bits a sample"), 12);
+    proResBits_->addItem(tr("10 bits a sample"), 10);
+    proResBits_->setCurrentIndex(std::max(0, proResBits_->findData(appSettings().value("export/proResBits", 12).toInt())));
+    proResBits_->setToolTip(tr("ProRes 4444 and 4444 XQ hold 12 bits a sample; choose 10 for tools that read no more"));
+    form->addRow(tr("ProRes depth:"), proResBits_);
     connect(interlaced_, &QCheckBox::toggled, this, [this] { updateControls(); });
     {
         auto* row = new QWidget(form_);
@@ -1009,6 +1016,7 @@ void ExportDialog::updateControls() {
                             nd[0].toDouble() / nd[1].toDouble() < 40;
         interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks" || vc == "ffv1") && d != "as11-dpp" && !fields);
         if (segmentedFields_) segmentedFields_->setEnabled((interlaced_->isEnabled() && interlaced_->isChecked()) || (video && d == "as11-dpp"));
+        if (proResBits_) proResBits_->setEnabled(video && p && vc == "prores_ks" && p->settings.profile.rfind("4444", 0) == 0);
     }
     if (credentials_) {
         ExportSettings would = p ? p->settings : ExportSettings{};
@@ -1272,6 +1280,12 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/interlaced", interlaced_->isChecked());
     s.segmentedFields = segmentedFields_->isEnabled() && segmentedFields_->isChecked();
     settings.setValue("export/segmentedFields", segmentedFields_->isChecked());
+    if (proResBits_->isEnabled()) {
+        // (4:4:4 Y'CbCr at the depth chosen, with alpha where the preset keeps it: 12 bits is Montage's own encoder)
+        const int bits = proResBits_->currentData().toInt();
+        s.pixFmt = std::string(s.alpha ? "yuva444p" : "yuv444p") + (bits == 10 ? "10le" : "12le");
+        settings.setValue("export/proResBits", bits);
+    }
     if (const QStringList r = rate_->currentData().toString().split(QLatin1Char('|')); rate_->isEnabled() && r.size() == 3) {
         s.rateChange = r[0].toStdString();
         const QStringList nd = r[1].split(QLatin1Char('/'));

@@ -17107,6 +17107,50 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void exportDialogProResDepthAndFields() {
+        // Phase 16: ProRes 4444's depth is chosen in the Export dialog, 12 bits (as its presets) or 10, and only for
+        // 4444; with interlaced fields, segmented fields can be chosen too. Both reach the export queued.
+        loadDemo();
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        const QVariant rememberedPreset = appSettings().value("export/preset"), rememberedBits = appSettings().value("export/proResBits"),
+                       rememberedInterlaced = appSettings().value("export/interlaced"), rememberedSegmented = appSettings().value("export/segmentedFields");
+        auto restore = qScopeGuard([&] {
+            for (const auto& [key, value] : {std::pair{"export/preset", rememberedPreset}, std::pair{"export/proResBits", rememberedBits},
+                                             std::pair{"export/interlaced", rememberedInterlaced}, std::pair{"export/segmentedFields", rememberedSegmented}})
+                value.isValid() ? appSettings().setValue(key, value) : appSettings().remove(key);
+        });
+        for (const int bits : {10, 12}) {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* depth = ed.findChild<QComboBox*>("exportProResBits");
+            auto* interlaced = ed.findChild<QCheckBox*>("exportInterlaced");
+            auto* segmented = ed.findChild<QCheckBox*>("exportSegmentedFields");
+            QVERIFY(preset && depth && interlaced && segmented);
+            preset->setCurrentIndex(preset->findText("ProRes 422 HQ"));
+            QVERIFY(preset->currentIndex() >= 0 && !depth->isEnabled());
+            preset->setCurrentIndex(preset->findText("ProRes 4444 (alpha)"));
+            QVERIFY(preset->currentIndex() >= 0 && depth->isEnabled());
+            depth->setCurrentIndex(depth->findData(bits));
+            interlaced->setChecked(bits == 10);
+            QCOMPARE(segmented->isEnabled(), bits == 10);
+            if (segmented->isEnabled()) segmented->setChecked(true);
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.filePath(QStringLiteral("depth-%1.mov").arg(bits)));
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(ed.result(), int(QDialog::Accepted));
+            QCOMPARE(queue->jobs().size(), jobs + 1);
+            const RenderQueue::Job& job = queue->jobs().back();
+            QCOMPARE(job.settings.pixFmt, std::string(bits == 10 ? "yuva444p10le" : "yuva444p12le"));
+            QCOMPARE(job.settings.interlaced, bits == 10);
+            QCOMPARE(job.settings.segmentedFields, bits == 10);
+            queue->remove(job.id);
+            // (remembered for the next export)
+            QCOMPARE(ExportDialog(state(), win_.get()).findChild<QComboBox*>("exportProResBits")->currentData().toInt(), bits);
+        }
+        state()->newProject();
+    }
+
     void renderQueueInTheBackground() {
         loadDemo();
         RenderQueue* queue = win_->renderQueue();

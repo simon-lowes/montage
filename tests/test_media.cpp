@@ -23410,6 +23410,49 @@ if ui["pressed"] == "add":
         QCOMPARE(copied, 0);
     }
 
+    void mcpRenderProResDepth() {
+        // Phase 16: montage_render's bits picks ProRes 4444's depth: 12 (its presets', Montage's own encoder, which
+        // names itself in each frame header) or 10 (FFmpeg's encoder); refused for 4:2:2 ProRes and for other values.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 128, s.height = 72, s.fps = Rational{25, 1};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 5));
+        const QString project = QString::fromStdString(path("depth.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // The first frame's encoder, as its frame header names it.
+        auto vendor = [](const std::string& file) {
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return std::string();
+            std::string out;
+            AVPacket* pkt = av_packet_alloc();
+            while (out.empty() && av_read_frame(fmt, pkt) >= 0) {
+                if (fmt->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && pkt->size > 16)
+                    out.assign(reinterpret_cast<const char*>(pkt->data) + 12, 4);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            return out;
+        };
+        for (const int bits : {12, 10}) {
+            const std::string out = path(("depth-" + std::to_string(bits) + ".mov").c_str());
+            const QJsonObject r = call({{"project", project}, {"output", QString::fromStdString(out)}, {"preset", "ProRes 4444 (alpha)"}, {"bits", bits}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const std::string v = vendor(out);
+            QVERIFY2(bits == 12 ? v == "mtge" : (!v.empty() && v != "mtge"), v.c_str());
+        }
+        QJsonObject r = call({{"project", project}, {"output", QString::fromStdString(path("depth-hq.mov"))}, {"preset", "ProRes 422 HQ"}, {"bits", 12}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("4444"));
+        r = call({{"project", project}, {"output", QString::fromStdString(path("depth-8.mov"))}, {"preset", "ProRes 4444 (alpha)"}, {"bits", 8}});
+        QVERIFY(r.value("isError").toBool());
+    }
+
     void longGopSmartRendering() {
         // Video packets in decode order: their bytes and the frame each shows.
         struct Coded {

@@ -13560,6 +13560,7 @@ void McpServer::Impl::addTools() {
             "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
             "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first, as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes; each field rendered at its own moment"},
             "segmented_fields":{"type":"boolean","default":false,"description":"With interlaced: both fields the halves of one picture (PsF), as a progressive programme delivered interlaced"},
+            "bits":{"type":"integer","enum":[10,12],"description":"ProRes 4444 and 4444 XQ: 12 bits a sample (the presets' depth) or 10"},
             "rate_change":{"type":"string","enum":["none","pulldown","speed","convert"],"default":"none","description":"Deliver at another frame rate: pulldown (a 23.976 or 24 sequence with 2:3 or 2:2:2:4 pulldown, into fields at 29.97 or 30, coded interlaced: MPEG-2, AVC-Intra or H.264, ProRes, FFV1; or as repeated frames at 59.94 or 60); speed (each frame shown once at frame_rate, the programme faster or slower, as PAL's 25 from 24 is 4 % shorter, its sound sped with it, captions and markers with it); convert (a standards conversion to frame_rate, keeping its length: each new frame made from the two nearest by optical flow, or RIFE where installed, never blended across a cut)"},
             "frame_rate":{"type":["number","string"],"description":"With rate_change: the rate delivered (23.976, 24, 25, 29.97, 30, 50, 59.94, 60...); pulldown's default is 29.97 (30 from 24)"},
             "pulldown_cadence":{"type":"string","enum":["2:3","2:2:2:4"],"default":"2:3","description":"With pulldown: 2:3 (A A, B B, B C, C D, D D) or 2:2:2:4 (no frame of mixed fields)"},
@@ -13684,6 +13685,13 @@ void McpServer::Impl::addTools() {
                 throw ArgError{"\"two_pass\" is for H.264 and H.265 (software) with a \"bitrate\""};
             st.interlaced = a.value("interlaced").toBool(st.interlaced);
             st.segmentedFields = a.value("segmented_fields").toBool(st.segmentedFields);
+            if (a.contains("bits")) {
+                const int bits = a.value("bits").toInt();
+                if (bits != 10 && bits != 12) throw ArgError{"\"bits\" is 10 or 12"};
+                if (st.videoCodec != "prores_ks" || st.profile.rfind("4444", 0) != 0)
+                    throw ArgError{"\"bits\" is for ProRes 4444 and 4444 XQ (4:2:2 ProRes is 10 bits)"};
+                st.pixFmt = std::string(st.alpha ? "yuva444p" : "yuv444p") + (bits == 10 ? "10le" : "12le");
+            }
             if (a.contains("mxf_delivery")) {
                 const std::string d = str(a, "mxf_delivery").toStdString();
                 if (d != "op1a" && d != "rdd9" && d != "as11-dpp" && d != "as11-x2" && d != "as11-x8")

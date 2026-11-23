@@ -110,6 +110,7 @@ private:
     QSpinBox* teletextPage_ = nullptr;
     QCheckBox* interlaced_ = nullptr;
     QCheckBox* segmentedFields_ = nullptr;  // (interlaced: both fields the halves of one picture)
+    QComboBox* proResBits_ = nullptr;       // (ProRes 4444 and 4444 XQ: 12 or 10 bits a sample)
     QComboBox* rate_ = nullptr;      // the frame rate delivered (render/RateConversion.h)
     QCheckBox* ratePitch_ = nullptr;
     QString as11Text_;  // "Name=value" lines
