@@ -32,6 +32,7 @@
 // the protocol's experimental forerunner).
 #if !defined(MONTAGE_WAYLAND_COLOR) && QT_VERSION >= QT_VERSION_CHECK(6, 10, 2)
 #define MONTAGE_QT_WAYLAND_COLOR
+#include <dlfcn.h>
 #endif
 // Qt's word that it let a window's wl_surface go (made again when a window changes role, without a hide).
 #if defined(MONTAGE_WAYLAND_COLOR) && __has_include(<qpa/qplatformwindow_p.h>)
@@ -255,6 +256,25 @@ void releaseWindowContext(QRhi* rhi) {
 }
 #endif
 
+#if defined(MONTAGE_QT_WAYLAND_COLOR)
+// What Qt describes a new wl_surface with reaches the compositor before the surface's first frame. Qt asks for the
+// image description when it makes the wl_surface and sets it on the surface only once the compositor says it is ready,
+// so a first frame drawn sooner is committed without it and the description comes with a later commit. Weston (16.0.2)
+// then shows the surface wrongly for as long as it stays mapped: a description set after the surface was mapped drops
+// the surface's colour transformation, which Weston makes again only when it rebuilds its list of views, and the surface
+// is left out of every repaint ("shader config failure" in its log). A round trip on Qt's own queue (as Qt makes itself)
+// takes in the compositor's answer, and Qt sets the description, before the frame is drawn. (libwayland's function from
+// the process, where Qt's Wayland platform has loaded it: Montage does not link it when Qt describes the surface.)
+void takeInQtsDescription() {
+    QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
+    void* display = native ? native->nativeResourceForIntegration("wl_display") : nullptr;
+    if (!display) return;
+    using Roundtrip = int (*)(void*);
+    static const auto roundtrip = reinterpret_cast<Roundtrip>(dlsym(RTLD_DEFAULT, "wl_display_roundtrip"));
+    if (roundtrip) roundtrip(display);
+}
+#endif
+
 }  // namespace
 
 // The GPU side: the RHI, the swap chain and what is drawn with (the RHI is declared first so it goes last). On Linux
@@ -274,6 +294,7 @@ public:
     std::unique_ptr<QRhiShaderResourceBindings> srbPicture, srbOverlay, srbEncode;
     std::unique_ptr<QRhiGraphicsPipeline> psPicture, psOverlay, psEncode;
     bool hasSwapChain = false, vbufUploaded = false, notExposed = false, newlyExposed = false;
+    bool newSurface = true;  // (Qt's Wayland colour management: a wl_surface not drawn to yet, see takeInQtsDescription)
     QSize pictureSize{1, 1}, overlaySize{1, 1}, linearSize{1, 1};
     QRhiReadbackResult readSignal, readLight;  // (tests: HdrSurface::keepNextFrame)
 
@@ -859,12 +880,17 @@ bool HdrSurface::event(QEvent* e) {
         case QEvent::ParentWindowChange:
             // (put inside the viewer, or another window: on Wayland a new wl_surface, so a new EGL surface for it)
             if (encoded_ && gpu_) releaseWindowContext(gpu_->rhi.get());
+            if (gpu_) gpu_->newSurface = true;
             break;
 #endif
-#if defined(MONTAGE_WAYLAND_COLOR)
+#if defined(MONTAGE_WAYLAND_COLOR) || defined(MONTAGE_QT_WAYLAND_COLOR)
         case QEvent::Hide:
             // (Qt lets the wl_surface go with the window hidden: shown again, the new one is described afresh)
+#if defined(MONTAGE_WAYLAND_COLOR)
             if (wayland_) wayland_->detach();
+#else
+            if (gpu_) gpu_->newSurface = true;
+#endif
             break;
 #endif
         case QEvent::MouseButtonPress:
@@ -964,6 +990,13 @@ void HdrSurface::render() {
     // Linux: the surface described for this picture (applied with this frame's commit), and the linear target at the
     // swap chain's size.
     const bool encode = encoded_ && g.linearRt;
+#if defined(MONTAGE_QT_WAYLAND_COLOR)
+    if (encode && g.newSurface) {
+        g.newSurface = false;  // (first: the round trip may deliver events that draw)
+        takeInQtsDescription();
+        if (gpu_.get() != &g || !hdrActive_ || !g.hasSwapChain || g.notExposed) return;
+    }
+#endif
     if (encode) {
         describeSurface();
         if (!hdrActive_) return;
