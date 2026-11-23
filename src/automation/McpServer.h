@@ -40,6 +40,17 @@ struct McpCallPaths {
 McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& arguments, bool readOnly);
 // Whether two such paths are one file, or one lies inside the other (a file in a folder another call writes).
 bool mcpPathsOverlap(const QString& a, const QString& b);
+// How a file system tells names apart: exactly (Linux), with letter case and the composition of accented letters
+// ignored (macOS), or as Windows does, which also takes a component with a stream name after it ("x:$DATA") or with
+// dots or spaces after it as the same file. mcpNameRules: this computer's.
+enum class McpNameRules { Exact, Folded, Windows };
+McpNameRules mcpNameRules();
+// A name as those rules fold it, so that two spellings of one file are the same text.
+QString mcpFoldedName(const QString& name, McpNameRules rules);
+// Whether `path` is `own` or a file inside it (with `orHolding`, also a folder that holds it): by name, symbolic links
+// followed where the path exists and the names folded by `rules`, or by file identity where both exist (a hard link,
+// a folder mounted twice, a short or differently spelled name the file system takes as the same file).
+bool mcpPathReaches(const QString& path, const QString& own, McpNameRules rules, bool orHolding);
 // Why a call is refused for what only Montage writes, and only as the user asks (the roots the user trusts for
 // facility lists, the facility list, Montage's DCP certificates and the DKDMs); empty when it names none of them. A
 // path the call writes may not be one of them, inside one, or a folder that holds one; and no other text anywhere in

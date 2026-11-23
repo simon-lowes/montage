@@ -8,6 +8,7 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QHash>
 #include <QUuid>
 #include <QSaveFile>
 #include <QImage>
@@ -806,9 +807,13 @@ QString json(const QJsonObject& o) { return QString::fromUtf8(QJsonDocument(o).t
 
 // ---- Tools ------------------------------------------------------------------------------
 
-// A path as one name for the file it is: symbolic links followed as far as the path exists, and letter case folded
-// where the file system ignores it, so two spellings of one file are seen as one.
-static QString oneNameFor(const QString& path) {
+// A path as the file system takes it: symbolic links followed as far as it exists (`existing`, that part; `whole`,
+// all of it exists), the rest kept as written under it.
+struct ResolvedPath {
+    QString name, existing;
+    bool whole = false;
+};
+static ResolvedPath resolvedPath(const QString& path) {
     // (FFmpeg, which writes most outputs, takes "file:" and its other protocols' names before a path, nested as
     // "md5:file:/x": each is taken off, so they name the file they reach. One letter is a Windows drive.)
     QString bare = path;
@@ -824,14 +829,115 @@ static QString oneNameFor(const QString& path) {
         rest = rest.isEmpty() ? at.fileName() : at.fileName() + QLatin1Char('/') + rest;
         at = QFileInfo(parent);
     }
+    ResolvedPath r;
     QString base = at.exists() ? at.canonicalFilePath() : at.filePath();
     if (base.isEmpty()) base = at.filePath();
+    if (at.exists()) r.existing = base, r.whole = rest.isEmpty();
     if (!rest.isEmpty()) base = base.endsWith(QLatin1Char('/')) ? base + rest : base + QLatin1Char('/') + rest;
-#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
-    base = base.toLower();
-#endif
-    return base;
+    r.name = base;
+    return r;
 }
+
+McpNameRules mcpNameRules() {
+#if defined(Q_OS_WIN)
+    return McpNameRules::Windows;
+#elif defined(Q_OS_MACOS)
+    return McpNameRules::Folded;
+#else
+    return McpNameRules::Exact;
+#endif
+}
+
+QString mcpFoldedName(const QString& name, McpNameRules rules) {
+    if (rules == McpNameRules::Exact) return name;
+    // (letter case, and how an accented letter is composed: é as one character or as e and its accent)
+    QString out = name.normalized(QString::NormalizationForm_C).toCaseFolded();
+    if (rules == McpNameRules::Windows) {
+        // (either slash; a component's stream name, "x.pem:$DATA" or "x.pem::$DATA", is the file itself, and so is
+        // one with dots or spaces after it, which Windows drops; the drive's own colon stays)
+        out.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        QStringList parts = out.split(QLatin1Char('/'));
+        for (int i = 0; i < parts.size(); ++i) {
+            QString& c = parts[i];
+            const bool drive = i == 0 && c.size() == 2 && c.at(1) == QLatin1Char(':');
+            if (!drive)
+                if (const qsizetype colon = c.indexOf(QLatin1Char(':')); colon >= 0) c.truncate(colon);
+            if (c == QLatin1String(".") || c == QLatin1String("..")) continue;
+            while (!c.isEmpty() && (c.endsWith(QLatin1Char('.')) || c.endsWith(QLatin1Char(' ')))) c.chop(1);
+        }
+        out = parts.join(QLatin1Char('/'));
+    }
+    return out;
+}
+
+namespace {
+std::filesystem::path fsPath(const QString& s) {
+#if defined(Q_OS_WIN)
+    return std::filesystem::path(s.toStdWString());
+#else
+    return std::filesystem::path(QFile::encodeName(s).toStdString());
+#endif
+}
+bool oneFile(const QString& a, const QString& b) {
+    std::error_code ec;
+    return std::filesystem::equivalent(fsPath(a), fsPath(b), ec) && !ec;
+}
+bool inFolder(const QString& in, const QString& folder) {
+    return in.size() > folder.size() && in.startsWith(folder) && (folder.endsWith(QLatin1Char('/')) || in.at(folder.size()) == QLatin1Char('/'));
+}
+// Whether `file` is a file with other names (hard links), and one of them is in `folder` or below it (looked through
+// as far as 20,000 entries: Montage's own folders hold a few files).
+bool hardLinkedInto(const QString& file, const QString& folder) {
+    std::error_code ec;
+    const std::filesystem::path f = fsPath(file);
+    if (!std::filesystem::is_regular_file(f, ec) || std::filesystem::hard_link_count(f, ec) < 2 || ec) return false;
+    if (!std::filesystem::is_directory(fsPath(folder), ec)) return false;
+    int seen = 0;
+    for (auto it = std::filesystem::recursive_directory_iterator(fsPath(folder), std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator() && ++seen < 20000; it.increment(ec)) {
+        std::error_code e2;
+        if (it->is_regular_file(e2) && std::filesystem::equivalent(it->path(), f, e2) && !e2) return true;
+    }
+    return false;
+}
+// `existing` and the folders above it, as far as the root.
+QStringList withFoldersAbove(const QString& existing) {
+    QStringList out;
+    for (QFileInfo at(existing); !existing.isEmpty();) {
+        out << at.filePath();
+        const QString parent = at.path();
+        if (at.isRoot() || parent == at.filePath()) break;
+        at = QFileInfo(parent);
+    }
+    return out;
+}
+}  // namespace
+
+// (the names folded)
+static bool reachedByName(const QString& pn, const QString& on, bool orHolding) {
+    return pn == on || inFolder(pn, on) || (orHolding && inFolder(on, pn));
+}
+// By identity where both exist, whatever the names (a hard link, a folder mounted twice, a short name, a spelling the
+// file system takes as the same): the path's part that exists is the file or inside it, or, asked, holds it.
+static bool reachedByIdentity(const ResolvedPath& p, const ResolvedPath& o, bool orHolding) {
+    if (!p.existing.isEmpty() && o.whole)
+        for (const QString& f : withFoldersAbove(p.existing))
+            if (oneFile(f, o.existing)) return true;
+    if (orHolding && p.whole && !o.existing.isEmpty())
+        for (const QString& f : withFoldersAbove(o.existing))
+            if (oneFile(f, p.existing)) return true;
+    // (a file of one of Montage's folders, under a name of its own elsewhere)
+    return p.whole && o.whole && hardLinkedInto(p.existing, o.existing);
+}
+
+bool mcpPathReaches(const QString& path, const QString& own, McpNameRules rules, bool orHolding) {
+    const ResolvedPath p = resolvedPath(path), o = resolvedPath(own);
+    return reachedByName(mcpFoldedName(p.name, rules), mcpFoldedName(o.name, rules), orHolding) || reachedByIdentity(p, o, orHolding);
+}
+
+// A path as one name for the file it is: symbolic links followed as far as the path exists, and the name folded as
+// the file system folds it, so two spellings of one file are seen as one.
+static QString oneNameFor(const QString& path) { return mcpFoldedName(resolvedPath(path).name, mcpNameRules()); }
 
 McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOnly) {
     McpCallPaths out;
@@ -893,13 +999,38 @@ QString mcpOwnFileNamed(const QString& tool, const QJsonObject& arguments, const
                                                        {facilitiesFile(), "the facility list"},
                                                        {dcp::signerFolder(), "its DCP certificates"},
                                                        {dcp::dkdmFolder(), "the DKDMs of its DCPs"}};
-    std::vector<std::pair<QString, const char*>> names;
+    const McpNameRules rules = mcpNameRules();
+    struct Own {
+        ResolvedPath at;
+        QString name;
+        const char* what;
+    };
+    std::vector<Own> owns;
     for (const auto& [file, what] : own)
-        if (!file.empty()) names.emplace_back(oneNameFor(QString::fromStdString(file)), what);
+        if (!file.empty()) {
+            const ResolvedPath at = resolvedPath(QString::fromStdString(file));
+            owns.push_back({at, mcpFoldedName(at.name, rules), what});
+        }
+    // (the parts of paths that exist, each looked up once: most texts that are no path at all resolve to one folder)
+    QHash<QString, int> reached;
+    auto named = [&](const QString& path, bool orHolding) -> const char* {
+        const ResolvedPath p = resolvedPath(path);
+        const QString pn = mcpFoldedName(p.name, rules);
+        for (const Own& o : owns)
+            if (reachedByName(pn, o.name, orHolding)) return o.what;
+        const QString key = p.existing + QLatin1Char('\n') + QLatin1Char(p.whole ? '1' : '0') + QLatin1Char(orHolding ? 'h' : '-');
+        auto it = reached.find(key);
+        if (it == reached.end()) {
+            int found = -1;
+            for (size_t i = 0; i < owns.size() && found < 0; ++i)
+                if (reachedByIdentity(p, owns[i].at, orHolding)) found = int(i);
+            it = reached.insert(key, found);
+        }
+        return *it >= 0 ? owns[size_t(*it)].what : nullptr;
+    };
     // What the call is known to write: there, or a folder that holds one of them.
-    for (const auto& [name, what] : names)
-        for (const QString& w : paths.writes)
-            if (mcpPathsOverlap(w, name)) return QStringLiteral("%1 is where Montage keeps %2: a tool does not write there").arg(w, QLatin1String(what));
+    for (const QString& w : paths.writes)
+        if (const char* what = named(w, true)) return QStringLiteral("%1 is where Montage keeps %2: a tool does not write there").arg(w, QLatin1String(what));
     // And every other text in the arguments, whatever its key: a tool may write to an argument this server does not
     // know as a path. Only a DKDM and a server's certificate are read from there, by montage_make_kdm.
     const bool kdm = tool == QLatin1String("montage_make_kdm");
@@ -920,15 +1051,9 @@ QString mcpOwnFileNamed(const QString& tool, const QJsonObject& arguments, const
             const QString text = v.toString();
             // (no file system takes a longer path)
             if (text.isEmpty() || text.size() > 32768) return;
-            const QString at = oneNameFor(text);
-            for (const auto& [name, what] : names) {
-                const bool inside = at.size() > name.size() && at.startsWith(name) && (name.endsWith(QLatin1Char('/')) || at.at(name.size()) == QLatin1Char('/'));
-                if (at == name || inside) {
-                    found = QStringLiteral("%1 is where Montage keeps %2: a tool is given no path there (only a DKDM or a server's certificate, to read)")
-                                .arg(text, QLatin1String(what));
-                    return;
-                }
-            }
+            if (const char* what = named(text, false))
+                found = QStringLiteral("%1 is where Montage keeps %2: a tool is given no path there (only a DKDM or a server's certificate, to read)")
+                            .arg(text, QLatin1String(what));
         }
     };
     look(arguments, QString(), 0);

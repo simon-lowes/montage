@@ -78,6 +78,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 
 #include "AutoDuckDialog.h"
@@ -11600,6 +11601,82 @@ private slots:
             QCOMPARE(QFileInfo::exists(roots), hadRoots);
             if (hadRoots) QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == rootsBefore);
         }
+    }
+
+    // The guard on Montage's own files takes names as the file system does: letter case and how accented letters are
+    // composed ignored on macOS, those and a stream's name and trailing dots and spaces on Windows, and everywhere one
+    // file by identity under another name (a hard link). Each platform's rules are checked here on every platform.
+    void mcpOwnFilesAsTheFileSystemNamesThem() {
+        // Names folded by each platform's rules.
+        const QString composed = QStringLiteral("/Users/Ana/Caf") + QChar(0x00e9) + QStringLiteral("/DKDMs");
+        const QString decomposed = QStringLiteral("/users/ana/cafe") + QChar(0x0301) + QStringLiteral("/dkdms");
+        QCOMPARE(mcpFoldedName(composed, McpNameRules::Exact), composed);
+        QVERIFY(mcpFoldedName(composed, McpNameRules::Exact) != mcpFoldedName(decomposed, McpNameRules::Exact));
+        QCOMPARE(mcpFoldedName(composed, McpNameRules::Folded), mcpFoldedName(decomposed, McpNameRules::Folded));
+        QCOMPARE(mcpFoldedName(composed, McpNameRules::Windows), mcpFoldedName(decomposed, McpNameRules::Windows));
+        QCOMPARE(mcpFoldedName(QStringLiteral("C:\\Users\\Ana\\DKDMs. \\new.xml::$DATA"), McpNameRules::Windows), QStringLiteral("c:/users/ana/dkdms/new.xml"));
+        QCOMPARE(mcpFoldedName(QStringLiteral("C:/x/Roots.pem:$DATA"), McpNameRules::Windows), mcpFoldedName(QStringLiteral("c:/X/roots.pem"), McpNameRules::Windows));
+        QVERIFY(mcpFoldedName(QStringLiteral("/x/roots.pem:$DATA"), McpNameRules::Folded) != mcpFoldedName(QStringLiteral("/x/roots.pem"), McpNameRules::Folded));
+        // Paths that do not exist yet, under this run's folder, are told apart by name alone.
+        const QString folder = dir_.filePath("own-names");
+        QVERIFY(QDir().mkpath(folder));
+        const QString own = folder + "/Own/DKDMs";
+        const QString other = folder + "/own/dkdms/new.xml";
+        QVERIFY(!mcpPathReaches(other, own, McpNameRules::Exact, false));
+        QVERIFY(mcpPathReaches(other, own, McpNameRules::Folded, false));
+        QVERIFY(mcpPathReaches(other, own, McpNameRules::Windows, false));
+        QVERIFY(!mcpPathReaches(folder + "/own/dkdms./new.xml:$DATA", own, McpNameRules::Folded, false));
+        QVERIFY(mcpPathReaches(folder + "/own/dkdms./new.xml:$DATA", own, McpNameRules::Windows, false));
+        QVERIFY(mcpPathReaches(folder + "/Own/DKDMs", own, McpNameRules::Exact, false));
+        QVERIFY(!mcpPathReaches(folder + "/Own/DKDMs2/new.xml", own, McpNameRules::Windows, false));
+        // A folder that holds it reaches it only when that is asked (a folder written over).
+        QVERIFY(mcpPathReaches(folder + "/own", own, McpNameRules::Folded, true));
+        QVERIFY(!mcpPathReaches(folder + "/own", own, McpNameRules::Folded, false));
+        // One file under another name: a hard link to it is it, by every rule; a neighbour is not.
+        QVERIFY(QDir().mkpath(folder + "/real") && QDir().mkpath(folder + "/elsewhere"));
+        const QString roots = folder + "/real/roots.pem", alias = folder + "/elsewhere/alias.pem";
+        {
+            QFile f(roots);
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write("kept") == 4);
+        }
+        std::error_code ec;
+        std::filesystem::create_hard_link(QFile::encodeName(roots).toStdString(), QFile::encodeName(alias).toStdString(), ec);
+        QVERIFY2(!ec, ec.message().c_str());
+        for (McpNameRules rules : {McpNameRules::Exact, McpNameRules::Folded, McpNameRules::Windows}) {
+            QVERIFY(mcpPathReaches(alias, roots, rules, false));
+            QVERIFY(mcpPathReaches(alias, roots, rules, true));
+            QVERIFY(!mcpPathReaches(folder + "/elsewhere/other.pem", roots, rules, false));
+        }
+        // Through the server: Montage's DKDMs (in a folder of this run's), a hard link to one refused, and on a
+        // computer whose file system ignores letter case, the folder spelt otherwise too; the DKDM unchanged.
+        const QByteArray envBefore = qgetenv("MONTAGE_DCP_DKDMS");
+        const bool hadEnv = qEnvironmentVariableIsSet("MONTAGE_DCP_DKDMS");
+        auto restore = qScopeGuard([&] { hadEnv ? qputenv("MONTAGE_DCP_DKDMS", envBefore) : qunsetenv("MONTAGE_DCP_DKDMS"); });
+        const QString dkdms = folder + "/Montage-DKDMs";
+        QVERIFY(QDir().mkpath(dkdms));
+        qputenv("MONTAGE_DCP_DKDMS", QFile::encodeName(dkdms));
+        const QString kept = dkdms + "/kept.xml", linked = folder + "/elsewhere/kept.xml";
+        {
+            QFile f(kept);
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write("<dkdm/>") == 7);
+        }
+        std::filesystem::create_hard_link(QFile::encodeName(kept).toStdString(), QFile::encodeName(linked).toStdString(), ec);
+        QVERIFY2(!ec, ec.message().c_str());
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_export_markers"}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QStringList refused{linked};
+        if (mcpNameRules() != McpNameRules::Exact) refused << folder + "/montage-dkdms/new.csv";
+        for (const QString& path : refused) {
+            const QJsonObject r = call({{"path", path}});
+            QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+        }
+        QFile f(kept);
+        QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == "<dkdm/>");
+        QVERIFY(!QFileInfo::exists(dkdms + "/new.csv"));
     }
 
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
