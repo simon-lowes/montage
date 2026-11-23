@@ -186,6 +186,9 @@ public:
     int concealedSlices() const { return doneConcealed_; }  // its slices taken from the frame before
     int64_t passedOver() const { return passedOver_; }      // frames too damaged to rebuild
     int packetMode() const { return mode_; }
+    // The bytes held: the frame being built and the last one completed (which a later frame's missing slices are
+    // taken from), each once.
+    size_t keptBytes() const { return bytes_ + done_.capacity(); }
 
 private:
     struct Part {
@@ -201,9 +204,8 @@ private:
     int mode_ = 0;
     int64_t lastSeq_ = -1, lost_ = 0, frameLost_ = 0, doneLost_ = 0, passedOver_ = 0;
     int doneConcealed_ = 0;
-    // The frame before: its codestream, where its slices start (and its end), its boxes' bytes, a full packet's
-    // payload, and its packets.
-    std::vector<uint8_t> prev_;
+    // The frame before (done_, the last frame completed): where its slices start (and its end), its boxes' bytes,
+    // and a full packet's payload.
     std::vector<size_t> prevSlices_;
     size_t prevBoxes_ = 0, unit_ = 0;
     std::vector<uint8_t> done_;

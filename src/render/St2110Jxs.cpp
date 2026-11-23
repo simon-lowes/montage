@@ -323,11 +323,17 @@ bool JxsvAssembler::finish() {
     const bool startsWhole = first.p == 0 && (slices ? first.sep == 0x7FF : first.sep == 0);
     if (lost == 0 && startsWhole && parts.back().last) {
         // Whole: its units in turn, the boxes taken off the front.
+        // (each packet's bytes let go as they are copied, so that the frame is held once, not twice, meanwhile)
         std::vector<uint8_t> unit;
+        std::vector<size_t> partSizes(parts.size());
         size_t total = 0;
         for (const Part& q : parts) total += q.data.size();
         unit.reserve(total);
-        for (const Part& q : parts) unit.insert(unit.end(), q.data.begin(), q.data.end());
+        for (size_t i = 0; i < parts.size(); ++i) {
+            partSizes[i] = parts[i].data.size();
+            unit.insert(unit.end(), parts[i].data.begin(), parts[i].data.end());
+            std::vector<uint8_t>().swap(parts[i].data);
+        }
         const size_t boxes = boxBytes(unit.data(), unit.size());
         JxsHeader h;
         if (boxes == 0 && !(unit.size() >= 2 && unit[0] == 0xFF && unit[1] == 0x10)) return ++passedOver_, false;
@@ -344,14 +350,14 @@ bool JxsvAssembler::finish() {
                 const int s = parts[i].sep == 0x7FF ? -1 : sliceOf[i];
                 if (s != current && s >= 0) starts.push_back(at >= boxes ? at - boxes : 0);
                 current = s;
-                at += parts[i].data.size();
+                at += partSizes[i];
             }
             starts.push_back(cs.size());
         } else {
             starts = sliceStarts(cs);
         }
         if (frameUnit) unit_ = frameUnit;
-        prev_ = cs;
+        // (the frame kept to take a later frame's missing slices from is this one, done_: not a copy of it)
         prevSlices_ = starts;
         prevBoxes_ = boxes;
         done_ = std::move(cs);
@@ -363,9 +369,11 @@ bool JxsvAssembler::finish() {
     // Missing packets: what came put in its place in the frame before's layout, the slices with anything missing taken
     // whole from that frame.
     if (unit_ == 0) unit_ = frameUnit;
-    if (prev_.empty() || prevSlices_.size() < 2 || unit_ == 0) return ++passedOver_, false;
-    const size_t size = prev_.size();
-    std::vector<uint8_t> cs(size, 0), known(size, 0);
+    const std::vector<uint8_t>& prev = done_;
+    if (prev.empty() || prevSlices_.size() < 2 || unit_ == 0) return ++passedOver_, false;
+    const size_t size = prev.size();
+    std::vector<uint8_t> cs(size, 0);
+    std::vector<bool> known(size, false);
     size_t boxes = prevBoxes_;
     for (const Part& q : parts)
         if (q.p == 0 && (slices ? q.sep == 0x7FF : q.sep == 0)) {
@@ -391,12 +399,12 @@ bool JxsvAssembler::finish() {
             if (to < 0) continue;  // (the boxes)
             if (to >= int64_t(size)) return ++passedOver_, false;  // (not the frame before's layout)
             cs[size_t(to)] = q.data[k];
-            known[size_t(to)] = 1;
+            known[size_t(to)] = true;
         }
     }
-    auto whole = [&](size_t a, size_t b) { return std::all_of(known.begin() + ptrdiff_t(a), known.begin() + ptrdiff_t(b), [](uint8_t k) { return k != 0; }); };
+    auto whole = [&](size_t a, size_t b) { return std::all_of(known.begin() + ptrdiff_t(a), known.begin() + ptrdiff_t(b), [](bool k) { return k; }); };
     // The header (the same each frame), and each slice.
-    if (!whole(0, prevSlices_[0])) std::copy(prev_.begin(), prev_.begin() + ptrdiff_t(prevSlices_[0]), cs.begin());
+    if (!whole(0, prevSlices_[0])) std::copy(prev.begin(), prev.begin() + ptrdiff_t(prevSlices_[0]), cs.begin());
     int concealed = 0;
     for (size_t s = 0; s < sliceCount; ++s) {
         const size_t a = prevSlices_[s], b = prevSlices_[s + 1];
@@ -406,12 +414,11 @@ bool JxsvAssembler::finish() {
             if (b - a < 6 || cs[a] != 0xFF || cs[a + 1] != 0x20 || get16(&cs[a + 4]) != uint32_t(s)) return ++passedOver_, false;
             continue;
         }
-        std::copy(prev_.begin() + ptrdiff_t(a), prev_.begin() + ptrdiff_t(b), cs.begin() + ptrdiff_t(a));
+        std::copy(prev.begin() + ptrdiff_t(a), prev.begin() + ptrdiff_t(b), cs.begin() + ptrdiff_t(a));
         ++concealed;
     }
     JxsHeader h;
     if (!readJxsHeader(cs.data(), cs.size(), h) || (h.lcod && h.lcod != cs.size())) return ++passedOver_, false;
-    prev_ = cs;
     done_ = std::move(cs);
     doneTimestamp_ = timestamp_;
     doneLost_ = std::max<int64_t>(1, lost);

@@ -20486,6 +20486,16 @@ colorspaces:
             QVERIFY(as.lostInFrame() == 1 && as.concealedSlices() >= 1 && as.timestamp() == 4000);
             QCOMPARE(as.codestream(), cs);
             QCOMPARE(as.passedOver(), int64_t(0));
+            // Nightly 23 November: between frames the assembler holds the last frame once (it is also the one a
+            // later frame's missing slices come from), not a second copy of it.
+            QCOMPARE(as.heldBytes(), size_t(0));
+            QVERIFY2(as.keptBytes() <= cs.size() + 256, qPrintable(QString("%1 kept for a frame of %2").arg(as.keptBytes()).arg(cs.size())));
+            // (and a frame after it, missing a packet again, is still put together from it)
+            const std::vector<st::RtpPacket> again = packets(5000, seq, 64, false);
+            for (size_t i = 0; i < again.size(); ++i)
+                if (i != 2) done += as.add(again[i]);
+            QCOMPARE(done, 5);
+            QCOMPARE(as.codestream(), cs);
         }
         // A header naming the largest picture its fields can (65,535 a side) is not one to decode: refused by its
         // header alone, and by the decoder before it sets anything aside when the library is built in.
