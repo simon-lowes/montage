@@ -707,6 +707,15 @@ if(MONTAGE_WITH_OPENEXR)
   target_include_directories(montage_engine PRIVATE ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/common
                                                     ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/openjph
                                                     ${openexr_SOURCE_DIR}/external/zstd/lib)
+  # From 3.5.4 OpenEXR builds its OpenJPH under a namespace of its own (so that it cannot clash with another OpenJPH
+  # in the program): the source that uses OpenJPH's API is compiled with the same names, where this OpenEXR has them.
+  file(STRINGS ${openexr_SOURCE_DIR}/src/lib/OpenEXRCore/CMakeLists.txt MONTAGE_OJPH_RENAMED REGEX "_openexr_ojph_renames")
+  if(MONTAGE_OJPH_RENAMED AND OPENEXR_INTERNAL_IMF_NAMESPACE)
+    set_property(SOURCE render/Jpeg2000.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+      ojph=${OPENEXR_INTERNAL_IMF_NAMESPACE}_ojph
+      ojph_aligned_malloc=${OPENEXR_INTERNAL_IMF_NAMESPACE}_ojph_aligned_malloc
+      ojph_aligned_free=${OPENEXR_INTERNAL_IMF_NAMESPACE}_ojph_aligned_free)
+  endif()
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OPENEXR)
 endif()
 if(WIN32)
