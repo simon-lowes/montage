@@ -22803,8 +22803,11 @@ if __name__ == '__main__':
                 ids << rpc(server, "montage_render", {{"project", project}, {"output", dir.path() + name}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
             bool together = false;
             while (t.elapsed() < 120000) {
+                // (each read is a call of its own: the first read again after the second, so both were running at once,
+                // not one after the other between the reads)
                 const QString a = job(server, ids[0]).value("status").toString(), b = job(server, ids[1]).value("status").toString();
-                if (a == "running" && b == "running") together = true;
+                const QString again = job(server, ids[0]).value("status").toString();
+                if (a == "running" && b == "running" && again == "running") together = true;
                 if ((a == "done" || a == "failed") && (b == "done" || b == "failed")) break;
                 QThread::msleep(5);
             }
@@ -22826,7 +22829,9 @@ if __name__ == '__main__':
             bool both = false;
             t.restart();
             while (t.elapsed() < 120000) {
-                const QString a = job(server, same[0]).value("status").toString(), b = job(server, same[1]).value("status").toString();
+                // (the second read first: running, the first was done by then, as it lets go of the file only once done;
+                // read the other way round, the first could end and the second start between the two reads)
+                const QString b = job(server, same[1]).value("status").toString(), a = job(server, same[0]).value("status").toString();
                 if (a == "running" && b == "running") both = true;
                 if ((a == "done" || a == "failed") && (b == "done" || b == "failed")) break;
                 QThread::msleep(5);
