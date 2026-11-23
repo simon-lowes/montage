@@ -1094,6 +1094,37 @@ TitleLayerFn titleLayerSource(const Project& p, const Sequence& seq, const Clip&
 }
 
 namespace {
+Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t, const RenderOptions& o, int W, int H,
+                   bool* displayReferred);  // (below)
+thread_local int tTitle3DPictureDepth = 0;
+}  // namespace
+
+// The tracks' pictures a 3D title's faces show (render/Title3D.h): never its own track's, and a step deep at most where
+// such a picture holds a 3D title showing pictures in turn.
+Title3DPictures title3dPictures(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, int w, int h) {
+    Title3DPictures out;
+    if (tTitle3DPictureDepth >= 2) return out;
+    struct Depth {
+        Depth() { ++tTitle3DPictureDepth; }
+        ~Depth() { --tTitle3DPictureDepth; }
+    } depth;
+    const Effect& g = c.generator;
+    const FrameTime lt = t - c.start;
+    const auto own = edit::locate(seq, c.id);
+    auto picture = [&](const char* fill, long kind, const char* track, Image& into) {
+        if (std::lround(g.p(fill, lt, 0)) != kind) return;
+        const int m = int(std::lround(g.p(track, lt, 1))) - 1;
+        if (m < 0 || m >= int(seq.videoTracks.size())) return;
+        if (own && own->track.kind == TrackKind::Video && int(own->track.index) == m) return;
+        into = trackPicture(p, seq, size_t(m), t, o, w, h, nullptr);
+    };
+    picture("face_fill", 2, "face_track", out.front);
+    picture("side_fill", 2, "side_track", out.sides);
+    picture("back_fill", 3, "back_track", out.back);
+    return out;
+}
+
+namespace {
 
 // False when the clip has no picture.
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
@@ -1166,7 +1197,12 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
               : c.generator.type == "title" ? renderTitle(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), titlePathSource(p, seq, c, w, h),
                                                           titleLayerSource(p, seq, c, w, h))
-                                              : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
+              : c.generator.type == "title3d"
+                  ? [&] {
+                        const Title3DPictures pictures = title3dPictures(p, seq, c, t, o, w, h);
+                        return renderTitle3D(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), &pictures);
+                    }()
+                  : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         if (!modelError.empty() && o.issues) o.issues->note(modelError);
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white (graded scene-referred, back
         // through the output transform, so a white title stays white).

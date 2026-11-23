@@ -68,6 +68,7 @@
 #include "render/StyleFx.h"
 #include "render/Particles.h"
 #include "render/Titles.h"
+#include "render/Title3D.h"
 #include "core/Expression.h"
 #include "render/GpuCompositor.h"
 #include "render/Dcp.h"
@@ -26322,6 +26323,129 @@ colorspaces:
         const std::vector<Run> same = runs(renderGenerator(plain, 0, w, h, 1.0, 90, 30));
         QCOMPARE(int(same.size()), 2);
         QVERIFY(std::abs(deep(same[1]) - deep(same[0])) <= 1 && std::abs(deep(same[0]) - 40) <= 4);
+    }
+
+    void titles3DFacesFilledApart() {
+        // A 3D title's front, sides and back each take a colour, a gradient or a track's picture. "MW" extruded 120 px
+        // and turned so its sides show, lit flat (all ambient, no shine) so every pixel is its face's source exactly.
+        Effect g = makeEffect("title3d", 1);
+        g.strings["text"] = "MW";
+        g.strings["font"] = "DejaVu Sans";
+        g.params["size"] = Param(160.0);
+        g.params["depth"] = Param(120.0);
+        g.params["rot_x"] = Param(-25.0);
+        g.params["rot_y"] = Param(-35.0);
+        g.params["ambient"] = Param(100.0);
+        g.params["specular"] = Param(0.0);
+        for (const char* k : {"color", "side_color", "back_color"})
+            for (const char* c : {".r", ".g", ".b"}) g.params[std::string(k) + c] = Param(0.0);
+        g.params["color.r"] = Param(1.0);  // a red front
+        const int w = 640, h = 360;
+        // Where the front and the sides are: the front red, the sides black.
+        const Image ref = renderGenerator(g, 0, w, h, 1.0, 30, 30);
+        auto is = [](const float* q, float r, float gg, float b) {
+            return q[3] > 0.999f && std::fabs(q[0] - r) < 1.5f / 255 && std::fabs(q[1] - gg) < 1.5f / 255 && std::fabs(q[2] - b) < 1.5f / 255;
+        };
+        std::vector<std::pair<int, int>> front, sides;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                if (is(ref.at(x, y), 1, 0, 0)) front.push_back({x, y});
+                if (is(ref.at(x, y), 0, 0, 0)) sides.push_back({x, y});
+            }
+        QVERIFY2(front.size() > 2000 && sides.size() > 2000, qPrintable(QString("%1 %2").arg(front.size()).arg(sides.size())));
+        // The sides take a track's picture fitted to the title, its left half blue and its right half green: the
+        // front stays red, and the sides are blue on the left of the title and green on its right.
+        Title3DPictures pics;
+        pics.sides = Image(w, h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                float* q = pics.sides.at(x, y);
+                q[0] = 0, q[1] = x < w / 2 ? 0.0f : 1.0f, q[2] = x < w / 2 ? 1.0f : 0.0f, q[3] = 1;
+            }
+        g.params["side_fill"] = Param(2.0);
+        const Image painted = renderTitle3D(g, 0, w, h, 1.0, 30, 30, &pics);
+        size_t red = 0, blue = 0, green = 0;
+        double blueX = 0, greenX = 0;
+        for (auto [x, y] : front) red += is(painted.at(x, y), 1, 0, 0);
+        for (auto [x, y] : sides) {
+            if (is(painted.at(x, y), 0, 0, 1)) ++blue, blueX += x;
+            if (is(painted.at(x, y), 0, 1, 0)) ++green, greenX += x;
+        }
+        QVERIFY2(red >= front.size() * 99 / 100, qPrintable(QString("%1 of %2").arg(red).arg(front.size())));
+        QVERIFY2(blue + green >= sides.size() * 95 / 100 && blue > 500 && green > 500,
+                 qPrintable(QString("%1 + %2 of %3").arg(blue).arg(green).arg(sides.size())));
+        QVERIFY2(blueX / double(blue) < greenX / double(green) - 50, qPrintable(QString("%1 %2").arg(blueX / blue).arg(greenX / green)));
+        // Without the picture the sides keep their colour.
+        QVERIFY(renderTitle3D(g, 0, w, h, 1.0, 30, 30, nullptr).px == ref.px);
+        // A gradient on the front, red at the title's top to blue at its bottom: the front's highest pixels are
+        // nearly red and its lowest nearly blue, and blue grows down the title.
+        g.params["side_fill"] = Param(0.0);
+        g.params["face_fill"] = Param(1.0);
+        g.params["color2.r"] = Param(0.0), g.params["color2.g"] = Param(0.0), g.params["color2.b"] = Param(1.0);
+        const Image grad = renderGenerator(g, 0, w, h, 1.0, 30, 30);
+        int top = h, bottom = 0;
+        for (auto [x, y] : front) top = std::min(top, y), bottom = std::max(bottom, y);
+        bool mixed = true;  // every front pixel red and blue mixed
+        auto blueness = [&](int y0, int y1) {
+            double sum = 0;
+            int n = 0;
+            for (auto [x, y] : front)
+                if (y >= y0 && y <= y1) {
+                    const float* q = grad.at(x, y);
+                    mixed = mixed && std::fabs(q[0] + q[2] - 1) < 2.0f / 255 && q[1] < 1.0f / 255;
+                    sum += q[2], ++n;
+                }
+            return n ? sum / n : -1.0;
+        };
+        const double upper = blueness(top, top + 10), middle = blueness((top + bottom) / 2 - 5, (top + bottom) / 2 + 5),
+                     lower = blueness(bottom - 10, bottom);
+        QVERIFY(mixed);
+        QVERIFY2(upper >= 0 && upper < 0.2 && lower > 0.8 && middle > upper + 0.2 && middle < lower - 0.2,
+                 qPrintable(QString("%1 %2 %3").arg(upper).arg(middle).arg(lower)));
+        // The back, turned to the camera: the front's red, until it has a colour of its own (green). (What is not
+        // black there, the sides seen past the back's edges, is the back.)
+        g.params["face_fill"] = Param(0.0);
+        g.params["rot_x"] = Param(0.0);
+        g.params["rot_y"] = Param(180.0);
+        auto backShare = [&](float r, float gg, float b) {
+            const Image img = renderGenerator(g, 0, w, h, 1.0, 30, 30);
+            size_t n = 0, back = 0;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    if (img.at(x, y)[3] > 0.999f && !is(img.at(x, y), 0, 0, 0)) ++back, n += is(img.at(x, y), r, gg, b);
+            return back > 2000 ? double(n) / double(back) : 0.0;
+        };
+        QVERIFY2(backShare(1, 0, 0) > 0.95, qPrintable(QString::number(backShare(1, 0, 0))));
+        g.params["back_fill"] = Param(1.0);
+        g.params["back_color.g"] = Param(1.0);
+        QVERIFY2(backShare(0, 1, 0) > 0.95, qPrintable(QString::number(backShare(0, 1, 0))));
+        // Through the compositor: the sides show track 1's picture (a blue colour clip under the title on track 2),
+        // where they were black.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = w, s.height = h;
+        s.videoTracks.resize(2);
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.0f, 0.0f, 1.0f, 0, 30));
+        Clip title = makeGeneratorClip(p, "title3d", 30);
+        title.generator = g;
+        title.generator.params["back_fill"] = Param(0.0);
+        title.generator.params["rot_x"] = Param(-25.0);
+        title.generator.params["rot_y"] = Param(-35.0);
+        s.videoTracks[1].clips.push_back(title);
+        RenderOptions o;
+        auto sideBlue = [&] {
+            const Image img = renderSequenceFrame(p, *p.active(), 0, o);
+            size_t n = 0;
+            for (auto [x, y] : sides) n += img.at(x, y)[2] > 0.95f && img.at(x, y)[0] < 0.05f && img.at(x, y)[1] < 0.05f;
+            return double(n) / double(sides.size());
+        };
+        QVERIFY2(sideBlue() < 0.05, qPrintable(QString::number(sideBlue())));
+        p.active()->videoTracks[1].clips[0].generator.params["side_fill"] = Param(2.0);
+        p.active()->videoTracks[1].clips[0].generator.params["side_track"] = Param(1.0);
+        QVERIFY2(sideBlue() > 0.95, qPrintable(QString::number(sideBlue())));
+        // Its own track's picture is not taken (the sides keep their colour).
+        p.active()->videoTracks[1].clips[0].generator.params["side_track"] = Param(2.0);
+        QVERIFY2(sideBlue() < 0.05, qPrintable(QString::number(sideBlue())));
     }
 
     void titles3DLetterTransforms() {

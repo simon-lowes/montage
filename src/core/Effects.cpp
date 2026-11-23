@@ -1325,6 +1325,18 @@ std::vector<EffectInfo> buildCatalog() {
                                num("size", "Font Size (px)", 4, 1000, 120, 1),
                                color("color", "Face", 0.95, 0.95, 0.95),
                                color("side_color", "Sides", 0.45, 0.5, 0.6),
+                               // Each face filled with its colour, a gradient down the title to a second colour, or
+                               // a track's picture fitted to the title; the back as the face unless set apart.
+                               choice("face_fill", "Face Fill", {"Colour", "Gradient", "A Track's Picture"}, 0),
+                               color("color2", "Face Gradient's Bottom", 0.55, 0.6, 0.7),
+                               num("face_track", "Face Picture's Track (V number)", 1, 99, 1, 1),
+                               choice("side_fill", "Sides' Fill", {"Colour", "Gradient", "A Track's Picture"}, 0),
+                               color("side_color2", "Sides' Gradient's Bottom", 0.2, 0.22, 0.3),
+                               num("side_track", "Sides' Picture's Track (V number)", 1, 99, 1, 1),
+                               choice("back_fill", "Back Fill", {"As the Face", "Colour", "Gradient", "A Track's Picture"}, 0),
+                               color("back_color", "Back", 0.95, 0.95, 0.95),
+                               color("back_color2", "Back Gradient's Bottom", 0.55, 0.6, 0.7),
+                               num("back_track", "Back Picture's Track (V number)", 1, 99, 1, 1),
                                num("depth", "Extrusion (px)", 0, 1000, 40, 0.5),
                                num("rot_x", "Tilt (X°)", -360, 360, 10, 0.5),
                                num("rot_y", "Turn (Y°)", -360, 360, -20, 0.5),

@@ -48,6 +48,12 @@ struct M3 {
         return r;
     }
 };
+M3 transposed(const M3& a) {
+    M3 r;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) r.m[i][j] = a.m[j][i];
+    return r;
+}
 // Turned about X (tipping the top away), Y (the right side away) and Z (clockwise on screen), in that order.
 M3 rotation(double rx, double ry, double rz) {
     const double cx = std::cos(rx * kDeg), sx = std::sin(rx * kDeg), cy = std::cos(ry * kDeg), sy = std::sin(ry * kDeg),
@@ -88,10 +94,41 @@ struct Camera {
     }
 };
 
-// A corner of a polygon in camera space with its colour.
+// What a face of the title is filled with: its colour, a gradient from the title's top to its bottom, or a picture
+// fitted to the title's box; at (u, v) across that box (0 to 1, v down), then mixed as the animations mix its colour.
+struct Paint {
+    int kind = 0;  // 0 colour, 1 gradient, 2 picture
+    float c1[3] = {0, 0, 0}, c2[3] = {0, 0, 0};
+    const Image* picture = nullptr;
+    float keep = 1, add[3] = {0, 0, 0};  // the animations' mix: base * keep + add
+    void at(double u, double v, float* out) const {
+        float b[3] = {c1[0], c1[1], c1[2]};
+        if (kind == 2 && picture && !picture->empty()) {
+            // (bilinear, the picture's colour where it is opaque at all)
+            const double X = std::clamp(u, 0.0, 1.0) * picture->width - 0.5, Y = std::clamp(v, 0.0, 1.0) * picture->height - 0.5;
+            const int x0 = std::clamp(int(std::floor(X)), 0, picture->width - 1), y0 = std::clamp(int(std::floor(Y)), 0, picture->height - 1);
+            const int x1 = std::min(x0 + 1, picture->width - 1), y1 = std::min(y0 + 1, picture->height - 1);
+            const float fx = float(std::clamp(X - x0, 0.0, 1.0)), fy = float(std::clamp(Y - y0, 0.0, 1.0));
+            float q[4];
+            for (int k = 0; k < 4; ++k)
+                q[k] = (picture->at(x0, y0)[k] * (1 - fx) + picture->at(x1, y0)[k] * fx) * (1 - fy) +
+                       (picture->at(x0, y1)[k] * (1 - fx) + picture->at(x1, y1)[k] * fx) * fy;
+            for (int k = 0; k < 3; ++k) b[k] = q[3] > 1e-6f ? q[k] / q[3] : 0.0f;
+        } else if (kind == 1) {
+            const float f = float(std::clamp(v, 0.0, 1.0));
+            for (int k = 0; k < 3; ++k) b[k] = c1[k] + (c2[k] - c1[k]) * f;
+        }
+        for (int k = 0; k < 3; ++k) out[k] = b[k] * keep + add[k];
+    }
+};
+
+// A corner of a polygon in camera space with its colour, or (a painted face) where it is across the title's box and
+// how it is lit: colour = min(1, paint * lm + la).
 struct Corner {
     V3 p;
     float c[3] = {0, 0, 0};
+    double u = 0, v = 0;
+    float lm = 0, la = 0;
 };
 // The part of a closed polygon at least `near` in front of the camera (Sutherland-Hodgman against that plane). A
 // closed outline stays closed, so nonzero winding still fills what is left of it correctly.
@@ -108,6 +145,8 @@ std::vector<Corner> clipNear(const std::vector<Corner>& in, double near) {
             Corner m;
             m.p = a.p + (b.p - a.p) * t;
             for (int k = 0; k < 3; ++k) m.c[k] = float(a.c[k] + (b.c[k] - a.c[k]) * t);
+            m.u = a.u + (b.u - a.u) * t, m.v = a.v + (b.v - a.v) * t;
+            m.lm = float(a.lm + (b.lm - a.lm) * t), m.la = float(a.la + (b.la - a.la) * t);
             out.push_back(m);
         }
     }
@@ -117,6 +156,10 @@ std::vector<Corner> clipNear(const std::vector<Corner>& in, double near) {
 struct Tri {
     Screen v[3];
     float c[3][3];
+    // Painted: its paint, where each corner is across the title's box and how it is lit (else its corners' colours).
+    const Paint* paint = nullptr;
+    double u[3] = {0, 0, 0}, uv[3] = {0, 0, 0};
+    float lm[3] = {0, 0, 0}, la[3] = {0, 0, 0};
 };
 
 // A triangle with a colour at each corner (linear across the screen), depth tested, within the raster.
@@ -136,7 +179,16 @@ void fillTriangle(Raster& r, const Tri& t) {
             const double w2 = 1 - w0 - w1;
             if (w0 < 0 || w1 < 0 || w2 < 0) continue;
             float col[3];
-            for (int k = 0; k < 3; ++k) col[k] = float(w0 * t.c[0][k] + w1 * t.c[1][k] + w2 * t.c[2][k]);
+            if (t.paint) {
+                // (the paint where the sample is, true to perspective; the light across the screen, as colours are)
+                const double q0 = w0 * a.inv, q1 = w1 * b.inv, q2 = w2 * c.inv, qs = q0 + q1 + q2;
+                if (!(qs > 0)) continue;
+                t.paint->at((q0 * t.u[0] + q1 * t.u[1] + q2 * t.u[2]) / qs, (q0 * t.uv[0] + q1 * t.uv[1] + q2 * t.uv[2]) / qs, col);
+                const double lm = w0 * t.lm[0] + w1 * t.lm[1] + w2 * t.lm[2], la = w0 * t.la[0] + w1 * t.la[1] + w2 * t.la[2];
+                for (int k = 0; k < 3; ++k) col[k] = float(std::min(1.0, col[k] * lm + la));
+            } else {
+                for (int k = 0; k < 3; ++k) col[k] = float(w0 * t.c[0][k] + w1 * t.c[1][k] + w2 * t.c[2][k]);
+            }
             r.plot(x, y, float(w0 * a.inv + w1 * b.inv + w2 * c.inv), col);
         }
 }
@@ -162,13 +214,21 @@ struct Lighting {
         const double spec = specular * std::pow(std::max(0.0, dot(n, normalized(light + view))), 32);
         for (int k = 0; k < 3; ++k) out[k] = float(std::min(1.0, base[k] * (ambient + (1 - ambient) * diffuse) + spec));
     }
+    // The same light as a factor and a highlight: colour = min(1, base * lm + la).
+    void parts(V3 n, V3 p, float& lm, float& la) const {
+        const V3 view = normalized(p * -1.0);
+        if (dot(n, view) < 0) n = n * -1.0;
+        const double diffuse = std::max(0.0, dot(n, light));
+        lm = float(ambient + (1 - ambient) * diffuse);
+        la = float(specular * std::pow(std::max(0.0, dot(n, normalized(light + view))), 32));
+    }
 };
 
 double easeOut(double p) { return 1 - std::pow(1 - std::clamp(p, 0.0, 1.0), 3); }
 
 }  // namespace
 
-Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps) {
+Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const Title3DPictures* pictures) {
     Image out(w, h);
     if (w <= 0 || h <= 0) return out;
     // Animation: how far in (from the start) and out (towards the end).
@@ -234,10 +294,36 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
         V3 pivot, move;
         double s = 1;
         float face[3] = {0, 0, 0}, side[3] = {0, 0, 0};
+        Paint front, sides, back;  // (a colour is drawn from face and side, as it always was)
         V3 place(V3 p) const { return rot * ((p - pivot) * s) + pivot + move; }
+        V3 unplace(V3 q) const { return transposed(rot) * (q - pivot - move) * (1 / s) + pivot; }
     };
     const float face[3] = {float(g.p("color.r", t, 0.95)), float(g.p("color.g", t, 0.95)), float(g.p("color.b", t, 0.95))};
     const float side[3] = {float(g.p("side_color.r", t, 0.45)), float(g.p("side_color.g", t, 0.5)), float(g.p("side_color.b", t, 0.6))};
+    // Each face's fill: its colour, a gradient from that colour at the title's top to a second at its bottom, or a
+    // track's picture fitted to the title's box. The back is filled as the front unless it has a fill of its own.
+    struct FacePaint {
+        int kind = 0;
+        float c1[3] = {0, 0, 0}, c2[3] = {0, 0, 0};
+        const Image* picture = nullptr;
+    };
+    auto facePaint = [&](const std::string& pre, int fill, const float* def, const Image* pic) {
+        FacePaint fp;
+        fp.kind = fill == 1 ? 1 : fill == 2 && pic && !pic->empty() ? 2 : 0;
+        fp.picture = fp.kind == 2 ? pic : nullptr;
+        const char* ch[3] = {".r", ".g", ".b"};
+        for (int q = 0; q < 3; ++q) {
+            fp.c1[q] = float(g.p(pre + "color" + ch[q], t, def[q]));
+            fp.c2[q] = float(g.p(pre + "color2" + ch[q], t, fp.c1[q]));
+        }
+        return fp;
+    };
+    const float backDef[3] = {face[0], face[1], face[2]};
+    const int backFill = int(std::lround(g.p("back_fill", t, 0)));  // 0 as the front, 1 colour, 2 gradient, 3 picture
+    const FacePaint frontPaint = facePaint("", int(std::lround(g.p("face_fill", t, 0))), face, pictures ? &pictures->front : nullptr);
+    const FacePaint sidePaint = facePaint("side_", int(std::lround(g.p("side_fill", t, 0))), side, pictures ? &pictures->sides : nullptr);
+    const FacePaint backPaint = facePaint("back_", backFill - 1, backDef, pictures ? &pictures->back : nullptr);
+    const bool backOwn = backFill >= 1 && backFill <= 3;
     // Each outline and how it stands: its depth, and (a letter the animations move, turn, scale or colour) where it
     // turns about, how, how far it moves and its own colours.
     struct Outline {
@@ -247,6 +333,9 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
         double ox = 0, oy = 0, oz = 0, rx = 0, ry = 0, rz = 0, s = 1;  // raster pixels (y up, z towards the camera), degrees
         std::array<double, 3> face{0, 0, 0}, side{0, 0, 0};
         bool coloured = false;
+        // The same mixes as base * keep + add, for a face painted with a gradient or a picture.
+        double faceKeep = 1, sideKeep = 1;
+        std::array<double, 3> faceAdd{0, 0, 0}, sideAdd{0, 0, 0};
     };
     std::vector<Outline> outlines;
     const double baseDepth = std::max(0.0, g.p("depth", t, 40)) * px;
@@ -279,9 +368,14 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
                 const double fm = std::clamp(g.p(pre + "fill_mix", t) / 100 * v, 0.0, 1.0), sm = std::clamp(g.p(pre + "side_mix", t) / 100 * v, 0.0, 1.0);
                 const char* ch[3] = {".r", ".g", ".b"};
                 for (int q = 0; q < 3; ++q) {
-                    o.face[size_t(q)] += (std::clamp(g.p(pre + "fill" + ch[q], t, 1), 0.0, 1.0) - o.face[size_t(q)]) * fm;
-                    o.side[size_t(q)] += (std::clamp(g.p(pre + "side" + ch[q], t, 1), 0.0, 1.0) - o.side[size_t(q)]) * sm;
+                    const double fc = std::clamp(g.p(pre + "fill" + ch[q], t, 1), 0.0, 1.0), sc = std::clamp(g.p(pre + "side" + ch[q], t, 1), 0.0, 1.0);
+                    o.face[size_t(q)] += (fc - o.face[size_t(q)]) * fm;
+                    o.side[size_t(q)] += (sc - o.side[size_t(q)]) * sm;
+                    o.faceAdd[size_t(q)] = o.faceAdd[size_t(q)] * (1 - fm) + fc * fm;
+                    o.sideAdd[size_t(q)] = o.sideAdd[size_t(q)] * (1 - sm) + sc * sm;
                 }
+                o.faceKeep *= 1 - fm;
+                o.sideKeep *= 1 - sm;
                 o.coloured = o.coloured || fm > 0 || sm > 0;
             }
             // (letters as deep as each other and left in place are one outline, so where they overlap they merge, as a
@@ -323,6 +417,9 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
         box = box.isNull() ? simple.back().boundingRect() : box.united(simple.back().boundingRect());
     }
     const QPointF centre = box.center();
+    // Where a point of the text (centred, y up) is across the title's box, for a face's gradient or picture.
+    const double boxW = std::max(1e-9, box.width()), boxH = std::max(1e-9, box.height());
+    auto across = [&](V3 q, double& u, double& v) { u = q.x / boxW + 0.5, v = 0.5 - q.y / boxH; };
     std::vector<Solid> solids;
     for (size_t o = 0; o < outlines.size(); ++o) {
         Solid so;
@@ -366,6 +463,28 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
             so.move = {ol.ox, ol.oy, ol.oz};
         }
         for (int q = 0; q < 3; ++q) so.face[q] = ol.own ? float(ol.face[size_t(q)]) : face[q], so.side[q] = ol.own ? float(ol.side[size_t(q)]) : side[q];
+        // Its paints: the title's, mixed as the animations mix its colours (the back as the front's, unless it has
+        // its own).
+        auto paintOf = [&](const FacePaint& fp, double keep, const std::array<double, 3>& add, const float* colour) {
+            Paint pt;
+            pt.kind = fp.kind;
+            pt.picture = fp.picture;
+            for (int q = 0; q < 3; ++q) pt.c1[q] = fp.c1[q], pt.c2[q] = fp.c2[q], pt.add[q] = ol.own ? float(add[size_t(q)]) : 0.0f;
+            pt.keep = ol.own ? float(keep) : 1.0f;
+            if (pt.kind == 0)  // (a colour: as it always was)
+                for (int q = 0; q < 3; ++q) pt.c1[q] = colour[q], pt.add[q] = 0, pt.keep = 1;
+            return pt;
+        };
+        so.front = paintOf(frontPaint, ol.faceKeep, ol.faceAdd, so.face);
+        so.sides = paintOf(sidePaint, ol.sideKeep, ol.sideAdd, so.side);
+        if (backOwn) {
+            so.back = paintOf(backPaint, ol.faceKeep, ol.faceAdd, so.face);
+            if (backPaint.kind == 0)  // (its own colour, mixed as the front's is)
+                for (int q = 0; q < 3; ++q)
+                    so.back.c1[q] = ol.own ? float(backPaint.c1[q] * ol.faceKeep + ol.faceAdd[size_t(q)]) : backPaint.c1[q];
+        } else {
+            so.back = so.front;
+        }
         solids.push_back(std::move(so));
     }
     if (solids.empty()) return out;
@@ -448,13 +567,24 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
                 light.shade(Rs * nb, quad[1].p, so.side, quad[1].c);
                 light.shade(Rs * nb, quad[2].p, so.side, quad[2].c);
                 light.shade(Rs * na, quad[3].p, so.side, quad[3].c);
+                const bool painted = so.sides.kind != 0;
+                if (painted) {
+                    const V3* at[4] = {&c.pts[i], &c.pts[j], &c.pts[j], &c.pts[i]};
+                    const V3* nn[4] = {&na, &nb, &nb, &na};
+                    for (int q = 0; q < 4; ++q) {
+                        across(*at[q], quad[size_t(q)].u, quad[size_t(q)].v);
+                        light.parts(Rs * *nn[q], quad[size_t(q)].p, quad[size_t(q)].lm, quad[size_t(q)].la);
+                    }
+                }
                 const std::vector<Corner> poly = clipNear(quad, cam.nearest);
                 for (size_t m = 1; m + 1 < poly.size(); ++m) {
                     Tri tr;
                     const Corner* cs[3] = {&poly[0], &poly[m], &poly[m + 1]};
+                    if (painted) tr.paint = &so.sides;
                     for (int v = 0; v < 3; ++v) {
                         tr.v[v] = cam.project(cs[v]->p);
                         std::copy(cs[v]->c, cs[v]->c + 3, tr.c[v]);
+                        tr.u[v] = cs[v]->u, tr.uv[v] = cs[v]->v, tr.lm[v] = cs[v]->lm, tr.la[v] = cs[v]->la;
                         grow(tr.v[v]);
                     }
                     tris.push_back(tr);
@@ -473,6 +603,11 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
         V3 normal;
         double nd = 0;  // the plane: dot(normal, p) == nd
         float col[3];
+        // Painted (a gradient or a picture): the paint, its light (col = min(1, paint * lm + la)) and its solid, to
+        // find where each sample is on the text.
+        const Paint* paint = nullptr;
+        float lm = 0, la = 0;
+        const Solid* solid = nullptr;
     };
     std::vector<Face> faces;
     for (const Solid& so : solids)
@@ -484,7 +619,15 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
         const V3 onPlane = toCam(so, {0, 0, z});
         fc.nd = dot(fc.normal, onPlane);
         if (so.depth > 0 && fc.nd >= 0) continue;  // facing away
-        light.shade(fc.normal, onPlane, so.face, fc.col);
+        const Paint& paint = face_ == 0 ? so.front : so.back;
+        if (paint.kind != 0) {
+            fc.paint = &paint, fc.solid = &so;
+            light.parts(fc.normal, onPlane, fc.lm, fc.la);
+        } else if (face_ == 1) {
+            light.shade(fc.normal, onPlane, paint.c1, fc.col);  // (the back's colour: the front's unless its own)
+        } else {
+            light.shade(fc.normal, onPlane, so.face, fc.col);
+        }
         for (const Contour& c : so.contours) {
             std::vector<Corner> ring(c.pts.size());
             for (size_t i = 0; i < c.pts.size(); ++i) ring[i].p = toCam(so, {c.pts[i].x, c.pts[i].y, z});
@@ -507,6 +650,7 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
         return out;  // too big to draw: left out rather than taking the render down
     }
     Raster& r = *raster;
+    const M3 Rt = transposed(R);
     for (const Tri& tr : tris) fillTriangle(r, tr);
     for (const Face& fc : faces) {
         parallelRows(r.H, [&](int b0, int b1) {
@@ -536,6 +680,18 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
                         if (std::fabs(den) < 1e-12) continue;
                         const double dist = fc.nd / den;
                         if (dist < cam.nearest) continue;
+                        if (fc.paint) {
+                            // (the sample back on the text: through the camera, the title's turn and scale, and the
+                            // solid's own)
+                            const V3 q = Rt * (ray * dist - T) * (1 / k);
+                            double u, v;
+                            across(fc.solid->unplace(q), u, v);
+                            float col[3];
+                            fc.paint->at(u, v, col);
+                            for (int ch = 0; ch < 3; ++ch) col[ch] = std::min(1.0f, col[ch] * fc.lm + fc.la);
+                            r.plot(x, y, float(1 / dist), col);
+                            continue;
+                        }
                         r.plot(x, y, float(1 / dist), fc.col);
                     }
                 }
