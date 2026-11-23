@@ -213,17 +213,31 @@ void Channel::unlinkNames() {
 
 uint32_t Host::crashCode() const { return control.h ? control.h->crashed.load(std::memory_order_acquire) : 0; }
 
+void Host::asked(const std::string& id) {
+    std::lock_guard lock(askedM_);
+    if (!id.empty() && std::find(asked_.begin(), asked_.end(), id) == asked_.end()) asked_.push_back(id);
+}
+
 std::string Host::loading() const {
     if (!control.h) return {};
     // (written by the host, so read only as far as its field goes)
-    return std::string(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
+    const std::string noted(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
+    if (noted.empty() || control.h->loadingBytes <= noted.size()) return noted;
+    // An id longer than the field: the whole of it is one Montage asked this host to load, found by its length and
+    // hash (the field holds its beginning).
+    std::lock_guard lock(askedM_);
+    for (const std::string& id : asked_)
+        if (wasLoading(id)) return id;
+    return noted;
 }
 
 bool Host::wasLoading(const std::string& id) const {
-    const std::string noted = loading();
-    if (noted.empty() || id.empty()) return false;
-    if (noted.size() == sizeof control.h->loading - 1) return id.compare(0, noted.size(), noted) == 0;
-    return noted == id;
+    if (!control.h || id.empty()) return false;
+    const std::string noted(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
+    if (noted.empty()) return false;
+    // The whole id, however long: its beginning as far as the field goes, its length and its hash.
+    if (id.compare(0, noted.size(), noted) != 0 || id.size() < noted.size()) return false;
+    return control.h->loadingBytes == id.size() && control.h->loadingHash == wire::idHash(id.data(), id.size());
 }
 
 bool Host::alive() {
@@ -368,6 +382,7 @@ Result call(Channel& c, Host& host, int64_t timeoutUs, const std::function<void(
 
 Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json, const std::string& id) {
     Attached a;
+    host.asked(id);
     std::lock_guard lock(host.controlM);
     const bool alone = host.instances == 0;  // (a shared host may end for another plug-in's doing)
     Channel& k = host.control;

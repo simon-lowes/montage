@@ -3521,6 +3521,61 @@ private slots:
         QVERIFY(reg.find("clap:org.montage.test.delay64").has_value());
     }
 
+    // Ids of 300 bytes that differ in their last byte alone, in one shared host: the one that crashes the host as it
+    // loads is blocked and named whole, and the other, loaded before it, is not taken for it.
+    void longPlugInIdIsBlamedWhole() {
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-long.json"), {clapDir("longa"), clapDir("longb")});
+        reg.scan();
+        const std::string stem = "clap:org.montage.test.long." + std::string(277, 'x');
+        const auto crashes = reg.find(stem + "a"), stays = reg.find(stem + "b");
+        QVERIFY(crashes && stays);
+        QCOMPARE(crashes->id.size(), size_t(305));
+        QCOMPARE(crashes->vendor, stays->vendor);
+        QVERIFY(crashes->path != stays->path);
+        Hosting hostingMode(Isolation::PerVendor, [](HostingSettings& s) { s.autoRestarts = 0; });
+        std::string err;
+        std::unique_ptr<Instance> first;
+        {
+            Fault f("crash:long-a-init");
+            first = instantiate(*stays, &err);
+        }
+        QVERIFY2(first && first->activate(48000, 128), err.c_str());
+        const int64_t shared = hostProcessOf(first.get());
+        QVERIFY(shared > 0);
+        RenderModeScope playing(true);
+        std::vector<float> l(128), r(128);
+        float* ch[2] = {l.data(), r.data()};
+        auto block = [&] {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            first->process(ch, 2, 128);
+        };
+        block();
+        QVERIFY(!instantiate(*crashes, &err));  // (in the same host, which crashes as it loads it)
+        QVERIFY2(err.find("while loading it") != std::string::npos, err.c_str());
+        bool crashesBlocked = false, staysBlocked = false;
+        for (const Blocked& b : reg.blocklist()) {
+            crashesBlocked |= b.path == crashes->path;
+            staysBlocked |= b.path == stays->path;
+        }
+        QVERIFY(crashesBlocked && !staysBlocked);
+        QVERIFY(!reg.find(stem + "a") && reg.find(stem + "b"));
+        // The failure is filed under the whole id, and none under the other's.
+        const auto failure = failureOf(crashes->id);
+        QVERIFY(failure.has_value());
+        QCOMPARE(QString::fromStdString(failure->kind), QString("load"));
+        // The other plays on in a new host: it was only in the one that ended.
+        QVERIFY(eventually([&] {
+            block();
+            return !bypassed(first.get()) && hostProcessOf(first.get()) > 0 && hostProcessOf(first.get()) != shared;
+        }));
+        QVERIFY(!failureOf(stays->id).has_value());
+        reg.unblock(crashes->path);
+        reg.scan();
+        QVERIFY(reg.find(stem + "a").has_value());
+    }
+
     // A host for each instance: a crash in one leaves its sibling (the same plug-in) untouched, for audio and OpenFX.
     void hostPerInstanceKeepsSiblingsApart() {
         const auto gain = testPlugin("gain");

@@ -141,6 +141,11 @@ target_compile_definitions(montage_test_hang PRIVATE MONTAGE_TEST_HANG)
 montage_test_clap(montage_test_crash MontageTestCrash crash plugins/test_clap_misbehaving.c)
 target_compile_definitions(montage_test_crash PRIVATE MONTAGE_TEST_CRASH)
 montage_test_clap(montage_test_latency MontageTestLatency latency plugins/test_clap_latency.c)
+# (the same plug-in under ids of 300 bytes that differ in their last byte: long ids blamed and blocked whole)
+montage_test_clap(montage_test_long_a MontageTestLongA longa plugins/test_clap_latency.c)
+target_compile_definitions(montage_test_long_a PRIVATE MONTAGE_TEST_LONG_ID="a")
+montage_test_clap(montage_test_long_b MontageTestLongB longb plugins/test_clap_latency.c)
+target_compile_definitions(montage_test_long_b PRIVATE MONTAGE_TEST_LONG_ID="b")
 montage_test_clap(montage_test_convolver MontageTestConvolver convolver plugins/test_clap_convolver.c)
 montage_test_clap(montage_test_sidechain MontageTestSidechain sidechain plugins/test_clap_sidechain.c)
 if(NOT WIN32 AND NOT APPLE)
@@ -187,6 +192,7 @@ target_compile_definitions(test_plugins PRIVATE
   MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
   MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
   MONTAGE_PLUGIN_HOST="$<TARGET_FILE:montage-pluginhost>")
+add_dependencies(test_plugins montage_test_long_a montage_test_long_b)
 
 if(TARGET PkgConfig::LILV)
   # An LV2 gain with latency, as a bundle (shared module + Turtle files).

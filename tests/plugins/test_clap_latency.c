@@ -17,7 +17,20 @@ typedef struct {
 } Delay;
 
 static const char* const kFeatures[] = {CLAP_PLUGIN_FEATURE_AUDIO_EFFECT, CLAP_PLUGIN_FEATURE_DELAY, NULL};
-static const clap_plugin_descriptor_t kDesc = {CLAP_VERSION_INIT, "org.montage.test.delay64", "Montage Test Delay 64",
+#ifdef MONTAGE_TEST_LONG_ID
+/* Built again with -DMONTAGE_TEST_LONG_ID="a" (MontageTestLongA.clap) and "b": the same plug-in under an id of 300
+ * bytes whose last byte alone tells the two apart, each misbehaving on request in a call of its own ("long-a-init"). */
+#define X10 "xxxxxxxxxx"
+#define X50 X10 X10 X10 X10 X10
+#define TEST_ID "org.montage.test.long." X50 X50 X50 X50 X50 X10 X10 "xxxxxxx" MONTAGE_TEST_LONG_ID
+#define TEST_NAME "Montage Test Long Id " MONTAGE_TEST_LONG_ID
+#define TEST_INIT "long-" MONTAGE_TEST_LONG_ID "-init"
+#else
+#define TEST_ID "org.montage.test.delay64"
+#define TEST_NAME "Montage Test Delay 64"
+#define TEST_INIT "latency-init"
+#endif
+static const clap_plugin_descriptor_t kDesc = {CLAP_VERSION_INIT, TEST_ID, TEST_NAME,
                                                "Montage", "", "", "", "1.0.0", "Latency test", kFeatures};
 
 static uint32_t ports_count(const clap_plugin_t* p, bool in) { (void)p; (void)in; return 1; }
@@ -38,7 +51,7 @@ static const clap_plugin_latency_t kLatency = {latency_get};
 
 static bool init(const clap_plugin_t* p) {
     (void)p;
-    montage_test_fault("latency-init", NULL, 0);
+    montage_test_fault(TEST_INIT, NULL, 0);
     return true;
 }
 static void destroy(const clap_plugin_t* p) { free(p->plugin_data); }
