@@ -1,4 +1,6 @@
 #include "Voiceover.h"
+
+#include "LiveTake.h"
 #include "Language.h"
 
 #include <QAudioDevice>
@@ -213,6 +215,19 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         return false;
     }
     stopping_ = false;
+    {
+        // The take's waveform is drawn on its track (a grouped take's on each) as its blocks arrive.
+        LiveTake live;
+        live.owner = this;
+        live.sequence = s->id;
+        live.at = at_;
+        live.fps = s->fpsValue();
+        live.rate = rate_;
+        live.channels = channels_;
+        if (groupTracks_.size() > 1) live.tracks = groupTracks_;
+        else live.tracks = {track_};
+        LiveTakes::instance().begin(std::move(live));
+    }
     if (onDevice) {
         // Placed by the playback it follows (the round trip taken off), else the input's latency taken off its start.
         const int64_t first = std::llround(double(at_) / s->fpsValue() * rate_);
@@ -267,7 +282,10 @@ bool VoiceoverRecorder::startLoop(FrameTime in, FrameTime out, FrameTime preroll
     preroll = std::clamp<FrameTime>(preroll, 0, in);
     loopIn_ = in, loopOut_ = out, preroll_ = preroll;
     // (a grouped track's group records with it, as for a single take; the passes share pass ids and take numbers)
-    if (start(in - preroll, track, -1, input, openDevice, sampleRate, channels)) return true;
+    if (start(in - preroll, track, -1, input, openDevice, sampleRate, channels)) {
+        LiveTakes::instance().setLoop(this, in, out, preroll);
+        return true;
+    }
     loopIn_ = loopOut_ = preroll_ = 0;
     groupTracks_.clear();
     return false;
@@ -325,6 +343,7 @@ void VoiceoverRecorder::feed(const float* interleaved, qint64 frames) {
     }
     if (frames > 0) {
         writer_.write(interleaved, frames);
+        LiveTakes::instance().add(this, interleaved, frames);
         float peak = 0;
         for (qint64 i = 0; i < frames * channels_; ++i) peak = std::max(peak, std::fabs(interleaved[i]));
         emit level(peak);
@@ -347,6 +366,7 @@ Id VoiceoverRecorder::stop() {
     }
     const qint64 frames = writer_.frames();
     const bool whole = writer_.close();
+    LiveTakes::instance().end(this);
     if (frames == 0) {
         QFile::remove(path_);
         loopIn_ = loopOut_ = 0;
@@ -577,6 +597,7 @@ void VoiceoverRecorder::cancel() {
         writer_.close();
         QFile::remove(path_);
     }
+    LiveTakes::instance().end(this);
 }
 
 // ---------------------------------------------------------------------------

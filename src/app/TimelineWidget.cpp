@@ -27,6 +27,7 @@
 
 #include "Accessibility.h"
 #include "EditorState.h"
+#include "LiveTake.h"
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "PitchCurves.h"
@@ -143,6 +144,7 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     setAccessibleName(tr("Timeline"));
     pitch_ = new PitchCurves(this);
     connect(pitch_, &PitchCurves::ready, this, [this] { viewport()->update(); });
+    connect(&LiveTakes::instance(), &LiveTakes::changed, this, [this] { viewport()->update(); });  // (a take being recorded)
     horizontalScrollBar()->setSingleStep(20);
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
@@ -919,6 +921,14 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
                     p.setBrush(QColor(61, 139, 255, 60));
                     p.drawRoundedRect(gr, 3, 3);
                 }
+        }
+        // Takes being recorded: each on its track from where it began to where it has reached, its waveform so far.
+        for (const LiveTake& take : LiveTakes::instance().takes()) {
+            if (take.sequence != s->id) continue;
+            for (size_t k = 0; k < take.tracks.size(); ++k)
+                for (const Row& r : rs)
+                    if (r.pinned == band && r.ref == TrackRef{TrackKind::Audio, take.tracks[k]})
+                        paintLiveTake(p, take, k, QRect(kHeaderW, r.y + 2, W - kHeaderW, r.h - 5));
         }
         // Snap indicator, playhead.
         if (snapIndicator_ >= 0 && (drag_.started || !ghosts_.empty())) {
@@ -1732,6 +1742,70 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
             hi = std::max(hi, pk->minmax[b * 2 + 1]);
         }
         int y1 = int(mid - std::min(1.0, hi * gain) * half), y2 = int(mid - std::max(-1.0, lo * gain) * half);
+        p.drawLine(x, y1, x, std::max(y1, y2));
+    }
+}
+
+QRect TimelineWidget::liveTakeRectOn(const LiveTake& take, int audioTrack) const {
+    for (const Row& r : rows())
+        if (r.ref == TrackRef{TrackKind::Audio, audioTrack}) return liveTakeRect(take, QRect(kHeaderW, r.y + 2, viewport()->width() - kHeaderW, r.h - 5));
+    return {};
+}
+
+QRect TimelineWidget::liveTakeRect(const LiveTake& take, const QRect& row) const {
+    qint64 first = 0;
+    FrameTime from = 0;
+    take.pass(first, from);
+    const double frames = double(take.frames - first) / std::max(1, take.rate) * take.fps;
+    const int xs = xForFrame(from), xe = kHeaderW + int(std::lround((double(from) + frames) * ppf_)) - horizontalScrollBar()->value();
+    return QRect(xs, row.top(), std::max(2, xe - xs), row.height());
+}
+
+std::pair<float, float> TimelineWidget::liveTakeLevelAt(const LiveTake& take, size_t track, double frame) const {
+    // The take's lowest and highest sample over the timeline frame `frame` (one frame long), as it is drawn.
+    qint64 first = 0;
+    FrameTime from = 0;
+    take.pass(first, from);
+    if (track >= take.peaks.size()) return {0.0f, 0.0f};
+    const Peaks& pk = take.peaks[track];
+    const double perFrame = double(take.rate) / take.fps;
+    const double sA = double(first) + (frame - double(from)) * perFrame, sB = sA + perFrame;
+    if (sB <= double(first) || sA >= double(take.frames)) return {0.0f, 0.0f};
+    const size_t buckets = pk.minmax.size() / 2;
+    size_t bA = size_t(std::max(0.0, sA / pk.samplesPerBucket)), bB = std::min(buckets, size_t(std::max(0.0, sB / pk.samplesPerBucket)) + 1);
+    float lo = 0, hi = 0;
+    for (size_t b = bA; b < bB; ++b) {
+        lo = std::min(lo, pk.minmax[b * 2]);
+        hi = std::max(hi, pk.minmax[b * 2 + 1]);
+    }
+    return {lo, hi};
+}
+
+void TimelineWidget::paintLiveTake(QPainter& p, const LiveTake& take, size_t track, const QRect& row) {
+    const QRect r = liveTakeRect(take, row);
+    if (r.height() < 6 || track >= take.peaks.size()) return;
+    p.setPen(QPen(QColor(0xe0, 0x4a, 0x4a), 1));
+    p.setBrush(QColor(0xc0, 0x30, 0x30, 110));
+    p.drawRoundedRect(r, 3, 3);
+    qint64 first = 0;
+    FrameTime from = 0;
+    take.pass(first, from);
+    const Peaks& pk = take.peaks[track];
+    const size_t buckets = pk.minmax.size() / 2;
+    const double perFrame = double(take.rate) / take.fps;
+    const double mid = r.center().y(), half = r.height() / 2.0 - 1;
+    p.setPen(QColor(255, 225, 225));
+    for (int x = std::max(r.left(), kHeaderW); x <= std::min(r.right(), viewport()->width()); ++x) {
+        const double sA = double(first) + (frameAtX(x) - double(from)) * perFrame, sB = double(first) + (frameAtX(x + 1) - double(from)) * perFrame;
+        if (sB <= double(first) || sA >= double(take.frames)) continue;
+        const size_t bA = size_t(std::max(0.0, sA / pk.samplesPerBucket));
+        const size_t bB = std::min(buckets, size_t(std::max(0.0, sB / pk.samplesPerBucket)) + 1);
+        float lo = 0, hi = 0;
+        for (size_t b = bA; b < bB; ++b) {
+            lo = std::min(lo, pk.minmax[b * 2]);
+            hi = std::max(hi, pk.minmax[b * 2 + 1]);
+        }
+        const int y1 = int(mid - std::min(1.0f, hi) * half), y2 = int(mid - std::max(-1.0f, lo) * half);
         p.drawLine(x, y1, x, std::max(y1, y2));
     }
 }

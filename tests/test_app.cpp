@@ -240,6 +240,9 @@
 #include "MergeDialog.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
+#include "LiveTake.h"
+#include "audio/RtGuard.h"
+#include <QtEndian>
 #include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
 #include "TrackGroupsDialog.h"
@@ -2463,6 +2466,191 @@ private slots:
         r = call({{"action", "set"}, {"settings", QJsonObject{{"host", "qt"}}}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         audiodev::setLoopbackOptions({});
+    }
+
+    // Sets the audio device chosen in Monitoring through its tool (montage_audio_device), as the panel does.
+    QJsonObject setAudioDevice(const QJsonObject& settings) {
+        QJsonObject answer;
+        const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 7}, {"method", "tools/call"},
+                            {"params", QJsonObject{{"name", "montage_audio_device"}, {"arguments", QJsonObject{{"action", "set"}, {"settings", settings}}}}}};
+        win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                 [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+        return answer;
+    }
+
+    // A JACK server of the tests' own under the dummy driver, when jackd and a JACK library are here; false when not.
+    bool startJackServer(QProcess& jackd) {
+        const QString exe = QStandardPaths::findExecutable(QStringLiteral("jackd"));
+        if (exe.isEmpty() || audiodev::jackLibrary().empty()) return false;
+        const QString server = QStringLiteral("montage-app-test-%1").arg(QCoreApplication::applicationPid());
+        qputenv("JACK_DEFAULT_SERVER", server.toUtf8());
+        qputenv("JACK_NO_AUDIO_RESERVATION", "1");
+        jackd.start(exe, {"--no-realtime", "-n", server, "-d", "dummy", "-r", "48000", "-p", "256"});
+        return jackd.waitForStarted(5000);
+    }
+
+    // Opens the device on `host` ("loopback" or "jack"), trying for ten seconds (a server takes a moment to answer).
+    bool openAudioDevice(const QString& host) {
+        QElapsedTimer t;
+        t.start();
+        do {
+            setAudioDevice({{"host", "qt"}});
+            setAudioDevice({{"host", host}, {"buffer", 256}, {"sample_rate", 0}, {"inputs", 2}});
+            if (audiodev::Engine::shared().isOpen()) return true;
+            QTest::qWait(200);
+        } while (t.elapsed() < 10000);
+        return false;
+    }
+
+    void takeWaveformWhileRecording() {
+        // A take's waveform is drawn on its track while it is recorded. A 1 kHz burst sent out of the loopback device
+        // comes back into the take: before the take stops the track shows the burst where it will lie, and once it has
+        // stopped the take's file has that waveform, bucket for bucket.
+        const int rate = 48000;
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/live-take.montage"));
+        const double fps = state()->sequence()->fpsValue();
+        ppf_ = measurePpf();
+        audiodev::setLoopbackOptions({256, 512, 0});
+        // (back to the usual device however the test ends)
+        auto usualDevice = qScopeGuard([&] {
+            setAudioDevice({{"host", "qt"}});
+            audiodev::setLoopbackOptions({});
+        });
+        QVERIFY(openAudioDevice(QStringLiteral("loopback")));
+        auto& engine = audiodev::Engine::shared();
+        {
+            VoiceoverRecorder rec(state());
+            QVERIFY(rec.start(30, 1));
+            QVERIFY(LiveTakes::instance().takeOf(&rec));
+            std::atomic<int64_t> sent{0};
+            const int64_t burstAt = rate / 2, burstLong = 14400;
+            std::string error;
+            int out = engine.addOutput(nullptr, rate, 2, [&](float* o, int channels, int frames) -> int64_t {
+                const int64_t at = sent.load();
+                for (int i = 0; i < frames; ++i) {
+                    const int64_t n = at + i;
+                    const float v = n >= burstAt && n < burstAt + burstLong ? float(0.5 * std::sin(2 * M_PI * 1000 * double(n) / rate)) : 0.0f;
+                    for (int c = 0; c < channels; ++c) o[size_t(i) * size_t(channels) + size_t(c)] = v;
+                }
+                sent = at + frames;
+                return -1;
+            }, &error);
+            QVERIFY2(out >= 0, error.c_str());
+            // (the burst's sender reads this scope's variables: taken off the device however the test ends)
+            auto unhook = qScopeGuard([&] {
+                if (out >= 0) engine.removeOutput(out);
+            });
+            QElapsedTimer clock;
+            clock.start();
+            while (rec.seconds() < 1.6 && clock.elapsed() < 30000) QTest::qWait(20);
+            QVERIFY(rec.seconds() >= 1.6);
+            QVERIFY(rec.isRecording());
+
+            // While it records: the take as the timeline has it (no events run until it has been looked at).
+            const LiveTake* take = LiveTakes::instance().takeOf(&rec);
+            QVERIFY(take);
+            QCOMPARE(take->tracks, std::vector<int>{1});
+            QCOMPARE(take->at, FrameTime(30));
+            const Peaks live = take->peaks.at(0);
+            const qint64 liveFrames = take->frames;
+            const size_t whole = size_t(liveFrames / live.samplesPerBucket);
+            QVERIFY(whole > size_t(1.5 * rate / 256));
+            size_t first = 0, last = 0;
+            for (size_t b = 0; b < whole; ++b)
+                if (live.minmax[b * 2 + 1] > 0.25f) {
+                    if (!first) first = b;
+                    last = b;
+                }
+            QVERIFY(first > 0);
+            // (14400 samples are 56.25 buckets: 57 or 58 hold some of it)
+            QVERIFY2(std::abs(int(last - first + 1) - 57) <= 1, qPrintable(QStringLiteral("%1 to %2").arg(first).arg(last)));
+            for (size_t b = 0; b < whole; ++b)
+                if (b + 1 < first || b > last + 1) QVERIFY2(live.minmax[b * 2 + 1] < 1e-4f && live.minmax[b * 2] > -1e-4f, qPrintable(QString::number(b)));
+            // On the timeline it lies on A2 from frame 30 to where it has reached, the burst inside it at its place.
+            const TrackRef a2{TrackKind::Audio, 1};
+            const QRect drawn = timeline()->liveTakeRectOn(*take, 1);
+            QVERIFY(!drawn.isEmpty());
+            QVERIFY(std::abs(drawn.left() - pointFor(30, a2).x()) <= 1);
+            QVERIFY(std::abs(drawn.center().y() - pointFor(30, a2).y()) <= 8);
+            const double reached = 30 + double(liveFrames) / rate * fps;
+            QVERIFY(std::abs(drawn.right() - pointFor(0, a2).x() - reached * ppf_) <= 2);
+            const double burstFrame = 30 + (double(first) + 28) * 256 / rate * fps, quietFrame = 30 + (double(first) - 12) * 256 / rate * fps;
+            const auto inBurst = timeline()->liveTakeLevelAt(*take, 0, burstFrame);
+            const auto inQuiet = timeline()->liveTakeLevelAt(*take, 0, quietFrame);
+            // (a mono take is drawn as its file reads, -3 dB on each side: 0.5 comes back as 0.354)
+            QVERIFY2(inBurst.second > 0.3f && inBurst.first < -0.3f, qPrintable(QStringLiteral("%1 %2").arg(inBurst.first).arg(inBurst.second)));
+            QVERIFY(inQuiet.second < 1e-4f && inQuiet.first > -1e-4f);
+            // And it is painted: the column at the burst's middle has far more of the waveform's colour than one in
+            // the silence before it.
+            const QImage shot = timeline()->viewport()->grab().toImage();
+            auto inked = [&](double frame) {
+                const int x = drawn.left() + int(std::lround((frame - 30) * ppf_));
+                const int quietX = drawn.left() + int(std::lround((quietFrame - 30) * ppf_));
+                int n = 0;
+                for (int y = drawn.top() + 1; y < drawn.bottom(); ++y)
+                    if (shot.pixel(x, y) != shot.pixel(quietX, y)) ++n;
+                return n;
+            };
+            QVERIFY2(inked(burstFrame) >= drawn.height() / 4, qPrintable(QString::number(inked(burstFrame))));
+
+            // Stopped: the clip takes its place, and its file's waveform is what was drawn.
+            engine.removeOutput(out);
+            out = -1;
+            const Id clip = rec.stop();
+            QVERIFY(clip);
+            QVERIFY(!LiveTakes::instance().takeOf(&rec));
+            const Clip* c = edit::clipById(*state()->sequence(), clip);
+            QVERIFY(c && c->start == 30);
+            QCOMPARE(edit::locate(*state()->sequence(), clip)->track, a2);
+            std::vector<float> lo, hi;
+            QVERIFY(decodeAudioBlocks(rec.lastTake().toStdString(), rate, 256, [&](const std::vector<float>& mono) {
+                lo.push_back(*std::min_element(mono.begin(), mono.end()));
+                hi.push_back(*std::max_element(mono.begin(), mono.end()));
+                return true;
+            }));
+            QVERIFY(lo.size() >= whole);
+            for (size_t b = 0; b < whole; ++b) {
+                QVERIFY2(std::fabs(std::min(lo[b], 0.0f) - live.minmax[b * 2]) < 1e-4f, qPrintable(QString::number(b)));
+                QVERIFY2(std::fabs(std::max(hi[b], 0.0f) - live.minmax[b * 2 + 1]) < 1e-4f, qPrintable(QString::number(b)));
+            }
+        }
+        usualDevice.dismiss();
+        QVERIFY(!setAudioDevice({{"host", "qt"}}).value("isError").toBool());
+        audiodev::setLoopbackOptions({});
+
+        // A loop recording (fed by hand) draws the pass being recorded, from In; a grouped take a channel on each of
+        // its tracks.
+        {
+            const FrameTime in = FrameTime(std::llround(fps * 2)), out = in + FrameTime(std::llround(fps)), preroll = FrameTime(std::llround(fps / 2));
+            VoiceoverRecorder loop(state());
+            QVERIFY(loop.startLoop(in, out, preroll, 0, {}, false, rate, 1));
+            const qint64 lead = qint64(std::llround(double(preroll) / fps * rate)), round = qint64(std::llround(double(out - in) / fps * rate));
+            auto feed = [&](qint64 frames, float v) {
+                std::vector<float> block(size_t(frames), v);
+                loop.feed(block.data(), frames);
+            };
+            feed(lead, 0.1f);
+            const LiveTake* lt = LiveTakes::instance().takeOf(&loop);
+            QVERIFY(lt);
+            qint64 firstSample = -1;
+            FrameTime from = -1;
+            lt->pass(firstSample, from);
+            QCOMPARE(from, in - preroll);  // (the lead-in, drawn from where the take began)
+            feed(round, 0.2f);
+            feed(round / 2, 0.6f);
+            lt = LiveTakes::instance().takeOf(&loop);
+            lt->pass(firstSample, from);
+            QCOMPARE(from, in);
+            QCOMPARE(firstSample, lead + round);
+            const QRect pass = timeline()->liveTakeRectOn(*lt, 0);
+            QVERIFY(std::abs(pass.left() - pointFor(in, A1).x()) <= 1);
+            QVERIFY(std::abs(pass.width() - double(out - in) / 2 * ppf_) <= 2);
+            QVERIFY(std::fabs(timeline()->liveTakeLevelAt(*lt, 0, double(in) + 2).second - 0.6f * float(M_SQRT1_2)) < 1e-6f);  // (this pass, not the one before; mono, -3 dB)
+            QCOMPARE(timeline()->liveTakeLevelAt(*lt, 0, double(out) - 2).second, 0.0f);                     // (not reached yet)
+            loop.cancel();
+            QVERIFY(!LiveTakes::instance().takeOf(&loop));
+        }
     }
 
     void oscControl() {
