@@ -52,6 +52,17 @@ jobs:
         run: |
           scripts/build-svt-jpegxs.sh ~/svt-jpegxs
           echo "MONTAGE_TEST_SVTJPEGXS=$HOME/svt-jpegxs/bin" >> "$GITHUB_ENV"
+      # SVT-AV1 v4.3.0, from a pinned tag checked against its commit: its encoder reads the film grain tables Montage
+      # writes (--fgs-table), and the grain tests read the parameters it codes from them with Montage's own reader.
+      - name: Cache SVT-AV1
+        uses: actions/cache@v4
+        with:
+          path: ~/svt-av1
+          key: svt-av1-${{ runner.os }}-${{ hashFiles('scripts/build-svt-av1.sh') }}
+      - name: SVT-AV1
+        run: |
+          scripts/build-svt-av1.sh ~/svt-av1
+          echo "MONTAGE_TEST_SVTAV1=$HOME/svt-av1/bin" >> "$GITHUB_ENV"
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DMONTAGE_WITH_AV2=ON -DAV2_ROOT="$HOME/av2" -DSVTJPEGXS_ROOT="$HOME/svt-jpegxs" -DMONTAGE_REQUIRE_JPEGXS=ON
       - name: Build
