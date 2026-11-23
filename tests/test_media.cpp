@@ -21789,6 +21789,27 @@ if __name__ == '__main__':
         QVERIFY2(worst < 1e-3f, qPrintable(QString::number(worst)));
         QVERIFY2(peakRaw > 0.35f && peakBaked < 0.11f, qPrintable(QString("%1 %2").arg(peakRaw).arg(peakBaked)));
 
+        // A reversed clip's sound begins with the last sample of its stretch of the take (frames 17 to 67: sample
+        // 67 x 1920 - 1) and runs back from there: it is stamped with that sample's time, and that is what it holds.
+        {
+            Project pr = p;
+            Sequence& sq = *pr.active();
+            Clip* rc = edit::clipById(sq, c->id);
+            QVERIFY(rc);
+            rc->reverse = true;
+            const std::string reversed = path("tc-reversed.wav");
+            QVERIFY2(extractClipSound(pr, sq, rc->id, reversed, &err), err.c_str());
+            const auto rch = chunks(reversed);
+            QVERIFY(rch.count("bext") && rch.at("bext")[0].size() >= 602);
+            const int64_t firstPlayed = 67 * 1920 - 1;
+            QCOMPARE(int64_t(qFromLittleEndian<quint64>(rch.at("bext")[0].constData() + 338)), int64_t(stamped) + firstPlayed);
+            AudioBufferPtr back = decodeAudio(reversed, sr, &err);
+            QVERIFY(back && back->frames() >= sr);
+            float off = 0;
+            for (int64_t i = 0; i < sr; ++i) off = std::max(off, std::fabs(back->samples[size_t(i) * 2] - take.samples[size_t(firstPlayed - i) * 2]));
+            QVERIFY2(off < 1e-3f, qPrintable(QString::number(off)));
+        }
+
         // Stamping again replaces the chunks (one of each), and leaves the sound as it was.
         const QByteArray soundBefore = chunks(extracted).at("data")[0];
         BroadcastStamp again;

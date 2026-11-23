@@ -3723,7 +3723,11 @@ BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip&
     const MediaItem* m = p.findMedia(c.mediaId);
     // The source's timecode where the clip starts: its media's start (midnight without one) plus the clip's offset.
     // Samples since midnight: past 24:00:00 it goes round.
-    st.seconds = std::fmod(std::max(0.0, (m && m->timecode >= 0 ? m->timecode : 0.0) + c.sourceAt(0) / seq.fpsValue()), 86400.0);
+    // A reversed clip's sound begins with the last sample of its stretch of the source and runs back from there: its
+    // stamp is that sample's time (one sample of the clip's speed before the stretch's end), not its first frame's.
+    double first = c.sourceAt(0) / seq.fpsValue();
+    if (c.reverse) first = (double(c.sourceIn) + double(c.duration) * c.speed) / seq.fpsValue() - c.speed / double(std::max(1, seq.sampleRate));
+    st.seconds = std::fmod(std::max(0.0, (m && m->timecode >= 0 ? m->timecode : 0.0) + first), 86400.0);
     st.timecodeRate = m && m->fps.valid() ? m->fps : seq.fps;
     st.description = c.name;
     if (m) {

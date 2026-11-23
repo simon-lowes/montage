@@ -363,8 +363,9 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
 // when it cannot be stamped.
 bool extractClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                       const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
-// What such a WAV is stamped with: the source's timecode at the clip's first frame (its media's start timecode, or
-// midnight without one, plus the clip's in-point; round again past midnight), the recording's timecode rate (its own,
+// What such a WAV is stamped with: the source's timecode at the clip's first sample played (its media's start timecode,
+// or midnight without one, plus the clip's in-point, or for a reversed clip the last sample of its stretch of the
+// source, where its sound begins; round again past midnight), the recording's timecode rate (its own,
 // else its frame rate, else the sequence's), the clip's name as its description and the media's project, scene, take
 // and tape.
 struct BroadcastStamp;
