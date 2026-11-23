@@ -30662,7 +30662,9 @@ colorspaces:
         // a seed that changes every frame and scaling points that change at the cut. Decoded by dav1d, the grain it puts
         // back measures as each shot's did (its strength in every stop measured within 15 %, the darkest within 25 %, its
         // size within half a pixel); with dav1d's grain left off the picture is the clean one, well above the grainy
-        // one's PSNR. The file is smaller than one coding the grain as picture at the same setting (both sizes reported).
+        // one's PSNR. At an equal VMAF (90; the carried file's picture against the cleaned master, the other against the
+        // grainy one) the file is at least 30 % smaller than one coding the grain as picture; at the same CRF it is smaller
+        // too (all sizes reported).
         const char* encoder = avcodec_find_encoder_by_name("libsvtav1") ? "libsvtav1" : avcodec_find_encoder_by_name("libaom-av1") ? "libaom-av1" : nullptr;
         if (!encoder || !avcodec_find_decoder_by_name("libdav1d")) QSKIP("This FFmpeg has no AV1 encoder, or no dav1d");
         const ColorSpace& space = rec709Space();
@@ -30838,6 +30840,86 @@ colorspaces:
             QVERIFY2(std::fabs(grainSize(back) - grainSize(source)) < 0.5, qPrintable(QString("%1 for %2").arg(grainSize(back)).arg(grainSize(source))));
             QVERIFY2(clean > 38 && clean > withGrain + 3, qPrintable(QString("%1 %2").arg(clean).arg(withGrain)));
         }
+
+        // At an equal VMAF: for each file the coarsest whole CRF at which it reaches VMAF 90, the file carrying the grain
+        // scored (its picture, as a decoder shows it with the grain left off) against the cleaned master, the one coding
+        // the grain as picture against the grainy master. Both masters are lossless (FFV1) and each encode is made from its
+        // own; the carried file's size is taken after its parameters are written.
+        if (!vmafAvailable()) return;
+        Project clean = p;
+        {
+            std::vector<Clip>& clips = clean.active()->videoTracks[0].clips;
+            QCOMPARE(clips.size(), size_t(2));
+            for (size_t shot = 0; shot < clips.size(); ++shot) {
+                Effect e = makeEffect(clean, "grain_match");
+                e.params["source"] = 0.0, e.params["mode"] = 1.0, e.params["amount"] = 0.0;
+                e.strings["profile"] = grainProfileText(rep.shots[shot].profile);
+                clips[shot].effects.push_back(e);
+            }
+        }
+        auto master = [&](const Project& from, const QString& name) {
+            ExportSettings m;
+            m.videoCodec = "ffv1", m.pixFmt = "yuv420p", m.audioCodec = "none";
+            m.path = dir.filePath(name).toStdString();
+            std::string why;
+            return exportSequence(from, *from.active(), m, {}, nullptr, &why) ? m.path : std::string();
+        };
+        const std::string cleanMaster = master(clean, "clean-master.mkv"), grainyMaster = master(p, "grainy-master.mkv");
+        QVERIFY(!cleanMaster.empty() && !grainyMaster.empty());
+        // (each CRF tried once; a file, its VMAF and its size)
+        auto search = [&](const std::string& from, const QString& name, double target, int* crf, double* vmaf) {
+            Project mp = makeDefaultProject();
+            Sequence& ms = *mp.active();
+            ms.width = W, ms.height = H, ms.fps = {24, 1};
+            MediaItem m;
+            if (!probeMedia(from, m)) return std::string();
+            m.id = mp.newId();
+            mp.media.push_back(m);
+            if (!edit::placeMedia(mp, ms, m.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false).ok) return std::string();
+            CompareOptions o;
+            o.metrics = MetricVmaf;
+            std::map<int, double> tried;
+            auto score = [&](int c) {
+                if (!tried.count(c)) {
+                    ExportSettings e = es;
+                    e.filmGrain.clear();
+                    e.crf = c;
+                    e.path = dir.filePath(QString("%1-%2.mkv").arg(name).arg(c)).toStdString();
+                    std::string why;
+                    const EncodeComparison cmp = exportSequence(mp, ms, e, {}, nullptr, &why) ? compareEncodeFiles(from, e.path, o) : EncodeComparison{};
+                    tried[c] = cmp.ok && cmp.vmafScored ? cmp.mean.vmaf : -1;
+                    qInfo("%s CRF %d: VMAF %.2f, %lld bytes", qPrintable(name), c, tried[c], (long long)QFileInfo(QString::fromStdString(e.path)).size());
+                }
+                return tried[c];
+            };
+            int lo = 4, hi = 63;
+            if (score(lo) < target) return std::string();
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) / 2;
+                if (score(mid) >= target) lo = mid;
+                else hi = mid - 1;
+            }
+            *crf = lo, *vmaf = tried[lo];
+            return dir.filePath(QString("%1-%2.mkv").arg(name).arg(lo)).toStdString();
+        };
+        const double target = 90;
+        int crfCarried = 0, crfCoded = 0;
+        double vmafCarried = 0, vmafCoded = 0;
+        const std::string carriedFile = search(cleanMaster, "carried", target, &crfCarried, &vmafCarried);
+        const std::string codedFile = search(grainyMaster, "coded", target, &crfCoded, &vmafCoded);
+        QVERIFY2(!carriedFile.empty() && !codedFile.empty(), "a file short of the target at the finest CRF tried");
+        QVERIFY2(carryAv1Grain(carriedFile, [&](int64_t frame) {
+            const Av1GrainShot& sh = rep.shots[frame < kFrames ? 0 : 1];
+            Av1FilmGrain g = sh.grain;
+            g.seed = av1GrainSeed(frame);
+            return g;
+        }, &err), err.c_str());
+        const qint64 atVmafCarried = QFileInfo(QString::fromStdString(carriedFile)).size(), atVmafCoded = QFileInfo(QString::fromStdString(codedFile)).size();
+        const double saving = 1 - double(atVmafCarried) / double(atVmafCoded);
+        qInfo("%s at VMAF %.0f: %lld bytes with the grain carried as parameters (CRF %d, VMAF %.2f against the cleaned master), %lld coding it "
+              "as picture (CRF %d, VMAF %.2f against the grainy master): %.0f %% smaller",
+              encoder, target, (long long)atVmafCarried, crfCarried, vmafCarried, (long long)atVmafCoded, crfCoded, vmafCoded, saving * 100);
+        QVERIFY2(saving >= 0.30, qPrintable(QString("%1 bytes against %2").arg(atVmafCarried).arg(atVmafCoded)));
     }
     void av1GrainTableReadBySvtAv1() {
         // A film grain table as Montage writes it, two shots of parameters, given to SVT-AV1's own encoder
