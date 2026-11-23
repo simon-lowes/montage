@@ -347,6 +347,7 @@ public:
     explicit MixerDevice(QObject* parent) : QIODevice(parent) {
         mixer_.setNonBlocking(true);
         mixer_.setOfflineProxies(true);  // (an offline file's proxy is heard while editing)
+        mixer_.setLiveInput(liveInput());
     }
 
     void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16, int channels = 2, bool idle = false) {
@@ -434,6 +435,7 @@ public:
             monitor_->setNonBlocking(true);
             monitor_->setOfflineProxies(true);
             monitor_->setAmbisonicBinaural(binaural_);
+            monitor_->setLiveInput(liveInput());
         }
         monitor_->setSettings(m, rate);
         monitor_->prepare(project_, seq_);
@@ -507,6 +509,7 @@ protected:
         int rate = 48000;
         int monitored = 0;  // the monitoring section's channels, when it is on
         const bool idle = idle_;
+        bool liveIdle = false;  // stopped, with sampler slots sounding on other tracks' strips
         {
             QMutexLocker lock(&m_);
             const Sequence* s = project_ ? project_->findSequence(seq_) : nullptr;
@@ -514,19 +517,54 @@ protected:
                 monitored = monitor_->outputs();
                 mon_.resize(size_t(frames) * size_t(monitored));
             }
+            // The sampler's voices first. A slot sent to another track of this sequence is kept apart and joins that
+            // track's strip in the mix below (its inserts, fader, pan and bus); the rest is added at the output.
+            sends_.clear();
+            if (sampler_) {
+                smp_.assign(size_t(frames) * 2, 0.0f);
+                if (s)
+                    if (const sampler::KitPtr kit = sampler_->kit())
+                        for (const auto& pad : kit->pads) {
+                            const Id to = pad.settings.output;
+                            if (!to || std::any_of(sends_.begin(), sends_.end(), [&](const auto& sd) { return sd.output == to; })) continue;
+                            if (std::any_of(s->audioTracks.begin(), s->audioTracks.end(), [&](const Track& t) { return t.id == to; }))
+                                sends_.push_back({to, nullptr});
+                        }
+                if (sendBufs_.size() < sends_.size()) sendBufs_.resize(sends_.size());
+                for (size_t k = 0; k < sends_.size(); ++k) {
+                    sendBufs_[k].assign(size_t(frames) * 2, 0.0f);
+                    sends_[k].out = sendBufs_[k].data();
+                }
+                sampler_->render(samplerClock_, frames, smp_.data(), sends_.data(), int(sends_.size()));
+                samplerClock_ += frames;
+                if (samplerGain_ != 1.0f)
+                    for (float& v : smp_) v *= samplerGain_;
+                // Stopped, the strips are mixed only while something sent to them sounds, and ten seconds on (tails).
+                bool sounding = false;
+                for (size_t k = 0; k < sends_.size() && !sounding; ++k)
+                    sounding = std::any_of(sendBufs_[k].begin(), sendBufs_[k].end(), [](float v) { return v != 0.0f; });
+                if (sounding) liveTail_ = int64_t(s ? s->sampleRate : 48000) * 10;
+                else liveTail_ = std::max<int64_t>(0, liveTail_ - frames);
+            } else {
+                smp_.clear();
+                liveTail_ = 0;
+            }
+            liveIdle = idle && s && !sends_.empty() && liveTail_ > 0;
             // (In pieces where a loop wraps.)
             for (int done = 0; done < frames;) {
                 const int64_t v = sample_ + done;
                 const int n = int(std::min<int64_t>(frames - done, untilWrap(v)));
                 const int64_t at = looped(v);
+                sendOffset_ = done;
                 if (monitor_)
                     monitor_->render(at, n, mon_.data() + size_t(done) * size_t(monitored), buf_.data() + size_t(done) * 2, &tl,
-                                     s && cycle_ && !idle ? &*cycle_ : nullptr, s && !idle);
+                                     s && cycle_ && !idle ? &*cycle_ : nullptr, s && !idle, liveIdle);
                 else if (s && !idle) mixer_.mix(*project_, *s, at, n, buf_.data() + size_t(done) * 2, &tl);
+                else if (liveIdle) mixer_.mixLive(*project_, *s, at, n, buf_.data() + size_t(done) * 2);
                 else std::fill(buf_.begin() + done * 2, buf_.begin() + (done + n) * 2, 0.0f);
                 done += n;
             }
-            if (s && cycle_ && !monitored) {
+            if (s && cycle_ && !monitored && !idle) {
                 cycle = cycle_;
                 fps = s->fpsValue();
                 rate = s->sampleRate;
@@ -534,15 +572,6 @@ protected:
             first = looped(sample_);
             lastFirst_ = idle || !s ? -1 : first;
             if (!idle) sample_ += frames;
-            if (sampler_) {
-                smp_.assign(size_t(frames) * 2, 0.0f);
-                sampler_->render(samplerClock_, frames, smp_.data());
-                samplerClock_ += frames;
-                if (samplerGain_ != 1.0f)
-                    for (float& v : smp_) v *= samplerGain_;
-            } else {
-                smp_.clear();
-            }
         }
         const bool sampled = !smp_.empty() && !muted_;
         if (sampled && monitored)  // (onto the first two of the monitoring section's channels)
@@ -563,9 +592,9 @@ protected:
                     for (int c = 0; c < channels; ++c)
                         d[size_t(i) * size_t(channels) + size_t(c)] = muted_ || c >= monitored ? 0.0f : mon_[size_t(i) * size_t(monitored) + size_t(c)];
             }
-        } else if (idle && !sampled) {
+        } else if (idle && !liveIdle && !sampled) {
             std::memset(data, 0, size_t(frames) * size_t(bytesPerFrame));
-        } else if (idle) {
+        } else if (idle && !liveIdle) {
             for (int i = 0; i < frames; ++i)
                 for (int c = 0; c < channels; ++c) {
                     const float v = c < 2 ? smp_[size_t(i) * 2 + size_t(c)] : 0.0f;
@@ -670,6 +699,22 @@ private:
     int64_t samplerClock_ = 0;  // (the sampler's own timeline: its notes start at the next block)
     std::vector<float> smp_;
     float samplerGain_ = 1.0f;
+    // The sampler's slots sent to other tracks, this block: their sound apart, added to those strips by the mixer.
+    std::vector<sampler::Engine::Send> sends_;
+    std::vector<std::vector<float>> sendBufs_;
+    int sendOffset_ = 0;     // (frames of the block mixed so far: a loop's wrap mixes it in pieces)
+    int64_t liveTail_ = 0;   // (samples the strips are still mixed for while stopped)
+    AudioMixer::LiveInput liveInput() {
+        return [this](Id track, int frames, float* stereo) {
+            for (const auto& sd : sends_)
+                if (sd.output == track && sd.out) {
+                    const float* from = sd.out + size_t(sendOffset_) * 2;
+                    for (int i = 0; i < frames * 2; ++i) stereo[i] += from[i];
+                    return true;
+                }
+            return false;
+        };
+    }
     AudioMixer mixer_;
     std::unique_ptr<Monitor> monitor_;  // the monitoring section, while it is on
     bool binaural_ = false;

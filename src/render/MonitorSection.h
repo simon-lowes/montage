@@ -173,9 +173,11 @@ public:
     int outputs() const { return section_.outputs(); }
     // `frames` from sample `start`: `out` gets outputs() channels; `heard` (stereo, or null) the programme as heard
     // (for the meters); `tracks` the track meters; `cycle` an ADR cycle whose beeps play. Without `program` (stopped)
-    // only calibration noise and talkback are heard.
+    // only calibration noise and talkback are heard, and with `live` what the live input (AudioMixer::setLiveInput)
+    // sends to the strips.
     void render(int64_t start, int frames, float* out, float* heard = nullptr, std::vector<MeterLevels>* tracks = nullptr,
-                const AdrCycle* cycle = nullptr, bool program = true);
+                const AdrCycle* cycle = nullptr, bool program = true, bool live = false);
+    void setLiveInput(AudioMixer::LiveInput f) { program_.setLiveInput(std::move(f)); }
 
 private:
     MonitorSection section_;

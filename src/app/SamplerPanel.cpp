@@ -17,6 +17,9 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMimeData>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRandomGenerator>
@@ -89,6 +92,21 @@ SamplerPanel::SamplerPanel(EditorState* state, PlaybackController* program, QWid
     table_->viewport()->setAcceptDrops(true);
     table_->viewport()->installEventFilter(this);
     lay->addWidget(table_, 1);
+    curveView_ = new VelocityCurveView;
+    curveView_->setObjectName(QStringLiteral("samplerCurveView"));
+    curveView_->setToolTip(tr("The selected slot's velocity curve: press to add a point, drag to move one, double-click to remove one"));
+    lay->addWidget(curveView_);
+    connect(table_, &QTableWidget::currentCellChanged, this, [this] {
+        if (!refreshing_) refreshCurve();
+    });
+    connect(curveView_, &VelocityCurveView::drawn, this, [this](const std::vector<std::pair<int, int>>& points) {
+        const int row = table_->currentRow();
+        if (row < 0 || !table_->item(row, Key)) return;
+        changeSlot(table_->item(row, Key)->data(Qt::UserRole).toInt(), [&](SamplerSlot& x) {
+            x.velocityPoints = points;
+            x.velocityCurve = points.empty() ? 0 : 3;
+        });
+    });
 
     auto* buttons = new QHBoxLayout;
     auto* add = new QPushButton(tr("Add Sounds…"));
@@ -257,20 +275,25 @@ void SamplerPanel::refreshTable() {
         set(Choke, sl.choke ? QString::number(sl.choke) : QString());
         set(Pitch, QString::number(sl.pitchVariation, 'g', 4));
         set(Level, QString::number(sl.levelVariation, 'g', 4));
-        // How the force played comes out (drawn only from a curve given over MCP), and the track its part of a pass
-        // is recorded onto.
+        // How the force played comes out (drawn: through the points of the curve under the table), and the track its
+        // sound goes to, live and in a pass.
         set(Curve, QString(), false);
         auto* curve = new QComboBox;
         curve->setObjectName(QStringLiteral("samplerCurve%1").arg(sl.key));
         curve->addItems({tr("As Played"), tr("Soft"), tr("Hard"), tr("Drawn")});
-        if (sl.velocityPoints.empty()) qobject_cast<QStandardItemModel*>(curve->model())->item(3)->setEnabled(false);
-        else {
+        if (!sl.velocityPoints.empty()) {
             QStringList pts;
             for (const auto& [in, o] : sl.velocityPoints) pts << QStringLiteral("%1 → %2").arg(in).arg(o);
             curve->setToolTip(tr("Drawn through %1").arg(pts.join(QStringLiteral(", "))));
         }
         curve->setCurrentIndex(std::clamp(sl.velocityCurve, 0, 3));
-        connect(curve, &QComboBox::activated, this, [this, key = sl.key](int i) { changeSlot(key, [i](SamplerSlot& x) { x.velocityCurve = i; }); });
+        connect(curve, &QComboBox::activated, this, [this, key = sl.key](int i) {
+            changeSlot(key, [i](SamplerSlot& x) {
+                x.velocityCurve = i;
+                // (Drawn with nothing drawn yet: a straight line to draw from)
+                if (i == 3 && x.velocityPoints.empty()) x.velocityPoints = {{1, 1}, {127, 127}};
+            });
+        });
         table_->setCellWidget(r, Curve, curve);
         set(Output, QString(), false);
         auto* output = new QComboBox;
@@ -293,6 +316,139 @@ void SamplerPanel::refreshTable() {
     }
     clipPerHitBox_->setChecked(t && t->sampler.clipPerHit);
     refreshing_ = false;
+    refreshCurve();
+}
+
+void SamplerPanel::refreshCurve() {
+    const Track* t = audioTrack();
+    const int row = table_->currentRow();
+    const SamplerSlot* slot = nullptr;
+    if (t && row >= 0 && table_->item(row, Key)) {
+        const int key = table_->item(row, Key)->data(Qt::UserRole).toInt();
+        for (const SamplerSlot& sl : t->sampler.pads)
+            if (sl.key == key) slot = &sl;
+    }
+    curveView_->setSlot(slot);
+}
+
+// ---- The velocity curve, drawn ------------------------------------------------------------------------------------
+
+VelocityCurveView::VelocityCurveView(QWidget* parent) : QWidget(parent) {
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    setEnabled(false);
+}
+
+void VelocityCurveView::setSlot(const SamplerSlot* slot) {
+    if (drag_ >= 0) return;  // (a point is being moved: what is drawn stays until the mouse is let go)
+    has_ = slot != nullptr;
+    slot_ = slot ? *slot : SamplerSlot{};
+    points_ = slot_.velocityCurve == 3 ? slot_.velocityPoints : std::vector<std::pair<int, int>>{};
+    std::sort(points_.begin(), points_.end());
+    setEnabled(has_);
+    update();
+}
+
+QRect VelocityCurveView::plot() const { return rect().adjusted(8, 6, -8, -6); }
+
+QPoint VelocityCurveView::pointFor(int in, int out) const {
+    const QRect r = plot();
+    return {r.left() + int(std::lround((std::clamp(in, 1, 127) - 1) * double(r.width() - 1) / 126.0)),
+            r.bottom() - int(std::lround((std::clamp(out, 1, 127) - 1) * double(r.height() - 1) / 126.0))};
+}
+
+std::pair<int, int> VelocityCurveView::velocitiesAt(const QPoint& p) const {
+    const QRect r = plot();
+    const int in = 1 + int(std::lround((p.x() - r.left()) * 126.0 / std::max(1, r.width() - 1)));
+    const int out = 1 + int(std::lround((r.bottom() - p.y()) * 126.0 / std::max(1, r.height() - 1)));
+    return {std::clamp(in, 1, 127), std::clamp(out, 1, 127)};
+}
+
+int VelocityCurveView::pointNear(const QPoint& p) const {
+    int best = -1, bestD = 8 * 8 + 1;
+    for (size_t i = 0; i < points_.size(); ++i) {
+        const QPoint d = pointFor(points_[i].first, points_[i].second) - p;
+        const int dd = d.x() * d.x() + d.y() * d.y();
+        if (dd < bestD) best = int(i), bestD = dd;
+    }
+    return best;
+}
+
+void VelocityCurveView::paintEvent(QPaintEvent*) {
+    QPainter g(this);
+    g.setRenderHint(QPainter::Antialiasing);
+    const QRect r = plot();
+    g.fillRect(rect(), palette().base());
+    g.setPen(QPen(palette().mid().color(), 1, Qt::DotLine));
+    for (int k = 1; k < 4; ++k) {
+        const QPoint a = pointFor(1 + 126 * k / 4, 1), b = pointFor(1, 1 + 126 * k / 4);
+        g.drawLine(a.x(), r.top(), a.x(), r.bottom());
+        g.drawLine(r.left(), b.y(), r.right(), b.y());
+    }
+    g.setPen(palette().mid().color());
+    g.drawRect(r.adjusted(0, 0, -1, -1));
+    if (!has_) return;
+    // The curve as it plays (through what is being drawn, while a point is moved).
+    SamplerSlot shown = slot_;
+    if (!points_.empty()) {
+        shown.velocityCurve = 3;
+        shown.velocityPoints = points_;
+    }
+    QPainterPath path;
+    for (int v = 1; v <= 127; ++v) {
+        const QPointF pt = pointFor(v, sampler::curveVelocity(shown, v));
+        if (v == 1) path.moveTo(pt);
+        else path.lineTo(pt);
+    }
+    g.setPen(QPen(palette().highlight().color(), 1.5));
+    g.drawPath(path);
+    g.setBrush(palette().highlight());
+    for (const auto& [in, out] : points_) g.drawEllipse(QPointF(pointFor(in, out)), 3.5, 3.5);
+}
+
+void VelocityCurveView::mousePressEvent(QMouseEvent* e) {
+    if (!has_ || e->button() != Qt::LeftButton) return;
+    const QPoint at = e->position().toPoint();
+    if (points_.empty()) {
+        // (not drawn yet: from the two ends of the curve as it is)
+        points_ = {{1, sampler::curveVelocity(slot_, 1)}, {127, sampler::curveVelocity(slot_, 127)}};
+    }
+    drag_ = pointNear(at);
+    if (drag_ < 0) {
+        const auto v = velocitiesAt(at);
+        auto it = std::lower_bound(points_.begin(), points_.end(), v, [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (it != points_.end() && it->first == v.first) it->second = v.second;  // (one point for a velocity in)
+        else it = points_.insert(it, v);
+        drag_ = int(it - points_.begin());
+    }
+    update();
+}
+
+void VelocityCurveView::mouseMoveEvent(QMouseEvent* e) {
+    if (drag_ < 0 || drag_ >= int(points_.size())) return;
+    auto v = velocitiesAt(e->position().toPoint());
+    // (it stays between its neighbours)
+    const int lo = drag_ > 0 ? points_[size_t(drag_) - 1].first + 1 : 1;
+    const int hi = drag_ + 1 < int(points_.size()) ? points_[size_t(drag_) + 1].first - 1 : 127;
+    v.first = std::clamp(v.first, std::min(lo, hi), std::max(lo, hi));
+    points_[size_t(drag_)] = v;
+    update();
+}
+
+void VelocityCurveView::mouseReleaseEvent(QMouseEvent* e) {
+    if (drag_ < 0 || e->button() != Qt::LeftButton) return;
+    drag_ = -1;
+    emit drawn(points_);
+}
+
+void VelocityCurveView::mouseDoubleClickEvent(QMouseEvent* e) {
+    if (!has_ || e->button() != Qt::LeftButton) return;
+    // (the press before it made or took hold of the point under the mouse)
+    const int at = pointNear(e->position().toPoint());
+    if (at < 0) return;
+    points_.erase(points_.begin() + at);
+    drag_ = -1;
+    emit drawn(points_);
+    update();
 }
 
 void SamplerPanel::changeSlot(int key, const std::function<void(SamplerSlot&)>& change) {

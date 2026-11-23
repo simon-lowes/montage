@@ -11649,6 +11649,93 @@ private slots:
         QVERIFY(!cached().contains(first) && cached().contains(second) && cached().contains("sound-777-888.f32"));
     }
 
+    void samplerSlotsHeardOnTheirTracks() {
+        // Played live, a slot sent to another track passes that track's strip and bus: two slots sent to two tracks,
+        // each feeding a bus of its own, are heard through those buses (their faders and mutes) and on those tracks'
+        // meters, and not in the sampler's own sound. Stopped, the strips pass the live sound alone: no clip plays.
+        using namespace sampler;
+        const int rate = 48000;
+        auto level = [&](float v) {
+            auto b = std::make_shared<AudioBuffer>();
+            b->sampleRate = rate, b->channels = 2;
+            b->samples.assign(size_t(rate) * 2, v);
+            return AudioBufferPtr(b);
+        };
+        std::map<std::string, AudioBufferPtr> files{{"own", level(0.25f)}, {"feet", level(0.4f)}, {"props", level(0.2f)}};
+        const Loader load = [&](const std::string& file, int, std::string*) { return files.at(file); };
+        const std::string wav = path("live-bed.wav");
+        writeWav(wav, rate, 1.0, 0.5f, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        while (s.audioTracks.size() < 3) edit::addTrack(p, s, TrackKind::Audio);
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);  // (a clip on A2)
+        Bus feet, props;
+        feet.id = p.newId(), feet.name = "Feet", feet.volumeDb = -6.0206;
+        props.id = p.newId(), props.name = "Props", props.volumeDb = -12.0412;
+        s.buses = {feet, props};
+        s.audioTracks[1].output = feet.id;
+        s.audioTracks[2].output = props.id;
+        const Id a2 = s.audioTracks[1].id, a3 = s.audioTracks[2].id;
+        auto slot = [&](int key, const char* sound, Id output) {
+            SamplerSlot sl;
+            sl.key = key;
+            sl.sounds = {{sound, 0, 0, 1, 127}};
+            sl.output = output;
+            s.audioTracks[0].sampler.pads.push_back(sl);
+        };
+        slot(40, "own", 0);
+        slot(41, "feet", a2);
+        slot(42, "props", a3);
+        Engine e(rate);
+        e.setKit(loadKit(s.audioTracks[0].sampler, rate, nullptr, load));
+        const int frames = 1024;
+        std::vector<float> own, toA2, toA3, out(size_t(frames) * 2);
+        AudioMixer mixer;
+        mixer.setLiveInput([&](Id track, int n, float* stereo) {
+            const std::vector<float>* from = track == a2 ? &toA2 : track == a3 ? &toA3 : nullptr;
+            if (!from) return false;
+            for (int i = 0; i < n * 2; ++i) stereo[i] += (*from)[size_t(i)];
+            return true;
+        });
+        // A block of the three keys held down, from two seconds in (past the clip), with its meters.
+        int64_t clock = 0;
+        std::vector<MeterLevels> meters;
+        auto play = [&](bool stopped, int64_t at) {
+            own.assign(size_t(frames) * 2, 0.0f), toA2 = own, toA3 = own;
+            const Engine::Send sends[2] = {{a2, toA2.data()}, {a3, toA3.data()}};
+            e.render(clock, frames, own.data(), sends, 2);
+            clock += frames;
+            if (stopped) mixer.mixLive(p, s, at, frames, out.data());
+            else mixer.mix(p, s, at, frames, out.data(), &meters);
+            return out[size_t(frames)];  // (the left sample in the block's middle)
+        };
+        for (int key : {40, 41, 42}) e.noteOn(key, 127);
+        const int64_t after = int64_t(rate) * 2;
+        QVERIFY(std::fabs(play(false, after) - (0.4f * 0.5f + 0.2f * 0.25f)) < 1e-4f);  // (each through its bus's fader)
+        for (float v : own) QCOMPARE(v, 0.25f);  // (the sampler's own sound: the slot sent nowhere, and nothing else)
+        QCOMPARE(meters.size(), size_t(3));
+        QCOMPARE(meters[0].peakL, 0.0f);  // (nothing on the sampler's track)
+        QVERIFY(std::fabs(meters[1].peakL - 0.4f) < 1e-4f && std::fabs(meters[2].peakL - 0.2f) < 1e-4f);
+        s.buses[0].muted = true;
+        QVERIFY(std::fabs(play(false, after + frames) - 0.2f * 0.25f) < 1e-4f);
+        s.buses[0].muted = false, s.buses[1].muted = true;
+        QVERIFY(std::fabs(play(false, after + frames * 2) - 0.4f * 0.5f) < 1e-4f);
+        s.buses[1].muted = false;
+        s.audioTracks[1].muted = true;  // (a muted strip is silent, as for its clips)
+        QVERIFY(std::fabs(play(false, after + frames * 3) - 0.2f * 0.25f) < 1e-4f);
+        s.audioTracks[1].muted = false;
+        // Over the clip the live sound joins it on the strip; stopped there, the clip is not heard.
+        QVERIFY(std::fabs(play(false, rate / 2) - (0.9f * 0.5f + 0.2f * 0.25f)) < 0.005f);
+        QVERIFY(std::fabs(play(true, rate / 2) - (0.4f * 0.5f + 0.2f * 0.25f)) < 1e-4f);
+        QVERIFY(std::fabs(play(true, rate / 2) - (0.4f * 0.5f + 0.2f * 0.25f)) < 1e-4f);  // (the same place again: stopped)
+        // A mix that is not heard (an export's, a mixer without the live input) has none of it.
+        AudioMixer plain;
+        plain.mix(p, s, after, frames, out.data());
+        QCOMPARE(out[size_t(frames)], 0.0f);
+    }
+
     void samplerCacheAcrossProcesses() {
         // Two Montages share the sampler's cache folder (nightly 19 Nov): one tidying it never removes a cache file
         // the other still plays from, neither an earlier version of a changed sound nor one older than a week, nor

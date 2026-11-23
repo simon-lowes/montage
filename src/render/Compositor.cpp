@@ -4657,6 +4657,7 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
         }
         nextStart_ = start + frames;
         startTape();
+        const LiveScope live(liveNow_);
         mixInto(p, seq, start, frames, out, trackLevels, 0);
         return;
     }
@@ -4674,6 +4675,7 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
         }
         nextStart_ = start + frames;
         startTape();
+        const LiveScope live(liveNow_);
         mixInto(p, seq, start, frames, full.data(), trackLevels, 0, 0, -1, n);
         // An ambisonic mix heard binaurally (the decoder keeps its state from block to block).
         if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
@@ -4700,7 +4702,37 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
     }
     nextStart_ = start + frames;
     startTape();
+    const LiveScope live(liveNow_);
     mixInto(p, seq, start, frames, out, trackLevels, 0, 0, -1, n);
+}
+
+void AudioMixer::mixLive(const Project& p, const Sequence& seq, int64_t at, int frames, float* out, bool layout) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    plugins::RenderModeScope pluginTiming(nonBlocking_);
+    const int n = layoutChannels(seq.audioLayout);
+    std::vector<float> full;
+    {
+        std::lock_guard lock(m_);
+        // (not a stretch of the programme: its next block starts the effects afresh, as after any stop)
+        nextStart_ = -1;
+        const LiveScope live(liveNow_), only(liveOnly_);
+        TapeOff off(tape_);
+        if (n == 2) {
+            mixInto(p, seq, at, frames, out, nullptr, 0);
+            return;
+        }
+        if (layout) {
+            mixInto(p, seq, at, frames, out, nullptr, 0, 0, -1, n);
+            return;
+        }
+        full.assign(size_t(frames) * size_t(n), 0.0f);
+        mixInto(p, seq, at, frames, full.data(), nullptr, 0, 0, -1, n);
+        if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
+            binauralFor(monitor_, ambisonicOrder(seq.audioLayout), seq.sampleRate).process(full.data(), frames, out);
+            return;
+        }
+    }
+    downmixToStereo(seq.audioLayout, full.data(), frames, out, seq.downmixCentreDb, seq.downmixSurroundDb);
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
@@ -5226,9 +5258,11 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const bool dialogueApart = upmix && upmix->p("dialogue_centre", 0, 1) > 0.5 &&
                                    std::any_of(track.clips.begin(), track.clips.end(), [](const Clip& c) { return c.role == "Dialogue"; });
         if (dialogueApart) dialogueBuf.assign(trackBuf.size(), 0.0f);
-        const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
-                                       keepsField ? trackField.data() : nullptr, fieldStart, nch,
-                                       dialogueApart ? dialogueBuf.data() : nullptr);
+        bool any = !(liveOnly_ && depth == 0) &&
+                   mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
+                                 keepsField ? trackField.data() : nullptr, fieldStart, nch, dialogueApart ? dialogueBuf.data() : nullptr);
+        // Live sound sent to this strip (a sampler's slot): with its clips, before its inserts.
+        if (depth == 0 && liveNow_ && live_ && live_(track.id, frames, trackBuf.data())) any = true;
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
         if (!track.effects.empty()) {

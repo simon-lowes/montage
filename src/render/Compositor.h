@@ -196,6 +196,14 @@ public:
     // How mix() lets an ambisonic sequence be heard: binaurally for headphones, or through two virtual cardioids for
     // speakers (the default, as downmixToStereo folds it: exports, stems; playback sets the monitoring choice).
     void setAmbisonicBinaural(bool on) { ambisonicBinaural_ = on; }
+    // Live sound onto a track's strip (a sampler's slot sent there). It is asked for each audio track of the sequence
+    // as the track is mixed (never for a nested sequence's, nor in a latency pre-roll): it adds `frames` stereo samples
+    // to `stereo` and says whether it did. The sound passes the track's inserts, fader, pan, sends and bus as its clips do.
+    using LiveInput = std::function<bool(Id track, int frames, float* stereo)>;
+    void setLiveInput(LiveInput f) { live_ = std::move(f); }
+    // Only the live sound, through the strips, buses and master as they are at sample `at` (stopped: no clip plays):
+    // stereo into `out`, or with `layout` the sequence's own channels. The programme starts afresh after it.
+    void mixLive(const Project& p, const Sequence& seq, int64_t at, int frames, float* out, bool layout = false);
 
     // Dynamics held to another mix's. Recording, the built-in compressors, limiters, gates, de-essers and multiband
     // compressors note how far they turn the sound down (or up) at each sample of a mix; replaying, over the same
@@ -262,6 +270,9 @@ private:
     std::map<std::pair<Id, int64_t>, KeyBuffer> keyBufs_;  // by track and where it is heard from, this block
     int64_t keyBlock_ = 0;  // counts the top-level blocks mixed
     int64_t nextStart_ = -1;  // where the next contiguous block starts
+    LiveInput live_;
+    bool liveNow_ = false;   // (the block being mixed is one that is heard: live sound joins it)
+    bool liveOnly_ = false;  // (mixLive: no clip plays)
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;
@@ -285,6 +296,11 @@ private:
         GainTape* was;
         explicit TapeOff(GainTape*& t) : tape(t), was(t) { tape = nullptr; }
         ~TapeOff() { tape = was; }
+    };
+    struct LiveScope {  // a flag raised over one mix
+        bool& flag;
+        explicit LiveScope(bool& f) : flag(f) { flag = true; }
+        ~LiveScope() { flag = false; }
     };
     Id skipUpmix_ = 0;  // the Upmix processChain leaves out (mixInto runs it, into the speakers)
     bool offlineProxies_ = false;

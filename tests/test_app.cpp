@@ -2172,7 +2172,12 @@ private slots:
             auto* output = panel->findChild<QComboBox*>("samplerOutput48");
             auto* perHit = panel->findChild<QCheckBox*>("samplerClipPerHit");
             QVERIFY(curve && output && perHit);
-            QVERIFY(!qobject_cast<QStandardItemModel*>(curve->model())->item(3)->isEnabled());  // (drawn: no points)
+            curve->setCurrentIndex(3);  // (drawn, with nothing drawn yet: a straight line to draw from)
+            emit curve->activated(3);
+            QCOMPARE(track().sampler.pads[0].velocityPoints, (std::vector<std::pair<int, int>>{{1, 1}, {127, 127}}));
+            state()->undo();
+            QVERIFY(track().sampler.pads[0].velocityPoints.empty());
+            curve = panel->findChild<QComboBox*>("samplerCurve48");  // (the table made again)
             curve->setCurrentIndex(2);
             emit curve->activated(2);
             QCOMPARE(track().sampler.pads[0].velocityCurve, 2);
@@ -2250,6 +2255,214 @@ private slots:
         QVERIFY(track().lanes.empty() && track().sampler.passes.empty());
         win_->findChild<QDockWidget*>("sampler")->hide();
         QTRY_VERIFY(!panel->isActive());
+    }
+
+    void samplerCurveDrawnInThePanel() {
+        // A slot's velocity curve drawn with the mouse under the Sampler panel's table: points put down and dragged map
+        // every velocity from 1 to 127 as drawn (straight between the points), each stroke one undo step; a point
+        // double-clicked goes, and with the last one the slot plays as played again.
+        {
+            WavWriter w;
+            QVERIFY(w.open(dir_.path() + "/curve-click.wav", 48000, 1));
+            const std::vector<float> x(2400, 0.5f);
+            w.write(x.data(), int64_t(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/sampler-curve.montage"));
+        win_->findChild<QAction*>("showSampler")->trigger();
+        auto* panel = win_->findChild<SamplerPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        panel->setTrack(0);
+        QVERIFY(panel->addSounds(48, {dir_.path() + "/curve-click.wav"}));
+        auto slot = [&]() -> const SamplerSlot& { return state()->sequence()->audioTracks.at(0).sampler.pads.at(0); };
+        auto* view = panel->findChild<VelocityCurveView*>("samplerCurveView");
+        auto* table = panel->findChild<QTableWidget*>("samplerSlots");
+        QVERIFY(view && table);
+        QVERIFY(!view->isEnabled());  // (no slot selected: nothing to draw on)
+        table->setCurrentCell(0, 1);
+        QTRY_VERIFY(view->isEnabled() && view->isVisible());
+        // (a place for every velocity each way, so a point lands on the velocities it is put at)
+        QVERIFY(view->width() >= 160 && view->height() >= 140);
+        using Points = std::vector<std::pair<int, int>>;
+        auto stroke = [&](const QPoint& from, const QPoint& to) {
+            QTest::mousePress(view, Qt::LeftButton, Qt::NoModifier, from);
+            if (to != from) QTest::mouseMove(view, to);
+            QTest::mouseRelease(view, Qt::LeftButton, Qt::NoModifier, to);
+        };
+        // What the points should give: straight between them, level outside them.
+        auto drawn = [&](const Points& pts, int v) {
+            if (v <= pts.front().first) return pts.front().second;
+            if (v >= pts.back().first) return pts.back().second;
+            for (size_t i = 0; i + 1 < pts.size(); ++i)
+                if (v >= pts[i].first && v <= pts[i + 1].first)
+                    return int(std::lround(pts[i].second + (pts[i + 1].second - pts[i].second) * double(v - pts[i].first) /
+                                                              double(pts[i + 1].first - pts[i].first)));
+            return v;
+        };
+        auto mapsAsDrawn = [&](const Points& pts) {
+            if (slot().velocityCurve != 3 || slot().velocityPoints != pts) return false;
+            for (int v = 1; v <= 127; ++v)
+                if (sampler::curveVelocity(slot(), v) != drawn(pts, v)) return false;
+            return true;
+        };
+        // A point put down at (40 in, 90 out): the curve was as played, so it is drawn from that line's two ends.
+        const size_t undoBefore = state()->history().undoCount();
+        stroke(view->pointFor(40, 90), view->pointFor(40, 90));
+        QVERIFY(mapsAsDrawn({{1, 1}, {40, 90}, {127, 127}}));
+        QCOMPARE(state()->history().undoCount(), undoBefore + 1);
+        QCOMPARE(sampler::curveVelocity(slot(), 20), 44);  // (1 + 89 x 19/39 up the first stretch, to the nearest velocity)
+        // A second point put down and dragged before the mouse is let go: one step, where it was let go.
+        stroke(view->pointFor(90, 100), view->pointFor(100, 60));
+        QVERIFY(mapsAsDrawn({{1, 1}, {40, 90}, {100, 60}, {127, 127}}));
+        QCOMPARE(state()->history().undoCount(), undoBefore + 2);
+        // An end dragged up: the lightest touch now comes out at 30. A point cannot be dragged past its neighbour.
+        stroke(view->pointFor(1, 1), view->pointFor(1, 30));
+        QVERIFY(mapsAsDrawn({{1, 30}, {40, 90}, {100, 60}, {127, 127}}));
+        stroke(view->pointFor(100, 60), view->pointFor(20, 70));
+        QVERIFY(mapsAsDrawn({{1, 30}, {40, 90}, {41, 70}, {127, 127}}));
+        state()->undo();
+        QVERIFY(mapsAsDrawn({{1, 30}, {40, 90}, {100, 60}, {127, 127}}));
+        QCOMPARE(view->points(), slot().velocityPoints);  // (the view follows the undo)
+        // The table's box says Drawn, and lists the points (the boxes of the table as it was made before let go first).
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCOMPARE(panel->findChild<QComboBox*>("samplerCurve48")->currentIndex(), 3);
+        QVERIFY(panel->findChild<QComboBox*>("samplerCurve48")->toolTip().contains("40 → 90"));
+        // Double-clicked, a point goes; without any the slot plays as played.
+        QTest::mouseDClick(view, Qt::LeftButton, Qt::NoModifier, view->pointFor(100, 60));
+        QVERIFY(mapsAsDrawn({{1, 30}, {40, 90}, {127, 127}}));
+        for (const auto& pt : Points{{1, 30}, {40, 90}, {127, 127}}) QTest::mouseDClick(view, Qt::LeftButton, Qt::NoModifier, view->pointFor(pt.first, pt.second));
+        QCOMPARE(slot().velocityCurve, 0);
+        QVERIFY(slot().velocityPoints.empty());
+        for (int v = 1; v <= 127; ++v) QCOMPARE(sampler::curveVelocity(slot(), v), v);
+        win_->findChild<QDockWidget*>("sampler")->hide();
+        QTRY_VERIFY(!panel->isActive());
+    }
+    void samplerSlotsLiveOnTheirTracks() {
+        // Through the audio device (the loopback here, with a tap on what it plays): two sampler slots sent to two
+        // tracks, one panned hard left and one hard right, are heard on those sides as they are played, stopped and
+        // playing; the slot sent nowhere is heard on both, as before. A track muted silences what is sent to it.
+        const int rate = 48000;
+        {
+            WavWriter w;
+            QVERIFY(w.open(dir_.path() + "/live-level.wav", rate, 1));
+            const std::vector<float> x(size_t(rate) / 4, 0.5f);  // (a quarter of a second at one level)
+            w.write(x.data(), int64_t(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/sampler-live.montage"));
+        QVERIFY(state()->edit("Tracks", [&](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 3) edit::addTrack(p, s, TrackKind::Audio);
+            s.audioTracks[1].pan = -1;
+            s.audioTracks[2].pan = 1;
+            edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 600));  // (twenty seconds to play through)
+            return true;
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 7}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_audio_device"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        audiodev::setLoopbackOptions({256, 512, 0});
+        QJsonObject r = call({{"action", "set"}, {"settings", QJsonObject{{"host", "loopback"}, {"buffer", 256}, {"sample_rate", 0}, {"inputs", 2}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        win_->findChild<QAction*>("showSampler")->trigger();
+        auto* panel = win_->findChild<SamplerPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        panel->setTrack(0);
+        for (int key : {48, 50, 52}) QVERIFY(panel->addSounds(key, {dir_.path() + "/live-level.wav"}));
+        const Id a2 = state()->sequence()->audioTracks[1].id, a3 = state()->sequence()->audioTracks[2].id;
+        for (const auto& [key, index] : {std::pair{50, 1}, std::pair{52, 2}}) {
+            auto* output = panel->findChild<QComboBox*>(QStringLiteral("samplerOutput%1").arg(key));
+            QVERIFY(output);
+            output->setCurrentIndex(index);
+            emit output->activated(index);
+        }
+        QCOMPARE(state()->sequence()->audioTracks[0].sampler.pads[1].output, a2);
+        QCOMPARE(state()->sequence()->audioTracks[0].sampler.pads[2].output, a3);
+        QTRY_VERIFY(panel->isActive());
+        // What the device plays, heard back on its inputs.
+        std::mutex m;
+        float left = 0, right = 0;
+        const int tap = audiodev::Engine::shared().addInput(nullptr, rate, [&](const float* in, int channels, int frames, int64_t) {
+            std::lock_guard<std::mutex> lock(m);
+            for (int i = 0; i < frames; ++i) {
+                left = std::max(left, std::fabs(in[size_t(i) * size_t(channels)]));
+                if (channels > 1) right = std::max(right, std::fabs(in[size_t(i) * size_t(channels) + 1]));
+            }
+        });
+        QVERIFY(tap >= 0);
+        // (the tap reads this test's variables: taken off, and the device and panel put back, however the test ends)
+        bool tapped = true;
+        auto putBack = qScopeGuard([&] {
+            if (tapped) audiodev::Engine::shared().removeInput(tap);
+            program->pause();
+            win_->findChild<QDockWidget*>("sampler")->hide();
+            call({{"action", "set"}, {"settings", QJsonObject{{"host", "qt"}}}});
+            audiodev::setLoopbackOptions({});
+        });
+        // A key played: the loudest it was heard on each side until it had rung out (its sound is 250 ms long).
+        auto heard = [&](int key) {
+            QElapsedTimer quiet;
+            quiet.start();
+            while (quiet.elapsed() < 200) QTest::qWait(20);  // (whatever sounded before has gone)
+            {
+                std::lock_guard<std::mutex> lock(m);
+                left = right = 0;
+            }
+            panel->noteOn(key, 127);
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 700) QTest::qWait(20);
+            panel->noteOff(key);
+            std::lock_guard<std::mutex> lock(m);
+            return std::pair<float, float>{left, right};
+        };
+        auto check = [&](const char* when) {
+            const auto own = heard(48), toLeft = heard(50), toRight = heard(52);
+            const QByteArray what = QStringLiteral("%1: own %2 %3, left %4 %5, right %6 %7")
+                                        .arg(when).arg(own.first).arg(own.second).arg(toLeft.first).arg(toLeft.second).arg(toRight.first).arg(toRight.second).toUtf8();
+            // (at the output as it is, on both sides alike: a mono sound at 0.5 spread over two at -3 dB)
+            QVERIFY2(std::fabs(own.first - 0.5f * float(M_SQRT1_2)) < 0.01f && std::fabs(own.second - own.first) < 0.01f, what.constData());
+            QVERIFY2(toLeft.first > 0.3f && toLeft.second < 1e-4f, what.constData());
+            QVERIFY2(toRight.second > 0.3f && toRight.first < 1e-4f, what.constData());
+        };
+        check("stopped");
+        if (QTest::currentTestFailed()) return;
+        program->seek(0);
+        program->play();
+        QTRY_VERIFY(program->isPlaying());
+        check("playing");
+        if (QTest::currentTestFailed()) return;
+        // The track it is sent to muted: not heard, playing or stopped; the other slots as before.
+        QVERIFY(state()->edit("Mute", [&](Project&, Sequence& s) {
+            s.audioTracks[1].muted = true;
+            return true;
+        }));
+        auto muted = heard(50);
+        QVERIFY2(muted.first < 1e-4f && muted.second < 1e-4f, qPrintable(QStringLiteral("%1 %2").arg(muted.first).arg(muted.second)));
+        QVERIFY(heard(52).second > 0.3f);
+        program->pause();
+        QTRY_VERIFY(!program->isPlaying());
+        muted = heard(50);
+        QVERIFY2(muted.first < 1e-4f && muted.second < 1e-4f, qPrintable(QStringLiteral("%1 %2").arg(muted.first).arg(muted.second)));
+        QVERIFY(heard(52).second > 0.3f);
+        audiodev::Engine::shared().removeInput(tap);
+        tapped = false;
+        win_->findChild<QDockWidget*>("sampler")->hide();
+        QTRY_VERIFY(!panel->isActive());
+        putBack.dismiss();
+        r = call({{"action", "set"}, {"settings", QJsonObject{{"host", "qt"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        audiodev::setLoopbackOptions({});
     }
 
     void oscControl() {
