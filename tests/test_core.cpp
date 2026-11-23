@@ -1775,6 +1775,66 @@ private slots:
         QVERIFY(std::fabs(hit(80) - 0.5 * 50 / 127.0) < 1e-6);  // (80 comes out 50: the soft layer)
     }
 
+    void samplerSendsSlotsToTheirTracks() {
+        using namespace sampler;
+        // A slot sent to another track is rendered into that track's block and nowhere else. One sent nowhere, or to a
+        // track the render has no block for, stays in the sampler's own. A choke group still cuts across the blocks.
+        const int rate = 48000;
+        auto level = [&](float v) {
+            auto b = std::make_shared<AudioBuffer>();
+            b->sampleRate = rate, b->channels = 2;
+            b->samples.assign(size_t(4800) * 2, v);
+            return AudioBufferPtr(b);
+        };
+        std::map<std::string, AudioBufferPtr> files{{"own", level(0.25f)}, {"seven", level(0.5f)}, {"nine", level(1.0f)}};
+        const Loader load = [&](const std::string& path, int, std::string*) { return files.at(path); };
+        SamplerSettings st;
+        auto slot = [&](int key, const char* sound, Id output, int choke) {
+            SamplerSlot sl;
+            sl.key = key;
+            sl.sounds = {{sound, 0, 0, 1, 127}};
+            sl.output = output;
+            sl.choke = choke;
+            st.pads.push_back(sl);
+        };
+        slot(40, "own", 0, 0);
+        slot(41, "seven", 7, 1);
+        slot(42, "nine", 9, 1);
+        Engine e(rate);
+        e.setKit(loadKit(st, rate, nullptr, load));
+        const int frames = 256;
+        std::vector<float> own(frames * 2, 0.0f), seven(frames * 2, 0.0f), nine(frames * 2, 0.0f);
+        const Engine::Send sends[2] = {{7, seven.data()}, {9, nine.data()}};
+        e.noteOn(40, 127, 0);
+        e.noteOn(41, 127, 0);
+        e.noteOn(42, 127, 100);  // (it cuts key 41, its choke group, from frame 100)
+        e.render(0, frames, own.data(), sends, 2);
+        for (int i = 0; i < frames * 2; ++i) QCOMPARE(own[size_t(i)], 0.25f);
+        for (int i = 0; i < 100 * 2; ++i) {
+            QCOMPARE(seven[size_t(i)], 0.5f);
+            QCOMPARE(nine[size_t(i)], 0.0f);
+        }
+        for (int i = 100 * 2; i < frames * 2; ++i) QCOMPARE(nine[size_t(i)], 1.0f);
+        QVERIFY(seven[100 * 2] < 0.5f);                                            // (fading from the frame it was cut at)
+        for (int i = 150 * 2; i < frames * 2; ++i) QCOMPARE(seven[size_t(i)], 0.0f);  // (gone within a millisecond)
+        // No block for track 9: its slot is heard with the sampler's own.
+        e.reset();
+        std::fill(own.begin(), own.end(), 0.0f);
+        std::fill(seven.begin(), seven.end(), 0.0f);
+        e.noteOn(42, 127, 0);
+        e.render(0, frames, own.data(), sends, 1);
+        for (int i = 0; i < frames * 2; ++i) {
+            QCOMPARE(own[size_t(i)], 1.0f);
+            QCOMPARE(seven[size_t(i)], 0.0f);
+        }
+        // Rendered without sends, everything is in the one block.
+        e.reset();
+        std::fill(own.begin(), own.end(), 0.0f);
+        e.noteOn(41, 127, 0);
+        e.render(0, frames, own.data());
+        for (int i = 0; i < frames * 2; ++i) QCOMPARE(own[size_t(i)], 0.5f);
+    }
+
     void samplerStreamsLongSounds() {
         using namespace sampler;
         // A ten-minute sound (thirty seconds under valgrind: MONTAGE_TEST_SHORT) streamed from a slow disk, its first second
