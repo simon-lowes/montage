@@ -56,6 +56,7 @@ public:
         int64_t repeated = 0;    // pictures the recording holds again for frames that did not come
         int opened = 0;          // times its feed was opened (recording an input being watched does not open it again)
         Id media = 0;            // its media item, once imported
+        int finishing = 0;       // its recordings ended while the feed is received, still being finished
         QString error;           // why it is not showing
     };
 

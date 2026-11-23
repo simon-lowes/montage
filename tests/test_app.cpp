@@ -4164,6 +4164,8 @@ private slots:
         r = call({{"action", "multiview"}, {"record", false}});
         QVERIFY(!mv->tile(2).recording && mv->tile(2).running);
         QCOMPARE(mv->tile(2).opened, streamOpened);
+        // (its file finished on the recorder's thread, not waited for on the window's)
+        QVERIFY2(until([&] { return mv->tile(2).finishing == 0; }, 20000), "mv->tile(2).finishing == 0");
         QCOMPARE(r.value("structuredContent").toObject().value("inputs").toArray()[2].toObject().value("opened").toInt(), streamOpened);
         // (not finished: on macOS Qt may never hear that the sender started, leaving it Starting while it sends)
         QVERIFY(streams[0]->state() != QProcess::NotRunning);
