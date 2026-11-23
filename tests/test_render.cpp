@@ -27682,6 +27682,39 @@ colorspaces:
                 }
             }
         edit::clipById(s, topId)->effects.clear();
+        // Mesh Warp and Grid Warp with motion blur: a pin or a point keyed to move through the shutter, at three
+        // settings (the second with a shorter shutter on a denser mesh, the third through a feathered mask), a pass
+        // for each sample through the shutter, each drawn from the picture as the warp began. (They were the CPU's.)
+        for (const char* type : {"mesh_warp", "grid_warp"})
+            for (int k = 0; k < 3; ++k) {
+                Effect e = makeEffect(p, type);
+                e.params["motion_blur"] = 1.0;
+                const char* moving = "g1_1.dx";
+                if (std::string(type) == "mesh_warp") {
+                    e.params["mesh_from"] = 1.0;
+                    e.params["pin1.kind"] = 0.0, e.params["pin1.x"] = 0.3, e.params["pin1.y"] = 0.4;
+                    e.params["pin2.kind"] = 0.0, e.params["pin2.x"] = 0.7, e.params["pin2.y"] = 0.6;
+                    e.params["pin1.to_y"].addKey(0, 0.4), e.params["pin1.to_y"].addKey(12, 0.8);
+                    moving = "pin1.to_x";
+                    if (k == 1) e.params["density"] = 500.0;
+                }
+                Param& at = e.params[moving];
+                at.addKey(0, std::string(type) == "mesh_warp" ? 0.3 : 0.0);
+                at.addKey(12, std::string(type) == "mesh_warp" ? 0.9 : 0.3);
+                if (k == 1) e.params["shutter"] = 90.0;
+                if (k == 2) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.6, e.params["mask.h"] = 0.5, e.params["mask.feather"] = 10.0;
+                edit::clipById(s, topId)->effects = {e};
+                const long passes = gpu::stats().filterPasses;
+                compare(7 + FrameTime(k), QString("%1 through the shutter #%2").arg(type).arg(k + 1));
+                QVERIFY2(gpu::stats().filterPasses >= passes + 2, type);
+                // (blurred: not the picture drawn once at the frame's own time)
+                RenderOptions o;
+                o.gpu = true;
+                const Image blurred = renderProgramFrame(p, s, 7 + FrameTime(k), o);
+                edit::clipById(s, topId)->effects[0].params["motion_blur"] = 0.0;
+                QVERIFY(renderProgramFrame(p, s, 7 + FrameTime(k), o).px != blurred.px);
+            }
+        edit::clipById(s, topId)->effects.clear();
 
         // The colour tools that work on the working space's light (and two that do not) and the grain, three settings each: in Rec.709,
         // in Rec.2100 PQ, HLG or Adobe RGB, and through a mask in Display P3.

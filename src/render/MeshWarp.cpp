@@ -346,16 +346,19 @@ void drawLine(Image& img, MeshPoint a, MeshPoint b, const float colour[4]) {
 
 // Renders `draw(time, out)` at clip frame t, or averaged over the shutter when the mesh moves through it (as many
 // samples as pixels it moves, 2 to 32).
+// How many samples the shutter takes of a mesh whose vertices are at `a` as it opens and `b` as it closes.
+int shutterSamples(const std::vector<MeshPoint>& a, const std::vector<MeshPoint>& b) {
+    double most = 0;
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i) most = std::max(most, std::hypot(b[i][0] - a[i][0], b[i][1] - a[i][1]));
+    return most >= 0.5 ? std::clamp(int(std::ceil(most)), 2, 32) : 1;
+}
+// The clip time of sample i of n through the shutter, about t.
+double shutterTime(double t, double shutter, int i, int n) { return n == 1 ? t : t + ((i + 0.5) / n - 0.5) * shutter; }
+
 template <class Moved, class Draw>
 void throughShutter(Image& img, double t, bool blur, double shutter, Moved moved, Draw draw) {
     const Image src = img;
-    int n = 1;
-    if (blur && shutter > 0) {
-        const std::vector<MeshPoint> a = moved(t - shutter / 2), b = moved(t + shutter / 2);
-        double most = 0;
-        for (size_t i = 0; i < a.size() && i < b.size(); ++i) most = std::max(most, std::hypot(b[i][0] - a[i][0], b[i][1] - a[i][1]));
-        if (most >= 0.5) n = std::clamp(int(std::ceil(most)), 2, 32);
-    }
+    const int n = blur && shutter > 0 ? shutterSamples(moved(t - shutter / 2), moved(t + shutter / 2)) : 1;
     if (n == 1) {
         Image out(img.width, img.height);
         draw(src, t, out);
@@ -365,7 +368,7 @@ void throughShutter(Image& img, double t, bool blur, double shutter, Moved moved
     std::vector<float> sum(img.px.size(), 0.f);
     for (int i = 0; i < n; ++i) {
         Image out(img.width, img.height);
-        draw(src, t + ((i + 0.5) / n - 0.5) * shutter, out);
+        draw(src, shutterTime(t, shutter, i, n), out);
         for (size_t k = 0; k < sum.size(); ++k) sum[k] += out.px[k];
     }
     for (size_t k = 0; k < sum.size(); ++k) img.px[k] = sum[k] / float(n);
@@ -891,34 +894,60 @@ void gridWarp(const Effect& e, FrameTime t, Image& img) {
 }
 
 int warpDrawing(const Effect& e, FrameTime t, int w, int h, double pixelScale, WarpMesh& mesh, std::vector<MeshPoint>& moved,
-                std::vector<double>& depth, const Image* picture) {
+                std::vector<double>& depth, const Image* picture, std::vector<WarpSample>* shutterSamplesOut) {
     const bool grid = e.type == "grid_warp";
     const bool blur = e.p("motion_blur", t, 0) > 0.5;
     const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
     const bool show = e.p(grid ? "show_grid" : "show_mesh", t, 0) > 0.5;
     const bool overAlpha = !grid && std::lround(e.p("mesh_from", t, 0)) == 0;
-    if (w <= 0 || h <= 0) return show || blur ? -1 : overAlpha ? 2 : 0;
+    // (through the shutter only for a caller that takes its samples)
+    if (w <= 0 || h <= 0) return show || (blur && !shutterSamplesOut) ? -1 : overAlpha ? 2 : 0;
+    if (shutterSamplesOut) shutterSamplesOut->clear();
+    // The samples through the shutter, where the mesh moves through it (as throughShutter takes them).
+    auto through = [&](const std::function<void(double, std::vector<MeshPoint>&, std::vector<double>&)>& at) {
+        if (!blur || shutter <= 0) return 1;
+        std::vector<MeshPoint> a, b;
+        std::vector<double> unused;
+        at(double(t) - shutter / 2, a, unused);
+        at(double(t) + shutter / 2, b, unused);
+        const int n = shutterSamples(a, b);
+        if (n == 1) return 1;
+        if (!shutterSamplesOut) return -1;
+        for (int i = 0; i < n; ++i) {
+            WarpSample sample;
+            at(shutterTime(double(t), shutter, i, n), sample.moved, sample.depth);
+            shutterSamplesOut->push_back(std::move(sample));
+        }
+        return 1;
+    };
     if (grid) {
         const GridWarpSetup g(e, t, w, h);
         if (!show && g.still(g.moves(double(t))) && (!blur || (g.still(g.moves(t - shutter / 2)) && g.still(g.moves(t + shutter / 2)))))
             return 0;
-        if (show || blur) return -1;
+        if (show) return -1;
         mesh = g.mesh;
         moved = g.moved(double(t));
         depth.clear();
-        return 1;
+        return through([&](double time, std::vector<MeshPoint>& v, std::vector<double>& d) {
+            v = g.moved(time);
+            d.clear();
+        });
     }
     if (!show && pinsStill(meshWarpPins(e, double(t), w, h, pixelScale)) &&
         (!blur || (pinsStill(meshWarpPins(e, t - shutter / 2, w, h, pixelScale)) && pinsStill(meshWarpPins(e, t + shutter / 2, w, h, pixelScale)))))
         return 0;
-    if (show || blur) return -1;
+    if (show || (blur && !shutterSamplesOut)) return -1;
     if (overAlpha && (!picture || picture->width != w || picture->height != h)) return 2;
     mesh = buildWarpMesh(w, h, int(std::lround(e.p("density", t, 2000))), overAlpha ? picture : nullptr, std::max(0.0, e.p("expand", t, 3)) * pixelScale);
     if (overAlpha) rememberMesh(e, w, h, pixelScale, mesh);  // (as meshWarp does: the mesh the monitor's pins are shown on)
     const std::vector<WarpPin> pins = meshWarpPins(e, double(t), w, h, pixelScale);
     moved = solveWarp(mesh, pins);
     depth = warpDepths(mesh, pins);
-    return 1;
+    return through([&](double time, std::vector<MeshPoint>& v, std::vector<double>& d) {
+        const std::vector<WarpPin> at = meshWarpPins(e, time, w, h, pixelScale);
+        v = solveWarp(mesh, at);
+        d = warpDepths(mesh, at);
+    });
 }
 
 bool trackMeshPins(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, FrameTime at,

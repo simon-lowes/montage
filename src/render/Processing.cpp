@@ -3647,6 +3647,22 @@ gpu::ColorOp::FilterPass warpFilterPass(const WarpMesh& mesh, const std::vector<
     }
     return fp;
 }
+// The passes of a warp: its one drawing, or with samples through the shutter, each drawn from the picture as the warp
+// began (p[1].w) and laid over the mean of those before it (p[2].x of them, kept in slot 0).
+std::vector<gpu::ColorOp::FilterPass> warpFilterPasses(const WarpMesh& mesh, const std::vector<MeshPoint>& moved, const std::vector<double>& depth,
+                                                       const std::vector<WarpSample>& shutter, int width, int height) {
+    if (shutter.empty()) return {warpFilterPass(mesh, moved, depth, width, height)};
+    std::vector<gpu::ColorOp::FilterPass> passes;
+    for (size_t i = 0; i < shutter.size(); ++i) {
+        gpu::ColorOp::FilterPass fp = warpFilterPass(mesh, shutter[i].moved, shutter[i].depth, width, height);
+        fp.params[3] = 1;
+        fp.params[4] = float(i);
+        if (i > 0) fp.extra = 0;
+        if (i + 1 < shutter.size()) fp.save = 0;
+        passes.push_back(std::move(fp));
+    }
+    return passes;
+}
 }  // namespace
 
 bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale, bool showing, bool reads) {
@@ -4088,12 +4104,15 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         } else if (ty == "mesh_warp" || ty == "grid_warp") {
             // drawWarp's triangles (render/MeshWarp: the mesh solved on the CPU, as there), listed by the 8-pixel tiles
             // they may reach, in the order drawn (gpufilter.frag's mode 33)
+            // With motion blur, a drawing for each sample through the shutter, each from the picture as the warp
+            // began, kept as the mean of those so far (as throughShutter averages them).
             WarpMesh mesh;
             std::vector<MeshPoint> moved;
             std::vector<double> depth;
-            const int how = warpDrawing(e, t, width, height, pixelScale, mesh, moved, depth);
+            std::vector<WarpSample> shutter;
+            const int how = warpDrawing(e, t, width, height, pixelScale, mesh, moved, depth, nullptr, &shutter);
             if (how < 0) return false;
-            if (how == 1) f.passes.push_back(warpFilterPass(mesh, moved, depth, width, height));
+            if (how == 1) f.passes = warpFilterPasses(mesh, moved, depth, shutter, width, height);
             if (how == 2 && width > 0 && height > 0) {
                 // A mesh made over the picture's alpha: from the picture read back when the warp runs.
                 add(33, {});
@@ -4103,8 +4122,9 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                     WarpMesh made;
                     std::vector<MeshPoint> to;
                     std::vector<double> depths;
-                    if (warpDrawing(effect, t, picture.width, picture.height, pixelScale, made, to, depths, &picture) != 1) return false;
-                    step.passes = {warpFilterPass(made, to, depths, picture.width, picture.height)};
+                    std::vector<WarpSample> samples;
+                    if (warpDrawing(effect, t, picture.width, picture.height, pixelScale, made, to, depths, &picture, &samples) != 1) return false;
+                    step.passes = warpFilterPasses(made, to, depths, samples, picture.width, picture.height);
                     return true;
                 };
             }

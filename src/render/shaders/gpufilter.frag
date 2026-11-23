@@ -42,6 +42,7 @@
 //   27 Find Edges, 28 Emboss, 29 Halftone, 30 Duotone, 31 VHS (the table each row's shift, tearing and scanline), 32 Tilt-Shift's
 //      last step (the picture, orig, towards its blur by the distance from the band, and the saturation)
 //   33 Mesh Warp and Grid Warp (render/MeshWarp's drawWarp): the mesh's triangles, listed by the tiles they reach, in the table
+//      (with motion blur, a pass a sample through the shutter, each kept as the mean of those so far)
 // and 34 Depth Map and Depth Fog (each pixel towards the table's colour by its w, from the frame's depth); Light Rays
 // (35 the light above the threshold, 36 a pass along the lines to the centre, 37 added to the picture; with Shadows
 // Block Rays, 40 the small copy of what blocks them and 41 the light let through) and 38 Lens Flare;
@@ -344,13 +345,16 @@ vec4 tableTexel(int i) {
     return texelFetch(table, ivec2(i % w, i / w), 0);
 }
 // render/MeshWarp's drawWarp sample: bilinear, clamped to the picture's edge.
-vec4 warpSample(ivec2 size, float x, float y) {
+vec4 warpSample(ivec2 size, float x, float y, bool fromOrig) {
     x = clamp(x - 0.5, 0.0, float(size.x - 1));
     y = clamp(y - 0.5, 0.0, float(size.y - 1));
     const int x0 = min(int(x), size.x - 1), y0 = min(int(y), size.y - 1), x1 = min(x0 + 1, size.x - 1), y1 = min(y0 + 1, size.y - 1);
     const float fx = x - float(x0), fy = y - float(y0);
-    const vec4 a = texelFetch(srcTex, ivec2(x0, y0), 0), b = texelFetch(srcTex, ivec2(x1, y0), 0);
-    const vec4 c = texelFetch(srcTex, ivec2(x0, y1), 0), e = texelFetch(srcTex, ivec2(x1, y1), 0);
+    // (from the pass before, or from the picture as the effect began)
+    const vec4 a = fromOrig ? texelFetch(orig, ivec2(x0, y0), 0) : texelFetch(srcTex, ivec2(x0, y0), 0);
+    const vec4 b = fromOrig ? texelFetch(orig, ivec2(x1, y0), 0) : texelFetch(srcTex, ivec2(x1, y0), 0);
+    const vec4 c = fromOrig ? texelFetch(orig, ivec2(x0, y1), 0) : texelFetch(srcTex, ivec2(x0, y1), 0);
+    const vec4 e = fromOrig ? texelFetch(orig, ivec2(x1, y1), 0) : texelFetch(srcTex, ivec2(x1, y1), 0);
     const vec4 top = a + (b - a) * fx, bottom = c + (e - c) * fx;
     return top + (bottom - top) * fy;
 }
@@ -809,8 +813,10 @@ void main() {
         // the pixels it owns by the CPU's rule over those before it. p[1] the tile's size, the tiles across, where the
         // triangles start in the table; the table each tile's list (its start and length) at the tile's index, the lists,
         // then each triangle in 6 texels (edges k: A, B and the vertex P they are worked out from; the values at the
-        // vertices with which edges' pixels it owns, by bit; its vertices at rest)
+        // vertices with which edges' pixels it owns, by bit; its vertices at rest). Through the shutter (p[1].w), each
+        // sample drawn from the picture as the warp began and laid over the mean of the p[2].x drawn before it (extra).
         const int tile = int(p[1].x), tris = int(p[1].z);
+        const bool fromOrig = p[1].w > 0.5;
         const ivec2 tc = xy / tile;
         const vec4 list = tableTexel(tc.y * int(p[1].y) + tc.x);
         const int first = int(list.x), n = int(list.y);
@@ -830,9 +836,10 @@ void main() {
             }
             if (!inside) continue;
             const vec4 r01 = tableTexel(at + 4), r2 = tableTexel(at + 5);
-            const vec4 s = warpSample(size, l.x * r01.x + l.y * r01.z + l.z * r2.x, l.x * r01.y + l.y * r01.w + l.z * r2.y);
+            const vec4 s = warpSample(size, l.x * r01.x + l.y * r01.z + l.z * r2.x, l.x * r01.y + l.y * r01.w + l.z * r2.y, fromOrig);
             o = s + o * (1.0 - s.a);
         }
+        if (p[2].x > 0.0) o = mix(texelFetch(extra, xy, 0), o, 1.0 / (p[2].x + 1.0));
         fragColor = o;
         return;
     }
@@ -1617,7 +1624,7 @@ void main() {
         if (mode == 69) {
             // Focus Breathing: the picture scaled about its centre by p[2].x, the edges held
             const float cx = float(size.x) / 2.0, cy = float(size.y) / 2.0, k = p[2].x;
-            fragColor = warpSample(size, cx + (float(x) + 0.5 - cx) / k, cy + (float(y) + 0.5 - cy) / k);
+            fragColor = warpSample(size, cx + (float(x) + 0.5 - cx) / k, cy + (float(y) + 0.5 - cy) / k, false);
             return;
         }
     }
