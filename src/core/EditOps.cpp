@@ -2710,8 +2710,16 @@ Result nestClips(Project& p, Sequence& s, const std::vector<Id>& all, const std:
     const bool hasVideo = vIdx < int(sq.videoTracks.size());
     if (vIdx >= int(sq.videoTracks.size())) vIdx = 0;
     if (aIdx >= int(sq.audioTracks.size())) aIdx = 0;
-    return placeMedia(p, sq, m.id, lo, 0, double(hi - lo), {TrackKind::Video, vIdx}, {TrackKind::Audio, aIdx}, false,
-                      hasVideo || !pictureIfAny, true);
+    Result placed = placeMedia(p, sq, m.id, lo, 0, double(hi - lo), {TrackKind::Video, vIdx}, {TrackKind::Audio, aIdx}, false,
+                               hasVideo || !pictureIfAny, true);
+    // A range that ends in an empty stretch: the nested sequence ends at its last clip, and the compound is as long as
+    // the range all the same (past the last clip it shows and plays nothing, as the gap did).
+    if (placed.ok) {
+        Sequence& now = *p.findSequence(outerId);
+        for (Id id : placed.created)
+            if (Clip* c = clipById(now, id); c && c->duration < hi - lo) c->duration = hi - lo;
+    }
+    return placed;
 }
 }  // namespace
 
@@ -2759,6 +2767,17 @@ bool mixedAlike(const Track& x, const Track& y) {
            x.muteAuto == y.muteAuto && x.automation == y.automation;
 }
 }  // namespace
+
+std::vector<TrackRef> nestRangeStays(const Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& given) {
+    std::vector<TrackRef> stays;
+    if (b <= a) return stays;
+    for (TrackRef r : given) {
+        const Track* t = trackAt(s, r);
+        if (!t || !t->locked || std::find(stays.begin(), stays.end(), r) != stays.end()) continue;
+        if (overlapsRange(*t, a, b)) stays.push_back(r);
+    }
+    return stays;
+}
 
 Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& given, const std::string& name) {
     if (b <= a) return Result::fail("Set In and Out points first");

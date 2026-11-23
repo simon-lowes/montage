@@ -21919,9 +21919,76 @@ if __name__ == '__main__':
         const MediaItem* nest = back.findMedia(v1.clips[1].mediaId);
         QVERIFY(nest && nest->kind == MediaKind::Sequence && nest->name == "Middle");
         QCOMPARE(back.active()->audioTracks[0].clips[1].mediaId, nest->id);
+        QVERIFY(r.value("structuredContent").toObject().value("locked_tracks_left").toArray().isEmpty());
         // Out before In is refused.
         r = call("montage_nest_range", {{"project", project}, {"in", "00:00:02:00"}, {"out", "00:00:01:00"}});
         QVERIFY(r.value("isError").toBool());
+        // A locked track with clips in the range stays, and the answer names it.
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            Sequence& sq = *q.active();
+            while (sq.videoTracks.size() < 2) edit::addTrack(q, sq, TrackKind::Video);
+            Clip title = makeGeneratorClip(q, "color", 20);
+            title.start = 55;
+            QVERIFY(edit::overwrite(q, sq, {TrackKind::Video, 1}, title).ok);
+            sq.videoTracks[1].locked = true;
+            const QString lockedProject = QString::fromStdString(path("repoint-locked.montage"));
+            QVERIFY(saveProject(q, lockedProject.toStdString()));
+            r = call("montage_nest_range", {{"project", lockedProject}, {"in", "00:00:02:00"}, {"out", "00:00:03:00"}, {"name", "Under"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QCOMPARE(r.value("structuredContent").toObject().value("locked_tracks_left").toArray(), QJsonArray{QStringLiteral("V2")});
+            QVERIFY(loadProject(lockedProject.toStdString(), q));
+            QCOMPARE(q.active()->videoTracks[1].clips.size(), size_t(1));
+        }
+
+        // montage_extract_sound: each clip's sound as a file named for the clip, stamped with its source time; the
+        // project is not changed.
+        {
+            const QString folder = QString::fromStdString(path("extracted-sound"));
+            QFile before(project);
+            QVERIFY(before.open(QIODevice::ReadOnly));
+            const QByteArray saved = before.readAll();
+            before.close();
+            QVERIFY(loadProject(project.toStdString(), back));
+            const Track& a1 = back.active()->audioTracks[0];
+            QVERIFY(a1.clips.size() >= 3);
+            const Clip& last = a1.clips.back();  // (the third clip's sound: from 50 frames into the eight-second file)
+            r = call("montage_extract_sound", {{"project", project}, {"clips", QJsonArray{double(last.id)}}, {"folder", folder}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QJsonArray files = r.value("structuredContent").toObject().value("files").toArray();
+            QCOMPARE(files.size(), 1);
+            const QString file = files[0].toObject().value("file").toString();
+            QVERIFY(file.startsWith(folder) && QFileInfo::exists(file));
+            QVERIFY(std::fabs(files[0].toObject().value("source_seconds").toDouble() - last.sourceIn / 25.0) < 1e-9);
+            FieldRecording stamp;
+            QVERIFY(readFieldRecording(file.toStdString(), stamp));
+            QVERIFY(std::fabs(stamp.startSeconds - last.sourceIn / 25.0) < 1e-4);
+            std::string err;
+            AudioBufferPtr sound = decodeAudio(file.toStdString(), 48000, &err);
+            QVERIFY2(sound, err.c_str());
+            QVERIFY(std::abs(sound->frames() - int64_t(double(last.duration) / 25.0 * 48000)) < 100);
+            float peak = 0;
+            for (float v : sound->samples) peak = std::max(peak, std::fabs(v));
+            QVERIFY2(std::fabs(peak - 0.4f) < 0.01f, qPrintable(QString::number(peak)));
+            // Every audio clip by default (the same name twice gets a number); a clip that is not there is refused.
+            r = call("montage_extract_sound", {{"project", project}, {"folder", folder}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            files = r.value("structuredContent").toObject().value("files").toArray();
+            QCOMPARE(files.size(), int(a1.clips.size()));
+            QSet<QString> names;
+            for (const QJsonValue& f : files) {
+                QVERIFY(QFileInfo::exists(f.toObject().value("file").toString()));
+                names.insert(f.toObject().value("file").toString());
+            }
+            QCOMPARE(names.size(), int(a1.clips.size()));
+            QVERIFY(!names.contains(file));
+            r = call("montage_extract_sound", {{"project", project}, {"clips", QJsonArray{987654.0}}, {"folder", folder}});
+            QVERIFY(r.value("isError").toBool());
+            QFile after(project);
+            QVERIFY(after.open(QIODevice::ReadOnly));
+            QVERIFY(after.readAll() == saved);
+        }
     }
 
     void mixerGainPanMuteAndFades() {

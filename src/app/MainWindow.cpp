@@ -1746,7 +1746,15 @@ void MainWindow::buildMenus() {
             return;
         }
         bool ok = false;
-        const QString name = QInputDialog::getText(this, tr("Nest In to Out"), tr("Compound clip name:"), QLineEdit::Normal, tr("Nested Sequence"), &ok);
+        // What a locked track will do is said before anything is cut.
+        QString label = tr("Compound clip name:");
+        QStringList locked;
+        for (TrackRef r : edit::nestRangeStays(*s, s->inPoint, s->outPoint + 1, allTracks(*s)))
+            locked << (r.kind == TrackKind::Video ? QStringLiteral("V%1") : QStringLiteral("A%1")).arg(r.index + 1);
+        if (!locked.isEmpty())
+            label = tr("Locked tracks keep their clips between In and Out where they are, outside the nested clip: %1.").arg(locked.join(QStringLiteral(", "))) +
+                    QStringLiteral("\n\n") + label;
+        const QString name = QInputDialog::getText(this, tr("Nest In to Out"), label, QLineEdit::Normal, tr("Nested Sequence"), &ok);
         if (ok && !name.isEmpty()) nestInToOut(name);
     })->setObjectName(QStringLiteral("nestInToOut"));
     add(clipM, QT_TR_NOOP("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });

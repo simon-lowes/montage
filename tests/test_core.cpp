@@ -5751,6 +5751,61 @@ private slots:
         QVERIFY(nestRange(fz.p, fz.s(), 10, 20, allTracks(fz.s()), "Sound").ok);
         QVERIFY(trackAt(*fz.p.active(), V1)->clips.empty());
         QCOMPARE(trackAt(*fz.p.active(), A1)->clips.size(), size_t(3));
+        // A range that ends in an empty stretch: the compound is as long as the range (its picture and its sound),
+        // though the nested sequence ends at its last clip; and one that begins in one keeps the gap inside.
+        Fixture fg;
+        const Result placed = placeMedia(fg.p, fg.s(), fg.media, 0, 0, 30, V1, A1, false);
+        QVERIFY(placed.ok);
+        fg.put(V2, 60, 20);
+        const Id outerId = fg.s().id;
+        const Result gap = nestRange(fg.p, fg.s(), 10, 50, allTracks(fg.s()), "Gap");
+        QVERIFY2(gap.ok, gap.error.c_str());
+        {
+            const Sequence& outer = *fg.p.findSequence(outerId);
+            const Track& v1 = *trackAt(outer, V1);
+            QCOMPARE(v1.clips.size(), size_t(2));
+            QCOMPARE(v1.clips[1].start, FrameTime(10));
+            QCOMPARE(v1.clips[1].duration, FrameTime(40));
+            const Track& a1 = *trackAt(outer, A1);
+            QCOMPARE(a1.clips.size(), size_t(2));
+            QCOMPARE(a1.clips[1].start, FrameTime(10));
+            QCOMPARE(a1.clips[1].duration, FrameTime(40));
+            const MediaItem* m = fg.p.findMedia(v1.clips[1].mediaId);
+            QVERIFY(m && m->kind == MediaKind::Sequence);
+            QCOMPARE(fg.p.findSequence(m->sequenceId)->duration(), FrameTime(20));  // (10 to 30 of the range)
+            QCOMPARE(trackAt(outer, V2)->clips.size(), size_t(1));                  // (after Out: as it was)
+            // Saved and opened again it is as long.
+            Project again;
+            std::string err;
+            QVERIFY2(projectFromJson(projectToJson(fg.p), again, &err), err.c_str());
+            QCOMPARE(trackAt(*again.findSequence(outerId), V1)->clips[1].duration, FrameTime(40));
+        }
+        Fixture fh;
+        fh.put(V1, 20, 30);
+        const Id hId = fh.s().id;
+        QVERIFY(nestRange(fh.p, fh.s(), 10, 40, allTracks(fh.s()), "Lead").ok);
+        {
+            const Track& v1 = *trackAt(*fh.p.findSequence(hId), V1);
+            QCOMPARE(v1.clips.size(), size_t(2));
+            QCOMPARE(v1.clips[0].start, FrameTime(10));
+            QCOMPARE(v1.clips[0].duration, FrameTime(30));
+            const Sequence& nested = *fh.p.findSequence(fh.p.findMedia(v1.clips[0].mediaId)->sequenceId);
+            QCOMPARE(trackAt(nested, V1)->clips[0].start, FrameTime(10));
+        }
+        // The locked tracks whose clips will stay are named before anything is cut: those with clips in the range.
+        Fixture fl;
+        fl.put(V1, 0, 60);
+        fl.put(V2, 20, 10);
+        fl.put(V2, 70, 10);
+        fl.put(V3, 80, 10);
+        trackAt(fl.s(), V2)->locked = true;
+        trackAt(fl.s(), V3)->locked = true;
+        QCOMPARE(nestRangeStays(fl.s(), 10, 50, allTracks(fl.s())), std::vector<TrackRef>{V2});
+        QVERIFY(nestRangeStays(fl.s(), 30, 50, allTracks(fl.s())).empty());
+        QCOMPARE(nestRangeStays(fl.s(), 10, 90, allTracks(fl.s())), (std::vector<TrackRef>{V2, V3}));
+        QVERIFY(nestRangeStays(fl.s(), 50, 50, allTracks(fl.s())).empty());
+        QVERIFY(nestRange(fl.p, fl.s(), 10, 50, allTracks(fl.s()), "Under").ok);
+        QCOMPARE(trackAt(*fl.p.active(), V2)->clips.size(), size_t(2));  // (as they were, above the compound)
     }
 
     // Nightly 15 Nov: Nest In to Out leaves what is seen and heard as it was, or refuses before cutting anything.

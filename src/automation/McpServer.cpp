@@ -2582,6 +2582,10 @@ void McpServer::Impl::addTools() {
             if (!a.contains("tracks")) tracks = allTracks(s);
             if (tracks.empty()) throw ArgError{"\"tracks\" must list tracks"};
             const std::string name = str(a, "name", "Nested Sequence").toStdString();
+            // (locked tracks with clips in the range: they stay where they are, and the answer says so)
+            QJsonArray stays;
+            for (TrackRef t : edit::nestRangeStays(s, in, out, tracks))
+                stays.append((t.kind == TrackKind::Video ? QStringLiteral("V%1") : QStringLiteral("A%1")).arg(t.index + 1));
             const edit::Result r = edit::nestRange(l.project, s, in, out, tracks, name);
             check(r);
             save(l);
@@ -2591,6 +2595,7 @@ void McpServer::Impl::addTools() {
                 if (const Clip* c = edit::clipById(after, id)) made.append(clipJson(l.project, after, *c));
             QJsonObject outJson = projectJson(l.project);
             outJson["clips"] = made;
+            outJson["locked_tracks_left"] = stays;
             return ok(QStringLiteral("Nested %1 to %2 as \"%3\"").arg(tc(in, after), tc(out, after), QString::fromStdString(name)), outJson);
         });
 
@@ -2627,6 +2632,52 @@ void McpServer::Impl::addTools() {
             QJsonObject out = projectJson(l.project);
             out["clips"] = clips;
             return ok(QStringLiteral("Repointed %1 clip(s)").arg(r.created.size()), out);
+        });
+
+    add("montage_extract_sound", "Extract clips' sound to files",
+        "Write the sound of timeline clips as Broadcast Wave files (24-bit, the sequence's rate), one for each clip, in "
+        "`folder`: the clip's own sound without its effects, named for the clip, stamped with its source's timecode at "
+        "the first sample it plays (bext and iXML), so another tool lines it up with the recording. `clips` are clip "
+        "ids (audio clips, or pictures whose linked sound is taken); default every audio clip of the sequence. The "
+        "project is not changed.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clips":{"type":"array","items":{"type":"number"},"description":"Clip ids; default every audio clip"},
+            "folder":{"type":"string","description":"Where the files go (made if missing)"}},"required":["project","folder"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            std::vector<Id> given, clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) given.push_back(Id(v.toDouble()));
+            if (a.contains("clips")) {
+                if (given.empty()) throw ArgError{"\"clips\" must list clip ids"};
+                for (Id id : given)
+                    if (!edit::clipById(s, id)) throw ArgError{QStringLiteral("No clip %1 in the sequence").arg(qulonglong(id))};
+                for (Id id : edit::expandLinks(s, given))
+                    if (const auto loc = edit::locate(s, id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
+            } else {
+                for (const Track& t : s.audioTracks)
+                    for (const Clip& c : t.clips) clips.push_back(c.id);
+            }
+            if (clips.empty()) throw ArgError{"None of the clips has sound"};
+            const QString folder = absolute(need(a, "folder"));
+            if (!QDir().mkpath(folder)) throw ArgError{QStringLiteral("Could not make the folder %1").arg(folder)};
+            QJsonArray files;
+            for (Id id : clips) {
+                const Clip* c = edit::clipById(s, id);
+                QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^\\w\\- ]")), QStringLiteral("_"));
+                if (base.isEmpty()) base = QStringLiteral("Clip");
+                QString path = QDir(folder).filePath(base + QStringLiteral(".wav"));
+                for (int n = 2; QFileInfo::exists(path); ++n) path = QDir(folder).filePath(QStringLiteral("%1 %2.wav").arg(base).arg(n));
+                std::string err;
+                if (!extractClipSound(l.project, s, id, path.toStdString(), &err))
+                    throw ArgError{QStringLiteral("Extracting the sound of clip %1 failed: %2").arg(qulonglong(id)).arg(QString::fromStdString(err))};
+                const BroadcastStamp stamp = clipSoundStamp(l.project, s, *c);
+                files.append(QJsonObject{{"clip", double(id)}, {"file", path}, {"source_seconds", stamp.seconds},
+                                         {"duration", double(c->duration) / s.fpsValue()}});
+            }
+            QJsonObject out;
+            out["files"] = files;
+            return ok(QStringLiteral("Wrote %1 sound file(s) to %2").arg(files.size()).arg(folder), out);
         });
 
     add("montage_strip_silence", "Strip silence",
