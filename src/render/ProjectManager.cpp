@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <set>
+#include <vector>
 
 #include "Exporter.h"
 #include "core/ProjectMerge.h"
@@ -113,6 +115,41 @@ std::vector<Id> usedMedia(const Project& p, const std::vector<Id>& sequences) {
     return {used.begin(), used.end()};
 }
 
+namespace {
+
+// A file's bytes as one number (FNV-1a, 64 bits); false when it cannot be read.
+bool fileHash(const fs::path& file, uint64_t& hash) {
+    std::FILE* f =
+#ifdef _WIN32
+        _wfopen(file.c_str(), L"rb");
+#else
+        std::fopen(file.c_str(), "rb");
+#endif
+    if (!f) return false;
+    hash = 1469598103934665603ull;
+    std::vector<unsigned char> buf(size_t(1) << 20);
+    size_t n = 0;
+    while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0)
+        for (size_t i = 0; i < n; ++i) hash = (hash ^ buf[i]) * 1099511628211ull;
+    const bool ok = !std::ferror(f);
+    std::fclose(f);
+    return ok;
+}
+
+// Whether `copy` is already the whole of `from`: there, the same size, and the same hash.
+bool alreadyWhole(const fs::path& from, const fs::path& copy) {
+    std::error_code ec;
+    if (!fs::is_regular_file(copy, ec)) return false;
+    const auto a = fs::file_size(from, ec);
+    if (ec) return false;
+    const auto b = fs::file_size(copy, ec);
+    if (ec || a != b) return false;
+    uint64_t ha = 0, hb = 0;
+    return fileHash(from, ha) && fileHash(copy, hb) && ha == hb;
+}
+
+}  // namespace
+
 bool consolidateProject(const Project& p, const ConsolidateOptions& o, ConsolidateResult* result, const std::function<void(double)>& progress,
                         const std::atomic<bool>* cancel, std::string* error) {
     auto fail = [&](const std::string& msg) {
@@ -164,9 +201,15 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             // Every frame into a folder of its own, named as they were.
             const fs::path folder = uniqueIn(mediaDir, utf8(src.stem()), "", taken, own);
             begin(folder);
+            const bool mine = own.count(utf8(folder)) > 0;
             fs::create_directories(folder, ec);
             for (int n = frames.first; n <= frames.last; ++n) {
                 const fs::path from = u8path(imageSequenceFrame(frames, n)), to = folder / from.filename();
+                // (a frame the run before had finished stays as it is)
+                if (mine && alreadyWhole(from, to)) {
+                    res.passedOver++;
+                    continue;
+                }
                 if (!fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec)) return fail("Cannot copy " + utf8(from) + ": " + ec.message());
                 res.bytes += int64_t(fs::file_size(to, ec));
             }
@@ -302,14 +345,19 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             }
             const fs::path dest = uniqueIn(mediaDir, utf8(src.stem()), utf8(src.extension()), taken, own);
             begin(dest);
-            // (a copy the run before had begun is written over)
-            if (!fs::copy_file(src, dest, own.count(utf8(dest)) ? fs::copy_options::overwrite_existing : fs::copy_options::none, ec))
+            // (a copy the run before had finished stays as it is; one it had only begun is written over)
+            const bool mine = own.count(utf8(dest)) > 0, whole = mine && alreadyWhole(src, dest);
+            if (!whole && !fs::copy_file(src, dest, mine ? fs::copy_options::overwrite_existing : fs::copy_options::none, ec))
                 return fail("Cannot copy " + m.path + ": " + ec.message());
             copiedFiles[utf8(src)] = utf8(dest);
             m.path = interpretedPath(psdLayer ? psdLayerPath(utf8(dest), layer) : utf8(dest), reading);
             m.proxyPath.clear();
-            res.copied++;
-            res.bytes += int64_t(fs::file_size(dest, ec));
+            if (whole) {
+                res.passedOver++;
+            } else {
+                res.copied++;
+                res.bytes += int64_t(fs::file_size(dest, ec));
+            }
         }
     }
     const fs::path projectPath = folder / u8path(o.name + ".montage");

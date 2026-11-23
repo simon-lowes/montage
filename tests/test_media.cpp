@@ -23154,6 +23154,89 @@ if ui["pressed"] == "add":
         QVERIFY(!consolidateProject(p, o, &res, {}, nullptr, &err));
     }
 
+    void consolidationPassesOverWholeFiles() {
+        // Five stills in a cut, collected into a folder. The first run is stopped as its fourth file begins and that
+        // file is cut short, as a crash leaves it. Taken up again with the files the run had begun, the three whole
+        // copies are passed over (the same size and hash: counted, and their times unchanged) and only the other two
+        // are written; a copy of the right size whose bytes differ is written again too.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 96, s.height = 54, s.fps = Rational{25, 1};
+        for (int i = 0; i < 5; ++i) {
+            QImage still(96, 54, QImage::Format_RGB32);
+            still.fill(qRgb(40 * i, 200 - 30 * i, 60));
+            const std::string file = path(("whole-" + std::to_string(i) + ".png").c_str());
+            QVERIFY(still.save(QString::fromStdString(file)));
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 10 * i, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        }
+        ConsolidateOptions o;
+        o.folder = path("whole-collected");
+        o.name = "Whole";
+        std::vector<std::string> begun;
+        std::atomic<bool> stop{false};
+        o.began = [&](const std::string& file) {
+            begun.push_back(file);
+            if (begun.size() == 4) stop = true;
+        };
+        ConsolidateResult res;
+        std::string err;
+        QVERIFY(!consolidateProject(p, o, &res, {}, &stop, &err));
+        QCOMPARE(begun.size(), size_t(4));
+        for (const std::string& f : begun) QVERIFY(QFileInfo::exists(QString::fromStdString(f)));
+        QVERIFY(QFile::resize(QString::fromStdString(begun[3]), 100));
+        std::vector<QDateTime> stamps;
+        for (int i = 0; i < 3; ++i) {
+            // (stamped in the past, so a copy written again would show)
+            QFile f(QString::fromStdString(begun[size_t(i)]));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QVERIFY(f.setFileTime(QDateTime::currentDateTimeUtc().addSecs(-3600 - i), QFileDevice::FileModificationTime));
+            f.close();
+            stamps.push_back(QFileInfo(QString::fromStdString(begun[size_t(i)])).lastModified());
+        }
+        ConsolidateOptions again = o;
+        again.replace = begun;
+        std::vector<std::string> second;
+        again.began = [&](const std::string& file) { second.push_back(file); };
+        QVERIFY2(consolidateProject(p, again, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.passedOver, 3);
+        QCOMPARE(res.copied, 2);
+        QCOMPARE(second.size(), size_t(5));
+        for (int i = 0; i < 4; ++i) QCOMPARE(second[size_t(i)], begun[size_t(i)]);
+        for (int i = 0; i < 3; ++i) QCOMPARE(QFileInfo(QString::fromStdString(begun[size_t(i)])).lastModified(), stamps[size_t(i)]);
+        auto bytesOf = [](const std::string& file) {
+            QFile f(QString::fromStdString(file));
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+        for (int i = 0; i < 5; ++i) {
+            const QByteArray copy = bytesOf(second[size_t(i)]);
+            QVERIFY(!copy.isEmpty());
+            QCOMPARE(copy, bytesOf(path(("whole-" + std::to_string(i) + ".png").c_str())));
+        }
+        // The project it wrote plays the copies.
+        Project made;
+        QVERIFY2(loadProject(res.projectPath, made, &err), err.c_str());
+        QCOMPARE(made.media.size(), size_t(5));
+        for (const MediaItem& m : made.media) QVERIFY2(m.path.find("whole-collected") != std::string::npos, m.path.c_str());
+
+        // A copy of the right size with one byte changed is not whole: written again, the others passed over.
+        {
+            QFile f(QString::fromStdString(second[1]));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QVERIFY(f.seek(f.size() - 5));
+            char c = 0;
+            QVERIFY(f.getChar(&c));
+            QVERIFY(f.seek(f.size() - 5));
+            QVERIFY(f.putChar(char(c ^ 0x55)));
+        }
+        again.replace = second;
+        QVERIFY2(consolidateProject(p, again, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.passedOver, 4);
+        QCOMPARE(res.copied, 1);
+        QCOMPARE(bytesOf(second[1]), bytesOf(path("whole-1.png")));
+    }
+
     void smartRendering() {
         // The source: one second of a changing ramp in ProRes 422 HQ, 128 x 72 at 25 fps.
         Project gen = makeDefaultProject();

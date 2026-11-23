@@ -23,7 +23,8 @@ struct ConsolidateOptions {
     bool keepUnused = false;     // keep media items nothing uses
     // A job taken up again after it was cut short (app/DialogJobs.h): `began` is told each file or folder in the
     // folder's Media before it is written, and those of the run before, given as `replace`, are this job's own, so
-    // they are written again under the same names rather than beside themselves.
+    // they are written again under the same names rather than beside themselves. A whole copy among them that is
+    // already complete (the source's size and the same hash) is passed over instead; trimmed copies are made again.
     std::function<void(const std::string& file)> began;
     std::vector<std::string> replace;
 };
@@ -31,6 +32,7 @@ struct ConsolidateOptions {
 struct ConsolidateResult {
     std::string projectPath;
     int copied = 0;    // files copied whole
+    int passedOver = 0;  // a job taken up again: files of the run before found whole and not written again
     int trimmed = 0;   // videos transcoded to their used part
     int64_t bytes = 0;  // written to the folder's Media
     std::vector<std::string> missing;  // used files that could not be found (left pointing where they were)
