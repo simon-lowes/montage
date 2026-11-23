@@ -36,11 +36,32 @@ std::unique_ptr<Stream> openPortAudio(const DeviceSettings&, int, int, int, Stre
 
 namespace {
 
-// PortAudio is started once, the first time it is asked for, and kept (its device lists are taken then).
+// PortAudio is started the first time it is asked for, and kept. It lists the devices when it starts and never again,
+// so a device plugged in later (or unplugged and plugged back in) is not there until it is started again, which it
+// allows with no stream open: done for a list of devices, and for an open that does not find the device it was given,
+// no more often than every few seconds (starting it asks every device what it can do).
 std::mutex gPaM;
+bool gPaTried = false, gPaUp = false;
+int gPaStreams = 0;  // streams open (under gPaM)
+std::chrono::steady_clock::time_point gPaListed;
+constexpr std::chrono::seconds kRelistEvery{3};
+
 bool paReady() {
-    static const bool ok = Pa_Initialize() == paNoError;
-    return ok;
+    if (!gPaTried) {
+        gPaTried = true;
+        gPaUp = Pa_Initialize() == paNoError;
+        gPaListed = std::chrono::steady_clock::now();
+    }
+    return gPaUp;
+}
+
+// (under gPaM) True when the devices were listed again.
+bool paRelist() {
+    if (!paReady() || gPaStreams > 0 || std::chrono::steady_clock::now() - gPaListed < kRelistEvery) return false;
+    Pa_Terminate();
+    gPaUp = Pa_Initialize() == paNoError;
+    gPaListed = std::chrono::steady_clock::now();
+    return gPaUp;
 }
 
 PaHostApiTypeId paType(Host h) {
@@ -81,14 +102,27 @@ PaDeviceIndex findDevice(PaHostApiIndex api, const std::string& id, bool output)
     return output ? h->defaultOutputDevice : h->defaultInputDevice;
 }
 
+// Whether the host lists a device of this name (with outputs, or with inputs).
+bool listed(PaHostApiIndex api, const std::string& id, bool output) {
+    const PaHostApiInfo* h = Pa_GetHostApiInfo(api);
+    for (int k = 0; h && k < h->deviceCount; ++k) {
+        const PaDeviceIndex d = Pa_HostApiDeviceIndexToDeviceIndex(api, k);
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(d);
+        if (info && deviceId(d) == id && (output ? info->maxOutputChannels : info->maxInputChannels) > 0) return true;
+    }
+    return false;
+}
+
 class PaStreamBox : public Stream {
 public:
     explicit PaStreamBox(StreamCallbacks cb) : cb_(std::move(cb)) {}
     ~PaStreamBox() override {
         if (stream_) {
             closing_ = true;
+            std::lock_guard<std::mutex> lock(gPaM);
             Pa_StopStream(stream_);
             Pa_CloseStream(stream_);
+            --gPaStreams;
         }
     }
     bool open(const DeviceSettings& s, int rate, int inputs, int outputs, std::string* error) {
@@ -97,7 +131,11 @@ public:
             if (error) *error = "PortAudio could not start";
             return false;
         }
-        const PaHostApiIndex api = paIndex(s.host);
+        PaHostApiIndex api = paIndex(s.host);
+        // (a device asked for by name that is not listed may have been plugged in since the devices were listed)
+        if (api >= 0 && ((!s.output.empty() && outputs > 0 && !listed(api, s.output, true)) || (!s.input.empty() && inputs > 0 && !listed(api, s.input, false))) &&
+            paRelist())
+            api = paIndex(s.host);
         if (api < 0) {
             if (error) *error = std::string("This build or system has no ") + hostId(s.host);
             return false;
@@ -162,6 +200,7 @@ public:
             if (error) *error = std::string("The device could not be opened: ") + Pa_GetErrorText(e);
             return false;
         }
+        ++gPaStreams;
         const PaStreamInfo* info = Pa_GetStreamInfo(stream_);
         rate_ = info && info->sampleRate > 0 ? int(info->sampleRate + 0.5) : rate;
         latency_.input = info && inputs_ > 0 ? int(info->inputLatency * rate_ + 0.5) : 0;
@@ -243,6 +282,7 @@ bool portAudioHas(Host h) {
 std::vector<DeviceInfo> portAudioDevices(Host h, std::string* error) {
     std::lock_guard<std::mutex> lock(gPaM);
     std::vector<DeviceInfo> out;
+    paRelist();
     const PaHostApiIndex api = paReady() ? paIndex(h) : -1;
     const PaHostApiInfo* info = api >= 0 ? Pa_GetHostApiInfo(api) : nullptr;
     if (!info) {

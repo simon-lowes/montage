@@ -4279,6 +4279,59 @@ private slots:
         audiodev::setLoopbackOptions({});
     }
 
+    // Nightly 23 Nov: PortAudio lists the devices when it starts and never again, so a device plugged in later (or
+    // unplugged and plugged back in) was not there until Montage was started again. A device added to ALSA's
+    // configuration stands in for one plugged in: it is listed within a few seconds, and opens by its name.
+    void portAudioListsADevicePluggedInLater() {
+#ifndef Q_OS_LINUX
+        QSKIP("ALSA's configuration stands in for plugging a device in: on Linux only");
+#else
+        using namespace audiodev;
+        const std::vector<Host> hosts = availableHosts();
+        if (std::find(hosts.begin(), hosts.end(), Host::Alsa) == hosts.end()) QSKIP("No ALSA through PortAudio here");
+        if (!QFile::exists("/usr/share/alsa/alsa.conf")) QSKIP("No ALSA configuration to add a device to");
+        auto listed = [] {
+            const std::vector<DeviceInfo> all = devices(Host::Alsa);
+            return std::any_of(all.begin(), all.end(), [](const DeviceInfo& d) { return d.id == "montage_plugged_in" && d.outputs > 0; });
+        };
+        QVERIFY(!listed());
+        QTemporaryDir dir;
+        QFile conf(dir.filePath("asound.conf"));
+        QVERIFY(conf.open(QIODevice::WriteOnly));
+        conf.write("</usr/share/alsa/alsa.conf>\npcm.montage_plugged_in { type null }\n");
+        conf.close();
+        const bool had = qEnvironmentVariableIsSet("ALSA_CONFIG_PATH");
+        const QByteArray before = qgetenv("ALSA_CONFIG_PATH");
+        qputenv("ALSA_CONFIG_PATH", conf.fileName().toLocal8Bit());
+        QElapsedTimer waited;
+        waited.start();
+        bool there = false;
+        while (!(there = listed()) && waited.elapsed() < 20000) QTest::qWait(250);
+        QString opened;
+        if (there) {
+            Engine e;
+            DeviceSettings s;
+            s.host = Host::Alsa;
+            s.output = "montage_plugged_in";
+            s.bufferFrames = 256;
+            s.sampleRate = 48000;
+            e.setSettings(s);
+            Feed feed(e);
+            std::string why;
+            if (feed.open(48000, 2, 0.1, &why)) opened = QString::fromStdString(e.status().device);
+            else opened = QString::fromStdString("not opened: " + why);
+        }
+        // (ALSA's configuration as it was, the devices listed again without the stand-in)
+        if (had) qputenv("ALSA_CONFIG_PATH", before);
+        else qunsetenv("ALSA_CONFIG_PATH");
+        QVERIFY(there);
+        QCOMPARE(opened, QString("montage_plugged_in"));
+        waited.start();
+        while (listed() && waited.elapsed() < 20000) QTest::qWait(250);
+        QVERIFY(!listed());
+#endif
+    }
+
     void overloadedCallbackIsAnXrun() {
         // A callback held past its period (an overloaded computer) is counted as an xrun, and the count can be reset.
         audiodev::Engine e;
