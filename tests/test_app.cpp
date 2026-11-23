@@ -23856,6 +23856,74 @@ print("added " + ui["name"])
         else appSettings().remove("export/preset");
     }
 
+    void streamingDialogScoringSettings() {
+        // Export Streaming Package's display size and Lowest CRF: off until rates are set per shot, and the package
+        // they set up is scored at the size chosen and searched no finer than the CRF given, as its ladder.csv says.
+        if (!vmafAvailable()) QSKIP("Built without libvmaf");
+        loadDemo();
+        const QString folder = dir_.path() + "/streaming-dialog";
+        QVERIFY(QDir().mkpath(folder));
+        auto wrong = std::make_shared<QString>();
+        auto opened = std::make_shared<bool>(false), chose = std::make_shared<bool>(false);
+        whenModal<QDialog>(this, [this, wrong, opened, chose, folder](QDialog* d) {
+            *opened = true;
+            auto* perShot = d->findChild<QCheckBox*>("streamingPerShot");
+            auto* size = d->findChild<QComboBox*>("streamingDisplaySize");
+            auto* crf = d->findChild<QDoubleSpinBox*>("streamingCrfFloor");
+            auto* ladder = d->findChild<QListWidget*>("streamingLadder");
+            auto* sound = d->findChild<QComboBox*>("streamingSound");
+            auto fail = [&](const QString& why) {
+                *wrong = why;
+                d->reject();
+            };
+            if (!perShot || !size || !crf || !ladder || !sound || ladder->count() == 0) return fail("a control is missing");
+            if (size->isEnabled() || crf->isEnabled()) return fail("enabled before rates are set per shot");
+            if (size->count() != 4 || size->itemData(0).toSize().isValid() || size->itemData(1).toSize() != QSize(1280, 720) ||
+                size->itemData(3).toSize() != QSize(3840, 2160))
+                return fail("display sizes");
+            if (crf->minimum() != 1 || crf->maximum() != 40 || crf->value() != 18) return fail("Lowest CRF's range or default");
+            perShot->setChecked(true);
+            if (!size->isEnabled() || !crf->isEnabled()) return fail("not enabled with rates set per shot");
+            perShot->setChecked(false);
+            if (size->isEnabled() || crf->isEnabled()) return fail("still enabled with rates set per shot off");
+            perShot->setChecked(true);
+            size->setCurrentIndex(1);
+            crf->setValue(22);
+            // (the smallest rung only, and no sound: quicker)
+            for (int i = 0; i < ladder->count(); ++i) ladder->item(i)->setCheckState(i == ladder->count() - 1 ? Qt::Checked : Qt::Unchecked);
+            sound->setCurrentIndex(sound->findData(QStringLiteral("none")));
+            whenModal<QFileDialog>(this, [chose, folder](QFileDialog* f) {
+                f->setDirectory(folder);
+                if (auto* name = f->findChild<QLineEdit*>(QStringLiteral("fileNameEdit"))) name->setText(folder);
+                *chose = true;
+                static_cast<QDialog*>(f)->accept();
+            });
+            d->accept();
+        });
+        auto* action = win_->findChild<QAction*>("exportStreaming");
+        QVERIFY(action);
+        action->trigger();
+        QVERIFY(*opened);
+        QVERIFY2(wrong->isEmpty(), qPrintable(*wrong));
+        QVERIFY(*chose);
+        QString report;
+        for (QDirIterator it(folder, {QStringLiteral("ladder.csv")}, QDir::Files, QDirIterator::Subdirectories); it.hasNext();) report = it.next();
+        QVERIFY2(!report.isEmpty(), "no ladder.csv");
+        QFile f(report);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QByteArray csv = f.readAll();
+        QVERIFY2(csv.contains("# display_size,1280x720\n") && csv.contains("# crf_floor,22.00\n"), csv.constData());
+        int rows = 0;
+        for (const QByteArray& line : csv.split('\n')) {
+            if (line.isEmpty() || line.startsWith('#') || line.startsWith("rendition,")) continue;
+            const QList<QByteArray> cells = line.split(',');
+            QVERIFY2(cells.size() > 4 && cells[4].toDouble() >= 22, line.constData());
+            ++rows;
+        }
+        QVERIFY2(rows > 0, csv.constData());
+        QDir(folder).removeRecursively();
+    }
+
     void editingFromAnotherSequence() {
         state()->newProject();
         const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg")});
