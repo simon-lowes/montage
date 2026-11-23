@@ -693,6 +693,9 @@ private slots:
         qputenv("MONTAGE_SOUND_LIBRARY", dir_.filePath(QStringLiteral("sound-library.sqlite")).toUtf8());
         // And a job store (the render queue kept on disk) of their own.
         qputenv("MONTAGE_JOBS_DIR", dir_.filePath(QStringLiteral("jobs")).toUtf8());
+        // And a recovery folder, in this run's own temporary folder whatever the environment names: a run that is
+        // killed leaves its unsaved work there, where no later run looks.
+        qputenv("MONTAGE_RECOVERY_DIR", dir_.filePath(QStringLiteral("recovery")).toUtf8());
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();
@@ -24995,6 +24998,90 @@ print("added " + ui["name"])
         // A build run from its build folder has no packaged licences folder to open.
         QVERIFY(packagedLicencesFolder().isEmpty());
         QVERIFY(!dlg.findChild<QPushButton*>("openLicencesFolder")->isEnabled());
+    }
+
+    void recoveryHelper() {
+        // Does nothing by itself: killedRunLeavesNothingToRecover runs this binary again with this as its only test,
+        // to leave unsaved work behind when it is killed, or to say what a run after that finds to recover.
+        const QString file = qEnvironmentVariable("MONTAGE_TEST_RECOVERY_HELPER");
+        if (file.isEmpty()) return;
+        const bool look = qEnvironmentVariable("MONTAGE_TEST_RECOVERY_MODE") == QStringLiteral("look");
+        QJsonObject said{{"recovery", qEnvironmentVariable("MONTAGE_RECOVERY_DIR")}, {"folder", dir_.path()}};
+        if (look) {
+            RecoveryManager probe(state());
+            said["crashed"] = int(probe.crashedSessions().size());
+        } else {
+            // Unsaved work, and the time its recovery copy takes to be written (a second after the edit).
+            QVERIFY(state()->edit("Unsaved", [](Project& p, Sequence& s) { return edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 30)).ok; }));
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 3000) QTest::qWait(50);
+        }
+        QFile part(file + QStringLiteral(".part"));
+        QVERIFY(part.open(QIODevice::WriteOnly));
+        part.write(QJsonDocument(said).toJson());
+        part.close();
+        QVERIFY(part.rename(file));
+        if (!look)
+            for (;;) QTest::qWait(1000);  // (until the test that started it kills it)
+    }
+
+    void killedRunLeavesNothingToRecover() {
+        // The app tests keep their recovery folder inside their own temporary folder: a run killed with unsaved work
+        // leaves its session there, and the next run has nothing to recover (it would wait at Recover Unsaved Work),
+        // even when both were started with the same folder named in their environment, as ctest starts them.
+        QVERIFY(qEnvironmentVariable("MONTAGE_RECOVERY_DIR").startsWith(dir_.path()));
+        const QString sharedFolder = dir_.filePath(QStringLiteral("recovery-as-ctest-names-it"));
+        auto run = [&](const QString& mode, const QString& file) {
+            auto p = std::make_unique<QProcess>();
+            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            env.insert("MONTAGE_TEST_RECOVERY_HELPER", file);
+            env.insert("MONTAGE_TEST_RECOVERY_MODE", mode);
+            env.insert("QT_QPA_PLATFORM", "offscreen");
+            env.insert("MONTAGE_NO_PLUGIN_SCAN", "1");
+            env.insert("MONTAGE_NO_RECOVERY_PROMPT", "1");
+            env.insert("MONTAGE_RECOVERY_DIR", sharedFolder);
+            p->setProcessEnvironment(env);
+            p->setProcessChannelMode(QProcess::MergedChannels);
+            p->start(QCoreApplication::applicationFilePath(), {"recoveryHelper"});
+            return p;
+        };
+        auto answer = [&](const QString& file, QProcess& p, QJsonObject& out) {
+            QElapsedTimer t;
+            t.start();
+            while (!QFileInfo::exists(file) && t.elapsed() < 120000 && p.state() != QProcess::NotRunning) QTest::qWait(50);
+            QFile f(file);
+            if (!f.open(QIODevice::ReadOnly)) return false;
+            out = QJsonDocument::fromJson(f.readAll()).object();
+            return !out.isEmpty();
+        };
+        // A run with unsaved work, killed.
+        const QString firstFile = dir_.filePath(QStringLiteral("recovery-helper-1.json"));
+        auto first = run(QStringLiteral("leave"), firstFile);
+        QJsonObject left;
+        QVERIFY2(answer(firstFile, *first, left), first->readAll().constData());
+        first->kill();
+        QVERIFY(first->waitForFinished(10000));
+        const QString itsFolder = left.value("folder").toString(), itsRecovery = left.value("recovery").toString();
+        QVERIFY(!itsFolder.isEmpty() && itsRecovery.startsWith(itsFolder) && itsFolder != dir_.path());
+        // The run after it finds nothing.
+        const QString secondFile = dir_.filePath(QStringLiteral("recovery-helper-2.json"));
+        auto second = run(QStringLiteral("look"), secondFile);
+        QJsonObject found;
+        QVERIFY2(answer(secondFile, *second, found), second->readAll().constData());
+        QVERIFY(second->waitForFinished(60000));
+        QCOMPARE(found.value("crashed").toInt(-1), 0);
+        QVERIFY(found.value("recovery").toString() != itsRecovery);
+        // The killed run did leave its unsaved work, in its own folder (which is cleared away here).
+        {
+            RecoveryManager probe(state(), itsRecovery);
+            const auto crashed = probe.crashedSessions();
+            QCOMPARE(crashed.size(), size_t(1));
+            QVERIFY(!crashed[0].recoveryFile.isEmpty());
+        }
+        QVERIFY(!QDir(sharedFolder + QStringLiteral("/sessions")).exists() ||
+                QDir(sharedFolder + QStringLiteral("/sessions")).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty());
+        QVERIFY(QDir(itsFolder).removeRecursively());
     }
 
     void effectPointedAtIsPreviewed() {
