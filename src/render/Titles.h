@@ -172,6 +172,9 @@ std::vector<TitleGlyph> titleGlyphs(const Effect& g, FrameTime t, int w, int h, 
 // rest at every time.
 Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {},
                   const TitleLayerFn& layer = {});
+// How many times a styled title's text has been laid out so far (tests: with Motion Blur a frame's text is laid out
+// once, not at every time through the shutter, unless its text or its letters' styles change between them).
+long titleLayoutsMade();
 // One render at a time between frames, without motion blur.
 Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {},
                     const TitleLayerFn& layer = {});

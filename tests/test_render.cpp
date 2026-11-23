@@ -16988,6 +16988,64 @@ colorspaces:
         QVERIFY2(worst <= 1.0 / 255, qPrintable(QString("boxed: %1 of 255 off").arg(worst * 255)));
     }
 
+    void titleBlurLaysItsTextOutOnce() {
+        // The title of titleBlurMovesOnlyMovingLetters (40 letters, one of them moving, a 360 degree shutter and 16
+        // samples): a frame is built at seventeen times through the shutter, and its text is laid out once for all
+        // of them, as nothing about the letters' shapes changes between them.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCD";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 40.0;
+        const int k = addTextAnimator(t);
+        const std::string pre = "ta" + std::to_string(k) + ".";
+        t.params[pre + "start"] = Param(47.5);
+        t.params[pre + "end"] = Param(50.0);
+        Param move;
+        move.addKey(0, -200.0);
+        move.addKey(10, 200.0);
+        t.params[pre + "x"] = move;
+        t.params["letter_blur"] = 1.0;
+        t.params["letter_shutter"] = 360.0;
+        t.params["letter_samples"] = 16.0;
+        const int w = 640, h = 360;
+        auto whole = [&] {
+            // Every time's whole title, each laid out for itself, averaged.
+            Image sum(w, h);
+            for (int i = 0; i < 16; ++i) {
+                const Image one = renderTitleAt(t, 5 + ((i + 0.5) / 16 - 0.5), w, h, 1.0, 30, 30);
+                for (size_t j = 0; j < sum.px.size(); ++j) sum.px[j] += one.px[j];
+            }
+            for (float& v : sum.px) v /= 16;
+            return sum;
+        };
+        auto apart = [](const Image& a, const Image& b) {
+            float worst = 0;
+            for (size_t i = 0; i < a.px.size(); ++i) worst = std::max(worst, std::fabs(a.px[i] - b.px[i]));
+            return worst;
+        };
+        long before = titleLayoutsMade();
+        const Image blurred = renderTitle(t, 5, w, h, 1.0, 30, 30);
+        QCOMPARE(titleLayoutsMade() - before, 1L);
+        before = titleLayoutsMade();
+        const Image each = whole();
+        QCOMPARE(titleLayoutsMade() - before, 16L);
+        QVERIFY2(apart(blurred, each) < 1.5f / 255, qPrintable(QString::number(apart(blurred, each))));
+        // With the letters growing through the shutter (Size keyed 40 to 60 px over ten frames, two pixels a frame)
+        // the text is laid out again at each time whose size differs, and at no other: more than once, fewer times
+        // than there are times, and the picture is the average of the times laid out each for itself.
+        Param grow;
+        grow.addKey(0, 40.0);
+        grow.addKey(10, 60.0);
+        t.params["size"] = grow;
+        before = titleLayoutsMade();
+        const Image growing = renderTitle(t, 5, w, h, 1.0, 30, 30);
+        const long made = titleLayoutsMade() - before;
+        QVERIFY2(made >= 2 && made <= 8, qPrintable(QString::number(made)));
+        const Image growingEach = whole();
+        QVERIFY2(apart(growing, growingEach) < 1.5f / 255, qPrintable(QString::number(apart(growing, growingEach))));
+    }
+
     void titleLetterMotionBlur() {
         // A letter moving 40 px a frame (a text animator's Position X keyed 0 to 400 over 10 frames), blurred with a
         // 360 degree shutter and 16 samples: the frame is the average of the 16 renders at the subframes, within 1/255.

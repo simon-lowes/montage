@@ -14,6 +14,7 @@
 #include <QTextLayout>
 #include <QTransform>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -214,14 +215,35 @@ LineLayout layoutLine(const QString& text, int start, const std::vector<CharStyl
     return out;
 }
 
+// A frame's layouts, kept while one frame of a title is drawn at several times through the shutter (letter motion
+// blur): the text is laid out once for the frame, and again only if its lines or its letters' styles differ at one of
+// those times. One for each thread, inside renderTitle only.
+struct FrameLayouts {
+    struct Kept {
+        QStringList lines;
+        std::vector<CharStyle> styles, bases;
+        std::vector<LineLayout> out;
+    };
+    std::vector<Kept> kept;
+};
+thread_local FrameLayouts* tFrameLayouts = nullptr;
+std::atomic<long> gTitleLayouts{0};
+
 std::vector<LineLayout> layoutText(const QStringList& lines, const std::vector<CharStyle>& styles, const Effect& g, double t,
                                    double px, double defaultSize) {
+    std::vector<CharStyle> bases;
+    for (int i = 0; i < lines.size(); ++i) bases.push_back(baseStyle(g, t, px, defaultSize, i));
+    if (tFrameLayouts)
+        for (const FrameLayouts::Kept& k : tFrameLayouts->kept)
+            if (k.lines == lines && k.styles == styles && k.bases == bases) return k.out;
     std::vector<LineLayout> out;
     int start = 0;
     for (int i = 0; i < lines.size(); ++i) {
-        out.push_back(layoutLine(lines[i], start, styles, baseStyle(g, t, px, defaultSize, i)));
+        out.push_back(layoutLine(lines[i], start, styles, bases[size_t(i)]));
         start += int(lines[i].size()) + 1;
     }
+    ++gTitleLayouts;
+    if (tFrameLayouts && tFrameLayouts->kept.size() < 8) tFrameLayouts->kept.push_back({lines, styles, bases, out});
     return out;
 }
 
@@ -1805,11 +1827,20 @@ Image drawScene(const Effect& g, double t, const TitleScene& s, int w, int h, do
 
 }  // namespace
 
+long titleLayoutsMade() { return gTitleLayouts.load(); }
+
 Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path,
                   const TitleLayerFn& layer) {
     const double shutter = std::clamp(g.p("letter_shutter", t, 180), 0.0, 720.0) / 360.0;
     const int n = std::clamp(int(std::lround(g.p("letter_samples", t, 16))), 2, 64);
     if (g.p("letter_blur", t) <= 0.5 || shutter <= 0) return renderTitleAt(g, double(t), w, h, scale, duration, fps, path, layer);
+    // (the frame's text laid out once for all its times: see FrameLayouts)
+    FrameLayouts layouts;
+    struct Scope {
+        FrameLayouts* was;
+        explicit Scope(FrameLayouts* now) : was(tFrameLayouts) { tFrameLayouts = now; }
+        ~Scope() { tFrameLayouts = was; }
+    } scope(&layouts);
     // The times through the shutter, centred on the frame; a title that draws the same at the first, middle and last
     // of them is drawn once.
     std::vector<double> times;
