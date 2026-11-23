@@ -797,9 +797,14 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     timer_.setTimerType(Qt::PreciseTimer);
     timer_.setInterval(8);
     connect(&timer_, &QTimer::timeout, this, &PlaybackController::tick);
+    // The audio device going away: told on the engine's thread, acted on here.
+    lostListener_ = audiodev::Engine::shared().addLostListener([this](const std::string& why) {
+        QMetaObject::invokeMethod(this, [this, w = QString::fromStdString(why)] { deviceLost(w); }, Qt::QueuedConnection);
+    });
 }
 
 PlaybackController::~PlaybackController() {
+    audiodev::Engine::shared().removeLostListener(lostListener_);  // (not called again once this returns)
     players().erase(std::remove(players().begin(), players().end(), this), players().end());
     worker_->setSinks({});
     stopAudio(true);
@@ -1327,6 +1332,19 @@ bool PlaybackController::startDeviceAudio(FrameTime from, bool idle) {
     engineRate_ = s->sampleRate;
     outputChannels_ = channels;
     return true;
+}
+
+void PlaybackController::deviceLost(const QString& why) {
+    // Sound goes on through the next device that opens: the host's own choice where the one named is gone, else the
+    // system's output (Qt Multimedia's), as when no device is chosen. Playback is not stopped for it.
+    const bool was = engineOut_ >= 0;
+    if (was) {
+        audiodev::Engine::shared().removeOutput(engineOut_);
+        engineOut_ = -1;
+        refreshAudio(true);
+    }
+    const audiodev::EngineStatus st = audiodev::Engine::shared().status();
+    emit audioDeviceLost(why, st.open ? QString::fromStdString(st.device) : QString());
 }
 
 double PlaybackController::devicePlayed() const {

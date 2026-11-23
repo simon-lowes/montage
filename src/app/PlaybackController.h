@@ -198,11 +198,16 @@ signals:
     void audioAnalysis(montage::AudioAnalysisPtr analysis);
     void playingChanged(bool playing);
     void monitoringChanged();
+    // The audio device chosen in Monitoring went away (unplugged, its server stopped): `why`, and what sound goes
+    // through now (the device standing in for it as the system names it, "" for the system's own output).
+    void audioDeviceLost(const QString& why, const QString& now);
 
 private slots:
     void tick();
 
 private:
+    void deviceLost(const QString& why);  // (told by the audio engine, on this object's thread)
+    int lostListener_ = -1;
     void startAudio(FrameTime from, bool idle = false);
     void stopAudio(bool force = false);  // (not forced, an idle sink stays for calibration or talkback)
     // The sink as playback and the monitoring section need it: the programme at normal speed, else idle for

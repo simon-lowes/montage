@@ -107,11 +107,14 @@ signals:
     void stopped(montage::Id clip);      // after a take is placed (also when Out ended it)
     // After a take is imported (placed or not): its media, and the timeline frame its first sample belongs at.
     void taken(montage::Id media, montage::FrameTime at);
+    // The audio device went away during a take: the take was ended with what had arrived (stopped() has been sent).
+    void deviceLost(const QString& why);
 
 private:
     void readDevice();
     void drainDevice();  // what the device's input has brought, into the take (on this thread)
     void closeDevice();
+    void lostDevice(const QString& why);  // the device is gone: the take ends whole with what it brought
     Id stopLoop();
     QStringList splitGroupTake(const std::vector<int>& grouped);  // the take's channels, a mono file a grouped track
 
@@ -126,8 +129,10 @@ private:
     int tap_ = -1, firstInput_ = 0, takeNumber_ = 0;
     std::atomic<bool> armed_{false};
     audiodev::TakeAligner aligner_;
+    // (pending_ and spare_ change places at each drain, each keeping its room: nothing is allocated once a take runs)
     std::mutex pendingM_;
-    std::vector<float> pending_;
+    std::vector<float> pending_, spare_;
+    int lostListener_ = -1;
     QTimer drain_;
     int rate_ = 48000, channels_ = 1, sampleBytes_ = 4;
     int feedChannels_ = 0;

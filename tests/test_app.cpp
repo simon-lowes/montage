@@ -2653,6 +2653,222 @@ private slots:
         }
     }
 
+    void lostAudioDeviceKeepsTheTake_data() {
+        QTest::addColumn<QString>("host");
+        QTest::newRow("loopback unplugged") << QStringLiteral("loopback");
+        QTest::newRow("JACK server killed") << QStringLiteral("jack");
+    }
+
+    void lostAudioDeviceKeepsTheTake() {
+        // The audio device goes away during a take (the test device unplugged; a JACK server killed): the take's file
+        // ends whole with the last block the device brought, the take is in the bin and on its track, the user is told
+        // within a second, and playback goes on through what opens next.
+        QFETCH(QString, host);
+        const bool jack = host == QStringLiteral("jack");
+        QProcess jackd;
+        if (jack && !startJackServer(jackd)) QSKIP("No jackd with a JACK library here");
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + QStringLiteral("/lost-%1.montage").arg(host)));
+        QVERIFY(state()->edit("Picture", [&](Project& p, Sequence& s) {
+            return edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 900)).ok;  // (thirty seconds to play through)
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        if (!jack) audiodev::setLoopbackOptions({256, 512, 0});
+        QVERIFY2(openAudioDevice(host), audiodev::Engine::shared().status().error.c_str());
+        {
+            VoiceoverRecorder rec(state());
+            QSignalSpy lost(&rec, &VoiceoverRecorder::deviceLost);
+            QSignalSpy stopped(&rec, &VoiceoverRecorder::stopped);
+            QSignalSpy told(program, &PlaybackController::audioDeviceLost);
+            QStringList said;
+            QObject listener;
+            connect(state(), &EditorState::statusMessage, &listener, [&](const QString& text, int) { said << text; });
+            program->seek(0);
+            program->play();
+            QTRY_VERIFY(program->isPlaying());
+            QVERIFY(rec.start(0, 1));
+            QElapsedTimer clock;
+            clock.start();
+            while (rec.seconds() < 1.0 && clock.elapsed() < 30000) QTest::qWait(20);
+            QVERIFY(rec.seconds() >= 1.0);
+            const double had = rec.seconds();
+
+            QElapsedTimer since;
+            since.start();
+            if (jack) {
+                jackd.kill();
+            } else {
+                audiodev::LoopbackOptions gone = audiodev::loopbackOptions();
+                gone.unplugged = true;
+                audiodev::setLoopbackOptions(gone);
+            }
+            while (lost.isEmpty() && since.elapsed() < 10000) QTest::qWait(5);
+            QVERIFY(!lost.isEmpty());
+            QVERIFY2(since.elapsed() < 1000, qPrintable(QString::number(since.elapsed())));
+            QVERIFY(!rec.isRecording());
+
+            // The file is whole: its header's length is the file's, and it reads to its end with all that had arrived.
+            const QString take = rec.lastTake();
+            QVERIFY(QFileInfo::exists(take));
+            QFile file(take);
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QByteArray header = file.read(12);
+            QCOMPARE(header.left(4), QByteArray("RIFF"));
+            QCOMPARE(qint64(qFromLittleEndian<quint32>(header.constData() + 4)), file.size() - 8);
+            file.close();
+            qint64 read = 0;
+            QVERIFY(decodeAudioBlocks(take.toStdString(), 48000, 4800, [&](const std::vector<float>& mono) {
+                read += qint64(mono.size());
+                return true;
+            }));
+            QVERIFY2(read >= qint64(had * 48000) - 4800, qPrintable(QStringLiteral("%1 of %2").arg(read).arg(had * 48000)));
+            // It is in the bin and on its track.
+            QCOMPARE(stopped.size(), 1);
+            const Id clip = stopped[0][0].toULongLong();
+            const Clip* c = edit::clipById(*state()->sequence(), clip);
+            QVERIFY(c && c->start == 0);
+            QCOMPARE(edit::locate(*state()->sequence(), clip)->track, (TrackRef{TrackKind::Audio, 1}));
+            const MediaItem* media = state()->project().findMedia(c->mediaId);
+            QVERIFY(media && media->bin == "Voiceover" && QString::fromStdString(media->path) == take);
+            // The user is told which take was kept, and that sound goes on through another device.
+            QTRY_VERIFY_WITH_TIMEOUT(!told.isEmpty(), 2000);
+            QVERIFY2(said.filter(QFileInfo(take).fileName()).size() == 1, qPrintable(said.join(" | ")));
+            QVERIFY2(said.filter(QStringLiteral("Sound now goes through")).size() == 1, qPrintable(said.join(" | ")));
+            // Playback was not stopped, and goes on.
+            QVERIFY(program->isPlaying());
+            const FrameTime at = program->position();
+            QElapsedTimer on;
+            on.start();
+            while (on.elapsed() < 1000) QTest::qWait(20);
+            QVERIFY2(program->position() >= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(program->position())));
+            program->pause();
+            QTRY_VERIFY(!program->isPlaying());
+        }
+        QVERIFY(!setAudioDevice({{"host", "qt"}}).value("isError").toBool());
+        audiodev::setLoopbackOptions({});
+        if (jackd.state() != QProcess::NotRunning) {
+            jackd.kill();
+            jackd.waitForFinished(5000);
+        }
+        qunsetenv("JACK_DEFAULT_SERVER");
+    }
+
+    void audioCallbackGuardedForAMinute_data() {
+        QTest::addColumn<QString>("host");
+        QTest::newRow("loopback") << QStringLiteral("loopback");
+        QTest::newRow("JACK dummy driver") << QStringLiteral("jack");
+    }
+
+    void audioCallbackGuardedForAMinute() {
+        // A minute of playback of 32 tracks, one through a hosted plug-in, with the sampler played and a take being
+        // recorded: the guard on the device's callback counts no allocation, no lock and no wait in it. Through the
+        // test device, and under JACK's dummy driver where jackd is installed.
+        QFETCH(QString, host);
+        const bool jack = host == QStringLiteral("jack");
+        QProcess jackd;
+        if (jack && !startJackServer(jackd)) QSKIP("No jackd with a JACK library here");
+        const int rate = 48000;
+        const QString tone = dir_.path() + "/guard-tone.wav", hit = dir_.path() + "/guard-hit.wav";
+        {
+            std::vector<float> x(size_t(rate) * 70);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.01 * std::sin(2 * M_PI * 220 * double(i) / rate));
+            WavWriter w;
+            QVERIFY(w.open(tone, rate, 1));
+            w.write(x.data(), qint64(x.size()));
+            QVERIFY(w.close());
+            WavWriter h;
+            QVERIFY(h.open(hit, rate, 1));
+            h.write(x.data(), rate / 4);
+            QVERIFY(h.close());
+        }
+        plugins::Registry& reg = plugins::Registry::instance();
+        reg.setCachePath((dir_.path() + "/plugin-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        for (plugins::Format f : plugins::kAllFormats) reg.setSearchPaths(f, {"/nonexistent-montage-test-dir"});
+        reg.setSearchPaths(plugins::Format::Clap, {QStringLiteral(MONTAGE_TEST_CLAP_DIR "/good").toStdString()});
+        reg.scan();
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + QStringLiteral("/guard-%1.montage").arg(host)));
+        const auto ids = state()->importFiles({tone});
+        QCOMPARE(ids.size(), size_t(1));
+        std::string pluginError;
+        QVERIFY2(state()->edit("Tracks", [&](Project& p, Sequence& s) {
+            // Thirty-two tracks that sound, the sampler's and the take's.
+            while (s.audioTracks.size() < 34) edit::addTrack(p, s, TrackKind::Audio);
+            for (int i = 0; i < 32; ++i)
+                if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, V1, {TrackKind::Audio, i}, false).ok) return false;
+            auto fx = plugins::makeEffectOfType(p, "plugin:clap:org.montage.test.gain", &pluginError);
+            if (!fx) return false;
+            s.audioTracks[0].clips[0].effects.push_back(*fx);
+            return true;
+        }), pluginError.c_str());
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        if (!jack) audiodev::setLoopbackOptions({256, 512, 0});
+        QVERIFY2(openAudioDevice(host), audiodev::Engine::shared().status().error.c_str());
+        win_->findChild<QAction*>("showSampler")->trigger();
+        auto* panel = win_->findChild<SamplerPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        panel->setTrack(32);
+        QVERIFY(panel->addSounds(48, {hit}));
+        QTRY_VERIFY(panel->isActive());
+        {
+            VoiceoverRecorder rec(state());
+            program->seek(0);
+            program->play();
+            QTRY_VERIFY(program->isPlaying());
+            QVERIFY(rec.start(0, 33));
+            QTRY_VERIFY_WITH_TIMEOUT(rec.seconds() > 0.2, 10000);
+            rtguard::reset();
+            QElapsedTimer clock;
+            clock.start();
+            int played = 0;
+            while (clock.elapsed() < 60000) {
+                // A key every half second, and the meters and readouts kept up as they are while a user watches.
+                panel->noteOn(48, 100);
+                QElapsedTimer beat;
+                beat.start();
+                while (beat.elapsed() < 500) QTest::qWait(20);
+                panel->noteOff(48);
+                ++played;
+            }
+            const rtguard::Counts counted = rtguard::counts();
+            QVERIFY(program->isPlaying());
+            QVERIFY2(program->position() > FrameTime(55 * state()->sequence()->fpsValue()), qPrintable(QString::number(program->position())));
+            QVERIFY(rec.isRecording() && rec.seconds() > 55);
+            QVERIFY(played > 100);
+            // (a minute of blocks of 256 at 48 kHz is 11250 callbacks)
+            QVERIFY2(counted.callbacks > 9000, qPrintable(QString::number(counted.callbacks)));
+            QCOMPARE(counted.allocations, int64_t(0));
+            QCOMPARE(counted.locks, int64_t(0));
+            QCOMPARE(counted.waits, int64_t(0));
+#ifdef Q_OS_LINUX
+            QCOMPARE(rtguard::sees(), int(rtguard::Allocations | rtguard::Locks | rtguard::Waits));
+#endif
+            // The dropouts counted are shown beside the loudness meters.
+            const qint64 dropouts = audiodev::Engine::shared().dropouts();
+            QVERIFY(dropouts >= 0);
+            auto* readout = win_->findChild<LoudnessReadout*>();
+            QVERIFY(readout);
+            QTRY_COMPARE_WITH_TIMEOUT(readout->text("DO"), QString::number(audiodev::Engine::shared().dropouts()), 3000);
+            program->pause();
+            QTRY_VERIFY(!program->isPlaying());
+            QVERIFY(rec.stop());
+        }
+        win_->findChild<QDockWidget*>("sampler")->hide();
+        QTRY_VERIFY(!panel->isActive());
+        QVERIFY(!setAudioDevice({{"host", "qt"}}).value("isError").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(win_->findChild<LoudnessReadout*>()->text("DO"), QStringLiteral("—"), 3000);
+        audiodev::setLoopbackOptions({});
+        if (jackd.state() != QProcess::NotRunning) {
+            jackd.terminate();
+            jackd.waitForFinished(5000);
+        }
+        qunsetenv("JACK_DEFAULT_SERVER");
+    }
+
     void oscControl() {
         state()->newProject();
         QVERIFY(state()->edit("Tracks", [](Project& p, Sequence& s) {
