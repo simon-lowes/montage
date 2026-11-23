@@ -13,12 +13,13 @@
 //   31: Displace by Layer (render/PaintFx's displaceByMap), `aTex` moved by `bTex`'s channels: p[0].yzw the channels
 //   across and down and the edges, p[1] the amounts, bicubic and turned, p[2] the picture's own pixels (left, top,
 //   right, bottom); turned, p[3] its origin and across, p[4] down, the determinant's sign and size, p[5].xy how far
-//   to keep within its edges; p[5].zw whether it moves across and down
+//   to keep within its edges; p[5].zw whether it moves across and down; p[6].x through a mask, `table` four of its
+//   values on the canvas to a texel
 layout(location = 0) out vec4 fragColor;
 layout(std140, binding = 0) uniform Params { vec4 p[16]; };
 layout(binding = 1) uniform sampler2D aTex;  // RGBA32F, premultiplied
 layout(binding = 4) uniform sampler2D bTex;
-layout(binding = 5) uniform sampler2D table;  // RGBA32F: Smooth Cut's flow
+layout(binding = 5) uniform sampler2D table;  // RGBA32F: Smooth Cut's flow, Displace by Layer's mask
 
 const float PI = 3.14159265358979;
 
@@ -381,6 +382,12 @@ void main() {
     }
     if (mode == 31) {
         fragColor = displaced(xy, size);
+        if (p[6].x > 0.5) {
+            // (moved within the mask, as it was outside: render/Compositor's displaceLayer)
+            const vec4 here = texelFetch(aTex, xy, 0);
+            const float m = texelFetch(table, ivec2(xy.x / 4, xy.y), 0)[xy.x % 4];
+            fragColor = here + (fragColor - here) * m;
+        }
         return;
     }
     fragColor = transition(mode, xy, size);

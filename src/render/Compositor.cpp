@@ -2173,9 +2173,10 @@ bool canvasToFrame(const Sequence& seq, const Geometry& g, double scale, int X, 
 }
 
 // A clip effect's mask (empty: none) drawn over the clip's own frame and carried onto the canvas, for the effects run
-// where tracks are composited.
+// where tracks are composited: `layer` (null for a mask that does not look at the picture, maskSeesPicture's false)
+// on a canvas LW by LH pixels.
 std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
-                                      const Effect& e, const Image& layer, int W, int H) {
+                                      const Effect& e, const Image* layer, int LW, int LH) {
     const FrameTime lt = t - c.start;
     std::vector<float> mask;
     // A mask on the effect is drawn over the clip's own frame, as every effect's is: made there, from the layer seen
@@ -2184,21 +2185,21 @@ std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, con
     Geometry g;
     if (hasMask(e, lt) && clipGeometry(p, seq, c, t, g)) {
         const double cr = std::cos(g.rot), sn = std::sin(g.rot);
-        const int pw = std::clamp(int(std::lround(g.mw * std::fabs(g.sx) * o.scale)), 1, 4 * W);
-        const int ph = std::clamp(int(std::lround(g.mh * std::fabs(g.sy) * o.scale)), 1, 4 * H);
+        const int pw = std::clamp(int(std::lround(g.mw * std::fabs(g.sx) * o.scale)), 1, 4 * LW);
+        const int ph = std::clamp(int(std::lround(g.mh * std::fabs(g.sy) * o.scale)), 1, 4 * LH);
         Image pic(pw, ph);
         for (int j = 0; j < ph; ++j)
             for (int i = 0; i < pw; ++i) {
                 const double rx = ((i + 0.5) / pw * g.mw - g.mw / 2 - g.ax) * g.sx, ry = ((j + 0.5) / ph * g.mh - g.mh / 2 - g.ay) * g.sy;
                 const int X = int(std::floor((seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale));
                 const int Y = int(std::floor((seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale));
-                if (X >= 0 && Y >= 0 && X < layer.width && Y < layer.height) std::copy(layer.at(X, Y), layer.at(X, Y) + 4, pic.at(i, j));
+                if (layer && X >= 0 && Y >= 0 && X < LW && Y < LH) std::copy(layer->at(X, Y), layer->at(X, Y) + 4, pic.at(i, j));
             }
         const std::vector<float> m = effectMatte(e, lt, pic, effectPixelScale(c, lt, g.sx, g.mw, pw), c.sourceFrameAt(t) / seq.fpsValue());
         if (m.size() == size_t(pw) * size_t(ph)) {
-            mask.assign(size_t(layer.width) * size_t(layer.height), 0.0f);
-            for (int Y = 0; Y < layer.height; ++Y)
-                for (int X = 0; X < layer.width; ++X) {
+            mask.assign(size_t(LW) * size_t(LH), 0.0f);
+            for (int Y = 0; Y < LH; ++Y)
+                for (int X = 0; X < LW; ++X) {
                     double u, v;
                     if (!canvasToFrame(seq, g, o.scale, X, Y, u, v)) continue;
                     u = u * pw - 0.5, v = v * ph - 0.5;
@@ -2206,12 +2207,22 @@ std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, con
                     const int i1 = std::min(i0 + 1, pw - 1), j1 = std::min(j0 + 1, ph - 1);
                     const float fu = float(std::clamp(u - i0, 0.0, 1.0)), fv = float(std::clamp(v - j0, 0.0, 1.0));
                     auto at = [&](int i, int j) { return m[size_t(j) * size_t(pw) + size_t(i)]; };
-                    mask[size_t(Y) * size_t(layer.width) + size_t(X)] =
+                    mask[size_t(Y) * size_t(LW) + size_t(X)] =
                         (at(i0, j0) * (1 - fu) + at(i1, j0) * fu) * (1 - fv) + (at(i0, j1) * (1 - fu) + at(i1, j1) * fu) * fv;
                 }
         }
     }
     return mask;
+}
+
+// Whether an effect's mask at a clip's time lt is made from the picture or what is known of the frame, not drawn from
+// its shape alone: its edge settled on the picture's (Refine Edges), its colours qualified, an object's, the people's
+// or a Cryptomatte's, bent with a surface's track, or the frame's depths ranged.
+bool maskSeesPicture(const Effect& e, FrameTime lt) {
+    const int shape = int(std::lround(e.p("mask.shape", lt)));
+    if (shape == 3 || shape == 4 || shape == 7 || (shape > 0 && shape != 6 && e.p("mask.refine", lt) > 0)) return true;  // (maskRefine's)
+    if ((shape == 1 || shape == 2 || shape == 5) && e.p("mask.surface", lt) > 0.5) return true;
+    return e.p("mask.qualify", lt) > 0.5 || e.p("mask.depth", lt) > 0.5;
 }
 
 // Displace by Layer's settings on clip `c` at t, with the edges of the clip's picture on a W x H canvas: false when
@@ -2275,7 +2286,7 @@ void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip&
     if (map.width != layer.width || map.height != layer.height) return;
     if (const SceneGrading* sg = currentSceneGrading()) outputTransform(map, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
     // (a mask on the effect: moved within it, as it was outside)
-    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, layer, W, H);
+    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, &layer, layer.width, layer.height);
     const Image before = mask.empty() ? Image() : layer;
     DisplaceSettings ds;
     if (!displaceGeometry(p, seq, c, *e, t, o, layer.width, layer.height, ds)) return;
@@ -2305,7 +2316,7 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
     shown(sky);
     // A mask on the effect is drawn over the clip's own frame, as every effect's is (so a moved, turned or keyed
     // picture keeps it in place).
-    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *sr, layer, W, H);
+    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *sr, &layer, layer.width, layer.height);
     // The clip's analysed depth carried onto the layer (null: found in the layer, if at all), and the frames either side
     // for a steady sky.
     auto analysedOnLayer = [&](FrameTime at, int w, int h) -> std::shared_ptr<const ValueMap> {
@@ -3287,10 +3298,11 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
                 if (const Effect* e = enabledEffect(seq, *c, "displace_by_layer")) {
-                    // (drawn there alone, with another track's picture as it is, or its own; not through a mask)
+                    // (drawn there alone, with another track's picture as it is, or its own; through a mask drawn
+                    // from its shape alone)
                     if (tr) return fallback("Displace by Layer in a transition");
-                    if (c->isGenerator() && c->generator.type == "adjustment") return fallback("Displace by Layer on an adjustment layer");
-                    if (hasMask(*e, t - c->start)) return fallback("Displace by Layer through a mask");
+                    if (hasMask(*e, t - c->start) && maskSeesPicture(*e, t - c->start))
+                        return fallback("Displace by Layer through a mask made from the picture");
                     FrameTime mf = 0, mt = 0;
                     if (const int m = std::lround(e->p("source", t - c->start, 0)) == 0 ? matteTrack(seq, ti, *c, *e, t) : -1;
                         m >= 0 && activeTransition(seq.videoTracks[size_t(m)], t, mf, mt))
@@ -3447,6 +3459,17 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                         q[21] = float(std::min(0.5, reach / std::max(1e-9, std::hypot(ds.down[0], ds.down[1]))));
                         q[22] = across ? 1 : 0, q[23] = down ? 1 : 0;
                         if (ds.turned && !(std::fabs(ds.across[0] * ds.down[1] - ds.across[1] * ds.down[0]) > 1e-9 && q[19] > 0)) item.displace = false;
+                        // (through its mask, drawn on the canvas from its shape alone: four values to a texel)
+                        if (item.displace && hasMask(*e, t - c->start))
+                            if (const std::vector<float> mask = effectMaskOnCanvas(p, seq, *c, t, o, *e, nullptr, W, H);
+                                mask.size() == size_t(W) * size_t(H)) {
+                                item.displaceMaskWidth = (W + 3) / 4;
+                                item.displaceMask.assign(size_t(item.displaceMaskWidth) * 4 * size_t(H), 0.0f);
+                                for (int y = 0; y < H; ++y)
+                                    std::copy(mask.begin() + std::ptrdiff_t(size_t(y) * size_t(W)), mask.begin() + std::ptrdiff_t(size_t(y + 1) * size_t(W)),
+                                              item.displaceMask.begin() + std::ptrdiff_t(size_t(y) * size_t(item.displaceMaskWidth) * 4));
+                                q[24] = 1;
+                            }
                         // (the map's blur: gaussian's passes, as Painterly's)
                         if (const GaussianPlan plan = gaussianPlan(ds.mapBlur / 2); ds.mapBlur > 0 && (plan.byBoxes || !plan.kernel.empty())) {
                             gpu::ColorOp f;

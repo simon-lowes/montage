@@ -187,6 +187,7 @@ size_t frameShape(const Frame& frame, bool eightBit) {
     for (const Item& it : frame.items) {
         layer(&it.a), layer(it.b ? &*it.b : nullptr), layer(it.matte ? &*it.matte : nullptr), layer(it.displaceMap ? &*it.displaceMap : nullptr);
         mix(it.transition), mix(it.transitionStep != nullptr), mix(static_cast<long long>(it.transitionTable.size())), mix(it.displace), mix(it.displaceSelf);
+        mix(static_cast<long long>(it.displaceMask.size()));
         ops(it.displaceBlur);
     }
     return h ? h : 1;
@@ -1881,7 +1882,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         }
         float q[64] = {};
         std::copy(params, params + n, q);
-        QRhiTexture* table = nullptr;  // (Smooth Cut's flow)
+        QRhiTexture* table = nullptr;  // (Smooth Cut's flow, Displace by Layer's mask)
         if (rows && rowWidth > 0 && !rows->empty()) {
             table = texture(T::RGBA32F, rowWidth, int(rows->size() / (size_t(rowWidth) * 4)), false);
             if (!table) {
@@ -1956,7 +1957,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
                     if (blurred != map) release(map);
                     map = blurred;
                 }
-                m = mixed(m, map, it.displaceParams, 24);  // (both let go, whatever comes of it)
+                m = mixed(m, map, it.displaceParams, 25, &it.displaceMask, it.displaceMaskWidth);  // (both let go, whatever comes of it)
             } else if (self) {
                 release(self);
             }

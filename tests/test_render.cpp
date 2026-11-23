@@ -34025,6 +34025,73 @@ colorspaces:
                     compare(2, QString("%1 #%2%3").arg(self ? "its own map" : "V2's map").arg(k + 1).arg(turned ? ", turned" : ""));
                 }
             }
+        // Through a mask drawn from its shape alone (a feathered ellipse, a rectangle inverted and faded), on the
+        // picture placed square and turned: moved within it, as it was outside, on the GPU too.
+        for (int masked = 0; masked < 2; ++masked)
+            for (int turned = 0; turned < 2; ++turned) {
+                Effect fx = makeEffect(p, "displace_by_layer");
+                for (const auto& [key, v] : settings[size_t(masked)]) fx.params[key] = v;
+                fx.params["mask.shape"] = masked ? 2.0 : 1.0;
+                fx.params["mask.x"] = 0.45, fx.params["mask.y"] = 0.55, fx.params["mask.w"] = 0.5, fx.params["mask.h"] = 0.4;
+                fx.params["mask.feather"] = masked ? 4.0 : 12.0;
+                if (masked) fx.params["mask.invert"] = 1.0, fx.params["mask.opacity"] = 70.0;
+                c.effects = {fx};
+                c.motion.params = {};
+                c.motion.params["scale"] = turned ? 80.0 : 70.0;
+                c.motion.params["pos_x"] = turned ? -20.0 : 31.0;
+                if (turned) c.motion.params["rotation"] = 25.0;
+                compare(2, QString("through %1%2").arg(masked ? "a rectangle inverted" : "an ellipse").arg(turned ? ", turned" : ""));
+            }
+        // A mask made from the picture as well (its edge refined onto it) is the CPU's.
+        c.effects.front().params["mask.refine"] = 60.0;
+        RenderOptions o;
+        o.gpu = true;
+        const gpu::Stats before = gpu::stats();
+        renderProgramFrame(p, s, 2, o);
+        QCOMPARE(gpu::stats().gpuFrames, before.gpuFrames);
+        QVERIFY(QString::fromStdString(gpu::stats().lastFallback).contains("Displace by Layer through a mask made from the picture"));
+        // On an adjustment layer over the picture (V3, V2's map): the canvas beneath it moved, at its full opacity and
+        // faded, through a mask and not.
+        c.effects.clear();
+        c.motion.params = {};
+        c.motion.params["scale"] = 70.0, c.motion.params["pos_x"] = 31.0;
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        Clip adj = makeGeneratorClip(p, "adjustment", 30);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
+        Clip& a = s.videoTracks[2].clips.at(0);
+        for (int k = 0; k < 3; ++k) {
+            Effect fx = makeEffect(p, "displace_by_layer");
+            for (const auto& [key, v] : settings[size_t(k)]) fx.params[key] = v;
+            fx.params["track"] = 2.0;
+            if (k == 2) fx.params["mask.shape"] = 1.0, fx.params["mask.w"] = 0.6, fx.params["mask.h"] = 0.5, fx.params["mask.feather"] = 10.0;
+            a.effects = {fx};
+            a.motion.params = {};
+            if (k == 1) a.motion.params["opacity"] = 60.0;
+            RenderOptions co;
+            co.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, 2, co);
+            a.effects.front().enabled = false;
+            const Image still = renderProgramFrame(p, s, 2, co);
+            a.effects.front().enabled = true;
+            const gpu::Stats was = gpu::stats();
+            co.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, 2, co);
+            const gpu::Stats now = gpu::stats();
+            const QString what = QString("an adjustment layer, #%1").arg(k + 1);
+            QVERIFY2(now.gpuFrames == was.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(now.lastFallback)));
+            QVERIFY2(now.mixPasses > was.mixPasses, qPrintable(what + ": not moved on the GPU"));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0, moved = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int ch = 0; ch < 4; ++ch) {
+                        if (const double d = std::fabs(double(cpu.at(x, y)[ch]) - onGpu.at(x, y)[ch]); d > worst) worst = d, wx = x, wy = y;
+                        moved += std::fabs(cpu.at(x, y)[ch] - still.at(x, y)[ch]);
+                    }
+            QVERIFY2(moved > 50, qPrintable(what + ": nothing moved"));
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
+        }
     }
     void gpuAdjustmentLayersInTransitions() {
         std::string why;

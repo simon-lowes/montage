@@ -172,11 +172,15 @@ struct Item {
     bool matteLuma = false, matteReverse = false;
     // Displace by Layer (render/PaintFx's displaceByMap, before the track matte): the clip, placed on the canvas, moved
     // by the channels of a map, another track's picture (displaceMap, placed at the canvas's size) or its own
-    // (displaceSelf), through displaceBlur's filters first; gpumix.frag's 31 with displaceParams.
+    // (displaceSelf), through displaceBlur's filters first; gpumix.frag's 31 with displaceParams. Through the effect's
+    // mask (displaceParams[24] 1), moved within it as it was outside: the mask on the canvas, four of its values to an
+    // RGBA texel, in rows displaceMaskWidth texels wide.
     bool displace = false, displaceSelf = false;
     std::optional<Layer> displaceMap;
     std::vector<ColorOp> displaceBlur;
-    float displaceParams[24] = {};
+    float displaceParams[25] = {};
+    std::vector<float> displaceMask;
+    int displaceMaskWidth = 0;
     int blendMode = 0;       // render/Processing's blendModeIndex
 };
 
