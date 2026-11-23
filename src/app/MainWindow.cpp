@@ -553,6 +553,47 @@ void MainWindow::buildPanels() {
     });
     effects_ = new EffectsBrowser(this);
     connect(effects_, &EffectsBrowser::applyRequested, this, &MainWindow::applyFromBrowser);
+    // A video effect or preset pointed at in the Effects panel is shown on the Program monitor as it would look on
+    // the selected clips: drawn from a copy of the project, which itself is not touched (no undo step, nothing to
+    // save). The frame is the playhead's when it is on the clip, else the clip's middle one. Not while playing, and
+    // not for plug-ins (one would have to be loaded to be looked at) or effects that ask something first.
+    connect(effects_, &EffectsBrowser::previewRequested, this, [this](const QString& typeQ, EffectCategory category) {
+        const Sequence* s = state_->sequence();
+        const std::string type = typeQ.toStdString();
+        EffectPreset preset;
+        const bool isPreset = typeQ.startsWith(QStringLiteral("preset:"));
+        bool can = s && !program_->isPlaying();
+        if (can && isPreset) can = presets::load(typeQ.mid(7), preset) && preset.video;
+        else if (can) can = category == EffectCategory::VideoFilter && findEffectInfo(type) && type != "lens_correction";
+        std::vector<Id> targets;
+        if (can)
+            for (Id id : state_->selectedClips())
+                if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) targets.push_back(id);
+        if (targets.empty()) {
+            program_->setPicturePreview(nullptr);
+            return;
+        }
+        auto copy = std::make_shared<Project>(state_->project());
+        Sequence* sq = copy->findSequence(s->id);
+        bool added = false;
+        for (Id id : targets)
+            if (Clip* c = sq ? edit::clipById(*sq, id) : nullptr) {
+                if (isPreset) {
+                    added = applyPreset(*copy, *c, preset) > 0 || added;
+                } else if (auto e = plugins::makeEffectOfType(*copy, type, nullptr)) {
+                    c->effects.push_back(*e);
+                    added = true;
+                }
+            }
+        if (!added) {
+            program_->setPicturePreview(nullptr);
+            return;
+        }
+        const Clip* first = edit::clipById(*s, targets.front());
+        const bool under = s->playhead >= first->start && s->playhead < first->end();
+        program_->setPicturePreview(std::move(copy), under ? FrameTime(-1) : first->start + first->duration / 2);
+    });
+    connect(effects_, &EffectsBrowser::previewEnded, this, [this] { program_->setPicturePreview(nullptr); });
     inspector_ = new InspectorWidget(state_, this);
     scopes_ = new ScopesWidget(this);
     // The selected clip's Crosstalk shown moving the primaries on the chromaticity scope.

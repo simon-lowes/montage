@@ -815,6 +815,7 @@ PlaybackController::~PlaybackController() {
 
 void PlaybackController::setProject(const Project& p, Id sequenceId) {
     project_ = std::make_shared<const Project>(p);
+    picturePreview_.reset();
     sequenceId_ = sequenceId;
     updateHeard();
     device_->setProject(heard_);
@@ -1001,13 +1002,24 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale (a reference output its own).
-    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_, scopesWorking_});
+    const bool preview = picturePreview_ && !isPlaying();
+    worker_->request({preview ? picturePreview_ : project_, sequenceId_, preview && picturePreviewAt_ >= 0 ? picturePreviewAt_ : position_, renderScale(),
+                      useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_,
+                      hdrHeadroom_, scopesWorking_});
+}
+
+void PlaybackController::setPicturePreview(std::shared_ptr<const Project> p, FrameTime at) {
+    if (!p && !picturePreview_) return;
+    picturePreview_ = std::move(p);
+    picturePreviewAt_ = at;
+    if (!isPlaying()) requestFrame();
 }
 
 void PlaybackController::seek(FrameTime t) {
     t = clampToSequence(t);
     bool playing = isPlaying();
     if (t == position_ && !playing) return;
+    picturePreview_.reset();
     position_ = t;
     if (playing) {
         startFrame_ = t;

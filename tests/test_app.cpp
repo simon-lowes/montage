@@ -24996,6 +24996,146 @@ print("added " + ui["name"])
         QVERIFY(!dlg.findChild<QPushButton*>("openLicencesFolder")->isEnabled());
     }
 
+    void effectPointedAtIsPreviewed() {
+        // An effect pointed at in the Effects panel is shown on the Program monitor as it would look on the selected
+        // clip: the same picture, to 1/255, as when the effect is added, and the project is not touched (no undo step,
+        // nothing to save).
+        loadDemo();
+        PlaybackController* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp->controller();
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        QVERIFY(program && browser);
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->setSelection({red}, false);
+        QImage shown;
+        FrameTime shownAt = -1;
+        int frames = 0;
+        QObject listener;
+        connect(program, &PlaybackController::frameRendered, &listener, [&](const QImage& img, FrameTime t) {
+            shown = img;
+            shownAt = t;
+            ++frames;
+        });
+        // The picture once what was asked for has been drawn: a frame has come since, and none for 400 ms after it.
+        auto settled = [&](int since) {
+            QElapsedTimer total, quiet;
+            total.start();
+            quiet.start();
+            int seen = frames;
+            while (total.elapsed() < 30000) {
+                QTest::qWait(20);
+                if (frames != seen) {
+                    seen = frames;
+                    quiet.restart();
+                } else if (frames > since && quiet.elapsed() >= 400) {
+                    break;
+                }
+            }
+            return shown.convertToFormat(QImage::Format_RGBA8888);
+        };
+        auto furthest = [](const QImage& a, const QImage& b) {
+            if (a.size() != b.size() || a.isNull()) return 256;
+            int most = 0;
+            for (int y = 0; y < a.height(); ++y) {
+                const uchar *pa = a.constScanLine(y), *pb = b.constScanLine(y);
+                for (int x = 0; x < a.width() * 4; ++x) most = std::max(most, std::abs(int(pa[x]) - int(pb[x])));
+            }
+            return most;
+        };
+        int since = frames;
+        state()->setPlayhead(20);
+        program->requestFrame();
+        const QImage plain = settled(since);
+        QVERIFY(!plain.isNull());
+        QCOMPARE(shownAt, FrameTime(20));
+
+        const size_t undos = state()->history().undoCount();
+        const bool modified = state()->isModified();
+        const Project before = state()->project();
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("invert")));
+        QVERIFY(program->hasPicturePreview());
+        const QImage previewed = settled(since);
+        QVERIFY2(furthest(previewed, plain) > 100, qPrintable(QString::number(furthest(previewed, plain))));
+        QCOMPARE(shownAt, FrameTime(20));
+        QCOMPARE(state()->history().undoCount(), undos);
+        QCOMPARE(state()->isModified(), modified);
+        QVERIFY(state()->project() == before);
+        // Pointing at another shows that one; an audio effect or a folder shows the frame as it is.
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("gaussian_blur")));
+        QVERIFY(program->hasPicturePreview());
+        QVERIFY(furthest(settled(since), previewed) > 100);
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("compressor")));
+        QVERIFY(!program->hasPicturePreview());
+        QCOMPARE(furthest(settled(since), plain), 0);
+        // The pointer back on it, then off the list: the frame as it was.
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("invert")));
+        QCOMPARE(furthest(settled(since), previewed), 0);
+        since = frames;
+        QVERIFY(browser->pointAt(QString()));
+        QVERIFY(!program->hasPicturePreview());
+        QCOMPARE(furthest(settled(since), plain), 0);
+        QCOMPARE(state()->history().undoCount(), undos);
+        QVERIFY(state()->project() == before);
+
+        // The effect added for real draws what the preview showed.
+        since = frames;
+        emit browser->applyRequested(QStringLiteral("invert"), EffectCategory::VideoFilter);
+        QCOMPARE(state()->history().undoCount(), undos + 1);
+        const QImage added = settled(since);
+        QVERIFY2(furthest(added, previewed) <= 1, qPrintable(QString::number(furthest(added, previewed))));
+        state()->undo();
+        since = frames;
+        program->requestFrame();
+        QCOMPARE(furthest(settled(since), plain), 0);
+
+        // A saved preset is previewed the same way.
+        EffectPreset preset;
+        preset.name = "Preview Negative";
+        Effect negative;
+        negative.id = 1;
+        negative.type = "invert";
+        preset.effects = {negative};
+        const QString file = presets::save(preset);
+        QVERIFY(!file.isEmpty());
+        browser->reload();
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("preset:") + file));
+        QVERIFY(program->hasPicturePreview());
+        QVERIFY(furthest(settled(since), previewed) <= 1);
+        QVERIFY(browser->pointAt(QString()));
+
+        // With the playhead off the selected clip, the clip's middle frame is shown, and the playhead's again after.
+        since = frames;
+        state()->setPlayhead(90);
+        program->requestFrame();
+        settled(since);
+        QCOMPARE(shownAt, FrameTime(90));
+        const Clip* c = edit::clipById(*state()->sequence(), red);
+        const FrameTime middle = c->start + c->duration / 2;
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("invert")));
+        settled(since);
+        QCOMPARE(shownAt, middle);
+        QCOMPARE(state()->playhead(), FrameTime(90));
+        since = frames;
+        QVERIFY(browser->pointAt(QString()));
+        settled(since);
+        QCOMPARE(shownAt, FrameTime(90));
+        // With no clip selected nothing is previewed.
+        state()->setSelection({}, false);
+        QVERIFY(browser->pointAt(QStringLiteral("invert")));
+        QVERIFY(!program->hasPicturePreview());
+        QVERIFY(browser->pointAt(QString()));
+        QCOMPARE(state()->history().undoCount(), undos);
+        QVERIFY(presets::remove(file));
+        browser->reload();
+    }
+
     void playbackAdvances() {
         loadDemo();
         auto controllers = win_->findChildren<PlaybackController*>();

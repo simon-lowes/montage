@@ -50,6 +50,11 @@ public:
     // sequence to play (by id). Cheap enough to call on every edit.
     void setProject(const Project& p, Id sequenceId);
     std::shared_ptr<const Project> snapshot() const { return project_; }
+    // A project to draw the paused picture from in place of the snapshot (an effect tried on a clip from the Effects
+    // panel), at frame `at` when that is not negative, else at the playhead. Nothing else reads it: the sound, the
+    // outputs and the project stay as they are. It ends when cleared (null), on a new snapshot, a seek or playback.
+    void setPicturePreview(std::shared_ptr<const Project> p, montage::FrameTime at = -1);
+    bool hasPicturePreview() const { return bool(picturePreview_); }
     const Sequence* sequence() const;
 
     // Preview resolution as a fraction of the sequence size (1, 1/2, 1/4...).
@@ -230,6 +235,8 @@ private:
     double renderScale() const;
 
     std::shared_ptr<const Project> project_;
+    std::shared_ptr<const Project> picturePreview_;  // (see setPicturePreview)
+    FrameTime picturePreviewAt_ = -1;
     std::shared_ptr<const Project> heard_;  // project_, or a copy with mutedTracks_ muted and liveMix_ laid over
     std::vector<int> mutedTracks_;
     std::function<void(Sequence&)> liveMix_, audition_;
