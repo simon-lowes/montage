@@ -17668,6 +17668,51 @@ const auto seq = [this] { return state()->sequence(); };
         else appSettings().remove("export/preset");
     }
 
+    void pngExportSettings() {
+        // The export dialog sets PNG frames' compression level and their bits a channel, for the PNG Sequence preset only.
+        loadDemo();
+        // (the dialog keeps the preset last used: put back as it was, so later exports are not PNG frames)
+        const QVariant lastPreset = appSettings().value("export/preset");
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        int png = -1, mp4 = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i) {
+            if (png < 0 && exportPresets()[i].settings.videoCodec == "png") png = int(i);
+            if (mp4 < 0 && exportPresets()[i].extension == "mp4") mp4 = int(i);
+        }
+        QVERIFY(png >= 0 && mp4 >= 0);
+        ExportDialog ed(state(), win_.get());
+        ed.setQueue(queue);
+        auto* preset = ed.findChild<QComboBox*>("exportPreset");
+        auto* level = ed.findChild<QComboBox*>("exportPngCompression");
+        auto* bits = ed.findChild<QComboBox*>("exportPngBits");
+        QVERIFY(preset && level && bits);
+        preset->setCurrentIndex(mp4);
+        QVERIFY(!level->isEnabled() && !bits->isEnabled());
+        preset->setCurrentIndex(png);
+        QVERIFY(level->isEnabled() && bits->isEnabled());
+        QCOMPARE(level->currentData().toInt(), 6);  // (balanced, and 8 bits, until chosen otherwise)
+        QCOMPARE(bits->currentData().toInt(), 8);
+        level->setCurrentIndex(level->findData(9));
+        bits->setCurrentIndex(bits->findData(16));
+        ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/frames.png");
+        ed.findChild<QPushButton*>("addToQueue")->click();
+        QCOMPARE(queue->jobs().size(), jobs + 1);
+        const RenderQueue::Job& job = queue->jobs().back();
+        QCOMPARE(job.settings.pngCompression, 9);
+        QCOMPARE(job.settings.pngBits, 16);
+        queue->remove(job.id);
+        // The choice is kept for the next export.
+        {
+            ExportDialog again(state(), win_.get());
+            QCOMPARE(again.findChild<QComboBox*>("exportPngCompression")->currentData().toInt(), 9);
+            QCOMPARE(again.findChild<QComboBox*>("exportPngBits")->currentData().toInt(), 16);
+        }
+        for (const char* key : {"export/pngCompression", "export/pngBits"}) appSettings().remove(key);
+        if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
+        else appSettings().remove("export/preset");
+    }
+
     void frameRateDelivery() {
         // 29.97 video made from a 23.976 cut with 2:3 pulldown, then removed in Interpret Footage, starting on A.
         const QString telecined = dir_.filePath("telecined.mov");

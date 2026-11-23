@@ -109,6 +109,10 @@ struct ExportSettings {
     // pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256 or htj2k32 (High-Throughput JPEG 2000, lossless); "" = FFmpeg's
     // writer, ZIP in blocks of 16 lines.
     std::string exrCompression;
+    // PNG frames (videoCodec "png"): how hard the compressor works at each, 0 (fastest, largest files) to 9 (slowest,
+    // smallest); every level keeps every value. -1: the encoder's own choice. And 8 or 16 bits a channel.
+    int pngCompression = -1;
+    int pngBits = 8;
     // JPEG XL frames (videoCodec "jxl", written with libjxl): depth "8", "16", "half" or "float" ("" = 16 bits, half
     // floats in linear light), 0 lossless or libjxl's distance (1 visually lossless), its effort (1-9), and alpha
     // written premultiplied rather than straight.

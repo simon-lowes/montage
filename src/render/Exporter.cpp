@@ -142,6 +142,7 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
     if (c == "liboapv") return s.alpha ? AV_PIX_FMT_YUVA444P12LE : s.profile == "4444" ? AV_PIX_FMT_YUV444P12LE : AV_PIX_FMT_YUV422P10LE;
     if (c == "mjpeg") return AV_PIX_FMT_YUVJ420P;
     if (c == "libvpx-vp9" && s.alpha) return AV_PIX_FMT_YUVA420P;
+    if (c == "png" && s.pngBits == 16 && s.videoCodec == "png") return s.alpha ? AV_PIX_FMT_RGBA64BE : AV_PIX_FMT_RGB48BE;
     if (c == "png") return s.alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
     if (c == "tiff") return AV_PIX_FMT_RGB48LE;
     if (c == "exr") return s.alpha ? AV_PIX_FMT_GBRAPF32LE : AV_PIX_FMT_GBRPF32LE;
@@ -1063,6 +1064,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const bool imageSequence = exportIsImageSequence(s);
     const bool floatFrames = s.videoCodec == "exr";
     // JPEG XL frames written with libjxl (media/Jxl.h), in the delivery's own encoding, float and alpha kept.
+    if (s.videoCodec == "png" && (s.pngCompression < -1 || s.pngCompression > 9)) return fail("A PNG compression level is 0 (fastest) to 9 (smallest)");
+    if (s.videoCodec == "png" && s.pngBits != 8 && s.pngBits != 16) return fail("PNG frames have 8 or 16 bits a channel");
     const bool jxlFrames = s.videoCodec == "jxl";
     if (jxlFrames && wantVideo && !jxlAvailable()) return fail("This build of Montage writes no JPEG XL (libjxl)");
     if (jxlFrames && !s.jxlDepth.empty() && s.jxlDepth != "8" && s.jxlDepth != "16" && s.jxlDepth != "half" && s.jxlDepth != "float")
@@ -1280,6 +1283,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->flags |= AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME;
             o.vctx->field_order = AV_FIELD_TT;
         }
+        // PNG frames: how hard the compressor works (every level is lossless).
+        if (s.videoCodec == "png" && s.pngCompression >= 0) o.vctx->compression_level = s.pngCompression;
         AVDictionary* opts = nullptr;
         const bool hwEncoder = hasSuffix(c, "_videotoolbox") || hasSuffix(c, "_nvenc") || hasSuffix(c, "_qsv") ||
                                hasSuffix(c, "_amf") || hasSuffix(c, "_mf");

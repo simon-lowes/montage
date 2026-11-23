@@ -20801,6 +20801,87 @@ if __name__ == '__main__':
         QCOMPARE(findExportPreset("Social - TikTok / Reels / Shorts")->settings.loudnessTarget, -14.0);
     }
 
+    void pngFramesCompressionAndDepth() {
+        // PNG frames at a compression level, always lossless: the highest level's files are smaller than the lowest's
+        // and both decode to the same pixels. At 16 bits a channel the files say so and hold steps finer than 8 bits.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        // (a picture with detail a compressor has work to do on: bars under a ramp that moves from frame to frame)
+        Clip bars = makeGeneratorClip(p, "bars", 20), ramp = makeGeneratorClip(p, "color", 20);
+        ramp.generator.params["color.r"].addKey(0, 0.1);
+        ramp.generator.params["color.r"].addKey(19, 0.9);
+        ramp.generator.params["color.g"] = 0.37;
+        ramp.motion.params["opacity"] = 50.0;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, bars).ok);
+        edit::addTrack(p, s, TrackKind::Video);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, ramp).ok);
+        const QString folder = QString::fromStdString(path("png-levels"));
+        QVERIFY(QDir().mkpath(folder));
+        std::string err;
+        auto write = [&](const char* name, int level, int bits, bool alpha = false) {
+            ExportSettings st = findExportPreset("PNG Sequence")->settings;
+            st.path = (folder + "/" + name + ".png").toStdString();
+            st.in = 3, st.out = 6;
+            st.pngCompression = level;
+            st.pngBits = bits;
+            st.alpha = alpha;
+            if (!exportSequence(p, s, st, nullptr, nullptr, &err)) return qint64(-1);
+            qint64 bytes = 0;
+            for (int i = 0; i < 3; ++i) bytes += QFileInfo(folder + QString("/%1_%2.png").arg(name).arg(i, 6, 10, QChar('0'))).size();
+            return bytes;
+        };
+        const qint64 none = write("none", 0, 8), fast = write("fast", 1, 8), small = write("small", 9, 8), own = write("own", -1, 8);
+        QVERIFY2(none > 0 && fast > 0 && small > 0 && own > 0, err.c_str());
+        QVERIFY2(small < fast && fast < none, qPrintable(QString("%1 %2 %3").arg(none).arg(fast).arg(small)));
+        QVERIFY(none >= qint64(320) * 180 * 3 * 3);  // (not compressed at all: every byte of the three frames is there)
+        for (int i = 0; i < 3; ++i) {
+            const QString n = QString("_%1.png").arg(i, 6, 10, QChar('0'));
+            const QImage a(folder + "/none" + n), b(folder + "/small" + n), c(folder + "/fast" + n), d(folder + "/own" + n);
+            QCOMPARE(a.size(), QSize(320, 180));
+            QVERIFY(a == b && a == c && a == d);
+            QVERIFY(a.depth() <= 32);
+        }
+        // 16 bits a channel, with and without alpha: the header says 16, the levels still only change the size, and
+        // the values are finer than 8 bits hold (not all of them an 8-bit value written twice over).
+        auto bitDepth = [&](const QString& file) {
+            QFile f(file);
+            if (!f.open(QIODevice::ReadOnly)) return -1;
+            const QByteArray head = f.read(26);
+            return head.size() == 26 && head.mid(12, 4) == "IHDR" ? int(uint8_t(head[24])) : -1;
+        };
+        QCOMPARE(bitDepth(folder + "/small_000000.png"), 8);
+        const qint64 deepFast = write("deep-fast", 1, 16), deepSmall = write("deep-small", 9, 16), deepAlpha = write("deep-alpha", 9, 16, true);
+        QVERIFY2(deepFast > 0 && deepSmall > 0 && deepAlpha > 0, err.c_str());
+        QVERIFY(deepSmall < deepFast);
+        QCOMPARE(bitDepth(folder + "/deep-small_000001.png"), 16);
+        QCOMPARE(bitDepth(folder + "/deep-alpha_000001.png"), 16);
+        {
+            const QImage a = QImage(folder + "/deep-fast_000001.png").convertToFormat(QImage::Format_RGBA64);
+            const QImage b = QImage(folder + "/deep-small_000001.png").convertToFormat(QImage::Format_RGBA64);
+            QCOMPARE(a.size(), QSize(320, 180));
+            QVERIFY(a == b);
+            int fine = 0;
+            for (int y = 0; y < a.height(); ++y) {
+                const QRgba64* row = reinterpret_cast<const QRgba64*>(a.constScanLine(y));
+                for (int x = 0; x < a.width(); ++x) fine += row[x].red() % 257 != 0 || row[x].green() % 257 != 0;
+            }
+            QVERIFY2(fine > 320 * 180 / 4, qPrintable(QString::number(fine)));
+            // The picture is the 8-bit one's, to within its steps.
+            const QImage eight(folder + "/small_000001.png");
+            const QRgba64 deep = a.pixelColor(200, 90).rgba64();
+            QVERIFY(std::abs(int(deep.red()) / 257 - qRed(eight.pixel(200, 90))) <= 1);
+        }
+        // A level out of range, or a depth PNG has not, is refused; other frames take no notice of them.
+        ExportSettings bad = findExportPreset("PNG Sequence")->settings;
+        bad.path = (folder + "/bad.png").toStdString();
+        bad.in = 0, bad.out = 1;
+        bad.pngCompression = 12;
+        QVERIFY(!exportSequence(p, s, bad, nullptr, nullptr, &err) && err.find("PNG") != std::string::npos);
+        bad.pngCompression = 6, bad.pngBits = 12;
+        QVERIFY(!exportSequence(p, s, bad, nullptr, nullptr, &err) && err.find("PNG") != std::string::npos);
+    }
+
     void masteringCodecs() {
         // A short sequence: colour bars, a title on transparency above, the JFK clip's sound (176 lines: CineForm needs
         // a multiple of 8).
@@ -29002,6 +29083,8 @@ private slots:
         s.jxlDepth = "half";
         s.jxlDistance = 1.5;
         s.jxlPremultiplied = true;
+        s.pngCompression = 9;
+        s.pngBits = 16;
         const QJsonObject json = exportSettingsToJson(s);
         ExportSettings back;
         std::string err;
@@ -29015,6 +29098,8 @@ private slots:
         QCOMPARE(back.jxlDepth, s.jxlDepth);
         QCOMPARE(back.jxlDistance, s.jxlDistance);
         QVERIFY(back.jxlPremultiplied);
+        QCOMPARE(back.pngCompression, 9);
+        QCOMPARE(back.pngBits, 16);
         // What is missing keeps its default; a value of the wrong type is an error.
         ExportSettings partial;
         QVERIFY(exportSettingsFromJson(QJsonObject{{"crf", 20}}, partial));

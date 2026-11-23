@@ -452,6 +452,22 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     exrCompression_->setToolTip(tr("How OpenEXR frames are compressed: ZIP, PIZ, Zstandard and HTJ2K keep every value; PXR24, B44 and DWA are smaller and lossy"));
     if (exrAvailable()) form->addRow(tr("OpenEXR compression:"), exrCompression_);
     else exrCompression_->hide();
+    // PNG frames: the compression level (every level keeps every value) and the bits a channel.
+    pngCompression_ = new QComboBox(form_);
+    pngCompression_->setObjectName(QStringLiteral("exportPngCompression"));
+    pngCompression_->addItem(tr("Fastest (largest files)"), 1);
+    pngCompression_->addItem(tr("Balanced"), 6);
+    pngCompression_->addItem(tr("Smallest (slowest)"), 9);
+    pngCompression_->addItem(tr("None (not compressed)"), 0);
+    pngCompression_->setCurrentIndex(std::max(0, pngCompression_->findData(appSettings().value("export/pngCompression", 6).toInt())));
+    pngCompression_->setToolTip(tr("How hard PNG frames are compressed: always lossless; a higher level takes longer and makes smaller files"));
+    form->addRow(tr("PNG compression:"), pngCompression_);
+    pngBits_ = new QComboBox(form_);
+    pngBits_->setObjectName(QStringLiteral("exportPngBits"));
+    pngBits_->addItem(tr("8 bits a channel"), 8);
+    pngBits_->addItem(tr("16 bits a channel"), 16);
+    pngBits_->setCurrentIndex(std::max(0, pngBits_->findData(appSettings().value("export/pngBits", 8).toInt())));
+    form->addRow(tr("PNG depth:"), pngBits_);
     jxlQuality_ = new QComboBox(form_);
     jxlQuality_->setObjectName(QStringLiteral("exportJxlQuality"));
     jxlQuality_->addItem(tr("Lossless"), 0.0);
@@ -946,6 +962,8 @@ void ExportDialog::updateControls() {
                                  !sceneReferredWorking(*sq) && vc != "exr");
         adaptiveHdr_->setEnabled(video && out && out->hdr() && vc != "exr" && vc != "gif" && vc != "jxl");
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
+        pngCompression_->setEnabled(video && vc == "png");
+        pngBits_->setEnabled(pngCompression_->isEnabled());
         jxlQuality_->setEnabled(video && vc == "jxl" && jxlAvailable());
         jxlDepth_->setEnabled(jxlQuality_->isEnabled());
         jpegXsRate_->setEnabled(video && vc == "jpegxs" && jpegXsAvailable());
@@ -1247,6 +1265,12 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         const std::string c = exrCompression_->currentData().toString().toStdString();
         s.exrCompression = c == "zip" ? std::string() : c;  // (ZIP: FFmpeg's writer, as before)
         settings.setValue("export/exrCompression", exrCompression_->currentData());
+    }
+    if (pngCompression_->isEnabled()) {
+        s.pngCompression = pngCompression_->currentData().toInt();
+        settings.setValue("export/pngCompression", s.pngCompression);
+        s.pngBits = pngBits_->currentData().toInt();
+        settings.setValue("export/pngBits", s.pngBits);
     }
     if (jxlQuality_->isEnabled()) {
         s.jxlDistance = jxlQuality_->currentData().toDouble();

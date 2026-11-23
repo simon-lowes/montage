@@ -193,6 +193,8 @@ void visitSettings(S& s, V& v) {
     v("cea608", s.cea608);
     v("cea708", s.cea708);
     v("exrCompression", s.exrCompression);
+    v("pngCompression", s.pngCompression);
+    v("pngBits", s.pngBits);
     v("jxlDepth", s.jxlDepth);
     v("jxlDistance", s.jxlDistance);
     v("jxlEffort", s.jxlEffort);

@@ -13600,6 +13600,8 @@ void McpServer::Impl::addTools() {
             "spatial_baseline_mm":{"type":"number","default":64,"description":"Spatial video: the distance between the cameras' lenses (mm)"},
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
             "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
+            "png_compression":{"type":"integer","minimum":0,"maximum":9,"description":"PNG Sequence preset: how hard each frame is compressed, 0 (fastest, largest) to 9 (smallest); always lossless"},
+            "png_bits":{"type":"integer","enum":[8,16],"default":8,"description":"PNG Sequence preset: bits a channel"},
             "jxl_depth":{"type":"string","enum":["8","16","half","float"],"description":"JPEG XL preset: the frames' samples (default 16-bit, half floats in linear light)"},
             "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL preset: 0 lossless, else libjxl's distance (1 visually lossless)"},
             "jxl_premultiplied":{"type":"boolean","default":false,"description":"JPEG XL preset with alpha: written premultiplied rather than straight (libjxl 0.9 or later)"},
@@ -13754,6 +13756,14 @@ void McpServer::Impl::addTools() {
             if (a.contains("exr_compression")) {
                 if (st.videoCodec != "exr") throw ArgError{"\"exr_compression\" is for the OpenEXR preset"};
                 st.exrCompression = str(a, "exr_compression").toStdString();
+            }
+            if (a.contains("png_compression") || a.contains("png_bits")) {
+                if (st.videoCodec != "png") throw ArgError{"\"png_compression\" and \"png_bits\" are for the PNG Sequence preset"};
+                if (a.contains("png_compression")) st.pngCompression = std::clamp(a.value("png_compression").toInt(6), 0, 9);
+                if (a.contains("png_bits")) {
+                    st.pngBits = a.value("png_bits").toInt(8);
+                    if (st.pngBits != 8 && st.pngBits != 16) throw ArgError{"\"png_bits\" is 8 or 16"};
+                }
             }
             if (a.contains("jxl_depth") || a.contains("jxl_distance") || a.contains("jxl_premultiplied")) {
                 if (st.videoCodec != "jxl") throw ArgError{"\"jxl_depth\", \"jxl_distance\" and \"jxl_premultiplied\" are for the JPEG XL preset"};

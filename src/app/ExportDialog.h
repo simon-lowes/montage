@@ -96,6 +96,8 @@ private:
     QCheckBox* hdr10Plus_ = nullptr;    // HDR10+ dynamic metadata (PQ)
     QCheckBox* adaptiveHdr_ = nullptr;  // adaptive HDR metadata (PQ and HLG)
     QComboBox* exrCompression_ = nullptr;  // OpenEXR frames' compression
+    QComboBox* pngCompression_ = nullptr;  // PNG frames: how hard the compressor works (always lossless)
+    QComboBox* pngBits_ = nullptr;         // and 8 or 16 bits a channel
     QComboBox* jxlQuality_ = nullptr;      // JPEG XL frames: lossless or a distance
     QComboBox* jpegXsRate_ = nullptr;      // JPEG XS: bits a pixel (0: the preset's)
     QComboBox* jxlDepth_ = nullptr;        // and their depth (the preset's, 8 or 16-bit, half or float)
