@@ -26993,9 +26993,17 @@ colorspaces:
             };
             QVERIFY2(fx.navigate(rig.page(), &why), why.c_str());
             QVERIFY2(until("document.readyState === 'complete' && !!window.__montage", 20), fx.log().right(2000).constData());
-            QCOMPARE(fx.js("__montage.join('Bo', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
-            QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30),
-                     (fx.js("__montage.stage").toString() + " " + fx.js("__montage.pc.iceConnectionState").toString() + " " + QString::fromUtf8(said())).toUtf8().constData());
+            // (for a failure's message: Firefox's own addresses in its offer, the relay's among them, and how its
+            // checks go)
+            auto fxSaid = [&] {
+                return fx.js("__montage.stage + ' (Firefox: ' + (__montage.pc ? __montage.pc.iceGatheringState + ' ' + __montage.pc.iceConnectionState + '; ' +"
+                             " (__montage.pc.localDescription ? __montage.pc.localDescription.sdp.split('\\r\\n').filter(l => l.startsWith('a=candidate')).join(' | ') : 'no offer') : 'no connection') + ')'")
+                           .toString() +
+                       " " + QString::fromUtf8(said());
+            };
+            const QString fxJoined = fx.js("__montage.join('Bo', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString();
+            QVERIFY2(fxJoined == QStringLiteral("joined"), (fxJoined + " " + fxSaid()).toUtf8().constData());
+            QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30), fxSaid().toUtf8().constData());
             st = rig.review->stats();
             QCOMPARE(st.bridges.size(), size_t(2));
             QCOMPARE(st.bridgeThreads, 1);
@@ -27012,11 +27020,24 @@ colorspaces:
             QVERIFY(quint64(tab.js("__montage.presented").toDouble()) > presented + 20);
             const quint64 carried = fake->sendIndications - before;
             QVERIFY2(carried > 40, std::to_string(carried).c_str());
+            // (those from the bridges' own addresses at the relay, the ones the browsers chose to send to: Chrome's own, from
+            // each address it has at the relay and for as long as it checks pairs it did not choose, are not the
+            // bridge's; and counted here before the bridge's count is read, as the bridge counts each before it goes)
+            // (Firefox gives no transport's stats, and marks the pair chosen itself)
+            const QString chosenPort = QStringLiteral("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
+                                                      "if (!p) r.forEach(s => { if (s.type === 'candidate-pair' && s.selected) p = s; });"
+                                                      "const c = p ? r.get(p.remoteCandidateId) : null; return c ? (c.port || c.portNumber || 0) : 0; })");
+            const quint16 bridgePort = quint16(tab.js(chosenPort).toInt());
+            const quint16 secondPort = firefox ? quint16(fx.js(chosenPort).toInt()) : quint16(0);
+            QVERIFY(bridgePort > 0 && (!firefox || (secondPort > 0 && secondPort != bridgePort)));
+            const quint64 fromBridge = fake->sendIndicationsFrom(bridgePort) + (firefox ? fake->sendIndicationsFrom(secondPort) : 0);
             st = rig.review->stats();
             quint64 sent = 0;
             for (const auto& b : st.bridges) sent += b.toRelay;
-            // (Chrome's own Send indications, before its channels are bound, are counted by the relay too)
-            QVERIFY2(fake->sendIndications <= sent + 64 && fake->sendIndications + 64 >= sent, (std::to_string(fake->sendIndications) + " of " + std::to_string(sent)).c_str());
+            qInfo("Through the relay: %llu Send indications from the bridges' addresses there, %llu sent by them, %llu from all",
+                  (unsigned long long)fromBridge, (unsigned long long)sent, (unsigned long long)fake->sendIndications.load());
+            // (a few still on their way, or sent before the relay let the viewer in)
+            QVERIFY2(fromBridge <= sent && fromBridge + 64 >= sent, (std::to_string(fromBridge) + " of " + std::to_string(sent)).c_str());
             QCOMPARE(fake->bytesOverUdp.load() > 0, transport == "udp");
             QCOMPARE(fake->bytesOverStream.load() > 0, transport != "udp");
             QVERIFY(fake->channelData.load() > 0);

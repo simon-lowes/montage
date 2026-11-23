@@ -70,6 +70,13 @@ public:
     std::atomic<quint64> sendIndications{0}, channelData{0}, toPeers{0}, fromPeers{0};
     std::atomic<quint64> bytesOverUdp{0}, bytesOverStream{0};
 
+    // The Send indications passed on from the client whose relayed port is this one (a client's checks on pairs
+    // that were not chosen are its own, not the chosen one's).
+    quint64 sendIndicationsFrom(quint16 relayedPort) const {
+        std::lock_guard lock(logMutex_);
+        return sendsByPort_.value(relayedPort);
+    }
+
     // What it did, in order (the first few hundred things), for a failing test's message.
     QByteArray told() const {
         std::lock_guard lock(logMutex_);
@@ -441,6 +448,10 @@ private:
             }
             if (may) {
                 ++sendIndications;
+                {
+                    std::lock_guard lock(logMutex_);
+                    ++sendsByPort_[c.back->localPort()];
+                }
                 ++toPeers;
                 c.back->writeDatagram(data, real(peer), peerPort);
             }
@@ -597,6 +608,7 @@ private:
     quint32 mangles_ = 0;
     mutable std::mutex logMutex_;
     QStringList log_;
+    QHash<quint16, quint64> sendsByPort_;  // Send indications passed on, by the sender's relayed port (under logMutex_)
     std::thread thread_;
     std::mutex m_;
     std::condition_variable cv_;
