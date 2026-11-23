@@ -859,7 +859,8 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
                 }
             }
         }
-    // The 3D layers' cards seen through that solve, as they stand at their clips' first frames.
+    // The 3D layers' cards seen through that solve, as they stand at their clips' first frames, their pictures at each
+    // frame they play over (one picture when it does not change).
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
         for (const Clip& c : seq.videoTracks[ti].clips) {
             if (!c.enabled || (c.isGenerator() && c.generator.type == "model3d")) continue;
@@ -879,6 +880,8 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
                 const int frame = cameraSolveFrame(seq, footage, *solve, t - footage.start);
                 if (frame < 0 || (!m.motion.empty() && m.motion.back().first >= frame)) continue;
                 const Layer3DPlace at = layer3dPlace(*e, t - c.start, seq.width, seq.height);
+                if (std::string pic = cardPicturePng(p, seq, ti, c, t); m.pictures.empty() || pic != m.pictures.back().second)
+                    m.pictures.push_back({double(frame), std::move(pic)});
                 const double k = firstUnit > 0 ? at.unit / firstUnit : 1;
                 m.motion.push_back({double(frame), {at.axisU[0] * k, at.axisU[1] * k, at.axisU[2] * k, 0, at.axisV[0] * k, at.axisV[1] * k, at.axisV[2] * k, 0,
                                                     at.normal[0] * k, at.normal[1] * k, at.normal[2] * k, 0, at.origin[0], at.origin[1], at.origin[2], 1}});
@@ -890,7 +893,12 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             }
             std::shared_ptr<const Model> plane;
             const PosedTriangles tr = layer3dTriangles(place, plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));
-            m.picture = cardPicturePng(p, seq, ti, c, from < to ? from : c.start);
+            if (!m.pictures.empty()) {
+                m.picture = m.pictures.front().second;
+                if (m.pictures.size() == 1 || m.picture.empty()) m.pictures.clear();
+            } else {
+                m.picture = cardPicturePng(p, seq, ti, c, from < to ? from : c.start);
+            }
             m.card = true;
             m.name = c.name;
             m.color = {1, 1, 1, 1};

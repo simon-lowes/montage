@@ -124,6 +124,9 @@ struct SolvedSceneMesh {
     bool card = false;  // a 3D layer's card (Card_N), not a model (Model_N)
     // Its picture (PNG: sRGB, straight alpha) on its uvs as the material's colour and opacity (empty: none).
     std::string picture;
+    // A picture that changes over the range: each time code where it changes and its picture there, held until the
+    // next (written as its texture's file's time samples, a file each; empty: `picture` throughout).
+    std::vector<std::pair<double, std::string>> pictures;
     // Its place by time code (the solve's frames): the matrix from its own space (positions and normals then in it)
     // to the scene's, row vectors as USD writes them (its first three rows the axes, the fourth where it is). Empty:
     // it stands still, its positions in the scene's space.

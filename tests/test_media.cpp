@@ -41536,6 +41536,50 @@ private slots:
                 }
                 QVERIFY2(xforms == 3 && picture, qPrintable(said));
             }
+            // A card whose picture changes (its colour keyed from black to red over the ten frames): a picture for
+            // each frame, each byte for byte the picture of the card at that frame alone, named by the texture's
+            // file's time samples and read back so by Montage.
+            {
+                Sequence changing = s;
+                Clip& card = changing.videoTracks[1].clips[0];
+                card.generator = makeEffect(p, "color");
+                card.generator.params["color.g"] = 0.0, card.generator.params["color.b"] = 0.0;
+                card.generator.params["color.r"].keys = {{0, 0.0}, {9, 0.9}};
+                const std::vector<SolvedSceneMesh> c = solvedSceneModels(p, changing, 0, changing.videoTracks[0].clips[0]);
+                QVERIFY(c.size() == 1 && c[0].pictures.size() == 10);
+                for (int i = 0; i < 10; ++i) QCOMPARE(c[0].pictures[size_t(i)].first, double(i));
+                QVERIFY(c[0].picture == c[0].pictures[0].second);
+                for (int i : {0, 4, 9}) {
+                    Sequence still = changing;
+                    Clip& k = still.videoTracks[1].clips[0];
+                    k.generator.params["color.r"] = Param(card.generator.p("color.r", i));
+                    const std::vector<SolvedSceneMesh> one = solvedSceneModels(p, still, 0, still.videoTracks[0].clips[0]);
+                    QVERIFY(one.size() == 1 && one[0].pictures.empty() && !one[0].picture.empty());
+                    QVERIFY2(one[0].picture == c[0].pictures[size_t(i)].second, qPrintable(QString("frame %1").arg(i)));
+                }
+                for (const char* name : {"changing.usda", "changing.usdz"}) {
+                    const std::string file = path(name);
+                    std::string err;
+                    QVERIFY2(writeSolveUsda(solve, file, c, &err), err.c_str());
+                    usd::Stage stage;
+                    QVERIFY2(usd::openStage(file, stage, &err), err.c_str());
+                    const auto* tex = stage.prim("/Solve/Looks/Card_1/Picture");
+                    QVERIFY(tex && tex->attribute("inputs:file"));
+                    const auto& samples = tex->attribute("inputs:file")->samples;
+                    QCOMPARE(int(samples.size()), 10);
+                    std::set<std::string> names;
+                    for (int i = 0; i < 10; ++i) {
+                        QCOMPARE(samples[size_t(i)].first, double(i));
+                        std::string bytes;
+                        QVERIFY(stage.readAsset(samples[size_t(i)].second.text(0), bytes));
+                        QVERIFY2(bytes == c[0].pictures[size_t(i)].second, qPrintable(QString("%1 at %2").arg(name).arg(i)));
+                        names.insert(samples[size_t(i)].second.text(0));
+                    }
+                    QCOMPARE(int(names.size()), 10);
+                    std::string bytes;
+                    QVERIFY(stage.readAsset(tex->attribute("inputs:file")->value.text(0), bytes) && bytes == c[0].pictures[0].second);
+                }
+            }
         }
     }
 
