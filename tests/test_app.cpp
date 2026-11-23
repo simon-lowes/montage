@@ -3946,7 +3946,8 @@ private slots:
         // (made before the streams start: one that does not start leaves no inputs behind for the tests after)
         auto finish = qScopeGuard([&] {
             stop = true;
-            for (auto& p : streams) p->kill(), p->waitForFinished(5000);
+            for (auto& p : streams)
+                if (p) p->kill(), p->waitForFinished(5000);
             for (std::thread& t : sending)
                 if (t.joinable()) t.join();
 #ifdef MONTAGE_WITH_OMT
@@ -3959,7 +3960,19 @@ private slots:
             for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
                 if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
         });
-        for (int k = 0; k < (omtOk ? 1 : 2); ++k) {
+        // The streams' senders. One is started again when it has ended (an SRT caller that called between two of the
+        // listener's waits gives up), and when its tile has had no picture since it was started 15 s ago: on macOS a
+        // process started while another thread forks can be held before it runs (a Mac runner's first sender sent
+        // nothing for 90 s, and Qt never heard it start), or run with Qt not told (Qt makes the pipe that says so and
+        // marks it close-on-exec in two steps, and a process another thread starts in between keeps it). So Qt's word
+        // that it started is not waited for, and the wait for pictures runs from the last sender's start.
+        const int streamCount = omtOk ? 1 : 2;
+        streams.resize(size_t(streamCount));
+        std::vector<QElapsedTimer> streamStarted(static_cast<size_t>(streamCount));
+        std::vector<int> streamStarts(size_t(streamCount), 0);
+        QElapsedTimer lastStart;
+        auto startStream = [&](int k) {
+            if (auto& old = streams[size_t(k)]) old->kill(), old->waitForFinished(5000);
             auto p = std::make_unique<QProcess>();
             p->setProcessChannelMode(QProcess::ForwardedChannels);  // (its few errors in the test's own output)
             const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
@@ -3968,18 +3981,42 @@ private slots:
                               "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", QString::number(lifetimeS), "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
                               "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
                               "-c:a", "mp2", "-f", "mpegts", to});
-            // Only a command that could not be run fails here; the pictures below show it sending. (On macOS, which
-            // makes a pipe and marks it close-on-exec in two steps, a process another thread starts in between keeps
-            // the pipe that tells Qt the command has started, so Qt can wait as long as that process lives: a Mac
-            // runner with nothing much to do once waited more than three minutes for a sender that was running.)
-            streams.push_back(std::move(p));
-            if (!streams.back()->waitForStarted(within(30000)))
-                QVERIFY2(streams.back()->error() != QProcess::FailedToStart, qPrintable(streams.back()->errorString()));
+            streams[size_t(k)] = std::move(p);
+            streamStarted[size_t(k)].start();
+            ++streamStarts[size_t(k)];
+            lastStart.start();
+        };
+        // (each at most four times again: a sender that never shows is then left to fail the wait below)
+        auto keepSending = [&] {
+            for (int k = 0; k < streamCount; ++k) {
+                QProcess& p = *streams[size_t(k)];
+                const bool ended = p.state() == QProcess::NotRunning;
+                if (ended && p.error() == QProcess::FailedToStart) continue;  // (failed below)
+                if (streamStarts[size_t(k)] > 4 || !(ended || (mv->tile(2 + k).pictures == 0 && streamStarted[size_t(k)].elapsed() > 15000))) continue;
+                qInfo("multiviewer: stream sender %d started again (%s) after %lld ms", k, ended ? "it ended" : "no picture from it",
+                      sinceStart.elapsed());
+                startStream(k);
+            }
+        };
+        for (int k = 0; k < streamCount; ++k) {
+            startStream(k);
+            // Only a command that could not be run fails here; the pictures below show it sending.
+            if (!streams[size_t(k)]->waitForStarted(within(2000)))
+                QVERIFY2(streams[size_t(k)]->error() != QProcess::FailedToStart, qPrintable(streams[size_t(k)]->errorString()));
         }
         phase("senders started");
-        // (waiting on pictures, not the clock: a busy machine is slow)
-        QVERIFY2(until([&] { return mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10; }, 60000),
-                 qPrintable(QStringLiteral("pictures per tile: %1 %2 %3 %4").arg(mv->tile(0).pictures).arg(mv->tile(1).pictures).arg(mv->tile(2).pictures).arg(mv->tile(3).pictures)));
+        // (waiting on pictures, not the clock: a busy machine is slow; for 60 s from the last sender's start)
+        auto fourShowing = [&] { return mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10; };
+        while (!fourShowing() && lastStart.elapsed() < 60000 && sinceStart.elapsed() < watchdog - 15000) {
+            keepSending();
+            QTest::qWait(20);
+        }
+        QVERIFY2(fourShowing(),
+                 qPrintable(QStringLiteral("pictures per tile: %1 %2 %3 %4 (stream senders started %5 and %6 times)").arg(mv->tile(0).pictures)
+                                .arg(mv->tile(1).pictures).arg(mv->tile(2).pictures).arg(mv->tile(3).pictures).arg(streamStarts[0])
+                                .arg(streamCount > 1 ? streamStarts[1] : 0)));
+        // (the stream's feed as opened by now: a listener's wait that ran out before its sender called opened it again)
+        const int streamOpened = mv->tile(2).opened;
         phase("four tiles showing");
         // Each tile's picture the one its timecode names, its hour the source's, close behind what was sent.
         const int hours[4] = {10, 11, 12, omtOk ? 13 : 14};
@@ -4120,8 +4157,8 @@ private slots:
         phase("stream recorded");
         r = call({{"action", "multiview"}, {"record", false}});
         QVERIFY(!mv->tile(2).recording && mv->tile(2).running);
-        QCOMPARE(mv->tile(2).opened, 1);
-        QCOMPARE(r.value("structuredContent").toObject().value("inputs").toArray()[2].toObject().value("opened").toInt(), 1);
+        QCOMPARE(mv->tile(2).opened, streamOpened);
+        QCOMPARE(r.value("structuredContent").toObject().value("inputs").toArray()[2].toObject().value("opened").toInt(), streamOpened);
         // (not finished: on macOS Qt may never hear that the sender started, leaving it Starting while it sends)
         QVERIFY(streams[0]->state() != QProcess::NotRunning);
         {

@@ -135,6 +135,10 @@ struct Raster {
     const uint16_t* row(int r) const { return samples.data() + size_t(r) * size_t(rowSamples()); }
     bool operator==(const Raster& o) const = default;
 };
+// An interlaced frame's field (1: its first, the rows 0, 2, 4...; 2: its second, the rows 1, 3, 5...) as a raster of
+// half its height, and a field woven back into its frame's rows.
+Raster fieldOf(const Raster& frame, int field);
+void weaveField(Raster& frame, const Raster& field, int which);
 // A pixel group: the fewest pixels whose samples fill whole bytes (RFC 4175 and ST 2110-20's table).
 struct Pgroup {
     int pixels = 2, bytes = 5;
@@ -153,11 +157,13 @@ Raster rasterOf(const JxsPicture& p);
 // The boxes RFC 9134 puts before each codestream (ISO/IEC 21122-3's): the video support box (the stream's maximum bit
 // rate, frame rate, sampling, profile and level) and the colour specification box (the format's CICP code points).
 std::vector<uint8_t> jxsvBoxes(const VideoFormat& f, uint16_t ppih, uint16_t plev, uint32_t codestreamBytes);
-// One frame (progressive) as RFC 9134's packets: `boxes`, then the codestream (as JxsEncoder makes it; `units` its
-// header's and each slice's bytes, for the slice packetization mode), each packet a 4-byte payload header and at most
-// `maxPayload` bytes, every packet of a packetization unit as long but its last; `frameCount` the F counter's frame.
+// One frame as RFC 9134's packets (or with `field` 1 or 2 an interlaced frame's field, each field a codestream of its
+// own, sent under the frame's timestamp and F count, its last packet marked): `boxes`, then the codestream (as
+// JxsEncoder makes it; `units` its header's and each slice's bytes, for the slice packetization mode), each packet a
+// 4-byte payload header and at most `maxPayload` bytes, every packet of a packetization unit as long but its last;
+// `frameCount` the F counter's frame.
 bool packJxsv(const std::vector<uint8_t>& boxes, const uint8_t* codestream, size_t size, const std::vector<uint32_t>& units, int packetMode,
-              int64_t frameCount, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
+              int64_t frameCount, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload = 1200, int field = 0);
 // The most bytes a frame of a JPEG XS format's packets may come to (JxsvAssembler::setFrameLimit): its picture at the
 // bits a pixel its SDP names, at the bits of the picture uncompressed (a sender may code that many: 36 for 4:4:4 at 12
 // bits), or at 24, whichever is most, and the boxes before it.
@@ -181,6 +187,9 @@ public:
     bool add(const RtpPacket& p);
     const std::vector<uint8_t>& codestream() const { return done_; }
     uint32_t timestamp() const { return doneTimestamp_; }
+    // Which picture it was: 0 a frame, 1 or 2 an interlaced frame's first or second field (each its own codestream,
+    // under the frame's timestamp; a field's missing slices are taken from the field before, the other one).
+    int field() const { return doneField_; }
     int64_t lost() const { return lost_; }            // packets missing by their sequence numbers
     int64_t lostInFrame() const { return doneLost_; } // packets missing from the frame last completed (0: whole)
     int concealedSlices() const { return doneConcealed_; }  // its slices taken from the frame before
@@ -200,6 +209,7 @@ private:
     size_t limit_ = kLargestFrame, bytes_ = 0;  // (the frame being built: its packets' bytes, and the most it may hold)
     bool over_ = false;                         // (it went past that: nothing more of it is kept)
     uint32_t timestamp_ = 0, doneTimestamp_ = 0;
+    int field_ = 0, doneField_ = 0;
     bool started_ = false;
     int mode_ = 0;
     int64_t lastSeq_ = -1, lost_ = 0, frameLost_ = 0, doneLost_ = 0, passedOver_ = 0;
@@ -449,6 +459,8 @@ private:
     std::unique_ptr<Jxs> jxs_;
     std::vector<uint8_t> codestream_, boxes_;
     std::vector<uint32_t> units_;
+    std::vector<uint8_t> codestream2_;  // (an interlaced frame's second field's, and its slices)
+    std::vector<uint32_t> units2_;
     bool sendJxs(const Raster& picture, const float* audio, int audioFrames, const output::Timecode* timecode,
                  const std::vector<AncPacket>& anc, const std::atomic<bool>* stop);
     std::string clock_, source_, source2_;

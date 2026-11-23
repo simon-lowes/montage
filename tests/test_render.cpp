@@ -20528,6 +20528,87 @@ colorspaces:
         QCOMPARE(recorded, montage::jpegXsAvailable() && broadcastMxfAvailable());
     }
 
+    // Interlaced JPEG XS over ST 2110-22 (RFC 9134's picture segments): each field a codestream of its own, sent under
+    // the frame's timestamp and F count with I saying which field, each field's last packet marked; rebuilt as two
+    // codestreams, the first field's and then the second's, and a progressive frame after them as a frame. A field is
+    // its frame's rows of one parity, woven back exactly. The format is taken with an even height, and said in the SDP.
+    void st2110JpegXsFields() {
+        namespace st = montage::st2110;
+        // Two codestreams as far as the assembler reads them (a header, four slices and the end), told apart by their bytes.
+        auto codestream = [](int seed) {
+            std::vector<uint8_t> cs = {0xFF, 0x10, 0xFF, 0x12, 0x00, 0x1A};
+            cs.resize(cs.size() + 24, 0);
+            cs[6 + 9] = 64, cs[6 + 11] = 32, cs[6 + 15] = 1, cs[6 + 16] = 3, cs[6 + 22] = 4;
+            for (int b : {0xFF, 0x13, 0x00, 0x08, 0x0A, 0x11, 0x0A, 0x21, 0x0A, 0x21}) cs.push_back(uint8_t(b));
+            for (int slice = 0; slice < 4; ++slice) {
+                for (int b : {0xFF, 0x20, 0x00, 0x04, 0x00, slice}) cs.push_back(uint8_t(b));
+                for (int i = 0; i < 122; ++i) cs.push_back(uint8_t(1 + (seed * 7 + slice * 31 + i) % 200));
+            }
+            cs.push_back(0xFF), cs.push_back(0x11);
+            cs[8] = uint8_t(cs.size() >> 8), cs[9] = uint8_t(cs.size());
+            return cs;
+        };
+        const std::vector<uint8_t> first = codestream(1), second = codestream(2), progressive = codestream(3);
+        const std::vector<uint32_t> units = {40, 128, 128, 128, 130};
+        QCOMPARE(size_t(40 + 128 * 3 + 130), first.size());
+        for (const int mode : {0, 1}) {
+            std::vector<std::vector<uint8_t>> sent;
+            st::RtpState rtp;
+            rtp.payloadType = 98;
+            auto keep = [&](const uint8_t* d, size_t n) {
+                sent.emplace_back(d, d + n);
+                return true;
+            };
+            QVERIFY(st::packJxsv({}, first.data(), first.size(), units, mode, 7, 90000, rtp, keep, 200, 1));
+            const size_t firstPackets = sent.size();
+            QVERIFY(st::packJxsv({}, second.data(), second.size(), units, mode, 7, 90000, rtp, keep, 200, 2));
+            const size_t fieldPackets = sent.size();
+            QVERIFY(st::packJxsv({}, progressive.data(), progressive.size(), units, mode, 8, 93600, rtp, keep, 200));
+            QVERIFY(!st::packJxsv({}, first.data(), first.size(), units, mode, 9, 97200, rtp, keep, 200, 3));
+            st::JxsvAssembler as;
+            std::vector<std::pair<int, std::vector<uint8_t>>> got;
+            for (size_t i = 0; i < sent.size(); ++i) {
+                st::RtpPacket p;
+                QVERIFY(st::parseRtp(sent[i].data(), sent[i].size(), p));
+                const uint32_t h = uint32_t(p.payload[0]) << 24 | uint32_t(p.payload[1]) << 16 | uint32_t(p.payload[2]) << 8 | p.payload[3];
+                // (I: 2 the first field, 3 the second, 0 a frame; F the frame's; the marker on each picture's last)
+                QCOMPARE(int((h >> 27) & 3), i < firstPackets ? 2 : i < fieldPackets ? 3 : 0);
+                QCOMPARE(int((h >> 22) & 31), i < fieldPackets ? 7 : 8);
+                QCOMPARE(p.timestamp, i < fieldPackets ? 90000u : 93600u);
+                QCOMPARE(p.marker, i + 1 == firstPackets || i + 1 == fieldPackets || i + 1 == sent.size());
+                if (as.add(p)) got.emplace_back(as.field(), as.codestream());
+            }
+            QCOMPARE(got.size(), size_t(3));
+            QCOMPARE(got[0].first, 1);
+            QVERIFY(got[0].second == first);
+            QCOMPARE(got[1].first, 2);
+            QVERIFY(got[1].second == second);
+            QCOMPARE(got[2].first, 0);
+            QVERIFY(got[2].second == progressive);
+            QCOMPARE(as.lost(), int64_t(0));
+        }
+        // A frame's fields, each of its rows of one parity, woven back into the very frame.
+        st::Raster frame(8, 6, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < frame.height; ++y)
+            for (int i = 0; i < frame.rowSamples(); ++i) frame.row(y)[i] = uint16_t(y * 100 + i);
+        const st::Raster top = st::fieldOf(frame, 1), bottom = st::fieldOf(frame, 2);
+        QCOMPARE(top.height, 3);
+        QCOMPARE(int(top.row(1)[0]), 200);
+        QCOMPARE(int(bottom.row(1)[0]), 300);
+        st::Raster woven(8, 6, st::Sampling::Ycc422, 10);
+        st::weaveField(woven, top, 1);
+        st::weaveField(woven, bottom, 2);
+        QVERIFY(woven == frame);
+        // The format: interlaced JPEG XS taken at an even height, and the SDP saying it is interlaced.
+        st::VideoFormat v;
+        v.width = 1920, v.height = 1080, v.fps = {25, 1}, v.interlaced = true, v.codec = "jxsv", v.bpp = 4;
+        std::string why;
+        QVERIFY2(st::videoFormatOk(v, &why), why.c_str());
+        QVERIFY(st::videoSdp(v, {"239.1.1.1", 5004}, 98, {}).find("; interlace") != std::string::npos);
+        v.height = 1081;
+        QVERIFY(!st::videoFormatOk(v));
+    }
+
     // ST 2110-22's JPEG XS (RFC 9134), in both packetization modes: packets as the RFC lays them out (a constant number
     // each frame, every payload of a unit as long but its last, the marker on the frame's last), rebuilt to the very
     // codestream; one lost packet damages only its slices' lines (taken from the frame before); and over the loopback
@@ -20710,6 +20791,7 @@ colorspaces:
             }
             const st::VideoFormat& got = streams[0].video;
             if (!(got.jpegXs() && got.packetMode == v.packetMode && got.width == v.width && got.sampling == v.sampling && got.depth == v.depth &&
+                  got.interlaced == v.interlaced &&
                   got.profile == snd.videoFormat().profile && got.bandwidthKbps == snd.videoFormat().bandwidthKbps && got.bandwidthKbps > 0 &&
                   streams[0].redundant()))
                 return "SDP video format";
@@ -20724,12 +20806,25 @@ colorspaces:
             const montage::JxsPicture pics[2] = {jxsTestPicture(v.width, v.height, v.depth, js, 0), jxsTestPicture(v.width, v.height, v.depth, js, 9)};
             montage::JxsEncoder direct;
             montage::JxsEncodeSettings ds;
-            ds.width = v.width, ds.height = v.height, ds.depth = v.depth, ds.sampling = js, ds.bppNum = int(std::lround(v.bpp * 1000)), ds.bppDen = 1000;
+            // (interlaced: each field coded on its own and the two decoded woven into the frame; no codestream kept as
+            // the frame's)
+            ds.width = v.width, ds.height = v.interlaced ? v.height / 2 : v.height, ds.depth = v.depth, ds.sampling = js;
+            ds.bppNum = int(std::lround(v.bpp * 1000)), ds.bppDen = 1000;
             ds.slices = v.packetMode == 1;
             if (!direct.open(ds, &e)) return e;
             std::vector<uint8_t> codes[2];
             st::Raster expect[2];
-            for (int k = 0; k < 2; ++k) {
+            for (int k = 0; k < 2 && v.interlaced; ++k) {
+                expect[k] = st::Raster(v.width, v.height, v.sampling, v.depth);
+                for (int field : {1, 2}) {
+                    std::vector<uint8_t> code;
+                    montage::JxsPicture p;
+                    if (!direct.encode(st::jxsPictureOf(st::fieldOf(st::rasterOf(pics[k]), field)), code, nullptr, &e)) return e;
+                    if (!dec.decode(code.data(), code.size(), p, &e, js)) return e;
+                    st::weaveField(expect[k], st::rasterOf(p), field);
+                }
+            }
+            for (int k = 0; k < 2 && !v.interlaced; ++k) {
                 if (!direct.encode(pics[k], codes[k], nullptr, &e)) return e;
                 montage::JxsPicture p;
                 if (!dec.decode(codes[k].data(), codes[k].size(), p, &e, js)) return e;
@@ -20784,9 +20879,14 @@ colorspaces:
         v.packetMode = 1, v.sampling = st::Sampling::Rgb, v.depth = 12, v.bpp = 6, v.fps = {50, 1};
         const std::string e = loopback(v, 20);
         QVERIFY2(e.empty(), ("RGB 12-bit: " + e).c_str());
-        // Interlaced JPEG XS is refused, as the RFC's second picture segment is not sent here.
+        // Interlaced JPEG XS, a codestream each field, in both modes: the fields' pictures woven as each decodes alone.
         v.interlaced = true;
-        QVERIFY(!st::videoFormatOk(v));
+        v.sampling = st::Sampling::Ycc422, v.depth = 10, v.bpp = 4, v.fps = {25, 1};
+        for (int mode : {0, 1}) {
+            v.packetMode = mode;
+            const std::string fe = loopback(v, 20);
+            QVERIFY2(fe.empty(), (std::string(mode ? "interlaced, slice mode: " : "interlaced, codestream mode: ") + fe).c_str());
+        }
     }
 
     // JPEG XS coded and decoded through SVT-JPEG-XS: the header read without it, a constant number of bytes a picture
