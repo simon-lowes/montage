@@ -154,6 +154,7 @@ add_library(montage_engine STATIC
   media/CameraSolve.h media/CameraSolve.cpp
   media/Reframe.h media/Reframe.cpp
   media/Capture.h media/Capture.cpp
+  media/WhipEndpoint.h media/WhipEndpoint.cpp
   media/ModelFiles.h media/ModelFiles.cpp
   media/Sofa.h media/Sofa.cpp
   media/LensDatabase.h media/LensDatabase.cpp

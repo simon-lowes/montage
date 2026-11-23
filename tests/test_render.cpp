@@ -107,6 +107,8 @@
 #include "render/StreamingPackage.h"
 #include "render/LivePackage.h"
 #include "media/Capture.h"
+#include "media/WhipEndpoint.h"
+#include "render/BroadcastMxf.h"
 #include "render/TsSegments.h"
 #include "render/Ac3.h"
 #include "media/Loudness.h"
@@ -26911,6 +26913,205 @@ colorspaces:
             QVERIFY(fake->channelData.load() > 0);
             QCOMPARE(fake->loginsRefused.load(), 0);
         }
+    }
+
+    // Capture as a WHIP endpoint (RFC 9725, media/WhipEndpoint.h): headless Chrome opens the page the endpoint serves
+    // and sends what the page makes (a canvas that flashes white every 1.2 seconds, and a 1 kHz tone that beeps with
+    // each flash) to whip://127.0.0.1:port/whip, and Montage records it to ProRes. A wrong token is answered 401, a
+    // second sender 409, and the page's DELETE ends the recording whole.
+    void captureFromWhip() {
+        using namespace montage::reviewtest;
+        std::string why;
+        if (!whip::available(&why)) QSKIP(why.c_str());
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        QTemporaryDir dir;
+        // (a port free for TCP and UDP both: the endpoint's requests and its media share the number)
+        int port = 0;
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QTcpServer t;
+            QUdpSocket u;
+            if (t.listen(QHostAddress::LocalHost, 0) && u.bind(QHostAddress::LocalHost, t.serverPort())) port = t.serverPort();
+        }
+        QVERIFY(port > 0);
+        const std::string token = "a-token-made-up-for-this-test";
+        const QString url = QStringLiteral("http://127.0.0.1:%1/whip").arg(port);
+        CaptureSettings cs;
+        cs.video.url = "whip://127.0.0.1:" + std::to_string(port) + "/whip";
+        cs.video.options = {{"token", token}, {"wait", "60"}};
+        cs.path = (dir.path() + "/whip.mov").toStdString();
+        cs.codec = "prores_proxy";
+        std::mutex m;
+        std::vector<double> lumas;  // each picture's mean, 0 to 1, in the recording's order
+        int fpsNum = 0, fpsDen = 1;
+        std::vector<float> sound;   // the first channel, whole
+        cs.onPicture = [&](const AVFrame* f, int num, int den) {
+            const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(f->format));
+            if (!d) return;
+            const bool deep = d->comp[0].depth > 8;
+            double sum = 0;
+            int n = 0;
+            for (int y = f->height / 4; y < f->height * 3 / 4; y += 4)
+                for (int x = f->width / 4; x < f->width * 3 / 4; x += 4) {
+                    sum += deep ? reinterpret_cast<const uint16_t*>(f->data[0] + y * f->linesize[0])[x] / double((1 << d->comp[0].depth) - 1)
+                                : f->data[0][y * f->linesize[0] + x] / 255.0;
+                    ++n;
+                }
+            std::lock_guard lock(m);
+            const int64_t at = f->pts;
+            if (at >= 0 && size_t(at) >= lumas.size()) lumas.resize(size_t(at) + 1, -1);
+            if (at >= 0) lumas[size_t(at)] = n ? sum / n : 0;
+            fpsNum = num, fpsDen = den;
+        };
+        cs.onSound = [&](const AVFrame* f) {
+            const int ch = f->ch_layout.nb_channels;
+            if (ch <= 0 || f->pts < 0) return;
+            std::lock_guard lock(m);
+            if (sound.size() < size_t(f->pts) + size_t(f->nb_samples)) sound.resize(size_t(f->pts) + size_t(f->nb_samples), 0);
+            for (int i = 0; i < f->nb_samples; ++i)
+                sound[size_t(f->pts) + i] = f->format == AV_SAMPLE_FMT_S32 ? float(reinterpret_cast<const int32_t*>(f->data[0])[i * ch]) / 2147483648.0f
+                                                                           : reinterpret_cast<const float*>(f->data[0])[i * ch];
+        };
+        Recorder rec;
+        std::atomic<bool> finished{false}, fine{false};
+        std::string finishedWhy;
+        rec.onFinished = [&](bool ok, const std::string& message) {
+            fine = ok;
+            finishedWhy = message;
+            finished = true;
+        };
+        QVERIFY2(rec.start(cs, &why), why.c_str());
+        auto stopRecording = qScopeGuard([&] { rec.stop(); });
+
+        // A request of the endpoint's, its status line (the endpoint listens once the recording has opened it).
+        auto ask = [&](const QByteArray& method, const QByteArray& path, const QByteArray& authorization, const QByteArray& body) -> QByteArray {
+            QTcpSocket c;
+            c.connectToHost(QHostAddress::LocalHost, quint16(port));
+            if (!c.waitForConnected(2000)) return {};
+            QByteArray req = method + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/sdp\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n";
+            if (!authorization.isEmpty()) req += "Authorization: " + authorization + "\r\n";
+            c.write(req + "\r\n" + body);
+            QByteArray got;
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 5000 && !got.contains("\r\n\r\n")) {
+                c.waitForReadyRead(100);
+                got += c.readAll();
+            }
+            return got.left(got.indexOf("\r\n"));
+        };
+        QElapsedTimer listening;
+        listening.start();
+        QByteArray page;
+        while (listening.elapsed() < 10000 && !(page = ask("GET", "/whip", {}, {})).startsWith("HTTP/1.1 200")) QThread::msleep(50);
+        QVERIFY2(page.startsWith("HTTP/1.1 200"), page.constData());
+        QVERIFY(ask("POST", "/whip", "Bearer wrong", "v=0\r\n").startsWith("HTTP/1.1 401"));
+        QVERIFY(ask("POST", "/whip", {}, "v=0\r\n").startsWith("HTTP/1.1 401"));
+        QVERIFY(ask("DELETE", "/whip/nothing", "Bearer " + QByteArray::fromStdString(token), {}).startsWith("HTTP/1.1 404"));
+
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why), why.c_str());
+        tab.js(QStringLiteral("location.href = '%1#%2'; true").arg(url, QString::fromStdString(token)));
+        QVERIFY2(tab.until("document.readyState === 'complete' && !!window.__montageWhip", 20), tab.log().right(1500).constData());
+        // The page's own picture and sound: each flash drawn and its beep begun in the same moment, the canvas's
+        // picture given at once (a stream of pictures asked for, not one at a set rate).
+        tab.js(R"((async () => {
+            const c = document.createElement('canvas');
+            c.width = 640; c.height = 360;
+            const g = c.getContext('2d');
+            const ac = new AudioContext({sampleRate: 48000});
+            await ac.resume();
+            const osc = ac.createOscillator();
+            osc.frequency.value = 1000;
+            const gain = ac.createGain();
+            gain.gain.value = 0;
+            const out = ac.createMediaStreamDestination();
+            osc.connect(gain).connect(out);
+            osc.start();
+            const picture = c.captureStream(0).getVideoTracks()[0];
+            const t = window.__test = {flashes: 0, frames: 0, sendingAt: 0, stoppedAt: 0};
+            let frame = 0;
+            const draw = () => {
+              const flash = frame % 36 < 3;
+              if (frame % 36 === 0) {
+                gain.gain.setValueAtTime(0.8, ac.currentTime);
+                gain.gain.setValueAtTime(0, ac.currentTime + 0.1);
+                ++t.flashes;
+              }
+              g.fillStyle = flash ? '#fff' : '#000';
+              g.fillRect(0, 0, 640, 360);
+              g.fillStyle = '#808080';
+              g.fillRect((frame * 8) % 600, 300, 40, 40);
+              picture.requestFrame();
+              ++frame;
+              ++t.frames;
+            };
+            t.timer = setInterval(draw, 1000 / 30);
+            await __montageWhip.send(false, new MediaStream([picture, out.stream.getAudioTracks()[0]]));
+            return true;
+        })())");
+        QVERIFY2(tab.until("__montageWhip.stage === 'sending'", 30), (tab.js("__montageWhip.stage + ': ' + document.getElementById('state').textContent").toString().toStdString() + tab.log().right(1500).toStdString()).c_str());
+        tab.js("__test.sendingAt = performance.now(); true");
+        // A second sender while the first is connected: 409.
+        QVERIFY(ask("POST", "/whip", "Bearer " + QByteArray::fromStdString(token), "v=0\r\n").startsWith("HTTP/1.1 409"));
+        QThread::msleep(7000);
+        QVERIFY(rec.recording());
+        // DELETE (the page's stop) ends the recording, all of it written.
+        tab.js("(async () => { __test.stoppedAt = performance.now(); clearInterval(__test.timer); await __montageWhip.stop(); return true; })()");
+        const double sent = (tab.js("__test.stoppedAt - __test.sendingAt").toDouble()) / 1000;
+        QVERIFY(rec.wait(20));
+        QVERIFY2(finished && fine, finishedWhy.c_str());
+        stopRecording.dismiss();
+        const CaptureStatus st = rec.status();
+        QVERIFY2(st.error.empty(), st.error.c_str());
+        QCOMPARE(st.width, 640);
+        QCOMPARE(st.height, 360);
+        MediaItem item;
+        QVERIFY2(probeMedia(cs.path, item, &why), why.c_str());
+        QVERIFY(item.hasVideo && item.hasAudio);
+        QCOMPARE(item.videoCodec, std::string("prores"));
+
+        std::lock_guard lock(m);
+        QVERIFY(fpsNum > 0);
+        const double fps = double(fpsNum) / fpsDen;
+        // Its pictures: as many as the time sent (from the connection to the stop) within a second.
+        const double recorded = double(lumas.size()) / fps;
+        qInfo("WHIP: %zu pictures at %.3f a second (%.2f s), %.2f s sent", lumas.size(), fps, recorded, sent);
+        QVERIFY2(std::fabs(recorded - sent) < 1.0, (std::to_string(recorded) + " recorded, " + std::to_string(sent) + " sent").c_str());
+        // The flashes and the beeps: each flash's first picture, each beep's first sound, paired.
+        std::vector<double> flashes, beeps;
+        for (size_t i = 1; i < lumas.size(); ++i)
+            if (lumas[i] > 0.6 && lumas[i - 1] >= 0 && lumas[i - 1] < 0.3) flashes.push_back(double(i) / fps);
+        double lastBeep = -1;
+        for (size_t i = 0; i < sound.size(); ++i)
+            if (std::fabs(sound[i]) > 0.3) {
+                const double at = double(i) / 48000;
+                if (at - lastBeep > 0.5) beeps.push_back(at);
+                lastBeep = at;
+            }
+        QVERIFY2(flashes.size() >= 4, std::to_string(flashes.size()).c_str());
+        QVERIFY2(beeps.size() >= 4, std::to_string(beeps.size()).c_str());
+        // The tone itself: 1 kHz, by its crossings over the first beep's 100 ms.
+        const size_t from = size_t(beeps.front() * 48000) + 240;
+        int crossings = 0;
+        for (size_t i = from + 1; i < std::min(sound.size(), from + 3840); ++i)
+            if ((sound[i - 1] < 0) != (sound[i] < 0)) ++crossings;
+        QVERIFY2(crossings > 150 && crossings < 170, std::to_string(crossings).c_str());
+        // Each flash and its beep land within 40 ms of each other on average, and each within 40 ms and a picture's
+        // time (a flash is seen only from the picture it falls in).
+        int paired = 0;
+        double worst = 0, sum = 0;
+        for (const double f : flashes) {
+            double nearest = 1e9;
+            for (const double b : beeps) nearest = std::fabs(b - f) < std::fabs(nearest) ? b - f : nearest;
+            if (std::fabs(nearest) > 0.5) continue;
+            ++paired;
+            sum += nearest;
+            worst = std::max(worst, std::fabs(nearest));
+            qInfo("WHIP: flash at %.3f s, its beep %+.0f ms", f, nearest * 1000);
+        }
+        QVERIFY2(paired >= 4, std::to_string(paired).c_str());
+        QVERIFY2(std::fabs(sum / paired) <= 0.040, std::to_string(sum / paired).c_str());
+        QVERIFY2(worst <= 0.040 + 1 / fps, std::to_string(worst).c_str());
     }
 
     void ndiOutput() {

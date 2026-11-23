@@ -1,6 +1,9 @@
 // Montage — recording a live feed (Resolve's Media page capture, Media Composer's Capture tool), through FFmpeg:
 // a network stream (SRT, RIST, UDP or RTP MPEG-TS, RTMP, HLS or any URL FFmpeg opens), an Open Media Transport source
-// (media/Omt.h: omt://host:port or its announced name, with its timecode and colour when Montage sent it) or a capture
+// (media/Omt.h: omt://host:port or its announced name, with its timecode and colour when Montage sent it), a feed sent
+// over WebRTC by a browser, a phone or an encoder to Montage as a WHIP endpoint (media/WhipEndpoint.h:
+// whip://host:port/path, its options token=, the bearer token a sender gives, and wait=, the seconds a sender is
+// waited for, else until stopped), or a capture
 // device FFmpeg reaches (V4L2 and ALSA or PulseAudio on Linux, AVFoundation on macOS, DirectShow on Windows; built with
 // libavdevice), recorded to ProRes, DNxHR or JPEG XS (MXF) with its sound (up to 16 channels, 24-bit) and timecode (the
 // feed's own SMPTE 12-M timecode, one given, or the time of day). QuickTime files are written in fragments half a
