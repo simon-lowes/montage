@@ -174,9 +174,10 @@ endif()
 montage_test_ofx(montage_test_ofx_crash MontageTestOfxCrash crash)
 target_compile_definitions(montage_test_ofx_crash PRIVATE MONTAGE_TEST_OFX_CRASH)
 # (on-screen controls and OpenGL renders, in the render tests the GPU job runs)
-add_dependencies(test_render montage_test_ofx montage-plugin-probe)
+add_dependencies(test_render montage_test_ofx montage-plugin-probe montage-pluginhost)
 target_compile_definitions(test_render PRIVATE MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
-  MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
+  MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
+  MONTAGE_PLUGIN_HOST="$<TARGET_FILE:montage-pluginhost>")
 
 montage_test(test_plugins)
 add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage_test_sidechain

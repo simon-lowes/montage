@@ -160,6 +160,11 @@
 #include "render/TrimPasses.h"
 #include "render/RoomTone.h"
 #include "render/Ocio.h"
+#include "audio/PluginHost.h"
+#include "render/OfxRemote.h"
+#ifdef __linux__
+#include <signal.h>
+#endif
 #include "media/Tracking.h"
 #include "render/Ofx.h"
 #include "render/OfxGl.h"
@@ -26746,6 +26751,170 @@ colorspaces:
         QVERIFY(gpu::sharesOpenGl());
         wrong = check("transition after a new start", frame(50), "ofx transition");
         QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+    }
+
+    // Pictures from plug-in hosts as handles. Asked with MONTAGE_GPU_HANDLES=1 of hosts started for GPU rendering, an
+    // effect's picture, a transition's and a generator's each come as a handle where both sides share, and through
+    // shared memory with the reason where they do not; either way within 1/1023 of the picture made in Montage's
+    // process. A hundred pictures that each carry their number come back in order, none stale or torn. A host killed
+    // in the middle of a frame whose picture was to come as a handle: the frame comes all the same, from a new host
+    // through shared memory, and no handle is asked for after. With MONTAGE_EXPECT_HANDLES=1 (CI's guest, whose driver
+    // shares), a picture that does not come as a handle fails the test.
+    void openFxHandlesForEveryKindAndAfterAHostEnds() {
+        QTemporaryDir dir;
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath((dir.path() + "/ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve, generator, temporal;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.dissolve/1", dissolve) &&
+                reg.find("org.montage.test.generator/1", generator) && reg.find("org.montage.test.temporal/1", temporal));
+        const bool expected = qEnvironmentVariable("MONTAGE_EXPECT_HANDLES") == "1";
+        Project p = makeDefaultProject();
+        // Plug-in hosts for this test only: the host program, the grouping, what is asked and OpenGL for plug-ins are
+        // as they were when it ends, with no host left running.
+        struct Asking {
+            const QByteArray before = qgetenv("MONTAGE_GPU_HANDLES");
+            const bool set = qEnvironmentVariableIsSet("MONTAGE_GPU_HANDLES");
+            const bool gpu = ofx::gpuRendering();
+            const plugins::HostingSettings hosting = plugins::hosting();
+            ~Asking() {
+                ofx::remote::releaseIdle();
+                for (int i = 0; i < 2000 && !plugins::runningHosts().empty(); ++i) QTest::qWait(10);
+                plugins::setHosting(hosting);
+                plugins::setHostExecutable({});
+                plugins::clearHostFailures();
+                if (set) qputenv("MONTAGE_GPU_HANDLES", before);
+                else qunsetenv("MONTAGE_GPU_HANDLES");
+                ofx::setGpuRendering(gpu);
+                ofx::remote::resetPictureStats();
+            }
+        } asking;
+        plugins::setHostExecutable(MONTAGE_PLUGIN_HOST);
+        auto host = [&](plugins::Isolation how) {
+            ofx::remote::releaseIdle();
+            plugins::HostingSettings s = asking.hosting;
+            s.isolation = how;
+            plugins::setHosting(s);
+            plugins::clearHostFailures();
+        };
+        qputenv("MONTAGE_GPU_HANDLES", "1");
+        // (hosts render with OpenGL, and are asked for handles, only where Montage's own OpenGL for plug-ins runs)
+        std::string noOpenGl;
+        const bool openGl = ofx::initializeGpu(&noOpenGl);
+        if (expected) QVERIFY2(openGl, noOpenGl.c_str());
+        ofx::setGpuRendering(true);
+        // A picture that carries a number: every row holds it, so a torn picture has rows of two numbers.
+        auto numbered = [](int n) {
+            Image img(64, 36);
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    float* px = img.at(x, y);
+                    px[0] = float(x) / img.width, px[1] = float(n) / 128, px[2] = float(y) / img.height, px[3] = 1.0f;
+                }
+            return img;
+        };
+        auto worstBetween = [](const Image& a, const Image& b) {
+            if (a.width != b.width || a.height != b.height) return 1e9;
+            double worst = 0;
+            for (size_t k = 0; k < a.px.size(); ++k) worst = std::max(worst, std::fabs(double(a.px[k]) - b.px[k]));
+            return worst;
+        };
+        std::string err;
+        Effect fx = ofx::makeEffect(p, invert);
+        fx.params["param.amount"] = Param(0.9);
+        Effect mix = ofx::makeEffect(p, dissolve);
+        Effect gen = ofx::makeEffect(p, generator);
+        Image from(64, 36), to(64, 36);
+        from.fill(0.9f, 0.2f, 0.1f, 1.0f);
+        to.fill(0.1f, 0.6f, 0.8f, 1.0f);
+        // Each made in Montage's own process first.
+        std::vector<Image> here(100);
+        Image mixedHere, generatedHere;
+        {
+            host(plugins::Isolation::InProcess);
+            for (int n = 0; n < 100; ++n) {
+                here[size_t(n)] = numbered(n);
+                QVERIFY2(ofx::applyEffect(fx, n, here[size_t(n)], 1.0, {}, &err), err.c_str());
+            }
+            QVERIFY2(ofx::applyTransition(mix, 0, 0.25, from, to, mixedHere, 1.0, &err), err.c_str());
+            QVERIFY2(ofx::renderGenerator(gen, 3, 64, 36, 1.0, generatedHere, &err), err.c_str());
+        }
+        QVERIFY(worstBetween(here[10], here[11]) > 1.0 / 256);  // (the number shows in the picture)
+        {
+            host(plugins::Isolation::PerPlugin);
+            ofx::remote::resetPictureStats();
+            // What a picture took, counted: as a handle, or through shared memory with a reason that is not "not asked".
+            long handles = 0, memory = 0;
+            auto took = [&](const QString& what) {
+                const ofx::remote::PictureStats now = ofx::remote::pictureStats();
+                const bool handle = now.handles == handles + 1 && now.sharedMemory == memory;
+                const bool shared = now.handles == handles && now.sharedMemory == memory + 1;
+                handles = now.handles, memory = now.sharedMemory;
+                const QString last = QString::fromStdString(now.last);
+                if (!handle && !shared) return what + ": counted neither once as a handle nor once through shared memory";
+                if (shared && (expected || last.contains("not asked for") || !last.contains("through shared memory: ")))
+                    return what + ": " + last;
+                if (handle && !last.endsWith("as a DMA-BUF")) return what + ": " + last;
+                return QString();
+            };
+            Image there, mixedThere, generatedThere;
+            QVERIFY2(ofx::applyTransition(mix, 0, 0.25, from, to, mixedThere, 1.0, &err), err.c_str());
+            QCOMPARE(took("the transition"), QString());
+            QVERIFY2(worstBetween(mixedHere, mixedThere) <= 1.0 / 1023, qPrintable(QString::number(worstBetween(mixedHere, mixedThere))));
+            QVERIFY2(ofx::renderGenerator(gen, 3, 64, 36, 1.0, generatedThere, &err), err.c_str());
+            QCOMPARE(took("the generator"), QString());
+            QVERIFY2(worstBetween(generatedHere, generatedThere) <= 1.0 / 1023, qPrintable(QString::number(worstBetween(generatedHere, generatedThere))));
+            for (int n = 0; n < 100; ++n) {
+                there = numbered(n);
+                QVERIFY2(ofx::applyEffect(fx, n, there, 1.0, {}, &err), err.c_str());
+                QCOMPARE(took(QString("picture %1").arg(n)), QString());
+                const double worst = worstBetween(here[size_t(n)], there);
+                QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("picture %1 is off by %2 (stale or torn)").arg(n).arg(worst)));
+            }
+            qInfo("%s", ofx::remote::pictureStats().last.c_str());
+#ifdef __linux__
+            // A host killed while it renders: the plug-in asks Montage for the frame before, and the answer kills it.
+            Effect slow = ofx::makeEffect(p, temporal);
+            Image wanted = numbered(7);
+            host(plugins::Isolation::InProcess);
+            QVERIFY2(ofx::applyEffect(slow, 7, wanted, 1.0, [&](double, Image& out) { return out = numbered(6), true; }, &err), err.c_str());
+            host(plugins::Isolation::PerPlugin);
+            ofx::remote::resetPictureStats();
+            const long askedBefore = ofx::remote::pictureStats().asked;
+            bool killed = false;
+            const ofx::FrameFetch killing = [&](double, Image& out) {
+                if (!killed)
+                    for (const plugins::HostInfo& running : plugins::runningHosts())
+                        if (running.key.find("temporal") != std::string::npos && running.pid > 0) killed = ::kill(pid_t(running.pid), SIGKILL) == 0;
+                out = numbered(6);
+                return true;
+            };
+            there = numbered(7);
+            const bool came = ofx::applyEffect(slow, 7, there, 1.0, killing, &err);
+            QVERIFY(killed);
+            const ofx::remote::PictureStats after = ofx::remote::pictureStats();
+            if (after.asked > askedBefore) {
+                // (a handle was asked of the host that was killed: the picture is made again, through shared memory)
+                QVERIFY2(came, err.c_str());
+                QVERIFY2(worstBetween(wanted, there) <= 1.0 / 1023, qPrintable(QString::number(worstBetween(wanted, there))));
+                QCOMPARE(after.handles, 0L);
+                QCOMPARE(after.sharedMemory, 1L);
+                QVERIFY2(QString::fromStdString(after.last).contains("its plug-in host ended while the picture was shared as a handle"), after.last.c_str());
+                // (and none is asked for after)
+                there = numbered(8);
+                QVERIFY2(ofx::applyEffect(slow, 8, there, 1.0, [&](double, Image& out) { return out = numbered(7), true; }, &err), err.c_str());
+                QCOMPARE(ofx::remote::pictureStats().asked, after.asked);
+                QVERIFY(QString::fromStdString(ofx::remote::pictureStats().last).contains("ended while the picture was shared as a handle"));
+            } else {
+                // (no handle was asked for here: a host that ends takes its picture with it, as ever, and says so)
+                QVERIFY(!expected);
+                QVERIFY(!came && !err.empty());
+            }
+            plugins::clearHostFailures();
+#endif
+        }
     }
 
     void gpuFallback() {

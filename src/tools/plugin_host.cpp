@@ -193,6 +193,9 @@ void noteLoading(const std::string& id, bool loading) {
     h->loading[0] = '\0';
     std::memcpy(h->loading + 1, id.data() + 1, n - 1);
     h->loading[n] = '\0';
+    // (the whole id's length and hash: one longer than the field is told from every other by them)
+    h->loadingBytes = uint32_t(id.size());
+    h->loadingHash = wire::idHash(id.data(), id.size());
     std::atomic_thread_fence(std::memory_order_release);
     h->loading[0] = id[0];
 }
@@ -593,6 +596,19 @@ struct OfxChannel {
     float* at(size_t offsetBytes) const { return reinterpret_cast<float*>(static_cast<char*>(arena->data()) + offsetBytes); }
 };
 
+// What Montage is told of a picture shared as a DMA-BUF.
+void describeHandle(const ofx::gl::DmaBuf& buf, int w, int h, wire::PictureHandle& handle) {
+    handle = wire::PictureHandle{};
+    handle.kind = 1;
+    handle.fourcc = buf.fourcc;
+    handle.stride = buf.stride;
+    handle.offset = buf.offset;
+    handle.modifier = buf.modifier;
+    handle.width = w;
+    handle.height = h;
+    handle.fence = buf.fence >= 0 ? 1 : 0;
+}
+
 // A clip effect's picture drawn into a texture and shared with Montage from the GPU's memory, as a DMA-BUF whose
 // descriptors go to Montage's socket `post` (render/OfxGl.h, render/OfxRemote.h). False where it cannot be: `why`
 // says why, and the picture is rendered as usual and goes through shared memory; or, `failed`, the plug-in failed
@@ -630,17 +646,83 @@ bool renderToHandle(const Effect& e, double t, const Image& in, double scale, co
         ofx::gl::destroyTexture(from);
         ofx::gl::destroyTexture(to);
     });
-    if (shared) {
-        handle = wire::PictureHandle{};
-        handle.kind = 1;
-        handle.fourcc = buf.fourcc;
-        handle.stride = buf.stride;
-        handle.offset = buf.offset;
-        handle.modifier = buf.modifier;
-        handle.width = w;
-        handle.height = h;
-        handle.fence = buf.fence >= 0 ? 1 : 0;
+    if (shared) describeHandle(buf, w, h, handle);
+    ofx::gl::closeDmaBuf(buf);
+    return shared;
+}
+
+// A transition's picture likewise, drawn from its two sides' textures where the plug-in renders with OpenGL.
+bool transitionToHandle(const Effect& e, double t, double progress, const Image& a, const Image& b, int w, int h, double scale, const ColorSpace* space,
+                        const std::string& post, wire::PictureHandle& handle, std::string& why, bool& failed, std::string& error) {
+    failed = false;
+    if (post.empty()) {
+        why = "Montage named no socket for the picture's descriptors";
+        return false;
     }
+    if (!ofx::gl::exportsDmaBuf(&why) || !ofx::rendersTextures(e, &why, true)) return false;
+    unsigned from = 0, to = 0, out = 0;
+    const Image clear(w, h);  // (a side with no picture: transparent)
+    ofx::gl::run([&] {
+        from = ofx::gl::makeTexture(w, h);
+        to = ofx::gl::makeTexture(w, h);
+        out = ofx::gl::makeTexture(w, h, true);
+        if (from) ofx::gl::writeTexture(from, a.empty() ? clear : a);
+        if (to) ofx::gl::writeTexture(to, b.empty() ? clear : b);
+    });
+    ofx::gl::DmaBuf buf;
+    bool shared = false;
+    if (!from || !to || !out) {
+        why = "no texture could be made for the picture";
+    } else if (!ofx::applyTransitionTexture(e, t, progress, ofx::GlPicture{from, w, h}, ofx::GlPicture{to, w, h}, ofx::GlPicture{out, w, h}, scale,
+                                            &error, space)) {
+        failed = true;
+    } else {
+        ofx::gl::run([&] { shared = ofx::gl::exportDmaBuf(out, w, h, buf, &why); });
+        if (shared && !ofx::gl::sendDmaBuf(post, buf)) {
+            shared = false;
+            why = "the picture's descriptors could not be sent to Montage";
+        }
+    }
+    ofx::gl::run([&] {
+        ofx::gl::destroyTexture(from);
+        ofx::gl::destroyTexture(to);
+        ofx::gl::destroyTexture(out);
+    });
+    if (shared) describeHandle(buf, w, h, handle);
+    ofx::gl::closeDmaBuf(buf);
+    return shared;
+}
+
+// A picture made as usual (a generator's, an effect's through a mask of its own, a transition's or an effect's whose
+// plug-in does not draw into textures) put into a texture here and shared from the GPU's memory in the same way, so
+// that Montage takes it as a texture and not through shared memory.
+bool pictureToHandle(const Image& picture, const std::string& post, wire::PictureHandle& handle, std::string& why) {
+    if (post.empty()) {
+        why = "Montage named no socket for the picture's descriptors";
+        return false;
+    }
+    if (picture.empty()) {
+        why = "there is no picture to share";
+        return false;
+    }
+    if (!ofx::gl::exportsDmaBuf(&why)) return false;
+    const int w = picture.width, h = picture.height;
+    unsigned texture = 0;
+    ofx::gl::DmaBuf buf;
+    bool shared = false;
+    ofx::gl::run([&] {
+        texture = ofx::gl::makeTexture(w, h, true);
+        if (!texture) return;
+        ofx::gl::writeTexture(texture, picture);
+        shared = ofx::gl::exportDmaBuf(texture, w, h, buf, &why);
+    });
+    if (!texture) why = "no texture could be made for the picture";
+    if (shared && !ofx::gl::sendDmaBuf(post, buf)) {
+        shared = false;
+        why = "the picture's descriptors could not be sent to Montage";
+    }
+    ofx::gl::run([&] { ofx::gl::destroyTexture(texture); });
+    if (shared) describeHandle(buf, w, h, handle);
     ofx::gl::closeDmaBuf(buf);
     return shared;
 }
@@ -875,16 +957,26 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
                 bool failed = false;
                 if ((flags & wire::kWantsHandle) && !(flags & wire::kHasMask))
                     handled = renderToHandle(e, t, out, scale, fetch, space, post, handle, noHandle, failed, error);
-                else if (flags & wire::kWantsHandle) noHandle = "an effect with a mask of its own is not shared as a handle";
-                // (one whose OpenGL render failed renders as ever, through shared memory, and that is why)
+                // (one whose OpenGL render failed renders as ever, and that is why its picture was not drawn there)
                 if (failed) noHandle = "its OpenGL render failed: " + error;
                 ok = handled || ofx::applyEffect(e, t, out, scale, fetch, &error, space);
             } else if (kind == 1) {
                 const Image from = (empties & 1) ? Image() : picture(0);
                 const Image to = (empties & 2) ? Image() : picture(1);
-                ok = ofx::applyTransition(e, t, progress, from, to, out, scale, &error, space);
+                bool failed = false;
+                if (flags & wire::kWantsHandle)
+                    handled = transitionToHandle(e, t, progress, from, to, w, hh, scale, space, post, handle, noHandle, failed, error);
+                if (failed) noHandle = "its OpenGL render failed: " + error;
+                ok = handled || ofx::applyTransition(e, t, progress, from, to, out, scale, &error, space);
             } else {
                 ok = ofx::renderGenerator(e, t, w, hh, scale, out, &error, space);
+            }
+            // A picture not drawn into a texture (a generator's, one through a mask of the effect's own, one whose
+            // plug-in renders without OpenGL) is put into one and shared all the same, where Montage asks.
+            if (ok && !handled && (flags & wire::kWantsHandle)) {
+                std::string cannot;
+                handled = pictureToHandle(out, post, handle, cannot);
+                if (!handled && noHandle.empty()) noHandle = cannot;
             }
             // The picture back, after the inputs (and the mask).
             if (ok && !handled) {

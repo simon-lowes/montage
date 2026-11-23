@@ -202,7 +202,7 @@ void notePicture(const PluginDesc& d, bool handle, const std::string& why) {
 }
 
 // Whether the host is asked for a handle; why not, otherwise.
-bool asksForHandle(Kind kind, bool withMask, const Host& host, std::string& why) {
+bool asksForHandle(const Host& host, std::string& why) {
     auto no = [&](const std::string& reason) {
         why = reason;
         return false;
@@ -214,7 +214,6 @@ bool asksForHandle(Kind kind, bool withMask, const Host& host, std::string& why)
         std::lock_guard lock(gPicturesM);
         if (!gHandlesOff.empty()) return no(gHandlesOff);
     }
-    if (kind != Kind::Effect || withMask) return no("only a clip effect's picture, without a mask of its own, is shared as a handle");
     if (!host.gpu) return no("its plug-in host renders without OpenGL");
     if (gl::servingOpenGl()) return no("OpenGL is busy with the render this picture is for");
     std::string cannot;
@@ -345,7 +344,7 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
     // The picture back as a handle to the GPU's memory where that is asked for and both sides can; through the shared
     // block otherwise, and `viaMemory` says why.
     std::string viaMemory;
-    bool asked = asksForHandle(kind, withMask, *link->host, viaMemory);
+    bool asked = asksForHandle(*link->host, viaMemory);
     if (asked && link->post < 0) {
         link->postName = ipc::uniqueName("h");
         link->post = gl::openDmaBufPost(link->postName, &viaMemory);
@@ -357,7 +356,11 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
         if (fetch && *fetch) flags |= wire::kHasFetch;
         if (inputs) flags |= wire::kHasInputs;
         if (withMask) flags |= wire::kHasMask;
-        if (asked) flags |= wire::kWantsHandle;
+        if (asked) {
+            flags |= wire::kWantsHandle;
+            std::lock_guard lock(gPicturesM);
+            ++gPictures.asked;
+        }
         hd->flags = flags;
         hd->resultFlags = 0;
         hd->argI = int64_t(kind);
@@ -441,6 +444,18 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
     }
     // It crashed or did not answer: bypassed this time, named, and started again for the next render (a few times).
     const std::string how = hostFailed(*link->host, d, bypassKey(e, d), r, timeout);
+    if (asked) {
+        // A host that ended while its picture was to come as a handle: no handle is asked for from now on, and this
+        // picture is rendered again in a new host, through shared memory (once: nothing is asked of that one).
+        const std::string why = "its plug-in host ended while the picture was shared as a handle (" + d.label + " " + how + ")";
+        {
+            std::lock_guard lock(gPicturesM);
+            gHandlesOff = why;
+        }
+        if (logsPictures()) std::fprintf(stderr, "montage gpu: %s: pictures come through shared memory from now on\n", why.c_str());
+        link.reset();
+        return renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
+    }
     if (error) *error = d.label + " " + how;
     return false;
 }

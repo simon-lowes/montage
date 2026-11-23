@@ -286,10 +286,12 @@ jobs:
         run: sudo scripts/nmos-check.sh build/src/montage-cli "$RUNNER_TEMP/nmos"
 
   # The GPU compositor needs Qt 6.6 or later (Ubuntu 24.04 has 6.4), so this job builds the render tests against Qt
-  # 6.8 and runs the GPU ones on Mesa's software drivers: llvmpipe through OpenGL and lavapipe through Vulkan.
+  # 6.8 and runs the GPU ones on Mesa's software drivers: llvmpipe through OpenGL and lavapipe through Vulkan. It then
+  # runs the plug-in hosts' shared pictures (DMA-BUFs) inside a virtual machine, as the runner's own kernel has no
+  # udmabuf for Mesa's software renderers to export through (scripts/kvm-guest.sh).
   gpu:
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 90  # (the render tests' build and runs took about 60; the guest comes after)
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -322,7 +324,7 @@ jobs:
           MONTAGE_GPU_LOG: "1"
         run: |
           # Every GPU test must run on both: a skip (no device, no shader compiler) fails the step.
-          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuDepthAndObjectMasks gpuYcbcrPlanes gpuHardwareFrames gpuHardwareFramesImportedOnce gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl ofxSharedTextures gpuOfxTextures"
+          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuDepthAndObjectMasks gpuYcbcrPlanes gpuHardwareFrames gpuHardwareFramesImportedOnce gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl ofxSharedTextures gpuOfxTextures gpuTextureBudget gpuMasksAndStepsFromThePicture openFxHandlesForEveryKindAndAfterAHostEnds"
           for backend in opengl vulkan; do
             echo "::group::$backend"
             MONTAGE_GPU=$backend xvfb-run -a build/tests/test_render $tests -o "$RUNNER_TEMP/$backend.txt,txt" -o -,txt || failed=1
@@ -333,6 +335,22 @@ jobs:
             fi
           done
           exit "${failed:-0}"
+      # Plug-in pictures shared from the GPU's memory between a plug-in host and Montage, run to the end: in a guest
+      # whose kernel has udmabuf (QEMU and the kernel from Ubuntu's packages; KVM where the runner allows it), on
+      # llvmpipe through EGL under Xvfb. There a picture that does not come as a handle fails the test
+      # (MONTAGE_EXPECT_HANDLES).
+      - name: QEMU and a kernel with udmabuf (Ubuntu's packages)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 linux-image-virtual > /dev/null
+          ver=$(ls /lib/modules | grep -- '-generic$' | sort -V | tail -n 1)
+          sudo apt-get install -y -q --no-install-recommends "linux-modules-extra-$ver" > /dev/null
+      - name: Plug-in pictures as DMA-BUFs, in the guest
+        timeout-minutes: 30
+        run: |
+          scripts/kvm-guest.sh "$RUNNER_TEMP/guest" env QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=xcb_egl MONTAGE_GPU_HANDLES=1 \
+            MONTAGE_EXPECT_HANDLES=1 MONTAGE_GPU_LOG=1 QTEST_FUNCTION_TIMEOUT=900000 \
+            xvfb-run -a build/tests/test_render openFxHandlesForEveryKindAndAfterAHostEnds
 
   # HDR viewing on Linux: the viewer under Weston (headless, GL on llvmpipe, Wayland's colour management) built from
   # source, as Ubuntu 24.04's Weston and wayland-protocols are too old for color-management-v1; Qt 6.8 for its RHI.

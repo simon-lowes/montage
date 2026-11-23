@@ -25,11 +25,16 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
 
 // How pictures came back from plug-in hosts. A host can give its plug-in's picture as a handle to the GPU's memory (a
 // Linux DMA-BUF with a fence, read here from the imported texture) instead of copying it through shared memory: asked
-// for with MONTAGE_GPU_HANDLES=1 in the environment, for a clip effect that renders with OpenGL in a host started for
-// GPU rendering, where both sides' OpenGL is EGL's with the extensions for it. Everything else, and every picture
-// while it is not asked for, comes through shared memory. MONTAGE_GPU_LOG=1 says which each picture took, and why.
+// for with MONTAGE_GPU_HANDLES=1 in the environment, of a host started for GPU rendering, where both sides' OpenGL is
+// EGL's with the extensions for it. A clip effect and a transition whose plug-in renders with OpenGL are drawn into
+// the texture shared; a generator's picture, an effect's through a mask of its own and any other made in the host's
+// memory are put into a texture there and shared likewise. Every picture while handles are not asked for, or where a
+// side cannot share, comes through shared memory; so does every later one once a handle could not be taken or a host
+// ended while its picture was to come as one (that picture is rendered again, through shared memory).
+// MONTAGE_GPU_LOG=1 says which each picture took, and why.
 struct PictureStats {
     long handles = 0, sharedMemory = 0;
+    long asked = 0;    // renders a handle was asked for (one that came back through shared memory is counted in both)
     std::string last;  // the last picture's, as MONTAGE_GPU_LOG says it ("... through shared memory: <why>")
 };
 PictureStats pictureStats();
