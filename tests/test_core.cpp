@@ -1987,10 +1987,14 @@ private slots:
         QVERIFY(events[2].key == nrpn && events[2].value == (11 << 7 | 21));
         QVERIFY(events[3].key == (Key{Kind::Rpn, 1, 0}) && events[3].value == 2);
         QVERIFY(events[4].key == (Key{Kind::Cc, 1, 6}) && events[4].value == 9);
-        // Chosen again and moved by its fine half alone: near where it was, not near zero.
+        // Chosen again and moved by its fine half alone: held in case its coarse half follows, then (flush: a pair's
+        // time has passed) near where it was, not near zero.
         events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 22});
+        QVERIFY(events.empty() && decoder.holding());
+        decoder.flush([&](const Event& e) { events.push_back(e); });
         QCOMPARE(events.size(), size_t(1));
         QVERIFY(events[0].key == nrpn && events[0].value == (11 << 7 | 22));
+        QVERIFY(!decoder.holding());
 
         // ---- Names, as maps are saved.
         QCOMPARE(keyName(nrpn), std::string("nrpn:2:388"));
@@ -2360,10 +2364,104 @@ private slots:
         QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
         QVERIFY(events[1].key == nrpn && events[1].value == (11 << 7 | 30));
         QVERIFY(events[2].key == nrpn && events[2].value == (12 << 7 | 40));
-        // (then a fine half alone, twice: the second goes out with the coarse half it has)
+        // (then a fine half alone, twice: each goes out with the coarse half it has, the first when the second
+        // comes, the second once a pair's time has passed)
+        auto rest = [&] {
+            std::vector<Event> held;
+            decoder.flush([&](const Event& e) { held.push_back(e); });
+            return held;
+        };
         events = decode({0xB1, 38, 41, 0xB1, 38, 42});
         QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (12 << 7 | 41));
+        events = rest();
+        QCOMPARE(events.size(), size_t(1));
         QVERIFY(events[0].key == nrpn && events[0].value == (12 << 7 | 42));
+        // Nightly 23 Nov: nothing is learnt about a controller's order, so nothing can be learnt wrong for good.
+        // A controller that sends the coarse half first, the parameter chosen once, its first message a fine half
+        // alone (no telling where the control is yet: nothing is sent): the pairs after it each come once, whole,
+        // and nothing is left held.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 5});
+        QVERIFY(events.empty() && decoder.holding());
+        QVERIFY(rest().empty() && !decoder.holding());
+        events = decode({0xB1, 6, 10, 0xB1, 38, 20, 0xB1, 6, 11, 0xB1, 38, 21});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
+        QVERIFY(events[1].value == (11 << 7 | 21));
+        QVERIFY(!decoder.holding());
+        // (the same with no pause after the lone half, which no order of messages can tell from pairs sent fine
+        // half first: the last half is held, and sent once a pair's time has passed, so the control ends where it is)
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 5, 0xB1, 6, 10, 0xB1, 38, 20, 0xB1, 6, 11, 0xB1, 38, 21});
+        QVERIFY(decoder.holding());
+        events = rest();
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].value == (11 << 7 | 21));
+        // A controller that sends the fine half first, the parameter chosen once: two fine halves alone, each sent
+        // with the coarse half it has; the pairs after them still come once each, whole (not the fine half with the
+        // coarse half before it, the coarse halves lost), and a last fine half alone is sent too.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 20, 0xB1, 6, 10});
+        QCOMPARE(events.size(), size_t(1));
+        for (int fine : {21, 22}) {
+            QVERIFY(decode({0xB1, 38, uint8_t(fine)}).empty());
+            events = rest();
+            QCOMPARE(events.size(), size_t(1));
+            QCOMPARE(events[0].value, 10 << 7 | fine);
+        }
+        events = decode({0xB1, 38, 30, 0xB1, 6, 11, 0xB1, 38, 40, 0xB1, 6, 12});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].value == (11 << 7 | 30) && events[1].value == (12 << 7 | 40));
+        QVERIFY(!decoder.holding());
+        QVERIFY(decode({0xB1, 38, 41}).empty());
+        events = rest();
+        QVERIFY(events.size() == 1 && events[0].value == (12 << 7 | 41) && !decoder.holding());
+        // Given when each message arrived, a lone half is told from a pair by the time between them, with no pause
+        // for the caller's flush: a controller that sends the coarse half first, its first message a fine half alone,
+        // then pairs 20 ms apart, each pair's halves 0.5 ms apart: every value once, whole, its own two halves.
+        auto timed = [&](const std::vector<std::pair<std::vector<uint8_t>, int64_t>>& messages) {
+            std::vector<Event> out;
+            for (const auto& [bytes, at] : messages) decoder.feed(MidiMessage(bytes), [&](const Event& e) { out.push_back(e); }, at);
+            return out;
+        };
+        {
+            const Decoder saved = decoder;
+            decoder.reset();
+            events = timed({{{0xB1, 99, 3}, 0}, {{0xB1, 98, 4}, 100}, {{0xB1, 38, 5}, 200}, {{0xB1, 6, 10}, 20000}, {{0xB1, 38, 20}, 20500},
+                            {{0xB1, 6, 11}, 40000}, {{0xB1, 38, 21}, 40500}, {{0xB1, 6, 12}, 60000}, {{0xB1, 38, 22}, 60500}});
+            QCOMPARE(events.size(), size_t(3));
+            QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
+            QVERIFY(events[1].value == (11 << 7 | 21) && events[2].value == (12 << 7 | 22));
+            // A controller that sends the fine half first: two fine halves alone, 20 ms apart, then pairs again. Each
+            // lone half goes out with the coarse half the parameter has once the next half shows it came alone (the
+            // last held until a pair's time has passed), and the pairs after them are whole.
+            decoder.reset();
+            events = timed({{{0xB1, 99, 3}, 0}, {{0xB1, 98, 4}, 100}, {{0xB1, 38, 20}, 200}, {{0xB1, 6, 10}, 600}, {{0xB1, 38, 21}, 20000},
+                            {{0xB1, 38, 22}, 40000}, {{0xB1, 38, 30}, 60000}, {{0xB1, 6, 11}, 60500}, {{0xB1, 38, 40}, 80000},
+                            {{0xB1, 6, 12}, 80500}});
+            QCOMPARE(events.size(), size_t(5));
+            QCOMPARE(events[0].value, 10 << 7 | 20);
+            QCOMPARE(events[1].value, 10 << 7 | 21);
+            QCOMPARE(events[2].value, 10 << 7 | 22);
+            QCOMPARE(events[3].value, 11 << 7 | 30);
+            QCOMPARE(events[4].value, 12 << 7 | 40);
+            QVERIFY(!decoder.holding());
+            // (a lone coarse half, 20 ms before a pair: 13 with a fine half of 0, then the pair)
+            events = timed({{{0xB1, 6, 13}, 100000}, {{0xB1, 6, 14}, 120000}, {{0xB1, 38, 1}, 120500}});
+            QCOMPARE(events.size(), size_t(2));
+            QVERIFY(events[0].value == (13 << 7) && events[1].value == (14 << 7 | 1));
+            decoder = saved;
+        }
+        // A coarse half alone, from a parameter that sends fine halves: its fine half is 0 (MIDI 1.0).
+        QVERIFY(decode({0xB1, 6, 13}).empty());
+        events = rest();
+        QVERIFY(events.size() == 1 && events[0].value == (13 << 7) && events[0].resolution == 16384);
+        // A half held when another parameter is chosen goes out for its own parameter.
+        events = decode({0xB1, 38, 7, 0xB1, 99, 3, 0xB1, 98, 9, 0xB1, 6, 1});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].key == nrpn && events[0].value == (13 << 7 | 7));
+        QVERIFY(events[1].key == (Key{Kind::Nrpn, 1, 3 << 7 | 9}) && events[1].value == 1 && events[1].resolution == 128);
 
         // ---- One fader, three targets, each in its own range.
         {

@@ -119,10 +119,35 @@ void Decoder::reset() {
     for (Channel& c : ch_) c = Channel();
     fine_.clear();
     coarse_.clear();
-    lsbFirst_.clear();
 }
 
-void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>& out) {
+bool Decoder::holding() const {
+    return std::any_of(std::begin(ch_), std::end(ch_), [](const Channel& c) { return c.held >= 0; });
+}
+
+void Decoder::flush(const std::function<void(const Event&)>& out) {
+    for (int ch = 0; ch < 16; ++ch) release(ch, out);
+}
+
+// The half a channel holds, as one that came alone: a fine half with the coarse half its parameter last had (none yet:
+// not sent, there being no telling where the control is); a coarse half with a fine half of 0, as a coarse half alone
+// means (MIDI 1.0), for a parameter that sends fine halves (one that does not has had its value already).
+void Decoder::release(int ch, const std::function<void(const Event&)>& out) {
+    Channel& c = ch_[ch];
+    if (c.held < 0) return;
+    const int held = c.held;
+    c.held = -1;
+    const int param = (c.paramMsb << 7) | c.paramLsb;
+    const Key key{c.rpn ? Kind::Rpn : Kind::Nrpn, ch, param};
+    const auto id = std::make_tuple(ch, c.rpn, param);
+    if (c.heldFine) {
+        if (const auto it = coarse_.find(id); it != coarse_.end()) out({key, (it->second << 7) | held, 16384});
+    } else if (fine_.count(id)) {
+        out({key, held << 7, 16384});
+    }
+}
+
+void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>& out, int64_t atUs) {
     if (m.size() < 2 || m[0] < 0x80 || m[0] >= 0xF0) return;
     const int status = m[0] & 0xF0, ch = m[0] & 0x0F;
     const int d1 = m[1] & 0x7F, d2 = m.size() > 2 ? m[2] & 0x7F : 0;
@@ -147,21 +172,11 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
     if (m.size() < 3) return;
     Channel& c = ch_[ch];
     const int n = d1, v = d2;
-    // Choosing a parameter: a fine half still held for a coarse half that never came (a controller that sends the
-    // fine half first moved by its fine half alone) goes out with the coarse half the parameter last had.
-    auto chosenAgain = [&] {
-        if (c.heldLsb >= 0) {
-            const int param = (c.paramMsb << 7) | c.paramLsb;
-            const auto it = coarse_.find(std::make_tuple(ch, c.rpn, param));
-            out({{c.rpn ? Kind::Rpn : Kind::Nrpn, ch, param}, ((it != coarse_.end() ? it->second : 0) << 7) | c.heldLsb, 16384});
-        }
-        c.heldLsb = -1;
-    };
     switch (n) {
-        case 99: chosenAgain(); c.paramMsb = v; c.rpn = false; return;
-        case 98: chosenAgain(); c.paramLsb = v; c.rpn = false; return;
-        case 101: chosenAgain(); c.paramMsb = v; c.rpn = true; return;
-        case 100: chosenAgain(); c.paramLsb = v; c.rpn = true; return;
+        case 99: release(ch, out); c.paramMsb = v; c.rpn = false; return;
+        case 98: release(ch, out); c.paramLsb = v; c.rpn = false; return;
+        case 101: release(ch, out); c.paramMsb = v; c.rpn = true; return;
+        case 100: release(ch, out); c.paramLsb = v; c.rpn = true; return;
         default: break;
     }
     const bool chosen = !(c.paramMsb == 127 && c.paramLsb == 127);
@@ -169,37 +184,36 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
         const int param = (c.paramMsb << 7) | c.paramLsb;
         const Key key{c.rpn ? Kind::Rpn : Kind::Nrpn, ch, param};
         const auto id = std::make_tuple(ch, c.rpn, param);
-        if (n == 6) {
-            coarse_[id] = v;
-            if (c.heldLsb >= 0) {
-                // The fine half came first (some controllers send them in that order, with the parameter chosen
-                // before each pair or only once): the value is whole now, and the parameter is known to send them so.
-                lsbFirst_.insert(id);
-                out({key, (v << 7) | c.heldLsb, 16384});
-                c.heldLsb = -1;
-            } else if (!fine_.count(id)) {
-                out({key, v, 128});  // a parameter that sends only the coarse half
-            }
-        } else if (n == 38) {
-            fine_.insert(id);
-            if (c.heldLsb >= 0) {
-                // A second fine half with no coarse half between: a fine half alone after all (the one held is
-                // overtaken), with the coarse half the parameter has, 0 when none has come.
-                lsbFirst_.erase(id);
-                c.heldLsb = -1;
-                coarse_.try_emplace(id, 0);
-            } else if (lsbFirst_.count(id) || !coarse_.count(id)) {
-                // From a parameter that sends the fine half first, or one whose coarse half has not come yet: held
-                // for its coarse half (sent with the old one, the value would step back before it steps on; with
-                // none, it would jump to near 0).
-                c.heldLsb = v;
+        if (n == 6 || n == 38) {
+            // A half is held for the other half to follow it, whichever a controller sends first (nothing is learnt
+            // about the order, which a run of halves alone cannot tell from a run of pairs): the value goes out
+            // whole when the other half arrives. The same half again means the one held came alone, and it goes out
+            // as that; so does one still held when the caller's time for a pair has passed (flush).
+            const bool fineHalf = n == 38;
+            // (the half held came alone when this one is too late to be its other half: nightly 23 Nov, a lone half
+            // first otherwise paired each value with a half of the one before, for as long as the halves kept coming)
+            if (c.held >= 0 && atUs >= 0 && c.heldAt >= 0 && atUs - c.heldAt > kPairUs) release(ch, out);
+            if (c.held >= 0 && c.heldFine != fineHalf) {
+                const int coarse = fineHalf ? c.held : v, fine = fineHalf ? v : c.held;
+                c.held = -1;
+                fine_.insert(id);
+                coarse_[id] = coarse;
+                out({key, (coarse << 7) | fine, 16384});
                 return;
             }
-            // (a fine half alone, as a parameter that sends the coarse half first does when only it changed: with the
-            // coarse half it last had)
-            out({key, (coarse_[id] << 7) | v, 16384});
+            release(ch, out);
+            if (fineHalf) {
+                fine_.insert(id);
+            } else {
+                coarse_[id] = v;
+                if (!fine_.count(id)) out({key, v, 128});  // a parameter that (so far) sends only the coarse half
+            }
+            c.held = v;
+            c.heldFine = fineHalf;
+            c.heldAt = atUs;
         } else {
             // Data increment (96) and decrement (97): a step each, their value not read (RP-018).
+            release(ch, out);
             Event e{key, 0, fine_.count(id) ? 16384 : 128};
             e.steps = n == 96 ? 1 : -1;
             out(e);
