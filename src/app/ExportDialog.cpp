@@ -430,6 +430,13 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
                               "Uses Analyse HDR Light Levels' measurements while the cut still matches them, else measures first."));
     hdr10Plus_->setChecked(appSettings().value("export/hdr10Plus", false).toBool());
     form->addRow(QString(), hdr10Plus_);
+    filmGrain_ = new QCheckBox(tr("Carry grain as parameters (AV1)"), form_);
+    filmGrain_->setObjectName(QStringLiteral("exportFilmGrain"));
+    filmGrain_->setToolTip(tr("Each shot's grain measured, as Measure Grain measures it, and taken out of the picture before it is encoded, "
+                              "then written beside it as AV1 film grain parameters, which the player's decoder puts back: the bits go "
+                              "to the picture instead of the grain"));
+    filmGrain_->setChecked(appSettings().value("export/filmGrain", false).toBool());
+    form->addRow(QString(), filmGrain_);
     adaptiveHdr_ = new QCheckBox(tr("Adaptive HDR metadata (ST 2094-50, any display's headroom)"), form_);
     adaptiveHdr_->setObjectName(QStringLiteral("exportAdaptiveHdr"));
     adaptiveHdr_->setToolTip(tr("Each scene's reference white, headroom and the gain curve to its SDR rendition (the sequence's SDR trim, "
@@ -926,6 +933,8 @@ void ExportDialog::updateControls() {
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
     color_->setEnabled(video);
+    filmGrain_->setEnabled(video && (p->settings.videoCodec == "libsvtav1" || p->settings.videoCodec == "libaom-av1" || p->settings.videoCodec == "librav1e") &&
+                           (!rate_ || rate_->currentData().toString().isEmpty()) && !(credentials_ && credentials_->isChecked()));
     {
         // HDR10+ is HDR10's: PQ output only.
         const Sequence* sq = state_ ? state_->sequence() : nullptr;
@@ -1228,6 +1237,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/allCaptions", allCaptions_->isChecked());
     s.cea608 = cea608_->isEnabled() && cea608_->isChecked();
     settings.setValue("export/cea608", cea608_->isChecked());
+    s.filmGrain = filmGrain_->isEnabled() && filmGrain_->isChecked() ? "measure" : "";
+    settings.setValue("export/filmGrain", filmGrain_->isChecked());
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
     s.adaptiveHdr = adaptiveHdr_->isEnabled() && adaptiveHdr_->isChecked();

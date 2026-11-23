@@ -163,6 +163,7 @@
 #include "render/PaperEdit.h"
 #include "render/LutExport.h"
 #include "render/GrainMatch.h"
+#include "render/Av1GrainExport.h"
 #include "render/LutToGrade.h"
 #include "render/ProjectManager.h"
 #include "render/SurfaceTrack.h"
@@ -6986,6 +6987,7 @@ void McpServer::Impl::addTools() {
                 "description":"What to measure (default all; VMAF of HDR only where libvmaf has an HDR model)"},
             "min_psnr":{"type":"number","description":"Frames with luma PSNR under this (dB) are problems"},
             "min_vmaf":{"type":"number","description":"Frames with VMAF under this are problems"},
+            "vmaf_every":{"type":"integer","default":1,"description":"VMAF scored on every such frame only (4: about a quarter of the time), the frames between still feeding its motion; the other metrics are of every frame"},
             "max_delta_ictcp":{"type":"number","description":"Frames whose mean ΔE_ITP is over this are problems"}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -7009,6 +7011,10 @@ void McpServer::Impl::addTools() {
                 }
                 q.qualityLimits.minPsnr = std::max(0.0, a.value("min_psnr").toDouble(0));
                 q.qualityLimits.minVmaf = std::max(0.0, a.value("min_vmaf").toDouble(0));
+                if (a.contains("vmaf_every")) {
+                    q.compareVmafEvery = a.value("vmaf_every").toInt(0);
+                    if (q.compareVmafEvery < 1 || q.compareVmafEvery > 1000) throw ArgError{"\"vmaf_every\" must be between 1 and 1000"};
+                }
                 q.qualityLimits.maxDeltaItp = std::max(0.0, a.value("max_delta_ictcp").toDouble(0));
             }
             q.flashing = a.value("flashing").toBool(true);
@@ -7066,6 +7072,7 @@ void McpServer::Impl::addTools() {
                 if (!QFileInfo::exists(ref)) throw ArgError{"No file at \"reference\": " + ref};
                 CompareOptions o;
                 o.metrics = q.compareMetrics;
+                o.vmafEvery = q.compareVmafEvery;
                 comparison = compareEncodeFiles(ref.toStdString(), encode, o, [this](double f) { if (f >= 0) progress(0.5 + 0.5 * f, "Comparing"); });
                 if (!comparison.ok) return fail(QStringLiteral("The encode could not be compared: %1").arg(QString::fromStdString(comparison.error)));
                 for (const QualitySpan& sp : qualityOverLimits(comparison, q.qualityLimits))
@@ -7096,7 +7103,11 @@ void McpServer::Impl::addTools() {
                             .arg(num(comparison.mean.psnrY, 2), num(comparison.worst.psnrY, 2), num(comparison.mean.ssim, 5),
                                  num(comparison.worst.ssim, 5), num(comparison.mean.msSsim, 5), num(comparison.mean.deltaItp, 3),
                                  num(comparison.worst.deltaItp, 3));
-                if (comparison.vmafScored) text += QStringLiteral(", VMAF %1 (worst %2)").arg(num(comparison.mean.vmaf, 2), num(comparison.worst.vmaf, 2));
+                if (comparison.vmafScored && comparison.vmafEvery > 1)
+                    text += QStringLiteral(", VMAF %1 (worst %2; scored on one frame in %3)")
+                                .arg(num(comparison.mean.vmaf, 2), num(comparison.worst.vmaf, 2))
+                                .arg(comparison.vmafEvery);
+                else if (comparison.vmafScored) text += QStringLiteral(", VMAF %1 (worst %2)").arg(num(comparison.mean.vmaf, 2), num(comparison.worst.vmaf, 2));
                 else if (!comparison.vmafNote.empty()) text += QStringLiteral(" (%1)").arg(QString::fromStdString(comparison.vmafNote));
                 text += '\n';
                 if (!comparison.worstFrames.empty()) {
@@ -13559,6 +13570,7 @@ void McpServer::Impl::addTools() {
             "color_space":{"type":"string","description":"Deliver in this display space (rec709, srgb, rec2100pq, rec2100hlg...) instead of the sequence's; an HDR sequence delivered in SDR is tone mapped"},
             "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"An HDR sequence delivered in SDR: \"\" Montage's roll-off, or ITU-R BT.2446 Method A or C (a sequence graded scene-referred goes through its output transform instead)"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
+            "film_grain":{"type":"string","description":"AV1 exports: carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned: that grain for every shot; \"off\" (the default): none"},
             "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
@@ -13606,6 +13618,10 @@ void McpServer::Impl::addTools() {
                 "cut_aligned":{"type":"boolean","default":false,"description":"Segments end at the cut nearest each nominal end"},
                 "per_shot":{"type":"boolean","default":false,"description":"Rungs set per shot: each shot (from the cuts and shot changes) starts a segment, is tried at several CRFs on each rung and scored by VMAF, and gets the CRF that reaches vmaf_target for the fewest bits (or, with no target, that spends the rung's bitrate best); each rung's bitrate is then its cap. Writes ladder.csv"},
                 "vmaf_target":{"type":"number","minimum":0,"maximum":100,"description":"With per_shot: the VMAF each shot is to reach on each rung (default none: fill each rung's bitrate)"},
+                "display_width":{"type":"integer","description":"With per_shot: VMAF scored at this display size, every rung scaled to it (default: the largest rung's)"},
+                "display_height":{"type":"integer","description":"With display_width: its height (default: in proportion to the width)"},
+                "crf_floor":{"type":"number","minimum":1,"maximum":40,"description":"With per_shot: the lowest CRF (best quality) a shot may be given on H.264 and HEVC rungs, AV1's two more (default 18); ladder.csv says which shots stopped there"},
+                "trial_vmaf_every":{"type":"integer","minimum":1,"description":"With per_shot: the trials score VMAF on every such frame (default 4; what is delivered is scored on every frame)"},
                 "hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
                 "iframe_playlists":{"type":"boolean","default":true},
                 "cue":{"type":"string","enum":["splice_insert","time_signal"],"default":"splice_insert"},
@@ -13849,6 +13865,8 @@ void McpServer::Impl::addTools() {
             st.cea608 = a.value("cea608").toBool();
             st.cea708 = a.value("cea708").toBool(true);
             st.hdr10Plus = a.value("hdr10plus").toBool();
+            st.filmGrain = str(a, "film_grain", "").toStdString();
+            if (std::string e; !checkFilmGrainSetting(st.filmGrain, &e)) throw ArgError{QString::fromStdString(e)};
             st.adaptiveHdr = a.value("adaptive_hdr").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
@@ -13936,6 +13954,15 @@ void McpServer::Impl::addTools() {
                 ss.vmafTarget = so.value("vmaf_target").toDouble(0);
                 if (so.contains("vmaf_target") && !ss.perShot) throw ArgError{"\"vmaf_target\" is for per_shot"};
                 if (!(ss.vmafTarget >= 0 && ss.vmafTarget <= 100)) throw ArgError{"\"vmaf_target\" is 0 to 100"};
+                for (const char* k : {"display_width", "display_height", "crf_floor", "trial_vmaf_every"})
+                    if (so.contains(k) && !ss.perShot) throw ArgError{QStringLiteral("\"%1\" is for per_shot").arg(k)};
+                ss.displayWidth = so.value("display_width").toInt(0), ss.displayHeight = so.value("display_height").toInt(0);
+                if (ss.displayWidth < 0 || ss.displayWidth > 16384 || ss.displayHeight < 0 || ss.displayHeight > 16384 || (ss.displayHeight > 0 && ss.displayWidth == 0))
+                    throw ArgError{"\"display_width\" is 1 to 16384, and \"display_height\" goes with it"};
+                ss.crfFloor = so.value("crf_floor").toDouble(0);
+                if (so.contains("crf_floor") && !(ss.crfFloor >= 1 && ss.crfFloor <= 40)) throw ArgError{"\"crf_floor\" is 1 to 40"};
+                ss.trialVmafEvery = so.value("trial_vmaf_every").toInt(0);
+                if (so.contains("trial_vmaf_every") && (ss.trialVmafEvery < 1 || ss.trialVmafEvery > 1000)) throw ArgError{"\"trial_vmaf_every\" is 1 to 1000"};
                 ss.hls = so.value("hls").toBool(true), ss.dash = so.value("dash").toBool(true);
                 ss.iframePlaylists = so.value("iframe_playlists").toBool(true);
                 ss.cueCommand = str(so, "cue", "splice_insert").toStdString();
@@ -13983,7 +14010,8 @@ void McpServer::Impl::addTools() {
                         QJsonArray shots;
                         for (const StreamingShot& sh : rs.shots)
                             shots.append(QJsonObject{{"from", tc(sh.first + std::max<FrameTime>(0, ss.in), s)}, {"frames", double(sh.end - sh.first)},
-                                                     {"crf", sh.crf}, {"bitrate", double(sh.bitrate)}, {"vmaf", sh.vmaf}});
+                                                     {"crf", sh.crf}, {"bitrate", double(sh.bitrate)}, {"vmaf", sh.vmaf},
+                                                     {"stopped", QString::fromStdString(sh.stopped)}});
                         rungs.append(QJsonObject{{"rendition", QString::fromStdString(rs.rendition)}, {"bitrate", double(rs.bitrate)}, {"vmaf", rs.vmaf}, {"shots", shots}});
                         text += QStringLiteral("\n%1: %2 kb/s, VMAF %3 over %4 shots").arg(QString::fromStdString(rs.rendition)).arg(rs.bitrate / 1000).arg(rs.vmaf, 0, 'f', 1).arg(rs.shots.size());
                     }

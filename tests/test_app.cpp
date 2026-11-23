@@ -1008,6 +1008,21 @@ private slots:
         for (const char* box : {"qcFlashing", "qcLevels", "qcBlack", "qcFreeze", "qcSilence", "qcClipping", "qcPhase", "qcDcOffset", "qcSpelling", "qcSync"})
             compare.findChild<QCheckBox*>(box)->setChecked(false);
         compare.findChild<QLineEdit*>("qcCompareFile")->setText(QString::fromStdString(st.path));
+        // Quick VMAF scores every fourth frame, and an estimate of VMAF's time is shown before the check starts.
+        auto* quick = compare.findChild<QCheckBox*>("qcVmafQuick");
+        QVERIFY(quick);
+        if (vmafAvailable()) {
+            QVERIFY(quick->isEnabled());
+            QTRY_VERIFY_WITH_TIMEOUT(compare.findChild<QLabel*>("qcVmafEstimate")->text().startsWith("VMAF: about"), 20000);
+            quick->setChecked(true);
+            QCOMPARE(compare.settings().compareVmafEvery, 4);
+            QTRY_VERIFY_WITH_TIMEOUT(compare.findChild<QLabel*>("qcVmafEstimate")->text().startsWith("VMAF: about"), 20000);
+            quick->setChecked(false);
+            compare.findChild<QCheckBox*>("qcVmaf")->setChecked(false);
+            QVERIFY(!quick->isEnabled() && compare.findChild<QLabel*>("qcVmafEstimate")->text().isEmpty());
+            compare.findChild<QCheckBox*>("qcVmaf")->setChecked(true);
+        }
+        QCOMPARE(compare.settings().compareVmafEvery, 1);
         auto* preset = compare.findChild<QComboBox*>("qcQualityPreset");
         preset->setCurrentIndex(preset->findText("Broadcast", Qt::MatchStartsWith));
         QCOMPARE(compare.findChild<QDoubleSpinBox*>("qcMinPsnr")->value(), 38.0);
@@ -22644,6 +22659,54 @@ print("added " + ui["name"])
         // Not for SDR.
         state()->newProject();
         QVERIFY(!win_->analyseHdrLightLevels(false));
+    }
+
+    void av1GrainExportSetting() {
+        // The export dialog offers Carry grain as parameters for AV1 presets only, not with a frame rate change, and
+        // the export it sets up measures each shot's grain; the choice is kept for the next export.
+        loadDemo();
+        // (the dialog keeps the preset last used: put back as it was)
+        const QVariant lastPreset = appSettings().value("export/preset");
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        int av1 = -1, mp4 = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i) {
+            if (av1 < 0 && exportPresets()[i].settings.videoCodec == "libsvtav1") av1 = int(i);
+            if (mp4 < 0 && exportPresets()[i].settings.videoCodec == "libx264") mp4 = int(i);
+        }
+        QVERIFY(av1 >= 0 && mp4 >= 0);
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* grain = ed.findChild<QCheckBox*>("exportFilmGrain");
+            QVERIFY(preset && grain);
+            preset->setCurrentIndex(mp4);
+            QVERIFY(!grain->isEnabled());
+            preset->setCurrentIndex(av1);
+            QVERIFY(grain->isEnabled());
+            if (auto* rate = ed.findChild<QComboBox*>("exportRate"); rate && rate->count() > 1) {
+                rate->setCurrentIndex(1);
+                QVERIFY(!grain->isEnabled());
+                rate->setCurrentIndex(0);
+                QVERIFY(grain->isEnabled());
+            }
+            grain->setChecked(true);
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/grain.mp4");
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(queue->jobs().size(), jobs + 1);
+            const RenderQueue::Job& job = queue->jobs().back();
+            QCOMPARE(job.settings.filmGrain, std::string("measure"));
+            QCOMPARE(job.settings.videoCodec, std::string("libsvtav1"));
+            queue->remove(job.id);
+        }
+        {
+            ExportDialog again(state(), win_.get());
+            QVERIFY(again.findChild<QCheckBox*>("exportFilmGrain")->isChecked());
+        }
+        appSettings().remove("export/filmGrain");
+        if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
+        else appSettings().remove("export/preset");
     }
 
     void editingFromAnotherSequence() {

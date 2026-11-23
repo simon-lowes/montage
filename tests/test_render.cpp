@@ -30439,8 +30439,8 @@ colorspaces:
         // is measured and the picture cleaned; Montage's reading of the file's headers finds grain on every shown frame,
         // a seed that changes every frame and scaling points that change at the cut. Decoded by dav1d, the grain it puts
         // back measures as each shot's did (its strength in every stop measured within 15 %, the darkest within 25 %, its
-        // size within half a pixel); with dav1d's grain left off the picture is the clean one, well above the grainy one's PSNR. The file is
-        // smaller than one coding the grain as picture at the same setting (both sizes reported).
+        // size within half a pixel); with dav1d's grain left off the picture is the clean one, well above the grainy
+        // one's PSNR. The file is smaller than one coding the grain as picture at the same setting (both sizes reported).
         const char* encoder = avcodec_find_encoder_by_name("libsvtav1") ? "libsvtav1" : avcodec_find_encoder_by_name("libaom-av1") ? "libaom-av1" : nullptr;
         if (!encoder || !avcodec_find_decoder_by_name("libdav1d")) QSKIP("This FFmpeg has no AV1 encoder, or no dav1d");
         const ColorSpace& space = rec709Space();

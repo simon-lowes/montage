@@ -71,6 +71,10 @@ private:
     QDoubleSpinBox* maxDeltaItp_ = nullptr;
     QDoubleSpinBox* minVmaf_ = nullptr;
     QCheckBox* vmaf_ = nullptr;
+    QCheckBox* vmafQuick_ = nullptr;   // VMAF of every fourth frame only
+    QLabel* vmafEstimate_ = nullptr;   // about how long VMAF will take
+    int estimateAsked_ = 0;            // (the latest estimate asked for: earlier ones that come back later are dropped)
+    void updateVmafEstimate();
     QPushButton* report_ = nullptr;
     EncodeComparison comparison_;
     QTableWidget* table_;

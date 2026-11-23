@@ -75,6 +75,7 @@
 #include "core/ProjectIO.h"
 #include "core/ProjectMerge.h"
 #include "render/GrainMatch.h"
+#include "render/Av1Headers.h"
 #include "render/Expressions.h"
 #include "render/Particles.h"
 #include "core/Surround.h"
@@ -6466,6 +6467,77 @@ private slots:
         QVERIFY(call({{"compare", QString::fromStdString(st.path)}, {"metrics", QJsonArray{"butteraugli"}}}).value("isError").toBool());
         QVERIFY(call({{"compare", QString::fromStdString(path("missing.mp4"))}}).value("isError").toBool());
         if (!vmafAvailable()) QVERIFY(call({{"compare", QString::fromStdString(st.path)}, {"metrics", QJsonArray{"vmaf"}}}).value("isError").toBool());
+        // VMAF of every fourth frame only, said in the result; 0 frames apart is refused.
+        if (vmafAvailable()) {
+            r = call({{"compare", QString::fromStdString(st.path)}, {"metrics", QJsonArray{"vmaf"}}, {"vmaf_every", 4}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("VMAF") && text(r).contains("one frame in 4"), qPrintable(text(r)));
+            QVERIFY(call({{"compare", QString::fromStdString(st.path)}, {"vmaf_every", 0}}).value("isError").toBool());
+        }
+    }
+
+    // Phase 16 #6 over MCP: montage_render's film_grain carries a grain profile as AV1 film grain parameters on every
+    // shown frame; text that is not a profile, and a codec other than AV1, are refused.
+    void av1GrainOverMcp() {
+        if (!avcodec_find_encoder_by_name("libsvtav1")) QSKIP("This build of FFmpeg has no SVT-AV1");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 192, s.height = 108, s.fps = {25, 1};
+        Clip c = makeGeneratorClip(p, "color", 20);
+        c.generator.params["color.r"] = 0.5, c.generator.params["color.g"] = 0.45, c.generator.params["color.b"] = 0.4;
+        s.videoTracks[0].clips.push_back(c);
+        const QString project = QString::fromStdString(path("grain-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& extra) {
+            QJsonObject args{{"project", project}};
+            for (auto it = extra.begin(); it != extra.end(); ++it) args[it.key()] = it.value();
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QString out = QString::fromStdString(path("grain-mcp.mkv"));
+        QJsonObject r = call({{"output", out}, {"preset", "AV1 (SVT-AV1)"}, {"film_grain", "fine, please"}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("grain profile"), qPrintable(text(r)));
+        const QString profile = QString::fromStdString(grainProfileText(stockGrain(1)));
+        r = call({{"output", QString::fromStdString(path("grain-mcp.mp4"))}, {"preset", "H.264 - Fast Draft"}, {"film_grain", profile}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("AV1"), qPrintable(text(r)));
+        r = call({{"output", out}, {"preset", "AV1 (SVT-AV1)"}, {"film_grain", profile}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        // Montage's own reader finds the parameters applied on every shown frame, each with its own seed.
+        AVFormatContext* f = nullptr;
+        QVERIFY(avformat_open_input(&f, out.toUtf8().constData(), nullptr, nullptr) >= 0);
+        std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> held(f, [](AVFormatContext* x) { avformat_close_input(&x); });
+        QVERIFY(avformat_find_stream_info(f, nullptr) >= 0);
+        const int v = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        QVERIFY(v >= 0 && f->streams[v]->codecpar->codec_id == AV_CODEC_ID_AV1);
+        Av1HeaderReader reader;
+        std::string err;
+        const AVCodecParameters* par = f->streams[v]->codecpar;
+        QVERIFY2(par->extradata_size <= 0 || reader.configure(par->extradata, size_t(par->extradata_size), &err), err.c_str());
+        AVPacket* pkt = av_packet_alloc();
+        std::set<uint16_t> seeds;
+        int shown = 0, withGrain = 0;
+        while (av_read_frame(f, pkt) >= 0) {
+            if (pkt->stream_index == v) {
+                std::vector<Av1FrameHeader> frames;
+                QVERIFY2(reader.read(pkt->data, size_t(pkt->size), frames, &err), err.c_str());
+                for (const Av1FrameHeader& h : frames)
+                    if (h.shown()) {
+                        ++shown;
+                        if (h.grain.apply) ++withGrain, seeds.insert(h.grain.seed);
+                    }
+            }
+            av_packet_unref(pkt);
+        }
+        av_packet_free(&pkt);
+        QVERIFY(reader.sequence().filmGrainPresent);
+        QCOMPARE(shown, 20);
+        QCOMPARE(withGrain, 20);
+        QCOMPARE(int(seeds.size()), 20);
     }
 
     void dereverbSpeech() {
@@ -11049,13 +11121,18 @@ private slots:
         const QByteArray m3u = playlist.readAll();
         playlist.close();  // (on Windows a file held open keeps its folder from being moved aside by the next render)
         QVERIFY(m3u.contains("SCTE35-OUT=0xFC") && m3u.contains("SCTE35-IN=0xFC"));
-        // Set per shot (one shot here) to a VMAF target: each rung's shots and the ladder's report; a target without
-        // per_shot, or past 100, refused.
+        // Set per shot (one shot here) to a VMAF target at a display size and a CRF floor of the caller's: each rung's
+        // shots and the ladder's report, which states them; a target, a floor or a display size without per_shot, a
+        // target past 100 and a floor past 40, refused.
         QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"vmaf_target", 90}}}}).value("isError").toBool());
         QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"per_shot", true}, {"vmaf_target", 150}}}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"crf_floor", 22}}}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"display_width", 1280}}}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"per_shot", true}, {"crf_floor", 45}}}}).value("isError").toBool());
         if (vmafAvailable()) {
             r = call("montage_render", {{"output", folder},
                                         {"streaming", QJsonObject{{"segment_seconds", 2}, {"dash", false}, {"audio_codec", "none"}, {"per_shot", true}, {"vmaf_target", 90},
+                                                                  {"display_width", 384}, {"crf_floor", 22}, {"trial_vmaf_every", 2},
                                                                   {"ladder", QJsonArray{QJsonObject{{"width", 192}, {"height", 108}, {"bitrate", 150000}}}}}}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
             const QJsonObject shots = r.value("structuredContent").toObject();
@@ -11065,7 +11142,12 @@ private slots:
             QCOMPARE(list.size(), 1);
             QCOMPARE(list[0].toObject().value("frames").toInt(), 200);
             QVERIFY(list[0].toObject().value("vmaf").toDouble() > 50 && list[0].toObject().value("bitrate").toDouble() <= 150000 * 1.1);
-            QVERIFY(QFileInfo::exists(shots.value("ladder_report").toString()));
+            QVERIFY(list[0].toObject().value("crf").toDouble() >= 22 && list[0].toObject().contains("stopped"));
+            QFile ladder(shots.value("ladder_report").toString());
+            QVERIFY(ladder.open(QIODevice::ReadOnly));
+            const QByteArray csv = ladder.readAll();
+            ladder.close();
+            QVERIFY2(csv.contains("# display_size,384x216\n") && csv.contains("# crf_floor,22.00\n") && csv.contains("# trial_vmaf_every,2\n"), csv.constData());
         }
         QDir(folder).removeRecursively();
     }

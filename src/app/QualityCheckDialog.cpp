@@ -228,11 +228,25 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
         vmaf_->setObjectName(QStringLiteral("qcVmaf"));
         vmaf_->setChecked(vmafAvailable());
         vmaf_->setToolTip(tr("VMAF (libvmaf %1, its v1 model) as well; HDR encodes only where libvmaf has an HDR model").arg(QString::fromStdString(vmafVersion())));
+        vmafQuick_ = new QCheckBox(tr("Quick"), lw);
+        vmafQuick_->setObjectName(QStringLiteral("qcVmafQuick"));
+        vmafQuick_->setToolTip(tr("VMAF scored on every fourth frame only, which takes less time; the frames between still count towards "
+                                  "its motion, and the other measures are of every frame"));
+        vmafEstimate_ = new QLabel(lw);
+        vmafEstimate_->setObjectName(QStringLiteral("qcVmafEstimate"));
         if (!vmafAvailable()) {
             vmaf_->setEnabled(false);
             minVmaf_->setEnabled(false);
             vmaf_->setToolTip(tr("This copy of Montage was built without libvmaf"));
         }
+        vmafQuick_->setEnabled(vmaf_->isEnabled() && vmaf_->isChecked());
+        connect(vmaf_, &QCheckBox::toggled, this, [this](bool on) {
+            vmafQuick_->setEnabled(on && vmaf_->isEnabled());
+            updateVmafEstimate();
+        });
+        connect(vmafQuick_, &QCheckBox::toggled, this, [this] { updateVmafEstimate(); });
+        connect(compareFile_, &QLineEdit::textChanged, this, [this] { updateVmafEstimate(); });
+        connect(range_, &QComboBox::currentIndexChanged, this, [this] { updateVmafEstimate(); });
         connect(qualityPreset_, &QComboBox::currentIndexChanged, this, [this] {
             const QVariantList v = qualityPreset_->currentData().toList();
             if (v.size() != 3) return;
@@ -246,6 +260,8 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
         lh->addWidget(maxDeltaItp_);
         lh->addWidget(minVmaf_);
         lh->addWidget(vmaf_);
+        lh->addWidget(vmafQuick_);
+        lh->addWidget(vmafEstimate_);
         lh->addStretch();
         form->addRow(tr("Limits:"), lw);
     }
@@ -291,6 +307,32 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     layout->addWidget(buttons);
 }
 
+// About how long VMAF will take over the sequence's frames (or In to Out) at the encode's size (the sequence's when the
+// file cannot be read), worked out in the background (the first time, libvmaf runs for a moment) and shown beside the box.
+void QualityCheckDialog::updateVmafEstimate() {
+    const Sequence* seq = state_->sequence();
+    const int asked = ++estimateAsked_;
+    vmafEstimate_->clear();
+    if (!seq || !vmafAvailable() || !vmaf_->isChecked() || compareFile_->text().trimmed().isEmpty()) return;
+    const bool range = range_->currentIndex() == 1 && seq->inPoint >= 0 && seq->outPoint >= 0;
+    const int64_t frames = range ? seq->outPoint + 1 - seq->inPoint : seq->duration();
+    const int w = seq->width, h = seq->height, every = vmafQuick_->isChecked() ? 4 : 1;
+    auto* watcher = new QFutureWatcher<double>(this);
+    connect(watcher, &QFutureWatcher<double>::finished, this, [this, watcher, asked] {
+        watcher->deleteLater();
+        const double seconds = watcher->result();
+        if (asked != estimateAsked_ || seconds <= 0) return;
+        vmafEstimate_->setText(seconds < 90 ? tr("VMAF: about %1 s").arg(std::max(1, int(std::lround(seconds))))
+                                            : tr("VMAF: about %1 min").arg(int(std::lround(seconds / 60))));
+    });
+    const std::string file = compareFile_->text().trimmed().toStdString();
+    watcher->setFuture(QtConcurrent::run([file, w, h, frames, every] {
+        QualityPicture pic;
+        const bool read = QFileInfo::exists(QString::fromStdString(file)) && probePictureFile(file, pic, CompareOptions{});
+        return vmafSecondsEstimate(read ? pic.width : w, read ? pic.height : h, frames, every);
+    }));
+}
+
 QcSettings QualityCheckDialog::settings() const {
     QcSettings q;
     q.flashing = flashing_->isChecked();
@@ -317,6 +359,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.compareFile = compareFile_->text().trimmed().toStdString();
     q.hrdFile = hrdFile_->text().trimmed().toStdString();
     if (!vmaf_->isChecked() || !vmafAvailable()) q.compareMetrics &= ~unsigned(MetricVmaf);
+    q.compareVmafEvery = vmafQuick_->isChecked() ? 4 : 1;
     q.qualityLimits.minPsnr = minPsnr_->value();
     q.qualityLimits.maxDeltaItp = maxDeltaItp_->value();
     q.qualityLimits.minVmaf = vmafAvailable() ? minVmaf_->value() : 0;

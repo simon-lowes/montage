@@ -8371,8 +8371,25 @@ void MainWindow::exportStreamingDialog() {
     target->setPrefix(tr("VMAF "));
     target->setToolTip(tr("Each shot gets the quality that reaches this VMAF for the fewest bits, the rung's rate its cap; at 0, the "
                           "rung's rate spread over the shots for the most VMAF. The package gets ladder.csv, each shot's rate and score."));
-    perShot->setToolTip(tr("Each shot (between cuts and marked shot changes, a second at the least) starts a segment and is "
-                           "first encoded at several qualities on each rung, then scored by VMAF at the rung's size: longer to make"));
+    perShot->setToolTip(tr("Each shot (between cuts and marked shot changes, or scene changes where there are none; a second at the "
+                           "least) starts a segment and is first encoded at several qualities on each rung, then scored by VMAF at "
+                           "the size it is shown at: longer to make"));
+    // The size every rung is scored at, and the best quality a shot may be given.
+    auto* displaySize = new QComboBox;
+    displaySize->setObjectName(QStringLiteral("streamingDisplaySize"));
+    displaySize->addItem(tr("Scored at the largest rung's size"), QSize());
+    for (const QSize& z : {QSize(1280, 720), QSize(1920, 1080), QSize(3840, 2160)})
+        displaySize->addItem(tr("Scored at %1 × %2").arg(z.width()).arg(z.height()), z);
+    displaySize->setToolTip(tr("Every rung's pictures are scaled to this size and scored against the render at it, so one VMAF target is "
+                           "one quality on every rung"));
+    auto* lowestCrf = new QDoubleSpinBox;
+    lowestCrf->setObjectName(QStringLiteral("streamingCrfFloor"));
+    lowestCrf->setRange(1, 40);
+    lowestCrf->setDecimals(0);
+    lowestCrf->setValue(18);
+    lowestCrf->setPrefix(tr("Lowest CRF "));
+    lowestCrf->setToolTip(tr("The best quality a shot may be given (H.264 and HEVC; AV1's is two more): a shot that would need more "
+                         "stops there, and ladder.csv says so"));
     const bool vmaf = vmafAvailable() && !(hdr && vmafModelFor([&] {
                                                      QualityPicture q;
                                                      q.width = s->width, q.height = s->height, q.transfer = cs->transfer == Transfer::Pq ? "pq" : "hlg";
@@ -8380,11 +8397,16 @@ void MainWindow::exportStreamingDialog() {
                                                  }(), CompareOptions{}).empty());
     perShot->setEnabled(vmaf);
     if (!vmaf) perShot->setToolTip(tr("Needs VMAF (libvmaf %1), and for HDR an HDR VMAF model").arg(QString::fromStdString(vmafVersion())));
-    target->setEnabled(false);
+    target->setEnabled(false), displaySize->setEnabled(false), lowestCrf->setEnabled(false);
     connect(perShot, &QCheckBox::toggled, target, &QWidget::setEnabled);
+    connect(perShot, &QCheckBox::toggled, displaySize, &QWidget::setEnabled);
+    connect(perShot, &QCheckBox::toggled, lowestCrf, &QWidget::setEnabled);
     auto* rates = new QHBoxLayout;
     rates->addWidget(perShot), rates->addWidget(target), rates->addStretch();
     form->addRow(tr("Rates:"), rates);
+    auto* scoring = new QHBoxLayout;
+    scoring->addWidget(displaySize), scoring->addWidget(lowestCrf), scoring->addStretch();
+    form->addRow(QString(), scoring);
     auto* hls = new QCheckBox(tr("HLS"));
     auto* dash = new QCheckBox(tr("DASH"));
     hls->setChecked(true), dash->setChecked(true);
@@ -8441,6 +8463,11 @@ void MainWindow::exportStreamingDialog() {
     st.hls = hls->isChecked(), st.dash = dash->isChecked();
     st.perShot = perShot->isChecked();
     st.vmafTarget = st.perShot ? target->value() : 0;
+    if (st.perShot) {
+        const QSize z = displaySize->currentData().toSize();
+        st.displayWidth = z.isValid() ? z.width() : 0, st.displayHeight = z.isValid() ? z.height() : 0;
+        st.crfFloor = lowestCrf->value();
+    }
     st.audioCodec = audio->currentData().toString().toStdString();
     st.segmentFormat = segmentFormat->currentData().toString().toStdString();
     if (st.segmentFormat == "ts" && (st.audioCodec == "libopus" || codec->currentData().toString() != "libx264")) {
