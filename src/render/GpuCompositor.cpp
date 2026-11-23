@@ -937,7 +937,13 @@ size_t Device::cardMemory() const {
     }
 #endif
     if (backend_ == QRhi::OpenGLES2) {
-        // (kilobytes: the card's memory in all, or the texture pool's free memory where only that is told)
+        // (kilobytes: the card's memory in all, or the texture pool's free memory where only that is told; not asked of
+        // a renderer on the CPU, which has none of its own: llvmpipe answers with a value it never set, hundreds of
+        // gigabytes that change from run to run)
+        const QRhiDriverInfo info = rhi_->driverInfo();
+        if (info.deviceType == QRhiDriverInfo::CpuDevice || info.deviceName.contains("llvmpipe") || info.deviceName.contains("softpipe") ||
+            info.deviceName.contains("SwiftShader"))
+            return 0;
         if (!rhi_->makeThreadLocalNativeContextCurrent()) return 0;
         QOpenGLContext* current = QOpenGLContext::currentContext();
         if (!current) return 0;
