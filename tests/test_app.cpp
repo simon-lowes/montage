@@ -11169,6 +11169,22 @@ private slots:
             QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
                                                 {"prores_profile", "proxy"}})
                         .value("isError").toBool());
+            // Phase 16: a ProRes master carries the sequence's markers as timed events, here as a JSON document; the
+            // check passes it and says what it advises beside the problems.
+            {
+                Project marked = state()->project();
+                marked.active()->markers.push_back(Marker{10, 0, "Act two"});
+                QVERIFY(saveProject(marked, dir_.filePath("imf-marked.montage").toStdString()));
+                r = call("montage_export_imf", {{"project", dir_.filePath("imf-marked.montage")}, {"folder", dir_.filePath("mcp-prores-events")},
+                                                {"title", "Events"}, {"application", "prores"}, {"events_json", true}});
+                QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+                const QJsonObject ev = r.value("structuredContent").toObject();
+                QVERIFY2(ev.value("problems").toArray().isEmpty() && ev.value("events").toInt() == 1 && ev.value("advice").isArray(),
+                         QJsonDocument(ev).toJson().constData());
+                r = call("montage_verify_imf", {{"folder", ev.value("folder").toString()}});
+                QVERIFY2(r.value("structuredContent").toObject().value("ok").toBool() && r.value("structuredContent").toObject().value("advice").isArray(),
+                         QJsonDocument(r).toJson().constData());
+            }
             // Interlaced, Y'CbCr 4:4:4 and full range, each checked.
             for (const QJsonObject& extra : {QJsonObject{{"fields", "tff"}}, QJsonObject{{"prores_profile", "4444"}, {"ycbcr444", true}},
                                              QJsonObject{{"prores_profile", "4444xq"}, {"full_range", true}}}) {
@@ -11279,19 +11295,25 @@ private slots:
             offered = offered && edition && edition->isEnabled() && edition->currentData().toInt() == 2026 && eventsBox && eventsBox->isEnabled() &&
                       eventsBox->isChecked() && offeredIn(sizes, "8k");
             if (offered) {
+                // The events document as JSON is chosen only while the markers go as events.
+                auto* eventsJson = dlg->findChild<QCheckBox*>("imfEventsJson");
+                offered = eventsJson && eventsJson->isEnabled() && !eventsJson->isChecked();
                 edition->setCurrentIndex(edition->findData(2021));
-                offered = !eventsBox->isEnabled() && !offeredIn(sizes, "8k");
+                offered = offered && !eventsBox->isEnabled() && !eventsJson->isEnabled() && !offeredIn(sizes, "8k");
                 edition->setCurrentIndex(edition->findData(2026));
-                offered = offered && eventsBox->isEnabled() && offeredIn(sizes, "8k");
+                offered = offered && eventsBox->isEnabled() && eventsJson->isEnabled() && offeredIn(sizes, "8k");
+                eventsBox->setChecked(false);
+                offered = offered && !eventsJson->isEnabled();
+                eventsBox->setChecked(true);
             }
-            // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
+            // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not; its markers go as events too.
             auto* application = dlg->findChild<QComboBox*>("imfApplication");
             auto* graded = dlg->findChild<QComboBox*>("imfGraded");
             offered = offered && application && graded && !graded->isEnabled() && dlg->findChild<QComboBox*>("imfColour")->isEnabled();
             if (offered && exrAvailable()) {
                 application->setCurrentIndex(application->findData(5));
                 offered = graded->isEnabled() && dlg->findChild<QCheckBox*>("imfTargetFrame")->isEnabled() &&
-                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled() && !edition->isEnabled() && !eventsBox->isEnabled() && !offeredIn(sizes, "8k");
+                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled() && !edition->isEnabled() && eventsBox->isEnabled() && !offeredIn(sizes, "8k");
                 application->setCurrentIndex(application->findData(2));
             }
             // Application ProRes: fields for 4:2:2, Y'CbCr, full range and 12 bits for 4:4:4. Application DPP: 422 HQ, 4444

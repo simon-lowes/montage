@@ -13302,7 +13302,8 @@ void McpServer::Impl::addTools() {
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
             "size":{"type":"string","enum":["sequence","hd","uhd","4k","8k"],"default":"sequence","description":"8k (7680 x 4320): Application #2E to the 2026 edition"},
             "edition":{"type":"integer","enum":[2026,2021],"default":2026,"description":"Application #2E: ST 2067-21:2026's identification (8K, timed events), or the 2021 one, the package as before (a supplemental keeps the earlier package's)"},
-            "events":{"type":"boolean","default":true,"description":"The sequence's markers as ST 2067-206 timed events (Application #2E to the 2026 edition)"},
+            "events":{"type":"boolean","default":true,"description":"The sequence's markers as ST 2067-206 timed events (Application #2E to the 2026 edition, #5, ProRes and DPP)"},
+            "events_json":{"type":"boolean","default":false,"description":"The events document as JSON instead of XML (a supplemental keeps the earlier package's form)"},
             "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
             "lossless":{"type":"boolean","default":true},"htj2k":{"type":"boolean","default":false},"megabits_per_second":{"type":"number","minimum":20,"maximum":6400,"description":"Lossy: the cap (default 400)"},
             "mastering_peak":{"type":"number","minimum":100,"maximum":10000,"description":"HDR: the mastering display's peak, cd/m^2"},
@@ -13378,6 +13379,7 @@ void McpServer::Impl::addTools() {
             st.edition = a.contains("edition") && !a.value("edition").isDouble() ? 0 : a.value("edition").toInt(2026);
             if (st.edition != 2026 && st.edition != 2021) throw ArgError{"\"edition\" is 2026 or 2021"};
             st.events = a.value("events").toBool(true);
+            st.eventsJson = a.value("events_json").toBool();
             if (a.value("application").isString()) {
                 const QString app = a.value("application").toString();
                 if (app != "prores" && app != "dpp_prores") throw ArgError{"\"application\" is 2, 5, \"prores\" or \"dpp_prores\""};
@@ -13420,8 +13422,10 @@ void McpServer::Impl::addTools() {
                     return true;
                 }, &err))
                 return fail(QString::fromStdString(err));
-            QJsonArray found;
-            for (const std::string& i : verifyImf(r.folder)) found.append(QString::fromStdString(i));
+            QJsonArray found, advised;
+            std::vector<std::string> advice;
+            for (const std::string& i : verifyImf(r.folder, {}, &advice)) found.append(QString::fromStdString(i));
+            for (const std::string& i : advice) advised.append(QString::fromStdString(i));
             QJsonObject out{{"folder", QString::fromStdString(r.folder)}, {"cpl", QString::fromStdString(r.cpl)},
                                   {"frames", double(r.frames)}, {"edit_rate", QStringLiteral("%1/%2").arg(r.rateNum).arg(r.rateDen)},
                                   {"width", r.width}, {"height", r.height}, {"bits", r.bits}, {"channels", r.channels},
@@ -13429,6 +13433,9 @@ void McpServer::Impl::addTools() {
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
                                   {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application},
                                   {"events", r.events}, {"new_events", r.newEvents}};
+            // (what the check says without failing the package, and another maker's events tracks in a supplemental)
+            out["advice"] = advised;
+            if (r.supplemental) out["carried_event_tracks"] = r.carriedEventTracks, out["left_event_tracks"] = r.leftEventTracks;
             if (r.application == 2) out["edition"] = r.edition;
             if (r.application == 45 || r.application == 59) {
                 out["application"] = r.application == 45 ? "prores" : "dpp_prores";
@@ -13456,14 +13463,18 @@ void McpServer::Impl::addTools() {
         "resources in the package with their essence descriptors and durations, the Application #2E or #5 identification, "
         "picture track files JPEG 2000 in an IMF profile (or ACES OpenEXR images, with their target frames) with the right number of frames, sound 24-bit 48 kHz with the "
         "right number of samples, timed text that reads, timed events (ST 2067-206) as a Simple Scheme document with its "
-        "parameter set, Application #2E's sizes and profiles by its edition. A supplemental package's track files from earlier packages are "
-        "looked for in the folders beside it. Returns the problems found (none: it passed).",
+        "parameter set, Application #2E's sizes and profiles by its edition, and an Application DPP package's sound labels (one "
+        "soundfield group, each channel labelled once, by ST 2067-8's or ST 377-42's labels). A supplemental package's track files from earlier packages are "
+        "looked for in the folders beside it. Returns the problems found (none: it passed) and, as `advice`, what does not fail "
+        "the package: a 5.1 channel order broadcasters do not usually take, and that a DPP package has no DPP003 metadata.",
         R"json({"type":"object","properties":{"folder":{"type":"string"}},"required":["folder"]})json", true, [](const QJsonObject& a) {
             const QString folder = absolute(need(a, "folder"));
-            QJsonArray found;
-            for (const std::string& i : verifyImf(folder.toStdString())) found.append(QString::fromStdString(i));
+            QJsonArray found, advised;
+            std::vector<std::string> advice;
+            for (const std::string& i : verifyImf(folder.toStdString(), {}, &advice)) found.append(QString::fromStdString(i));
+            for (const std::string& i : advice) advised.append(QString::fromStdString(i));
             return ok(found.isEmpty() ? QStringLiteral("The IMF package checks out") : QStringLiteral("%1 problem(s): %2").arg(found.size()).arg(found.at(0).toString()),
-                      QJsonObject{{"problems", found}, {"ok", found.isEmpty()}});
+                      QJsonObject{{"problems", found}, {"ok", found.isEmpty()}, {"advice", advised}});
         });
 
     add("montage_read_broadcast_mxf", "Read a broadcast MXF file",
