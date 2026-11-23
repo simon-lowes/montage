@@ -50,6 +50,11 @@ std::vector<FrameTime> captionShotChanges(const Sequence& seq);
 // clip shows a picture at `f`, or where a retimed clip has no whole source frame that lands on `f`. False when the
 // sequence already has a shot change there (a cut or a marker).
 bool markShotChange(Sequence& seq, FrameTime f);
+// A shot change marked on a clip goes on the clips linked to it too (its sound), so it is still there when the sound
+// is used without its picture: `frame` is where the clip's marker shows on the timeline; each linked clip playing at
+// that frame gets a shot-change marker at its own source time for it, unless it has one. Returns how many were made.
+// (Shot changes are counted from picture clips only, so these add none.)
+int markShotChangeOnLinked(Sequence& seq, Id clipId, FrameTime frame);
 
 // Characters a second for one caption.
 double captionCps(const Caption& c, Rational fps);

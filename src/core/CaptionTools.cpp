@@ -105,6 +105,29 @@ std::vector<FrameTime> captionShotChanges(const Sequence& seq) {
     return {out.begin(), out.end()};
 }
 
+int markShotChangeOnLinked(Sequence& seq, Id clipId, FrameTime frame) {
+    int made = 0;
+    for (const Id id : edit::linkedClips(seq, clipId)) {
+        Clip* l = id == clipId ? nullptr : edit::clipById(seq, id);
+        if (!l || l->isGenerator() || frame < l->start || frame >= l->end()) continue;
+        if (std::any_of(l->markers.begin(), l->markers.end(), [&](const Marker& k) { return k.shotChange && l->markerFrame(k) == frame; })) continue;
+        Marker m;
+        m.name = "Shot change";
+        m.shotChange = true;
+        // (its own source time for that frame: sound synchronised from another file starts elsewhere)
+        const double source = l->sourceFrameAt(frame);
+        for (const FrameTime at : {FrameTime(std::llround(source)), FrameTime(std::floor(source)), FrameTime(std::ceil(source))}) {
+            m.t = at;
+            if (l->markerFrame(m) != frame) continue;
+            l->markers.push_back(m);
+            std::stable_sort(l->markers.begin(), l->markers.end(), [](const Marker& x, const Marker& y) { return x.t < y.t; });
+            ++made;
+            break;
+        }
+    }
+    return made;
+}
+
 bool markShotChange(Sequence& seq, FrameTime f) {
     const std::vector<FrameTime> have = captionShotChanges(seq);
     if (std::binary_search(have.begin(), have.end(), f)) return false;
@@ -129,6 +152,7 @@ bool markShotChange(Sequence& seq, FrameTime f) {
             if (c.markerFrame(m) != frame) continue;
             c.markers.push_back(m);
             std::stable_sort(c.markers.begin(), c.markers.end(), byTime);
+            markShotChangeOnLinked(seq, c.id, frame);
             return true;
         }
         break;  // (the picture on top is the one a viewer sees cut: none below it is marked instead)

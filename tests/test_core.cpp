@@ -1306,6 +1306,35 @@ private slots:
             c0.markers.clear();
             c0.sourceIn = 0;
         }
+        // A shot change marked on a picture goes on its linked sound too, at the sound's own source time for that
+        // frame and once only; a clip that is not linked, or not playing at that frame, gets none; and the sequence
+        // counts the shot change once.
+        {
+            Fixture fx;
+            const Id v = fx.put(V1, 0, 100, 0), a = fx.put(A1, 0, 100, 25);
+            const TrackRef A2{TrackKind::Audio, 1}, A3{TrackKind::Audio, 2};
+            const Id other = fx.put(A2, 0, 100, 0), late = fx.put(A3, 60, 40, 0);
+            for (const Id id : {v, a, late}) edit::clipById(fx.s(), id)->linkGroup = 7;
+            QVERIFY(markShotChange(fx.s(), 40));
+            const Clip& sound = *edit::clipById(fx.s(), a);
+            QCOMPARE(edit::clipById(fx.s(), v)->markers.size(), size_t(1));
+            QCOMPARE(sound.markers.size(), size_t(1));
+            QVERIFY(sound.markers[0].shotChange);
+            QCOMPARE(sound.markers[0].t, FrameTime(65));
+            QCOMPARE(sound.markerFrame(sound.markers[0]), FrameTime(40));
+            QVERIFY(edit::clipById(fx.s(), other)->markers.empty());
+            QVERIFY(edit::clipById(fx.s(), late)->markers.empty());
+            QCOMPARE(captionShotChanges(fx.s()), std::vector<FrameTime>{40});
+            QVERIFY(!markShotChange(fx.s(), 40));
+            QCOMPARE(markShotChangeOnLinked(fx.s(), v, 40), 0);
+            QCOMPARE(sound.markers.size(), size_t(1));
+            // (scene detection's way in: the frame its marker shows at)
+            QCOMPARE(markShotChangeOnLinked(fx.s(), v, 70), 2);
+            QCOMPARE(edit::clipById(fx.s(), late)->markers.at(0).t, FrameTime(10));
+            // The sound keeps it without its picture.
+            QVERIFY(removeClips(fx.p, fx.s(), {v}, false).ok);
+            QCOMPARE(edit::clipById(fx.s(), a)->markers.size(), size_t(2));
+        }
 
         // The half-second rules at each rate: a caption starting just after a cut starts on it; one ending just before a
         // cut, on it, or just after it ends two frames before it; one whose speech is over well before a cut it runs
