@@ -231,6 +231,7 @@ private:
                 pic->height = img.height;
                 pic->contentPeak = hdrContentPeak(trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim));
                 pic->transfer = trimTargetSpace(*s, r.trim).transfer;
+                pic->mastering = hdrMasteringPrimaries(trimTargetSpace(*s, r.trim));
                 if (r.trim.empty()) pic->maxCll = s->hdrMaxCll, pic->maxFall = s->hdrMaxFall;  // (measured on the master)
                 hdrViewImage(img, trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim), pic->contentPeak, pic->rgba);  // (rolled off as drawn)
                 // The master's adaptive HDR metadata (render/AdaptiveHdr.h), while it matches the cut: tone mapped by its

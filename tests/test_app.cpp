@@ -22369,6 +22369,20 @@ print("added " + ui["name"])
         // ends the connection): whole nits, the minimum in 1/10000 nit, nothing unmeasured sent.
         QCOMPARE(hdrSurfaceLightArgs(full, Transfer::Pq, true), (HdrSurfaceLightArgs{50, 1000, 1000, 300}));
         QCOMPARE(hdrSurfaceLightArgs(HdrSurfaceLight(), Transfer::Pq, true), (HdrSurfaceLightArgs{50, 1000, 0, 0}));
+        // The mastering display's primaries are the sequence's: BT.2020 for BT.2100's PQ and HLG, P3-D65 for P3-D65 PQ
+        // (and for a picture that does not say), each as the protocol takes it, in millionths.
+        QCOMPARE(hdrMasteringPrimaries(*findColorSpace("rec2100pq")), Primaries::Bt2020);
+        QCOMPARE(hdrMasteringPrimaries(*findColorSpace("rec2100hlg")), Primaries::Bt2020);
+        QCOMPARE(hdrMasteringPrimaries(*findColorSpace("p3d65pq")), Primaries::P3D65);
+        QCOMPARE(hdrMasteringPrimaries(*findColorSpace("rec709")), Primaries::P3D65);
+        QCOMPARE(full.masteringPrimaries, Primaries::P3D65);
+        HdrPicture wide = pic;
+        wide.mastering = Primaries::Bt2020;
+        QCOMPARE(hdrSurfaceLight(wide, 8).masteringPrimaries, Primaries::Bt2020);
+        QVERIFY(!(hdrSurfaceLight(wide, 8) == hdrSurfaceLight(pic, 8)));  // (a surface is described again for it)
+        QCOMPARE(hdrSurfacePrimariesArgs(Primaries::Bt2020), (std::array<int32_t, 8>{708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000}));
+        QCOMPARE(hdrSurfacePrimariesArgs(Primaries::P3D65), (std::array<int32_t, 8>{680000, 320000, 265000, 690000, 150000, 60000, 312700, 329000}));
+        QCOMPARE(hdrSurfacePrimariesArgs(Primaries::SGamut3Venice), hdrSurfacePrimariesArgs(Primaries::P3D65));
         // No mastering range for the compositor: the signal's own range bounds the levels (HLG's ends at 1000).
         HdrSurfaceLight odd;
         odd.masteringMaxNits = 4000, odd.maxCll = 5000, odd.maxFall = 6000;
@@ -22417,7 +22431,9 @@ print("added " + ui["name"])
 
     void hdrViewerOnWayland() {
         // Under Weston (scripts/wayland-hdr-check.sh, in CI): headless, its GL renderer, colour management on with a
-        // BT.2100 PQ output (reference white 203 nits, peak 1000; MONTAGE_TEST_WESTON_CM=true), or off.
+        // BT.2100 PQ output (reference white 203 nits, peak 1000; MONTAGE_TEST_WESTON_CM=true), on with an SDR output
+        // (sdr), or off. The surface is described by Montage's binding of the protocol, or by Qt (6.10.2 and later,
+        // the binding switched off): then with PQ's own luminances and no mastering display, and nothing read back.
         const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
         if (log.isEmpty() || !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
             QSKIP("Runs under Weston (scripts/wayland-hdr-check.sh)");
@@ -22425,9 +22441,13 @@ print("added " + ui["name"])
         QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
 #else
         QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
-        const bool cm = qEnvironmentVariable("MONTAGE_TEST_WESTON_CM") == QLatin1String("true");
+        const QString mode = qEnvironmentVariable("MONTAGE_TEST_WESTON_CM");
+        const bool cm = mode == QLatin1String("true"), sdrOutput = mode == QLatin1String("sdr");
+        const bool throughQt = hdrViewerOnWaylandThroughQt();
+        qInfo().noquote() << "The surface is described by" << (throughQt ? "Qt" : "Montage's binding") << "(Qt" << qVersion() << ")";
         // A viewer of its own over the whole output (the kiosk shell gives it the screen), with an SDR picture to stand
-        // for the HDR one, and a PQ grey ramp from a sequence mastered at 800 nits: eight bars, eight texels each.
+        // for the HDR one, and a PQ grey ramp from a sequence mastered at 800 nits on a BT.2020 display: eight bars,
+        // eight texels each.
         win_->hide();
         auto restore = qScopeGuard([this] { win_->show(); });
         ViewerWidget viewer;
@@ -22441,6 +22461,8 @@ print("added " + ui["name"])
         ramp->width = 64, ramp->height = 8;
         ramp->contentPeak = 800.0 / 203;
         ramp->maxCll = 800, ramp->maxFall = 200;
+        ramp->mastering = hdrMasteringPrimaries(*findColorSpace("rec2100pq"));
+        QCOMPARE(ramp->mastering, Primaries::Bt2020);
         std::vector<float> texels(size_t(ramp->width) * size_t(ramp->height) * 4);
         for (int y = 0; y < ramp->height; ++y)
             for (int x = 0; x < ramp->width; ++x) {
@@ -22495,9 +22517,11 @@ print("added " + ui["name"])
             qInfo().noquote() << said;
             QVERIFY2(right, qPrintable(said));
         }
+        QElapsedTimer asked;
+        asked.start();
         viewer.setHdrViewer(true);
         viewer.setHdrPicture(ramp);
-        if (!cm) {
+        if (!cm && !sdrOutput) {
             // No colour management: SDR, and why.
             QTRY_VERIFY(!viewer.hdrStatus().isEmpty());
             QVERIFY(!viewer.hdrShowing());
@@ -22505,13 +22529,35 @@ print("added " + ui["name"])
             QCOMPARE(viewer.hdrHeadroom(), 1.0);
             return;
         }
+        if (sdrOutput && !throughQt) {
+            // Colour management, and an output that is not HDR: SDR, said at once from what Weston prefers for the
+            // viewer's window (no wait for a surface of its own to have been up a while), and why.
+            QTRY_VERIFY(!viewer.hdrStatus().isEmpty());
+            const qint64 took = asked.elapsed();
+            qInfo().noquote() << "An SDR output was told from an HDR one in" << took << "ms";
+            QVERIFY(!viewer.hdrShowing());
+            QCOMPARE(viewer.hdrStatus(), QStringLiteral("This display does not show HDR"));
+            QCOMPARE(viewer.hdrHeadroom(), 1.0);
+            QVERIFY2(took < 1500, qPrintable(QString::number(took)));
+            return;
+        }
         QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);  // (why not, if it is not)
         QVERIFY2(viewer.hdrStatus().isEmpty(), qPrintable(viewer.hdrStatus()));
         HdrSurface* surface = viewer.hdrSurface();
         QVERIFY(surface);
+        if (sdrOutput) {
+            // Described by Qt, which reads nothing back: the surface is BT.2100 PQ on an SDR output too, and Weston
+            // fits it to the output.
+            QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->describedTransfer() == Transfer::Pq,
+                                      qPrintable(viewer.hdrStatus()), 10000);
+            QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->framesDrawn() > 0, qPrintable(viewer.hdrStatus()), 10000);
+            return;
+        }
         // The output's reference white and peak, as Weston prefers them where the viewer is: known as soon as the
-        // surface is made, from the viewer's window, which is on the output already.
-        QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
+        // surface is made, from the viewer's window, which is on the output already. Qt's description asks for none:
+        // PQ's whole range over its reference white, nothing rolled off here.
+        const double headroom = throughQt ? 10000.0 / 203 : 1000.0 / 203;
+        QVERIFY2(std::fabs(viewer.hdrHeadroom() - headroom) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
         QCOMPARE(viewer.hdrSdrWhiteNits(), 203.0);
         QCOMPARE(surface->bufferBits(), 10);
         // Described with its first frame (the surface's own wl_surface is there once it is exposed), and a frame for
@@ -22530,7 +22576,10 @@ print("added " + ui["name"])
         QTest::qWait(2500);
         QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));
         QCOMPARE(viewer.hdrSurface(), surface);
-        QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
+        QVERIFY2(std::fabs(viewer.hdrHeadroom() - headroom) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
+        // (Montage's binding: whether Weston's frame callback said the surface's first frame is up, after which the
+        // surface's own answer stands whatever it is)
+        if (!throughQt) qInfo().noquote() << "The surface's first frame was reported:" << surface->waylandEntered();
         // The surface's own pixels, as they go to Weston: in each bar's middle the linear light (relative to SDR white)
         // within 1% and the ramp's PQ code (read 8 bits a channel) within 2.
         surface->keepNextFrame();
@@ -22563,16 +22612,20 @@ print("added " + ui["name"])
             QVERIFY2(right, qPrintable(said.join(QStringLiteral("; "))));
         }
         QTest::qWait(500);  // (Weston repaints)
-        // Weston's protocol log: the surface described as BT.2100 PQ (named transfer 11, primaries 6) with the master's
-        // light (800 nits from 0.005; MaxCLL 800, MaxFALL 200), and 10-bit buffers (AR30 or XR30).
+        // Weston's protocol log: the surface described as BT.2100 PQ (named transfer 11, primaries 6), and 10-bit
+        // buffers (AR30 or XR30). From Montage's binding also the master's display and light: BT.2020's primaries and
+        // D65 in millionths, 800 nits from 0.005, MaxCLL 800 and MaxFALL 200.
         auto logged = [&](const QString& what) {
             QFile f(log);
             return f.open(QIODevice::ReadOnly) && QString::fromUtf8(f.readAll()).contains(what);
         };
         for (const char* request : {"wp_image_description_creator_params_v1@", ".set_tf_named(11)", ".set_primaries_named(6)",
-                                    ".set_mastering_luminance(50, 800)", ".set_max_cll(800)", ".set_max_fall(200)",
                                     "wp_color_management_surface_v1@", ".set_image_description(wp_image_description_v1@"})
             QTRY_VERIFY2(logged(QString::fromLatin1(request)), request);
+        if (!throughQt)
+            for (const char* request : {".set_mastering_display_primaries(708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000)",
+                                        ".set_mastering_luminance(50, 800)", ".set_max_cll(800)", ".set_max_fall(200)"})
+                QTRY_VERIFY2(logged(QString::fromLatin1(request)), request);
         QFile f(log);
         QVERIFY(f.open(QIODevice::ReadOnly));
         bool tenBit = false;

@@ -80,6 +80,14 @@ bool hdrViewerOnWaylandBuilt() {
 #endif
 }
 
+bool hdrViewerOnWaylandThroughQt() {
+#if defined(MONTAGE_HDR_VIEWER) && defined(MONTAGE_QT_WAYLAND_COLOR)
+    return true;
+#else
+    return false;
+#endif
+}
+
 #ifdef MONTAGE_HDR_VIEWER
 
 namespace {
@@ -365,10 +373,14 @@ HdrSurface::HdrSurface(QWidget* target) : target_(target) {
         }
         if (!encoded_) readDisplay();
     });
+    // Wayland: what the compositor says about the surface comes on a queue of Montage's own, looked at this often.
+    waylandTimer_.setInterval(50);
+    connect(&waylandTimer_, &QTimer::timeout, this, &HdrSurface::waylandEvents);
     connect(this, &QWindow::screenChanged, this, [this] {
         if (!gpu_ || !gpu_->sc || gTestHeadroom > 0) return;
         if (encoded_) {
-            // (Wayland: the compositor tells the surface what it prefers on the new output, read every second)
+            // (Wayland: the compositor tells the surface what it prefers on the new output)
+            waylandEvents();
             requestUpdate();
             return;
         }
@@ -568,12 +580,14 @@ HdrSurface::WaylandDisplay HdrSurface::waylandDisplay() {
         return d;
     };
     QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
+    if (waylandGone()) return out;
     if (wayland_->surface()) {
         // The surface's own answer, read again first if the compositor said it changed (another output, its
-        // brightness). It stands when it is HDR, and when it is SDR once the surface has had a frame up for a while.
+        // brightness). It stands when it is HDR, and when it is SDR once the compositor has said the surface's first
+        // frame is up: the surface is on its output then.
         if (isVisible() && native && native->nativeResourceForWindow("surface", this) == wayland_->surface()) wayland_->dispatch();
         out = answered(wayland_->preferred());
-        if (out.known && (out.headroom > 1.0 || (ownFrame_.isValid() && ownFrame_.elapsed() >= 2000))) return out;
+        if (out.known && (out.headroom > 1.0 || wayland_->entered())) return out;
     }
     // Else the viewer's top-level window's, once that is shown: it is on its output already, while a surface with no
     // frame yet is on none, and a compositor answers for such a surface with a default (its first output's, or sRGB)
@@ -589,11 +603,45 @@ HdrSurface::WaylandDisplay HdrSurface::waylandDisplay() {
     return out;
 }
 
+bool HdrSurface::waylandGone() {
+#if defined(MONTAGE_WAYLAND_COLOR)
+    if (!wayland_ || !wayland_->display()) return false;
+    // Qt's connection now (another one once Qt has connected to a compositor again, the old one closed): the
+    // surface's colour management was made on the old one, and nothing of it may be used again.
+    QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
+    if (native && native->nativeResourceForIntegration("wl_display") == wayland_->display()) return false;
+    wayland_->abandon();
+    stopHdr(tr("The Wayland compositor went away"));
+    return true;
+#else
+    return false;
+#endif
+}
+
+void HdrSurface::waylandEvents() {
+#if defined(MONTAGE_WAYLAND_COLOR)
+    if (!hdrActive_ || !wayland_ || gTestHeadroom > 0 || waylandGone()) return;
+    QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
+    if (!wayland_->surface() || !isVisible() || !native || native->nativeResourceForWindow("surface", this) != wayland_->surface()) return;
+    if (!wayland_->dispatch()) return;
+    // What the compositor prefers for the surface was read again: HDR stops on an output that does not show it, and
+    // on another HDR output the picture is drawn again for its reference white and peak.
+    if (!displayShowsHdr()) {
+        stopHdr(problem_);
+        return;
+    }
+    displayRead_.invalidate();
+    readDisplay();
+    requestUpdate();
+#endif
+}
+
 void HdrSurface::stopHdr(const QString& why) {
     if (!hdrActive_) return;
     hdrActive_ = false;
     problem_ = why.isEmpty() ? tr("This display does not show HDR") : why;
     displayTimer_.stop();
+    waylandTimer_.stop();
     emit displayChanged();
 }
 
@@ -676,9 +724,17 @@ Transfer HdrSurface::describedTransfer() const {
     return Transfer::Linear;
 }
 
+bool HdrSurface::waylandEntered() const {
+#if defined(MONTAGE_WAYLAND_COLOR)
+    return wayland_ && wayland_->entered();
+#else
+    return false;
+#endif
+}
+
 void HdrSurface::describeSurface() {
 #if defined(MONTAGE_WAYLAND_COLOR)
-    if (!wayland_ || !hdrActive_) return;
+    if (!wayland_ || !hdrActive_ || waylandGone()) return;
     QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
     auto* surface = native ? static_cast<wl_surface*>(native->nativeResourceForWindow("surface", this)) : nullptr;
     if (!surface) return;
@@ -698,7 +754,6 @@ void HdrSurface::describeSurface() {
             stopHdr(tr("The connection to the Wayland compositor failed"));
             return;
         }
-        ownFrame_.invalidate();  // (no frame on this wl_surface yet)
         displayRead_.invalidate();
         readDisplay();
     }
@@ -749,8 +804,12 @@ void HdrSurface::exposeEvent(QExposeEvent*) {
     }
     if (isExposed() && hdrActive_) {
         if (!displayTimer_.isActive()) displayTimer_.start();
+#if defined(MONTAGE_WAYLAND_COLOR)
+        if (wayland_ && !waylandTimer_.isActive()) waylandTimer_.start();
+#endif
     } else {
         displayTimer_.stop();
+        waylandTimer_.stop();
     }
     const QSize size = g.hasSwapChain ? g.sc->surfacePixelSize() : QSize();
     if ((!isExposed() || size.isEmpty()) && g.hasSwapChain) g.notExposed = true;
@@ -1012,7 +1071,6 @@ void HdrSurface::render() {
         keptLight_ = readBack(g.readLight, QRhiTexture::RGBA16F, QImage::Format_RGBA16FPx4, 8, bottomFirst);
     }
 #endif
-    if (!ownFrame_.isValid()) ownFrame_.start();
     if (++frames_ == 1) {
         // macOS reports the headroom once a frame is up: asked again straight after the first.
         QTimer::singleShot(100, this, [this] {

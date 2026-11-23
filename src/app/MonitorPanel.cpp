@@ -404,6 +404,13 @@ void ViewerWidget::updateHdr() {
             if (surface_ || hdrStatus_.isEmpty()) return;
             hdrStatus_.clear();
             updateHdr();
+            // Asked once more a moment later: a Wayland compositor may say what it prefers for the window on its new
+            // output only after the window has entered it.
+            QTimer::singleShot(500, this, [this] {
+                if (surface_ || hdrStatus_.isEmpty()) return;
+                hdrStatus_.clear();
+                updateHdr();
+            });
         });
     }
     if (want && !surface_ && hdrStatus_.isEmpty()) {
@@ -1247,6 +1254,7 @@ void MonitorPanel::showLivePicture() {
                 pic->height = full.light.height;
                 pic->contentPeak = hdrContentPeak(*space, 1000);
                 pic->transfer = space->transfer;
+                pic->mastering = hdrMasteringPrimaries(*space);
                 hdrViewImage(full.light, *space, 1000, pic->contentPeak, pic->rgba);  // (rolled off as drawn)
                 if (calibration) calibrateHdrPicture(pic->rgba, pic->width, pic->height, *calibration, white);
                 hdr = std::move(pic);
