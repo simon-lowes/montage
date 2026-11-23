@@ -109,6 +109,9 @@ std::string offerThroughRelay(const std::string& sdp, const std::function<uint16
 
 // The family of relayed address a viewer's offer needs: 6 when its UDP candidates' addresses are all IPv6, else 4.
 int offerFamily(const std::string& sdp);
+// How many UDP candidates with an IPv4 or IPv6 address a viewer's offer has: what a bridge can carry to. None, and
+// the viewer cannot be reached through the relay (a browser that got no address at the relay offers none).
+int offerAddresses(const std::string& sdp);
 
 // Montage's answer from behind a bridge: its loopback candidate becomes the address at the relay, as a relay
 // candidate, and any other candidate is left out. `localPort` is given the loopback port it had (0 when none).

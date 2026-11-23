@@ -474,6 +474,17 @@ int offerFamily(const std::string& sdp) {
     return v6 > 0 && v4 == 0 ? 6 : 4;
 }
 
+int offerAddresses(const std::string& sdp) {
+    int n = 0;
+    mapLines(sdp, [&](const QString& line) {
+        Candidate c;
+        Address a;
+        if (readCandidate(line, c) && c.transport.compare(QLatin1String("udp"), Qt::CaseInsensitive) == 0 && readAddress(c.address, a)) ++n;
+        return QString();
+    });
+    return n;
+}
+
 std::string answerThroughRelay(const std::string& sdp, const std::string& relayedIp, uint16_t relayedPort, uint16_t* localPort) {
     if (localPort) *localPort = 0;
     bool given = false;

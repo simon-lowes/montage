@@ -1120,6 +1120,10 @@ struct BrowserReviewBackend::Impl {
                 return respond(c, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
         }
         if (!settings.relayOnly) return answerOffer(c, sdp, hdr, nullptr);
+        // (only through the relay, a viewer is reached at its address there: a browser that got none, as Firefox
+        // gets none from a relay at ::1, is told so, not left to fail its checks)
+        if (offerAddresses(sdp.toStdString()) == 0)
+            return respond(c, "400 Bad Request", {}, "This browser got no address at the review's relay, so it cannot watch through it");
         auto bridge = std::make_shared<RelayBridge>(relay, relayLogin);
         {
             std::lock_guard lock(m);

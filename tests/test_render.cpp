@@ -25892,6 +25892,15 @@ colorspaces:
                                  "a=candidate:3 1 udp 41885439 127.0.0.1 " + QByteArray::number(viewer[2]->localPort()) + " typ relay raddr 0.0.0.0 rport 0\r\n" +
                                  "a=candidate:4 1 tcp 1518280447 127.0.0.1 9 typ host tcptype active\r\n"
                                  "a=candidate:5 1 udp 2122262783 ::1 50005 typ host\r\na=end-of-candidates\r\n";
+        // An offer with no address a bridge could carry to (a browser that got none at the relay: only a TCP and a
+        // named candidate) is refused at once, saying so, and holds no bridge.
+        QByteArray none;
+        for (const QByteArray& line : offer.split('\n'))
+            if (!line.startsWith("a=candidate:") || line.contains(" tcp ")) none += line + '\n';
+        none += "a=candidate:6 1 udp 2122260223 4f0c2b1e-0d9a-4e4b-9c55-07c1e41a4f53.local 50006 typ host\r\n";
+        const QByteArray refused = httpsRequest({}, rig.port(), "POST", "/whep", QByteArray::fromStdString(rig.settings.passphrase), none, "application/sdp", 20000);
+        QVERIFY2(httpStatusOf(refused) == 400 && httpBodyOf(refused).contains("no address at the review's relay"), refused.left(400).constData());
+        QCOMPARE(rig.review->stats().bridges.size(), size_t(0));
         const QByteArray response = httpsRequest({}, rig.port(), "POST", "/whep", QByteArray::fromStdString(rig.settings.passphrase), offer, "application/sdp", 20000);
         QVERIFY2(httpStatusOf(response) == 201, response.left(400).constData());
         // The answer offers one candidate: Montage's address at the relay.
@@ -26433,6 +26442,10 @@ colorspaces:
         QCOMPARE(offerFamily(six), 6);
         QCOMPARE(offerFamily(six + "a=candidate:4 1 udp 41885439 203.0.113.5 50004 typ relay raddr 0.0.0.0 rport 0\r\n"), 4);
         QCOMPARE(offerFamily("v=0\r\n"), 4);
+        // (what a bridge can carry to: the UDP candidates with addresses, not names or TCP)
+        QCOMPARE(offerAddresses(six), 1);
+        QCOMPARE(offerAddresses("v=0\r\na=candidate:2 1 udp 2122260223 4f0c2b1e.local 50006 typ host\r\n"), 0);
+        QCOMPARE(offerAddresses("v=0\r\n"), 0);
         QCOMPARE(offerThroughRelay(six, [](const std::string& ip, uint16_t port) { return uint16_t(ip == "2001:db8::5" && port == 50003 ? 40001 : 0); }),
                  std::string("v=0\r\na=candidate:1 1 UDP 41885439 127.0.0.1 40001 typ host\r\n"));
         uint16_t local = 0;
@@ -26917,6 +26930,7 @@ colorspaces:
             turnPort = fake->port();
         }
         const bool firefox = transport != "tls" && !GeckoBrowser::firefox().empty() && !GeckoBrowser::geckodriver().empty();
+        bool firefoxPlays = firefox;
         ChromeTab tab;
         QVERIFY2(tab.start(&why, {"--allow-loopback-in-peer-connection"}), why.c_str());
         GeckoBrowser fx;
@@ -27001,12 +27015,24 @@ colorspaces:
                            .toString() +
                        " " + QString::fromUtf8(said());
             };
+            const int addressesBefore = fake ? fake->allocations.load() : 0;
             const QString fxJoined = fx.js("__montage.join('Bo', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString();
-            QVERIFY2(fxJoined == QStringLiteral("joined"), (fxJoined + " " + fxSaid()).toUtf8().constData());
-            QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30), fxSaid().toUtf8().constData());
-            st = rig.review->stats();
-            QCOMPARE(st.bridges.size(), size_t(2));
-            QCOMPARE(st.bridgeThreads, 1);
+            if (ipv6 && fxJoined != QStringLiteral("joined")) {
+                // Firefox asks a relay at ::1 for nothing (on Linux and macOS alike, the test's relay and coturn
+                // alike: the relay hears nothing from it), so it offers no address there; Montage tells it so at
+                // once, with no bridge begun for it, in place of an answer whose checks could only fail.
+                QVERIFY2(fxJoined.contains(QStringLiteral("no address at the review's relay")), (fxJoined + " " + fxSaid()).toUtf8().constData());
+                if (fake) QCOMPARE(fake->allocations.load(), addressesBefore);
+                QCOMPARE(rig.review->stats().bridges.size(), size_t(1));
+                firefoxPlays = false;
+                qInfo("Firefox got no address at the relay on ::1, and was told so");
+            } else {
+                QVERIFY2(fxJoined == QStringLiteral("joined"), (fxJoined + " " + fxSaid()).toUtf8().constData());
+                QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30), fxSaid().toUtf8().constData());
+                st = rig.review->stats();
+                QCOMPARE(st.bridges.size(), size_t(2));
+                QCOMPARE(st.bridgeThreads, 1);
+            }
         } else {
             qInfo("Chrome alone through the relay over %s%s", qPrintable(transport), transport == "tls" ? " (Firefox does not take a relay's certificate no root signed)" : "");
         }
@@ -27028,9 +27054,9 @@ colorspaces:
                                                       "if (!p) r.forEach(s => { if (s.type === 'candidate-pair' && s.selected) p = s; });"
                                                       "const c = p ? r.get(p.remoteCandidateId) : null; return c ? (c.port || c.portNumber || 0) : 0; })");
             const quint16 bridgePort = quint16(tab.js(chosenPort).toInt());
-            const quint16 secondPort = firefox ? quint16(fx.js(chosenPort).toInt()) : quint16(0);
-            QVERIFY(bridgePort > 0 && (!firefox || (secondPort > 0 && secondPort != bridgePort)));
-            const quint64 fromBridge = fake->sendIndicationsFrom(bridgePort) + (firefox ? fake->sendIndicationsFrom(secondPort) : 0);
+            const quint16 secondPort = firefoxPlays ? quint16(fx.js(chosenPort).toInt()) : quint16(0);
+            QVERIFY(bridgePort > 0 && (!firefoxPlays || (secondPort > 0 && secondPort != bridgePort)));
+            const quint64 fromBridge = fake->sendIndicationsFrom(bridgePort) + (firefoxPlays ? fake->sendIndicationsFrom(secondPort) : 0);
             st = rig.review->stats();
             quint64 sent = 0;
             for (const auto& b : st.bridges) sent += b.toRelay;
