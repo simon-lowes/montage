@@ -34185,8 +34185,11 @@ colorspaces:
         const Image small = picture(640, 360), square = picture(512, 512);
         const size_t smallBytes = size_t(640) * 360 * 16, squareBytes = size_t(512) * 512 * 16;
         gpu::setTextureLimitForTesting(0);
-        gpu::resetStats();
         Image out;
+        // (tables earlier frames left on the GPU, such as Aperture Glare's while its kernel is kept, go once nine
+        // frames have not used them)
+        for (int i = 0; i < 9; ++i) QVERIFY(gpu::execute(frameOf(small, nullptr), &out));
+        gpu::resetStats();
         // What a frame holds is counted: its picture, the canvas and what is read back at the least.
         QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
         gpu::Stats st = gpu::stats();
