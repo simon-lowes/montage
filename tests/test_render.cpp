@@ -73,6 +73,7 @@
 #include "render/Dcp.h"
 #include "render/Imf.h"
 #include "render/ImfEvents.h"
+#include "render/PackageFiles.h"
 #include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
@@ -10274,6 +10275,271 @@ colorspaces:
         }
     }
 
+    void exportsImfEventsInEveryApplication() {
+        // Markers travel as timed events in archival (#5), ProRes and DPP masters too, and as a JSON document when
+        // asked: each package passes the checker and comes back as the same markers. A supplemental to a package with
+        // another maker's events track plays that track again as it is.
+        QTemporaryDir dir;
+        std::string err;
+        auto marker = [](FrameTime t, FrameTime d, const std::string& name, const std::string& comment, int colour) {
+            Marker m;
+            m.t = t, m.duration = d, m.name = name, m.comment = comment, m.color = colour;
+            return m;
+        };
+        auto describe = [](const std::vector<Marker>& ms) {
+            QStringList out;
+            for (const Marker& m : ms)
+                out << QStringLiteral("%1+%2 [%3] [%4] %5%6%7").arg(m.t).arg(m.duration).arg(QString::fromStdString(m.name), QString::fromStdString(m.comment)).arg(m.color)
+                           .arg(m.chapter ? " chapter" : "", m.adBreak ? " ad-break" : "");
+            return out.join("\n");
+        };
+        auto readBack = [&](const std::string& folder) {
+            Project q = makeDefaultProject();
+            const ImportResult in = importImf(q, folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+            const Sequence* opened = in.ok ? q.findSequence(in.sequence) : nullptr;
+            return opened ? opened->markers : std::vector<Marker>{marker(-1, 0, in.error, "", 0)};
+        };
+        auto withMarkers = [&](Sequence& s) {
+            s.markers.push_back(marker(1, 0, "Opening \"titles\"", "Fade in\nfrom black \xe2\x80\x94 \xc3\xbcn\xc3\xaf", 2));
+            s.markers.back().chapter = true;
+            s.markers.push_back(marker(2, 3, "Ad break", "", 0));
+            s.markers.back().adBreak = true;
+            s.markers.push_back(marker(5, 0, "", "", 1));
+        };
+        auto eventsFile = [](const std::string& folder) {
+            const QDir out(QString::fromStdString(folder));
+            const QStringList files = out.entryList({"EVENTS_*.mxf"});
+            return files.size() == 1 ? out.filePath(files[0]) : QString();
+        };
+
+        // ---- The JSON form by itself: what Annex A.4 and A.5 ask, the same events back, and faults named.
+        {
+            std::vector<ImfEvent> events = imfEventsOfMarkers([&] {
+                Sequence s;
+                withMarkers(s);
+                return s.markers;
+            }(), 0, 6, 6);
+            QCOMPARE(events.size(), size_t(3));
+            const std::string json = imfEventsDocument(events, 25, 1, true);
+            const QJsonObject doc = QJsonDocument::fromJson(QByteArray::fromStdString(json)).object();
+            QVERIFY2(doc.value("id").toString().startsWith("urn:uuid:") && doc.value("editRate").toString() == "25 1", json.c_str());
+            QVERIFY(doc.value("objects").isArray() && doc.value("events").toArray().size() == 3);
+            // (counts are strings, as the schema has them)
+            QCOMPARE(doc.value("events").toArray()[1].toObject().value("startCount"), QJsonValue("2"));
+            QCOMPARE(doc.value("events").toArray()[1].toObject().value("endCount"), QJsonValue("5"));
+            QVERIFY2(checkImfEventsDocument(json).empty(), json.c_str());
+            std::vector<ImfEvent> back;
+            uint32_t num = 0, den = 0;
+            QVERIFY2(parseImfEventsDocument(json, back, num, den, &err), err.c_str());
+            QVERIFY(num == 25 && den == 1 && back.size() == 3);
+            for (size_t i = 0; i < 3; ++i) QVERIFY(back[i].same(events[i]) && back[i].id == events[i].id);
+            QCOMPARE(imfEventsDocument(back, 25, 1, true), json);  // (the same events, the same document)
+            // The same events as the XML form holds.
+            std::vector<ImfEvent> fromXml;
+            QVERIFY(parseImfEventsDocument(imfEventsDocument(events, 25, 1), fromXml, num, den));
+            for (size_t i = 0; i < 3; ++i) QVERIFY(fromXml[i].same(back[i]));
+            auto problems = [](const QString& x) { return checkImfEventsDocument(x.toStdString()); };
+            const QString good = QString::fromStdString(json);
+            QVERIFY(!problems(QString(good).replace("\"endCount\":\"5\"", "\"endCount\":\"1\"")).empty());
+            QVERIFY(!problems(QString(good).replace("\"startCount\":\"2\"", "\"startCount\":2")).empty());  // (a number, not a string)
+            QVERIFY(!problems(QString(good).replace("\"id\":\"M2\"", "\"id\":\"M1\"")).empty());
+            QVERIFY(!problems(QString(good).replace("\"id\":\"M3\"", "\"id\":\"M,3\"")).empty());
+            QVERIFY(!problems(QString(good).replace("\"editRate\": \"25 1\"", "\"editRate\": \"25\"")).empty());
+            QVERIFY(!problems(QString(good).replace("\"objects\": [],", "")).empty());
+            QVERIFY(!problems("[1, 2]").empty());
+        }
+
+        // ---- Each application's master, with the document as XML and as JSON.
+        struct Case {
+            const char* name;
+            int application;
+            int width, height, fps;
+            bool json;
+        };
+        const Case cases[] = {{"Archive", 5, 320, 180, 24, false}, {"ProRes", 45, 320, 180, 24, false}, {"ProRes JSON", 45, 320, 180, 24, true},
+                              {"DPP", 59, 1920, 1080, 25, true},   {"Archive JSON", 5, 320, 180, 24, true}};
+        for (const Case& c : cases) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = c.width, s.height = c.height, s.fps = Rational{c.fps, 1};
+            if (c.application == 5) s.workingSpace = "acescct";
+            s.videoTracks[0].clips = {colorClip(p, 0.7f, 0.4f, 0.2f, 0, 3), colorClip(p, 0.2f, 0.4f, 0.7f, 3, 3)};
+            withMarkers(s);
+            ImfSettings st;
+            st.title = c.name;
+            st.captions = false;
+            st.application = c.application;
+            st.prores = "hq";
+            if (c.application == 59) st.kind = "programme";
+            st.eventsJson = c.json;
+            ImfResult r;
+            QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), qPrintable(QString("%1: %2").arg(c.name, QString::fromStdString(err))));
+            QVERIFY2(r.application == c.application && r.events == 3 && r.newEvents == 3, c.name);
+            const std::vector<std::string> issues = verifyImf(r.folder);
+            QVERIFY2(issues.empty(), qPrintable(QString("%1: %2").arg(c.name, issues.empty() ? QString() : QString::fromStdString(issues.front()))));
+            dcp::ImfTrackReader reader;
+            QVERIFY2(reader.open(eventsFile(r.folder).toStdString(), &err), err.c_str());
+            QCOMPARE(reader.textMime(), std::string(c.json ? "application/json" : "text/xml"));
+            std::string text;
+            QVERIFY(reader.text(text));
+            QCOMPARE(QJsonDocument::fromJson(QByteArray::fromStdString(text)).isObject(), c.json);
+            QVERIFY2(checkImfEventsDocument(text).empty(), text.c_str());
+            QFile cpl(QString::fromStdString(r.cpl));
+            QVERIFY(cpl.open(QIODevice::ReadOnly));
+            const QByteArray cplText = cpl.readAll();
+            QVERIFY(cplText.contains("<imfses:SimpleSchemeMediaTimedEventsSequence>") && cplText.contains("<imfebm:TimedEventsVirtualTrackParameterSet>"));
+            QVERIFY(cplText.contains(c.json ? "<r1:TextMIMEType>application/json</r1:TextMIMEType>" : "<r1:TextMIMEType>text/xml</r1:TextMIMEType>"));
+            // Photon's general checks, when it is here (it does not know the events' sequence, and so not its descriptor).
+            if (c.application == 5) {
+                QStringList photon = photonErrors(QString::fromStdString(r.folder));
+                photon.removeIf([](const QString& e) {
+                    return e.contains("Unsupported sequence type or schema Tag: imfses:SimpleSchemeMediaTimedEventsSequence") ||
+                           e.contains("is not referenced by any resource");
+                });
+                QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            }
+            // Read back: the same markers.
+            std::vector<Marker> want = s.markers;
+            std::stable_sort(want.begin(), want.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            QCOMPARE(describe(readBack(r.folder)), describe(want));
+            // Without markers asked for: no events track, as before.
+            if (c.application == 45 && !c.json) {
+                ImfSettings plain = st;
+                plain.events = false;
+                QTemporaryDir other;
+                ImfResult rp;
+                QVERIFY2(exportImf(p, s, plain, other.path().toStdString(), &rp, {}, &err), err.c_str());
+                QVERIFY(rp.events == 0 && eventsFile(rp.folder).isEmpty());
+                QVERIFY(readBack(rp.folder).empty());
+            }
+        }
+
+        // ---- A JSON document's supplemental keeps the form (one virtual track's files are all of one type).
+        if (openJpegAvailable()) {
+            QTemporaryDir json;
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320, s.height = 180, s.fps = Rational{24, 1};
+            s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.25f, 0.75f, 0, 12));
+            withMarkers(s);
+            ImfSettings st;
+            st.title = "Json Events";
+            st.threads = 2;
+            st.eventsJson = true;
+            ImfResult r;
+            QVERIFY2(exportImf(p, s, st, json.path().toStdString(), &r, {}, &err), err.c_str());
+            std::vector<std::string> issues = verifyImf(r.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            Sequence now = s;
+            now.markers[1].comment = "Two minutes";
+            ImfSettings sup = st;
+            sup.supplementOf = r.folder;
+            sup.eventsJson = false;  // (asked for XML: the earlier track's form is kept all the same)
+            ImfResult r2;
+            QVERIFY2(exportImf(p, now, sup, json.path().toStdString(), &r2, {}, &err), err.c_str());
+            QVERIFY(r2.supplemental && r2.events == 3 && r2.newEvents == 1);
+            dcp::ImfTrackReader reader;
+            QVERIFY(reader.open(eventsFile(r2.folder).toStdString(), &err));
+            QCOMPARE(reader.textMime(), std::string("application/json"));
+            issues = verifyImf(r2.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            std::vector<Marker> want = now.markers;
+            std::stable_sort(want.begin(), want.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            QCOMPARE(describe(readBack(r2.folder)), describe(want));
+
+            // ---- Another maker's events track. The fixture is the package above with its events track file made
+            // another scheme's (the scheme's name changed in the track file, its document and its descriptor, and the
+            // hashes that cover them put right), so Montage does not take it for its own markers.
+            QTemporaryDir foreign;
+            ImfResult made;
+            ImfSettings plain = st;
+            plain.title = "Foreign";
+            plain.eventsJson = false;
+            QVERIFY2(exportImf(p, s, plain, foreign.path().toStdString(), &made, {}, &err), err.c_str());
+            const QString theirs = eventsFile(made.folder);
+            QVERIFY(!theirs.isEmpty());
+            auto fileText = [](const QString& path) {
+                QFile f(path);
+                return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+            };
+            auto writeText = [](const QString& path, const QByteArray& bytes) {
+                QFile f(path);
+                return f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(bytes) == bytes.size();
+            };
+            auto utf16 = [](const QByteArray& a) {
+                QByteArray out;
+                for (char ch : a) out.append('\0'), out.append(ch);
+                return out;
+            };
+            const QByteArray mine = kImfMarkerScheme, other = "urn:example:imf:markers";
+            QCOMPARE(mine.size(), other.size());
+            const QDir pkg(QString::fromStdString(made.folder));
+            const QString pkl = pkg.filePath(pkg.entryList({"PKL_*.xml"}).value(0));
+            const QString oldEventsHash = packageFileHash(theirs), oldCplHash = packageFileHash(QString::fromStdString(made.cpl));
+            QByteArray mxf = fileText(theirs);
+            QVERIFY(mxf.contains(mine) || mxf.contains(utf16(mine)));
+            mxf.replace(utf16(mine), utf16(other));
+            mxf.replace(mine, other);
+            QVERIFY(writeText(theirs, mxf));
+            QByteArray cplText = fileText(QString::fromStdString(made.cpl));
+            QVERIFY(cplText.contains(oldEventsHash.toUtf8()));
+            cplText.replace(mine, other);
+            cplText.replace(oldEventsHash.toUtf8(), packageFileHash(theirs).toUtf8());
+            QVERIFY(writeText(QString::fromStdString(made.cpl), cplText));
+            QByteArray pklText = fileText(pkl);
+            QVERIFY(pklText.contains(oldEventsHash.toUtf8()) && pklText.contains(oldCplHash.toUtf8()));
+            pklText.replace(oldEventsHash.toUtf8(), packageFileHash(theirs).toUtf8());
+            pklText.replace(oldCplHash.toUtf8(), packageFileHash(QString::fromStdString(made.cpl)).toUtf8());
+            QVERIFY(writeText(pkl, pklText));
+            issues = verifyImf(made.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            ImfComposition before;
+            QVERIFY2(readImfComposition(made.cpl, before, &err), err.c_str());
+            const ImfVirtualTrack* theirTrack = nullptr;
+            for (const ImfVirtualTrack& t : before.tracks)
+                if (t.kind == "SimpleSchemeMediaTimedEventsSequence") theirTrack = &t;
+            QVERIFY(theirTrack && theirTrack->resources.size() == 1);
+            {
+                dcp::ImfTrackReader r0;
+                QVERIFY(r0.open(theirs.toStdString(), &err));
+                QCOMPARE(r0.eventSchemes(), std::string("urn:example:imf:markers http://www.smpte-ra.org/ns/2067-206/2023/simple-scheme"));
+            }
+            // A supplemental with new markers of Montage's own: the other maker's track is played again as it is (its
+            // id, its track file and hash, its relationship to the picture), beside a track of Montage's markers.
+            for (const bool own : {true, false}) {
+                ImfSettings sup2 = plain;
+                sup2.supplementOf = made.folder;
+                sup2.events = own;
+                ImfResult rs;
+                QVERIFY2(exportImf(p, now, sup2, foreign.path().toStdString(), &rs, {}, &err), err.c_str());
+                QVERIFY2(rs.supplemental && rs.carriedEventTracks == 1 && rs.leftEventTracks == 0 && rs.codedFrames == 0, qPrintable(QString::number(rs.carriedEventTracks)));
+                QCOMPARE(rs.newEvents, own ? 3 : 0);
+                issues = verifyImf(rs.folder);
+                QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+                ImfComposition after;
+                QVERIFY2(readImfComposition(rs.cpl, after, &err), err.c_str());
+                const ImfVirtualTrack* carried = nullptr;
+                int eventTracks = 0;
+                for (const ImfVirtualTrack& t : after.tracks) {
+                    if (t.kind != "SimpleSchemeMediaTimedEventsSequence") continue;
+                    ++eventTracks;
+                    if (t.id == theirTrack->id) carried = &t;
+                }
+                QCOMPARE(eventTracks, own ? 2 : 1);
+                QVERIFY(carried && carried->resources.size() == 1 && carried->length() == theirTrack->length());
+                QCOMPARE(carried->resources[0].trackFile, theirTrack->resources[0].trackFile);
+                QCOMPARE(carried->resources[0].hash, theirTrack->resources[0].hash);
+                QCOMPARE(carried->resources[0].intrinsic, theirTrack->resources[0].intrinsic);
+                const QByteArray supCpl = fileText(QString::fromStdString(rs.cpl));
+                QVERIFY(supCpl.contains("<imfebm:TrackId>urn:uuid:" + QByteArray::fromStdString(theirTrack->id) + "</imfebm:TrackId>"));
+                QVERIFY(supCpl.contains("<r1:EventSchemeURIs>urn:example:imf:markers http://www.smpte-ra.org/ns/2067-206/2023/simple-scheme</r1:EventSchemeURIs>"));
+                QCOMPARE(supCpl.count("<imfebm:TimedEventsVirtualTrackParameterSet>"), own ? 2 : 1);
+                // (the supplemental holds none of the other maker's files: it plays the earlier package's)
+                QCOMPARE(QDir(QString::fromStdString(rs.folder)).entryList({"EVENTS_*.mxf"}).size(), own ? 1 : 0);
+            }
+        }
+    }
+
     void exportsImfMaster() {
         if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
         QTemporaryDir dir;
@@ -11708,6 +11974,114 @@ colorspaces:
             };
             QVERIFY(named("has no ContentKind") && named("more than one application"));
         }
+    }
+
+    void checksDppSoundLabels() {
+        // An Application DPP master's sound is held to RDD 59-1 8 and ST 2067-2 5.3.6: each channel labelled once, in
+        // one soundfield group that holds only its own channels, by labels of ST 2067-8 or ST 377-42. A fault is
+        // reported with the rule's number. A 5.1 in another order than the customary one is advice, not a fault (no
+        // SMPTE rule orders channels), and the check says that the DPP's own AS-11 metadata is absent.
+        QTemporaryDir dir;
+        std::string err;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1920, s.height = 1080, s.fps = Rational{25, 1};
+        s.audioLayout = "5.1";
+        s.videoTracks[0].clips = {colorClip(p, 0.6f, 0.6f, 0.6f, 0, 3)};
+        ImfSettings st;
+        st.title = "DPP Sound";
+        st.captions = false;
+        st.application = 59;
+        st.prores = "hq";
+        st.kind = "programme";
+        ImfResult r;
+        QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QCOMPARE(r.channels, 6);
+        std::vector<std::string> advice;
+        std::vector<std::string> issues = verifyImf(r.folder, {}, &advice);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        // What a correct one is told: only that DPP003's metadata is not there.
+        QCOMPARE(advice.size(), size_t(1));
+        QVERIFY2(advice[0].find("DPP003") != std::string::npos && advice[0].find("RDD 59-1 9.2") != std::string::npos, advice[0].c_str());
+        // (and nothing is advised about a package of another application)
+        {
+            Project q = makeDefaultProject();
+            Sequence& t = *q.active();
+            t.width = 320, t.height = 180, t.fps = Rational{24, 1};
+            t.videoTracks[0].clips = {colorClip(q, 0.6f, 0.6f, 0.6f, 0, 3)};
+            ImfSettings other = st;
+            other.application = 45;
+            other.kind = "feature";
+            ImfResult ro;
+            QTemporaryDir od;
+            QVERIFY2(exportImf(q, t, other, od.path().toStdString(), &ro, {}, &err), err.c_str());
+            std::vector<std::string> none{"x"};
+            QVERIFY(verifyImf(ro.folder, {}, &none).empty());
+            QVERIFY(none.empty());
+        }
+        // Fixtures: the composition's descriptor of the sound changed (and the packing list's hash of the composition
+        // put right, so only the labels are at fault).
+        const QDir pkg(QString::fromStdString(r.folder));
+        const QString cplPath = QString::fromStdString(r.cpl), pklPath = pkg.filePath(pkg.entryList({"PKL_*.xml"}).value(0));
+        auto fileText = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+        auto writeText = [](const QString& path, const QByteArray& bytes) {
+            QFile f(path);
+            return f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(bytes) == bytes.size();
+        };
+        const QByteArray cpl = fileText(cplPath), pkl = fileText(pklPath);
+        const QByteArray cplHash = packageFileHash(cplPath).toUtf8();
+        QVERIFY(pkl.contains(cplHash));
+        auto sym = [](const char* s) { return QByteArray("<r1:MCATagSymbol>") + s + "</r1:MCATagSymbol>"; };
+        for (const char* want : {"chL", "chR", "chC", "chLFE", "chLs", "chRs", "sg51"}) QVERIFY2(cpl.count(sym(want)) == 1, want);
+        auto checked = [&](const std::function<void(QByteArray&)>& change, std::vector<std::string>* adviceOut) {
+            QByteArray c = cpl;
+            change(c);
+            bool ok = c != cpl && writeText(cplPath, c);
+            QByteArray k = pkl;
+            k.replace(cplHash, packageFileHash(cplPath).toUtf8());
+            ok = ok && writeText(pklPath, k);
+            std::vector<std::string> found = ok ? verifyImf(r.folder, {}, adviceOut) : std::vector<std::string>{"the fixture was not written"};
+            writeText(cplPath, cpl);
+            writeText(pklPath, pkl);
+            return found;
+        };
+        auto has = [](const std::vector<std::string>& list, const char* what) {
+            return std::any_of(list.begin(), list.end(), [&](const std::string& i) { return i.find(what) != std::string::npos; });
+        };
+        auto all = [](const std::vector<std::string>& list) {
+            QStringList out;
+            for (const std::string& i : list) out << QString::fromStdString(i);
+            return out.join("\n");
+        };
+        // The left and right labels the other way round: every channel still labelled once with one of the 5.1's, so
+        // no rule is broken; the order is advised.
+        issues = checked([&](QByteArray& c) {
+            c.replace(sym("chL"), sym("chX"));
+            c.replace(sym("chR"), sym("chL"));
+            c.replace(sym("chX"), sym("chR"));
+        }, &advice);
+        QVERIFY2(!has(issues, "5.3.6") && !has(issues, "RDD 59-1 8"), qPrintable(all(issues)));
+        QVERIFY2(has(advice, "channels are R, L, C, LFE, Ls, Rs") && has(advice, "commonly ask for L, R, C, LFE, Ls, Rs"), qPrintable(all(advice)));
+        // Two channels both labelled Left.
+        issues = checked([&](QByteArray& c) { c.replace(sym("chR"), sym("chL")); }, nullptr);
+        QVERIFY2(has(issues, "more than one channel chL (ST 2067-2 5.3.6.6"), qPrintable(all(issues)));
+        // Two labels for channel 1, none for channel 2.
+        issues = checked([&](QByteArray& c) { c.replace("<r1:MCAChannelID>2</r1:MCAChannelID>", "<r1:MCAChannelID>1</r1:MCAChannelID>"); }, nullptr);
+        QVERIFY2(has(issues, "labels channel 1 2 times (ST 2067-2 5.3.6.2") && has(issues, "labels channel 2 not at all (ST 2067-2 5.3.6.2"), qPrintable(all(issues)));
+        // A channel that is not one of the 5.1's.
+        issues = checked([&](QByteArray& c) { c.replace(sym("chLs"), sym("chLss")); }, nullptr);
+        QVERIFY2(has(issues, "chLss, which is not a channel of sg51 (ST 2067-2 5.3.6.6)"), qPrintable(all(issues)));
+        // A label from outside the registry the two documents draw on.
+        issues = checked([&](QByteArray& c) {
+            c.replace("urn:smpte:ul:060e2b34.0401010d.03020103.00000000", "urn:smpte:ul:060e2b34.0401010d.0e090103.00000000");
+        }, nullptr);
+        QVERIFY2(has(issues, "names channel 3 (chC) by a label of neither ST 2067-8 nor ST 377-42 (RDD 59-1 8)"), qPrintable(all(issues)));
+        // Put back, the package passes again.
+        issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
     }
 
     void ownProResBitstream() {

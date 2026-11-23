@@ -1,9 +1,10 @@
 // Montage — a sequence's markers in an IMF package as event-based, text-based metadata (SMPTE ST 2067-206:2026).
 //
 // Each marker within the master becomes an event of a Simple Scheme Timed Events Resource (ST 2067-206 Annex A, as
-// XML): its frame and the frame it ends on as startCount and endCount at the composition's edit rate (a marker without
-// a duration an instant: both the same), and its name, comment, colour and kind (a chapter or an ad break) in
-// elements of Montage's own namespace, which the Simple Scheme leaves room for. The document's Event Scheme is
+// XML or as JSON): its frame and the frame it ends on as startCount and endCount at the composition's edit rate (a
+// marker without a duration an instant: both the same), and its name, comment, colour and kind (a chapter or an ad
+// break) in elements of Montage's own namespace (in JSON, in an object named by it), which the Simple Scheme leaves
+// room for. The document's Event Scheme is
 // Montage's markers scheme, a child of the Simple Scheme (its URI first in the track file's EventSchemeURIs, the
 // Simple Scheme's after it), so other readers of the Simple Scheme take the events' times and ids.
 //
@@ -46,13 +47,14 @@ std::vector<ImfEvent> imfEventsOfMarkers(const std::vector<Marker>& markers, Fra
 // A marker for an event at composition frame `at` (its start), lasting to its end.
 Marker markerOfImfEvent(const ImfEvent& e, int64_t at, int64_t length);
 
-// The Simple Scheme XML document of `events` at the edit rate num/den; its id a name-based UUID of what it holds (so
-// the same events make the same document).
-std::string imfEventsDocument(const std::vector<ImfEvent>& events, uint32_t num, uint32_t den);
-// Reads a Simple Scheme document (XML): its events (counts as written; an event without startCount starts at
-// INT64_MIN, one without endCount ends at INT64_MAX) and its edit rate.
+// The Simple Scheme document of `events` at the edit rate num/den, as XML (A.3) or, with `json`, as JSON (A.4: the
+// same properties, what a marker has in an object named by Montage's scheme); its id a name-based UUID of what it
+// holds (so the same events make the same document).
+std::string imfEventsDocument(const std::vector<ImfEvent>& events, uint32_t num, uint32_t den, bool json = false);
+// Reads a Simple Scheme document, XML or JSON (told apart by how it starts): its events (counts as written; an event
+// without startCount starts at INT64_MIN, one without endCount ends at INT64_MAX) and its edit rate.
 bool parseImfEventsDocument(const std::string& xml, std::vector<ImfEvent>& events, uint32_t& num, uint32_t& den, std::string* error = nullptr);
-// What Annex A's schema and A.5 ask of a Simple Scheme XML document that it lacks (empty: none).
+// What Annex A (its schema for XML, A.4 for JSON) and A.5 ask of a Simple Scheme document that it lacks (empty: none).
 std::vector<std::string> checkImfEventsDocument(const std::string& xml);
 
 // The stretches [from, to) of a composition of `frames` edit units where `now`'s events differ from `was`'s (at the

@@ -26,12 +26,12 @@
 // (http://www.smpte-ra.org/ns/2067-21/2021, ST 2067-21:2023's Table 15; pictures to 4096 x 3112), made as before but
 // that HTJ2K pictures now go under it too (Montage wrote /2023, which no edition defines).
 //
-// Markers (ST 2067-206:2026): in Application #2E to the 2026 edition, the sequence's markers within the master travel
-// as event-based, text-based metadata
-// (render/ImfEvents.h), a Simple Scheme document in a Timed Events Track File on a SimpleSchemeMediaTimedEventsSequence
-// whose parameter set relates it to the picture; a supplemental carries only the events that changed (its composition
-// plays the earlier track file around them), and opening any package brings a Simple Scheme XML events track back as
-// markers.
+// Markers (ST 2067-206:2026): in every application (Application #2E to the 2026 edition), the sequence's markers
+// within the master travel as event-based, text-based metadata (render/ImfEvents.h), a Simple Scheme document (XML,
+// or JSON when asked) in a Timed Events Track File on a SimpleSchemeMediaTimedEventsSequence whose parameter set
+// relates it to the picture; a supplemental carries only the events that changed (its composition plays the earlier
+// track file around them) and plays another maker's timed events tracks of the earlier package again as they are;
+// opening any package brings a Simple Scheme events track, XML or JSON, back as markers.
 //
 // Archival masters (Application #5, ST 2067-50): the programme as ACES 2065-1, half-float OpenEXR frames (ST 2065-4)
 // wrapped frame by frame (ST 2065-5), graded (the grade in the pictures, in the working space's light) or ungraded (each
@@ -131,9 +131,11 @@ struct ImfSettings {
     bool fullRange = false;
     // Application #2E: the edition of ST 2067-21 followed, 2026 or 2021 (a supplemental keeps the earlier package's).
     int edition = 2026;
-    // The sequence's markers as ST 2067-206 timed events: Application #2E to the 2026 edition (the other applications,
-    // and the 2021 edition, are made as before).
+    // The sequence's markers as ST 2067-206 timed events, in every application (Application #2E to the 2026 edition:
+    // its 2021 identification is made as before). `eventsJson`: the document as JSON (Annex A.4) rather than XML; a
+    // supplemental keeps the form of the earlier package's.
     bool events = true;
+    bool eventsJson = false;
     // Application #5: the grade in the pictures; false leaves it off.
     bool graded = true;
     // Application #5: sequence frames (within what is exported) also given as target frames.
@@ -167,6 +169,9 @@ struct ImfResult {
     int edition = 0;             // Application #2E: the edition followed (2026 or 2021)
     int events = 0;              // the events (markers) the composition plays, 0 with no timed events track
     int newEvents = 0;           // ... those in the package's own track file (a supplemental's: those of the stretches that changed)
+    // A supplemental: other makers' timed events tracks of the earlier package played again as they are, and those
+    // left out because they end before the new composition does.
+    int carriedEventTracks = 0, leftEventTracks = 0;
     bool supplemental = false;
     int64_t codedFrames = 0;     // pictures in the package's own track file (a supplemental's: those that changed)
     int64_t newSamples = 0;      // sample frames in its own sound track files
@@ -273,7 +278,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
 // descriptors, durations and rates, one encoding, MIME type and scheme along a virtual track, the Simple Scheme document as
 // Annex A has it at the resources' edit rate, the virtual track's parameter set relating it to another track). An
 // empty list means it passed; `progress` may return false to stop ("Stopped").
-std::vector<std::string> verifyImf(const std::string& folder, const std::function<bool(double)>& progress = {});
+// `advice` (when given) takes what is not a fault but worth knowing: for an Application DPP package, that the DPP's own
+// AS-11 metadata (Recommendation DPP003) is absent, and a 5.1 or 7.1 whose channels are not in the customary order.
+std::vector<std::string> verifyImf(const std::string& folder, const std::function<bool(double)>& progress = {},
+                                   std::vector<std::string>* advice = nullptr);
 
 // Frame `index` of an IMF picture track file decoded to RGB samples: JPEG 2000 at its depth, or ProRes (Application
 // ProRes and DPP) at its descriptor's (10 or 12; 4:4:4 decoded at 12), full range whatever its range (QE.1's 64 to 940
