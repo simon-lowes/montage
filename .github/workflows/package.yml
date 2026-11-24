@@ -112,6 +112,25 @@ jobs:
             || echo "::warning::Could not fetch the ProRes RAW sample; its decode test will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      # ctest prints a test's lines only when it fails: the macOS-only tests run again here with every line printed, and
+      # the step fails unless each passed (not skipped) and said what it ran.
+      - name: The Audio Unit and AVFoundation tests, seen to run
+        working-directory: build/tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -o pipefail
+          ./test_plugins -v1 hostsAppleAudioUnits appleAudioUnitsInAHost 2>&1 | tee "$RUNNER_TEMP/audio-units.txt"
+          ./test_render -v1 exportsProRes12Bit 2>&1 | tee "$RUNNER_TEMP/avfoundation.txt"
+          status=0
+          for t in hostsAppleAudioUnits appleAudioUnitsInAHost; do
+            grep -q "^PASS   : .*::$t()" "$RUNNER_TEMP/audio-units.txt" || { echo "::error::$t did not pass"; status=1; }
+          done
+          grep -q "^PASS   : .*::exportsProRes12Bit()" "$RUNNER_TEMP/avfoundation.txt" || { echo "::error::exportsProRes12Bit did not pass"; status=1; }
+          grep -q "aufx:lpas:appl: 40 blocks the same from its plug-in host" "$RUNNER_TEMP/audio-units.txt" || { echo "::error::no Audio Unit ran in a host"; status=1; }
+          grep -q "AVFoundation read 2 frames" "$RUNNER_TEMP/avfoundation.txt" || { echo "::error::AVFoundation did not read the file"; status=1; }
+          if grep -h "^SKIP" "$RUNNER_TEMP/audio-units.txt" "$RUNNER_TEMP/avfoundation.txt"; then status=1; fi
+          exit "$status"
       - name: Package
         run: scripts/package-macos.sh build
       - uses: actions/upload-artifact@v4

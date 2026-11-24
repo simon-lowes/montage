@@ -1249,6 +1249,7 @@ private slots:
         QVERIFY(other && other->activate(48000, 512));
         QVERIFY(other->loadState(state));
         QVERIFY(std::fabs(other->parameter(0) - 300) < 1);
+        qInfo("AULowpass hosted in Montage's process: its settings taken up by a second instance");
     }
 
     // Phase 15 #2: Apple's own Audio Units in a plug-in host give what they give in Montage's process, bit for bit.
@@ -1290,6 +1291,8 @@ private slots:
                          qPrintable(QString("%1, block %2").arg(id).arg(b)));
             }
             QVERIFY(!bypassed(there.get()));
+            qInfo("%s: 40 blocks the same from its plug-in host (process %lld) as in Montage's process", id,
+                  static_cast<long long>(hostProcessOf(there.get())));
         }
     }
 #endif

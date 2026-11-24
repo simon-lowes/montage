@@ -13108,6 +13108,9 @@ colorspaces:
                      }),
                      int64_t(2));
             QVERIFY2(worst <= 2 && over * 1000 <= total, qPrintable(QStringLiteral("worst %1, %2 of %3 more than a code apart").arg(worst).arg(over).arg(total)));
+            // (named in the log, so the packaging run shows that AVFoundation read the file)
+            qInfo("AVFoundation read 2 frames of ProRes 4444 XQ: at most %d codes apart, %lld of %lld samples more than one", worst,
+                  static_cast<long long>(over), static_cast<long long>(total));
         }
 #endif
     }
