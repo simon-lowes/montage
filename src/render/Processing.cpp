@@ -3584,7 +3584,8 @@ bool isGpuFilter(const std::string& type) {
                                                   "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
                                                   "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
                                                   "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare", "radial_blur",
-                                                  "aperture_glare", "painterly", "depth_blur"};
+                                                  "aperture_glare", "painterly", "depth_blur", "lens_distortion", "magnify",
+                                                  "drop_shadow", "broadcast_safe", "lens_correction", "edge_bevel", "layer_bevel"};
     return filters.count(type) > 0;
 }
 
@@ -4019,7 +4020,7 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                 f.passes.back().tableSlot = top;
             }
         } else if (ty == "wave_warp" || ty == "twirl" || ty == "spherize" || ty == "ripple" || ty == "turbulent_displace" ||
-                   ty == "motion_tile" || ty == "camera_shake" || ty == "corner_pin") {
+                   ty == "motion_tile" || ty == "camera_shake" || ty == "corner_pin" || ty == "lens_distortion") {
             // render/StyleFx's and render/VideoFx's warps: each pixel from where the warp says (gpufilter.frag's mode 26),
             // what is the same for the whole frame worked out here (as the CPU does, before any pixel)
             constexpr double kDeg = M_PI / 180;
@@ -4084,6 +4085,10 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                 if (sfx::cameraShakeMove(e, t, width, height, pixelScale, m))
                     add(26, {6, 0, 0, 0, float(W / 2), float(H / 2), float(m.ox), float(m.oy), float(m.zoom), float(std::cos(-m.angle)),
                              float(std::sin(-m.angle))});
+            } else if (ty == "lens_distortion") {
+                // (vfx::lensDistortion: about the layer's middle, over its half diagonal)
+                const double amount = std::clamp(e.p("amount", t, 0) / 100.0, -1.0, 1.0);
+                if (std::fabs(amount) >= 1e-4) add(26, {8, 0, 0, 0, float(W / 2), float(H / 2), float(std::hypot(W / 2, H / 2)), float(amount)});
             } else {
                 double q[4][2] = {{e.p("tl_x", t, 0) * W, e.p("tl_y", t, 0) * H},
                                   {e.p("tr_x", t, 1) * W, e.p("tr_y", t, 0) * H},
@@ -4103,6 +4108,85 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                             for (int c = 0; c < 3; ++c) f.passes.back().params[4 + r * 4 + c] = float(inv[r * 3 + c] / big);
                     }
                 }
+            }
+        } else if (ty == "magnify") {
+            // vfx::magnify, each pixel on its own (gpufilter.frag's mode 73)
+            const double radius = std::max(1.0, e.p("size", t, 40) / 100.0 * height * 0.5);
+            const float opacity = float(std::clamp(e.p("opacity", t, 100) / 100.0, 0.0, 1.0));
+            if (width > 0 && height > 0 && opacity > 0) {
+                add(73, {float(e.p("center_x", t, 0.5) * width), float(e.p("center_y", t, 0.5) * height), float(radius),
+                         float(std::max(1.0, e.p("magnification", t, 200) / 100.0)), float(std::max(0.0, e.p("feather", t, 0) * pixelScale)),
+                         float(std::max(0.0, e.p("border", t, 2) * pixelScale)), opacity, e.p("shape", t, 0) >= 0.5 ? 1.0f : 0.0f,
+                         float(e.p("border_color.r", t, 1)), float(e.p("border_color.g", t, 1)), float(e.p("border_color.b", t, 1))});
+            }
+        } else if (ty == "drop_shadow") {
+            // dropShadow: the layer's coverage moved and coloured (mode 74), blurred as gaussianBlur does, and the layer
+            // laid over it (75)
+            const double dist = e.p("distance", t, 10) * pixelScale, ang = e.p("angle", t, 135) * M_PI / 180.0;
+            const double soft = e.p("softness", t, 8) * pixelScale;
+            add(74, {float(std::lround(std::cos(ang) * dist)), float(std::lround(std::sin(ang) * dist)), float(e.p("opacity", t, 60)) / 100.0f, 0,
+                     float(e.p("color.r", t)), float(e.p("color.g", t)), float(e.p("color.b", t))});
+            if (soft > 0.5) blur(soft, true, true, all);
+            add(75, {});
+        } else if (ty == "broadcast_safe") {
+            // broadcastSafe, each pixel on its own (mode 76)
+            add(76, {e.p("limits", t, 0) >= 0.5 ? 1.0f : 0.0f, float(std::clamp(e.p("knee", t, 5) / 100.0, 0.0, 0.25)),
+                     e.p("highlight", t, 0) >= 0.5 ? 1.0f : 0.0f});
+        } else if (ty == "edge_bevel" || ty == "layer_bevel") {
+            // The bevel's surface (render/BevelFx) from the picture read back as the step runs, lit by gpufilter.frag's
+            // mode 78 or 79
+            const bool edge = ty == "edge_bevel";
+            if (width > 0 && height > 0) {
+                if (edge) {
+                    const double angle = e.p("angle", t, 45) * M_PI / 180;
+                    add(78, {float(std::clamp(e.p("strength", t, 40) / 100, 0.0, 1.0)), float(std::cos(angle)), float(-std::sin(angle)), 0,
+                             float(e.p("light.r", t, 1)), float(e.p("light.g", t, 1)), float(e.p("light.b", t, 1))});
+                } else {
+                    double l[3];
+                    bevel::bevelLight(e.p("angle", t, 120), e.p("altitude", t, 30), l);
+                    add(79, {std::clamp(int(std::lround(e.p("style", t, 0))), 0, 3) != 0 ? 1.0f : 0.0f,
+                             float(std::clamp(e.p("highlight_opacity", t, 75) / 100, 0.0, 1.0)), float(std::clamp(e.p("shadow_opacity", t, 75) / 100, 0.0, 1.0)),
+                             float(std::clamp(int(std::lround(e.p("highlight_mode", t, 1))), 0, 4)),
+                             float(std::clamp(int(std::lround(e.p("shadow_mode", t, 3))), 0, 4)), 0, 0, 0, float(l[0]), float(l[1]), float(l[2]), 0,
+                             float(e.p("highlight.r", t, 1)), float(e.p("highlight.g", t, 1)), float(e.p("highlight.b", t, 1)), 0,
+                             float(e.p("shadow.r", t, 0)), float(e.p("shadow.g", t, 0)), float(e.p("shadow.b", t, 0))});
+                }
+                const ExpressionContext where = currentExpressionContext();
+                f.prepare = [effect = e, t, pixelScale, where, edge](const Image& picture, gpu::ColorOp& step) {
+                    ExpressionScope expressions(where.project, where.sequence, where.clip, where.cancel);
+                    if (step.passes.size() != 1) return false;
+                    std::vector<float> z = edge ? bevel::edgeBevelSurface(effect, t, picture, pixelScale) : bevel::layerBevelSurface(effect, t, picture, pixelScale);
+                    const size_t n = size_t(picture.width + 2) * size_t(picture.height + 2);
+                    if (z.empty()) z.assign(n, 0.0f);  // (level: nothing changes)
+                    if (z.size() != n) return false;
+                    gpu::ColorOp::FilterPass& fp = step.passes[0];
+                    fp.tableWidth = int(std::min<size_t>(4096, n));
+                    fp.table.assign((n + size_t(fp.tableWidth) - 1) / size_t(fp.tableWidth) * size_t(fp.tableWidth) * 4, 0.0f);
+                    for (size_t i = 0; i < n; ++i) fp.table[i * 4] = z[i];
+                    return true;
+                };
+            }
+        } else if (ty == "lens_correction") {
+            // vfx::lensCorrection by its radial plan (gpufilter.frag's mode 77): the vignetting undone in light, then each
+            // pixel from where the lens put it, red and blue from their own places
+            const ColorSpace& working = currentWorkingSpace();
+            const int tf = gpuTransfer(working);
+            vfx::LensPlan plan;
+            static_assert(vfx::LensPlan::kSteps == TransferTables::kDecode, "the plan's row as wide as the transfer tables'");
+            if (width <= 0 || height <= 0) {
+                if (tf < 0 && e.p("vignetting", t, 1) >= 0.5) return false;  // (a curve the shader does not know)
+            } else if (vfx::lensCorrectionPlan(e, t, width, height, plan)) {
+                if (plan.vignetting && tf < 0) return false;
+                gpu::ColorOp::FilterPass fp;
+                fp.mode = 77;
+                transferTableRows(fp, working, 2);
+                std::copy(plan.table.begin(), plan.table.end(), fp.table.begin() + std::ptrdiff_t(fp.tableWidth) * 4);
+                const float common[8] = {0, float(tf), float(plan.cx), float(plan.cy), float(plan.across), float(plan.down),
+                                         float(plan.reach / vfx::LensPlan::kSteps), plan.fringes ? 1.0f : 0.0f};
+                std::copy(common, common + 8, fp.params);
+                if (plan.vignetting) f.passes.push_back(fp);
+                fp.params[0] = 1;
+                if (plan.geometric) f.passes.push_back(std::move(fp));
             }
         } else if (ty == "mesh_warp" || ty == "grid_warp") {
             // drawWarp's triangles (render/MeshWarp: the mesh solved on the CPU, as there), listed by the 8-pixel tiles

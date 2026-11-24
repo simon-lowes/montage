@@ -203,6 +203,11 @@ float blendChannel(int mode, float base, float over) {
 
 }  // namespace
 
+void bevelLight(double angleDeg, double altitudeDeg, double out[3]) {
+    const Light l(angleDeg, altitudeDeg);
+    out[0] = l.lx, out[1] = l.ly, out[2] = l.lz;
+}
+
 std::vector<float> edgeDistance(const Image& img) {
     if (img.empty()) return {};
     const std::vector<float> ringed = signedDistance(img, true, true);
@@ -212,17 +217,24 @@ std::vector<float> edgeDistance(const Image& img) {
     return sd;
 }
 
-void edgeBevel(const Effect& e, FrameTime t, Image& img, double pixelScale) {
-    if (img.empty()) return;
+std::vector<float> edgeBevelSurface(const Effect& e, FrameTime t, const Image& img, double pixelScale) {
+    if (img.empty()) return {};
     const double thickness = std::max(0.5, e.p("thickness", t, 8) * pixelScale), height = std::max(0.0, e.p("height", t, 8) * pixelScale);
     const float strength = float(std::clamp(e.p("strength", t, 40) / 100, 0.0, 1.0));
-    if (height <= 0 || strength <= 0) return;
-    const float light[3] = {float(e.p("light.r", t, 1)), float(e.p("light.g", t, 1)), float(e.p("light.b", t, 1))};
-    const int w = img.width, h = img.height;
+    if (height <= 0 || strength <= 0) return {};
     // The chamfer: it climbs from the edge to `height` over `thickness`, and is level from there in.
     std::vector<float> z = signedDistance(img, true, false);
     const float slope = float(height / thickness), top = float(height);
     for (float& v : z) v = std::clamp(v * slope, 0.0f, top);
+    return z;
+}
+
+void edgeBevel(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const std::vector<float> z = edgeBevelSurface(e, t, img, pixelScale);
+    if (z.empty()) return;
+    const float strength = float(std::clamp(e.p("strength", t, 40) / 100, 0.0, 1.0));
+    const float light[3] = {float(e.p("light.r", t, 1)), float(e.p("light.g", t, 1)), float(e.p("light.b", t, 1))};
+    const int w = img.width, h = img.height;
     // (the angle turns anticlockwise, as on the page; rows run down)
     const double angle = e.p("angle", t, 45) * kDeg, ax = std::cos(angle), ay = -std::sin(angle);
     const Light sun(0, 45);
@@ -245,16 +257,13 @@ void edgeBevel(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     });
 }
 
-void layerBevel(const Effect& e, FrameTime t, Image& img, double pixelScale) {
-    if (img.empty()) return;
+std::vector<float> layerBevelSurface(const Effect& e, FrameTime t, const Image& img, double pixelScale) {
+    if (img.empty()) return {};
     const int style = std::clamp(int(std::lround(e.p("style", t, 0))), 0, 3);  // inner, outer, emboss, pillow
     const double size = std::max(0.5, e.p("size", t, 5) * pixelScale), depth = std::clamp(e.p("depth", t, 100) / 100, 0.01, 10.0);
     const float hiOp = float(std::clamp(e.p("highlight_opacity", t, 75) / 100, 0.0, 1.0)),
                 shOp = float(std::clamp(e.p("shadow_opacity", t, 75) / 100, 0.0, 1.0));
-    if (hiOp <= 0 && shOp <= 0) return;
-    const int hiMode = std::clamp(int(std::lround(e.p("highlight_mode", t, 1))), 0, 4), shMode = std::clamp(int(std::lround(e.p("shadow_mode", t, 3))), 0, 4);
-    const float hi[3] = {float(e.p("highlight.r", t, 1)), float(e.p("highlight.g", t, 1)), float(e.p("highlight.b", t, 1))};
-    const float sh[3] = {float(e.p("shadow.r", t, 0)), float(e.p("shadow.g", t, 0)), float(e.p("shadow.b", t, 0))};
+    if (hiOp <= 0 && shOp <= 0) return {};
     const int w = img.width, h = img.height;
     const bool outside = style != 0;  // (what it draws beyond the layer's edge)
     std::vector<float> z = signedDistance(img, style != 1, outside);
@@ -268,6 +277,20 @@ void layerBevel(const Effect& e, FrameTime t, Image& img, double pixelScale) {
             default: v = std::min(std::fabs(v), sz * 0.5f) * k; break;
         }
     soften(z, w + 2, h + 2, e.p("soften", t, 0) * pixelScale);
+    return z;
+}
+
+void layerBevel(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const std::vector<float> z = layerBevelSurface(e, t, img, pixelScale);
+    if (z.empty()) return;
+    const int style = std::clamp(int(std::lround(e.p("style", t, 0))), 0, 3);
+    const float hiOp = float(std::clamp(e.p("highlight_opacity", t, 75) / 100, 0.0, 1.0)),
+                shOp = float(std::clamp(e.p("shadow_opacity", t, 75) / 100, 0.0, 1.0));
+    const int hiMode = std::clamp(int(std::lround(e.p("highlight_mode", t, 1))), 0, 4), shMode = std::clamp(int(std::lround(e.p("shadow_mode", t, 3))), 0, 4);
+    const float hi[3] = {float(e.p("highlight.r", t, 1)), float(e.p("highlight.g", t, 1)), float(e.p("highlight.b", t, 1))};
+    const float sh[3] = {float(e.p("shadow.r", t, 0)), float(e.p("shadow.g", t, 0)), float(e.p("shadow.b", t, 0))};
+    const int w = img.width, h = img.height;
+    const bool outside = style != 0;
     const Light sun(e.p("angle", t, 120), e.p("altitude", t, 30));
     parallelRows(h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {

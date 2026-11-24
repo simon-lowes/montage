@@ -30286,6 +30286,17 @@ colorspaces:
             // the smear along the contours)
             {"painterly", {{}, {{"radius", 20}, {"sharpness", 12}, {"roundness", 0.5}, {"detail", 5}}, {{"radius", 9}, {"mix", 60}, {"detail", 1}}}},
             {"painterly", {{{"style", 1}}, {{"style", 1}, {"length", 30}, {"levels", 0}, {"detail", 4}}, {{"style", 1}, {"length", 6}, {"levels", 4}, {"mix", 70}}}},
+            // (the effects that were the CPU's alone: barrel and pincushion, the lens over the picture, the shadow)
+            {"lens_distortion", {{{"amount", 40}}, {{"amount", -70}}, {{"amount", 100}}}},
+            {"magnify", {{}, {{"shape", 1}, {"center_x", 0.3}, {"magnification", 350}, {"border", 4}, {"border_color.g", 0.2}},
+                         {{"feather", 12}, {"size", 70}, {"opacity", 60}, {"border", 0}}}},
+            {"drop_shadow", {{}, {{"distance", 25}, {"angle", 40}, {"softness", 0}, {"opacity", 90}, {"color.r", 0.6}},
+                             {{"distance", 4}, {"softness", 30}, {"color.b", 1}}}},
+            // (the bevels' surfaces made on the CPU from the picture read back, lit on the GPU)
+            {"edge_bevel", {{}, {{"thickness", 14}, {"height", 20}, {"angle", 200}, {"strength", 80}}, {{"light.g", 0.3}, {"thickness", 4}}}},
+            {"layer_bevel", {{}, {{"style", 1}, {"size", 9}, {"soften", 3}, {"highlight_mode", 4}}, {{"style", 3}, {"depth", 300}, {"shadow_mode", 0}}}},
+            {"layer_bevel", {{{"style", 2}, {"angle", 30}, {"altitude", 60}}, {{"style", 2}, {"highlight_mode", 2}, {"shadow_mode", 1}, {"soften", 1}},
+                             {{"style", 1}, {"highlight_opacity", 0}, {"shadow.r", 0.5}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {
@@ -30305,6 +30316,46 @@ colorspaces:
                     QVERIFY(renderProgramFrame(p, s, 7 + FrameTime(k), o).px != lit.px);
                 }
             }
+        edit::clipById(s, topId)->effects.clear();
+        // Broadcast Safe on a picture pushed past white by a stop first: within EBU R103 with its knee, strict with the
+        // widest knee, and its stripes over what is out of range, through a feathered mask.
+        {
+            Effect brighter = makeEffect(p, "color_correct");
+            brighter.params["exposure"] = 1.0;
+            const std::vector<Settings> safe = {{}, {{"limits", 1}, {"knee", 20}}, {{"limits", 1}, {"knee", 0}, {"highlight", 1}}};
+            for (size_t k = 0; k < safe.size(); ++k) {
+                Effect e = makeEffect(p, "broadcast_safe");
+                for (const auto& [name, value] : safe[k]) e.params[name] = value;
+                if (k == 2) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.6, e.params["mask.h"] = 0.5, e.params["mask.feather"] = 10.0;
+                edit::clipById(s, topId)->effects = {brighter, e};
+                const long passes = gpu::stats().filterPasses;
+                compare(7 + FrameTime(k), QString("broadcast_safe #%1").arg(k + 1));
+                QVERIFY(gpu::stats().filterPasses > passes);
+            }
+        }
+        // Lens Correction by a test lens's profile: its distortion and colour fringes, then with its vignetting too, then
+        // made smaller without filling the frame, through a feathered mask.
+        {
+            QFile file(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            lens::Database db;
+            QVERIFY(db.addXml(file.readAll().toStdString()));
+            const lens::Lens* zoom = db.lens("FE 24-38mm f/2.8 Test");
+            QVERIFY(zoom);
+            const std::vector<Settings> corrections = {{{"focal", 27}, {"camera_crop", 1}, {"vignetting", 0}},
+                                                       {{"focal", 30}, {"aperture", 3.3}, {"camera_crop", 1}},
+                                                       {{"focal", 24}, {"aperture", 2.8}, {"fit", 2}, {"scale", 70}}};
+            for (size_t k = 0; k < corrections.size(); ++k) {
+                Effect e = makeEffect(p, "lens_correction");
+                e.strings["profile"] = lens::lensXml(*zoom);
+                for (const auto& [name, value] : corrections[k]) e.params[name] = value;
+                if (k == 2) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.6, e.params["mask.h"] = 0.5, e.params["mask.feather"] = 10.0;
+                edit::clipById(s, topId)->effects = {e};
+                const long passes = gpu::stats().filterPasses;
+                compare(7 + FrameTime(k), QString("lens_correction #%1").arg(k + 1));
+                QVERIFY(gpu::stats().filterPasses >= passes + (k == 0 ? 1 : 2));
+            }
+        }
         edit::clipById(s, topId)->effects.clear();
         // Mesh Warp and Grid Warp with motion blur: a pin or a point keyed to move through the shutter, at three
         // settings (the second with a shorter shutter on a denser mesh, the third through a feathered mask), a pass
@@ -35195,8 +35246,7 @@ colorspaces:
             // (deep pictures and layers in 3D)
             "make_deep", "deep_holdout", "deep_grade", "deep_slice", "flatten_deep", "layer_3d",
             // (with no GPU form yet)
-            "texture_pop", "broadcast_safe", "film_look", "magnify", "lens_distortion", "lens_correction", "drop_shadow", "edge_bevel",
-            "layer_bevel", "patch_fill", "paint", "film_negative", "fade_restore"};
+            "texture_pop", "film_look", "patch_fill", "paint", "film_negative", "fade_restore"};
         // (through a mask: on the CPU, not run on the camera's picture as they are without one)
         const std::set<std::string> cpuOnlyMasked = {"aces_gamut_compress", "ocio"};
         std::vector<std::string> fellBack, unlisted, nowGpu;

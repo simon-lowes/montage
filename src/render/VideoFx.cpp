@@ -291,6 +291,32 @@ void lensCorrection(const Effect& e, FrameTime t, Image& img) {
     });
 }
 
+bool lensCorrectionPlan(const Effect& e, FrameTime t, int width, int height, LensPlan& plan) {
+    const std::shared_ptr<const lens::Lens> lens = profileLens(e.s("profile"));
+    if (!lens || width < 2 || height < 2) return false;
+    const lens::Correction c(*lens, lensSettings(e, t), width, height);
+    if (!c.active()) return false;
+    plan.vignetting = c.vignetting(), plan.geometric = c.geometric();
+    plan.cx = c.centerX(), plan.cy = c.centerY(), plan.across = c.unit() * c.squeeze(), plan.down = c.unit();
+    // (as far as the frame's corners reach from the centre)
+    plan.reach = 0;
+    for (const double x : {0.0, double(width)})
+        for (const double y : {0.0, double(height)}) plan.reach = std::max(plan.reach, std::hypot((x - plan.cx) * plan.across, (y - plan.cy) * plan.down));
+    plan.reach = std::max(plan.reach * (1 + 1e-6), 1e-9);
+    plan.table.assign(size_t(LensPlan::kSteps + 1) * 4, 1.0f);
+    plan.fringes = false;
+    for (int i = 0; i <= LensPlan::kSteps; ++i) {
+        // (at the centre, the factor's limit there)
+        const double r = std::max(plan.reach * i / LensPlan::kSteps, plan.reach * 1e-7);
+        float* q = plan.table.data() + size_t(i) * 4;
+        for (int ch = 0; ch < 3; ++ch) q[ch] = float(c.sourceRadius(r, ch) / r);
+        plan.fringes = plan.fringes || q[0] != q[1] || q[2] != q[1];
+        // (falloff's distance is the same one: taken along the row through the centre)
+        q[3] = float(1 / c.falloff(plan.cx + r / plan.across, plan.cy));
+    }
+    return true;
+}
+
 void magnify(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const bool square = e.p("shape", t, 0) >= 0.5;
     const double cx = e.p("center_x", t, 0.5) * img.width, cy = e.p("center_y", t, 0.5) * img.height;
