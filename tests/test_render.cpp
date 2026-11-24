@@ -29766,7 +29766,7 @@ colorspaces:
         QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
     }
 
-    // Pictures from plug-in hosts as handles. Asked with MONTAGE_GPU_HANDLES=1 of hosts started for GPU rendering, an
+    // Pictures from plug-in hosts as handles. Asked with no setting of hosts started for GPU rendering, an
     // effect's picture, a transition's and a generator's each come as a handle where both sides share, and through
     // shared memory with the reason where they do not; either way within 1/1023 of the picture made in Montage's
     // process. A hundred pictures that each carry their number come back in order, none stale or torn. A host killed
@@ -29812,7 +29812,7 @@ colorspaces:
             plugins::setHosting(s);
             plugins::clearHostFailures();
         };
-        qputenv("MONTAGE_GPU_HANDLES", "1");
+        qunsetenv("MONTAGE_GPU_HANDLES");  // (asked for unless turned off)
         // (hosts render with OpenGL, and are asked for handles, only where Montage's own OpenGL for plug-ins runs)
         std::string noOpenGl;
         const bool openGl = ofx::initializeGpu(&noOpenGl);
@@ -29858,7 +29858,7 @@ colorspaces:
         {
             host(plugins::Isolation::PerPlugin);
             ofx::remote::resetPictureStats();
-            // What a picture took, counted: as a handle, or through shared memory with a reason that is not "not asked".
+            // What a picture took, counted: as a handle, or through shared memory with a reason that is not "turned off".
             long handles = 0, memory = 0;
             auto took = [&](const QString& what) {
                 const ofx::remote::PictureStats now = ofx::remote::pictureStats();
@@ -29867,7 +29867,7 @@ colorspaces:
                 handles = now.handles, memory = now.sharedMemory;
                 const QString last = QString::fromStdString(now.last);
                 if (!handle && !shared) return what + ": counted neither once as a handle nor once through shared memory";
-                if (shared && (expected || last.contains("not asked for") || !last.contains("through shared memory: ")))
+                if (shared && (expected || last.contains("turned off") || !last.contains("through shared memory: ")))
                     return what + ": " + last;
                 if (handle && !last.endsWith("as a DMA-BUF")) return what + ": " + last;
                 return QString();

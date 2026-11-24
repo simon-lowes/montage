@@ -2661,9 +2661,10 @@ private slots:
 
     void openFxPicturesFallBackToSharedMemory() {
         // A plug-in host gives its plug-in's picture back through shared memory unless it can share it from the GPU's
-        // memory. With no handle asked for, and, asked for one with MONTAGE_GPU_HANDLES=1, wherever one of the two
-        // sides cannot share it, the picture comes through shared memory, bit for bit the one made in Montage's
-        // process, and what was taken is counted and said, with why, as MONTAGE_GPU_LOG says it.
+        // memory. With handles turned off (MONTAGE_GPU_HANDLES=0), and, with no setting or asked for with
+        // MONTAGE_GPU_HANDLES=1, wherever one of the two sides cannot share it, the picture comes through shared memory,
+        // bit for bit the one made in Montage's process, and what was taken is counted and said, with why, as
+        // MONTAGE_GPU_LOG says it.
         ofx::Registry& reg = ofx::Registry::instance();
         reg.setCachePath(path("ofx-handles-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
@@ -2702,8 +2703,8 @@ private slots:
                    std::memcmp(here.px.data(), there.px.data(), here.px.size() * sizeof(float)) == 0;
         };
         Hosting h(Isolation::PerPlugin);
-        // Not asked for: shared memory, and it says how to ask.
-        qunsetenv("MONTAGE_GPU_HANDLES");
+        // Turned off: shared memory, and it says so.
+        qputenv("MONTAGE_GPU_HANDLES", "0");
         ofx::remote::resetPictureStats();
         Image there = picture;
         QVERIFY2(ofx::applyEffect(fx, 3, there, 1.0, {}, &err), err.c_str());
@@ -2712,12 +2713,13 @@ private slots:
         QCOMPARE(took.handles, 0L);
         QCOMPARE(took.sharedMemory, 1L);
         QCOMPARE(QString::fromStdString(took.last),
-                 QString("Test Invert's picture came from its plug-in host through shared memory: handles are not asked for "
-                         "(MONTAGE_GPU_HANDLES=1 asks)"));
+                 QString("Test Invert's picture came from its plug-in host through shared memory: handles are turned off "
+                         "(MONTAGE_GPU_HANDLES=0)"));
         QVERIFY(same(there));
-        // Asked for: a handle only where both sides can share one. Where one cannot (here: no OpenGL in a test without
-        // a display, a driver without the extensions, anything but Linux), shared memory again, with that reason.
-        qputenv("MONTAGE_GPU_HANDLES", "1");
+        // With no setting, asked for: a handle only where both sides can share one. Where one cannot (here: no OpenGL in
+        // a test without a display, a driver without the extensions, anything but Linux), shared memory again, with
+        // that reason.
+        qunsetenv("MONTAGE_GPU_HANDLES");
         there = picture;
         QVERIFY2(ofx::applyEffect(fx, 3, there, 1.0, {}, &err), err.c_str());
         took = ofx::remote::pictureStats();
@@ -2725,7 +2727,7 @@ private slots:
         if (took.handles == 0) {
             const QString start = "Test Invert's picture came from its plug-in host through shared memory: ";
             QCOMPARE(took.sharedMemory, 2L);
-            QVERIFY2(last.startsWith(start) && last.size() > start.size() && !last.contains("not asked for"), qPrintable(last));
+            QVERIFY2(last.startsWith(start) && last.size() > start.size() && !last.contains("turned off"), qPrintable(last));
             QVERIFY(same(there));
         } else {
             // (A machine where the picture is shared: the same picture, as 16-bit floats carry it.)

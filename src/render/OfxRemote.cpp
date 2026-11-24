@@ -207,9 +207,10 @@ bool asksForHandle(const Host& host, std::string& why) {
         why = reason;
         return false;
     };
+    // (asked for unless turned off: CI's guest showed the path working on 24 November 2026, where both sides share)
     const char* v = std::getenv("MONTAGE_GPU_HANDLES");
     const std::string asked = v ? v : "";
-    if (asked != "1" && asked != "on") return no("handles are not asked for (MONTAGE_GPU_HANDLES=1 asks)");
+    if (asked == "0" || asked == "off") return no("handles are turned off (MONTAGE_GPU_HANDLES=0)");
     {
         std::lock_guard lock(gPicturesM);
         if (!gHandlesOff.empty()) return no(gHandlesOff);

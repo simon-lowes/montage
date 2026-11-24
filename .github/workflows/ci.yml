@@ -370,7 +370,8 @@ jobs:
       - name: Plug-in pictures as DMA-BUFs, in the guest
         timeout-minutes: 30
         run: |
-          scripts/kvm-guest.sh "$RUNNER_TEMP/guest" env QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=xcb_egl MONTAGE_GPU_HANDLES=1 \
+          # (no MONTAGE_GPU_HANDLES: handles are asked for unless turned off)
+          scripts/kvm-guest.sh "$RUNNER_TEMP/guest" env QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=xcb_egl \
             MONTAGE_EXPECT_HANDLES=1 MONTAGE_GPU_LOG=1 QTEST_FUNCTION_TIMEOUT=900000 \
             xvfb-run -a build/tests/test_render openFxHandlesForEveryKindAndAfterAHostEnds
 
