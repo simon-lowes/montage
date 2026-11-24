@@ -148,8 +148,11 @@ void eachTask(int n, int threads, const std::function<void(int)>& fn) {
 
 // A splat ready to blend: its centre, the inverse of its blurred covariance, opacity, colour and depth, and the
 // tiles it may touch.
+// (`cut`: the power, -ln(255 opacity), below which it is fainter than 1/255, tested on the power itself so that a
+// renderer that blends them elsewhere, the GPU compositor, leaves out the same pixels whatever its exp() rounds to;
+// `reach`: how far from its centre it can be seen, in pixels.)
 struct Drawn {
-    float x, y, ia, ib, ic, opacity, r, g, b, depth;
+    float x, y, ia, ib, ic, opacity, r, g, b, depth, cut, reach;
     int tx0, ty0, tx1, ty1;
     bool shown;
 };
@@ -161,22 +164,19 @@ bool projectSplat(const SplatCloud& cloud, size_t i, const Mat4& place, const Mo
     return View(place, camera).project(cloud, i, out);
 }
 
-Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera, int w, int h,
-                   std::vector<float>* depthOut, const SplatRenderOptions& options) {
-    w = std::max(1, w), h = std::max(1, h);
-    Image img(w, h);
-    if (depthOut) depthOut->assign(size_t(w) * size_t(h), 0.0f);
-    if (cloud.count == 0) return img;
+namespace {
+
+// Each splat projected, coloured and given the tiles it reaches (w x h, at least 1 x 1), those past kMaxEntries in the
+// tiles together left out: what renderSplats blends, and splatsForBlending hands on.
+std::vector<Drawn> prepareSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera, int w, int h,
+                                 const SplatRenderOptions& options) {
     View view(place, camera);
     view.limitTo(w, h);
     const int tilesX = (w + kTile - 1) / kTile, tilesY = (h + kTile - 1) / kTile;
 
-    // Each splat projected, coloured, and given the tiles it reaches.
     std::vector<Drawn> drawn(cloud.count);
     const std::vector<uint8_t>* keep = options.keep && options.keep->size() == cloud.count ? options.keep.get() : nullptr;
     std::atomic<size_t> offeredAll{0}, projectedAll{0}, reachedAll{0};
-    // A linear cloud's colours are blended as they are and brought to display values after.
-    auto toDisplay = [&](float v) { return cloud.linearColor ? linearToSrgb(v) : v; };
     auto colour = [&](size_t i, const float* p, Drawn& d) {
         const double dir[3] = {p[0] - view.eye[0], p[1] - view.eye[1], p[2] - view.eye[2]};
         const double dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
@@ -209,7 +209,7 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
             }
             ++projected;
             if (options.points) {
-                d.x = float(s.x), d.y = float(s.y), d.depth = float(s.depth), d.opacity = 1;
+                d.x = float(s.x), d.y = float(s.y), d.depth = float(s.depth), d.opacity = 1, d.cut = 0, d.reach = 0;
                 colour(i, p, d);
                 d.tx0 = d.tx1 = d.ty0 = d.ty1 = 0;
                 d.shown = true;
@@ -233,6 +233,8 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
             d.x = float(s.x), d.y = float(s.y);
             d.ia = float(c / det), d.ib = float(-b / det), d.ic = float(a / det);
             d.opacity = float(opacity);
+            d.cut = float(-std::log(255.0 * double(d.opacity)));
+            d.reach = float(r);
             d.depth = float(s.depth);
             d.shown = true;
             ++reached;
@@ -240,6 +242,41 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
         offeredAll += offered, projectedAll += projected, reachedAll += reached;
     });
     if (options.stats) options.stats->offered = offeredAll, options.stats->projected = projectedAll, options.stats->drawn = reachedAll;
+    if (!options.points) {
+        // At most kMaxEntries splats in all the tiles together (a few huge splats in a small file could otherwise ask for
+        // more memory than there is): past that the farthest are left out.
+        size_t entries = 0;
+        for (const Drawn& d : drawn)
+            if (d.shown) entries += size_t(d.tx1 - d.tx0 + 1) * size_t(d.ty1 - d.ty0 + 1);
+        if (entries > kMaxEntries) {
+            std::vector<uint32_t> order;
+            for (size_t i = 0; i < drawn.size(); ++i)
+                if (drawn[i].shown) order.push_back(uint32_t(i));
+            std::sort(order.begin(), order.end(), [&](uint32_t p, uint32_t q) { return drawn[p].depth < drawn[q].depth || (drawn[p].depth == drawn[q].depth && p < q); });
+            entries = 0;
+            for (const uint32_t i : order) {
+                Drawn& d = drawn[i];
+                const size_t n = size_t(d.tx1 - d.tx0 + 1) * size_t(d.ty1 - d.ty0 + 1);
+                if (entries + n > kMaxEntries) d.shown = false;
+                else entries += n;
+            }
+        }
+    }
+    return drawn;
+}
+
+}  // namespace
+
+Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera, int w, int h,
+                   std::vector<float>* depthOut, const SplatRenderOptions& options) {
+    w = std::max(1, w), h = std::max(1, h);
+    Image img(w, h);
+    if (depthOut) depthOut->assign(size_t(w) * size_t(h), 0.0f);
+    if (cloud.count == 0) return img;
+    const int tilesX = (w + kTile - 1) / kTile, tilesY = (h + kTile - 1) / kTile;
+    std::vector<Drawn> drawn = prepareSplats(cloud, place, camera, w, h, options);
+    // A linear cloud's colours are blended as they are and brought to display values after.
+    auto toDisplay = [&](float v) { return cloud.linearColor ? linearToSrgb(v) : v; };
     const float layer = std::clamp(options.opacity, 0.0f, 1.0f);
 
     if (options.points) {
@@ -266,25 +303,6 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
                 if (depthOut) (*depthOut)[size_t(y) * size_t(w) + size_t(x)] = d.depth;
             }
         return img;
-    }
-
-    // At most kMaxEntries splats in all the tiles together (a few huge splats in a small file could otherwise ask for
-    // more memory than there is): past that the farthest are left out.
-    size_t entries = 0;
-    for (const Drawn& d : drawn)
-        if (d.shown) entries += size_t(d.tx1 - d.tx0 + 1) * size_t(d.ty1 - d.ty0 + 1);
-    if (entries > kMaxEntries) {
-        std::vector<uint32_t> order;
-        for (size_t i = 0; i < drawn.size(); ++i)
-            if (drawn[i].shown) order.push_back(uint32_t(i));
-        std::sort(order.begin(), order.end(), [&](uint32_t p, uint32_t q) { return drawn[p].depth < drawn[q].depth || (drawn[p].depth == drawn[q].depth && p < q); });
-        entries = 0;
-        for (const uint32_t i : order) {
-            Drawn& d = drawn[i];
-            const size_t n = size_t(d.tx1 - d.tx0 + 1) * size_t(d.ty1 - d.ty0 + 1);
-            if (entries + n > kMaxEntries) d.shown = false;
-            else entries += n;
-        }
     }
 
     // The splats each tile holds, nearest first (equal depths in the file's order).
@@ -319,8 +337,8 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
                     const float dx = d.x - cx, dy = d.y - cy;
                     const float power = -0.5f * (d.ia * dx * dx + d.ic * dy * dy) - d.ib * dx * dy;
                     if (power > 0) continue;
+                    if (power < d.cut) continue;  // (fainter than 1/255)
                     const float alpha = std::min(0.99f, d.opacity * std::exp(power));
-                    if (alpha < 1.0f / 255) continue;
                     const float next = T * (1 - alpha);
                     if (next < 1e-4f) break;
                     const float wgt = alpha * T;
@@ -339,6 +357,38 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
             }
     });
     return img;
+}
+
+size_t splatsForBlending(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera, int w, int h, const SplatRenderOptions& options,
+                         std::vector<float>& records, std::vector<float>& depths, std::vector<int32_t>* tiles) {
+    records.clear(), depths.clear();
+    if (tiles) tiles->clear();
+    w = std::max(1, w), h = std::max(1, h);
+    if (cloud.count == 0) return 0;
+    const std::vector<Drawn> drawn = prepareSplats(cloud, place, camera, w, h, options);
+    size_t n = 0;
+    for (const Drawn& d : drawn) n += d.shown;
+    records.reserve(n * 12), depths.reserve(n);
+    const float layer = std::clamp(options.opacity, 0.0f, 1.0f);
+    auto toDisplay = [&](float v) { return cloud.linearColor ? linearToSrgb(v) : v; };
+    size_t shown = 0;
+    for (const Drawn& d : drawn) {
+        if (!d.shown) continue;
+        if (options.points) {
+            // (only those whose pixel is on the picture, already as they are drawn: whole, in display values)
+            const double x = std::floor(double(d.x)), y = std::floor(double(d.y));
+            if (!(x >= 0 && y >= 0 && x < w && y < h)) continue;
+            ++shown;
+            records.insert(records.end(), {d.x, d.y, 0, 0, 0, 0, 0, 0, toDisplay(std::min(1.0f, d.r)) * layer, toDisplay(std::min(1.0f, d.g)) * layer,
+                                           toDisplay(std::min(1.0f, d.b)) * layer, layer});
+        } else {
+            records.insert(records.end(), {d.x, d.y, d.reach, d.opacity, d.ia, d.ib, d.ic, d.cut, d.r, d.g, d.b, 0});
+            if (tiles) tiles->insert(tiles->end(), {d.tx0, d.ty0, d.tx1, d.ty1});
+        }
+        depths.push_back(d.depth);
+    }
+    if (options.points && options.stats) options.stats->drawn = shown;
+    return depths.size();
 }
 
 namespace {

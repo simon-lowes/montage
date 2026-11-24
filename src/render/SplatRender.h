@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -63,5 +64,20 @@ std::vector<uint8_t> splatsUnderBrush(const SplatCloud& cloud, const Mat4& place
 // splats in front have covered half the pixel (else their weighted mean), 0 where nothing is drawn.
 Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera, int w, int h,
                    std::vector<float>* depth = nullptr, const SplatRenderOptions& options = {});
+
+// The splats renderSplats would blend (the options as it takes them; `depth` aside), worked out here with its
+// arithmetic, for a renderer that sorts and blends them itself (the GPU compositor): each one's depth in front of the
+// camera, and 12 floats a splat, in the cloud's order. Each splat: its centre on the picture (pixels), how far from it
+// it is seen (pixels), its opacity, the inverse of its covariance there (xx, xy, yy) and the power below which a pixel
+// is left out (fainter than 1/255), and its colour; it is blended at a pixel's centre, nearest first (equal depths in
+// the cloud's order), as alpha = min(0.99, opacity exp(power)) for power = -(xx dx² + yy dy²) / 2 - xy dx dy (dx, dy
+// from the pixel's centre to the splat's), the blend stopping where less than 1e-4 of the pixel is left uncovered; a
+// linear cloud's colour is then brought to display values under its coverage, and the whole is the layer's opacity
+// of that. With `points`, those whose centres fall on the picture: their centres and their colours as they are drawn
+// (display values, the layer's opacity in), each pixel taking the nearest. Returns how many.
+// `tiles` (Gaussians only) takes the 16-pixel tiles each one reaches, as the CPU lists it in them: the first and last
+// across, then down (4 a splat).
+size_t splatsForBlending(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera, int w, int h, const SplatRenderOptions& options,
+                         std::vector<float>& records, std::vector<float>& depths, std::vector<int32_t>* tiles = nullptr);
 
 }  // namespace montage

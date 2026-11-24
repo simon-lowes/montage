@@ -19,6 +19,7 @@
 // textures the last frame used, and of the others up to 768 MB (or the budget, if less) for a few frames; when no frame
 // has been drawn for 10 s, it lets them go.
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -44,6 +45,7 @@ int maxTextureSize();      // the widest picture it takes (0 without a GPU)
 bool takesPlanes();        // it converts decoded Y′CbCr planes itself (Frame16::planes)
 bool takesShaders(const std::string& key = {});  // it compiles shader steps (ShaderStep) while running (that one, too)
 bool sharesOpenGl();       // it runs texture steps (TextureStep): its OpenGL textures are the OpenFX plug-ins' context's too
+bool takesSplats(std::string* why = nullptr);  // it sorts and blends Gaussian splats (Layer::splats): it has compute
 size_t textureBudget();    // the most texture memory a frame may hold, bytes (0: no budget known, nothing is refused)
 void shutdown();           // (before the application goes; initialize() again is allowed)
 
@@ -131,6 +133,21 @@ struct ColorOp {
     std::function<bool(const Image& picture, ColorOp& op)> prepare;
 };
 
+// A splat clip's capture, worked out for blending on the CPU (render/SplatRender's splatsForBlending, whose arithmetic
+// it is): sorted by depth on the GPU, by a stable radix sort in compute passes (equal depths in the cloud's order), and
+// blended front to back there, each splat a quad drawn over the pixels it reaches; or with `points`, each pixel the
+// nearest centre's colour. Its buffers are counted against the texture budget: a capture they would take past it is
+// drawn in batches of splats, nearest first, each batch sorted and blended under what is drawn already.
+struct SplatLayer {
+    int width = 0, height = 0;
+    std::vector<float> records;  // 12 floats a splat, as splatsForBlending makes them
+    std::vector<float> depths;   // a float a splat
+    std::vector<int32_t> tiles;  // (Gaussians) 4 a splat: the 16-pixel tiles it reaches, as splatsForBlending gives them
+    bool points = false;
+    bool linearColor = false;    // (its blend brought to display values under its coverage)
+    float opacity = 1;
+};
+
 // Where a layer goes on the canvas (render/Compositor's Geometry, worked out on the CPU).
 struct Placement {
     bool full = false;  // the picture is the canvas's size already, drawn as it is
@@ -148,6 +165,7 @@ struct Layer {
     std::shared_ptr<const Lut3D> input;  // ... and its input transform, if any
     Image image;                         // or a picture made on the CPU (premultiplied, working space)
     std::shared_ptr<const ShapeRaster> shapes;  // or a Shape layer's paints, drawn here (gpufilter.frag's 56) at their size
+    std::shared_ptr<const SplatLayer> splats;   // or a splat clip's capture, sorted and blended here at its size
     std::vector<ColorOp> ops;
     Placement place;
 };
@@ -203,6 +221,10 @@ struct Stats {
     long shaderBuilds = 0;                 // shader steps built (ShaderStep, once a key), since resetStats
     long shapeLayers = 0;                  // Shape layers drawn on the GPU (Layer::shapes)
     long textureSteps = 0;                 // texture steps run (TextureStep: plug-ins drawing into the compositor's textures)
+    // Splat layers sorted and blended on the GPU (Layer::splats), their splats, and the batches they took (one a
+    // layer within the budget); and why the last splat clip was drawn on the CPU instead (countSplatsOnCpu).
+    long splatLayers = 0, splatsDrawn = 0, splatBatches = 0;
+    std::string lastSplatFallback;
     long pictureReadBacks = 0;             // pictures read back part way through a layer, for steps finished from them (ColorOp::prepare)
     long texturesMade = 0;                 // textures made for frames, since resetStats (one kept from an earlier frame and lent again is not made)
     // Texture memory by the compositor's own count, in bytes: every texture it holds after the last frame (those lent
@@ -240,6 +262,9 @@ void setTextureLimitForTesting(size_t bytes);
 // Tests: how long no frame is drawn before the textures kept for later frames are let go, ms (0: 10 s again).
 void setIdleReleaseForTesting(int ms);
 void countFallback(const std::string& why);  // (render/Compositor's bookkeeping)
+void countSplatsOnCpu(const std::string& why);  // (a splat clip drawn on the CPU, and why: logged with MONTAGE_GPU_LOG)
+// Tests: splats refused as on a device without compute (false), or taken again.
+void setSplatsForTesting(bool take);
 void countLayer(bool onGpu, const std::string& how = {});  // (and with MONTAGE_GPU_LOG, says how it was drawn)
 
 }  // namespace gpu

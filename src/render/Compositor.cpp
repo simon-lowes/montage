@@ -813,6 +813,7 @@ struct ClipSource {
     Image src;
     // Or, when asked to leave it (`deferFrame`), a Shape layer's paints for the GPU to draw (render/ShapeRaster) ...
     std::shared_ptr<const ShapeRaster> shapes;
+    std::shared_ptr<const gpu::SplatLayer> splats;  // ... or a splat clip's capture, worked out for the GPU to sort and blend ...
     // ... or the decoded frame and the space it is in: nothing ran on it yet.
     Frame16Ptr frame;
     const ColorSpace* frameSpace = nullptr;
@@ -1268,6 +1269,30 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             src = drawShapeRaster(raster);
             return true;
+        }
+        // A splat clip the GPU sorts and blends itself (in the values its splats were trained on, the sequence's own when it
+        // is Rec.709 graded display-referred), each splat worked out here as the CPU's renderer works it out.
+        if (deferFrame && c.generator.type == "model3d" && std::lround(c.generator.p("shape", lt, 0)) == 0 && isSplatFile(c.generator.s("file"))) {
+            std::string why;
+            if (currentSceneGrading() || !sameColorSpace(rec709Space(), sequenceColorSpace(seq))) why = "the sequence is graded in another space than Rec.709";
+            else if (std::max(w, h) > gpu::maxTextureSize()) why = "a picture larger than the GPU takes";
+            if (why.empty() && gpu::takesSplats(&why)) {
+                std::shared_ptr<const SplatCloud> cloud;
+                Mat4 place;
+                ModelCamera cam;
+                SplatRenderOptions so;
+                if (splatClipScene(p, seq, c, t, double(w) / SW, cloud, place, cam, so, nullptr, !o.highQuality)) {
+                    auto layer = std::make_shared<gpu::SplatLayer>();
+                    layer->width = std::max(1, w), layer->height = std::max(1, h);
+                    layer->points = so.points, layer->linearColor = cloud->linearColor, layer->opacity = so.opacity;
+                    splatsForBlending(*cloud, place, cam, layer->width, layer->height, so, layer->records, layer->depths, &layer->tiles);
+                    out.splats = std::move(layer);
+                    return true;
+                }
+                // (one that cannot be drawn is the CPU's, which says why)
+            } else {
+                gpu::countSplatsOnCpu(why);
+            }
         }
         src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError,
                                                                       modelLayerAt(p, seq, o), !o.highQuality)
@@ -3308,6 +3333,9 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     } else if (cs.shapes) {
         out.shapes = cs.shapes;
         w = cs.shapes->width, h = cs.shapes->height;
+    } else if (cs.splats) {
+        out.splats = cs.splats;
+        w = cs.splats->width, h = cs.splats->height;
     } else {
         out.image = std::move(cs.src);
         w = out.image.width, h = out.image.height;
@@ -3336,6 +3364,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
                    ", converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
         else if (cs.frame) *why = "16-bit RGBA from the decoder";
         else if (cs.shapes) *why = "a Shape layer, drawn there";
+        else if (cs.splats) *why = std::to_string(cs.splats->depths.size()) + " splats, sorted and blended there";
         else *why = "a picture made on the CPU before its effects";
     }
     // A transform moving through its shutter is drawn at each time on the CPU.

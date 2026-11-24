@@ -1,6 +1,7 @@
 #include "GpuCompositor.h"
 
 #include <QImage>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -50,6 +51,14 @@ void countFallback(const std::string& why) {
     if (logFallbacks()) std::fprintf(stderr, "montage gpu: frame on the CPU: %s\n", why.c_str());
 }
 
+void countSplatsOnCpu(const std::string& why) {
+    {
+        std::lock_guard lock(gStatsMutex);
+        gStats.lastSplatFallback = why;
+    }
+    if (logFallbacks()) std::fprintf(stderr, "montage gpu: splats drawn on the CPU: %s\n", why.c_str());
+}
+
 void countLayer(bool onGpu, const std::string& how) {
     {
         std::lock_guard lock(gStatsMutex);
@@ -77,6 +86,11 @@ int maxTextureSize() { return 0; }
 bool takesPlanes() { return false; }
 bool takesShaders(const std::string&) { return false; }
 bool sharesOpenGl() { return false; }
+bool takesSplats(std::string* why) {
+    if (why) *why = kNoGpu;
+    return false;
+}
+void setSplatsForTesting(bool) {}
 size_t textureBudget() { return 0; }
 void shutdown() {}
 bool execute(const Frame&, Image*, QImage*, std::string*) { return false; }
@@ -128,6 +142,7 @@ namespace {
 #include "shaders/GpuShaders.inc"
 
 std::atomic<bool> gRefuseHw{false};  // (tests: refuseHardwareFramesForTesting)
+std::atomic<bool> gRefuseSplats{false};  // (tests: setSplatsForTesting)
 
 // Set while this thread runs a texture step for the GPU's thread (Device::callBack), which waits for it: the thread
 // holds the device (execute()'s lock) and must not ask the GPU for another frame meanwhile.
@@ -181,6 +196,8 @@ size_t frameShape(const Frame& frame, bool eightBit) {
         if (const YcbcrPlanes* yc = l->frame ? l->frame->planes.get() : nullptr) mix(yc->width), mix(yc->height), mix(yc->wide), mix(yc->hw != nullptr);
         mix(l->image.width), mix(l->image.height), mix(l->shapes ? l->shapes->width : 0), mix(l->shapes ? l->shapes->height : 0);
         mix(l->shapes ? static_cast<long long>(l->shapes->table.size()) : 0);
+        mix(l->splats ? l->splats->width : 0), mix(l->splats ? l->splats->height : 0);
+        mix(l->splats ? static_cast<long long>(l->splats->depths.size()) : 0), mix(l->splats && l->splats->points);
         ops(l->ops);
     };
     mix(frame.width), mix(frame.height), mix(eightBit), mix(static_cast<long long>(frame.items.size()));
@@ -241,6 +258,17 @@ public:
     long texturesMade = 0;                 // (textures made, the last frame)
     long shaderBuilds = 0;                 // (shader steps built, the last frame)
     long shapeLayers = 0;                  // (Shape layers drawn, the last frame)
+    long splatLayers = 0, splatsDrawn = 0, splatBatches = 0;  // (splat layers sorted and blended, the last frame)
+    // Whether it sorts and blends splats (it has compute, and their shaders were built), and why not.
+    bool takesSplats(std::string* why) const {
+        std::lock_guard lock(brokenMutex_);
+        if (gRefuseSplats) {
+            if (why) *why = "compute turned off for a test";
+            return false;
+        }
+        if (!splats_ && why) *why = noSplats_;
+        return splats_;
+    }
     long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
     long hwImports = 0;                    // (and imported or copied for this frame, not kept from an earlier draw)
     std::string hwFallback;                // (why the last of them that could not be mapped was copied back)
@@ -273,6 +301,9 @@ private:
         QRhiTexture* tex = nullptr;
         QRhiTextureRenderTarget* rt = nullptr;
         QRhiRenderPassDescriptor* rp = nullptr;
+        // (drawn into again, what is there kept: the splats' later batches)
+        QRhiTextureRenderTarget* keepRt = nullptr;
+        QRhiRenderPassDescriptor* keepRp = nullptr;
     };
     QRhiTexture* texture(QRhiTexture::Format format, int w, int h, bool target);
     void dropPooled(size_t i);  // (pool_[i] let go, with its target)
@@ -298,6 +329,30 @@ private:
     Program* program(const ShaderStep& step, QRhiResourceUpdateBatch* u);
     void dropProgram(Program& prog, bool later = false);
     QRhiTexture* layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiTexture* canvas = nullptr);
+    // Splats (Layer::splats): their pipelines, made where the device has compute; the buffers a layer's batches are
+    // sorted and drawn from (kept between frames as textures are, counted against the budget); a layer drawn.
+    bool makeSplatPipelines();
+    struct SplatBuffers {
+        size_t splats = 0, entries = 0;  // a batch's: its splats, and the keys sorted (a splat a tile it reaches)
+        int width = 0, height = 0;       // (Gaussians: the picture, blended in its tiles; points 0)
+        QRhiBuffer *keysA = nullptr, *keysB = nullptr, *hist = nullptr, *sums = nullptr, *rec = nullptr, *inst = nullptr;
+        QRhiBuffer *ents = nullptr, *starts = nullptr, *state = nullptr;
+        QRhiTexture* picture = nullptr;
+        bool used = false;
+        long lastFrame = 0;
+        size_t bytes = 0;
+        void free() {
+            delete keysA, delete keysB, delete hist, delete sums, delete rec, delete inst, delete ents, delete starts, delete state, delete picture;
+        }
+    };
+    static size_t splatSetBytes(size_t splats, size_t entries, int width, int height);
+    void dropSplatSet(size_t i);
+    // (making room for `bytes` more: textures and splat sets no pass of this frame uses let go; false where it would
+    // still be past the budget)
+    bool roomFor(size_t bytes);
+    SplatBuffers* splatBuffers(size_t splats, size_t entries, int width, int height);
+    QRhiTexture* splatLayer(const SplatLayer& s, QRhiResourceUpdateBatch*& u);
+    QRhiTextureRenderTarget* keepTarget(QRhiTexture* tex);
     // A texture step run from `from` into `into` (false, the frame failed, when it could not be).
     bool external(const TextureStep* step, const std::vector<QRhiTexture*>& from, QRhiTexture* into, QRhiResourceUpdateBatch*& u);
     bool readPicture(QRhiTexture* from, QRhiResourceUpdateBatch*& u, Image& picture);
@@ -359,6 +414,14 @@ private:
     QRhiShaderResourceBindings* layout_ = nullptr;
     QRhiGraphicsPipeline *colorPs_ = nullptr, *compositePs_ = nullptr, *outputPs_ = nullptr, *output8Ps_ = nullptr;
     QRhiGraphicsPipeline *filterPs_ = nullptr, *mixPs_ = nullptr;
+    bool splats_ = false;  // (brokenMutex_)
+    std::string noSplats_;  // (why not; brokenMutex_)
+    QRhiBuffer* splatDummy_ = nullptr;
+    QRhiTexture* splatDummyPicture_ = nullptr;
+    QRhiShaderResourceBindings *sortLayout_ = nullptr, *splatLayout_ = nullptr;
+    QRhiComputePipeline* sortPs_ = nullptr;
+    QRhiGraphicsPipeline* splatPointPs_ = nullptr;
+    std::vector<SplatBuffers> splatSets_;
     QRhiRenderPassDescriptor *rpFloat_ = nullptr, *rp8_ = nullptr;
     QRhiTexture *rpFloatTex_ = nullptr, *rp8Tex_ = nullptr;  // (the small targets they were made from)
     // Textures kept between frames (by format and size), lent out within one. Only let go between frames: a pass
@@ -492,8 +555,12 @@ bool Device::launch() {
     }
     if (backend_ == QRhi::OpenGLES2) {
         QSurfaceFormat format = QSurfaceFormat::defaultFormat();
-        format.setVersion(3, 3);
         format.setProfile(QSurfaceFormat::CoreProfile);
+        // OpenGL 4.3 where the driver has it (compute shaders: splats are sorted there), else 3.3. (Qt's OpenGL
+        // backend goes by the version the context was made for, not the driver's own.)
+        format.setVersion(4, 3);
+        if (QOpenGLContext probe; probe.setFormat(format), !probe.create() || probe.format().version() < qMakePair(4, 3))
+            format.setVersion(3, 3);
         glFormat_ = format;
         fallback_ = QRhiGles2InitParams::newFallbackSurface(format);
     }
@@ -563,6 +630,7 @@ void Device::letGoIdle() {
     if (idleLetGo_ || !rhi_ || std::chrono::steady_clock::now() - lastDrawn_ < std::chrono::milliseconds(idleMs.load())) return;
     idleLetGo_ = true;
     while (!pool_.empty()) dropPooled(pool_.size() - 1);
+    while (!splatSets_.empty()) dropSplatSet(splatSets_.size() - 1);
     // (an empty frame, after which the API frees what was let go: it holds a texture until a frame has ended past it)
     QRhiCommandBuffer* cb = nullptr;
     if (rhi_->beginOffscreenFrame(&cb) == QRhi::FrameOpSuccess) rhi_->endOffscreenFrame();
@@ -762,6 +830,17 @@ bool Device::create() {
         problem_ = "the graphics device cannot build the compositor's shaders";
         return false;
     }
+    // Splats are sorted in compute passes and drawn as instances; without those the CPU draws them.
+    {
+        std::string noSplats;
+        if (!rhi_->isFeatureSupported(QRhi::Compute)) noSplats = "the graphics device has no compute shaders (OpenGL below 4.3, or OpenGL ES below 3.1)";
+        else if (!rhi_->isFeatureSupported(QRhi::Instancing)) noSplats = "the graphics device cannot draw instances";
+        else if (!rhi_->isTextureFormatSupported(T::RGBA32F, T::RenderTarget)) noSplats = "the graphics device cannot blend into float textures";
+        else if (!makeSplatPipelines()) noSplats = "the graphics device cannot build the splats' shaders";
+        std::lock_guard lock(brokenMutex_);
+        splats_ = noSplats.empty();
+        noSplats_ = noSplats;
+    }
     // The texture budget: MONTAGE_GPU_MEMORY megabytes, or half the card's memory where the device tells it (the rest
     // is the decoders', the display's and other programs'), never under 256 MB.
     {
@@ -823,7 +902,7 @@ void Device::destroy() {
     for (auto& [rows, t] : sharedTables_) delete t.tex;
     sharedTables_.clear();
     sharedTablesNew_.clear();
-    for (auto& [tex, t] : targets_) delete t.rt, delete t.rp;
+    for (auto& [tex, t] : targets_) delete t.rt, delete t.rp, delete t.keepRt, delete t.keepRp;
     targets_.clear();
     for (Pooled& p : pool_) delete p.tex;
     pool_.clear();
@@ -831,6 +910,13 @@ void Device::destroy() {
     refused_ = 0;
     for (QRhiBuffer* b : ubufs_) delete b;
     ubufs_.clear();
+    while (!splatSets_.empty()) dropSplatSet(splatSets_.size() - 1);
+    delete sortPs_, delete splatPointPs_, delete sortLayout_, delete splatLayout_, delete splatDummy_, delete splatDummyPicture_;
+    sortPs_ = nullptr, splatPointPs_ = nullptr, sortLayout_ = splatLayout_ = nullptr, splatDummy_ = nullptr, splatDummyPicture_ = nullptr;
+    {
+        std::lock_guard lock(brokenMutex_);
+        splats_ = false;
+    }
     delete colorPs_, delete compositePs_, delete outputPs_, delete output8Ps_, delete filterPs_, delete mixPs_;
     colorPs_ = compositePs_ = outputPs_ = output8Ps_ = filterPs_ = mixPs_ = nullptr;
     rpFloat_ = rp8_ = nullptr;  // (the targets' own)
@@ -866,9 +952,12 @@ QRhiTexture* Device::texture(QRhiTexture::Format format, int w, int h, bool isTa
         }
     const size_t bytes = size_t(w) * size_t(h) * texelBytes(format);
     if (const size_t most = textureBudget(); most > 0) {
-        // Past the budget: the textures kept from earlier frames that this one has not used go first (no pass of this
-        // frame reads them), then the frame is given up, for the CPU.
+        // Past the budget: the splats' buffers and textures kept from earlier frames that this one has not used go first
+        // (no pass of this frame reads them), then the frame is given up, for the CPU.
         size_t now = held();
+        for (size_t i = 0; now + bytes > most && i < splatSets_.size();)
+            if (splatSets_[i].used) ++i;
+            else now -= splatSets_[i].bytes, dropSplatSet(i);
         for (size_t i = 0; now + bytes > most && i < pool_.size();) {
             if (pool_[i].used || pool_[i].lastFrame >= frameNo_) {
                 ++i;
@@ -898,7 +987,7 @@ QRhiTexture* Device::texture(QRhiTexture::Format format, int w, int h, bool isTa
 
 void Device::dropPooled(size_t i) {
     if (auto tg = targets_.find(pool_[i].tex); tg != targets_.end()) {
-        delete tg->second.rt, delete tg->second.rp;
+        delete tg->second.rt, delete tg->second.rp, delete tg->second.keepRt, delete tg->second.keepRp;
         targets_.erase(tg);
     }
     delete pool_[i].tex;
@@ -912,6 +1001,7 @@ size_t Device::held() const {
     for (const auto& [rows, t] : sharedTables_) bytes += bytesOf(t.tex);
     for (const auto& [key, prog] : programs_)
         for (const auto& [tex, linear] : prog.textures) bytes += bytesOf(tex);
+    for (const SplatBuffers& b : splatSets_) bytes += b.bytes;
     return bytes;  // (the one-texel stand-ins aside)
 }
 
@@ -1360,6 +1450,9 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         release(table);
         ++filterPasses;
         ++shapeLayers;
+    } else if (l.splats) {
+        cur = splatLayer(*l.splats, u);
+        if (!cur) return nullptr;
     } else {
         const int w = l.image.width, h = l.image.height;
         if (w <= 0 || h <= 0) return nullptr;
@@ -1694,6 +1787,383 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
 }
 
 // A texture of the frame's read back as a picture, what is recorded so far run first.
+bool Device::makeSplatPipelines() {
+    using B = QRhiShaderResourceBinding;
+    splatDummy_ = rhi_->newBuffer(QRhiBuffer::Static, QRhiBuffer::StorageBuffer, 256);
+    if (!splatDummy_->create()) return false;
+    QRhiBuffer* d = splatDummy_;
+    splatDummyPicture_ = rhi_->newTexture(QRhiTexture::RGBA32F, QSize(1, 1), 1, QRhiTexture::UsedWithLoadStore);
+    if (!splatDummyPicture_->create()) return false;
+    const auto C = B::ComputeStage;
+    sortLayout_ = rhi_->newShaderResourceBindings();
+    sortLayout_->setBindings({B::uniformBuffer(0, C, ubufs_[0]), B::bufferLoad(1, C, d), B::bufferStore(2, C, d), B::bufferLoadStore(3, C, d),
+                              B::bufferLoadStore(4, C, d), B::bufferLoad(5, C, d), B::bufferStore(6, C, d), B::bufferLoad(7, C, d),
+                              B::bufferLoad(8, C, d), B::bufferLoadStore(9, C, d), B::imageStore(10, C, splatDummyPicture_, 0)});
+    if (!sortLayout_->create()) return false;
+    sortPs_ = rhi_->newComputePipeline();
+    sortPs_->setShaderStage({QRhiShaderStage::Compute, shader(kSplatsortCompQsb, sizeof kSplatsortCompQsb)});
+    sortPs_->setShaderResourceBindings(sortLayout_);
+    if (!sortPs_->create()) return false;
+    splatLayout_ = rhi_->newShaderResourceBindings();
+    splatLayout_->setBindings({B::uniformBuffer(0, B::VertexStage | B::FragmentStage, ubufs_[0])});
+    if (!splatLayout_->create()) return false;
+    // (each splat an instance: its 3 texels of 16 bytes)
+    QRhiVertexInputLayout input;
+    input.setBindings({QRhiVertexInputBinding(48, QRhiVertexInputBinding::PerInstance)});
+    input.setAttributes({QRhiVertexInputAttribute(0, 0, QRhiVertexInputAttribute::Float4, 0), QRhiVertexInputAttribute(0, 2, QRhiVertexInputAttribute::Float4, 32)});
+    QRhiGraphicsPipeline* ps = rhi_->newGraphicsPipeline();
+    ps->setTopology(QRhiGraphicsPipeline::Triangles);
+    ps->setShaderStages({{QRhiShaderStage::Vertex, shader(kSplatVertQsb, sizeof kSplatVertQsb)},
+                         {QRhiShaderStage::Fragment, shader(kSplatFragQsb, sizeof kSplatFragQsb)}});
+    ps->setVertexInputLayout(input);
+    ps->setShaderResourceBindings(splatLayout_);
+    ps->setRenderPassDescriptor(rpFloat_);
+    if (!ps->create()) {
+        delete ps;
+        return false;
+    }
+    splatPointPs_ = ps;
+    return true;
+}
+
+size_t Device::splatSetBytes(size_t splats, size_t entries, int width, int height) {
+    const size_t blocks = (entries + 255) / 256, digits = blocks * 16, tiles = size_t((width + 15) / 16) * size_t((height + 15) / 16);
+    // (the keys twice and their entries, the splats as uploaded and as drawn, the digits' counts and their scan's sums;
+    // for Gaussians each tile's start, and the blend's state and picture)
+    return blocks * 256 * 24 + splats * 96 + digits * 4 + std::max<size_t>(1, (digits + 1023) / 1024) * 4 +
+           (width > 0 ? (tiles + 1) * 4 + size_t(width) * size_t(height) * 32 : 0);
+}
+
+void Device::dropSplatSet(size_t i) {
+    splatSets_[i].free();
+    splatSets_.erase(splatSets_.begin() + std::ptrdiff_t(i));
+}
+
+bool Device::roomFor(size_t bytes) {
+    const size_t most = textureBudget();
+    if (most == 0) return true;
+    size_t now = held();
+    for (size_t i = 0; now + bytes > most && i < splatSets_.size();)
+        if (splatSets_[i].used) ++i;
+        else now -= splatSets_[i].bytes, dropSplatSet(i);
+    for (size_t i = 0; now + bytes > most && i < pool_.size();)
+        if (pool_[i].used || pool_[i].lastFrame >= frameNo_) ++i;
+        else now -= pool_[i].bytes, dropPooled(i);
+    return now + bytes <= most;
+}
+
+Device::SplatBuffers* Device::splatBuffers(size_t splats, size_t entries, int width, int height) {
+    // A set kept from an earlier frame (or made by an earlier layer of this one) that holds a batch ...
+    for (SplatBuffers& b : splatSets_)
+        if (!b.used && b.splats >= splats && b.entries >= entries && b.width == width && b.height == height) {
+            b.used = true;
+            b.lastFrame = frameNo_;
+            return &b;
+        }
+    // ... or a new one (the caller has made room for it).
+    SplatBuffers b;
+    b.splats = splats, b.entries = entries, b.width = width, b.height = height;
+    const size_t blocks = (entries + 255) / 256, digits = blocks * 16;
+    auto storage = [&](size_t bytes, bool vertex = false) {
+        QRhiBuffer* buf = rhi_->newBuffer(QRhiBuffer::Static, vertex ? QRhiBuffer::VertexBuffer | QRhiBuffer::StorageBuffer : QRhiBuffer::StorageBuffer,
+                                          quint32(std::max<size_t>(16, bytes)));
+        if (!buf->create()) {
+            delete buf;
+            return static_cast<QRhiBuffer*>(nullptr);
+        }
+        return buf;
+    };
+    b.keysA = storage(blocks * 256 * 8), b.keysB = storage(blocks * 256 * 8), b.hist = storage(digits * 4);
+    b.sums = storage(std::max<size_t>(1, (digits + 1023) / 1024) * 4), b.rec = storage(splats * 48), b.inst = storage(splats * 48, true);
+    bool ok = b.keysA && b.keysB && b.hist && b.sums && b.rec && b.inst;
+    if (width > 0 && height > 0) {
+        const size_t tiles = size_t((width + 15) / 16) * size_t((height + 15) / 16);
+        b.ents = storage(blocks * 256 * 8), b.starts = storage((tiles + 1) * 4), b.state = storage(size_t(width) * size_t(height) * 16);
+        b.picture = rhi_->newTexture(QRhiTexture::RGBA32F, QSize(width, height), 1, QRhiTexture::UsedWithLoadStore);
+        if (!b.picture->create()) delete b.picture, b.picture = nullptr;
+        ok = ok && b.ents && b.starts && b.state && b.picture;
+    }
+    b.used = true, b.lastFrame = frameNo_, b.bytes = splatSetBytes(splats, entries, width, height);
+    if (!ok) {
+        b.free();
+        failed_ = true;
+        return nullptr;
+    }
+    splatSets_.push_back(b);
+    countHeld();
+    return &splatSets_.back();
+}
+
+QRhiTextureRenderTarget* Device::keepTarget(QRhiTexture* tex) {
+    Target* t = target(tex);
+    if (!t) return nullptr;
+    if (!t->keepRt) {
+        t->keepRt = rhi_->newTextureRenderTarget({QRhiColorAttachment(tex)}, QRhiTextureRenderTarget::PreserveColorContents);
+        t->keepRp = t->keepRt->newCompatibleRenderPassDescriptor();
+        t->keepRt->setRenderPassDescriptor(t->keepRp);
+        if (!t->keepRt->create()) {
+            delete t->keepRt, delete t->keepRp;
+            t->keepRt = nullptr, t->keepRp = nullptr;
+            failed_ = true;
+            return nullptr;
+        }
+    }
+    return t->keepRt;
+}
+
+QRhiTexture* Device::splatLayer(const SplatLayer& s, QRhiResourceUpdateBatch*& u) {
+    using T = QRhiTexture;
+    using B = QRhiShaderResourceBinding;
+    const int w = s.width, h = s.height;
+    const size_t n = std::min(s.depths.size(), s.records.size() / 12);
+    if (w <= 0 || h <= 0 || !splats_ || (!s.points && s.tiles.size() < n * 4)) {
+        failed_ = true;
+        return nullptr;
+    }
+    ++splatLayers;
+    if (n == 0) {  // (none to draw: transparent)
+        QRhiTexture* none = texture(T::RGBA32F, w, h, true);
+        const Target* t = none ? target(none) : nullptr;
+        if (!t) {
+            if (none) release(none);
+            return nullptr;
+        }
+        cb_->beginPass(t->rt, Qt::transparent, {1.0f, 0}, u);
+        cb_->endPass();
+        u = rhi_->nextResourceUpdateBatch();
+        return none;
+    }
+    // A key a splat: its depth's bits, flipped so that they order as the depths do (the padding, all ones, last).
+    auto keyOf = [](float depth) {
+        uint32_t bits;
+        std::memcpy(&bits, &depth, 4);
+        return bits & 0x80000000u ? ~bits : bits | 0x80000000u;
+    };
+    // Gaussians are blended a 16-pixel tile at a time, as the CPU blends them: a key for each tile a splat reaches.
+    const int tilesX = (w + 15) / 16, tilesY = (h + 15) / 16;
+    const size_t tiles = size_t(tilesX) * size_t(tilesY);
+    const int pw = s.points ? 0 : w, ph = s.points ? 0 : h;
+    auto reach = [&](size_t i) -> size_t {
+        if (s.points) return 1;
+        const int32_t* t = s.tiles.data() + i * 4;
+        return size_t(std::max(0, t[2] - t[0] + 1)) * size_t(std::max(0, t[3] - t[1] + 1));
+    };
+    // Over the budget, in batches by depth: the splats in each, nearest first, are those between two keys (with their
+    // indices, so that equal depths keep the cloud's order across batches too), each batch's in the cloud's order.
+    constexpr size_t kMostBatch = size_t(1) << 20;    // (splats: each buffer at most 48 MB, drivers' own limits)
+    constexpr size_t kMostEntries = size_t(1) << 24;  // (the keys of a batch, as far as the digits' two-level scan reaches)
+    size_t batch = std::min(n, kMostBatch), mostEntries = 0;
+    std::vector<uint32_t> order;
+    std::vector<size_t> starts;
+    auto band = [&] {
+        order.clear(), starts.assign(1, 0);
+        const size_t batches = (n + batch - 1) / batch;
+        if (batches > 1) {
+            std::vector<uint64_t> key(n);
+            for (size_t i = 0; i < n; ++i) key[i] = uint64_t(keyOf(s.depths[i])) << 32 | uint64_t(i);
+            std::vector<uint64_t> sorted = key, bounds;
+            for (size_t k = 1; k < batches; ++k) {
+                std::nth_element(sorted.begin() + std::ptrdiff_t((k - 1) * batch), sorted.begin() + std::ptrdiff_t(k * batch), sorted.end());
+                bounds.push_back(sorted[k * batch]);
+            }
+            std::vector<std::vector<uint32_t>> parts(batches);
+            for (size_t i = 0; i < n; ++i) parts[size_t(std::upper_bound(bounds.begin(), bounds.end(), key[i]) - bounds.begin())].push_back(uint32_t(i));
+            for (const std::vector<uint32_t>& part : parts) {
+                order.insert(order.end(), part.begin(), part.end());
+                starts.push_back(order.size());
+            }
+        } else {
+            starts.push_back(n);
+        }
+        mostEntries = 0;
+        for (size_t k = 0; k + 1 < starts.size(); ++k) {
+            size_t e = 0;
+            for (size_t j = starts[k]; j < starts[k + 1]; ++j) e += reach(batches > 1 ? order[j] : j);
+            mostEntries = std::max(mostEntries, e);
+        }
+    };
+    auto reusable = [&] {
+        for (const SplatBuffers& b : splatSets_)
+            if (!b.used && b.splats >= batch && b.entries >= mostEntries && b.width == pw && b.height == ph) return true;
+        return false;
+    };
+    // (room kept too for the picture the layer is drawn into, taken after the set, and for the frame's own targets that
+    // follow it: the set is held until the frame is done)
+    const size_t picture = size_t(w) * size_t(h) * 16 * 4;
+    QRhiBuffer* keptKeys = nullptr;  // (a kept set claimed, known by its keys' buffer: making room may move it)
+    for (;;) {
+        band();
+        if (mostEntries <= kMostEntries) {
+            // (a kept set is claimed first, so that making room for the picture does not let it go)
+            SplatBuffers* kept = reusable() ? splatBuffers(batch, mostEntries, pw, ph) : nullptr;
+            keptKeys = kept ? kept->keysA : nullptr;
+            if (roomFor((kept ? 0 : splatSetBytes(batch, mostEntries, pw, ph)) + picture)) break;
+            for (SplatBuffers& b : splatSets_)
+                if (keptKeys && b.keysA == keptKeys) b.used = false;
+            keptKeys = nullptr;
+        }
+        if (batch <= 1024) {
+            overBudget = mostEntries > kMostEntries ? "its splats reach too many tiles to be sorted"
+                                                    : "its splats would hold " + std::to_string((held() + splatSetBytes(batch, mostEntries, pw, ph) + picture + (size_t(1) << 20) - 1) >> 20) +
+                                                          " MB of textures and buffers, over the budget of " + std::to_string(textureBudget() >> 20) + " MB";
+            failed_ = true;
+            return nullptr;
+        }
+        batch = std::max<size_t>(1024, batch / 2 / 256 * 256);
+    }
+    SplatBuffers* set = nullptr;
+    for (SplatBuffers& b : splatSets_)
+        if (keptKeys && b.keysA == keptKeys) set = &b;
+    if (!set) set = splatBuffers(batch, mostEntries, pw, ph);
+    if (!set) return nullptr;
+    const size_t batches = starts.size() - 1;
+    // Points are drawn as quads, a pixel each, into a target (the farthest batch first, each drawn last to first, so
+    // that the nearest is drawn last).
+    QRhiTexture* acc = nullptr;
+    const Target* first = nullptr;
+    if (s.points) {
+        acc = texture(T::RGBA32F, w, h, true);
+        first = acc ? target(acc) : nullptr;
+        if (!first) {
+            if (acc) release(acc);
+            return nullptr;
+        }
+    }
+    const bool flip = rhi_->isYUpInNDC() != rhi_->isYUpInFramebuffer();
+    for (size_t k = 0; k < batches; ++k) {
+        const size_t part = s.points ? batches - 1 - k : k;
+        const size_t from = starts[part], nb = starts[part + 1] - from;
+        size_t E = 0;
+        for (size_t j = 0; j < nb; ++j) E += reach(batches > 1 ? order[from + j] : j);
+        const size_t blocks = (E + 255) / 256, digits = blocks * 16, scans = (digits + 1023) / 1024;
+        std::vector<uint32_t> keys(blocks * 256 * 2, 0xffffffffu), ents;
+        std::vector<uint32_t> tileStarts;
+        std::vector<float> rec(nb * 12);
+        if (!s.points) ents.assign(blocks * 256 * 2, 0), tileStarts.assign(tiles + 1, 0);
+        size_t e = 0;
+        for (size_t j = 0; j < nb; ++j) {
+            const size_t i = batches > 1 ? order[from + j] : j;
+            std::memcpy(rec.data() + j * 12, s.records.data() + i * 12, 48);
+            const uint32_t key = keyOf(s.depths[i]);
+            if (s.points) {
+                keys[e * 2] = key, keys[e * 2 + 1] = uint32_t(j), ++e;
+                continue;
+            }
+            const int32_t* t = s.tiles.data() + i * 4;
+            for (int ty = t[1]; ty <= t[3]; ++ty)
+                for (int tx = t[0]; tx <= t[2]; ++tx) {
+                    const uint32_t tile = uint32_t(ty * tilesX + tx);
+                    keys[e * 2] = key, keys[e * 2 + 1] = uint32_t(e);
+                    ents[e * 2] = tile, ents[e * 2 + 1] = uint32_t(j);
+                    ++tileStarts[tile + 1], ++e;
+                }
+        }
+        for (size_t t = 1; t < tileStarts.size(); ++t) tileStarts[t] += tileStarts[t - 1];
+        u->uploadStaticBuffer(set->keysA, 0, quint32(keys.size() * 4), keys.data());
+        u->uploadStaticBuffer(set->rec, 0, quint32(rec.size() * 4), rec.data());
+        if (!s.points) {
+            u->uploadStaticBuffer(set->ents, 0, quint32(ents.size() * 4), ents.data());
+            u->uploadStaticBuffer(set->starts, 0, quint32(tileStarts.size() * 4), tileStarts.data());
+        }
+        // The sort's dispatches, each with its settings: eight passes of four bits by depth (from A into B and back),
+        // then the copy for points; for Gaussians the keys made their entries' tiles, passes by those, then the blend.
+        struct Dispatch {
+            QRhiShaderResourceBindings* srb;
+            int groupsX, groupsY;
+            bool fromA;
+        };
+        std::vector<Dispatch> dispatches;
+        auto dispatch = [&](float mode, float shift, float count, int groupsX, bool fromA, std::initializer_list<float> more = {}, int groupsY = 1) {
+            float q[64] = {};
+            q[0] = mode, q[1] = shift, q[2] = float(blocks), q[3] = count;
+            std::copy(more.begin(), more.end(), q + 4);
+            QRhiBuffer* ub = uniforms(u, q);
+            QRhiBuffer* in = fromA ? set->keysA : set->keysB;
+            QRhiBuffer* out = fromA ? set->keysB : set->keysA;
+            const auto C = B::ComputeStage;
+            QRhiShaderResourceBindings* srb = rhi_->newShaderResourceBindings();
+            // (points: what the blend takes bound to buffers read or written the same way already)
+            srb->setBindings({B::uniformBuffer(0, C, ub), B::bufferLoad(1, C, in), B::bufferStore(2, C, out), B::bufferLoadStore(3, C, set->hist),
+                              B::bufferLoadStore(4, C, set->sums), B::bufferLoad(5, C, set->rec), B::bufferStore(6, C, set->inst),
+                              B::bufferLoad(7, C, s.points ? set->rec : set->ents), B::bufferLoad(8, C, s.points ? set->rec : set->starts),
+                              B::bufferLoadStore(9, C, s.points ? set->sums : set->state),
+                              B::imageStore(10, C, s.points ? splatDummyPicture_ : set->picture, 0)});
+            srb->create();
+            frameSrbs_.push_back(srb);
+            dispatches.push_back({srb, groupsX, groupsY, fromA});
+        };
+        auto sortBy = [&](int passes, bool fromA) {
+            for (int pass = 0; pass < passes; ++pass, fromA = !fromA) {
+                const float shift = float(pass * 4);
+                dispatch(0, shift, 0, int(blocks), fromA);
+                dispatch(1, shift, float(digits), int(scans), fromA);
+                dispatch(2, shift, float(scans), 1, fromA);
+                dispatch(3, shift, float(digits), int((digits + 255) / 256), fromA);
+                dispatch(4, shift, 0, int(blocks), fromA);
+            }
+            return fromA;  // (where the keys are now)
+        };
+        sortBy(8, true);
+        if (s.points) {
+            dispatch(5, 0, float(nb), int(blocks), true, {1});
+        } else {
+            dispatch(6, 0, 0, int(blocks), true);
+            int passes = 1;  // (enough for every tile, below the padding's)
+            while ((size_t(1) << (4 * passes)) <= tiles) ++passes;
+            const bool inA = sortBy(passes, false);
+            dispatch(7, 0, 0, tilesX, inA, {float(tilesX), float(w), float(h), k == 0 ? 1.0f : 0.0f, k + 1 == batches ? 1.0f : 0.0f}, tilesY);
+        }
+        // (a compute pass for each way the keys go: a buffer is read or written within a pass, not both)
+        for (size_t d = 0; d < dispatches.size();) {
+            cb_->beginComputePass(d == 0 ? u : nullptr);
+            cb_->setComputePipeline(sortPs_);
+            const bool fromA = dispatches[d].fromA;
+            for (; d < dispatches.size() && dispatches[d].fromA == fromA; ++d) {
+                cb_->setShaderResources(dispatches[d].srb);
+                cb_->dispatch(dispatches[d].groupsX, dispatches[d].groupsY, 1);
+            }
+            cb_->endComputePass();
+        }
+        u = rhi_->nextResourceUpdateBatch();
+        ++splatBatches;
+        if (!s.points) continue;
+        // Points drawn: the first batch onto a cleared target, the others under what is there.
+        float q[64] = {};
+        q[0] = float(w), q[1] = float(h), q[2] = flip ? 1 : 0, q[3] = 1;
+        QRhiShaderResourceBindings* srb = rhi_->newShaderResourceBindings();
+        srb->setBindings({B::uniformBuffer(0, B::VertexStage | B::FragmentStage, uniforms(u, q))});
+        srb->create();
+        frameSrbs_.push_back(srb);
+        QRhiTextureRenderTarget* rt = k == 0 ? first->rt : keepTarget(acc);
+        if (!rt) {
+            u->release();
+            u = rhi_->nextResourceUpdateBatch();
+            release(acc);
+            return nullptr;
+        }
+        cb_->beginPass(rt, Qt::transparent, {1.0f, 0}, u);
+        cb_->setGraphicsPipeline(splatPointPs_);
+        cb_->setViewport({0, 0, float(w), float(h)});
+        cb_->setShaderResources(srb);
+        const QRhiCommandBuffer::VertexInput input(set->inst, 0);
+        cb_->setVertexInput(0, 1, &input);
+        cb_->draw(6, quint32(nb));
+        cb_->endPass();
+        u = rhi_->nextResourceUpdateBatch();
+    }
+    splatsDrawn += long(n);
+    if (s.points) return acc;
+    // Finished: a linear cloud's colour to display values under its coverage, and the layer's opacity.
+    QRhiTexture* out = texture(T::RGBA32F, w, h, true);
+    if (!out) return nullptr;
+    float q[64] = {};
+    q[0] = 72, q[4] = s.linearColor ? 1 : 0, q[5] = std::clamp(s.opacity, 0.0f, 1.0f);
+    pass(filterPs_, out, u, {{1, set->picture}}, uniforms(u, q));
+    u = rhi_->nextResourceUpdateBatch();
+    ++filterPasses;
+    return out;
+}
+
 bool Device::readPicture(QRhiTexture* from, QRhiResourceUpdateBatch*& u, Image& picture) {
     const QSize size = from->pixelSize();
     QRhiReadbackResult read;
@@ -1753,6 +2223,7 @@ void Device::endFrame(bool drawn) {
     for (QRhiShaderResourceBindings* s : frameSrbs_) delete s;
     frameSrbs_.clear();
     for (Pooled& p : pool_) p.used = false;
+    for (SplatBuffers& b : splatSets_) b.used = false;
     ubufUsed_ = 0;
     // The frame is finished (offscreen frames wait for the GPU), so textures can go now: those not used for a few
     // frames, then the least recently used while the pool holds more than its budget. What this frame used stays
@@ -1767,6 +2238,9 @@ void Device::endFrame(bool drawn) {
     const size_t most = budget.load() ? budget.load() : whole > 0 ? std::min(kBudget, whole) : kBudget;
     for (size_t i = 0; i < pool_.size();)
         if (frameNo_ - pool_[i].lastFrame > kIdleFrames) dropPooled(i);
+        else ++i;
+    for (size_t i = 0; i < splatSets_.size();)
+        if (frameNo_ - splatSets_[i].lastFrame > kIdleFrames) dropSplatSet(i);
         else ++i;
     // So too the LUTs and the filters' tables no frame has been drawn with for as long, and those whose owner has gone
     // (an effect taken off: its tables are not held for the CPU's own cache of them to let go).
@@ -1803,7 +2277,7 @@ void Device::endFrame(bool drawn) {
     ++frameNo_;
     failed_ = false;
     lastDrawn_ = std::chrono::steady_clock::now();
-    idleLetGo_ = pool_.empty();
+    idleLetGo_ = pool_.empty() && splatSets_.empty();
     const size_t peak = peakBytes;
     countHeld();
     peakBytes = peak;
@@ -1812,6 +2286,7 @@ void Device::endFrame(bool drawn) {
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
     filterPasses = mixPasses = shaderBuilds = shapeLayers = textureSteps = texturesMade = pictureReadBacks = 0;
+    splatLayers = splatsDrawn = splatBatches = 0;
     hwMapped = hwGpuCopies = hwImports = 0;
     hwFallback.clear();
     overBudget.clear();
@@ -1908,7 +2383,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         return to;
     };
     // (Nothing to draw, transparent: no picture, or an adjustment layer over nothing.)
-    auto absent = [&](const Layer& l) { return l.canvas ? !canvas : !l.frame && l.image.empty() && !l.shapes; };
+    auto absent = [&](const Layer& l) { return l.canvas ? !canvas : !l.frame && l.image.empty() && !l.shapes && !l.splats; };
     Layer full;  // (a picture the canvas's size already)
     full.place.full = true;
     for (const Item& it : frame.items) {
@@ -2136,6 +2611,17 @@ bool sharesOpenGl() {
     return gDevice && gDevice->ready() && gDevice->sharesOpenGl();
 }
 
+bool takesSplats(std::string* why) {
+    DeviceLock lock;
+    if (!gDevice || !gDevice->ready()) {
+        if (why) *why = gDevice && !gDevice->problem().empty() ? gDevice->problem() : "no GPU compositor";
+        return false;
+    }
+    return gDevice->takesSplats(why);
+}
+
+void setSplatsForTesting(bool take) { gRefuseSplats = !take; }
+
 size_t textureBudget() {
     DeviceLock lock;
     return gDevice && gDevice->ready() ? gDevice->textureBudget() : 0;
@@ -2151,11 +2637,13 @@ bool execute(const Frame& frame, Image* out, QImage* out8, std::string* why) {
     if (!gDevice || !gDevice->ready() || waitedFor(*gDevice)) return false;
     Device* d = gDevice.get();
     long filters = 0, mixes = 0, mapped = 0, copied = 0, imported = 0, builds = 0, shapes = 0, steps = 0, made = 0, readBacks = 0;
+    long splatLayers = 0, splats = 0, splatBatches = 0;
     size_t held = 0, peak = 0, tables = 0;
     std::string hwFallback, overBudget;
     const bool ok = d->serve([&] {
         const bool drawn = d->draw(frame, out, out8);
         filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds, shapes = d->shapeLayers;
+        splatLayers = d->splatLayers, splats = d->splatsDrawn, splatBatches = d->splatBatches;
         mapped = d->hwMapped, copied = d->hwGpuCopies, imported = d->hwImports, hwFallback = d->hwFallback, steps = d->textureSteps, readBacks = d->pictureReadBacks;
         made = d->texturesMade;
         held = d->heldBytes, peak = d->peakBytes, tables = d->tableBytes, overBudget = d->overBudget;
@@ -2174,6 +2662,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8, std::string* why) {
         gStats.filterPasses += filters;
         gStats.mixPasses += mixes;
         gStats.shapeLayers += shapes;
+        gStats.splatLayers += splatLayers, gStats.splatsDrawn += splats, gStats.splatBatches += splatBatches;
         gStats.textureSteps += steps;
         gStats.pictureReadBacks += readBacks;
     }
