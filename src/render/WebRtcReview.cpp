@@ -386,16 +386,16 @@ bool makeReviewCertificate(const std::vector<std::string>& hosts, std::string& c
     serial[0] &= 0x7f;  // (positive)
     std::unique_ptr<BIGNUM, decltype(&BN_free)> bn(BN_bin2bn(serial, sizeof serial, nullptr), BN_free);
     if (!bn || !BN_to_ASN1_INTEGER(bn.get(), X509_get_serialNumber(x.get()))) return fail("no serial number");
-    X509_gmtime_adj(X509_getm_notBefore(x.get()), -3600);
-    X509_gmtime_adj(X509_getm_notAfter(x.get()), 2L * 365 * 24 * 3600);
-    X509_set_pubkey(x.get(), key.get());
+    if (!X509_gmtime_adj(X509_getm_notBefore(x.get()), -3600) || !X509_gmtime_adj(X509_getm_notAfter(x.get()), 2L * 365 * 24 * 3600))
+        return fail("no validity period");
+    if (!X509_set_pubkey(x.get(), key.get())) return fail("cannot put the key in the certificate");
     // (The name is made apart and then set: OpenSSL 4 gives a certificate's own name back read-only.)
     std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name(X509_NAME_new(), X509_NAME_free);
     if (!name) return fail("no certificate name");
-    X509_NAME_add_entry_by_txt(name.get(), "O", MBSTRING_UTF8, reinterpret_cast<const unsigned char*>("Montage"), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_UTF8, reinterpret_cast<const unsigned char*>("Montage live review"), -1, -1, 0);
-    X509_set_subject_name(x.get(), name.get());
-    X509_set_issuer_name(x.get(), name.get());
+    if (!X509_NAME_add_entry_by_txt(name.get(), "O", MBSTRING_UTF8, reinterpret_cast<const unsigned char*>("Montage"), -1, -1, 0)
+        || !X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_UTF8, reinterpret_cast<const unsigned char*>("Montage live review"), -1, -1, 0))
+        return fail("no certificate name");
+    if (!X509_set_subject_name(x.get(), name.get()) || !X509_set_issuer_name(x.get(), name.get())) return fail("cannot name the certificate");
     std::string san;
     for (const std::string& h : hosts) {
         if (h.empty() || h.find_first_of(",\r\n") != std::string::npos) continue;
@@ -412,8 +412,9 @@ bool makeReviewCertificate(const std::vector<std::string>& hosts, std::string& c
         if (value.empty()) continue;
         X509_EXTENSION* e = X509V3_EXT_conf_nid(nullptr, &ctx, nid, value.c_str());
         if (!e) return fail("a bad host name");
-        X509_add_ext(x.get(), e, -1);
+        const int added = X509_add_ext(x.get(), e, -1);
         X509_EXTENSION_free(e);
+        if (!added) return fail("cannot add its extensions");
     }
     if (!X509_sign(x.get(), key.get(), EVP_sha256())) return fail("cannot sign it");
     auto pem = [](const std::function<int(BIO*)>& write) {
