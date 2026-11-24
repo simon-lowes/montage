@@ -8,12 +8,14 @@
 #
 #   scripts/build-svt-av1.sh [prefix]     (default /opt/svt-av1; set TMPDIR to put the sources and build elsewhere)
 #
+# The project's GitHub repository is read: its GitLab mirror stops at v4.3.0.
+#
 # Needs CMake, Ninja, a C and C++ compiler, and NASM (2.14 or later) on x86-64. A prefix that already has this version
 # is left as it is.
 set -euo pipefail
 
-TAG=v4.3.0
-COMMIT=e3d63405f9ba8219913a7276c2c47d10e5d022fe
+TAG=v4.3.1
+COMMIT=462771f87694e959cc1d3f9addde23d7015662e3
 PREFIX=${1:-/opt/svt-av1}
 STAMP="SVT-AV1 $TAG"
 
@@ -30,7 +32,7 @@ PREFIX=$(cd "$PREFIX" && pwd)
 CMAKE_PREFIX=$PREFIX
 command -v cygpath > /dev/null && CMAKE_PREFIX=$(cygpath -m "$PREFIX")  # (MSYS2: the native CMake's own spelling)
 
-git -c advice.detachedHead=false clone -q --depth 1 --branch "$TAG" https://gitlab.com/AOMediaCodec/SVT-AV1.git "$tmp/src"
+git -c advice.detachedHead=false clone -q --depth 1 --branch "$TAG" https://github.com/AOMediaCodec/SVT-AV1.git "$tmp/src"
 got=$(git -C "$tmp/src" rev-parse HEAD)
 [ "$got" = "$COMMIT" ] || { echo "SVT-AV1 $TAG is commit $got, expected $COMMIT" >&2; exit 1; }
 

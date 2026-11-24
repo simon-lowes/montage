@@ -32404,7 +32404,7 @@ colorspaces:
     }
     void av1GrainTableReadBySvtAv1() {
         // A film grain table as Montage writes it, two shots of parameters, given to SVT-AV1's own encoder
-        // (SvtAv1EncApp --fgs-table, built in CI from v4.3.0): Montage's reading of the frame headers it writes finds on
+        // (SvtAv1EncApp --fgs-table, built in CI from v4.3.1): Montage's reading of the frame headers it writes finds on
         // every shown frame the parameters of the shot the table gives for its time, as dav1d does.
         const QString bin = qEnvironmentVariable("MONTAGE_TEST_SVTAV1");
         QString app = bin.isEmpty() ? QString() : QDir(bin).filePath("SvtAv1EncApp");
