@@ -11151,11 +11151,12 @@ void MainWindow::exportInterchange(Interchange format) {
     const Kind kinds[] = {{"edl", tr("Export EDL"), tr("CMX 3600 EDL (*.edl)")},
                           {"otio", tr("Export OpenTimelineIO"), tr("OpenTimelineIO (*.otio)")},
                           {"xml", tr("Export Final Cut Pro 7 XML"), tr("Final Cut Pro 7 XML (*.xml)")},
-                          {"fcpxml", tr("Export FCPXML"), tr("FCPXML (*.fcpxml)")}};
+                          {"fcpxml", tr("Export FCPXML"), tr("FCPXML 1.15 (*.fcpxml);;FCPXML 1.10 (*.fcpxml)")}};
     const Kind& k = kinds[int(format)];
+    QString chosen;
     QString path = QFileDialog::getSaveFileName(this, k.title,
                                                 st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + "." + k.ext,
-                                                k.filter);
+                                                k.filter, &chosen);
     if (path.isEmpty()) return;
     // A copy with each compositing graph's clip rendered to a file beside the export.
     Project pr = state_->project();
@@ -11171,7 +11172,7 @@ void MainWindow::exportInterchange(Interchange format) {
     const std::string text = format == Interchange::Edl ? exportEdl(pr, sq)
                              : format == Interchange::Otio ? exportOtio(pr, sq)
                              : format == Interchange::Fcp7Xml ? exportFcp7Xml(pr, sq)
-                                                              : exportFcpXml(pr, sq);
+                                                              : exportFcpXml(pr, sq, chosen.contains("1.10") ? "1.10" : "1.15");
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size())) {
         QMessageBox::warning(this, tr("Export"), tr("Cannot write %1").arg(path));

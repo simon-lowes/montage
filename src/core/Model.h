@@ -541,6 +541,10 @@ struct Clip {
     // effect: lift, gamma, gain, saturation, highlights, mid_detail; keyframable). None: the target as mapped.
     std::map<std::string, Effect> trims;
     std::optional<DuckLink> duck;  // (sound clips) its Auto Duck, when kept up to date
+    // What an interchange file said of the clip that Montage does not use, by format ("fcpxml": core/FcpXml.cpp's
+    // carried elements and attributes, and the element it was connected to), written back when the clip is exported
+    // in that format again.
+    std::map<std::string, std::string> foreign;
     bool operator==(const Clip&) const = default;
 };
 

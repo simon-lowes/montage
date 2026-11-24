@@ -156,7 +156,7 @@ int usage() {
                  "      [--avid-media [--drive DIR] [--codec dnxhr_sq] [--handles 30] [--bake]]   (for Media Composer: the media as\n"
                  "      MXF OP-Atom in DIR's \"Avid MediaFiles/MXF/<n>\", the AAF linked to it)\n"
                  "  montage-cli xml <project.montage> [-o out.xml]       (Final Cut Pro 7 XML)\n"
-                 "  montage-cli fcpxml <project.montage> [-o out.fcpxml]\n"
+                 "  montage-cli fcpxml <project.montage> [-o out.fcpxml] [--version 1.15|1.10]\n"
                  "  montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o <project.montage> [--fps N]\n"
                  "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120] [--gpu]\n"
                  "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate] [--speakers [N]]\n"
@@ -1178,9 +1178,10 @@ int cmdImport(const std::vector<std::string>& args) {
 
 int cmdInterchange(const std::vector<std::string>& args, const std::string& format) {
     if (args.empty()) return usage();
-    std::string out;
+    std::string out, version = "1.15";
     for (size_t i = 1; i < args.size(); ++i)
         if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--version" && i + 1 < args.size()) version = args[++i];
     Project p;
     if (!load(args[0], p)) return 1;
     // Each compositing graph's clip rendered to a file beside the export (standard output: beside the project).
@@ -1192,7 +1193,7 @@ int cmdInterchange(const std::vector<std::string>& args, const std::string& form
     const Sequence& s = *p.active();
     const std::string text = format == "otio"     ? exportOtio(p, s)
                              : format == "xml"    ? exportFcp7Xml(p, s)
-                             : format == "fcpxml" ? exportFcpXml(p, s)
+                             : format == "fcpxml" ? exportFcpXml(p, s, version)
                                                   : exportEdl(p, s);
     if (out.empty()) {
         std::fwrite(text.data(), 1, text.size(), stdout);

@@ -16048,6 +16048,7 @@ void McpServer::Impl::addTools() {
         "PCM sound) in a new numbered folder of \"Avid MediaFiles/MXF\" on the drive, so the sequence opens linked.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml","aaf"]},
             "output":{"type":"string"},"picture":{"type":"boolean","description":"AAF: include the video tracks (default true)"},
+            "fcpxml_version":{"type":"string","enum":["1.15","1.10"],"description":"FCPXML: the version written (default 1.15)"},
             "avid_media":{"type":"object","description":"AAF: write the media for Media Composer","properties":{
                 "drive":{"type":"string","description":"Where \"Avid MediaFiles\" goes (default: the AAF's folder)"},
                 "codec":{"type":"string","enum":["dnxhr_lb","dnxhr_sq","dnxhr_hq","dnxhr_hqx","dnxhr_444","dnxhd_lb","dnxhd_sq","dnxhd_hq"],"description":"Default dnxhr_sq; DNxHD is 1920 x 1080 only"},
@@ -16103,6 +16104,7 @@ void McpServer::Impl::addTools() {
                           res);
             }
             if (f != "otio" && f != "xml" && f != "fcpxml" && f != "edl") throw ArgError{"format must be edl, otio, xml, fcpxml or aaf"};
+            if (const QString v = a.value("fcpxml_version").toString("1.15"); v != "1.15" && v != "1.10") throw ArgError{"fcpxml_version must be 1.15 or 1.10"};
             const QString out = absolute(need(a, "output"));
             // A copy with each compositing graph's clip rendered to a file beside the export.
             Project baked = l.project;
@@ -16111,7 +16113,7 @@ void McpServer::Impl::addTools() {
             const Sequence& bs = *baked.findSequence(l.seq().id);
             const std::string text = f == "otio" ? exportOtio(baked, bs)
                                      : f == "xml" ? exportFcp7Xml(baked, bs)
-                                     : f == "fcpxml" ? exportFcpXml(baked, bs)
+                                     : f == "fcpxml" ? exportFcpXml(baked, bs, a.value("fcpxml_version").toString("1.15").toStdString())
                                                      : exportEdl(baked, bs);
             QFile file(out);
             if (!file.open(QIODevice::WriteOnly) || file.write(text.data(), qint64(text.size())) != qint64(text.size()))

@@ -11,6 +11,8 @@
 #include <set>
 #include <tuple>
 #include <random>
+
+#include <QDomDocument>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -58,6 +60,7 @@
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
+#include "render/XmlCanonical.h"
 #include "core/MarkerList.h"
 #include "core/ReviewPage.h"
 #include "core/MergeClips.h"
@@ -12251,7 +12254,7 @@ private slots:
             interchangeFixture(fx);
             const Sequence original = fx.s();
             const std::string xml = flavour == 0 ? exportFcp7Xml(fx.p, original) : exportFcpXml(fx.p, original);
-            QVERIFY(xml.find(flavour == 0 ? "<xmeml version=\"5\">" : "<fcpxml version=\"1.10\">") != std::string::npos);
+            QVERIFY(xml.find(flavour == 0 ? "<xmeml version=\"5\">" : "<fcpxml version=\"1.15\">") != std::string::npos);
             ImportResult r = importXmlTimeline(fx.p, xml);
             QVERIFY2(r.ok, r.error.c_str());
             const Sequence& back = *fx.p.findSequence(r.sequence);
@@ -12523,6 +12526,277 @@ private slots:
         Project fc;
         ImportResult rf = importXmlTimeline(fc, readData("interchange/final-cut.fcpxml"));
         QVERIFY(rf.ok);
+    }
+
+    void fcpxmlWhatEachClipDoes() {
+        // A sequence's keyed transforms, trims, fades, blend mode, volume and pan, a 50 % optical-flow clip, roles and SRT
+        // captions go to FCPXML 1.15 and back with every value within 1e-6 and every key within a frame.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        auto addMedia = [&](const char* name, bool video, bool audio) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = video ? MediaKind::Video : MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = 60.0;
+            m.width = video ? 1280 : 0;
+            m.height = video ? 720 : 0;
+            m.fps = {30, 1};
+            m.hasVideo = video;
+            m.hasAudio = audio;
+            p.media.push_back(m);
+            return p.media.back();
+        };
+        const MediaItem interview = addMedia("interview.mov", true, true), broll = addMedia("broll.mov", true, false),
+                        music = addMedia("music.wav", false, true);
+        auto place = [&](const MediaItem& m, TrackKind kind, int track, FrameTime at, FrameTime len, double in) -> Clip& {
+            Clip c = makeClip(p, m, kind, s);
+            c.start = at, c.duration = len, c.sourceIn = in;
+            Track& t = kind == TrackKind::Video ? s.videoTracks.at(size_t(track)) : s.audioTracks.at(size_t(track));
+            t.clips.push_back(c);
+            return t.clips.back();
+        };
+        while (s.videoTracks.size() < 2) s.videoTracks.push_back(makeTrack(p, TrackKind::Video, "V" + std::to_string(s.videoTracks.size() + 1)));
+        while (s.audioTracks.size() < 2) s.audioTracks.push_back(makeTrack(p, TrackKind::Audio, "A" + std::to_string(s.audioTracks.size() + 1)));
+        {
+            Clip& v = place(interview, TrackKind::Video, 0, 0, 90, 30);
+            Clip& a = place(interview, TrackKind::Audio, 0, 0, 90, 30);
+            v.linkGroup = a.linkGroup = p.newId();
+            a.role = "Dialogue";
+            a.audio.params["gain_db"] = Param(-3.5);
+        }
+        {
+            Clip& slow = place(broll, TrackKind::Video, 0, 90, 60, 100);
+            slow.speed = 0.5;
+            slow.timing.params["sampling"] = Param(2);
+        }
+        {
+            Clip& c = place(broll, TrackKind::Video, 1, 20, 60, 300);
+            Effect& m = c.motion;
+            m.params["pos_x"].addKey(0, 0);
+            m.params["pos_x"].addKey(30, 240.5, Interp::Smooth);
+            m.params["pos_x"].addKey(59, -120);
+            m.params["pos_y"].addKey(0, 10);
+            m.params["pos_y"].addKey(30, -54, Interp::Smooth);
+            m.params["pos_y"].addKey(59, 0);
+            m.params["scale"].addKey(0, 100, Interp::Hold);
+            m.params["scale"].addKey(20, 150, Interp::Bezier);
+            m.params["scale"].addKey(50, 75);
+            m.params["rotation"] = Param(15);
+            m.params["anchor_x"] = Param(32);
+            m.params["anchor_y"] = Param(-18);
+            m.params["crop_left"] = Param(10);
+            m.params["crop_top"] = Param(5);
+            m.params["crop_right"].addKey(0, 0);
+            m.params["crop_right"].addKey(40, 20);
+            m.params["opacity"].addKey(0, 0);
+            m.params["opacity"].addKey(15, 100);
+            c.blendMode = "multiply";
+        }
+        {
+            Clip& a = place(music, TrackKind::Audio, 1, 10, 120, 0);
+            a.role = "Music";
+            a.audio.params["gain_db"].addKey(0, -60);
+            a.audio.params["gain_db"].addKeyAt(12.5, -6);
+            a.audio.params["gain_db"].addKey(100, -6, Interp::Smooth);
+            a.audio.params["gain_db"].addKey(119, -20);
+            a.audio.params["pan"].addKey(0, -0.5);
+            a.audio.params["pan"].addKey(60, 0.5);
+        }
+        {
+            CaptionTrack t;
+            t.id = p.newId();
+            t.name = "English";
+            t.format = "SRT";
+            t.language = "en";
+            t.captions.push_back(Caption{15, 45, "Hello there", {}});
+            Caption second{60, 100, "Somewhere off screen\nanother line", {}};
+            second.italic = true;
+            t.captions.push_back(second);
+            s.captionTracks.push_back(t);
+        }
+        const Sequence original = s;
+        const std::string xml = exportFcpXml(p, s);
+        QVERIFY(xml.find("<fcpxml version=\"1.15\">") != std::string::npos);
+        QVERIFY(xml.find("interp=\"hold\"") != std::string::npos);
+        QVERIFY(xml.find("frameSampling=\"optical-flow\"") != std::string::npos);
+        QVERIFY(xml.find("audioRole=\"dialogue\"") != std::string::npos);
+        QVERIFY(xml.find("captionFormat=SRT.en") != std::string::npos);
+        ImportResult r = importXmlTimeline(p, xml);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Sequence& back = *p.findSequence(r.sequence);
+        auto sameParam = [](const Param& a, const Param& b, const char* what) {
+            if (a.keys.empty()) {
+                QVERIFY2(b.keys.empty(), what);
+                QVERIFY2(std::fabs(a.value - b.value) < 1e-6, qPrintable(QString("%1: %2 %3").arg(what).arg(a.value).arg(b.value)));
+                return;
+            }
+            for (const Keyframe& k : a.keys) {
+                const auto it = std::find_if(b.keys.begin(), b.keys.end(), [&](const Keyframe& x) { return std::fabs(x.time() - k.time()) < 1; });
+                QVERIFY2(it != b.keys.end(), qPrintable(QString("%1: no key near %2").arg(what).arg(k.time())));
+                QVERIFY2(std::fabs(it->v - k.v) < 1e-6, qPrintable(QString("%1 at %2: %3 %4").arg(what).arg(k.time()).arg(k.v).arg(it->v)));
+                QVERIFY2(it->interp == k.interp, what);
+            }
+        };
+        auto sameEffect = [&](const Effect& a, const Effect& b, const std::vector<const char*>& names) {
+            for (const char* n : names) {
+                const Param none;
+                const Param& pa = a.params.count(n) ? a.params.at(n) : none;
+                const Param& pb = b.params.count(n) ? b.params.at(n) : none;
+                sameParam(pa, pb, n);
+            }
+        };
+        const std::vector<const char*> motion = {"pos_x", "pos_y", "scale", "rotation", "anchor_x", "anchor_y", "crop_left",
+                                                 "crop_top", "crop_right", "crop_bottom", "opacity"};
+        const Clip& keyed = back.videoTracks.at(1).clips.at(0);
+        QCOMPARE(keyed.start, FrameTime(20));
+        sameEffect(original.videoTracks[1].clips[0].motion, keyed.motion, motion);
+        QCOMPARE(keyed.blendMode, std::string("multiply"));
+        const Clip& slow = back.videoTracks.at(0).clips.at(1);
+        QVERIFY(std::fabs(slow.speed - 0.5) < 1e-6);
+        QCOMPARE(int(slow.timing.p("sampling", 0)), 2);
+        const Clip& dialogue = back.audioTracks.at(0).clips.at(0);
+        QCOMPARE(dialogue.role, std::string("Dialogue"));
+        sameEffect(original.audioTracks[0].clips[0].audio, dialogue.audio, {"gain_db", "pan"});
+        const Clip& song = back.audioTracks.at(1).clips.at(0);
+        QCOMPARE(song.role, std::string("Music"));
+        QCOMPARE(song.start, FrameTime(10));
+        sameEffect(original.audioTracks[1].clips[0].audio, song.audio, {"gain_db", "pan"});
+        QVERIFY(std::fabs(song.audio.params.at("gain_db").keys.at(1).time() - 12.5) < 1e-3);  // the key between frames, to the sample
+        QCOMPARE(back.captionTracks.size(), size_t(1));
+        const CaptionTrack& ct = back.captionTracks[0];
+        QCOMPARE(ct.name, std::string("English"));
+        QCOMPARE(ct.format, std::string("SRT"));
+        QCOMPARE(ct.language, std::string("en"));
+        QCOMPARE(ct.captions.size(), size_t(2));
+        for (size_t i = 0; i < 2; ++i) {
+            QCOMPARE(ct.captions[i].start, original.captionTracks[0].captions[i].start);
+            QCOMPARE(ct.captions[i].end, original.captionTracks[0].captions[i].end);
+            QCOMPARE(ct.captions[i].text, original.captionTracks[0].captions[i].text);
+            QCOMPARE(ct.captions[i].italic, original.captionTracks[0].captions[i].italic);
+        }
+        // 1.10 on request: no interpolation 1.10 lacks (a hold becomes a key a frame before the next).
+        const std::string old = exportFcpXml(p, original, "1.10");  // (`s` may have moved: the import added a sequence)
+        QVERIFY(old.find("<fcpxml version=\"1.10\">") != std::string::npos);
+        QVERIFY(old.find("interp=\"hold\"") == std::string::npos && old.find("interp=\"bezier\"") == std::string::npos);
+        ImportResult r10 = importXmlTimeline(p, old);
+        QVERIFY2(r10.ok, r10.error.c_str());
+        const Param& held = p.findSequence(r10.sequence)->videoTracks.at(1).clips.at(0).motion.params.at("scale");
+        QVERIFY(std::fabs(held.at(19) - 100) < 1e-6);
+        QVERIFY(std::fabs(held.at(20) - 150) < 1e-6);
+    }
+
+    void fcpxml115CarriedThrough() {
+        // A 1.15 file with natural motion blur, a semantic mask and the flags attribute reads with motion blur on, and
+        // writes back the mask and the flags equal in canonical XML; the report names the filter Montage did not use, by
+        // clip; a connected clip keeps its parent through a round trip.
+        Project p = makeDefaultProject();
+        const std::string fixture = readData("interchange/final-cut-115.fcpxml");
+        ImportResult r = importXmlTimeline(p, fixture);
+        QVERIFY2(r.ok, r.error.c_str());
+        auto said = [&](const char* a, const char* b) {
+            return std::any_of(r.warnings.begin(), r.warnings.end(), [&](const std::string& w) { return w.find(a) != std::string::npos && w.find(b) != std::string::npos; });
+        };
+        std::string report;
+        for (const std::string& w : r.warnings) report += w + "\n";
+        QVERIFY2(said("Gaussian Blur", "Street"), report.c_str());
+        QVERIFY2(said("passthrough", "Interview"), report.c_str());
+        const Sequence& s = *p.findSequence(r.sequence);
+        QCOMPARE(s.fps, (Rational{25, 1}));
+        const Clip& street = s.videoTracks.at(0).clips.at(0);
+        QCOMPARE(street.name, std::string("Street"));
+        const auto blur = std::find_if(street.effects.begin(), street.effects.end(), [](const Effect& e) { return e.type == "motion_blur"; });
+        QVERIFY(blur != street.effects.end() && blur->enabled);
+        QVERIFY(std::fabs(blur->p("shutter", 0) - 270) < 1e-9);
+        const Clip& slow = s.videoTracks.at(0).clips.at(2);
+        QCOMPARE(int(slow.timing.p("sampling", 0)), 2);
+        QVERIFY(std::any_of(slow.effects.begin(), slow.effects.end(), [](const Effect& e) { return e.type == "motion_blur"; }));
+        QVERIFY(std::fabs(slow.speed - 0.5) < 1e-6);
+        const Clip& interview = s.videoTracks.at(0).clips.at(1);
+        const Param& pos = interview.motion.params.at("pos_x");
+        QCOMPARE(pos.keys.size(), size_t(4));
+        QVERIFY(pos.keys[0].interp == Interp::Hold && pos.keys[1].interp == Interp::Linear && pos.keys[2].interp == Interp::Bezier);
+        QVERIFY(std::fabs(pos.keys[2].v - 20 * 1080 / 100.0) < 1e-6);
+        QCOMPARE(s.audioTracks.at(0).clips.at(0).role, std::string("Dialogue.boom"));
+        const Clip& cutaway = s.videoTracks.at(1).clips.at(0);
+        QCOMPARE(cutaway.start, FrameTime(9 * 25));  // under Street, connected to Interview
+
+        // Written back: the same mask and flags, the filter's effect named again, the cutaway inside Interview.
+        auto canon = [](QDomElement e, const QDomDocument& doc) {
+            std::map<QString, QString> uid;
+            for (QDomElement x = doc.documentElement().firstChildElement("resources").firstChildElement("effect"); !x.isNull(); x = x.nextSiblingElement("effect"))
+                uid[x.attribute("id")] = x.attribute("uid");
+            QDomDocument d;
+            d.appendChild(d.importNode(e, true));
+            QList<QDomElement> all{d.documentElement()};
+            for (qsizetype i = 0; i < all.size(); ++i)
+                for (QDomElement x = all[i].firstChildElement(); !x.isNull(); x = x.nextSiblingElement()) all << x;
+            for (QDomElement& x : all)
+                if (x.hasAttribute("ref")) x.setAttribute("ref", uid[x.attribute("ref")]);
+            return canonicalXml(d.toString(-1).toStdString());
+        };
+        auto find = [](const QDomDocument& d, const char* tag, const char* name) {
+            const QDomNodeList all = d.elementsByTagName(tag);
+            for (int i = 0; i < all.size(); ++i)
+                if (all.at(i).toElement().attribute("name") == name) return all.at(i).toElement();
+            return QDomElement();
+        };
+        QDomDocument in, out;
+        QVERIFY(in.setContent(QByteArray::fromStdString(fixture)));
+        const std::string xml = exportFcpXml(p, s);
+        QVERIFY(out.setContent(QByteArray::fromStdString(xml)));
+        const QDomElement a = find(in, "video", "Street"), b = find(out, "video", "Street");
+        QVERIFY(!b.isNull());
+        QCOMPARE(b.attribute("flags"), QString("1"));
+        const std::string maskIn = canon(a.firstChildElement("filter-video-mask"), in), maskOut = canon(b.firstChildElement("filter-video-mask"), out);
+        QVERIFY(!maskIn.empty());
+        QCOMPARE(maskOut, maskIn);
+        QCOMPARE(canon(b.firstChildElement("adjust-natural-motion-blur"), out), canon(a.firstChildElement("adjust-natural-motion-blur"), in));
+        const QDomElement iv = find(out, "asset-clip", "Interview");
+        QCOMPARE(iv.attribute("flags"), QString("1"));
+        QCOMPARE(iv.attribute("audioRole"), QString("dialogue.boom"));
+        QVERIFY(!find(out, "asset-clip", "Cutaway").isNull() || !find(out, "video", "Cutaway").isNull());
+        QDomElement cut = find(out, "video", "Cutaway");
+        if (cut.isNull()) cut = find(out, "asset-clip", "Cutaway");
+        QCOMPARE(cut.parentNode().toElement().attribute("name"), QString("Interview"));
+        QCOMPARE(cut.attribute("flags"), QString("1"));
+        QCOMPARE(find(out, "video", "Slow").firstChildElement("timeMap").attribute("frameSampling"), QString("vsa-motion-blur"));
+        // Read again, written again: the cutaway still in Interview.
+        ImportResult again = importXmlTimeline(p, xml);
+        QVERIFY2(again.ok, again.error.c_str());
+        QDomDocument twice;
+        QVERIFY(twice.setContent(QByteArray::fromStdString(exportFcpXml(p, *p.findSequence(again.sequence)))));
+        cut = find(twice, "video", "Cutaway");
+        QCOMPARE(cut.parentNode().toElement().attribute("name"), QString("Interview"));
+        // As 1.10: none of 1.15's own (flags, the semantic mask, natural motion blur).
+        const std::string old = exportFcpXml(p, *p.findSequence(r.sequence), "1.10");  // (`s` may have moved since)
+        QVERIFY(old.find("flags=") == std::string::npos);
+        QVERIFY(old.find("mask-semantic") == std::string::npos);
+        QVERIFY(old.find("adjust-natural-motion-blur") == std::string::npos);
+        QVERIFY(old.find("vsa-motion-blur") == std::string::npos);
+
+        // Every FCPXML fixture already in the tests reads as before: no element carried, no transform, level or role.
+        for (const char* name : {"interchange/final-cut.fcpxml", "interchange/final-cut-angles.fcpxml", "interchange/final-cut-multicam.fcpxml"}) {
+            Project q = makeDefaultProject();
+            ImportResult rq = importXmlTimeline(q, readData(name));
+            QVERIFY2(rq.ok, name);
+            for (const std::string& w : rq.warnings) QVERIFY2(w.find("not used") == std::string::npos, w.c_str());
+            const Effect transform = makeEffect("transform", 0), volume = makeEffect("volume", 0);
+            for (const Sequence& sq : q.sequences)
+                for (const auto* list : {&sq.videoTracks, &sq.audioTracks})
+                    for (const Track& t : *list)
+                        for (const Clip& c : t.clips) {
+                            // (only a connected clip's parent, and attributes such as tcFormat written back as they were)
+                            for (const auto& [k, v] : c.foreign) {
+                                QVERIFY2(k == "fcpxml-parent" || k == "fcpxml", k.c_str());
+                                if (k == "fcpxml") QVERIFY2(v.find("<res/><el/>") != std::string::npos, v.c_str());
+                            }
+                            QVERIFY2(c.role.empty() && c.blendMode == "normal" && c.effects.empty(), name);
+                            for (const auto& [k, v] : transform.params) QVERIFY2(!c.motion.params.count(k) || c.motion.params.at(k) == v, k.c_str());
+                            for (const auto& [k, v] : volume.params) QVERIFY2(!c.audio.params.count(k) || c.audio.params.at(k) == v, k.c_str());
+                        }
+        }
     }
 
     void interchangeReviewFixes() {

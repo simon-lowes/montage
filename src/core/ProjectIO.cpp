@@ -382,6 +382,11 @@ QJsonObject clipToJson(const Clip& c) {
     if (c.linkGroup) o["link"] = double(c.linkGroup);
     if (c.colorLabel) o["label"] = c.colorLabel;
     if (!c.role.empty()) o["role"] = qs(c.role);
+    if (!c.foreign.empty()) {
+        QJsonObject f;
+        for (const auto& [k, v] : c.foreign) f[qs(k)] = qs(v);
+        o["foreign"] = f;
+    }
     if (c.duck) {
         const DuckLink& d = *c.duck;
         QJsonArray tracks, keys;
@@ -472,6 +477,8 @@ Clip clipFromJson(const QJsonObject& o) {
     c.linkGroup = Id(i64(o.value("link")));
     c.colorLabel = o.value("label").toInt(0);
     c.role = ss(o.value("role"));
+    const QJsonObject foreign = o.value("foreign").toObject();
+    for (auto it = foreign.constBegin(); it != foreign.constEnd(); ++it) c.foreign[it.key().toStdString()] = ss(it.value());
     if (const QJsonObject d = o.value("duck").toObject(); !d.isEmpty()) {
         DuckLink link;
         for (const QJsonValue& t : d.value("tracks").toArray()) link.tracks.push_back(Id(i64(t)));
@@ -846,8 +853,10 @@ QJsonObject captionTrackToJson(const CaptionTrack& t) {
         if (!c.colour.empty()) item.append(qs(c.colour));
         items.append(item);
     }
-    return QJsonObject{{"id", double(t.id)},        {"name", qs(t.name)}, {"language", qs(t.language)},
-                       {"visible", t.visible},      {"style", style},     {"captions", items}};
+    QJsonObject o{{"id", double(t.id)},   {"name", qs(t.name)},   {"language", qs(t.language)},
+                  {"visible", t.visible}, {"style", style},       {"captions", items}};
+    if (!t.format.empty()) o["format"] = qs(t.format);
+    return o;
 }
 
 CaptionTrack captionTrackFromJson(const QJsonObject& o) {
@@ -855,6 +864,7 @@ CaptionTrack captionTrackFromJson(const QJsonObject& o) {
     t.id = Id(i64(o.value("id")));
     t.name = ss(o.value("name"));
     t.language = ss(o.value("language"));
+    t.format = ss(o.value("format"));
     t.visible = o.value("visible").toBool(true);
     const QJsonObject so = o.value("style").toObject();
     CaptionStyle& st = t.style;
