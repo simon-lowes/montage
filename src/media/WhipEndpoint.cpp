@@ -212,6 +212,7 @@ constexpr size_t kHeldBytes = size_t(16) << 20;     // pictures kept before the 
 constexpr size_t kQueuedBytes = size_t(64) << 20;   // packets waiting to be read: past this, pictures are dropped
 constexpr double kReportsWait = 3.0;                // seconds the sender's reports are waited for before arrival lines the sound up
 constexpr int kFramesHeld = 8;                      // pictures seen before the feed begins (their rate is measured from them)
+constexpr double kTimingKept = 15.0;                // seconds of the sender's reports (and of its sound's packets) a stream's timing is taken from
 
 double secondsNow() { return std::chrono::duration<double>(Clock::now().time_since_epoch()).count(); }
 
@@ -365,10 +366,14 @@ struct Stream {
     int pt = 0, clock = 90000;
     std::string codec, fmtp;
     uint32_t ssrc = 0;
-    // The sender's latest report: its clock (NTP, seconds) at an RTP time (unwrapped).
+    // The sender's clock (NTP, seconds) at an RTP time (unwrapped): the latest report's RTP time, at the clock the
+    // least delayed of the last kTimingKept seconds' reports puts it at (anchor()).
     bool reported = false;
     double reportNtp = 0;
     int64_t reportRtp = 0;
+    // Each of those reports, when it came: the sender's clock at RTP time 0 by it. And for sound, the same by this
+    // computer's clock from its packets as they came, the least of each fifth of a second.
+    std::deque<std::pair<double, double>> origins, came;
     // RTP times unwrapped, and packets counted by their numbers.
     bool seen = false;
     uint32_t lastTs = 0;
@@ -397,6 +402,8 @@ struct Feed {
     bool heldLost = false; // a picture's packet was lost since that keyframe (the pictures held do not all decode)
     double keyAt = 0;      // when that keyframe came
     bool byReports = false;
+    // Each report, when it came: how far this computer's clock was ahead of the sender's then (and the report's way here).
+    std::deque<std::pair<double, double>> gaps;
     std::string sdp;
     double fps = 0;
     std::deque<std::vector<uint8_t>> out;
@@ -429,8 +436,37 @@ struct Feed {
         }
     }
 
-    // The pictures' shift that puts a picture where the sound of the same moment is, by both streams' latest
-    // reports (in the pictures' RTP units, added to their unwrapped times).
+    // Where a stream's RTP times stand against the sender's clock: by the report, of the last kTimingKept seconds',
+    // that puts them earliest. Not simply by the latest: a sender tells the time it sent its sound at, not the time
+    // it was made at, so sound held up in a busy sender's encoder is reported as made that much later, and lining the
+    // pictures up by that would move them ahead of their sound for as long as it is held up. Sound is also placed by
+    // its packets as they came (this computer's clock put on the sender's by how soon the reports came): many more
+    // moments than the reports to find one where nothing held it up. (Within the time kept, a sender's clocks drift
+    // apart by a millisecond or so at most; a jump of a second or more starts that timing afresh.)
+    static double least(std::deque<std::pair<double, double>>& q, double now, bool keepOne) {
+        while (q.size() > (keepOne ? 1u : 0u) && q.front().first < now - kTimingKept) q.pop_front();
+        double m = q.empty() ? 0 : q.back().second;
+        for (const auto& e : q) m = std::min(m, e.second);
+        return m;
+    }
+    static void note(std::deque<std::pair<double, double>>& q, double now, double value, double block) {
+        if (!q.empty() && std::fabs(value - q.back().second) >= 1) q.clear();
+        if (!q.empty() && block > 0 && q.back().first > now - block)
+            q.back().second = std::min(q.back().second, value);
+        else
+            q.emplace_back(now, value);
+    }
+    void anchor(Stream& s, double now) {
+        double origin = least(s.origins, now, true);
+        if (&s == &audio && !gaps.empty()) {
+            const double gap = least(gaps, now, true);
+            if (const double soonest = least(s.came, now, false); !s.came.empty()) origin = std::min(origin, soonest - gap);
+        }
+        s.reportNtp = origin + double(s.reportRtp) / s.clock;
+    }
+
+    // The pictures' shift that puts a picture where the sound of the same moment is, by both streams' reports (in
+    // the pictures' RTP units, added to their unwrapped times).
     void placePictures() {
         if (!started || !video.present || !audio.present || !video.reported || !audio.reported) return;
         const double soundAt = double(audio.reportRtp - audio.firstExt) / audio.clock + (video.reportNtp - audio.reportNtp);
@@ -611,6 +647,7 @@ struct Feed {
             s.lastSeq = r.seq;
         }
         const int64_t ts = s.unwrap(r.ts);
+        if (!isVideo) note(s.came, now, now - double(ts) / s.clock, 0.2);
         if (!s.seen || ts > s.lastExt) s.lastExt = ts, s.lastTs = r.ts;
         s.seen = true;
         s.ssrc = r.ssrc;
@@ -674,11 +711,15 @@ struct Feed {
                     for (int k = 0; k < 8; ++k) ntp = (ntp << 8) | d[at + 8 + k];
                     const uint32_t ts = (uint32_t(d[at + 16]) << 24) | (uint32_t(d[at + 17]) << 16) | (uint32_t(d[at + 18]) << 8) | d[at + 19];
                     if (ntp != 0) {
+                        const double now = secondsNow(), sent = double(ntp >> 32) + double(ntp & 0xffffffffu) / 4294967296.0;
                         s.reported = true;
-                        s.reportNtp = double(ntp >> 32) + double(ntp & 0xffffffffu) / 4294967296.0;
                         s.reportRtp = s.unwrap(ts);
+                        note(s.origins, now, sent - double(s.reportRtp) / s.clock, 0);
+                        note(gaps, now, now - sent, 0);
+                        for (Stream* st : {&video, &audio})
+                            if (st->reported) anchor(*st, now);
                         placePictures();
-                        if (!started) tryStart(secondsNow());
+                        if (!started) tryStart(now);
                     }
                 }
             }

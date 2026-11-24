@@ -27204,11 +27204,15 @@ colorspaces:
             t.timer = setInterval(draw, 1000 / 30);
             await __montageWhip.send(false, new MediaStream([picture, out.stream.getAudioTracks()[0]]));
             // (what the sender says it has sent, and when it first sent a picture: a sender's encoder may take a moment
-            // after the connection, and its pacer holds pictures for a moment after they are made)
+            // after the connection, and its pacer holds pictures for a moment after they are made. And its sound made
+            // against its sound sent: how much more it held back at most than at least, a busy sender's encoder behind)
             t.poll = setInterval(async () => {
               const pc = __montageWhip.pc;
               if (!pc) return;
+              let made = -1, sent = -1;
               (await pc.getStats()).forEach(s => {
+                if (s.type === 'media-source' && s.kind === 'audio') made = s.totalSamplesDuration || 0;
+                if (s.type === 'outbound-rtp' && s.kind === 'audio') sent = (s.packetsSent || 0) * 0.020;
                 if (s.type !== 'outbound-rtp' || s.kind !== 'video') return;
                 if (s.framesSent > 0 && !t.firstSentAt) t.firstSentAt = performance.now();
                 if (!t.connectedAt && __montageWhip.stage === 'sending') t.connectedAt = performance.now();
@@ -27217,6 +27221,10 @@ colorspaces:
                 const size = s.frameWidth + 'x' + s.frameHeight;
                 if (s.frameWidth && (!t.sizes.length || t.sizes[t.sizes.length - 1].size !== size)) t.sizes.push({size, at: performance.now()});
               });
+              if (made > 0 && sent > 0) {
+                t.heldLeast = Math.min(t.heldLeast ?? 1e9, made - sent);
+                t.heldMost = Math.max(t.heldMost ?? -1e9, made - sent);
+              }
             }, 20);
             return true;
         })())");
@@ -27236,7 +27244,8 @@ colorspaces:
         const int framesSent = tab.js("__test.framesSent").toInt();
         // (for a failure's message: when the sender began after the connection, its keyframes, and its sizes in time)
         const QString sender = tab.js("(() => { const t = __test; return 'first picture sent ' + Math.round(t.firstSentAt - t.connectedAt) + ' ms after the connection, ' +"
-                                      " t.keyframes + ' keyframes, sizes ' + t.sizes.map(s => s.size + ' at ' + Math.round(s.at - t.firstSentAt) + ' ms').join(', '); })()")
+                                      " t.keyframes + ' keyframes, sizes ' + t.sizes.map(s => s.size + ' at ' + Math.round(s.at - t.firstSentAt) + ' ms').join(', ') +"
+                                      " (t.heldMost !== undefined ? ', its sound held back up to ' + Math.round((t.heldMost - t.heldLeast) * 1000) + ' ms more than at least' : ''); })()")
                                    .toString();
         QVERIFY(rec.wait(20));
         QVERIFY2(finished && fine, finishedWhy.c_str());
