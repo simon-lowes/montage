@@ -298,6 +298,7 @@ add_library(montage_engine STATIC
   render/Exporter.h render/Exporter.cpp render/ExportScaler.h render/ExportScaler.cpp
   render/RenderFarm.h render/RenderFarm.cpp
   render/BackgroundJobs.h render/BackgroundJobs.cpp
+  render/EncodeFolders.h render/EncodeFolders.cpp
   render/SegmentedExport.h render/SegmentedExport.cpp
   render/StreamingPackage.h render/StreamingPackage.cpp
   render/Ac3.h render/Ac3.cpp

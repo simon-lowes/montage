@@ -234,6 +234,7 @@
 #include "PluginManagerDialog.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
+#include "EncodeFoldersDialog.h"
 #include "Accessibility.h"
 #include "LearnEffectDialog.h"
 #include "Theme.h"
@@ -19512,6 +19513,83 @@ const auto seq = [this] { return state()->sequence(); };
         StillEditor::setLauncherForTesting({});
         StillEditor::setProgram(program);
         state()->newProject();
+    }
+
+    void encodeFoldersEncodeEachFileOnce() {
+        // A folder encoded to WAV: three files copied into it slowly are each encoded once they stop growing, a
+        // fourth still being written waits, and after a restart nothing is encoded again.
+        const QString in = dir_.path() + "/encode-in", out = dir_.path() + "/encode-out";
+        QVERIFY(QDir().mkpath(in) && QDir().mkpath(out));
+        QVERIFY(win_->findChild<QAction*>("encodeFolders"));
+        const std::vector<EncodeFolder> saved = savedEncodeFolders();
+        saveEncodeFolders({{in, "Audio - WAV 24-bit", out}});
+        auto* jobs = EncodeFolderJobs::of(win_.get(), state());
+        jobs->setSettleMs(700);
+        const int startedBefore = jobs->started();
+        QFile source(QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        const QByteArray wav = source.readAll();
+        auto pause = [](int ms) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) QTest::qWait(20);
+        };
+        // Written in four pieces 200 ms apart.
+        auto slowCopy = [&](const QString& name) {
+            QFile f(in + "/" + name);
+            if (!f.open(QIODevice::WriteOnly)) return false;
+            const qint64 piece = wav.size() / 4 + 1;
+            for (qint64 at = 0; at < wav.size(); at += piece) {
+                f.write(wav.mid(at, piece));
+                f.flush();
+                pause(200);
+            }
+            return true;
+        };
+        for (const char* name : {"one.wav", "two.wav", "three.wav"}) QVERIFY(slowCopy(name));
+        // The fourth: a piece every 200 ms for as long as the others take.
+        QFile fourth(in + "/four.wav");
+        QVERIFY(fourth.open(QIODevice::WriteOnly));
+        auto encodedFiles = [&] { return QDir(out).entryList({"*.wav"}, QDir::Files); };
+        QElapsedTimer clock;
+        clock.start();
+        qint64 written = 0;
+        while (encodedFiles().size() < 3 && clock.elapsed() < 60000) {
+            fourth.write(wav.mid(written, 4096));
+            fourth.flush();
+            written += 4096;
+            pause(200);
+            QVERIFY(!encodedFiles().contains("four.wav"));
+        }
+        QCOMPARE(encodedFiles(), (QStringList{"one.wav", "three.wav", "two.wav"}));
+        QCOMPARE(jobs->started() - startedBefore, 3);
+        for (const QString& f : encodedFiles()) {
+            MediaItem m;
+            QVERIFY(probeMedia((out + "/" + f).toStdString(), m));
+            QVERIFY(m.hasAudio && std::fabs(m.duration - 11.0) < 0.3);
+        }
+        // Once the fourth is whole and left, it is encoded too.
+        fourth.write(wav.mid(written));
+        fourth.close();
+        clock.restart();
+        while (encodedFiles().size() < 4 && clock.elapsed() < 60000) pause(100);
+        QCOMPARE(encodedFiles().size(), 4);
+        QTRY_COMPARE_WITH_TIMEOUT(jobs->pending(), 0, 30000);
+        QCOMPARE(jobs->started() - startedBefore, 4);
+        std::map<QString, QDateTime> made;
+        for (const QString& f : encodedFiles()) made[f] = QFileInfo(out + "/" + f).lastModified();
+        // After a restart (a new watcher reading the ledger): nothing is encoded again.
+        delete jobs;
+        jobs = EncodeFolderJobs::of(win_.get(), state());
+        jobs->setSettleMs(700);
+        pause(2500);
+        QCOMPARE(jobs->started(), 0);
+        for (const QString& f : encodedFiles()) QCOMPARE(QFileInfo(out + "/" + f).lastModified(), made[f]);
+        EncodeFolderScan ledger({in, "Audio - WAV 24-bit", out});
+        QCOMPARE(ledger.encodedCount(), 4);
+        for (const char* name : {"one.wav", "two.wav", "three.wav", "four.wav"}) QVERIFY(ledger.encoded(name));
+        saveEncodeFolders(saved);
+        jobs->reloadFolders();
     }
 
     void keyframeCopyPaste() {

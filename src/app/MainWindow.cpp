@@ -181,6 +181,7 @@ extern "C" {
 #include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
 #include "DialogJobs.h"
+#include "EncodeFoldersDialog.h"
 #include "DialogTasks.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
@@ -871,6 +872,7 @@ void MainWindow::buildPanels() {
         if (kind == QLatin1String("imf")) imfMade(result, nullptr);
     });
     dialogJobs_->resume();
+    EncodeFolderJobs::of(this, state_);  // (the encode folders looked at from now on)
     auto* queuePanel = new RenderQueuePanel(queue_, this);
     queuePanel->setDialogJobs(dialogJobs_);
     connect(queuePanel, &RenderQueuePanel::taskSaid, this, [this](const QString& text) { statusBar()->showMessage(text, 8000); });
@@ -1433,6 +1435,7 @@ void MainWindow::buildMenus() {
     add(file, QT_TR_NOOP("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
     add(file, QT_TR_NOOP("Import Image Sequence…"), QKeySequence(), [this] { bin_->importImageSequenceDialog(); })->setObjectName(QStringLiteral("importImageSequence"));
     add(file, QT_TR_NOOP("Watch Folders…"), QKeySequence(), [this] { watchFoldersDialog(); })->setObjectName(QStringLiteral("watchFolders"));
+    add(file, QT_TR_NOOP("Encode Folders…"), QKeySequence(), [this] { showEncodeFoldersDialog(this, state_); })->setObjectName(QStringLiteral("encodeFolders"));
     add(file, QT_TR_NOOP("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, QT_TR_NOOP("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
     add(file, QT_TR_NOOP("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
