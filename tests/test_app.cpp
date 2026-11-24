@@ -24756,16 +24756,23 @@ print("added " + ui["name"])
         // The same light from a sequence in HLG: the surface described with HLG's transfer (named transfer 13) where
         // Weston lists it, and with PQ, the picture converted, where it does not (Weston 16.0.2's colour manager lists
         // no HLG), when Weston's screenshot is the ramp's PQ code within 2 again. (Qt's description is PQ for both.)
+        // Shown on a surface of its own, as when the viewer is turned on for an HLG sequence: Weston 16.0.2 drops a
+        // shown surface's colour transformation when its description changes (an HLG sequence's peak is 1000 nits,
+        // the ramp's 800) and makes it again only when it next rebuilds its list of views, so until then it leaves
+        // the surface out of every repaint ("skipped repaint: shader config failure" in its log).
         const bool westonHlg = logged(QStringLiteral(".supported_tf_named(13)"));
         const Transfer hlgDescribed = westonHlg && !throughQt ? Transfer::Hlg : Transfer::Pq;
         qInfo().noquote() << "Weston" << (westonHlg ? "lists" : "does not list") << "HLG's transfer";
         auto hlg = std::make_shared<HdrPicture>(*ramp);
         hlg->transfer = Transfer::Hlg;
         hlg->contentPeak = hdrContentPeak(*findColorSpace("rec2100hlg"), 1000);
-        const int beforeHlg = drawn();
+        const QPointer<HdrSurface> shown = viewer.hdrSurface();
+        viewer.setHdrViewer(false);
+        QTRY_VERIFY(shown.isNull() && !viewer.hdrSurface());  // (gone with its wl_surface)
+        viewer.setHdrViewer(true);
         viewer.setHdrPicture(hlg);
-        QTRY_VERIFY2_WITH_TIMEOUT(drawn() > beforeHlg, qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame drawn") : viewer.hdrStatus()),
-                                  10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(drawn() > 0, qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame drawn") : viewer.hdrStatus()), 10000);
         QTRY_VERIFY2_WITH_TIMEOUT(described() == hlgDescribed, qPrintable(viewer.hdrStatus()), 10000);
         QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));
         if (hlgDescribed == Transfer::Hlg) {
