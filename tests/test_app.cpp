@@ -19217,6 +19217,141 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(edit::clipById(*state()->sequence(), red)->motion.params.at("rotation").repeat, Repeat::Hold);
     }
 
+    void keyframeStretchAndEasings() {
+        // Red's rotation keyed at 5, 15 and 25 with Bezier handles.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Keys", [red](Project&, Sequence& s) {
+            Param& r = edit::clipById(s, red)->motion.params["rotation"];
+            r.addKey(5, 0, Interp::Bezier);
+            r.addKey(15, 45, Interp::Bezier);
+            r.addKey(25, 90);
+            r.keys[0].outDt = 3, r.keys[0].outDv = 9;
+            r.keys[1].inDt = -2, r.keys[1].inDv = -6, r.keys[1].outDt = 2, r.keys[1].outDv = 6;
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        win_->raisePanel("keyframes");
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible() && panel->width() > 300);
+        QTRY_COMPARE(panel->clip(), red);
+        QCOMPARE(int(panel->rows().size()), 1);
+        const ParamAddress rot = panel->rows().front().address;
+        auto rotation = [&]() -> const Param& { return edit::clipById(*state()->sequence(), red)->motion.params.at("rotation"); };
+        auto times = [&] {
+            std::vector<FrameTime> t;
+            for (const Keyframe& k : rotation().keys) t.push_back(k.t);
+            return t;
+        };
+        using Times = std::vector<FrameTime>;
+        // Alt-dragging the last selected key to twice the selection's length stretches it from its first key: every
+        // time doubled (within a frame), the handles' times with them, in one undo step.
+        panel->select({{rot, 5}, {rot, 15}, {rot, 25}});
+        const size_t steps = state()->history().undoCount();
+        const QPoint last = panel->keyPoint(0, 25), twice = panel->keyPoint(0, 45);
+        QTest::mousePress(panel, Qt::LeftButton, Qt::AltModifier, last);
+        QMouseEvent move(QEvent::MouseMove, twice, panel->mapToGlobal(twice), Qt::NoButton, Qt::LeftButton, Qt::AltModifier);
+        QApplication::sendEvent(panel, &move);
+        QTest::mouseRelease(panel, Qt::LeftButton, Qt::AltModifier, twice);
+        const Times stretched = times();
+        QCOMPARE(stretched.size(), size_t(3));
+        QCOMPARE(stretched[0], FrameTime(5));
+        QVERIFY2(std::llabs(stretched[1] - 25) <= 1 && std::llabs(stretched[2] - 45) <= 1, qPrintable(QString("%1 %2").arg(stretched[1]).arg(stretched[2])));
+        const double factor = double(stretched[2] - 5) / 20;
+        QVERIFY(std::fabs(rotation().keys[0].outDt - 3 * factor) < 1e-9 && rotation().keys[0].outDv == 9);
+        QVERIFY(std::fabs(rotation().keys[1].inDt + 2 * factor) < 1e-9 && std::fabs(rotation().keys[1].outDt - 2 * factor) < 1e-9);
+        QCOMPARE(state()->history().undoCount(), steps + 1);
+        QCOMPARE(QString::fromStdString(state()->history().undoLabel()), QString("Stretch Keyframes"));
+        QCOMPARE(panel->selection().size(), size_t(3));  // the keys where they went
+        state()->undo();
+        QCOMPARE(times(), (Times{5, 15, 25}));
+        // The same from the panel's API, about the last key; refused when it would pass the clip's start.
+        panel->select({{rot, 15}, {rot, 25}});
+        QVERIFY(panel->stretchSelected(0.5, true));
+        QCOMPARE(times(), (Times{5, 20, 25}));
+        state()->undo();
+        panel->select({{rot, 15}, {rot, 25}});
+        QVERIFY(!panel->stretchSelected(3.0, true));  // 15 would go to -5
+        QCOMPARE(times(), (Times{5, 15, 25}));
+
+        // An easing from the panel's menu (Easing Curve, Elastic, Out) on the first key: the curve between 5 and 15
+        // at its eleven frames is the formula's, within 1e-6.
+        panel->select({});
+        QStringList offered;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            for (QAction* a : menu->findChildren<QAction*>())
+                if (!a->objectName().isEmpty()) offered << a->objectName();
+            for (QAction* a : menu->findChildren<QAction*>())
+                if (a->objectName() == "elastic_out") a->trigger();
+            menu->close();
+        });
+        const QPoint first = panel->keyPoint(0, 5);
+        QContextMenuEvent menuEvent(QContextMenuEvent::Mouse, first, panel->mapToGlobal(first));
+        QApplication::sendEvent(panel, &menuEvent);
+        for (Interp i : allInterps())
+            if (isEasing(i)) QVERIFY2(offered.contains(interpName(i)), interpName(i));
+        QCOMPARE(rotation().keys[0].interp, Interp::ElasticOut);
+        QVERIFY(panel->keyText({rot, 5}).contains("Elastic Out"));
+        auto elasticIn = [](double u) { return u == 0 ? 0.0 : -std::pow(2.0, 10 * u - 10) * std::sin((10 * u - 10.75) * 2 * M_PI / 3); };
+        auto bounceOut = [](double u) {
+            if (u < 1 / 2.75) return 7.5625 * u * u;
+            if (u < 2 / 2.75) return 7.5625 * (u - 1.5 / 2.75) * (u - 1.5 / 2.75) + 0.75;
+            if (u < 2.5 / 2.75) return 7.5625 * (u - 2.25 / 2.75) * (u - 2.25 / 2.75) + 0.9375;
+            return 7.5625 * (u - 2.625 / 2.75) * (u - 2.625 / 2.75) + 0.984375;
+        };
+        auto bounceInOut = [&](double u) { return u < 0.5 ? (1 - bounceOut(1 - 2 * u)) / 2 : 1 - (1 - bounceOut(2 * u - 1)) / 2; };
+        for (int j = 0; j <= 10; ++j) {
+            const double want = 45 * (1 - elasticIn(1 - j / 10.0));
+            QVERIFY2(std::fabs(rotation().at(5 + j) - want) < 1e-6, qPrintable(QString("%1: %2, not %3").arg(j).arg(rotation().at(5 + j)).arg(want)));
+        }
+
+        // Over MCP: read with its name and the values at the eleven frames, set to another easing, and stretched.
+        const QString project = dir_.path() + "/easing-mcp.montage";
+        QVERIFY(state()->save(project));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonArray at;
+        for (int j = 0; j <= 10; ++j) at.append(5 + j);
+        QJsonObject r = call("montage_keyframes", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"at", at}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject got = r.value("structuredContent").toObject();
+        QCOMPARE(got.value("keys").toArray().at(0).toObject().value("interpolation").toString(), QString("elastic_out"));
+        for (int j = 0; j <= 10; ++j)
+            QVERIFY(std::fabs(got.value("values").toArray().at(j).toDouble() - 45 * (1 - elasticIn(1 - j / 10.0))) < 1e-6);
+        r = call("montage_keyframes", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"action", "set"},
+                                       {"keys", QJsonArray{QJsonObject{{"frame", 5}, {"interpolation", "bounce_in_out"}}}}, {"at", at}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        got = r.value("structuredContent").toObject();
+        QCOMPARE(got.value("keys").toArray().at(0).toObject().value("interpolation").toString(), QString("bounce_in_out"));
+        QCOMPARE(got.value("keys").toArray().at(0).toObject().value("value").toDouble(), 0.0);  // (its value kept)
+        for (int j = 0; j <= 10; ++j) QVERIFY(std::fabs(got.value("values").toArray().at(j).toDouble() - 45 * bounceInOut(j / 10.0)) < 1e-6);
+        QVERIFY(call("montage_keyframes", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"action", "set"},
+                                           {"keys", QJsonArray{QJsonObject{{"frame", 5}, {"interpolation", "wobbly"}}}}})
+                    .value("isError").toBool());
+        r = call("montage_scale_keys", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"factor", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Param& scaled = edit::clipById(*back.active(), red)->motion.params.at("rotation");
+        QCOMPARE(scaled.keys.at(1).t, FrameTime(25));
+        QCOMPARE(scaled.keys.at(2).t, FrameTime(45));
+        QCOMPARE(scaled.keys.at(1).inDt, -4.0);
+        QCOMPARE(scaled.keys.at(0).interp, Interp::BounceInOut);
+        // Too far for the clip: refused, nothing written.
+        QVERIFY(call("montage_scale_keys", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"factor", 1000}}).value("isError").toBool());
+        state()->newProject();
+    }
+
     void keyframeCopyPaste() {
         // Red's opacity fade and a blur's radius, copied and pasted onto Blue at the playhead.
         loadDemo();

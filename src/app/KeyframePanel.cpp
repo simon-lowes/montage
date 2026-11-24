@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <map>
 
 #include "Accessibility.h"
@@ -301,6 +302,66 @@ bool KeyframePanel::setInterpolation(Interp interp) {
                     }
         return any;
     });
+}
+
+namespace {
+// Each parameter's selected key times.
+std::map<ParamAddress, std::vector<FrameTime>> timesByParam(const std::set<KeyframePanel::Key>& keys) {
+    std::map<ParamAddress, std::vector<FrameTime>> out;
+    for (const KeyframePanel::Key& k : keys) out[k.address].push_back(k.t);
+    return out;
+}
+// Whether every parameter's keys can take the stretch (on copies).
+bool stretchFits(const Clip& c, const std::map<ParamAddress, std::vector<FrameTime>>& byParam, double pivot, double factor) {
+    for (const auto& [addr, times] : byParam)
+        if (const Param* p = findParam(c, addr)) {
+            Param copy = *p;
+            if (!scaleKeys(copy, times, pivot, factor, c.duration - 1)) return false;
+        }
+    return !byParam.empty();
+}
+void applyStretch(Clip& c, const std::map<ParamAddress, std::vector<FrameTime>>& byParam, double pivot, double factor) {
+    for (const auto& [addr, times] : byParam)
+        if (Param* p = findParam(c, addr)) scaleKeys(*p, times, pivot, factor, c.duration - 1);
+}
+}  // namespace
+
+bool KeyframePanel::stretchSelected(double factor, bool aboutLast) {
+    const Clip* c = currentClip();
+    if (!c || selection_.empty()) return false;
+    const auto keys = linked(selection_);
+    FrameTime lo = std::numeric_limits<FrameTime>::max(), hi = std::numeric_limits<FrameTime>::min();
+    for (const Key& k : keys) lo = std::min(lo, k.t), hi = std::max(hi, k.t);
+    const double pivot = double(aboutLast ? hi : lo);
+    const auto byParam = timesByParam(keys);
+    if (hi <= lo || !stretchFits(*c, byParam, pivot, factor)) return false;
+    const Id id = clip_;
+    const bool done = state_->edit(tr("Stretch Keyframes"), [id, byParam, pivot, factor](Project&, Sequence& s) {
+        Clip* cc = edit::clipById(s, id);
+        if (!cc) return false;
+        applyStretch(*cc, byParam, pivot, factor);
+        return true;
+    });
+    if (done) {
+        std::set<Key> moved;
+        for (const Key& k : selection_) moved.insert({k.address, FrameTime(std::llround(pivot + (double(k.t) - pivot) * factor))});
+        selection_ = moved;
+        update();
+    }
+    return done;
+}
+
+bool KeyframePanel::beginStretch(QMouseEvent* e, const Key& k) {
+    if (!(e->modifiers() & Qt::AltModifier) || !selection_.count(k)) return false;
+    FrameTime lo = std::numeric_limits<FrameTime>::max(), hi = std::numeric_limits<FrameTime>::min();
+    for (const Key& s : linked(selection_)) lo = std::min(lo, s.t), hi = std::max(hi, s.t);
+    if (hi <= lo || (k.t != lo && k.t != hi)) return false;
+    drag_ = Drag::Stretch;
+    dragStart_ = selection_;
+    stretchFrom_ = k.t;
+    stretchPivot_ = double(k.t == lo ? hi : lo);
+    update();
+    return true;
 }
 
 bool KeyframePanel::easeSelected(bool in, bool out) {
@@ -607,6 +668,10 @@ void KeyframePanel::mousePressEvent(QMouseEvent* e) {
             return;
         }
         if (graphKeyAt(e->pos(), k, row)) {
+            if (beginStretch(e, k)) {
+                freeze();
+                return;
+            }
             if (add && selection_.count(k)) selection_.erase(k);
             else if (add) selection_.insert(k);
             else if (!selection_.count(k)) selection_ = {k};
@@ -617,6 +682,7 @@ void KeyframePanel::mousePressEvent(QMouseEvent* e) {
             return;
         }
     } else if (keyAt(e->pos(), k)) {
+        if (beginStretch(e, k)) return;
         if (add && selection_.count(k)) selection_.erase(k);
         else if (add) selection_.insert(k);
         else if (!selection_.count(k)) selection_ = {k};
@@ -674,6 +740,27 @@ void KeyframePanel::mouseMoveEvent(QMouseEvent* e) {
             selection_ = moved;
             break;
         }
+        case Drag::Stretch: {
+            // The grabbed end of the selection to the frame under the mouse, the other end held: the keys between
+            // stretched or squeezed with it (from where the drag began; a stretch the keys cannot take is not made).
+            if (start) state_->beginGesture(tr("Stretch Keyframes"));
+            const Sequence* origin = state_->gestureBase();
+            const Clip* oc = origin ? edit::clipById(*origin, clip_) : nullptr;
+            if (!oc) break;
+            const std::set<Key> base = dragStart_;
+            const double pivot = stretchPivot_;
+            const double factor = (double(frameAtX(e->pos().x())) - pivot) / (double(stretchFrom_) - pivot);
+            const auto byParam = timesByParam(linked(base));
+            if (!stretchFits(*oc, byParam, pivot, factor)) break;
+            const Id id = clip_;
+            state_->updateGesture([id, byParam, pivot, factor](Project&, Sequence& s) {
+                if (Clip* cc = edit::clipById(s, id)) applyStretch(*cc, byParam, pivot, factor);
+            });
+            std::set<Key> moved;
+            for (const Key& k : base) moved.insert({k.address, FrameTime(std::llround(pivot + (double(k.t) - pivot) * factor))});
+            selection_ = moved;
+            break;
+        }
         case Drag::GraphKey: {
             // The grabbed key, to the frame and value under the mouse (from where the drag began).
             if (start) state_->beginGesture(tr("Move Keyframe"));
@@ -721,7 +808,7 @@ void KeyframePanel::mouseReleaseEvent(QMouseEvent* e) {
     if (e->button() != Qt::LeftButton) return;
     // The keyboard carries on from the row clicked.
     if (const int r = rowAt(e->pos().y()); r >= 0 && r < int(rows_.size())) currentRow_ = r;
-    if ((drag_ == Drag::Keys || drag_ == Drag::GraphKey || drag_ == Drag::Handle) && dragging_) state_->endGesture(true);
+    if ((drag_ == Drag::Keys || drag_ == Drag::GraphKey || drag_ == Drag::Handle || drag_ == Drag::Stretch) && dragging_) state_->endGesture(true);
     frozen_.clear();
     if (drag_ == Drag::Box) {
         if (dragging_) {
@@ -804,6 +891,24 @@ bool KeyframePanel::addKeyAt(int row, FrameTime t) {
     return added;
 }
 
+QString KeyframePanel::easingFamilyName(int family) {
+    const QString names[] = {tr("Exponential"), tr("Logarithmic"), tr("Sine"), tr("Circular"), tr("Back (Overshoot)"), tr("Elastic"), tr("Bounce")};
+    return family >= 0 && family < 7 ? names[family] : QString();
+}
+
+QString KeyframePanel::interpolationName(Interp i) {
+    switch (i) {
+        case Interp::Linear: return tr("Linear");
+        case Interp::Hold: return tr("Hold");
+        case Interp::Smooth: return tr("Smooth");
+        case Interp::Bezier: return tr("Bezier");
+        default: break;
+    }
+    const int k = int(i) - int(Interp::ExpoIn);
+    const QString forms[] = {tr("%1 In"), tr("%1 Out"), tr("%1 In and Out")};
+    return forms[k % 3].arg(easingFamilyName(k / 3));
+}
+
 std::vector<KeyframePanel::Key> KeyframePanel::keys() const {
     std::vector<Key> out;
     if (const Clip* c = currentClip())
@@ -821,11 +926,9 @@ QString KeyframePanel::keyText(const Key& key) const {
     QString label;
     for (const Row& r : rows_)
         if (r.address == key.address) label = r.label;
-    static const char* const kInterp[] = {QT_TR_NOOP("Linear"), QT_TR_NOOP("Hold"), QT_TR_NOOP("Smooth"), QT_TR_NOOP("Bezier")};
-    const int interp = int(k->interp);
     return tr("%1, %2, %3%4")
         .arg(label, timecodeString(state_->sequence(), c->start + key.t), QString::number(k->v, 'g', 4),
-             interp >= 0 && interp < 4 ? QStringLiteral(", ") + tr(kInterp[interp]) : QString());
+             QStringLiteral(", ") + interpolationName(k->interp));
 }
 
 void KeyframePanel::selectKey(int row, int step) {
@@ -883,6 +986,19 @@ void KeyframePanel::contextMenuEvent(QContextMenuEvent* e) {
                                                 {Interp::Bezier, tr("Bezier")}};
     for (const auto& [interp, name] : kinds)
         menu.addAction(name, this, [this, interp = interp] { setInterpolation(interp); })->setData(int(interp));
+    // The easing curves, each in, out, or in and out.
+    QMenu* curves = menu.addMenu(tr("Easing Curve"));
+    curves->setObjectName(QStringLiteral("easingCurves"));
+    for (int family = 0; family < 7; ++family) {
+        QMenu* m = curves->addMenu(easingFamilyName(family));
+        const QString forms[] = {tr("In"), tr("Out"), tr("In and Out")};
+        for (int form = 0; form < 3; ++form) {
+            const Interp interp = Interp(int(Interp::ExpoIn) + family * 3 + form);
+            QAction* act = m->addAction(forms[form], this, [this, interp] { setInterpolation(interp); });
+            act->setData(int(interp));
+            act->setObjectName(QString::fromLatin1(interpName(interp)));
+        }
+    }
     menu.addSeparator();
     menu.addAction(tr("Ease In"), this, [this] { easeSelected(true, false); })->setObjectName(QStringLiteral("easeIn"));
     menu.addAction(tr("Ease Out"), this, [this] { easeSelected(false, true); })->setObjectName(QStringLiteral("easeOut"));

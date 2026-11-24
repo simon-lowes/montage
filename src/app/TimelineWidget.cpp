@@ -27,6 +27,7 @@
 
 #include "Accessibility.h"
 #include "EditorState.h"
+#include "KeyframePanel.h"
 #include "LiveTake.h"
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
@@ -1654,22 +1655,37 @@ void TimelineWidget::laneMenu(QMenu& menu, const LaneHit& h) {
                                                 {Interp::Hold, tr("Hold")},
                                                 {Interp::Smooth, tr("Smooth (Ease In and Out)")},
                                                 {Interp::Bezier, tr("Bezier")}};
-    for (const auto& [interp, name] : kinds) {
-        QAction* a = menu.addAction(name, this, [this, id, lane, key, interp = interp] {
-            state_->edit(tr("Keyframe Interpolation"), [id, lane, key, interp](Project&, Sequence& s) {
-                Clip* c = edit::clipById(s, id);
-                if (!c) return false;
-                for (Keyframe& k : laneParamRef(*c, lane).keys)
-                    if (k.t == key && k.interp != interp) {
-                        k.interp = interp;
-                        return true;
-                    }
-                return false;
-            });
+    auto setInterp = [this, id, lane, key](Interp interp) {
+        state_->edit(tr("Keyframe Interpolation"), [id, lane, key, interp](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, id);
+            if (!c) return false;
+            for (Keyframe& k : laneParamRef(*c, lane).keys)
+                if (k.t == key && k.interp != interp) {
+                    k.interp = interp;
+                    return true;
+                }
+            return false;
         });
+    };
+    for (const auto& [interp, name] : kinds) {
+        QAction* a = menu.addAction(name, this, [setInterp, interp = interp] { setInterp(interp); });
         a->setCheckable(true);
         a->setChecked(k->interp == interp);
         a->setData(int(interp));
+    }
+    // The easing curves, as the Keyframes panel offers them.
+    QMenu* curves = menu.addMenu(tr("Easing Curve"));
+    for (int family = 0; family < 7; ++family) {
+        QMenu* m = curves->addMenu(KeyframePanel::easingFamilyName(family));
+        const QString forms[] = {tr("In"), tr("Out"), tr("In and Out")};
+        for (int form = 0; form < 3; ++form) {
+            const Interp interp = Interp(int(Interp::ExpoIn) + family * 3 + form);
+            QAction* a = m->addAction(forms[form], this, [setInterp, interp] { setInterp(interp); });
+            a->setCheckable(true);
+            a->setChecked(k->interp == interp);
+            a->setData(int(interp));
+            a->setObjectName(QString::fromLatin1(interpName(interp)));
+        }
     }
 }
 

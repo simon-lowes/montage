@@ -77,21 +77,11 @@ MediaKind kindFrom(const QString& s) {
     return MediaKind::Video;
 }
 
-const char* interpName(Interp i) {
-    switch (i) {
-        case Interp::Linear: return "linear";
-        case Interp::Hold: return "hold";
-        case Interp::Smooth: return "smooth";
-        case Interp::Bezier: return "bezier";
-    }
-    return "linear";
-}
-
+// (Model.h's names; one Montage does not know reads as linear.)
 Interp interpFrom(const QString& s) {
-    if (s == "hold") return Interp::Hold;
-    if (s == "smooth") return Interp::Smooth;
-    if (s == "bezier") return Interp::Bezier;
-    return Interp::Linear;
+    Interp i = Interp::Linear;
+    interpFromName(s.toStdString(), i);
+    return i;
 }
 
 QJsonValue surroundToJson(const SurroundPan& p) {

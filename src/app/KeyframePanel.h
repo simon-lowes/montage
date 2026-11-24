@@ -51,6 +51,9 @@ public:
     bool setInterpolation(Interp interp);
     bool shiftSelected(FrameTime delta);
     bool easeSelected(bool in, bool out);
+    // The selected keys stretched (factor > 1) or squeezed in time about the first of them (or the last, `aboutLast`),
+    // as Alt-dragging the last (or first) does: their order kept, short of the keys that stay. One undo step.
+    bool stretchSelected(double factor, bool aboutLast = false);
     // After the last keyframe, for the parameters of the selected keys: hold, loop, ping-pong or offset.
     bool setRepeat(Repeat repeat);
     // Copy the selected keys, and paste the copied ones at the playhead into this clip (or another one): the same
@@ -63,6 +66,10 @@ public:
     // 80, Linear".
     std::vector<Key> keys() const;
     QString keyText(const Key& key) const;
+    // What the panel calls an interpolation ("Linear", "Bounce In and Out") and an easing curve's family (0 exponential
+    // to 6 bounce, as Interp orders them).
+    static QString interpolationName(Interp i);
+    static QString easingFamilyName(int family);
     // The keyboard (with the panel focused): Up and Down move to the row above or below and select its key nearest the
     // playhead, Alt+Left and Alt+Right the key before or after on the row (the playhead following), Left and Right
     // move the selected keys a frame (Shift: ten), Insert or Enter adds a key on the row at the playhead, Delete
@@ -123,7 +130,11 @@ private:
     std::vector<Row> rows_;
     std::set<Key> selection_;
     // Mouse: dragging keys, a selection box, or scrubbing the ruler.
-    enum class Drag { None, Keys, Box, Scrub, GraphKey, Handle } drag_ = Drag::None;
+    // Alt-dragging the first or last of the selected keys stretches the selection about its other end.
+    enum class Drag { None, Keys, Box, Scrub, GraphKey, Handle, Stretch } drag_ = Drag::None;
+    bool beginStretch(QMouseEvent* e, const Key& k);
+    FrameTime stretchFrom_ = 0;
+    double stretchPivot_ = 0;
     QPoint press_;
     QRect box_;
     std::set<Key> dragStart_;

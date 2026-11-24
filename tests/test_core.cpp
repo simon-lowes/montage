@@ -6,6 +6,7 @@
 #include <QTemporaryDir>
 #include <QImage>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <set>
 #include <tuple>
@@ -5316,6 +5317,108 @@ private slots:
         QVERIFY(p.removeKey(0));
         QVERIFY(p.removeKey(10));
         QCOMPARE(p.at(3), 20.0);  // last value becomes static
+    }
+
+    void easingCurves() {
+        // Each easing's "in" curve, written out here, with "out" its mirror and "in and out" the two halves joined.
+        const double s = 1.70158;
+        auto bounceOut = [](double u) {
+            if (u < 1 / 2.75) return 7.5625 * u * u;
+            if (u < 2 / 2.75) return 7.5625 * (u - 1.5 / 2.75) * (u - 1.5 / 2.75) + 0.75;
+            if (u < 2.5 / 2.75) return 7.5625 * (u - 2.25 / 2.75) * (u - 2.25 / 2.75) + 0.9375;
+            return 7.5625 * (u - 2.625 / 2.75) * (u - 2.625 / 2.75) + 0.984375;
+        };
+        const std::function<double(double)> in[] = {
+            [](double u) { return (std::pow(2.0, 10 * u) - 1) / 1023; },
+            [](double u) { return 1 - std::log10(10 - 9 * u); },
+            [](double u) { return 1 - std::cos(u * M_PI / 2); },
+            [](double u) { return 1 - std::sqrt(1 - u * u); },
+            [s](double u) { return u * u * ((s + 1) * u - s); },
+            [](double u) { return u == 0 ? 0.0 : -std::pow(2.0, 10 * u - 10) * std::sin((10 * u - 10.75) * 2 * M_PI / 3); },
+            [bounceOut](double u) { return 1 - bounceOut(1 - u); }};
+        const char* families[] = {"expo", "log", "sine", "circ", "back", "elastic", "bounce"};
+        for (int f = 0; f < 7; ++f)
+            for (int form = 0; form < 3; ++form) {
+                const Interp interp = Interp(int(Interp::ExpoIn) + 3 * f + form);
+                // Its name, and the name read back.
+                const std::string name = std::string(families[f]) + (form == 0 ? "_in" : form == 1 ? "_out" : "_in_out");
+                QCOMPARE(std::string(interpName(interp)), name);
+                Interp back = Interp::Linear;
+                QVERIFY(interpFromName(name, back) && back == interp);
+                QVERIFY(isEasing(interp));
+                // From 0 at frame 0 to 1 at frame 10: the curve at the 11 frames, within 1e-6.
+                Param p;
+                p.addKey(0, 0, interp);
+                p.addKey(10, 1);
+                for (int j = 0; j <= 10; ++j) {
+                    const double u = j / 10.0;
+                    const double want = form == 0 ? in[f](u) : form == 1 ? 1 - in[f](1 - u) : u < 0.5 ? in[f](2 * u) / 2 : 1 - in[f](2 - 2 * u) / 2;
+                    QVERIFY2(std::fabs(p.at(j) - want) < 1e-6, qPrintable(QString("%1 at %2: %3, not %4").arg(name.c_str()).arg(u).arg(p.at(j)).arg(want)));
+                    QVERIFY(std::fabs(easeCurve(interp, u) - want) < 1e-6);
+                }
+            }
+        for (Interp i : {Interp::Linear, Interp::Hold, Interp::Smooth, Interp::Bezier}) QVERIFY(!isEasing(i));
+        Interp none = Interp::Hold;
+        QVERIFY(!interpFromName("ease_sideways", none) && none == Interp::Hold);
+        QCOMPARE(allInterps().size(), size_t(25));
+        // Kept as itself in a saved project, and a speed curve through one integrates to its average.
+        Project pr;
+        Sequence& sq = pr.sequences.emplace_back();
+        sq.id = pr.newId();
+        pr.activeSequence = sq.id;
+        sq.videoTracks.emplace_back();
+        Clip c;
+        c.id = pr.newId();
+        c.duration = 20;
+        c.motion = makeEffect(pr, "transform");
+        c.motion.params["opacity"].addKey(0, 0, Interp::ElasticOut);
+        c.motion.params["opacity"].addKey(10, 100, Interp::BounceInOut);
+        c.motion.params["opacity"].addKey(19, 50);
+        sq.videoTracks[0].clips.push_back(c);
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(pr), back));
+        const Param& op = back.active()->videoTracks.at(0).clips.at(0).motion.params.at("opacity");
+        QCOMPARE(op.keys.at(0).interp, Interp::ElasticOut);
+        QCOMPARE(op.keys.at(1).interp, Interp::BounceInOut);
+        QCOMPARE(op.keys.at(2).interp, Interp::Linear);
+    }
+
+    void keyframeStretchCore() {
+        // Keys at 10, 20 and 30 stretched to twice as long about 10: at 10, 30 and 50, their handles twice as long in
+        // time and the same in value; a key outside the stretch stays.
+        Param p;
+        p.addKey(0, 5);
+        p.addKey(10, 0, Interp::Bezier);
+        p.addKey(20, 50, Interp::Bezier);
+        p.addKey(30, 100);
+        p.keys[1].outDt = 3, p.keys[1].outDv = 10;
+        p.keys[2].inDt = -2, p.keys[2].inDv = -4, p.keys[2].outDt = 4, p.keys[2].outDv = 8;
+        QVERIFY(scaleKeys(p, {10, 20, 30}, 10, 2.0, 99));
+        QCOMPARE(p.keys.size(), size_t(4));
+        QCOMPARE(p.keys[0].t, FrameTime(0));
+        QCOMPARE(p.keys[1].t, FrameTime(10));
+        QCOMPARE(p.keys[2].t, FrameTime(30));
+        QCOMPARE(p.keys[3].t, FrameTime(50));
+        QCOMPARE(p.keys[1].outDt, 6.0);
+        QCOMPARE(p.keys[1].outDv, 10.0);
+        QCOMPARE(p.keys[2].inDt, -4.0);
+        QCOMPARE(p.keys[2].outDt, 8.0);
+        QCOMPARE(p.keys[2].outDv, 8.0);
+        QCOMPARE(p.at(50), 100.0);
+        // Squeezed back to half: where they were (to the frame).
+        QVERIFY(scaleKeys(p, {10, 30, 50}, 10, 0.5, 99));
+        QCOMPARE(p.keys[2].t, FrameTime(20));
+        QCOMPARE(p.keys[3].t, FrameTime(30));
+        // Refused, nothing changed: past the end, onto a key that stays, into each other, or by nothing.
+        const Param before = p;
+        QVERIFY(!scaleKeys(p, {20, 30}, 10, 6.0, 99));     // 30 to 130
+        QVERIFY(!scaleKeys(p, {20, 30}, 30, 4.0, 99));     // 20 to -10
+        QVERIFY(!scaleKeys(p, {10, 20}, 0, 3.0, 99));     // 20 to 60, past 30 that stays
+        QVERIFY(!scaleKeys(p, {10, 20, 30}, 10, 0.01, 99));  // all onto frame 10
+        QVERIFY(!scaleKeys(p, {10, 20}, 10, 0.0, 99));
+        QVERIFY(!scaleKeys(p, {10, 20}, 10, -1.0, 99));
+        QVERIFY(!scaleKeys(p, {11}, 10, 2.0, 99));         // no key there
+        QVERIFY(p == before);
     }
 
     void effectDefaults() {

@@ -34,6 +34,7 @@
 #include <sstream>
 
 #include "core/ClipAnimation.h"
+#include "core/KeyframeEdit.h"
 #include "core/GradeVersions.h"
 #include "core/CompositeGraph.h"
 #include "core/GradeGraph.h"
@@ -534,6 +535,25 @@ Clip& clipArg(Loaded& l, const QJsonObject& a, const char* key = "clip") {
     Clip* c = edit::clipById(l.seq(), Id(v.toDouble()));
     if (!c) throw ArgError{QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble()))};
     return *c;
+}
+
+// Which of a clip's settings `effect` (an effect id on it; omitted = its Transform) and `param` name.
+ParamAddress paramAddressArg(const Clip& c, const QJsonObject& a, bool needParam = true) {
+    ParamAddress out;
+    if (needParam && !a.value("param").isString()) throw ArgError{"\"param\" names the setting (as pos_x or opacity)"};
+    out.param = a.value("param").toString().toStdString();
+    const Id effect = Id(a.value("effect").toDouble(0));
+    if (effect == 0 || effect == c.motion.id) return out;
+    if (effect == c.audio.id) out.slot = ParamSlot::Audio;
+    else if (effect == c.timing.id) out.slot = ParamSlot::Timing;
+    else if (effect == c.generator.id) out.slot = ParamSlot::Generator;
+    else {
+        out.slot = ParamSlot::Effect;
+        out.effect = effect;
+        if (std::none_of(c.effects.begin(), c.effects.end(), [&](const Effect& e) { return e.id == effect; }))
+            throw ArgError{QStringLiteral("The clip has no effect %1").arg(qulonglong(effect))};
+    }
+    return out;
 }
 
 // A video clip by its id or its name.
@@ -14867,6 +14887,139 @@ void McpServer::Impl::addTools() {
                                                     : QStringLiteral("The expression fails at frame %1 (the keyed value is used): %2").arg(at).arg(QString::fromStdString(why)))
                                      : QStringLiteral("%1 has no expression").arg(QString::fromStdString(param));
             return ok(text, out);
+        });
+
+    add("montage_keyframes", "Keyframes of a setting",
+        "Read or set the keyframes of one of a clip's settings: `param` of the effect `effect` (an effect id; omitted = "
+        "the clip's Transform: pos_x, pos_y, scale, rotation, opacity...). get: each key's frame (from the clip's start), "
+        "value and interpolation towards the next key, and the value at each of `at` (clip frames, fractions allowed). "
+        "set: `keys`, each {frame, value, interpolation}, adds a key or changes the one on that frame (a key's value or "
+        "interpolation left out stays as it was). Interpolations: linear, hold, smooth, bezier, and the easings expo, "
+        "log, sine, circ, back, elastic and bounce, each _in, _out or _in_out (as \"sine_in_out\"); each is kept as itself.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"number"},
+            "param":{"type":"string"},"action":{"type":"string","enum":["get","set"],"default":"get"},
+            "keys":{"type":"array","items":{"type":"object","properties":{"frame":{"type":"integer"},"value":{"type":"number"},
+                "interpolation":{"type":"string"}},"required":["frame"]}},
+            "at":{"type":"array","items":{"type":"number"}}},"required":["project","clip","param"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Clip& c = clipArg(l, a);
+            const ParamAddress address = paramAddressArg(c, a);
+            const QString action = str(a, "action", "get");
+            if (action != "get" && action != "set") throw ArgError{"action is get or set"};
+            if (action == "set") {
+                Effect* owner = paramOwner(c, address);
+                if (!owner) throw ArgError{"The clip has no such effect"};
+                // A setting the effect has (as the Inspector lists it), at its default outside the keys when not set yet.
+                if (!owner->params.count(address.param)) {
+                    const std::vector<ParamInfo> infos = effectParams(*owner);
+                    const auto info = std::find_if(infos.begin(), infos.end(), [&](const ParamInfo& pi) { return pi.name == address.param; });
+                    if (info == infos.end())
+                        throw ArgError{QStringLiteral("%1 has no setting %2").arg(QString::fromStdString(owner->type), QString::fromStdString(address.param))};
+                    owner->params[address.param] = Param(info->def);
+                }
+                Param& p = owner->params[address.param];
+                const QJsonArray keys = a.value("keys").toArray();
+                if (keys.isEmpty()) throw ArgError{"\"keys\" lists the keys to set"};
+                for (const QJsonValue& v : keys) {
+                    const QJsonObject k = v.toObject();
+                    if (!k.value("frame").isDouble()) throw ArgError{"Each key has a \"frame\""};
+                    const FrameTime t = FrameTime(std::llround(k.value("frame").toDouble()));
+                    if (t < 0 || t >= std::max<FrameTime>(1, c.duration)) throw ArgError{QStringLiteral("Frame %1 is outside the clip").arg(t)};
+                    Interp interp = Interp::Linear;
+                    if (k.contains("interpolation") && !interpFromName(k.value("interpolation").toString().toStdString(), interp))
+                        throw ArgError{QStringLiteral("\"%1\" is not an interpolation").arg(k.value("interpolation").toString())};
+                    const bool had = p.keyAt(t) != nullptr;
+                    const Keyframe kept = had ? *p.keyAt(t) : Keyframe{};
+                    if (!had && !k.contains("value")) throw ArgError{QStringLiteral("No key is on frame %1: give its value").arg(t)};
+                    const double value = k.contains("value") ? k.value("value").toDouble() : kept.v;
+                    if (!std::isfinite(value)) throw ArgError{"A key's value is a number"};
+                    if (!k.contains("interpolation") && had) interp = kept.interp;
+                    p.addKey(t, value, interp);
+                    // (A key changed keeps its handles and its place between frames.)
+                    if (had)
+                        for (Keyframe& x : p.keys)
+                            if (x.t == t) x.inDt = kept.inDt, x.inDv = kept.inDv, x.outDt = kept.outDt, x.outDv = kept.outDv, x.sub = kept.sub;
+                }
+                save(l);
+            }
+            const Clip* cc = edit::clipById(l.seq(), c.id);
+            const Param* p = cc ? findParam(*cc, address) : nullptr;
+            QJsonArray keys, values;
+            if (p)
+                for (const Keyframe& k : p->keys)
+                    keys.append(QJsonObject{{"frame", double(k.t)}, {"value", k.v}, {"interpolation", QString::fromLatin1(interpName(k.interp))}});
+            for (const QJsonValue& v : a.value("at").toArray()) values.append(p ? p->keyedAtTime(v.toDouble()) : 0.0);
+            QJsonObject out{{"keys", keys}};
+            if (a.contains("at")) out["values"] = values;
+            return ok(QStringLiteral("%1 has %2 keys").arg(QString::fromStdString(address.param)).arg(keys.size()), out);
+        });
+
+    add("montage_scale_keys", "Stretch keyframes in time",
+        "Stretch or squeeze keyframes of a clip in time, so an animation plays slower or faster as a whole: each key's "
+        "time from `pivot` (a clip frame; default the first of them) times `factor` (2 twice as long, 0.5 half), to the "
+        "nearest frame, its Bezier handles with it; values stay. `param` of `effect` (omitted = the Transform), or every "
+        "keyed setting of that effect when `param` is left out; `keys` (clip frames) picks some of the keys (default all). "
+        "Refused, changing nothing, when keys would pass ones that stay, land on the same frame or leave the clip.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"number"},
+            "param":{"type":"string"},"factor":{"type":"number","exclusiveMinimum":0},"pivot":{"type":"number"},
+            "keys":{"type":"array","items":{"type":"integer"}}},"required":["project","clip","factor"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Clip& c = clipArg(l, a);
+            const double factor = a.value("factor").toDouble(0);
+            if (!(factor > 0) || !std::isfinite(factor)) throw ArgError{"factor is a number above 0"};
+            ParamAddress address = paramAddressArg(c, a, false);
+            Effect* owner = paramOwner(c, address);
+            if (!owner) throw ArgError{"The clip has no such effect"};
+            std::vector<std::string> names;
+            if (!address.param.empty()) {
+                if (!owner->params.count(address.param) || owner->params.at(address.param).keys.empty())
+                    throw ArgError{QStringLiteral("%1 has no keys").arg(QString::fromStdString(address.param))};
+                names.push_back(address.param);
+            } else {
+                for (const auto& [name, p] : owner->params)
+                    if (!p.keys.empty()) names.push_back(name);
+                if (names.empty()) throw ArgError{"Nothing there is keyed"};
+            }
+            std::vector<FrameTime> picked;
+            for (const QJsonValue& v : a.value("keys").toArray()) picked.push_back(FrameTime(v.toInt()));
+            auto chosen = [&](const Param& p) {
+                std::vector<FrameTime> out;
+                for (const Keyframe& k : p.keys)
+                    if (picked.empty() || std::find(picked.begin(), picked.end(), k.t) != picked.end()) out.push_back(k.t);
+                return out;
+            };
+            FrameTime first = std::numeric_limits<FrameTime>::max();
+            for (const std::string& n : names)
+                for (FrameTime t : chosen(owner->params.at(n))) first = std::min(first, t);
+            if (first == std::numeric_limits<FrameTime>::max()) throw ArgError{"None of those keys is there"};
+            const double pivot = a.contains("pivot") ? a.value("pivot").toDouble() : double(first);
+            const FrameTime last = std::max<FrameTime>(0, c.duration - 1);
+            // Every setting stretched, or none (a copy changed, kept only if all of them fit).
+            std::map<std::string, Param> stretched;
+            int moved = 0;
+            for (const std::string& n : names) {
+                Param p = owner->params.at(n);
+                const std::vector<FrameTime> keys = chosen(p);
+                if (keys.empty()) continue;
+                if (!scaleKeys(p, keys, pivot, factor, last))
+                    return fail(QStringLiteral("%1's keys cannot stretch that far: they would pass keys that stay, meet, or leave the clip")
+                                    .arg(QString::fromStdString(n)));
+                stretched[n] = std::move(p);
+                moved += int(keys.size());
+            }
+            for (auto& [n, p] : stretched) owner->params[n] = std::move(p);
+            save(l);
+            QJsonObject out{{"moved", moved}, {"pivot", pivot}};
+            QJsonObject times;
+            for (const auto& [n, p] : stretched) {
+                QJsonArray t;
+                for (const Keyframe& k : p.keys) t.append(double(k.t));
+                times[QString::fromStdString(n)] = t;
+            }
+            out["keys"] = times;
+            return ok(QStringLiteral("Stretched %1 keys by %2").arg(moved).arg(factor), out);
         });
 
     add("montage_ltc", "Timecode from LTC",
