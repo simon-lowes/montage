@@ -1978,6 +1978,20 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!o.jxs->open(s.path, xs, &o.jxsError)) return fail(o.jxsError);
         opened = true;  // (removed if the export fails after the writer has finished it)
     }
+    // Matroska has no place in a track for an ICC profile: Adobe RGB's goes in as an attachment of the ICC profile's
+    // media type, after every track is made (WebM takes no attachments).
+    if (outSpace.primaries == Primaries::AdobeRgb && o.vst && std::strcmp(o.oc->oformat->name, "matroska") == 0) {
+        const QByteArray icc = QColorSpace(QColorSpace::AdobeRgb).iccProfile();
+        if (AVStream* att = icc.isEmpty() ? nullptr : avformat_new_stream(o.oc, nullptr)) {
+            att->codecpar->codec_type = AVMEDIA_TYPE_ATTACHMENT;
+            att->codecpar->extradata = static_cast<uint8_t*>(av_mallocz(size_t(icc.size()) + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (!att->codecpar->extradata) return fail("Out of memory");
+            std::memcpy(att->codecpar->extradata, icc.constData(), size_t(icc.size()));
+            att->codecpar->extradata_size = int(icc.size());
+            av_dict_set(&att->metadata, "filename", "AdobeRGB1998.icc", 0);
+            av_dict_set(&att->metadata, "mimetype", "application/vnd.iccprofile", 0);
+        }
+    }
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
 

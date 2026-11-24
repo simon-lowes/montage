@@ -3340,6 +3340,59 @@ private slots:
             QCOMPARE(m.colorSpace, std::string("adobergb"));
         }
 #endif
+        // Matroska, which has no place in a track for one, carries the profile as an attachment of the ICC profile's
+        // media type: FFmpeg's probe reads it as an attached file, and Montage reads the file back as Adobe RGB.
+        if (avcodec_find_encoder_by_name("libx264")) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 64, s.height = 64;
+            s.videoTracks[0].clips.push_back(colorClip(p, 0.2f, 0.6f, 0.3f, 0, 5));
+            QTemporaryDir dir;
+            ExportSettings st;
+            st.path = dir.path().toStdString() + "/adobe.mkv";
+            st.videoCodec = "libx264";
+            st.audioCodec = "aac";
+            st.colorSpace = "adobergb";
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            AVFormatContext* fc = nullptr;
+            QVERIFY(avformat_open_input(&fc, st.path.c_str(), nullptr, nullptr) == 0);
+            QVERIFY(avformat_find_stream_info(fc, nullptr) >= 0);
+            QByteArray profile;
+            int attachments = 0, others = 0;
+            for (unsigned i = 0; i < fc->nb_streams; ++i) {
+                const AVStream* a = fc->streams[i];
+                if (a->codecpar->codec_type != AVMEDIA_TYPE_ATTACHMENT) {
+                    ++others;
+                    continue;
+                }
+                ++attachments;
+                const AVDictionaryEntry* mime = av_dict_get(a->metadata, "mimetype", nullptr, 0);
+                QVERIFY(mime && QByteArray(mime->value) == "application/vnd.iccprofile");
+                profile = QByteArray(reinterpret_cast<const char*>(a->codecpar->extradata), a->codecpar->extradata_size);
+            }
+            avformat_close_input(&fc);
+            QCOMPARE(attachments, 1);
+            QCOMPARE(others, 2);  // (the picture and the sound, as before)
+            QCOMPARE(QColorSpace::fromIccProfile(profile).primaries(), QColorSpace::Primaries::AdobeRgb);
+            MediaItem m;
+            QVERIFY2(probeMedia(st.path, m, &err), err.c_str());
+            QCOMPARE(m.colorSpace, std::string("adobergb"));
+            QVERIFY(m.hasAudio);
+            // WebM takes no attachments: written as before, without one.
+            st.path = dir.path().toStdString() + "/adobe.webm";
+            st.videoCodec = "libvpx-vp9";
+            st.audioCodec = "none";
+            st.preset = "good";
+            st.crf = 35;
+            st.gop = 24;
+            if (avcodec_find_encoder_by_name("libvpx-vp9")) {
+                QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+                QVERIFY(avformat_open_input(&fc, st.path.c_str(), nullptr, nullptr) == 0);
+                for (unsigned i = 0; i < fc->nb_streams; ++i) QVERIFY(fc->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_ATTACHMENT);
+                avformat_close_input(&fc);
+            }
+        }
         // Stills of an Adobe RGB sequence: a PNG, an AVIF and a HEIF each carry the profile and read back as Adobe RGB.
         {
             Project p = makeDefaultProject();
