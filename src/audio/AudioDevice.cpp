@@ -306,7 +306,7 @@ private:
             if (late && !wasLate) ++xruns_;
             wasLate = late;
             if (now > next + std::chrono::seconds(2)) next = now;
-            if (now < next) std::this_thread::sleep_until(next);
+            if (now < next) rtguard::sleepUntil(next);  // (on time: on Windows not to the system timer's next tick)
         }
     }
     // The delay line: a ring of delay_ frames (inputs_ channels), the oldest at ring_: read a block from there, and the

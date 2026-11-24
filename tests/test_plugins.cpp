@@ -4018,9 +4018,15 @@ private slots:
         while (!sounding.empty() && std::fabs(sounding.back()) < 1e-4f) sounding.pop_back();
         for (float v : sounding) energy += double(v) * v;
         const audiodev::EngineStatus st = e.status();
+        // (the longest silence inside the tone, where a gap would be: the sine is never silent two samples running)
+        size_t gap = 0, gapAt = 0;
+        for (size_t i = 0, run = 0; i < sounding.size(); ++i) {
+            run = std::fabs(sounding[i]) < 1e-6f ? run + 1 : 0;
+            if (run > gap) gap = run, gapAt = i + 1 - run;
+        }
         const auto told = [&](const QString& what) {
-            return QStringLiteral("%1 (%2 underruns, %3 xruns, %4 frames the feed was short)")
-                .arg(what).arg(st.underruns).arg(st.xruns).arg(f.starved());
+            return QStringLiteral("%1 (%2 underruns, %3 xruns, %4 frames the feed was short, longest silence %5 frames at %6)")
+                .arg(what).arg(st.underruns).arg(st.xruns).arg(f.starved()).arg(gap).arg(gapAt);
         };
         // A second of it at 48 kHz (the resampler's edges aside), at its pitch.
         QVERIFY2(std::llabs(int64_t(sounding.size()) - 48000) < 600, qPrintable(told(QString::number(sounding.size()))));

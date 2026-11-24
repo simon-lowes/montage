@@ -3,9 +3,11 @@
 #endif
 #include "RtGuard.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <new>
+#include <thread>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -149,6 +151,38 @@ void Wake::wait(int ms) noexcept {
     while (r != 0 && errno == EINTR);
     if (r == 0) d_->raised = false;
 }
+#endif
+
+// ---- sleepUntil.
+
+#if defined(_WIN32)
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+namespace {
+// One for each thread that sleeps on it (Windows 10 1803 and later; none before, and the tick is waited for then).
+struct HighResolutionTimer {
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    ~HighResolutionTimer() {
+        if (timer) CloseHandle(timer);
+    }
+};
+}  // namespace
+
+void sleepUntil(std::chrono::steady_clock::time_point when) noexcept {
+    const auto left = when - std::chrono::steady_clock::now();
+    if (left <= std::chrono::steady_clock::duration::zero()) return;
+    thread_local HighResolutionTimer t;
+    LARGE_INTEGER due;
+    due.QuadPart = -std::max<LONGLONG>(1, LONGLONG(std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() / 100));  // (from now, in 100 ns)
+    if (t.timer && SetWaitableTimer(t.timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(t.timer, INFINITE);
+        return;
+    }
+    std::this_thread::sleep_until(when);
+}
+#else
+void sleepUntil(std::chrono::steady_clock::time_point when) noexcept { std::this_thread::sleep_until(when); }
 #endif
 
 }  // namespace montage::rtguard

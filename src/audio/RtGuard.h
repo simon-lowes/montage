@@ -10,6 +10,7 @@
 // through here). On other systems nothing is seen and only the callbacks are counted; sees() says which.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 
 namespace montage::rtguard {
@@ -51,5 +52,10 @@ private:
     struct Impl;
     Impl* d_;
 };
+
+// Sleeps until `when`, as near it as the system wakes a thread: on Windows on a high-resolution waitable timer, where
+// std::this_thread::sleep_until ends on a tick of the system's timer (15.6 ms apart, unless a program has asked for
+// finer); elsewhere as std::this_thread::sleep_until.
+void sleepUntil(std::chrono::steady_clock::time_point when) noexcept;
 
 }  // namespace montage::rtguard
