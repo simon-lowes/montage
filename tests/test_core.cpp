@@ -40,6 +40,7 @@
 #include "core/Captions.h"
 #include "core/SdhCaptions.h"
 #include "core/Cea708.h"
+#include "CcFeed.h"
 #include "core/Teletext.h"
 #include "core/ColorWarp.h"
 #include "core/Bleep.h"
@@ -3843,6 +3844,88 @@ private slots:
         t.captions = caps;
         QVERIFY(captionFormatKnown(".mcc"));
         QCOMPARE(exportCaptions(t, *p.active(), ".mcc").substr(0, 26), std::string("File Format=MacCaption_MCC"));
+    }
+
+    void ccEveryServiceAndChannel() {
+        // A feed's four caption languages: 708 service 1 and 608 channel 1 with the same pop-on captions, 708 service 2
+        // and 608 channel 3 (field 2) with roll-up lines. Each is read on its own; built as shown, a roll-up line is
+        // in no caption before it is typed, and the line above it stays up.
+        const Rational fps{25, 1};
+        const int64_t frames = 400;
+        const std::vector<Caption> popOn = {{25, 75, "Pop one", {}}, {100, 150, "Pop two", {}}, {200, 250, "Pop three", {}}};
+        const std::vector<testcc::Line> two = {{30, "Dos uno"}, {90, "Dos dos"}, {150, "Dos tres"}};
+        const std::vector<testcc::Line> three = {{40, "Trois un"}, {100, "Trois deux"}, {160, "Trois trois"}};
+        const auto data = testcc::fourLanguages(popOn, two, three, fps, frames);
+        std::vector<std::pair<double, CcTriplet>> entries;
+        for (int64_t f = 0; f < frames; ++f) {
+            QVERIFY(data[size_t(f)].size() <= 31);
+            for (const CcTriplet& t : data[size_t(f)]) entries.push_back({double(f) / 25, t});
+        }
+        const std::vector<CcCaptionStream> streams = captionStreamsFromCc(entries, fps, true);
+        QStringList ids;
+        for (const CcCaptionStream& c : streams) ids << QString::fromStdString(c.id);
+        QCOMPARE(ids.join(','), QString("SERVICE1,SERVICE2,CC1,CC3"));
+        QCOMPARE(streams[0].service708, 1);
+        QCOMPARE(streams[3].channel608, 3);
+        for (int k : {0, 2}) {
+            QCOMPARE(streams[size_t(k)].captions.size(), popOn.size());
+            for (size_t i = 0; i < popOn.size(); ++i) {
+                QCOMPARE(streams[size_t(k)].captions[i].text, popOn[i].text);
+                QVERIFY2(std::llabs(streams[size_t(k)].captions[i].start - popOn[i].start) <= 2, qPrintable(ids[k]));
+            }
+        }
+        // Built line by line: a caption for each line as it begins, holding the line above it.
+        auto check = [&](const CcCaptionStream& c, const std::vector<testcc::Line>& lines, int64_t slack) {
+            QVERIFY2(c.captions.size() == lines.size(), qPrintable(QString::number(c.captions.size())));
+            for (size_t i = 0; i < lines.size(); ++i) {
+                const Caption& got = c.captions[i];
+                const std::string want = i == 0 ? lines[0].text : lines[i - 1].text + "\n" + lines[i].text;
+                QVERIFY2(got.text == want, qPrintable(QString("%1 caption %2: %3").arg(QString::fromStdString(c.id)).arg(i).arg(QString::fromStdString(got.text))));
+                QVERIFY2(got.start >= lines[i].frame && got.start <= lines[i].frame + slack,
+                         qPrintable(QString("%1 line %2 at %3").arg(QString::fromStdString(c.id)).arg(i).arg(got.start)));
+                if (i + 1 < lines.size()) QVERIFY(got.end == c.captions[i + 1].start);
+            }
+        };
+        check(streams[1], two, 1);
+        check(streams[3], three, 12);  // (field 2's pairs come about one a frame, after the control codes)
+        // Read as the text comes to be (files): the window's text in one caption from its first line, the second
+        // line already in it.
+        const std::vector<CcCaptionStream> whole = captionStreamsFromCc(entries, fps, false);
+        QCOMPARE(whole.size(), size_t(4));
+        QCOMPARE(whole[1].captions.front().text, std::string("Dos uno\nDos dos"));
+        QVERIFY(whole[1].captions.front().start <= 31);
+        // What files read is still service 1's pop-on captions.
+        std::vector<Caption> files;
+        QVERIFY(captionsFromCc(entries, fps, files));
+        QCOMPARE(files.size(), popOn.size());
+        QCOMPARE(files[1].text, popOn[1].text);
+        // Channel 2 on field 1: its control codes with bit 3 set, read apart from channel 1.
+        std::vector<std::pair<double, uint16_t>> pairs;
+        int64_t k = 0;
+        for (uint16_t w : {0x1c25, 0x1c25, 0x1c2d, 0x1c2d, 0x4869, 0x2121, 0x142c, 0x142c})
+            pairs.push_back({double(k++) / 30, w});
+        std::vector<Caption> ch2;
+        QVERIFY(captionsFrom608(pairs, {30, 1}, ch2, nullptr, 2, true));
+        QVERIFY(ch2.size() == 1 && ch2[0].text == "Hi!!");
+        QVERIFY(!captionsFrom608(pairs, {30, 1}, ch2, nullptr, 1, true));
+        // Every frame's caption data written to an MCC file as a recording keeps it (mccHeader, mccFrame), and read
+        // back whole: the same entries, and the same four languages.
+        std::string mcc = mccHeader(fps);
+        for (int64_t f = 0; f < frames; ++f) mcc += mccFrame(data[size_t(f)], fps, f);
+        std::vector<std::pair<double, CcTriplet>> back;
+        QVERIFY(mccCcData(mcc, fps, back));
+        QCOMPARE(back.size(), entries.size());
+        for (size_t i = 0; i < back.size(); ++i) {
+            QVERIFY(back[i].second == entries[i].second);
+            QVERIFY(std::fabs(back[i].first - entries[i].first) < 0.5 / 25);
+        }
+        const std::vector<CcCaptionStream> again = captionStreamsFromCc(back, fps, true);
+        QCOMPARE(again.size(), streams.size());
+        for (size_t i = 0; i < again.size(); ++i) {
+            QCOMPARE(again[i].id, streams[i].id);
+            QCOMPARE(again[i].captions.size(), streams[i].captions.size());
+            for (size_t j = 0; j < again[i].captions.size(); ++j) QCOMPARE(again[i].captions[j].text, streams[i].captions[j].text);
+        }
     }
 
     void teletextSubtitlePages() {

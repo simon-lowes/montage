@@ -100,6 +100,9 @@ struct CaptionTrack {
     bool visible = true;          // shown in the viewer, burned in when exporting with burn-in
     CaptionStyle style;
     std::vector<Caption> captions;  // sorted by start, never overlapping
+    // The caption format the track was made for, as an FCPXML caption role names it ("SRT", "ITT" or "CEA608"); ""
+    // none in particular.
+    std::string format;
     bool operator==(const CaptionTrack&) const = default;
 };
 
@@ -174,8 +177,12 @@ std::vector<Cc608Pair> captionsTo608(const std::vector<Caption>& captions, Ratio
 // Captions timed in a clip's media (frames at the sequence's rate) placed where the clip plays them on the timeline,
 // cut to the clip (trims, speed and reverse followed).
 std::vector<Caption> captionsThroughClip(const Clip& c, const std::vector<Caption>& source);
+// `channel`: the data channel of the pairs' field to read (1, or 2 when its control codes have bit 3 set: CC2 on field 1,
+// CC4 on field 2). With `building`, roll-up and paint-on captions are made as a viewer sees them build: a caption ends
+// as each line begins on screen and the next holds the lines up then and the new one (roll-up's whole window, not a
+// line alone).
 bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rational fps, std::vector<Caption>& out,
-                     std::string* error = nullptr);
+                     std::string* error = nullptr, int channel = 1, bool building = false);
 // Reads SCC: CEA-608 channel 1 pop-on, paint-on and roll-up captions (each
 // roll-up line becomes a caption, up until the next one).
 bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
