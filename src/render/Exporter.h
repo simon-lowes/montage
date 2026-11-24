@@ -64,7 +64,8 @@ struct ExportSettings {
     // H.264 and H.265 (x264, x265): a hypothetical reference decoder stated in the stream, as broadcast ingest checks
     // it (render/HrdCheck.h): "cbr" (a constant rate, filler data where the pictures need fewer bits), "vbr" (no more
     // than the rate, at the quality or bit rate asked), or empty (none stated). The HRD's rate is vbvMaxrate (0: the
-    // video bit rate), its buffer vbvBuffer bits (0: a second at the rate).
+    // video bit rate), its buffer vbvBuffer bits (0: a second at the rate). MPEG-2 always states its VBV: these set
+    // it (0 buffer: XDCAM HD422's), and empty is XDCAM HD422's own (exportMpeg2Vbv).
     std::string hrd;
     int64_t vbvMaxrate = 0;
     int64_t vbvBuffer = 0;
@@ -328,6 +329,19 @@ bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames);
 
 // An MPEG-2 (XDCAM HD422) export's GOP at `fps`: the one asked for, else 12 frames (15 at 30 and 60 frames a second).
 int exportMpeg2Gop(const ExportSettings& s, Rational fps);
+// The VBV an MPEG-2 export's sequence headers state, as the stream has it: its rate (bits/s, a whole number of 400s,
+// rounded up as the header counts it) and buffer (a whole number of 16,384 bits, rounded down, so the encoder keeps
+// to the buffer stated), and whether every picture's vbv_delay is set (a constant rate) or 0xFFFF (a variable one).
+// From `hrd` ("cbr", "vbr"; vbvMaxrate, else the video bit rate; vbvBuffer, else XDCAM HD422's 17,825,792 bits), and
+// without one XDCAM HD422's: a constant video bit rate (50 Mb/s when none) into that buffer. At a constant rate the
+// buffer is no more than a vbv_delay can wait for it to fill (just under 0.73 s at the rate), and one not stated is cut
+// to that. Not valid when the buffer is under one unit or over `most` (2,880 units, 47,185,920 bits, the largest any
+// profile and level allows, 4:2:2 at high level; less at a constant rate), or the rate is not above 0.
+struct Mpeg2Vbv {
+    bool valid = false, cbr = true;
+    int64_t rate = 0, buffer = 0, most = 0;
+};
+Mpeg2Vbv exportMpeg2Vbv(const ExportSettings& s);
 // The picture an export codes: the chosen size (or the sequence's), each eye's when a stereoscopic sequence's eyes are
 // packed side by side or one above the other, made even.
 void codedPictureSize(const Sequence& seq, const ExportSettings& s, int& width, int& height);

@@ -1309,11 +1309,20 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->gop_size = 1;
         } else if (c == "mpeg2video") {
             // XDCAM HD422: 4:2:2 MPEG-2 at a constant 50 Mb/s, a long GOP of 12 (15 at 30 and 60 frames a second), two
-            // B-frames, 10-bit DC precision, as Sony's discs and broadcasters' ingest expect.
-            const int64_t rate = s.videoBitrate > 0 ? s.videoBitrate : 50000000;
-            o.vctx->bit_rate = o.vctx->rc_min_rate = o.vctx->rc_max_rate = rate;
-            o.vctx->rc_buffer_size = 17825792;
-            o.vctx->rc_initial_buffer_occupancy = s.vbvInit > 0 ? int(std::clamp(s.vbvInit, 0.05, 1.0) * 17825792) : 17825792;
+            // B-frames, 10-bit DC precision, as Sony's discs and broadcasters' ingest expect. A stated VBV (`hrd`) sets
+            // the rate and buffer the sequence headers give: at a constant rate every picture's vbv_delay is set; at a
+            // variable one (0xFFFF) the rate is the most it may arrive at, the pictures coded under it.
+            const Mpeg2Vbv vbv = exportMpeg2Vbv(s);
+            if (!vbv.valid) {
+                av_dict_free(&opts);
+                return fail("An MPEG-2 VBV buffer is 16,384 to " + std::to_string(vbv.most) + " bits at this rate (" +
+                            std::to_string(vbv.buffer) + " asked), at a rate over 0");
+            }
+            o.vctx->rc_max_rate = vbv.rate;
+            o.vctx->rc_min_rate = vbv.cbr ? vbv.rate : 0;
+            o.vctx->bit_rate = vbv.cbr ? vbv.rate : std::min<int64_t>(s.videoBitrate > 0 ? s.videoBitrate : vbv.rate * 3 / 4, vbv.rate);
+            o.vctx->rc_buffer_size = int(vbv.buffer);
+            o.vctx->rc_initial_buffer_occupancy = s.vbvInit > 0 ? int(std::clamp(s.vbvInit, 0.05, 1.0) * double(vbv.buffer)) : int(vbv.buffer);
             o.vctx->gop_size = exportMpeg2Gop(s, dseq.fps);
             o.vctx->max_b_frames = 2;
             o.vctx->intra_dc_precision = 2;
@@ -3257,6 +3266,23 @@ bool exportInTwoPasses(const Project& p, const Sequence& seq, const ExportSettin
 }  // namespace
 
 int exportMpeg2Gop(const ExportSettings& s, Rational fps) { return s.gop > 0 ? s.gop : std::lround(fps.toDouble()) % 25 == 0 ? 12 : 15; }
+
+Mpeg2Vbv exportMpeg2Vbv(const ExportSettings& s) {
+    constexpr int64_t kXdcamBuffer = 17825792, kUnit = 16384;
+    Mpeg2Vbv v;
+    const bool stated = s.hrd == "cbr" || s.hrd == "vbr";
+    v.cbr = s.hrd != "vbr";
+    const int64_t rate = stated && s.vbvMaxrate > 0 ? s.vbvMaxrate : s.videoBitrate > 0 ? s.videoBitrate : 50000000;
+    const int64_t buffer = stated && s.vbvBuffer > 0 ? s.vbvBuffer : kXdcamBuffer;
+    v.rate = (rate + 399) / 400 * 400;
+    // (at a constant rate a picture's vbv_delay, 16 bits of a 90 kHz clock below 0xFFFF, must reach a full buffer:
+    // FFmpeg's encoder writes 0xFFFF, a variable rate's mark, into every picture of a longer one)
+    v.most = 2880 * kUnit;
+    if (v.cbr && v.rate > 0) v.most = std::min<int64_t>(v.most, (v.rate * 0xFFFF / 90000 + 1) / kUnit * kUnit);
+    v.buffer = (stated && s.vbvBuffer > 0 ? buffer : std::min(buffer, v.most)) / kUnit * kUnit;
+    v.valid = rate > 0 && v.buffer >= kUnit && v.buffer <= v.most;
+    return v;
+}
 
 void codedPictureSize(const Sequence& seq, const ExportSettings& s, int& W, int& H) {
     StereoView view = StereoView::Left;

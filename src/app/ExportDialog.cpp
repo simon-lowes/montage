@@ -57,9 +57,10 @@ const QString kSettingsPreset = QStringLiteral("export/preset");
 bool hasVideo(const ExportSettings& s) { return !s.videoCodec.empty() && s.videoCodec != "none"; }
 bool hasAudio(const ExportSettings& s) { return !s.audioCodec.empty() && s.audioCodec != "none"; }
 
-// Whether an export's video can state an HRD: x264's and x265's (not AVC-Intra, whose class fixes its rate).
+// Whether an export's video can state an HRD: x264's and x265's (not AVC-Intra, whose class fixes its rate), and
+// MPEG-2's VBV (which it always states: the row sets it).
 bool statesHrd(const ExportSettings& s) {
-    return (s.videoCodec == "libx264" || s.videoCodec == "libx265") && s.profile != "avci100";
+    return ((s.videoCodec == "libx264" || s.videoCodec == "libx265") && s.profile != "avci100") || s.videoCodec == "mpeg2video";
 }
 
 bool usesCrf(const std::string& codec) {
@@ -219,9 +220,9 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     hrd_->addItem(tr("Not stated"), QString());
     hrd_->addItem(tr("Constant bit rate (CBR)"), QStringLiteral("cbr"));
     hrd_->addItem(tr("Variable bit rate (VBR)"), QStringLiteral("vbr"));
-    hrd_->setToolTip(tr("States a buffer model (HRD) in H.264 or H.265 video, as broadcast ingest checks it. Constant: exactly this "
-                        "rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set "
-                        "above. The export is checked against it when it is written."));
+    hrd_->setToolTip(tr("States a buffer model (HRD) in H.264 or H.265 video, or sets MPEG-2's (its VBV), as broadcast ingest checks "
+                        "it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this "
+                        "rate, at the quality set above. The export is checked against it when it is written."));
     hrdRate_ = new QSpinBox(form_);
     hrdRate_->setObjectName(QStringLiteral("exportHrdRate"));
     hrdRate_->setRange(100, 800000);
@@ -977,6 +978,10 @@ void ExportDialog::updateControls() {
         const bool states = p && statesHrd(p->settings);
         const QString mode = states ? hrd_->currentData().toString() : QString();
         hrd_->setEnabled(states);
+        // (MPEG-2 always states a VBV: without one set, XDCAM HD422's)
+        const bool mpeg2 = p && p->settings.videoCodec == "mpeg2video";
+        hrd_->setItemText(0, mpeg2 ? tr("XDCAM HD422's own") : tr("Not stated"));
+        hrdBuffer_->setSpecialValueText(mpeg2 ? tr("XDCAM HD422's buffer") : tr("A second's buffer"));
         hrdRate_->setEnabled(!mode.isEmpty());
         hrdBuffer_->setEnabled(!mode.isEmpty());
         quality_->setEnabled(p && usesCrf(p->settings.videoCodec) && mode != QLatin1String("cbr"));
@@ -1114,7 +1119,20 @@ void ExportDialog::updateSummary() {
         const QString hrdMode = statesHrd(s) ? hrd_->currentData().toString() : QString();
         if (usesCrf(s.videoCodec) && hrdMode != QLatin1String("cbr"))
             line += (s.videoCodec == "liboapv" ? tr(", QP %1") : tr(", CRF %1")).arg(quality_->value());
-        if (!hrdMode.isEmpty()) {
+        if (s.videoCodec == "mpeg2video") {
+            // The VBV its sequence headers will state, as they count it (exportMpeg2Vbv).
+            ExportSettings stated = s;
+            stated.hrd = hrdMode.toStdString();
+            stated.vbvMaxrate = int64_t(hrdRate_->value()) * 1000;
+            stated.vbvBuffer = int64_t(hrdBuffer_->value()) * 1000;
+            const Mpeg2Vbv vbv = exportMpeg2Vbv(stated);
+            const QString rate = QString::number(double(vbv.rate) / 1000, 'f', vbv.rate % 1000 ? 1 : 0);
+            const QString buffer = QString::number(double(vbv.buffer) / 1000, 'f', 0);
+            if (!vbv.valid) line += tr(", a VBV buffer MPEG-2 cannot state at this rate (16 to %1 kbit)").arg(vbv.most / 1000);
+            else
+                line += (vbv.cbr ? tr(", a constant %1 kbit/s with its VBV stated (%2 kbit)") : tr(", no more than %1 kbit/s with its VBV stated (%2 kbit)"))
+                            .arg(rate, buffer);
+        } else if (!hrdMode.isEmpty()) {
             const int buffer = hrdBuffer_->value() > 0 ? hrdBuffer_->value() : hrdRate_->value();
             line += (hrdMode == QLatin1String("cbr") ? tr(", a constant %1 kbit/s with its buffer model stated (%2 kbit)")
                                                      : tr(", no more than %1 kbit/s with its buffer model stated (%2 kbit)"))

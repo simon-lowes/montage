@@ -6431,6 +6431,104 @@ private slots:
         QVERIFY2(std::fabs(report.bitRate - 1200000) < 12000 && std::fabs(report.bufferBits - 1200000) < 12000, report.summary().c_str());
     }
 
+    void exportDialogMpeg2Vbv() {
+        // The Export dialog's HRD row sets MPEG-2's VBV: XDCAM HD422's own (a constant 50 Mb/s into 17,825,792 bits)
+        // until asked, else a constant or a variable rate into a buffer. The row states the rate and buffer as the
+        // sequence headers will (a buffer a whole number of 16,384 bits), and the buffer check of the file written finds
+        // the same, with every picture kept to it.
+        loadDemo();
+        RenderQueue* queue = win_->renderQueue();
+        const size_t before = queue->jobs().size();
+        const QVariant remembered = appSettings().value("export/preset");
+        auto putBack = qScopeGuard([&] {
+            appSettings().remove("export/hrd");
+            appSettings().remove("export/hrdRate");
+            appSettings().remove("export/hrdBuffer");
+            if (remembered.isValid()) appSettings().setValue("export/preset", remembered);
+            else appSettings().remove("export/preset");
+        });
+        int xdcam = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i)
+            if (exportPresets()[i].settings.videoCodec == "mpeg2video") xdcam = int(i);
+        QVERIFY(xdcam >= 0);
+        auto queued = [&](const char* mode, int rateKbit, int bufferKbit, const QString& stated, const QString& file, ExportSettings* out) {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* hrd = ed.findChild<QComboBox*>("exportHrd");
+            auto* rate = ed.findChild<QSpinBox*>("exportHrdRate");
+            auto* buffer = ed.findChild<QSpinBox*>("exportHrdBuffer");
+            QVERIFY(hrd && rate && buffer);
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(xdcam);
+            QVERIFY(hrd->isEnabled());
+            QCOMPARE(hrd->itemText(0), QStringLiteral("XDCAM HD422's own"));
+            hrd->setCurrentIndex(hrd->findData(QString::fromLatin1(mode)));
+            QCOMPARE(rate->isEnabled(), QByteArray(mode) != "");
+            rate->setValue(rateKbit);
+            buffer->setValue(bufferKbit);
+            const QString summary = ed.findChild<QLabel*>("exportSummary")->text();
+            QVERIFY2(summary.contains(stated), qPrintable(summary));
+            ed.findChild<QLineEdit*>("exportPath")->setText(file);
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(ed.result(), int(QDialog::Accepted));
+            QCOMPARE(queue->jobs().size(), before + 1);
+            *out = queue->jobs().back().settings;
+            queue->remove(queue->jobs().back().id);
+        };
+        // Rendered small and short; the buffer check finds what the row stated, and every picture keeps to it.
+        auto rendered = [&](ExportSettings s, bool cbr, double rate, double buffer) {
+            s.width = 320, s.height = 180;
+            s.in = 0, s.out = 50;
+            s.path = QFileInfo(QString::fromStdString(s.path)).dir().filePath(QFileInfo(QString::fromStdString(s.path)).completeBaseName() + ".mov").toStdString();
+            std::string err;
+            QVERIFY2(renderExport(state()->project(), state()->sequence()->id, s, 0, {}, nullptr, &err), err.c_str());
+            const HrdReport r = checkHrd(s.path);
+            QVERIFY2(r.checked && r.signalled && r.codec == "MPEG-2" && r.model == "VBV", r.summary().c_str());
+            QCOMPARE(r.cbr, cbr);
+            QCOMPARE(r.bitRate, rate);
+            QCOMPARE(r.bufferBits, buffer);
+            QVERIFY2(r.conforms(), (r.summary() + " " + (r.issues.empty() ? std::string() : r.issues.front().text)).c_str());
+        };
+        // XDCAM HD422's own, as before.
+        ExportSettings own;
+        queued("", 8000, 0, QStringLiteral("a constant 50000 kbit/s with its VBV stated (17826 kbit)"), dir_.path() + "/vbv-own.mxf", &own);
+        if (QTest::currentTestFailed()) return;
+        QCOMPARE(own.hrd, std::string());
+        // A variable rate of no more than 20 Mb/s into a 9,000 kbit buffer: 549 units of 16,384 bits.
+        ExportSettings vbr;
+        queued("vbr", 20000, 9000, QStringLiteral("no more than 20000 kbit/s with its VBV stated (8995 kbit)"), dir_.path() + "/vbv-vbr.mxf", &vbr);
+        if (QTest::currentTestFailed()) return;
+        QCOMPARE(vbr.hrd, std::string("vbr"));
+        QCOMPARE(vbr.vbvMaxrate, int64_t(20000000));
+        QCOMPARE(vbr.vbvBuffer, int64_t(9000000));
+        rendered(vbr, false, 20000000, 549 * 16384);
+        if (QTest::currentTestFailed()) return;
+        // A constant 8 Mb/s: XDCAM HD422's buffer would take 2.2 s to fill, longer than a vbv_delay can say, so the
+        // buffer is cut to the 355 units that fill in 0.73 s.
+        ExportSettings cbr;
+        queued("cbr", 8000, 0, QStringLiteral("a constant 8000 kbit/s with its VBV stated (5816 kbit)"), dir_.path() + "/vbv-cbr.mxf", &cbr);
+        if (QTest::currentTestFailed()) return;
+        rendered(cbr, true, 8000000, 355 * 16384);
+        if (QTest::currentTestFailed()) return;
+        // A buffer asked for that a constant 8 Mb/s cannot state is said to be one, and the export refuses it.
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(xdcam);
+            auto* hrd = ed.findChild<QComboBox*>("exportHrd");
+            hrd->setCurrentIndex(hrd->findData(QStringLiteral("cbr")));
+            ed.findChild<QSpinBox*>("exportHrdRate")->setValue(8000);
+            ed.findChild<QSpinBox*>("exportHrdBuffer")->setValue(9000);
+            const QString summary = ed.findChild<QLabel*>("exportSummary")->text();
+            QVERIFY2(summary.contains(QStringLiteral("a VBV buffer MPEG-2 cannot state at this rate (16 to 5816 kbit)")), qPrintable(summary));
+        }
+        ExportSettings tooLong = cbr;
+        tooLong.vbvBuffer = 9000000;
+        tooLong.path = (dir_.path() + "/vbv-too-long.mov").toStdString();
+        std::string err;
+        QVERIFY(!renderExport(state()->project(), state()->sequence()->id, tooLong, 0, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("16,384 to 5816320 bits at this rate"), err.c_str());
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(tooLong.path)));
+    }
+
     void dialogTaskHelper() {
         // Does nothing by itself. The tests of background tasks run this binary again with this as its only test, to
         // have a task begun, or taken up, in a process of its own that can be killed.
