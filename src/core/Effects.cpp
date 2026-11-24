@@ -738,7 +738,9 @@ std::vector<EffectInfo> buildCatalog() {
                   num("ground_y", "Ground Height (y)", -100000, 100000, 0, 0.01),
                   pct("ground_strength", "Ground Shadow Strength", 0, 100, 80),
                   boolean("depth_of_field", "Depth of Field (through the scene's camera: the Camera clip's)", false),
-                  num("focus_distance", "Focus Distance (0: the card's middle)", 0, 10000000, 0, 0.01),
+                  num("focus_distance", "Focus Distance (0: the scene's middle depth)", 0, 10000000, 0, 0.01),
+                  // (off in projects saved before it: Focus Distance 0 is the card's own middle there)
+                  boolean("focus_scene", "Focus Distance 0 Focuses on the Scene", true),
                   num("fstop", "F-Stop", 0.7, 64, 2.8, 0.1),
                   num("units_m", "Scene Units a Metre (0: 1000 for its own or the scene's camera, else 1)", 0, 1000000, 0, 0.001)},
                  {str("camera_file", "Take The Camera From (USD, glTF)", StringKind::File)}});
@@ -1384,6 +1386,17 @@ std::vector<EffectInfo> buildCatalog() {
                                num("anim_out_dur", "Out Duration (s)", 0.05, 10, 0.8, 0.05),
                                num("camera_index", "The File's Camera Number", 1, 999, 1, 1),
                                num("units", "Size in the File's Scene (px a unit)", 0.001, 100000, 100, 0.1),
+                               // Letters that move blurred as they move, each letter on its own: renders through the
+                               // shutter (degrees of a frame, centred on it) averaged; letters that do not move are
+                               // drawn once.
+                               boolean("letter_blur", "Motion Blur"),
+                               num("letter_shutter", "Shutter Angle (°)", 0, 720, 180, 1),
+                               num("letter_samples", "Motion Blur Samples", 2, 64, 16, 1),
+                               // With cards or models seen through their own camera or the scene's on screen: drawn
+                               // in their scene, by depth with them, lit as they are and shadowing them (off in
+                               // projects saved before it: there the title floats over them as it did).
+                               boolean("in_scene", "Stand in the 3D Layers' Scene", true),
+                               boolean("shadows", "Cast Shadows (in the 3D layers' scene)", true),
                            },
                            {str("text", "Text", StringKind::MultilineText, "3D Title"),
                             str("font", "Font", StringKind::Font, "Sans Serif"),

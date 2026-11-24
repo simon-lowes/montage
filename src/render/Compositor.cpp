@@ -2506,7 +2506,7 @@ bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     const bool model = c.isGenerator() && c.generator.type == "model3d";  // (already in 3D: a 3D Layer does nothing to it)
     const bool deep = enabledEffect(seq, c, "make_deep") || (!model && enabledEffect(seq, c, "layer_3d")) ||
                       (c.isGenerator() && c.generator.type == "model3d" && c.generator.p("depth_merge", t - c.start, 0) > 0.5) ||
-                      !clipDeepFile(p, seq, c, t).empty();
+                      !clipDeepFile(p, seq, c, t).empty() || title3dInScene(seq, c, t);
     if (flattened) *flattened = deep && enabledEffect(seq, c, "flatten_deep");
     return deep;
 }
@@ -2572,6 +2572,25 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
                                       modelLayerAt(p, seq, o), !o.highQuality);
         if (!error.empty() && o.issues) o.issues->note(error);
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        intoWorking(layer, rec709Space(), seq, true);
+        f = throughTransform(deepFromFlat(layer.px.data(), W, H, depth.data(), 0), g.opacity);
+    } else if (c.isGenerator() && c.generator.type == "title3d" && !enabledEffect(seq, c, "make_deep") && title3dInScene(seq, c, t)) {
+        // A 3D title standing in the 3D layers' scene: its letters at their depths, through the clip's transform and
+        // opacity.
+        std::vector<float> depth;
+        Geometry g;
+        if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
+        Image layer = renderTitle3DInScene(p, seq, c, t, W, H, double(W) / seq.width, &depth);
+        if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        // (into Rec.709 as a model's picture is, straight then premultiplied again, then into the working space)
+        parallelRows(layer.height, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < layer.width; ++x) {
+                    float* q = layer.at(x, y);
+                    if (q[3] <= 0) continue;
+                    for (int k = 0; k < 3; ++k) q[k] = float(fromLinear(Transfer::Bt1886, std::max(0.0, double(q[k] / q[3])))) * q[3];
+                }
+        });
         intoWorking(layer, rec709Space(), seq, true);
         f = throughTransform(deepFromFlat(layer.px.data(), W, H, depth.data(), 0), g.opacity);
     } else if (const Effect* l3 = enabledEffect(seq, c, "layer_3d")) {

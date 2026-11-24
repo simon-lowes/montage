@@ -10,6 +10,9 @@
 
 #include "core/Model.h"
 #include "media/Image.h"
+#include "media/Model3D.h"
+
+#include <memory>
 
 namespace montage {
 
@@ -23,5 +26,22 @@ struct Title3DPictures {
 // `scale` output pixels per sequence pixel.
 Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps,
                     const Title3DPictures* pictures = nullptr);
+
+// How many letter solids 3D titles have drawn into a raster since the program started (for tests: a still letter is
+// drawn once under motion blur, a moving one once a sample).
+uint64_t title3dSolidsDrawn();
+
+// A 3D title at time t (clip frames) as triangles in the 3D layers' scene seen through its own camera (the frame at
+// z = 0 about its middle, a unit a sequence pixel, y up, the camera on +z): its letters' faces (cut into triangles,
+// the outline's corners among theirs) and sides, each corner coloured as the title paints it there (linear light; a
+// track's picture is not taken), in one material lit by the scene. False when nothing of it shows, or for a title seen
+// through a camera in a file.
+struct Title3DMesh {
+    PosedTriangles triangles;
+    std::shared_ptr<const Model> model;  // its material
+    std::vector<int> letterOf;           // each triangle's letter solid (in the title's order)
+    double opacity = 1;
+};
+bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, FrameTime duration, double fps, Title3DMesh& out);
 
 }  // namespace montage

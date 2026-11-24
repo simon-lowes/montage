@@ -1713,10 +1713,10 @@ void applyTitleStyleSpans(Effect& g, const std::vector<std::pair<QString, std::o
 // ---------------------------------------------------------------------------
 // Text animations
 
-double textSelection(const Effect& g, int k, FrameTime t, double fps, FrameTime duration, int i, int n) {
+double textSelection(const Effect& g, int k, double t, double fps, FrameTime duration, int i, int n) {
     fps = fps > 0 ? fps : 30;
-    const double remaining = duration > 0 ? double(duration - 1 - t) / fps : 1e9;
-    return selection(readAnimator(g, k, t), double(t) / fps, remaining, i, n);
+    const double remaining = duration > 0 ? (double(duration - 1) - t) / fps : 1e9;
+    return selection(readAnimator(g, k, t), t / fps, remaining, i, n);
 }
 
 namespace {
@@ -2077,7 +2077,7 @@ Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, Frame
     return drawScene(g, t, s, w, h, scale, nullptr, QRect(0, 0, w, h));
 }
 
-std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing,
+std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, double t, double px, double defaultSize, double lineSpacing,
                                                 const QString& defaultText, int& letters, int& solids, int& words, int& nLines) {
     const std::vector<TextRun> runs = parseTextRuns(g.s("runs"));
     const QString text = QString::fromStdString(g.s("text", defaultText.toStdString()));
@@ -2085,7 +2085,7 @@ std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, do
     const std::vector<LineLayout> lines = layoutText(text.split('\n'), styles, g, double(t), px, defaultSize);
     double blockW = 0;
     for (const LineLayout& l : lines) blockW = std::max(blockW, l.width);
-    const int align = int(std::lround(g.p("align", t, 1)));
+    const int align = int(std::lround(g.pAt("align", t, 1)));
     std::vector<TitleCharOutline> out;
     letters = solids = words = 0;
     nLines = int(lines.size());
@@ -2113,7 +2113,7 @@ std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, do
     return out;
 }
 
-QPainterPath styledTextOutline(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing) {
+QPainterPath styledTextOutline(const Effect& g, double t, double px, double defaultSize, double lineSpacing) {
     const std::vector<TextRun> runs = parseTextRuns(g.s("runs"));
     if (runs.empty()) return {};
     const QString text = QString::fromStdString(g.s("text", "3D Title"));
@@ -2122,7 +2122,7 @@ QPainterPath styledTextOutline(const Effect& g, FrameTime t, double px, double d
     const std::vector<LineLayout> lines = layoutText(text.split('\n'), styles, g, t, px, defaultSize);
     double blockW = 0;
     for (const LineLayout& l : lines) blockW = std::max(blockW, l.width);
-    const int align = int(std::lround(g.p("align", t, 1)));
+    const int align = int(std::lround(g.pAt("align", t, 1)));
     QPainterPath out;
     out.setFillRule(Qt::WindingFill);
     double y = 0;

@@ -216,6 +216,7 @@
 #include "media/Usd.h"
 #include "core/Zip.h"
 #include "render/Layer3D.h"
+#include "render/Title3D.h"
 #include "render/ShapeLayers.h"
 #include "render/Shapes.h"
 #include "render/ModelClip.h"
@@ -21411,6 +21412,145 @@ if __name__ == '__main__':
         QVERIFY(after.back() > after.front() + 0.01);
     }
 
+    void motionBlurFollowsTheEdit() {
+        // Footage of a white bar 16 px wide moving 8 px a source frame, kept by ProRes 422 HQ.
+        std::string err;
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+        Clip bg = makeGeneratorClip(gen, "color", 40);
+        bg.generator.params["color.r"] = bg.generator.params["color.g"] = bg.generator.params["color.b"] = Param(0.0);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, bg);
+        Clip bar = makeGeneratorClip(gen, "shape", 40);
+        bar.generator.params["width"] = Param(16.0);
+        bar.generator.params["height"] = Param(60.0);
+        bar.generator.params["fill_color.r"] = bar.generator.params["fill_color.g"] = bar.generator.params["fill_color.b"] = Param(1.0);
+        bar.generator.params["pos_x"].addKey(0, -156.0);
+        bar.generator.params["pos_x"].addKey(39, 156.0);
+        edit::overwrite(gen, gs, {TrackKind::Video, 1}, bar);
+        ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
+        st.path = path("moving-bar.mov");
+        st.audioCodec = "none";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        Clip& c = s.videoTracks[0].clips.at(0);
+        c.duration = 40;
+        // How long the smear is: from the spread of the light along the bar's middle row, less the bar's own.
+        auto spread = [](const Image& img) {
+            double sum = 0, mean = 0, var = 0;
+            for (int x = 0; x < img.width; ++x) sum += img.at(x, 90)[1], mean += x * img.at(x, 90)[1];
+            mean /= sum;
+            for (int x = 0; x < img.width; ++x) var += (x - mean) * (x - mean) * img.at(x, 90)[1];
+            return var / sum;
+        };
+        Effect mb = makeEffect(p, "motion_blur");
+        mb.params["shutter"] = Param(720.0);
+        auto smear = [&](FrameTime t) {
+            c.effects.clear();
+            const double sharp = spread(renderSequenceFrame(p, s, t, {}));
+            c.effects.push_back(mb);
+            const double blurred = spread(renderSequenceFrame(p, s, t, {}));
+            return std::sqrt(std::max(0.0, 12 * (blurred - sharp)));
+        };
+        // At its own speed a 720 degree shutter smears it over two source frames, 16 px.
+        const double normal = smear(20);
+        // At 400 % it is blurred over the eight source frames the shutter spans, four times as long.
+        c.speed = 4;
+        c.duration = 9;
+        const double fast = smear(5);
+        // At 25 % with Optical Flow, a quarter as long (over half a source frame, between the frames it is made from).
+        c.speed = 0.25;
+        c.duration = 150;
+        c.timing.params["sampling"] = Param(2.0);
+        const double slow = smear(81);
+        qInfo("footage motion blur: %.2f px at 100 %%, %.2f at 400 %%, %.2f at 25 %%", normal, fast, slow);
+        QVERIFY2(std::abs(normal - 16) < 1.6, qPrintable(QString::number(normal)));
+        QVERIFY2(std::abs(fast / normal - 4) < 0.4, qPrintable(QString::number(fast / normal)));
+        QVERIFY2(std::abs(slow / normal - 0.25) < 0.025, qPrintable(QString::number(slow / normal)));
+        // A frame held (Time Remapping at 0 %) is not blurred at all.
+        c.speed = 1;
+        c.duration = 40;
+        c.timing.params["sampling"] = Param(0.0);
+        c.timing.params["speed"] = Param(0.0);
+        c.effects.clear();
+        const Image held = renderSequenceFrame(p, s, 20, {});
+        c.effects.push_back(mb);
+        QVERIFY(renderSequenceFrame(p, s, 20, {}).px == held.px);
+        // At its own speed and a 180 degree shutter, Motion Blur is what it always was: the frames either side, a
+        // quarter of the way to each.
+        c.timing.params["speed"] = Param(100.0);
+        mb.params["shutter"] = Param(180.0);
+        const double quarter = smear(20);
+        QVERIFY2(std::abs(quarter - 4) < 0.8, qPrintable(QString::number(quarter)));
+        // Every motion blur off (an export for a VFX pull): as sharp as without the effect.
+        RenderOptions off;
+        off.motionBlur = false;
+        c.effects.clear();
+        const Image sharp = renderSequenceFrame(p, s, 20, {});
+        c.effects.push_back(mb);
+        QVERIFY(renderSequenceFrame(p, s, 20, off).px == sharp.px);
+    }
+
+    void motionBlurAndFocusInProjectsSavedBefore() {
+        // A project as a build before 24 November wrote it (the fixture): no shutter of its own, a box keyed to move
+        // 400 px over ten frames, a 3D title whose middle letter a text animation spins, and two cards seen through the
+        // scene's camera, the near one with its depth of field on at Focus Distance 0. Opened, the sequence's shutter is
+        // 180 degrees and none of the new settings are there, and its frames render byte for byte as they do with the
+        // transform's Motion Blur, the letters' Motion Blur and the scene focus set off by hand (the card focused on its
+        // own middle, as it was); with the scene focus on, the card would look different.
+        const QString fixturePath = QString(MONTAGE_TEST_DATA_DIR) + "/projects/blur-and-focus-before-24-nov.montage";
+        Project opened;
+        std::string err;
+        QVERIFY2(loadProject(fixturePath.toStdString(), opened, &err), err.c_str());
+        Sequence& os = *opened.active();
+        QCOMPARE(os.shutterAngle, 180.0);
+        QCOMPARE(int(os.videoTracks.size()), 5);
+        Clip& box = os.videoTracks[3].clips.at(0);
+        Clip& title = os.videoTracks[4].clips.at(0);
+        Clip& card = os.videoTracks[0].clips.at(0);
+        QVERIFY(box.motion.params.count("pos_x") && !box.motion.params.count("motion_blur"));
+        QCOMPARE(title.generator.type, std::string("title3d"));
+        QVERIFY(!title.generator.params.count("letter_blur"));
+        QVERIFY(card.effects.at(0).params.count("depth_of_field") && !card.effects[0].params.count("focus_scene"));
+        Project off = opened;
+        {
+            Sequence& s = *off.active();
+            s.videoTracks[3].clips[0].motion.params["motion_blur"] = Param(0.0);
+            s.videoTracks[4].clips[0].generator.params["letter_blur"] = Param(0.0);
+            s.videoTracks[0].clips[0].effects[0].params["focus_scene"] = Param(0.0);
+        }
+        RenderOptions o;
+        for (FrameTime t : {FrameTime(0), FrameTime(4), FrameTime(9)}) {
+            const Image a = renderSequenceFrame(opened, os, t, o), b = renderSequenceFrame(off, *off.active(), t, o);
+            QVERIFY2(a.px == b.px, qPrintable(QString("frame %1").arg(t)));
+        }
+        Project focused = opened;
+        focused.active()->videoTracks[0].clips[0].effects[0].params["focus_scene"] = Param(1.0);
+        QVERIFY(renderSequenceFrame(focused, *focused.active(), 0, o).px != renderSequenceFrame(opened, os, 0, o).px);
+        // Saved now, it still has no shutter of its own written, and opened again it renders the same.
+        const std::string json = projectToJson(opened);
+        QVERIFY(json.find("shutterAngle") == std::string::npos);
+        Project again;
+        QVERIFY2(projectFromJson(json, again, &err), err.c_str());
+        QVERIFY(renderSequenceFrame(again, *again.active(), 4, o).px == renderSequenceFrame(opened, os, 4, o).px);
+        // A sequence's own shutter is kept, and transforms and Motion Blurs made in it take it.
+        os.shutterAngle = 90;
+        Project kept;
+        QVERIFY2(projectFromJson(projectToJson(opened), kept, &err), err.c_str());
+        QCOMPARE(kept.active()->shutterAngle, 90.0);
+        QCOMPARE(makeEffect(kept, "transform").p("shutter", 0), 90.0);
+        QCOMPARE(makeEffect(kept, "motion_blur").p("shutter", 0), 90.0);
+        QCOMPARE(makeEffect(kept, "title").p("letter_shutter", 0), 90.0);
+        QCOMPARE(makeEffect(kept, "title3d").p("letter_shutter", 0), 90.0);
+        QVERIFY(makeEffect(kept, "transform").p("motion_blur", 0) < 0.5);  // (off until it is turned on)
+    }
+
     void videoNoiseReductionOnFootage() {
         // Grainy footage: a flat colour with fresh film grain on every frame, kept by ProRes 422 HQ.
         Project gen = makeDefaultProject();
@@ -41643,6 +41783,200 @@ private slots:
                     QVERIFY(stage.readAsset(tex->attribute("inputs:file")->value.text(0), bytes) && bytes == c[0].pictures[0].second);
                 }
             }
+        }
+    }
+
+    void titlesInTheScene() {
+        const int W = 320, H = 180;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 4) edit::addTrack(p, s, TrackKind::Video);
+        RenderOptions o;
+        auto maxDiff = [](const Image& a, const Image& b) {
+            float d = a.width == b.width && a.height == b.height ? 0.0f : 1e9f;
+            for (size_t i = 0; d < 1e9f && i < a.px.size(); ++i) d = std::max(d, std::fabs(a.px[i] - b.px[i]));
+            return d;
+        };
+        // A card of one colour through its own camera (a pixel a unit about the frame, a millimetre a unit), its picture
+        // `scale` % of the frame, `ahead` units in front of the camera.
+        auto card = [&](double scale, double ahead, double r, double g, double b) {
+            Clip c;
+            c.id = p.newId();
+            c.duration = 10;
+            c.generator = makeEffect(p, "color");
+            c.generator.params["color.r"] = r, c.generator.params["color.g"] = g, c.generator.params["color.b"] = b;
+            c.motion.params["scale"] = scale;
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 0.0;
+            c.effects.push_back(e);
+            ModelCamera cam;
+            std::string err;
+            if (!effectCamera(p, s, c, c.effects[0], 0, 1, cam, &err)) qFatal("%s", err.c_str());
+            c.effects[0].params["pos_z"] = cam.C[2] - ahead;
+            return c;
+        };
+
+        // ---- A card with its own depth of field and Focus Distance 0 in a scene of cards at 2 and 6 m focuses at
+        // their median, 4 m: as it does with its focus set to 4 m, not as at its own middle (where it is sharp).
+        {
+            Clip near = card(30, 2000, 1, 1, 1);
+            near.effects[0].params["depth_of_field"] = 1.0;
+            near.effects[0].params["fstop"] = 1.4;
+            const Clip far = card(100, 6000, 0.2, 0.3, 0.8);
+            s.videoTracks[0].clips = {far};
+            s.videoTracks[1].clips = {near};
+            const Image median = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips[0].effects[0].params["focus_distance"] = 4000.0;
+            const Image four = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips[0].effects[0].params["focus_distance"] = 2000.0;
+            const Image own = renderSequenceFrame(p, s, 3, o);
+            QCOMPARE(maxDiff(median, four), 0.0f);
+            QVERIFY2(maxDiff(median, own) > 0.1f, "blurred, not focused on itself");
+            // Alone, it focuses on its own middle (as before).
+            s.videoTracks[0].clips.clear();
+            const Image alone = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips[0].effects[0].params["focus_distance"] = 0.0;
+            QCOMPARE(maxDiff(renderSequenceFrame(p, s, 3, o), alone), 0.0f);
+            for (Track& t : s.videoTracks) t.clips.clear();
+        }
+
+        // A 3D title "I" (100 px, 20 px deep, square on), lit by a light from -20 degrees, 20 up.
+        bool sceneByDefault = true;  // (a new 3D title stands in the scene)
+        auto title = [&](bool inScene) {
+            Clip c = makeGeneratorClip(p, "title3d", 10);
+            Effect& g = c.generator;
+            g.strings["text"] = "I";
+            g.strings["font"] = "DejaVu Sans";
+            g.params["size"] = Param(100.0), g.params["depth"] = Param(20.0);
+            g.params["rot_x"] = Param(0.0), g.params["rot_y"] = Param(0.0);
+            g.params["light_angle"] = Param(-20.0), g.params["light_height"] = Param(20.0);
+            g.params["color.r"] = Param(0.2), g.params["color.g"] = Param(0.9), g.params["color.b"] = Param(0.3);
+            g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.9), g.params["side_color.b"] = Param(0.3);
+            sceneByDefault = sceneByDefault && g.p("in_scene", 0) == 1.0;
+            g.params["in_scene"] = Param(inScene ? 1.0 : 0.0);
+            return c;
+        };
+        ModelCamera front;
+        {
+            const Clip probe = card(100, 1000, 1, 1, 1);
+            std::string err;
+            QVERIFY(effectCamera(p, s, probe, probe.effects[0], 0, 1, front, &err));
+        }
+        // ---- Alone it renders byte for byte as it did, In the 3D Scene on or off.
+        {
+            s.videoTracks[1].clips = {title(true)};
+            const Image on = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips = {title(false)};
+            QVERIFY(on.px == renderSequenceFrame(p, s, 3, o).px);
+            QVERIFY(!title3dInScene(s, s.videoTracks[1].clips[0], 3));
+            QVERIFY(sceneByDefault);
+            for (Track& t : s.videoTracks) t.clips.clear();
+        }
+        // ---- A red card 100 px in front of the letter hides it; one 100 px behind does not. Out of the scene (as
+        // projects saved before it have it) the title is laid over the card in front.
+        {
+            const double at = front.C[2];  // (the frame's plane is at z = 0: the title's face is there)
+            auto middle = [&](const Image& img) { return std::array<float, 4>{img.at(W / 2, H / 2)[0], img.at(W / 2, H / 2)[1], img.at(W / 2, H / 2)[2], img.at(W / 2, H / 2)[3]}; };
+            s.videoTracks[0].clips = {card(20, at - 100, 1, 0, 0)};
+            s.videoTracks[1].clips = {title(true)};
+            QVERIFY(title3dInScene(s, s.videoTracks[1].clips[0], 3));
+            const std::array<float, 4> hidden = middle(renderSequenceFrame(p, s, 3, o));
+            QVERIFY2(hidden[0] > 0.9f && hidden[1] < 0.05f, qPrintable(QString("%1 %2 %3").arg(hidden[0]).arg(hidden[1]).arg(hidden[2])));
+            s.videoTracks[1].clips = {title(false)};
+            const std::array<float, 4> over = middle(renderSequenceFrame(p, s, 3, o));
+            QVERIFY(over[1] > over[0]);
+            s.videoTracks[0].clips = {card(20, at + 100, 1, 0, 0)};
+            s.videoTracks[1].clips = {title(true)};
+            const std::array<float, 4> shown = middle(renderSequenceFrame(p, s, 3, o));
+            QVERIFY2(shown[1] > shown[0], qPrintable(QString("%1 %2 %3").arg(shown[0]).arg(shown[1]).arg(shown[2])));
+            for (Track& t : s.videoTracks) t.clips.clear();
+        }
+        // ---- The letter's shadow on a lit white card 100 px behind it (lit by the same light) falls where a ray-traced reference puts it: a
+        // card pixel is in shadow where the ray from its point on the card towards the light meets one of the title's
+        // triangles (title3dMesh, as the scene has them). Every pixel the render shadows and the reference does not
+        // (or the other way) is within 1 px of one the reference shadows and one it lights. One shadow map is made for
+        // the light the title and the card share.
+        {
+            const double at = front.C[2];
+            Clip back = card(100, at + 100, 1, 1, 1);
+            back.effects[0].params["light_angle"] = -20.0, back.effects[0].params["light_height"] = 20.0;
+            back.effects[0].params["lit"] = 1.0;
+            back.effects[0].params["shadows"] = 1.0;
+            back.effects[0].params["ambient"] = 30.0;
+            s.videoTracks[0].clips = {back};
+            s.videoTracks[1].clips = {title(true)};
+            const uint64_t passes = modelShadowPasses();
+            const Image shaded = renderSequenceFrame(p, s, 3, o);
+            QCOMPARE(modelShadowPasses() - passes, uint64_t(1));
+            s.videoTracks[1].clips[0].generator.params["shadows"] = Param(0.0);
+            const Image unshaded = renderSequenceFrame(p, s, 3, o);
+            Title3DMesh mesh;
+            QVERIFY(title3dMesh(s.videoTracks[1].clips[0].generator, 3, W, H, 10, 25, mesh));
+            const PosedTriangles& T = mesh.triangles;
+            auto hits = [&](const std::array<double, 3>& o0, const std::array<double, 3>& d) {
+                for (size_t i = 0; i + 2 < T.indices.size(); i += 3) {
+                    std::array<double, 3> v[3];
+                    for (int k = 0; k < 3; ++k)
+                        for (int j = 0; j < 3; ++j) v[k][size_t(j)] = T.positions[T.indices[i + size_t(k)] * 3 + size_t(j)];
+                    const std::array<double, 3> e1{v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]}, e2{v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]};
+                    const std::array<double, 3> pv{d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+                    const double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+                    if (std::fabs(det) < 1e-12) continue;
+                    const std::array<double, 3> tv{o0[0] - v[0][0], o0[1] - v[0][1], o0[2] - v[0][2]};
+                    const double u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) / det;
+                    if (u < 0 || u > 1) continue;
+                    const std::array<double, 3> qv{tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+                    const double w = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) / det;
+                    if (w < 0 || u + w > 1) continue;
+                    if ((e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) / det > 1e-6) return true;
+                }
+                return false;
+            };
+            const ModelLight light = settingsLight(back.effects[0], 3, {0, 0, 0}, 1);
+            const std::array<double, 3> toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+            // Each pixel: -1 the title itself (its camera ray meets it), 1 shadowed, 0 lit, by the reference.
+            std::vector<int> ref(size_t(W) * size_t(H), 0);
+            const double planeZ = -100;  // (the card's plane: 100 px behind the frame's)
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const std::array<double, 3> d = front.ray(x + 0.5, y + 0.5);
+                    if (hits(front.C, d)) {
+                        ref[size_t(y) * W + size_t(x)] = -1;
+                        continue;
+                    }
+                    const double k = (planeZ - front.C[2]) / d[2];
+                    const std::array<double, 3> P{front.C[0] + d[0] * k, front.C[1] + d[1] * k, planeZ};
+                    if (std::fabs(P[0]) > W / 2.0 - 2 || std::fabs(P[1]) > H / 2.0 - 2) {  // (off the card, or at its edge)
+                        ref[size_t(y) * W + size_t(x)] = -1;
+                        continue;
+                    }
+                    ref[size_t(y) * W + size_t(x)] = hits(P, toLight) ? 1 : 0;
+                }
+            int shadowed = 0, wrong = 0, far = 0;
+            auto near = [&](int x, int y, int want) {
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int X = x + dx, Y = y + dy;
+                        if (X >= 0 && Y >= 0 && X < W && Y < H && ref[size_t(Y) * W + size_t(X)] == want) return true;
+                    }
+                return false;
+            };
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const int r = ref[size_t(y) * W + size_t(x)];
+                    if (r < 0 || near(x, y, -1)) continue;
+                    const bool ours = unshaded.at(x, y)[0] - shaded.at(x, y)[0] > 0.05f;
+                    shadowed += r == 1;
+                    if (ours != (r == 1)) {
+                        ++wrong;
+                        if (!(near(x, y, 0) && near(x, y, 1))) ++far;
+                    }
+                }
+            qInfo("a letter's shadow on a card: %d px in the reference's shadow, %d differ at its edge, %d further", shadowed, wrong, far);
+            QVERIFY(shadowed > 300);
+            QCOMPARE(far, 0);
+            for (Track& t : s.videoTracks) t.clips.clear();
         }
     }
 

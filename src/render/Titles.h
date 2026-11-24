@@ -67,7 +67,7 @@ void applyTitleStyleSpans(Effect& g, const std::vector<std::pair<QString, std::o
 // The text animations a title has, and their params: textAnimators and textAnimatorParams in core/Effects.h.
 // How much text animation k selects unit i of n at frame t (clip frames; fps for its sweep), from -1 to 1 with its
 // Amount: its range's shape over the units, eased, spread by its random amount.
-double textSelection(const Effect& g, int k, FrameTime t, double fps, FrameTime duration, int i, int n);
+double textSelection(const Effect& g, int k, double t, double fps, FrameTime duration, int i, int n);
 
 // Whether the title needs the styled path: it has runs that change something, a path, text animations or font axes
 // of its own.
@@ -188,7 +188,7 @@ Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, Frame
 
 // A styled title's text as one outline, laid out with its runs (no path or animation), lines `lineHeight` apart, for
 // the 3D titles: px output pixels per sequence pixel. Empty when it has no runs.
-QPainterPath styledTextOutline(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing);
+QPainterPath styledTextOutline(const Effect& g, double t, double px, double defaultSize, double lineSpacing);
 // The same text a glyph cluster at a time, for depths set letter by letter: each cluster's outline and its place
 // among the letters, letters not spaces, words and lines (-1 for a space), in reading order. `defaultText` is the
 // title's text when it has none set.
@@ -196,7 +196,7 @@ struct TitleCharOutline {
     QPainterPath path;
     int letter = 0, solid = -1, word = -1, line = 0;
 };
-std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing,
+std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, double t, double px, double defaultSize, double lineSpacing,
                                                 const QString& defaultText, int& letters, int& solids, int& words, int& lines);
 
 }  // namespace montage

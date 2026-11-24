@@ -28663,6 +28663,80 @@ colorspaces:
         }
     }
 
+    void titles3DLetterMotionBlur() {
+        // A 3D title "IOI" whose middle letter alone a text animation rolls a whole turn over ten frames (keyed
+        // linearly), its letters' Motion Blur on at 180 degrees with 16 samples, seen at frame 5.
+        const int w = 320, h = 180;
+        Effect g = makeEffect("title3d", 1);
+        g.strings["text"] = "IOI";
+        g.strings["font"] = "DejaVu Sans";
+        g.params["size"] = Param(100.0);
+        g.params["depth"] = Param(20.0);
+        const int k = addTextAnimator(g);
+        const std::string pre = "ta" + std::to_string(k) + ".";
+        g.params[pre + "start"] = Param(34.0);
+        g.params[pre + "end"] = Param(66.0);
+        Param roll;
+        roll.addKey(0, 0.0);
+        roll.addKey(10, 360.0);
+        g.params[pre + "rotation"] = roll;
+        QCOMPARE(g.p("letter_blur", 0), 0.0);
+        QCOMPARE(g.p("letter_shutter", 0), 180.0);
+        uint64_t before = title3dSolidsDrawn();
+        const Image sharp = renderTitle3D(g, 5, w, h, 1.0, 30, 25);
+        const uint64_t solids = title3dSolidsDrawn() - before;
+        QVERIFY(solids >= 2);
+        g.params["letter_blur"] = Param(1.0);
+        g.params["letter_samples"] = Param(16.0);
+        before = title3dSolidsDrawn();
+        const Image blurred = renderTitle3D(g, 5, w, h, 1.0, 30, 25);
+        const uint64_t drawn = title3dSolidsDrawn() - before;
+        // The still letters are drawn once and the spinning one once a sample.
+        QCOMPARE(drawn, solids - 1 + 16);
+        // At 64 samples, within 2/255 of a 64-sample reference: the title drawn sharp with the letter's roll set to
+        // where it is at each of 64 times spread through the shutter (a half frame centred on frame 5), averaged.
+        Effect fine = g;
+        fine.params["letter_samples"] = Param(64.0);
+        const Image blurred64 = renderTitle3D(fine, 5, w, h, 1.0, 30, 25);
+        Image ref(w, h);
+        Effect at = g;
+        at.params["letter_blur"] = Param(0.0);
+        for (int i = 0; i < 64; ++i) {
+            at.params[pre + "rotation"] = Param(36.0 * (5 + 0.5 * ((i + 0.5) / 64 - 0.5)));
+            const Image one = renderTitle3D(at, 5, w, h, 1.0, 30, 25);
+            for (size_t j = 0; j < ref.px.size(); ++j) ref.px[j] += one.px[j] / 64;
+        }
+        float worst = 0, moved = 0;
+        for (size_t j = 0; j < ref.px.size(); ++j)
+            worst = std::max(worst, std::abs(ref.px[j] - blurred64.px[j])), moved = std::max(moved, std::abs(sharp.px[j] - blurred.px[j]));
+        qInfo("3D letter blur: %.4f from the 64-sample reference, %.3f from the sharp frame", worst * 255, moved);
+        QVERIFY2(worst <= 2.0f / 255, qPrintable(QString::number(worst * 255)));
+        QVERIFY(moved > 0.2f);  // (it is blurred)
+        // Nothing moving: drawn once, byte for byte as without the blur.
+        Effect still = g;
+        still.params[pre + "rotation"] = Param(30.0);
+        Effect stillSharp = still;
+        stillSharp.params["letter_blur"] = Param(0.0);
+        before = title3dSolidsDrawn();
+        const Image a = renderTitle3D(still, 5, w, h, 1.0, 30, 25);
+        QCOMPARE(title3dSolidsDrawn() - before, solids);
+        QVERIFY(a.px == renderTitle3D(stillSharp, 5, w, h, 1.0, 30, 25).px);
+        // The whole title turning: every letter at every sample.
+        Effect turning = still;
+        Param turn;
+        turn.addKey(0, -20.0);
+        turn.addKey(10, 40.0);
+        turning.params["rot_y"] = turn;
+        before = title3dSolidsDrawn();
+        renderTitle3D(turning, 5, w, h, 1.0, 30, 25);
+        QCOMPARE(title3dSolidsDrawn() - before, solids * 16);
+        // Off for the render (MotionBlurOffScope, as an export with motion blur off): sharp.
+        {
+            const MotionBlurOffScope off(true);
+            QVERIFY(renderTitle3D(g, 5, w, h, 1.0, 30, 25).px == sharp.px);
+        }
+    }
+
     void titles3D() {
         // Extruded text, lit flat (all ambient, no shine) so faces and sides show their own colours.
         auto title = [](const std::string& text) {
