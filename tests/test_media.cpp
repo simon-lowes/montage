@@ -2250,6 +2250,7 @@ private slots:
             QVERIFY2(std::get<0>(ended[0]) == files[0].path && std::get<1>(ended[0]), std::get<2>(ended[0]).c_str());
         }
         files[1].timecode = r.status().timecode;
+        int64_t onlyWatched = 0;  // (pictures only watched between the second file and the third: in neither)
         QVERIFY2(r.recordTo({}, &err), err.c_str());  // (watched on)
         // (its pictures counted on, numbered from the first watched again)
         QVERIFY(waitFor([&] { return cs.live->look().pictures >= pictures + 10; }));
@@ -2257,6 +2258,7 @@ private slots:
             const LiveFeed::Now now = cs.live->look();
             QVERIFY2(r.status().path.empty() && now.frame >= 5 && now.frame < now.pictures - pictures,
                      qPrintable(QStringLiteral("frame %1, %2 pictures on").arg(now.frame).arg(now.pictures - pictures)));
+            onlyWatched = now.frame + 1;
         }
         QVERIFY2(r.recordTo({path("no-such-folder/same.mov"), "prores_proxy"}, &err), err.c_str());
         QVERIFY(waitFor([&] {
@@ -2269,6 +2271,9 @@ private slots:
             QVERIFY(std::get<0>(ended[2]) == path("no-such-folder/same.mov") && !std::get<1>(ended[2]) && !std::get<2>(ended[2]).empty());
         }
         QVERIFY(waitFor([&] { return r.status().path.empty() && cs.live->look().frame >= 5; }));  // (watched on)
+        // (numbered on from the first watched picture, or again from 0 after the file that was not made: either way
+        // at least the larger of the two counts went into no file)
+        onlyWatched = std::max<int64_t>(onlyWatched, cs.live->look().frame + 1);
         // A file that is begun and then cannot be written on (a full disk: here a file of that name whose every write is
         // refused as a full disk's, Linux's /dev/full; nightly 19 Nov: not the process's file size limit, which every
         // other thread's files had while it was lowered) is said the same way, and the feed is watched on.
@@ -2358,7 +2363,10 @@ private slots:
         // The second begins with the picture after the first's last: nothing was opened again between them.
         QVERIFY2(firsts[1] >= firsts[0] + files[0].frames && firsts[1] <= firsts[0] + files[0].frames + 1,
                  qPrintable(QStringLiteral("%1 + %2, then %3").arg(firsts[0]).arg(files[0].frames).arg(firsts[1])));
-        QVERIFY(firsts[2] > firsts[1] + files[1].frames + 15);
+        // The third begins after the second's last and every picture only watched in between (Linux watches more
+        // there, through the full disk): none of those went into a file.
+        QVERIFY2(firsts[2] >= firsts[1] + files[1].frames + onlyWatched,
+                 qPrintable(QStringLiteral("%1 + %2 + %3 watched, then %4").arg(firsts[1]).arg(files[1].frames).arg(onlyWatched).arg(firsts[2])));
     }
 
     // An HDR feed watched live (BT.2100 PQ over ST 2110: JPEG XS at 1920 by 1080 where this build has it, else
@@ -40718,7 +40726,8 @@ private slots:
             // (without the wall the picture reaches it)
             PosedTriangles open;
             face(open, {2, 0, -6}, {0, 0, 1}, {0, 1, 0});
-            const float* reached = renderModel(sceneOf(open, projector, nullptr), viewer, W, H).at(int(px), int(py));
+            const Image openImage = renderModel(sceneOf(open, projector, nullptr), viewer, W, H);  // (kept: `reached` points into it)
+            const float* reached = openImage.at(int(px), int(py));
             QVERIFY2(std::fabs(reached[0] - red[0]) < 2.0f / 255, qPrintable(QString("without the wall: %1").arg(reached[0])));
         }
 
