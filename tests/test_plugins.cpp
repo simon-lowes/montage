@@ -3529,6 +3529,60 @@ private slots:
         QVERIFY(reg.find("clap:org.montage.test.delay64").has_value());
     }
 
+    // OpenFX in one host for every plug-in: Test Invert from one binary renders, then a plug-in from a second binary
+    // crashes the host as its binary loads. The second binary alone is blocked and blamed, and the first renders on in
+    // a new host.
+    void sharedHostBlamesTheOpenFxBinaryLoading() {
+        ofx::Registry& oreg = ofx::Registry::instance();
+        oreg.setCachePath(path("ofx-blame-cache.json").toStdString());
+        oreg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        const std::string good = MONTAGE_TEST_OFX_DIR "/good", second = MONTAGE_TEST_OFX_DIR "/second";
+        oreg.setSearchPaths({good, second});
+        QCOMPARE(oreg.scan(), 14);
+        ofx::PluginDesc first, crashes;
+        QVERIFY(oreg.find("org.montage.test.invert/1", first) && oreg.find("org.montage.test.second.invert/1", crashes));
+        QVERIFY(first.binary != crashes.binary);
+        Hosting hostingMode(Isolation::Shared, [](HostingSettings& s) { s.autoRestarts = 0; });
+        Project p = makeDefaultProject();
+        const Effect a = ofx::makeEffect(p, first), b = ofx::makeEffect(p, crashes);
+        std::string err;
+        auto render = [&](const Effect& e) {
+            Image img(8, 8);
+            img.fill(0.2f, 0.4f, 0.6f, 1.0f);
+            return ofx::applyEffect(e, 0, img, 1.0, {}, &err) ? img.at(3, 3)[0] : -1.0f;
+        };
+        auto host = [] {
+            int64_t pid = 0;
+            for (const HostInfo& h : runningHosts())
+                if (h.key == "ofx:all") pid = h.pid;
+            return pid;
+        };
+        {
+            Fault f("crash:load");  // (reaches the host as it starts: only the second binary's load action reads it)
+            QVERIFY2(std::fabs(render(a) - 0.8f) < 1e-5f, err.c_str());
+        }
+        const int64_t shared = host();
+        QVERIFY(shared > 0);
+        QCOMPARE(render(b), -1.0f);
+        QVERIFY2(err.find("crashed") != std::string::npos, err.c_str());
+        const auto blocked = oreg.blocked();
+        QCOMPARE(blocked.size(), size_t(1));
+        QCOMPARE(blocked[0].first, crashes.binary);
+        QVERIFY(QString::fromStdString(blocked[0].second).contains("while loading"));
+        QVERIFY(failureOf(crashes.id).has_value());
+        QCOMPARE(QString::fromStdString(failureOf(crashes.id)->kind), QString("load"));
+        QVERIFY(!failureOf(first.id).has_value());
+        ofx::PluginDesc found;
+        QVERIFY(!oreg.find(crashes.id, found) && oreg.find(first.id, found));
+        // The first binary's plug-in renders on, in a host started again.
+        QVERIFY2(std::fabs(render(a) - 0.8f) < 1e-5f, err.c_str());
+        QVERIFY(host() > 0 && host() != shared);
+        QVERIFY(!failureOf(first.id).has_value());
+        QCOMPARE(oreg.scan(), 7);  // (until the second binary changes)
+        oreg.setSearchPaths({good});
+        QCOMPARE(oreg.scan(), 7);
+    }
+
     // Ids of 300 bytes that differ in their last byte alone, in one shared host: the one that crashes the host as it
     // loads is blocked and named whole, and the other, loaded before it, is not taken for it.
     void longPlugInIdIsBlamedWhole() {
