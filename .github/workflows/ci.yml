@@ -13,7 +13,7 @@ concurrency:
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90  # a stuck apt mirror or model host should not hold the runner for hours (a full run is about 55 minutes)
+    timeout-minutes: 120  # a stuck apt mirror or model host should not hold the runner for hours (a full run is about 80 minutes: a cold build about 40, the tests about 45)
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
