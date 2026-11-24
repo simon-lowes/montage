@@ -461,19 +461,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Qt
-          key: qt-6.12.0-linux_gcc_64-multimedia
+          key: qt-6.12.1-linux_gcc_64-multimedia
       - name: Qt 6.12 with Qt Multimedia (aqtinstall)
         run: |
-          if [ ! -d ~/Qt/6.12.0/gcc_64 ]; then
+          if [ ! -d ~/Qt/6.12.1/gcc_64 ]; then
             python3 -m venv ~/aqt && ~/aqt/bin/pip install -q aqtinstall==3.3.0
-            ~/aqt/bin/aqt install-qt linux desktop 6.12.0 linux_gcc_64 -m qtmultimedia -O ~/Qt
+            ~/aqt/bin/aqt install-qt linux desktop 6.12.1 linux_gcc_64 -m qtmultimedia -O ~/Qt
           fi
           # (its Wayland platform, whatever this Qt names the plug-in)
-          ls ~/Qt/6.12.0/gcc_64/plugins/platforms/ | grep -i wayland
+          ls ~/Qt/6.12.1/gcc_64/plugins/platforms/ | grep -i wayland
       - name: Configure
         run: |
           set -o pipefail
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="$HOME/Qt/6.12.0/gcc_64" \
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="$HOME/Qt/6.12.1/gcc_64" \
             -DMONTAGE_WAYLAND_BINDING=OFF | tee "$RUNNER_TEMP/configure.log"
           # (Qt's handling of the protocol, not Montage's binding)
           grep -q "HDR viewer on Wayland: Qt's colour management" "$RUNNER_TEMP/configure.log"
