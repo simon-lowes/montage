@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <QPointingDevice>
 #include <complex>
 #include <limits>
 #include <QDialog>
@@ -19350,6 +19351,76 @@ const auto seq = [this] { return state()->sequence(); };
         // Too far for the clip: refused, nothing written.
         QVERIFY(call("montage_scale_keys", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"factor", 1000}}).value("isError").toBool());
         state()->newProject();
+    }
+
+    void pinchAndSwipeGestures() {
+        loadDemo();
+        state()->setPlayhead(10);
+        MonitorPanel* program = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY(!viewer->imageRect().isEmpty());
+        viewer->fitView();
+        auto gesture = [](QWidget* w, Qt::NativeGestureType type, QPointF at, double value, QPointF delta = {}) {
+            QNativeGestureEvent e(type, QPointingDevice::primaryPointingDevice(), 2, at, QPointF(w->mapTo(w->window(), at.toPoint())),
+                                  QPointF(w->mapToGlobal(at.toPoint())), value, delta);
+            QApplication::sendEvent(w, &e);
+            return e.isAccepted();
+        };
+        // A pinch of 0.5 (Qt gives the change in scale, -0.5) halves the monitor's zoom, the picture's pixel under the
+        // pointer staying within a pixel of it.
+        const QPointF at(viewer->width() * 0.3, viewer->height() * 0.4);
+        QRectF r = viewer->imageRect();
+        QVERIFY(r.contains(at));
+        const QPointF pixel((at.x() - r.left()) / r.width(), (at.y() - r.top()) / r.height());
+        QVERIFY(gesture(viewer, Qt::ZoomNativeGesture, at, -0.5));
+        QCOMPARE(viewer->zoom(), 0.5);
+        r = viewer->imageRect();
+        QVERIFY(QLineF(QPointF(r.left() + pixel.x() * r.width(), r.top() + pixel.y() * r.height()), at).length() <= 1);
+        // Zoomed in (to 3), the same.
+        QVERIFY(gesture(viewer, Qt::ZoomNativeGesture, at, 5.0));
+        QCOMPARE(viewer->zoom(), 3.0);
+        r = viewer->imageRect();
+        QVERIFY(QLineF(QPointF(r.left() + pixel.x() * r.width(), r.top() + pixel.y() * r.height()), at).length() <= 1);
+        // A swipe to the right moves the picture a quarter of the monitor right; a pan follows the fingers.
+        const QPointF before = viewer->pan();
+        gesture(viewer, Qt::SwipeNativeGesture, at, 0);
+        QVERIFY(std::fabs(viewer->pan().x() - before.x() - viewer->width() / 4.0) < 1e-6 && std::fabs(viewer->pan().y() - before.y()) < 1e-6);
+        gesture(viewer, Qt::PanNativeGesture, at, 0, QPointF(-12, 7));
+        QVERIFY(std::fabs(viewer->pan().x() - before.x() - viewer->width() / 4.0 + 12) < 1e-6 && std::fabs(viewer->pan().y() - before.y() - 7) < 1e-6);
+        // A smart zoom (double tap) fits it again.
+        gesture(viewer, Qt::SmartZoomNativeGesture, at, 0);
+        QCOMPARE(viewer->zoom(), 1.0);
+        QCOMPARE(viewer->pan(), QPointF());
+        // The Source monitor's viewer takes them too.
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Source) {
+                QVERIFY(gesture(m->viewer(), Qt::ZoomNativeGesture, QPointF(10, 10), 1.0));
+                QCOMPARE(m->viewer()->zoom(), 2.0);
+                m->viewer()->fitView();
+            }
+
+        // On the timeline, a pinch zooms time about the pointer: the time under it stays (within a pixel); a swipe
+        // and a pan scroll.
+        timeline()->zoomToFit();
+        const int x = 176 + (viewport()->width() - 176) / 2;
+        const double ppf = timeline()->pixelsPerFrame(), under = timeline()->frameAtViewportX(x);
+        QVERIFY(gesture(viewport(), Qt::ZoomNativeGesture, QPointF(x, 40), 3.0));
+        QVERIFY(std::fabs(timeline()->pixelsPerFrame() - 4 * ppf) < 1e-9);
+        QVERIFY2(std::fabs(timeline()->frameAtViewportX(x) - under) * timeline()->pixelsPerFrame() <= 1,
+                 qPrintable(QString("%1 %2").arg(timeline()->frameAtViewportX(x)).arg(under)));
+        QVERIFY(gesture(viewport(), Qt::ZoomNativeGesture, QPointF(x, 40), -0.5));
+        QVERIFY(std::fabs(timeline()->pixelsPerFrame() - 2 * ppf) < 1e-9);
+        QVERIFY(std::fabs(timeline()->frameAtViewportX(x) - under) * timeline()->pixelsPerFrame() <= 1);
+        const int scrolled = timeline()->horizontalScrollBar()->value();
+        gesture(viewport(), Qt::PanNativeGesture, QPointF(x, 40), 0, QPointF(-30, 0));
+        QCOMPARE(timeline()->horizontalScrollBar()->value(), std::min(timeline()->horizontalScrollBar()->maximum(), scrolled + 30));
+        gesture(viewport(), Qt::SwipeNativeGesture, QPointF(x, 40), 0);  // to the right: back towards the start
+        QCOMPARE(timeline()->horizontalScrollBar()->value(),
+                 std::max(0, std::min(timeline()->horizontalScrollBar()->maximum(), scrolled + 30) - int(std::lround(viewport()->width() / 4.0))));
+        timeline()->zoomToFit();
     }
 
     void keyframeCopyPaste() {

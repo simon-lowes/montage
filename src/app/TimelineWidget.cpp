@@ -2842,6 +2842,38 @@ void TimelineWidget::wheelEvent(QWheelEvent* e) {
     e->accept();
 }
 
+bool TimelineWidget::viewportEvent(QEvent* e) {
+    if (e->type() != QEvent::NativeGesture) return QAbstractScrollArea::viewportEvent(e);
+    auto* g = static_cast<QNativeGestureEvent*>(e);
+    auto scrollBy = [this](QPointF d) {
+        horizontalScrollBar()->setValue(horizontalScrollBar()->value() - int(std::lround(d.x())));
+        verticalScrollBar()->setValue(verticalScrollBar()->value() - int(std::lround(d.y())));
+    };
+    switch (g->gestureType()) {
+        case Qt::ZoomNativeGesture:  // value: the change in scale
+            zoomAround(int(std::lround(g->position().x())), std::clamp(1 + g->value(), 0.05, 20.0));
+            break;
+        case Qt::SmartZoomNativeGesture:
+            zoomToFit();
+            break;
+        case Qt::PanNativeGesture:
+            scrollBy(g->delta());
+            break;
+        case Qt::SwipeNativeGesture:
+            // A swipe with no distance gives its direction (degrees, 0 right and 90 up): a quarter of the view.
+            if (!g->delta().isNull()) scrollBy(g->delta());
+            else {
+                const double a = g->value() * M_PI / 180;
+                scrollBy(QPointF(std::cos(a) * viewport()->width() / 4, -std::sin(a) * viewport()->height() / 4));
+            }
+            break;
+        default:
+            break;
+    }
+    e->accept();
+    return true;
+}
+
 void TimelineWidget::leaveEvent(QEvent* e) {
     if (drag_.kind == DragKind::None) viewport()->unsetCursor();
     QAbstractScrollArea::leaveEvent(e);

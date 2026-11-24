@@ -118,8 +118,9 @@ void ViewerWidget::setPeakingAtMonitorSize(bool on) {
 
 QSize ViewerWidget::peakingSize() const {
     if (!peakingAtMonitorSize_) return image_.size();
-    // The picture's area in device pixels, as it reaches the screen.
-    const QSizeF r = imageRect().size() * devicePixelRatioF();
+    // The picture's area in device pixels, as it reaches the screen (zoomed in, no more than the picture's own).
+    QSizeF r = imageRect().size() * devicePixelRatioF();
+    if (zoom_ > 1) r = r.boundedTo((r / zoom_).expandedTo(QSizeF(image_.size())));
     return QSize(std::max(1, int(std::lround(r.width()))), std::max(1, int(std::lround(r.height()))));
 }
 
@@ -372,8 +373,78 @@ double ViewerWidget::dividerX() const {
 
 QRectF ViewerWidget::imageRect() const {
     if (image_.isNull()) return {};
-    QSizeF s = QSizeF(image_.size()).scaled(size(), Qt::KeepAspectRatio);
-    return QRectF((width() - s.width()) / 2, (height() - s.height()) / 2, s.width(), s.height());
+    const QSizeF s = QSizeF(image_.size()).scaled(size(), Qt::KeepAspectRatio) * zoom_;
+    return QRectF((width() - s.width()) / 2 + pan_.x(), (height() - s.height()) / 2 + pan_.y(), s.width(), s.height());
+}
+
+void ViewerWidget::zoomAt(const QPointF& at, double factor) {
+    if (!(factor > 0) || !std::isfinite(factor)) return;
+    const QRectF before = imageRect();
+    const double was = zoom_;
+    zoom_ = std::clamp(zoom_ * factor, 0.1, 32.0);
+    if (before.isEmpty()) return viewMoved();
+    // The picture's point under `at` stays under it.
+    const double k = zoom_ / was;
+    const QPointF centre(width() / 2.0, height() / 2.0);
+    const QPointF oldMid = before.center();
+    pan_ = at + (oldMid - at) * k - centre;
+    viewMoved();
+}
+
+void ViewerWidget::panBy(const QPointF& delta) {
+    pan_ += delta;
+    viewMoved();
+}
+
+void ViewerWidget::fitView() {
+    zoom_ = 1;
+    pan_ = {};
+    viewMoved();
+}
+
+void ViewerWidget::viewMoved() {
+    // At least a little of the picture stays on the monitor.
+    if (!image_.isNull()) {
+        const QSizeF s = QSizeF(image_.size()).scaled(size(), Qt::KeepAspectRatio) * zoom_;
+        const double keep = 32;
+        const double mx = std::max(0.0, (width() + s.width()) / 2 - keep), my = std::max(0.0, (height() + s.height()) / 2 - keep);
+        pan_ = QPointF(std::clamp(pan_.x(), -mx, mx), std::clamp(pan_.y(), -my, my));
+    }
+#ifdef MONTAGE_HDR_VIEWER
+    if (surface_ && hdrPicture_) surface_->setPicture(hdrPicture_, imageRect());
+#endif
+    update();
+}
+
+bool ViewerWidget::event(QEvent* e) {
+    if (e->type() == QEvent::NativeGesture) {
+        auto* g = static_cast<QNativeGestureEvent*>(e);
+        switch (g->gestureType()) {
+            case Qt::ZoomNativeGesture:  // value: the change in scale (0.1 is 10 % bigger)
+                if (!twoUp_) zoomAt(g->position(), std::clamp(1 + g->value(), 0.05, 20.0));
+                break;
+            case Qt::SmartZoomNativeGesture:
+                fitView();
+                break;
+            case Qt::PanNativeGesture:
+                if (!twoUp_) panBy(g->delta());
+                break;
+            case Qt::SwipeNativeGesture:
+                // A swipe with no distance gives its direction (degrees, 0 right and 90 up): a quarter of the monitor.
+                if (twoUp_) break;
+                if (!g->delta().isNull()) panBy(g->delta());
+                else {
+                    const double a = g->value() * M_PI / 180;
+                    panBy(QPointF(std::cos(a) * width() / 4, -std::sin(a) * height() / 4));
+                }
+                break;
+            default:
+                break;
+        }
+        e->accept();
+        return true;
+    }
+    return QWidget::event(e);
 }
 
 void ViewerWidget::setLookAround(bool on) {

@@ -41,6 +41,9 @@ public:
     void zoomIn();
     void zoomOut();
     void zoomToFit();
+    // The zoom (pixels a frame), and the sequence time at a viewport x (in fractions of a frame).
+    double pixelsPerFrame() const { return ppf_; }
+    double frameAtViewportX(int x) const { return frameAtX(x); }
     // Keeps the playhead in view during playback (page-style scrolling).
     void followPlayhead(FrameTime t);
 
@@ -178,6 +181,9 @@ protected:
     void mouseReleaseEvent(QMouseEvent* e) override;
     void mouseDoubleClickEvent(QMouseEvent* e) override;
     void wheelEvent(QWheelEvent* e) override;
+    // Pinching on a trackpad or touch screen zooms about the fingers (the time under them stays), a pan or swipe
+    // scrolls, and a smart zoom (double tap) fits the sequence.
+    bool viewportEvent(QEvent* e) override;
     void contextMenuEvent(QContextMenuEvent* e) override;
     void dragEnterEvent(QDragEnterEvent* e) override;
     void dragMoveEvent(QDragMoveEvent* e) override;
