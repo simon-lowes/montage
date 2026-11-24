@@ -199,6 +199,7 @@
 #include "render/Shapes.h"
 #include "render/Shorts.h"
 #include "core/Transcript.h"
+#include "render/TemporalFx.h"
 #include "render/VideoDenoise.h"
 #include "render/VideoFx.h"
 #include "render/VideoPacking.h"
@@ -17982,6 +17983,112 @@ colorspaces:
         const Image stillBlur = renderTitle(t, 5, w, h, 1.0, 30, 30);
         t.params["letter_blur"] = 0.0;
         QVERIFY(stillBlur.px == renderTitle(t, 5, w, h, 1.0, 30, 30).px);
+    }
+
+    void transformMotionBlur() {
+        // A white 20 px square on a 320 x 180 sequence whose transform is keyed to move 100 px a frame (x = 0 at frame
+        // 10), its Motion Blur on at 180 degrees.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        Clip sq = makeGeneratorClip(p, "shape", 30);
+        sq.generator.params["width"] = Param(20.0);
+        sq.generator.params["height"] = Param(20.0);
+        sq.generator.params["fill_color.r"] = sq.generator.params["fill_color.g"] = sq.generator.params["fill_color.b"] = Param(1.0);
+        Param move;
+        move.addKey(5, -500.0);
+        move.addKey(15, 500.0);
+        sq.motion.params["pos_x"] = move;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, sq);
+        Clip& c = s.videoTracks[0].clips.at(0);
+        c.motion.params["motion_blur"] = Param(1.0);
+        QCOMPARE(c.motion.p("shutter", 0), 180.0);
+        auto render = [&](FrameTime t) { return renderSequenceFrame(p, s, t, {}); };
+        auto light = [](const Image& img) {
+            double a = 0;
+            for (size_t i = 3; i < img.px.size(); i += 4) a += img.px[i];
+            return a;
+        };
+        auto extent = [](const Image& img, int y) {
+            int x0 = img.width, x1 = -1;
+            for (int x = 0; x < img.width; ++x)
+                if (img.at(x, y)[3] > 1e-4f) x0 = std::min(x0, x), x1 = std::max(x1, x);
+            return x1 - x0 + 1;
+        };
+        uint64_t before = transformLayerDraws();
+        const Image blurred = render(10);
+        const uint64_t drawn = transformLayerDraws() - before;
+        // A smear 50 px long (the square's 20 px and the 50 px it moves with the shutter open), within 1 px, its light
+        // within 1 % of the square's, drawn once for each output pixel the square moves (adaptive samples).
+        const int smear = extent(blurred, 90) - 20;
+        qInfo("transform blur: smear %d px, light %.2f of 400, %llu draws", smear, light(blurred), (unsigned long long)drawn);
+        QVERIFY2(std::abs(smear - 50) <= 1, qPrintable(QString::number(smear)));
+        QVERIFY2(std::abs(light(blurred) - 400) <= 4, qPrintable(QString::number(light(blurred))));
+        QCOMPARE(drawn, uint64_t(50));
+        // Not smeared up and down.
+        QCOMPARE(blurred.at(160, 79)[3], 0.0f);
+        QVERIFY(blurred.at(160, 81)[3] > 0.3f);
+        // With eight samples, the frame is the mean of the layer drawn at its transform at each time through the
+        // shutter, centred on the frame.
+        c.motion.params["samples"] = Param(8.0);
+        const Image eight = render(10);
+        std::vector<double> sum(eight.px.size(), 0.0);
+        c.motion.params["motion_blur"] = Param(0.0);
+        for (int i = 0; i < 8; ++i) {
+            c.motion.params["pos_x"] = Param(100 * ((i + 0.5) / 8 - 0.5) * 0.5);
+            const Image one = render(10);
+            for (size_t j = 0; j < sum.size(); ++j) sum[j] += one.px[j];
+        }
+        double worst = 0;
+        for (size_t j = 0; j < sum.size(); ++j) worst = std::max(worst, std::abs(sum[j] / 8 - eight.px[j]));
+        QVERIFY2(worst < 1e-5, qPrintable(QString::number(worst)));
+        // The phase moves the shutter: opening at the frame, the smear lies wholly to the right of where the square is.
+        c.motion.params["pos_x"] = move;
+        c.motion.params["motion_blur"] = Param(1.0);
+        c.motion.params["samples"] = Param(0.0);
+        c.motion.params["shutter_phase"] = Param(90.0);
+        const Image late = render(10);
+        int first = -1;
+        for (int x = 0; x < late.width && first < 0; ++x)
+            if (late.at(x, 90)[3] > 1e-4f) first = x;
+        QCOMPARE(first, 150);
+        c.motion.params["shutter_phase"] = Param(0.0);
+        // Every motion blur off (an export for a VFX pull): the square sharp where it is at the frame.
+        c.motion.params["motion_blur"] = Param(0.0);
+        const Image sharp = render(10);
+        c.motion.params["motion_blur"] = Param(1.0);
+        {
+            const MotionBlurOffScope off;
+            QVERIFY(render(10).px == sharp.px);
+        }
+        // A layer that does not move renders byte for byte with the blur on and off, drawn once.
+        c.motion.params["pos_x"] = Param(12.0);
+        c.motion.params["motion_blur"] = Param(0.0);
+        const Image stillOff = render(10);
+        c.motion.params["motion_blur"] = Param(1.0);
+        before = transformLayerDraws();
+        const Image stillOn = render(10);
+        QCOMPARE(transformLayerDraws() - before, uint64_t(1));
+        QVERIFY(stillOn.px == stillOff.px);
+        // One that barely moves (a tenth of a pixel through the shutter) takes two samples; turning about its middle
+        // as it moves far takes more, up to 64.
+        Param creep;
+        creep.addKey(0, 0.0);
+        creep.addKey(30, 6.0);
+        c.motion.params["pos_x"] = creep;
+        before = transformLayerDraws();
+        render(10);
+        QCOMPARE(transformLayerDraws() - before, uint64_t(2));
+        Param spin;
+        spin.addKey(0, 0.0);
+        spin.addKey(30, 3000.0);
+        c.motion.params["pos_x"] = Param(0.0);
+        c.motion.params["rotation"] = spin;
+        before = transformLayerDraws();
+        const Image turned = render(10);
+        const uint64_t turns = transformLayerDraws() - before;
+        QVERIFY2(turns > 8 && turns <= 64, qPrintable(QString::number(turns)));
+        QVERIFY(std::abs(light(turned) - 400) <= 4);
     }
 
     void variableFontAxes() {

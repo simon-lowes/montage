@@ -83,6 +83,7 @@ struct ExportSettings {
     FrameTime out = -1;
     bool useProxies = false;
     bool gpu = false;                    // frames drawn on the GPU compositor where it can (render/GpuCompositor.h)
+    bool motionBlur = true;              // off: every motion blur through a shutter left out (plates for a VFX pull)
     bool alpha = false;                  // keep transparency (ProRes 4444 etc.)
     // A stereoscopic sequence's eyes as delivered (render/Stereo.h names): "sbs" side by side at full size (the
     // default), "sbs_half", "tb", "tb_half", or one picture ("left", "right", "anaglyph"). Packed exports carry stereo

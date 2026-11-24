@@ -89,6 +89,13 @@ std::vector<EffectInfo> buildCatalog() {
                      boolean("flip_h", "Flip Horizontal"),
                      boolean("flip_v", "Flip Vertical"),
                      choice("fit", "Fit", {"Fit", "Fill", "Stretch", "None (1:1)"}, 0),
+                     // Motion blur through a shutter (degrees of a sequence frame, centred on the frame unless the phase
+                     // moves it): the layer drawn at its transform at each sample time and the mean kept; samples
+                     // adaptive (0) from how far a corner moves, or 2 to 64.
+                     boolean("motion_blur", "Motion Blur"),
+                     num("shutter", "Shutter Angle (°)", 0, 720, 180, 1),
+                     num("shutter_phase", "Shutter Phase (°)", -360, 360, 0, 1),
+                     num("samples", "Motion Blur Samples (0: Adaptive)", 0, 64, 0, 1),
                  },
                  {}});
     // Time Remapping: a keyframeable speed curve within the clip's length, and
@@ -2222,7 +2229,14 @@ Effect makeEffect(const std::string& type, Id id) {
     return e;
 }
 
-Effect makeEffect(Project& p, const std::string& type) { return makeEffect(type, p.newId()); }
+Effect makeEffect(Project& p, const std::string& type) {
+    Effect e = makeEffect(type, p.newId());
+    // (blurred through the active sequence's shutter)
+    if (const Sequence* s = p.active(); s && s->shutterAngle != 180)
+        for (const char* name : {"shutter", "letter_shutter"})
+            if (auto it = e.params.find(name); it != e.params.end() && !it->second.animated()) it->second = Param(s->shutterAngle);
+    return e;
+}
 
 const std::vector<std::string>& blendModes() {
     static const std::vector<std::string> modes = {"normal",  "add",     "multiply", "screen",     "overlay",

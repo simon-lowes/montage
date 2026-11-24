@@ -11533,6 +11533,7 @@ void MainWindow::newSequence() {
             s.filmGauge = spec.filmGauge;
             s.workingSpace = spec.workingSpace;
             s.outputTransform = spec.outputTransform;
+            s.shutterAngle = spec.shutterAngle;
             return true;
         });
 }

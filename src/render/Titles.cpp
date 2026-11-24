@@ -24,6 +24,7 @@
 #include <tuple>
 
 #include "Processing.h"
+#include "TemporalFx.h"
 
 namespace montage {
 
@@ -1970,7 +1971,7 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, Fram
                   const TitleLayerFn& layer) {
     const double shutter = std::clamp(g.p("letter_shutter", t, 180), 0.0, 720.0) / 360.0;
     const int n = std::clamp(int(std::lround(g.p("letter_samples", t, 16))), 2, 64);
-    if (g.p("letter_blur", t) <= 0.5 || shutter <= 0) return renderTitleAt(g, double(t), w, h, scale, duration, fps, path, layer);
+    if (g.p("letter_blur", t) <= 0.5 || shutter <= 0 || motionBlurOff()) return renderTitleAt(g, double(t), w, h, scale, duration, fps, path, layer);
     // (the frame's text laid out once for all its times: see FrameLayouts)
     FrameLayouts layouts;
     struct Scope {

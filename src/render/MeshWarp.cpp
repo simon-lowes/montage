@@ -12,6 +12,7 @@
 #include <numeric>
 
 #include "FollowFocus.h"
+#include "TemporalFx.h"
 #include "core/Effects.h"
 #include "core/LinearSolve.h"
 #include "media/Tracking.h"
@@ -719,7 +720,7 @@ std::vector<WarpPin> meshWarpPins(const Effect& e, double t, int w, int h, doubl
 void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     if (img.empty()) return;
     const int W = img.width, H = img.height;
-    const bool blur = e.p("motion_blur", t, 0) > 0.5;
+    const bool blur = e.p("motion_blur", t, 0) > 0.5 && !motionBlurOff();
     const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
     const bool show = e.p("show_mesh", t, 0) > 0.5;
     auto still = [](const std::vector<WarpPin>& ps) { return pinsStill(ps); };
@@ -872,7 +873,7 @@ struct GridWarpSetup {
 void gridWarp(const Effect& e, FrameTime t, Image& img) {
     if (img.empty()) return;
     const GridWarpSetup g(e, t, img.width, img.height);
-    const bool blur = e.p("motion_blur", t, 0) > 0.5;
+    const bool blur = e.p("motion_blur", t, 0) > 0.5 && !motionBlurOff();
     const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
     const bool show = e.p("show_grid", t, 0) > 0.5;
     if (!show && g.still(g.moves(double(t))) && (!blur || (g.still(g.moves(t - shutter / 2)) && g.still(g.moves(t + shutter / 2))))) return;
@@ -896,7 +897,7 @@ void gridWarp(const Effect& e, FrameTime t, Image& img) {
 int warpDrawing(const Effect& e, FrameTime t, int w, int h, double pixelScale, WarpMesh& mesh, std::vector<MeshPoint>& moved,
                 std::vector<double>& depth, const Image* picture, std::vector<WarpSample>* shutterSamplesOut) {
     const bool grid = e.type == "grid_warp";
-    const bool blur = e.p("motion_blur", t, 0) > 0.5;
+    const bool blur = e.p("motion_blur", t, 0) > 0.5 && !motionBlurOff();
     const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
     const bool show = e.p(grid ? "show_grid" : "show_mesh", t, 0) > 0.5;
     const bool overAlpha = !grid && std::lround(e.p("mesh_from", t, 0)) == 0;

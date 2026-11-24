@@ -2325,6 +2325,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.highQuality = true;
     ro.useProxies = s.useProxies;
     ro.gpu = s.gpu;
+    ro.motionBlur = s.motionBlur;
     // Graded scene-referred, the frames are made for the space delivered, through its own output transform (a trim
     // pass's target's, its trim after it; a scene-referred one gets the working space's light).
     const bool sceneGraded = sceneReferredWorking(seq);

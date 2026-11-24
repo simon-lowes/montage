@@ -58,6 +58,80 @@ Image motionBlur(const Image& src, const MotionFn& back, const MotionFn& fwd, do
     return out;
 }
 
+Image motionBlurPath(const Image& src, const std::map<int, MotionFn>& flows, double at, double from, double to) {
+    if (src.empty() || !(to > from) || flows.empty()) return src;
+    // The whole frames the path runs over.
+    const int k0 = std::min(0, int(std::floor(at + from))), k1 = std::max(1, int(std::ceil(at + to)));
+    const size_t nk = size_t(k1 - k0 + 1);
+    Image out(src.width, src.height, Image::Uninitialized{});
+    parallelRows(src.height, [&](int y0, int y1) {
+        std::vector<Point2> d(nk);
+        std::vector<char> known(nk);
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < src.width; ++x) {
+                const double px = x + 0.5, py = y + 0.5;
+                // Where the point is at each whole frame, from frame 0 outwards (a missing one carrying the step on).
+                for (int k = k0; k <= k1; ++k) {
+                    const size_t i = size_t(k - k0);
+                    known[i] = 0;
+                    if (k == 0) {
+                        d[i] = {0, 0}, known[i] = 1;
+                    } else if (auto it = flows.find(k); it != flows.end() && it->second) {
+                        d[i] = it->second(px, py), known[i] = 1;
+                    }
+                }
+                // A frame either side of frame 0 with no motion to it moves as far the other way; one past that
+                // carries the step before it on.
+                const size_t zero = size_t(-k0);
+                const bool nextKnown = known[zero + 1], prevKnown = zero >= 1 && known[zero - 1];
+                if (!nextKnown) d[zero + 1] = prevKnown ? Point2{-d[zero - 1].x, -d[zero - 1].y} : Point2{0, 0};
+                if (zero >= 1 && !prevKnown) d[zero - 1] = nextKnown ? Point2{-d[zero + 1].x, -d[zero + 1].y} : Point2{0, 0};
+                for (size_t i = zero + 2; i < nk; ++i)
+                    if (!known[i]) d[i] = {2 * d[i - 1].x - d[i - 2].x, 2 * d[i - 1].y - d[i - 2].y};
+                for (size_t i = zero >= 2 ? zero - 1 : 0; i-- > 0;)
+                    if (!known[i]) d[i] = {2 * d[i + 1].x - d[i + 2].x, 2 * d[i + 1].y - d[i + 2].y};
+                auto pos = [&](double f) {
+                    const double u = std::clamp(f, double(k0), double(k1)) - k0;
+                    const size_t i = std::min(nk - 2, size_t(std::floor(u)));
+                    const double w = u - double(i);
+                    return Point2{d[i].x + (d[i + 1].x - d[i].x) * w, d[i].y + (d[i + 1].y - d[i].y) * w};
+                };
+                const Point2 here = pos(at);
+                // The path's length, over each frame's step it spans.
+                double len = 0;
+                for (int k = k0; k < k1; ++k) {
+                    const double a = std::max(double(k), at + from), b = std::min(double(k + 1), at + to);
+                    if (b <= a) continue;
+                    const size_t i = size_t(k - k0);
+                    len += std::hypot(d[i + 1].x - d[i].x, d[i + 1].y - d[i].y) * (b - a);
+                }
+                float* o = out.at(x, y);
+                if (len < 0.5) {
+                    std::copy_n(src.at(x, y), 4, o);
+                    continue;
+                }
+                const int n = std::clamp(int(std::ceil(len)), 2, 64);
+                float acc[4] = {0, 0, 0, 0};
+                for (int i = 0; i < n; ++i) {
+                    const Point2 q = pos(at + from + (to - from) * (i + 0.5) / n);
+                    float s[4];
+                    sampleClamped(src, px + q.x - here.x, py + q.y - here.y, s);
+                    for (int k = 0; k < 4; ++k) acc[k] += s[k];
+                }
+                for (int k = 0; k < 4; ++k) o[k] = acc[k] / float(n);
+            }
+    });
+    return out;
+}
+
+namespace {
+thread_local bool tMotionBlurOff = false;
+}
+
+MotionBlurOffScope::MotionBlurOffScope(bool off) : outer_(tMotionBlurOff) { tMotionBlurOff = tMotionBlurOff || off; }
+MotionBlurOffScope::~MotionBlurOffScope() { tMotionBlurOff = outer_; }
+bool motionBlurOff() { return tMotionBlurOff; }
+
 TileStats tileStats(const Image& img, int gw, int gh) {
     TileStats t;
     t.gw = std::max(1, gw), t.gh = std::max(1, gh);

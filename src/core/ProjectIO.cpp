@@ -1048,6 +1048,7 @@ QJsonObject sequenceToJson(const Sequence& s) {
     if (!s.workingSpace.empty()) o["workingSpace"] = qs(s.workingSpace);
     if (!s.outputTransform.empty()) o["outputTransform"] = qs(s.outputTransform);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
+    if (s.shutterAngle != 180) o["shutterAngle"] = s.shutterAngle;
     if (!s.trimTargets.empty()) {
         QJsonArray targets;
         for (const TrimTarget& tt : s.trimTargets) {
@@ -1129,6 +1130,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.workingSpace = ss(o.value("workingSpace"));
     s.outputTransform = ss(o.value("outputTransform"));
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
+    s.shutterAngle = std::clamp(o.value("shutterAngle").toDouble(180), 0.0, 720.0);
     for (const auto& v : o.value("trimTargets").toArray()) {
         const QJsonObject tt = v.toObject();
         TrimTarget target{ss(tt.value("id")), ss(tt.value("name")), ss(tt.value("colorSpace")), std::clamp(tt.value("peakNits").toDouble(100), 100.0, 10000.0),

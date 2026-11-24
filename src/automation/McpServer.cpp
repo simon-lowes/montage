@@ -702,6 +702,7 @@ QJsonObject projectJson(const Project& p) {
                        {"markers", markers},
                        {"media", media}};
     out["color_space"] = QString::fromStdString(sequenceColorSpace(s).id);
+    out["shutter_angle"] = s.shutterAngle;  // (what new transforms' and Motion Blurs' shutters start at)
     if (sceneReferredWorking(s)) {
         out["working_space"] = QString::fromStdString(workingColorSpace(s).id);
         out["output_transform"] = outputTransformKind(s) == OutputTransformKind::Aces2 ? "aces2" : "filmic";

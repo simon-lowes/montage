@@ -821,6 +821,8 @@ struct Sequence {
     // Stereoscopic 3D: the sequence is made for two eyes (its size is one eye's); each is rendered from stereo footage's
     // own eye, clips' Stereo 3D effect placing them in depth; exports pack the eyes (render/Stereo.h).
     bool stereo3d = false;
+    // The shutter (degrees of a frame) new transforms, Motion Blurs, warps and titles' letters are blurred through.
+    double shutterAngle = 180;
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;
