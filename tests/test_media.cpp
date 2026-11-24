@@ -39250,6 +39250,55 @@ private slots:
         QCOMPARE(shown[3], fa[3]);
     }
 
+    void exrWindowsTooLargeAreRefused() {
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        // Small files whose headers are changed to claim a data window far larger than what they hold: a deep scanline
+        // file 1.2 billion pixels wide (the width at which OpenEXR 3.5.4's CompositeDeepScanLine read outside its
+        // buffers) and a flat one of a million by a million. Each is refused before anything is allocated for it or
+        // read into it, and Valgrind sees no read past either file's buffers.
+        std::string err;
+        const DeepFrame small = buildDeep(8, 2, [](int, int, std::vector<DeepSample>& out) { out.push_back({1, 2, 0.5f, 0, 0, 0.5f}); });
+        QVERIFY2(writeDeepExr(path("wide-deep.exr"), small, "zips", false, false, &err), err.c_str());
+        ExrOutLayer main{"", {"R", "G", "B", "A"}, std::vector<float>(8 * 2 * 4, 0.5f)};
+        QVERIFY2(writeExr(path("wide-flat.exr"), 8, 2, {main}, "zip", {}, &err), err.c_str());
+        // The file as written reads back first.
+        DeepFrame back;
+        QVERIFY2(readDeepExr(path("wide-deep.exr"), back, &err), err.c_str());
+        QCOMPARE(back.width, 8);
+        auto claim = [&](const std::string& file, int32_t maxX, int32_t maxY) {
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QByteArray bytes = f.readAll();
+            const QByteArray key("dataWindow\0box2i\0", 17);
+            const int at = bytes.indexOf(key);
+            QVERIFY(at > 0 && at + 17 + 4 + 16 <= bytes.size());
+            int32_t box[4];
+            std::memcpy(box, bytes.constData() + at + 17 + 4, sizeof box);  // (xMin, yMin, xMax, yMax, little-endian)
+            QVERIFY(box[0] == 0 && box[1] == 0 && box[2] == 7 && box[3] == 1);
+            box[2] = maxX, box[3] = maxY;
+            std::memcpy(bytes.data() + at + 17 + 4, box, sizeof box);
+            QVERIFY(f.seek(0) && f.write(bytes) == bytes.size());
+        };
+        claim(path("wide-deep.exr"), 1'200'000'000 - 1, 1);
+        claim(path("wide-flat.exr"), 999'999, 999'999);
+        ExrInfo info;
+        QVERIFY(!readExrInfo(path("wide-deep.exr"), info, &err));
+        QVERIFY(!readDeepExr(path("wide-deep.exr"), back, &err));
+        QVERIFY(back.samples.empty());
+        int w = 0, h = 0;
+        std::vector<float> rgba;
+        QVERIFY(!compositeDeepWithOpenExr({path("wide-deep.exr")}, w, h, rgba, &err));
+        QVERIFY(rgba.empty());
+        QVERIFY(!readExrInfo(path("wide-flat.exr"), info, &err));
+        QVERIFY2(QString::fromStdString(err).contains("larger than Montage reads"), err.c_str());
+        QVERIFY(!readExrLayer(path("wide-flat.exr"), "", w, h, rgba, &err));
+        QVERIFY(rgba.empty());
+        int cw = 0, ch = 0;
+        std::vector<ExrCopiedLayer> copied;
+        QVERIFY(!readExrChannels(path("wide-flat.exr"), cw, ch, copied, nullptr, &err));
+        QVERIFY(copied.empty());
+    }
+
     void deepCompositing() {
         if (!exrAvailable()) QSKIP("Built without OpenEXR");
         // In a sequence: the red and blue volumes on two tracks merge the same in either order, under a flat clip above.

@@ -220,6 +220,18 @@ bool locate(const Imf::MultiPartInputFile& in, const std::string& layer, Located
     return false;
 }
 
+// A display or data window Montage will hold in memory: not empty, at most 262,144 pixels a side and 268 million in
+// all, worked out in 64 bits. A damaged or hostile header can claim a window of billions of pixels over a file of a
+// few bytes (OpenEXR 3.5.4 read past its buffers compositing deep lines more than about a billion pixels wide), so
+// every window is checked before anything is allocated for it or read into it.
+void checkWindow(const Imath::Box2i& w, const char* what) {
+    const int64_t width = int64_t(w.max.x) - w.min.x + 1, height = int64_t(w.max.y) - w.min.y + 1;
+    if (width < 1 || height < 1) throw std::runtime_error(std::string("its ") + what + " is empty");
+    if (width > (int64_t(1) << 18) || height > (int64_t(1) << 18) || width * height > (int64_t(1) << 28))
+        throw std::runtime_error(std::string("its ") + what + " (" + std::to_string(width) + " by " + std::to_string(height) +
+                                 ") is larger than Montage reads");
+}
+
 // The first deep part of a file, or -1.
 int isDeep(const Imf::MultiPartInputFile& in) {
     for (int p = 0; p < in.parts(); ++p)
@@ -314,6 +326,8 @@ bool readExrInfo(const std::string& file, ExrInfo& out, std::string* error) {
         Imf::MultiPartInputFile in(file.c_str());
         const Imf::Header& first = in.header(0);
         const Imath::Box2i& dw = first.displayWindow();
+        checkWindow(dw, "display window");
+        for (int p = 0; p < in.parts(); ++p) checkWindow(in.header(p).dataWindow(), "data window");
         out.width = dw.max.x - dw.min.x + 1;
         out.height = dw.max.y - dw.min.y + 1;
         out.pixelAspect = first.pixelAspectRatio() > 0 ? first.pixelAspectRatio() : 1;
@@ -415,6 +429,8 @@ bool readExrLayer(const std::string& file, const std::string& layer, int& width,
         }
         const Imf::Header& h = in.header(l.part);
         const Imath::Box2i disp = in.header(0).displayWindow(), dw = h.dataWindow();
+        checkWindow(disp, "display window");
+        checkWindow(dw, "data window");
         width = disp.max.x - disp.min.x + 1;
         height = disp.max.y - disp.min.y + 1;
         const int dwW = dw.max.x - dw.min.x + 1, dwH = dw.max.y - dw.min.y + 1;
@@ -499,6 +515,7 @@ bool readExrChannels(const std::string& file, int& width, int& height, std::vect
             }
             // The channels in groups, read as floats over the data window.
             const Imath::Box2i dw = h.dataWindow();
+            checkWindow(dw, "data window");
             const int dwW = dw.max.x - dw.min.x + 1, dwH = dw.max.y - dw.min.y + 1;
             std::vector<ExrCopiedLayer> groups;
             std::vector<std::vector<float>> buffers;
@@ -616,6 +633,8 @@ bool readCryptomatte(const std::string& file, const std::string& name, Cryptomat
             throw std::runtime_error("its Cryptomatte is not where its header said");
         const Imf::Header& h = in.header(part);
         const Imath::Box2i disp = in.header(0).displayWindow(), dw = h.dataWindow();
+        checkWindow(disp, "display window");
+        checkWindow(dw, "data window");
         out.width = disp.max.x - disp.min.x + 1;
         out.height = disp.max.y - disp.min.y + 1;
         out.ranks = int(c->channels.size() / 2);
@@ -931,6 +950,7 @@ bool readAcesContainer(const uint8_t* data, size_t size, AcesContainerInfo& info
         Imf::InputFile file(stream, 1);
         const Imf::Header& header = file.header();
         const Imath::Box2i dw = header.dataWindow();
+        checkWindow(dw, "data window");
         info.width = dw.max.x - dw.min.x + 1;
         info.height = dw.max.y - dw.min.y + 1;
         info.alpha = header.channels().findChannel("A") != nullptr;
@@ -1007,6 +1027,8 @@ bool readDeepExr(const std::string& file, DeepFrame& out, std::string* error, bo
         }
         const Imf::Header& h = in.header(p);
         const Imath::Box2i disp = in.header(0).displayWindow(), dw = h.dataWindow();
+        checkWindow(disp, "display window");
+        checkWindow(dw, "data window");
         const int dwW = dw.max.x - dw.min.x + 1, dwH = dw.max.y - dw.min.y + 1;
         const size_t n = size_t(dwW) * size_t(dwH);
         static const char* names[] = {"Z", "ZBack", "R", "G", "B", "A"};
@@ -1194,6 +1216,7 @@ bool compositeDeepWithOpenExr(const std::vector<std::string>& files, int& width,
             comp.addSource(in.back().get());
         }
         const Imath::Box2i dw = comp.dataWindow();
+        checkWindow(dw, "data window");
         width = dw.max.x - dw.min.x + 1, height = dw.max.y - dw.min.y + 1;
         rgba.assign(size_t(width) * size_t(height) * 4, 0.0f);
         Imf::FrameBuffer fb;

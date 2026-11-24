@@ -142,8 +142,8 @@ if(MONTAGE_WITH_OPENEXR)
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   FetchContent_Declare(openexr
     GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/openexr.git
-    # v3.5.4, pinned by its commit (a tag can be moved)
-    GIT_TAG 86687e5f34e3a164820c5e280259550e3ca87c92)
+    # v3.5.5, pinned by its commit (a tag can be moved)
+    GIT_TAG 486e238dd28ba6fed22528005b05f9f15bef0cc0)
   FetchContent_MakeAvailable(openexr)
   if(NOT WIN32)
     # zstd marks its API visibility("default") over OpenEXRCore's hidden default, so the executable would export its
