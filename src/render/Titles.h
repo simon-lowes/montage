@@ -17,6 +17,7 @@
 #include <QTransform>
 #include <array>
 #include <functional>
+#include <memory>
 #include <map>
 #include <optional>
 #include <string>
@@ -130,11 +131,17 @@ struct SvgTextLayout {
     double textLength = 0;   // textLength (the text's units), 0 for none
     bool adjustGlyphs = false;  // lengthAdjust="spacingAndGlyphs": the letters stretched too, not only spaced out
     double down = 0;  // dominant-baseline: the alphabetic baseline this far below the text's y (the text's units)
+    bool stretch = false;  // textPath method="stretch": each letter's outline bent along the path
+    // writing-mode vertical: set top to bottom, x the column's middle; each letter upright (its box's top at the pen,
+    // the pen moving down by its ascent and descent) or turned a quarter clockwise (its middle on the column, the pen
+    // moving down by its advance). orient: 0 mixed (upright for scripts written upright), 1 upright, 2 turned.
+    bool vertical = false;
+    int orient = 0;
     // The title's Position when it was laid out: moved from there, the text moves with it (output pixels).
     double atX = 0, atY = 0;
     bool empty() const {
         return matrix.isIdentity() && x.empty() && y.empty() && rotate.empty() && dx.empty() && dy.empty() && anchor == 0 && path.empty() &&
-               textLength == 0 && down == 0;
+               textLength == 0 && down == 0 && !stretch && !vertical;
     }
 };
 std::string svgTextLayoutJson(const SvgTextLayout& l);

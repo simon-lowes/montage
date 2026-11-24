@@ -42554,8 +42554,8 @@ private slots:
     void svgTextLengthsBaselinesAndSpans() {
         // SVG text attributes the test writes, each made a title and drawn within 1/255 of a reference the test paints
         // with QPainter where SVG puts each letter: textLength by spacing and by stretching the letters too, a
-        // textPath's side="right", dominant-baseline, baseline-shift, and tspans with a fill, size, weight and slant
-        // of their own.
+        // textPath's side="right", dominant-baseline, baseline-shift, tspans with a fill, size, weight and slant
+        // of their own, letters bent along their path (method="stretch"), and vertical text, turned and upright.
         Project p = makeDefaultProject();
         auto write = [&](const char* name, const std::string& body) {
             const std::string file = path(name);
@@ -42806,13 +42806,105 @@ private slots:
             for (const Letter& l : little) whites.addPath(QTransform::fromTranslate(x, 100).map(l.path)), x += l.advance;
             QVERIFY(same("tspans in their own look", drawn(texts[0]), paint({{whites, white}, {reds, QColor(255, 0, 0)}})));
         }
-        // What is not drawn as SVG has it is said: text stretched along its path, and vertical text.
+        // method="stretch" on a textPath round a circle of radius 60 about (100, 100), from startOffset 20: each
+        // letter's outline bent round the circle, a point x along the line and y below it landing x round the circle
+        // from its top (clockwise) and y inside it. The reference bends each letter's outline flattened to 1/256 px
+        // with its edges cut to a quarter of a pixel.
         {
-            textsOf(write("stretch.svg", std::string("<defs><path id=\"line\" d=\"M 20 100 L 180 100\"/></defs><text font-size=\"30\" ") + look +
-                                             "><textPath xlink:href=\"#line\" method=\"stretch\">HEMN</textPath></text>"));
-            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("stretched along its path") != std::string::npos; }));
-            textsOf(write("vertical.svg", std::string("<text x=\"100\" y=\"20\" writing-mode=\"vertical-rl\" font-size=\"30\" ") + look + ">HEMN</text>"));
-            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Vertical text") != std::string::npos; }));
+            const std::vector<SvgText> texts = textsOf(write(
+                "stretch.svg", std::string("<defs><path id=\"ring\" d=\"M 100 40 A 60 60 0 0 1 100 160 A 60 60 0 0 1 100 40 Z\"/></defs>"
+                                           "<text font-size=\"30\" ") + look +
+                                   "><textPath xlink:href=\"#ring\" method=\"stretch\" startOffset=\"20\">HEMN</textPath></text>"));
+            QCOMPARE(int(texts.size()), 1);
+            QVERIFY(texts[0].layout.stretch);
+            QVERIFY(std::none_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("stretched") != std::string::npos; }));
+            auto onRing = [](QPointF a) {
+                const double th = -M_PI / 2 + a.x() / 60, r = 60 - a.y();
+                return QPointF(100 + r * std::cos(th), 100 + r * std::sin(th));
+            };
+            QPainterPath all;
+            double along = 20;
+            for (const Letter& l : ls) {
+                for (const QPolygonF& poly : l.path.toSubpathPolygons(QTransform::fromScale(256, 256))) {
+                    QPolygonF bent;
+                    QPointF prev = poly[0] / 256;
+                    bent << onRing(prev + QPointF(along, 0));
+                    for (int i = 1; i < poly.size(); ++i) {
+                        const QPointF cur = poly[i] / 256;
+                        const int cuts = std::max(1, int(std::ceil(QLineF(prev, cur).length() / 0.25)));
+                        for (int c = 1; c <= cuts; ++c) bent << onRing(prev + (cur - prev) * (double(c) / cuts) + QPointF(along, 0));
+                        prev = cur;
+                    }
+                    all.addPolygon(bent);
+                    all.closeSubpath();
+                }
+                along += l.advance;
+            }
+            QVERIFY(same("text stretched round its path", drawn(texts[0]), paint({{all, white}})));
+            // Set along a path without stretching, the letters keep their shapes (the drawing is not the bent one).
+            const std::vector<SvgText> unbent = textsOf(write(
+                "unbent.svg", std::string("<defs><path id=\"ring\" d=\"M 100 40 A 60 60 0 0 1 100 160 A 60 60 0 0 1 100 40 Z\"/></defs>"
+                                          "<text font-size=\"30\" ") + look + "><textPath xlink:href=\"#ring\" startOffset=\"20\">HEMN</textPath></text>"));
+            QVERIFY(!unbent[0].layout.stretch);
+            QVERIFY(!same("text set round its path, unbent", drawn(unbent[0]), paint({{all, white}})));
+            const std::optional<SvgTextLayout> back = parseSvgTextLayout(svgTextTitle(texts[0]).s("svg_text"));
+            QVERIFY(back && back->stretch && !back->vertical);
+        }
+        // writing-mode vertical-rl: set top to bottom from y 20, x 100 the column's middle. Latin letters (mixed
+        // orientation, the default) turned a quarter clockwise, each moving the pen down by its advance and its middle
+        // (half way between the font's ascent and descent) on the column; with text-orientation upright (or SVG 1.1's
+        // glyph-orientation-vertical 0) each stands upright, its box's top at the pen, its middle on the column, the pen
+        // moving down by the font's ascent and descent; text-anchor middle centres the column on y.
+        {
+            const QFontMetricsF fm(font(30));
+            const double asc = fm.ascent(), desc = fm.descent();
+            auto turned = [&](double y0) {
+                QPainterPath all;
+                double y = y0;
+                for (const Letter& l : ls) {
+                    QTransform m;
+                    m.translate(100 - (asc - desc) / 2, y);
+                    m.rotate(90);
+                    all.addPath(m.map(l.path));
+                    y += l.advance;
+                }
+                return all;
+            };
+            auto standing = [&](double y0) {
+                QPainterPath all;
+                double y = y0;
+                for (const Letter& l : ls) {
+                    all.addPath(QTransform::fromTranslate(100 - l.advance / 2, y + asc).map(l.path));
+                    y += asc + desc;
+                }
+                return all;
+            };
+            const std::vector<SvgText> mixed =
+                textsOf(write("vertical.svg", std::string("<text x=\"100\" y=\"20\" writing-mode=\"vertical-rl\" font-size=\"30\" ") + look + ">HEMN</text>"));
+            QCOMPARE(int(mixed.size()), 1);
+            QVERIFY(mixed[0].layout.vertical && mixed[0].layout.orient == 0);
+            QVERIFY(std::none_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Vertical") != std::string::npos; }));
+            QVERIFY(same("vertical text, letters turned", drawn(mixed[0]), paint({{turned(20), white}})));
+            const std::vector<SvgText> upright = textsOf(write(
+                "upright.svg", std::string("<text x=\"100\" y=\"20\" style=\"writing-mode: vertical-rl; text-orientation: upright\" font-size=\"30\" ") +
+                                   look + ">HEMN</text>"));
+            QCOMPARE(int(upright.size()), 1);
+            QCOMPARE(upright[0].layout.orient, 1);
+            QVERIFY(same("vertical text, letters upright", drawn(upright[0]), paint({{standing(20), white}})));
+            const std::vector<SvgText> old = textsOf(write(
+                "old.svg", std::string("<text x=\"100\" y=\"20\" writing-mode=\"tb\" glyph-orientation-vertical=\"0\" font-size=\"30\" ") + look + ">HEMN</text>"));
+            QVERIFY(old[0].layout.vertical && old[0].layout.orient == 1);
+            QVERIFY(same("vertical text, glyph-orientation-vertical 0", drawn(old[0]), paint({{standing(20), white}})));
+            const std::vector<SvgText> middle = textsOf(write(
+                "middle.svg", std::string("<text x=\"100\" y=\"100\" writing-mode=\"vertical-rl\" text-orientation=\"upright\" text-anchor=\"middle\" "
+                                          "font-size=\"30\" ") + look + ">HEMN</text>"));
+            QVERIFY(same("vertical text, anchored in its middle", drawn(middle[0]), paint({{standing(100 - 2 * (asc + desc)), white}})));
+            const std::optional<SvgTextLayout> back = parseSvgTextLayout(svgTextTitle(upright[0]).s("svg_text"));
+            QVERIFY(back && back->vertical && back->orient == 1 && !back->stretch);
+            // Vertical text on a path is set along it as horizontal text, and said so.
+            textsOf(write("vpath.svg", std::string("<defs><path id=\"line\" d=\"M 20 100 L 180 100\"/></defs><text writing-mode=\"vertical-rl\" font-size=\"30\" ") +
+                                           look + "><textPath xlink:href=\"#line\">HEMN</textPath></text>"));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Vertical text on a path") != std::string::npos; }));
         }
         // A title an earlier version made from SVG text (its layout without the new entries) is laid out as it was.
         {
