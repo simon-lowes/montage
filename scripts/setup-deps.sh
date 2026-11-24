@@ -3,6 +3,71 @@
 set -euo pipefail
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+# ONNX Runtime (object masks): Ubuntu does not package it, so Microsoft's release goes to /opt/onnxruntime, where
+# CMake looks for it. It comes from Microsoft's NuGet package, which holds the library and headers for Linux on x64
+# and Arm64, and the package is checked against the SHA-256 kept here before anything in it is used (taken on
+# 24 November 2026 of the package whose SHA-512 is the one NuGet's catalog lists for it). GitHub's release archive
+# of the same version was the first source until it answered 404 on 19 November 2026; it is no longer fetched, as no
+# sum could be taken of it.
+ORT_VERSION=1.32.0
+ORT_NUPKG_SHA256=a9150bc2992cbbb6722070da9910e1ffa989a8bfc67bdd5bb8e745ca755641db
+case "$(uname -m)" in
+  x86_64) ORT_ARCH=x64 ;;
+  aarch64) ORT_ARCH=arm64 ;;
+  *) ORT_ARCH="" ;;
+esac
+# Checks a NuGet package against the sum above and takes Linux's library, headers and licences for one architecture
+# out of it into a folder: ort_unpack <package> <folder> <x64|arm64>. A package that is not the one the sum was taken
+# of is refused before it is opened.
+ort_unpack() {
+  local got
+  got=$(sha256sum "$1" | cut -d' ' -f1)
+  if [ "$got" != "$ORT_NUPKG_SHA256" ]; then
+    echo "$1 is not ONNX Runtime $ORT_VERSION's NuGet package: its SHA-256 is $got, not $ORT_NUPKG_SHA256" >&2
+    return 1
+  fi
+  mkdir -p "$2/include" "$2/lib"
+  python3 -I - "$1" "$2" "$3" "$ORT_VERSION" <<'EOF' || return 1
+import os, sys, zipfile
+nupkg, out, arch, version = sys.argv[1:]
+native = f"runtimes/linux-{arch}/native/"
+with zipfile.ZipFile(nupkg) as z:
+    names = z.namelist()
+    if native + "libonnxruntime.so" not in names:
+        sys.exit(f"no {native}libonnxruntime.so in the package")
+    for name in names:
+        base = os.path.basename(name)
+        if name.startswith("build/native/include/") and base.endswith(".h"):
+            target = os.path.join(out, "include", base)
+        elif name == native + "libonnxruntime.so":
+            target = os.path.join(out, "lib", "libonnxruntime.so." + version)
+        elif name.startswith(native) and base.endswith(".so"):
+            target = os.path.join(out, "lib", base)
+        elif name in ("LICENSE", "ThirdPartyNotices.txt"):
+            target = os.path.join(out, name)
+        else:
+            continue
+        with z.open(name) as src, open(target, "wb") as dst:
+            dst.write(src.read())
+os.chmod(os.path.join(out, "lib", "libonnxruntime.so." + version), 0o755)
+os.symlink("libonnxruntime.so." + version, os.path.join(out, "lib", "libonnxruntime.so.1"))
+os.symlink("libonnxruntime.so.1", os.path.join(out, "lib", "libonnxruntime.so"))
+with open(os.path.join(out, "VERSION_NUMBER"), "w") as f:
+    f.write(version + "\n")
+EOF
+}
+# scripts/setup-deps.sh --check-onnxruntime <package>: checks and unpacks a NuGet package as an install would, into a
+# temporary folder, and installs nothing (CI's check that a changed package is refused).
+if [ "${1:-}" = --check-onnxruntime ]; then
+  [ -n "${2:-}" ] || { echo "Usage: $0 --check-onnxruntime <package>" >&2; exit 2; }
+  check=$(mktemp -d)
+  status=0
+  ort_unpack "$2" "$check/ort" "${ORT_ARCH:-x64}" || status=1
+  [ "$status" != 0 ] || [ -f "$check/ort/include/onnxruntime_cxx_api.h" ] || { echo "No headers in $2" >&2; status=1; }
+  rm -rf "$check"
+  [ "$status" != 0 ] || echo "$2 is ONNX Runtime $ORT_VERSION's NuGet package"
+  exit "$status"
+fi
 # Retry flaky mirrors, give up on a stalled connection instead of hanging, and wait a bounded time for another apt
 # (a runner's own updates) to let go of its lock. Each step says when it starts, so a log shows where one stalls.
 APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=180)
@@ -68,71 +133,22 @@ if ! install_packages 240; then
   $SUDO dpkg --configure -a || true
   install_packages 480
 fi
-# ONNX Runtime (object masks): Ubuntu does not package it, so Microsoft's
-# release goes to /opt/onnxruntime, where CMake looks for it.
-ORT_VERSION=1.32.0
-case "$(uname -m)" in
-  x86_64) ORT_ARCH=x64; ORT_NUGET_ARCH=x64 ;;
-  aarch64) ORT_ARCH=aarch64; ORT_NUGET_ARCH=arm64 ;;
-  *) ORT_ARCH="" ;;
-esac
-# Microsoft's NuGet package of the same release holds the same library and headers. It is the second source:
-# on 19 November 2026 GitHub answered 404 for the release archive that had worked until then.
-ort_from_nuget() {
-  curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --speed-limit 51200 --speed-time 60 --max-time 900 \
-    -o "$tmp/ort.nupkg" "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$ORT_VERSION/microsoft.ml.onnxruntime.$ORT_VERSION.nupkg" \
-    || return 1
-  mkdir -p "$tmp/ort/include" "$tmp/ort/lib"
-  python3 -I - "$tmp/ort.nupkg" "$tmp/ort" "$ORT_NUGET_ARCH" "$ORT_VERSION" <<'EOF' || return 1
-import os, sys, zipfile
-nupkg, out, arch, version = sys.argv[1:]
-native = f"runtimes/linux-{arch}/native/"
-with zipfile.ZipFile(nupkg) as z:
-    names = z.namelist()
-    if native + "libonnxruntime.so" not in names:
-        sys.exit(f"no {native}libonnxruntime.so in the package")
-    for name in names:
-        base = os.path.basename(name)
-        if name.startswith("build/native/include/") and base.endswith(".h"):
-            target = os.path.join(out, "include", base)
-        elif name == native + "libonnxruntime.so":
-            target = os.path.join(out, "lib", "libonnxruntime.so." + version)
-        elif name.startswith(native) and base.endswith(".so"):
-            target = os.path.join(out, "lib", base)
-        elif name in ("LICENSE", "ThirdPartyNotices.txt"):
-            target = os.path.join(out, name)
-        else:
-            continue
-        with z.open(name) as src, open(target, "wb") as dst:
-            dst.write(src.read())
-os.chmod(os.path.join(out, "lib", "libonnxruntime.so." + version), 0o755)
-os.symlink("libonnxruntime.so." + version, os.path.join(out, "lib", "libonnxruntime.so.1"))
-os.symlink("libonnxruntime.so.1", os.path.join(out, "lib", "libonnxruntime.so"))
-with open(os.path.join(out, "VERSION_NUMBER"), "w") as f:
-    f.write(version + "\n")
-EOF
-}
 if [ -n "$ORT_ARCH" ] && [ ! -f /opt/onnxruntime/include/onnxruntime_cxx_api.h ]; then
   tmp=$(mktemp -d)
   echo "$(date -u +%T) ONNX Runtime $ORT_VERSION"
-  # (A download slower than 50 KB/s for a minute is given up and retried. GitHub's release downloads can answer 504
-  # for minutes at a time, so a failed round tries NuGet, and then both again after a pause, for about five minutes.)
-  ort_url="https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-linux-$ORT_ARCH-$ORT_VERSION.tgz"
+  # (A download slower than 50 KB/s for a minute is given up and retried, and a failed round is tried again after a
+  # pause, for about five minutes. MONTAGE_KEEP_ONNXRUNTIME_PACKAGE names a file the checked package is copied to.)
+  ort_url="https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$ORT_VERSION/microsoft.ml.onnxruntime.$ORT_VERSION.nupkg"
   for round in 1 2 3 4 5 6; do
-    if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --speed-limit 51200 --speed-time 60 --max-time 600 \
-         -o "$tmp/ort.tgz" "$ort_url"; then
-      $SUDO mkdir -p /opt/onnxruntime
-      $SUDO tar -xzf "$tmp/ort.tgz" -C /opt/onnxruntime --strip-components=1
-      break
-    fi
-    echo "$(date -u +%T) ONNX Runtime's archive could not be downloaded from GitHub; trying its NuGet package"
     rm -rf "$tmp/ort" "$tmp/ort.nupkg"
-    if ort_from_nuget; then
+    if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --speed-limit 51200 --speed-time 60 --max-time 900 \
+         -o "$tmp/ort.nupkg" "$ort_url" && ort_unpack "$tmp/ort.nupkg" "$tmp/ort" "$ORT_ARCH"; then
       $SUDO mkdir -p /opt/onnxruntime
       $SUDO cp -a "$tmp/ort/." /opt/onnxruntime/
+      [ -z "${MONTAGE_KEEP_ONNXRUNTIME_PACKAGE:-}" ] || cp "$tmp/ort.nupkg" "$MONTAGE_KEEP_ONNXRUNTIME_PACKAGE"
       break
     fi
-    [ "$round" -eq 6 ] && { echo "ONNX Runtime could not be downloaded from $ort_url or NuGet" >&2; exit 22; }
+    [ "$round" -eq 6 ] && { echo "ONNX Runtime could not be downloaded from $ort_url" >&2; exit 22; }
     echo "$(date -u +%T) ONNX Runtime download failed; trying again in 45 s"
     sleep 45
   done

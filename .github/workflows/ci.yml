@@ -18,7 +18,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         timeout-minutes: 15
+        env:
+          MONTAGE_KEEP_ONNXRUNTIME_PACKAGE: ${{ runner.temp }}/onnxruntime.nupkg
         run: ./scripts/setup-deps.sh
+      - name: ONNX Runtime's package with one byte changed is refused
+        run: |
+          pkg="$RUNNER_TEMP/onnxruntime.nupkg"
+          scripts/setup-deps.sh --check-onnxruntime "$pkg"
+          cp "$pkg" "$RUNNER_TEMP/changed.nupkg"
+          python3 -I -c 'import sys; f = open(sys.argv[1], "r+b"); f.seek(1000000); b = f.read(1); f.seek(1000000); f.write(bytes([b[0] ^ 1]))' \
+            "$RUNNER_TEMP/changed.nupkg"
+          if scripts/setup-deps.sh --check-onnxruntime "$RUNNER_TEMP/changed.nupkg"; then echo "A changed package was taken" >&2; exit 1; fi
+          rm -f "$pkg" "$RUNNER_TEMP/changed.nupkg"
       - name: Rust version (part of the C2PA library's cache key)
         id: rust
         run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
