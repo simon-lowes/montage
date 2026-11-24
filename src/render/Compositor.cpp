@@ -1607,14 +1607,19 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 // shows over that time, read from its speed and Time Remapping, are those the picture is blurred
                 // through, so footage played fast is blurred over every source frame it passes and slow motion over
                 // a part of one; a frame held is not blurred at all. Frames made in between (Frame Blending, Optical
-                // Flow, AI frames) take the motion between the frames they are made from.
+                // Flow, AI frames) take the motion between the frames they are made from. (A Motion Blur saved before it
+                // followed the edit, with no follow_edit, is blurred over its shutter in source frames, as it was.)
                 const double open = blur && !motionBlurOff() ? std::clamp(blur->p("shutter", lt, 180), 0.0, 720.0) / 360 : 0;
-                const double perSeq = mf / seq.fpsValue();  // source frames a sequence frame of source position
-                const double local = double(t - c.start);
-                const double here = c.sourceAt(local);
-                double from = (c.sourceAt(local - open / 2) - here) * perSeq, to = (c.sourceAt(local + open / 2) - here) * perSeq;
-                if (from > to) std::swap(from, to);  // (played backwards)
-                const double at = between ? std::clamp(sec * mf - double(base), 0.0, 1.0) : 0.0;
+                const bool follow = blur && blur->p("follow_edit", lt, 0) > 0.5;
+                double from = -open / 2, to = open / 2;
+                if (follow) {
+                    const double perSeq = mf / seq.fpsValue();  // source frames a sequence frame of source position
+                    const double local = double(t - c.start);
+                    const double here = c.sourceAt(local);
+                    from = (c.sourceAt(local - open / 2) - here) * perSeq, to = (c.sourceAt(local + open / 2) - here) * perSeq;
+                    if (from > to) std::swap(from, to);  // (played backwards)
+                }
+                const double at = follow && between ? std::clamp(sec * mf - double(base), 0.0, 1.0) : 0.0;
                 if (open > 0 && to - from > 1e-9) {
                     const Image self = decoded.empty() ? src : decoded;
                     // The frames it runs over: as far as the shutter reaches, at least one either side.

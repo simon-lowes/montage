@@ -1080,7 +1080,11 @@ std::vector<EffectInfo> buildCatalog() {
                      {num("hold", "Hold Each Frame For (frames)", 1, 30, 3, 1)}, {}});
         // From the frames either side (render/TemporalFx.h; worked out where the source frame is read).
         c.push_back({"motion_blur", "Motion Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
-                     {num("shutter", "Shutter Angle (°)", 0, 720, 180, 1)}, {}});
+                     {num("shutter", "Shutter Angle (°)", 0, 720, 180, 1),
+                      // (measured in the sequence's time, through the clip's speed and Time Remapping; read as off in
+                      // projects saved before it, which blurred over the shutter in source frames)
+                      boolean("follow_edit", "Follow Speed Changes and Time Remapping", true)},
+                     {}});
         c.push_back({"deflicker", "Deflicker", EffectCategory::VideoFilter, "Repair",
                      {num("frames", "Frames Either Side", 1, 12, 3, 1), choice("area", "Even Out", {"Whole Frame", "Each Area (16 x 9)"}, 1),
                       pct("strength", "Strength", 0, 100, 100)},

@@ -593,6 +593,7 @@ const char* const kTexts[] = {
     QT_TRANSLATE_NOOP("Engine", "Follow Camera"),
     QT_TRANSLATE_NOOP("Engine", "Follow Over Time"),
     QT_TRANSLATE_NOOP("Engine", "Follow Slanting Scratches"),
+    QT_TRANSLATE_NOOP("Engine", "Follow Speed Changes and Time Remapping"),
     QT_TRANSLATE_NOOP("Engine", "Follow the 360° View"),
     QT_TRANSLATE_NOOP("Engine", "Font"),
     QT_TRANSLATE_NOOP("Engine", "Font Size (px)"),

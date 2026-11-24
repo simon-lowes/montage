@@ -21488,6 +21488,17 @@ if __name__ == '__main__':
         mb.params["shutter"] = Param(180.0);
         const double quarter = smear(20);
         QVERIFY2(std::abs(quarter - 4) < 0.8, qPrintable(QString::number(quarter)));
+        // A Motion Blur saved before it followed the edit (with no follow_edit, read as off) blurs over its shutter in
+        // source frames, as it always did: at 400 % as long as at 100 %.
+        QCOMPARE(mb.p("follow_edit", 0), 1.0);
+        mb.params.erase("follow_edit");
+        mb.params["shutter"] = Param(720.0);
+        c.speed = 4;
+        c.duration = 9;
+        const double before = smear(5);
+        QVERIFY2(std::abs(before / normal - 1) < 0.1, qPrintable(QString::number(before / normal)));
+        c.speed = 1;
+        c.duration = 40;
         // Every motion blur off (an export for a VFX pull): as sharp as without the effect.
         RenderOptions off;
         off.motionBlur = false;
