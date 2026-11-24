@@ -524,7 +524,9 @@ void DialogJobs::startTask(Task& t) {
             while (sh->paused.load() && !sh->cancel.load()) QThread::msleep(20);
         };
         r.progress(0);
-        bool ok = run && !sh->cancel.load() && run(r) && !sh->cancel.load();
+        // (stopped by hand, it ends well only where it made what it was for and stopped only what came after, a
+        // package's check, as its result's "stopped" says)
+        bool ok = run && !sh->cancel.load() && run(r) && (!sh->cancel.load() || r.result.value("stopped").toBool());
         sh->error = r.error;
         if (ok) {
             sh->result = r.result;
@@ -594,7 +596,8 @@ QJsonObject DialogJobs::applyResult(Task& t, const QJsonObject& result, QString*
 void DialogJobs::taskFinished(const QString& id) {
     Task* t = task(id);
     if (!t) return;
-    const bool cancelled = t->shared->cancel.load(), ok = t->watcher.result() && !cancelled;
+    // (a task that ended well is done even when it was stopped as it ended: what it made is kept)
+    const bool ok = t->watcher.result(), cancelled = !ok && t->shared->cancel.load();
     TaskOutcome out;
     out.id = id;
     out.how = cancelled ? TaskOutcome::Cancelled : ok ? TaskOutcome::Done : TaskOutcome::Failed;

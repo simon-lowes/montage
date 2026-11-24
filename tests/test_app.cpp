@@ -7011,6 +7011,34 @@ private slots:
             QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
             QVERIFY(QDir(parent).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
         }
+        // Stopped by hand while the made package is checked: the job is done, the package kept whole, and the window
+        // says it was made with its check stopped (not that it was cancelled).
+        {
+            const QString parent = dir_.filePath("dcp-check-stopped");
+            win_->statusBar()->clearMessage();
+            qputenv("MONTAGE_JOBS_PAUSE_AT", "0.9");
+            const QString job = dialogs->start(state(), "dcp", "Making the DCP", dcpInput(parent));
+            qunsetenv("MONTAGE_JOBS_PAUSE_AT");
+            QVERIFY(!job.isEmpty());
+            const auto paused = [&] {
+                for (const DialogJobs::TaskInfo& t : dialogs->tasks())
+                    if (t.id == job) return t.paused;
+                return false;
+            };
+            QTRY_VERIFY_WITH_TIMEOUT(paused(), 300000);
+            dialogs->stop(job);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+            const QJsonObject result = taskResult(job);
+            QVERIFY(result.value("stopped").toBool());
+            jobs::Record record;
+            QVERIFY(jobs::load(job, record));
+            QCOMPARE(record.status, QString("done"));
+            const QString folder = QString::fromStdString(dcpResultFromJson(result).folder);
+            QCOMPARE(QDir(parent).entryList({"JobTest_*"}, QDir::Dirs | QDir::NoDotAndDotDot).size(), 1);
+            QVERIFY(verifyDcp(folder.toStdString()).empty());
+            QVERIFY(dcpPictures(folder) == pictures);
+            QVERIFY2(win_->statusBar()->currentMessage().contains("its check was stopped"), qPrintable(win_->statusBar()->currentMessage()));
+        }
 
         // ---- The IMF master.
         ImfSettings master;
