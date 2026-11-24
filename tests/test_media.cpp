@@ -26027,10 +26027,12 @@ private:
 private slots:
     void vp9SmartRenderCopiesGops() {
         if (!avcodec_find_encoder_by_name("libvpx-vp9")) QSKIP("This build of FFmpeg has no libvpx VP9 encoder");
-        // At 25 frames a second, and at 30, where WebM's millisecond times are each frame's rounded (33, 67, 100).
-        vp9SmartRender(25);
-        if (QTest::currentTestFailed()) return;
-        vp9SmartRender(30);
+        // At 25 frames a second, and at 24, 30 and 60, where WebM's millisecond times are each frame's rounded (at 24:
+        // 42, 83, 125; at 60: 17, 33, 50).
+        for (const int fps : {25, 24, 30, 60}) {
+            vp9SmartRender(fps);
+            if (QTest::currentTestFailed()) return;
+        }
     }
 
 private:
