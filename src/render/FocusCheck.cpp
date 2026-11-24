@@ -11,6 +11,7 @@
 #include "core/ColorGroups.h"
 #include "core/History.h"
 #include "media/MediaPool.h"
+#include "media/Tracking.h"
 
 namespace montage {
 
@@ -136,6 +137,16 @@ double quantile(std::vector<double> v, double share) {
     return v[at];
 }
 
+// How the grain over frames [a, b) of a shot was measured, for the report: " (grain measured between frames)", " (grain
+// measured on each frame alone: ...)", or both with how many frames each.
+std::string noiseNote(const std::vector<FocusMeasure>& frames, size_t a, size_t b) {
+    size_t between = 0, n = 0;
+    for (size_t i = a; i < b && i < frames.size(); ++i) between += frames[i].noiseBetweenFrames, ++n;
+    if (between == n) return " (grain measured between frames)";
+    if (between == 0) return " (grain measured on each frame alone, as for a still)";
+    return " (grain measured between frames on " + std::to_string(between) + " of " + std::to_string(n) + " frames, on the frame alone on the rest)";
+}
+
 // Runs of `on` at least `minLength` long, gaps of one frame bridged: [a, b) indexes.
 std::vector<std::pair<int, int>> runs(const std::vector<char>& on, int minLength) {
     std::vector<std::pair<int, int>> out;
@@ -165,7 +176,7 @@ std::vector<float> lumaOf(const Image& img) {
     return y;
 }
 
-FocusMeasure measureFocus(const float* luma, int w, int h, int threads) {
+FocusMeasure measureFocus(const float* luma, int w, int h, int threads, double between) {
     FocusMeasure m;
     if (!luma || w < 8 || h < 8) return m;
     static const std::vector<std::vector<float>> kernels{kernel(kSigmaFine),     kernel(kSigmaMid),      kernel(kSigmaBroad),
@@ -231,6 +242,11 @@ FocusMeasure measureFocus(const float* luma, int w, int h, int threads) {
             std::nth_element(noise.begin(), noise.begin() + std::ptrdiff_t(noise.size() / 2), noise.end());
             sigma = noise[noise.size() / 2];
         }
+        // (the noise between frames where there is one: the frame's own estimate reads fine texture as noise too, so
+        // it is used only where it is the lower)
+        if (between >= 0 && between < sigma) sigma = between;
+        m.noiseBetweenFrames = between >= 0;
+        m.noise = sigma;
         static const double fineGain = noiseGain(kernels[0], kernels[1]), broadGain = noiseGain(kernels[0], kernels[2]);
         const double v = sigma * sigma;
         for (TileSums& s : tiles) {
@@ -279,6 +295,168 @@ FocusMeasure measureFocus(const float* luma, int w, int h, int threads) {
     return m;
 }
 
+namespace {
+
+constexpr double kNoiseTile = 32;     // the tiles the noise between frames is measured in (px, at most)
+constexpr double kFlowMismatch = 0.5;  // px: a point whose forward and backward motion disagree by this much is left out
+
+// Catmull-Rom's four weights at t (0..1) for the samples at -1, 0, 1, 2.
+void cubicWeights(double t, double w[4]) {
+    const double t2 = t * t, t3 = t2 * t;
+    w[0] = 0.5 * (-t3 + 2 * t2 - t);
+    w[1] = 0.5 * (3 * t3 - 5 * t2 + 2);
+    w[2] = 0.5 * (-3 * t3 + 4 * t2 + t);
+    w[3] = 0.5 * (t3 - t2);
+}
+
+struct NoiseGrid {
+    int tile = 32, nx = 1, ny = 1;
+};
+
+NoiseGrid noiseGrid(int w, int h) {
+    NoiseGrid g;
+    g.tile = std::clamp(int(std::min({kNoiseTile, double(w) / 4, double(h) / 4})), 8, 64);
+    g.nx = std::max(1, w / g.tile), g.ny = std::max(1, h / g.tile);
+    return g;
+}
+
+// Tile by tile, the noise's standard deviation in `cur` less `nb` brought onto it along `fwd` (cur to nb), checked
+// against `back` (nb to cur): -1 for a tile with too few points matched.
+void tileNoise(const GrayImage& cur, const GrayImage& nb, const FlowField& fwd, const FlowField& back, const NoiseGrid& g,
+               std::vector<double>& out, int threads) {
+    const int w = cur.width, h = cur.height;
+    out.assign(size_t(g.nx) * size_t(g.ny), -1);
+    inBands(g.ny, threads, [&](int t0, int t1) {
+        std::vector<float> z;
+        for (int ty = t0; ty < t1; ++ty)
+            for (int tx = 0; tx < g.nx; ++tx) {
+                const int x0 = int(int64_t(w) * tx / g.nx), x1 = int(int64_t(w) * (tx + 1) / g.nx);
+                const int y0 = int(int64_t(h) * ty / g.ny), y1 = int(int64_t(h) * (ty + 1) / g.ny);
+                z.clear();
+                for (int y = y0; y < y1; ++y)
+                    for (int x = x0; x < x1; ++x) {
+                        const Point2 v = fwd.at(x, y);
+                        const double sx = x + v.x, sy = y + v.y;
+                        // (inside the neighbour with the cubic's taps; the motion back from there undoing this one)
+                        if (sx < 1 || sy < 1 || sx > w - 3 || sy > h - 3) continue;
+                        const Point2 b = back.at(sx, sy);
+                        if (std::hypot(v.x + b.x, v.y + b.y) >= kFlowMismatch) continue;
+                        const int ix = int(std::floor(sx)), iy = int(std::floor(sy));
+                        double wx[4], wy[4];
+                        cubicWeights(sx - ix, wx);
+                        cubicWeights(sy - iy, wy);
+                        double acc = 0, gx = 0, gy = 0;
+                        for (int j = 0; j < 4; ++j) {
+                            const float* row = nb.px.data() + size_t(iy - 1 + j) * size_t(w) + size_t(ix - 1);
+                            double r = 0;
+                            for (int i = 0; i < 4; ++i) r += wx[i] * row[i];
+                            acc += wy[j] * r;
+                            gy += wy[j] * wy[j];
+                        }
+                        for (int i = 0; i < 4; ++i) gx += wx[i] * wx[i];
+                        // (the difference holds the frame's noise and the neighbour's as the cubic smoothed it)
+                        z.push_back(float(std::fabs(cur.px[size_t(y) * size_t(w) + size_t(x)] - acc) / std::sqrt(1 + gx * gy)));
+                    }
+                if (z.size() * 2 < size_t(x1 - x0) * size_t(y1 - y0)) continue;
+                std::nth_element(z.begin(), z.begin() + std::ptrdiff_t(z.size() / 2), z.end());
+                out[size_t(ty) * size_t(g.nx) + size_t(tx)] = 1.4826 * double(z[z.size() / 2]);
+            }
+    });
+}
+
+GrayImage grayOf(const float* luma, int w, int h) {
+    GrayImage g;
+    g.width = w, g.height = h;
+    g.px.assign(luma, luma + size_t(w) * size_t(h));
+    return g;
+}
+
+// Folds a neighbour's tiles into `into` (the lower in each tile).
+void foldTiles(std::vector<double>& into, const std::vector<double>& t) {
+    if (into.empty()) into.assign(t.size(), -1);
+    for (size_t i = 0; i < t.size() && i < into.size(); ++i)
+        if (t[i] >= 0 && (into[i] < 0 || t[i] < into[i])) into[i] = t[i];
+}
+
+// The median of the tiles measured: -1 with fewer than four.
+double medianTile(const std::vector<double>& tiles) {
+    std::vector<double> v;
+    for (double t : tiles)
+        if (t >= 0) v.push_back(t);
+    if (v.size() < 4) return -1;
+    std::nth_element(v.begin(), v.begin() + std::ptrdiff_t(v.size() / 2), v.end());
+    return v[v.size() / 2];
+}
+
+// The flows between two pictures, each way (on a grid every 16 px: the motion of a camera or a subject is smooth
+// at that scale, and the forward and backward check leaves out what is not).
+void flowsBetween(const GrayImage& a, const GrayImage& b, FlowField& ab, FlowField& ba) {
+    ab = denseFlow(a, b, 16);
+    ba = denseFlow(b, a, 16);
+}
+
+}  // namespace
+
+double noiseBetweenFrames(const float* luma, const float* prev, const float* next, int w, int h, int threads) {
+    if (!luma || w < 16 || h < 16) return -1;
+    const GrayImage cur = grayOf(luma, w, h);
+    const NoiseGrid g = noiseGrid(w, h);
+    std::vector<double> tiles;
+    for (const float* other : {prev, next}) {
+        if (!other) continue;
+        const GrayImage nb = grayOf(other, w, h);
+        FlowField fwd, back;
+        flowsBetween(cur, nb, fwd, back);
+        std::vector<double> t;
+        tileNoise(cur, nb, fwd, back, g, t, threads);
+        foldTiles(tiles, t);
+    }
+    return medianTile(tiles);
+}
+
+struct FocusRun::Picture {
+    GrayImage gray;
+    std::vector<double> tiles;  // the noise between it and its neighbours so far, the lower in each tile (-1 none)
+    bool still = false;
+};
+
+FocusMeasure FocusRun::measure(const Picture& p) const {
+    return measureFocus(p.gray.px.data(), p.gray.width, p.gray.height, threads_, medianTile(p.tiles));
+}
+
+std::vector<FocusMeasure> FocusRun::add(std::vector<float> luma, int w, int h, bool cut, bool still) {
+    std::vector<FocusMeasure> out;
+    auto next = std::make_shared<Picture>();
+    next->still = still;
+    next->gray.width = std::max(0, w), next->gray.height = std::max(0, h);
+    next->gray.px = std::move(luma);
+    next->gray.px.resize(size_t(next->gray.width) * size_t(next->gray.height), 0.0f);
+    if (pending_) {
+        Picture& a = *pending_;
+        if (!cut && !still && !a.still && a.gray.width == w && a.gray.height == h && w >= 16 && h >= 16) {
+            // (one pair of flows serves both: the picture before against this one, and this one against it)
+            FlowField ab, ba;
+            flowsBetween(a.gray, next->gray, ab, ba);
+            const NoiseGrid g = noiseGrid(w, h);
+            std::vector<double> t;
+            tileNoise(a.gray, next->gray, ab, ba, g, t, threads_);
+            foldTiles(a.tiles, t);
+            tileNoise(next->gray, a.gray, ba, ab, g, t, threads_);
+            foldTiles(next->tiles, t);
+        }
+        out.push_back(measure(a));
+    }
+    pending_ = std::move(next);
+    return out;
+}
+
+std::vector<FocusMeasure> FocusRun::finish() {
+    std::vector<FocusMeasure> out;
+    if (pending_) out.push_back(measure(*pending_));
+    pending_.reset();
+    return out;
+}
+
 std::vector<uint8_t> focusPeaking(const float* luma, int w, int h, double threshold, int threads) {
     std::vector<uint8_t> mask(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0);
     if (!luma || w < 2 || h < 2) return mask;
@@ -315,6 +493,7 @@ std::vector<FocusIssue> judgeFocus(std::vector<FocusShot>& shots, const FocusOpt
         }
         shot.best = quantile(sharp, 0.9);
         shot.typical = quantile(sharp, 0.5);
+        shot.noiseBetween = std::count_if(shot.frames.begin(), shot.frames.end(), [](const FocusMeasure& f) { return f.noiseBetweenFrames; });
         // Stretches well under the shot's own best.
         std::vector<char> soft(n, 0);
         for (size_t i = 0; i < n; ++i) {
@@ -329,7 +508,7 @@ std::vector<FocusIssue> judgeFocus(std::vector<FocusShot>& shots, const FocusOpt
             is.kind = FocusFinding::Soft;
             is.start = shot.start + a, is.end = shot.start + b, is.shot = si;
             is.share = quantile(v, 0.5) / shot.best;
-            is.text = "Soft focus: " + percent(is.share) + " as sharp as the shot's best";
+            is.text = "Soft focus: " + percent(is.share) + " as sharp as the shot's best" + noiseNote(shot.frames, size_t(a), size_t(b));
             issues.push_back(is);
         }
         for (const auto& [a, b] : runs(motion[si], minFrames)) {
@@ -376,7 +555,7 @@ std::vector<FocusIssue> judgeFocus(std::vector<FocusShot>& shots, const FocusOpt
         is.share = shot.typical / other;
         is.text = "Soft focus: the shot is " + percent(is.share) + " as sharp as the other angles of " +
                   (shot.sceneName.empty() ? std::string("its scene") : "scene " + shot.sceneName) +
-                  (shot.angleName.empty() ? std::string() : " (it is " + shot.angleName + ")");
+                  (shot.angleName.empty() ? std::string() : " (it is " + shot.angleName + ")") + noiseNote(shot.frames, 0, shot.frames.size());
         issues.push_back(is);
     }
     std::stable_sort(issues.begin(), issues.end(), [](const FocusIssue& a, const FocusIssue& b) {
@@ -441,6 +620,17 @@ std::vector<FocusIssue> checkSequenceFocus(const Project& p, const Sequence& s, 
     const bool hdr = space.hdr() || space.sceneReferred;
     std::vector<FocusShot> shots;
     const Clip* last = nullptr;
+    // (each frame is measured once the next is rendered, its noise taken between it and both: `waiting` holds the shot
+    // of each frame still to come back from the run)
+    FocusRun run(o.threads);
+    std::vector<size_t> waiting;
+    auto place = [&](const std::vector<FocusMeasure>& done) {
+        for (const FocusMeasure& f : done) {
+            FocusShot& shot = shots[waiting.front()];
+            shot.frames.push_back(f);
+            waiting.erase(waiting.begin());
+        }
+    };
     for (FrameTime t = in; t < out; ++t) {
         if (cancel && cancel->load()) return {};
         const Clip* c = topClip(s, t);
@@ -458,11 +648,13 @@ std::vector<FocusIssue> checkSequenceFocus(const Project& p, const Sequence& s, 
         last = c;
         Image img = renderProgramFrame(p, s, t, ro);
         if (hdr && !img.empty()) convertColor(img, space, rec709Space(), std::clamp(s.hdrPeakNits, 100.0, 10000.0));
-        const std::vector<float> luma = lumaOf(img);
-        shots.back().frames.push_back(measureFocus(luma.data(), img.width, img.height, o.threads));
+        waiting.push_back(shots.size() - 1);
+        const MediaItem* media = c && c->mediaId ? p.findMedia(c->mediaId) : nullptr;
+        place(run.add(lumaOf(img), img.width, img.height, !same, media && media->kind == MediaKind::Image));
         shots.back().end = t + 1;
         if (progress) progress(double(t - in + 1) / double(out - in));
     }
+    place(run.finish());
     std::vector<FocusIssue> issues = judgeFocus(shots, o, s.fpsValue());
     if (shotsOut) *shotsOut = std::move(shots);
     return issues;
@@ -503,13 +695,17 @@ std::vector<MediaFocus> checkMediaFocus(const Project& p, const std::vector<Id>&
         const double from = m->subclipOf ? m->subclipIn : 0.0;
         // (A picture that cannot be read renders black: it is not judged.)
         r.checked = MediaPool::instance().videoFrame(m->path, from + 0.5 / fps, 16, 16) != nullptr;
+        FocusRun run(o.threads);
+        auto place = [&](const std::vector<FocusMeasure>& measured) {
+            for (const FocusMeasure& fm : measured) shot.frames.push_back(fm);
+        };
         for (FrameTime f = 0; r.checked && f < frames; ++f) {
             if (cancel && cancel->load()) return {};
             const Image img = renderMediaFrame(p, *m, from + (double(f) + 0.5) / fps, w, h);
-            const std::vector<float> luma = lumaOf(img);
-            shot.frames.push_back(measureFocus(luma.data(), img.width, img.height, o.threads));
+            place(run.add(lumaOf(img), img.width, img.height, f == 0));
             if (progress) progress(++done / std::max(1.0, total));
         }
+        place(run.finish());
         if (!r.checked) done += double(frames);
         out.push_back(r);
         shots.push_back(std::move(shot));
@@ -522,6 +718,10 @@ std::vector<MediaFocus> checkMediaFocus(const Project& p, const std::vector<Id>&
         MediaFocus& r = out[k];
         const MediaItem* m = items[k];
         r.typical = shots[k].typical;
+        if (!shots[k].frames.empty()) {
+            const std::string note = noiseNote(shots[k].frames, 0, shots[k].frames.size());
+            r.grain = note.substr(2, note.size() - 3);  // (without its brackets)
+        }
         if (!r.checked) {
             r.summary = "Not read";
             continue;

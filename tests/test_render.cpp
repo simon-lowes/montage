@@ -10441,6 +10441,194 @@ colorspaces:
         QVERIFY2(!more[1].checked && more[1].summary == "Not read", more[1].summary.c_str());
     }
 
+    // The focus check tells grain from texture: noise is measured from what changes between a frame and its neighbours
+    // brought onto it along the flow, which a picture's own fine texture does not do and grain does. Two angles of one
+    // scene: clean fine texture (a static pattern down to the pixel, with discs over it) out of focus by 0.85 px for 15
+    // of its 50 frames, which is flagged, and the same texture dark (a tenth of the light) under grain that changes
+    // every frame, in focus, which is not flagged and reads as sharp as the clean angle. Both hold with the grain halved
+    // and doubled, and with the camera panning 1.6 px a frame. A still falls back to its own estimate and says so.
+    void focusGrainFromTexture() {
+        const int W = 320, H = 180;
+        // (the pattern at x + shift: a value per pixel, linear between, and discs of 1.5 to 7.5 px)
+        auto texture = [&](double shift) {
+            std::vector<float> v(size_t(W) * H);
+            auto at = [](int x, int y) {
+                uint32_t k = uint32_t(x * 73856093) ^ uint32_t(y * 19349663);
+                k ^= k >> 13, k *= 0x5bd1e995u, k ^= k >> 15;
+                return (double(k & 0xffff) / 65535.0 - 0.5) * 3.46;
+            };
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double xs = x + shift;
+                    const int xi = int(std::floor(xs));
+                    const double t = xs - xi;
+                    v[size_t(y) * W + size_t(x)] = float(0.5 + 0.1 * (at(xi, y) * (1 - t) + at(xi + 1, y) * t));
+                }
+            uint32_t seed = 12345;
+            auto rnd = [&] {
+                seed = seed * 1664525u + 1013904223u;
+                return double(seed >> 8) / double(1u << 24);
+            };
+            for (int d = 0; d < (W + 40) * H / 140; ++d) {
+                const double cx = rnd() * (W + 40) - 20 - shift, cy = rnd() * H, r = 1.5 + rnd() * 6, grey = 0.1 + 0.8 * rnd();
+                for (int y = std::max(0, int(cy - r - 1)); y <= std::min(H - 1, int(cy + r + 1)); ++y)
+                    for (int x = std::max(0, int(cx - r - 1)); x <= std::min(W - 1, int(cx + r + 1)); ++x) {
+                        int in = 0;
+                        for (int sy = 0; sy < 4; ++sy)
+                            for (int sx = 0; sx < 4; ++sx) {
+                                const double dx = x + (sx + 0.5) / 4 - cx, dy = y + (sy + 0.5) / 4 - cy;
+                                in += dx * dx + dy * dy <= r * r;
+                            }
+                        float& p = v[size_t(y) * W + size_t(x)];
+                        p = float(p + (grey - 0.5) * in / 16.0);  // (the disc keeps the pattern over it)
+                    }
+            }
+            return v;
+        };
+        uint32_t seed = 99;
+        auto gauss = [&] {
+            auto u = [&] {
+                seed = seed * 1664525u + 1013904223u;
+                return (double(seed >> 8) + 0.5) / double(1u << 24);
+            };
+            const double a = u(), b = u();
+            return std::sqrt(-2 * std::log(a)) * std::cos(2 * M_PI * b);
+        };
+        auto clean = [&](int f, double pan) {
+            std::vector<float> v = texture(pan * f);
+            return f >= 20 && f < 35 ? blurred(v, W, H, 0.85) : v;
+        };
+        auto grainy = [&](int f, double pan, double grain) {
+            std::vector<float> v = texture(pan * f);
+            for (float& x : v) x = float(0.02 + 0.1 * x + grain * gauss());
+            return v;
+        };
+        for (const double grain : {0.004, 0.008, 0.016})
+            for (const double pan : {0.0, 1.6}) {
+                std::vector<FocusShot> shots(2);
+                for (int k = 0; k < 2; ++k) {
+                    FocusShot& shot = shots[size_t(k)];
+                    shot.start = 50 * k, shot.end = 50 * k + 50;
+                    shot.scene = "scene:1", shot.angle = k ? "camera:B" : "camera:A";
+                    FocusRun run;
+                    for (int f = 0; f < 50; ++f)
+                        for (const FocusMeasure& m : run.add(k ? grainy(f, pan, grain) : clean(f, pan), W, H, f == 0)) shot.frames.push_back(m);
+                    for (const FocusMeasure& m : run.finish()) shot.frames.push_back(m);
+                }
+                const std::vector<FocusIssue> issues = judgeFocus(shots, FocusOptions(), 25);
+                QString got = QStringLiteral("grain %1, pan %2: typical %3 and %4;").arg(grain).arg(pan).arg(shots[0].typical).arg(shots[1].typical);
+                for (const FocusIssue& i : issues) got += QStringLiteral(" %1-%2 %3").arg(i.start).arg(i.end).arg(QString::fromStdString(i.text));
+                qInfo("%s", qPrintable(got));
+                QCOMPARE(shots[0].frames.size(), size_t(50));
+                QCOMPARE(shots[1].frames.size(), size_t(50));
+                QVERIFY2(issues.size() == 1 && issues[0].kind == FocusFinding::Soft && issues[0].start == 20 && issues[0].end == 35, qPrintable(got));
+                QVERIFY2(QString::fromStdString(issues[0].text).endsWith("(grain measured between frames)"), qPrintable(got));
+                QVERIFY2(std::fabs(shots[1].typical / shots[0].typical - 1) < 0.1, qPrintable(got));
+                // The grain is what is measured on the dark angle, within a tenth (a little more under a pan, where
+                // what the flow leaves over adds to it); the clean angle, which has none, measures almost none.
+                for (const FocusMeasure& m : shots[1].frames) {
+                    QVERIFY2(m.noiseBetweenFrames && m.noise > 0.9 * grain && m.noise < (pan > 0 ? 1.6 : 1.1) * grain,
+                             qPrintable(got + QStringLiteral(" noise %1").arg(m.noise)));
+                }
+                QCOMPARE(shots[0].noiseBetween, int64_t(50));
+                QCOMPARE(shots[1].noiseBetween, int64_t(50));
+                if (pan == 0)
+                    for (const FocusMeasure& m : shots[0].frames) QVERIFY2(m.noise < 0.001, qPrintable(got + QStringLiteral(" noise %1").arg(m.noise)));
+                // Measured as before, each frame on its own (as a still is), the defocus was missed where nothing moves.
+                if (grain == 0.008 && pan == 0) {
+                    std::vector<FocusShot> alone = shots;
+                    for (int k = 0; k < 2; ++k) {
+                        alone[size_t(k)].frames.clear();
+                        FocusRun run;
+                        for (int f = 0; f < 50; ++f)
+                            for (const FocusMeasure& m : run.add(k ? grainy(f, pan, grain) : clean(f, pan), W, H, f == 0, true)) alone[size_t(k)].frames.push_back(m);
+                        for (const FocusMeasure& m : run.finish()) alone[size_t(k)].frames.push_back(m);
+                    }
+                    const std::vector<FocusIssue> before = judgeFocus(alone, FocusOptions(), 25);
+                    qInfo("Each frame measured alone: %d findings; the clean angle's frames read %.4f of noise", int(before.size()), alone[0].frames[0].noise);
+                    QVERIFY(std::none_of(alone[0].frames.begin(), alone[0].frames.end(), [](const FocusMeasure& m) { return m.noiseBetweenFrames; }));
+                }
+            }
+        // The same between any two frames given: the noise of a grainy frame with both neighbours, one or none.
+        {
+            const std::vector<float> a = grainy(0, 0, 0.008), b = grainy(1, 0, 0.008), c = grainy(2, 0, 0.008);
+            const double both = noiseBetweenFrames(b.data(), a.data(), c.data(), W, H), one = noiseBetweenFrames(b.data(), nullptr, c.data(), W, H);
+            QVERIFY2(both > 0.0072 && both < 0.0088 && one > 0.0072 && one < 0.0088, qPrintable(QStringLiteral("%1 %2").arg(both).arg(one)));
+            QCOMPARE(noiseBetweenFrames(b.data(), nullptr, nullptr, W, H), -1.0);
+            // The same on one thread and on eight.
+            QCOMPARE(noiseBetweenFrames(b.data(), a.data(), c.data(), W, H, 1), noiseBetweenFrames(b.data(), a.data(), c.data(), W, H, 8));
+        }
+
+        // Through the dailies check: the two angles as image sequences; and through Quality Check, a still of the dark
+        // angle out of focus against them, which falls back to its own estimate and says so.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        auto writeTake = [&](const QString& name, const std::function<std::vector<float>(int)>& frameAt, int frames) {
+            QDir().mkpath(dir.filePath(name));
+            for (int f = 0; f < frames; ++f) {
+                QImage q(W, H, QImage::Format_Grayscale16);
+                const std::vector<float> v = frameAt(f);
+                for (int y = 0; y < H; ++y) {
+                    auto* row = reinterpret_cast<quint16*>(q.scanLine(y));
+                    for (int x = 0; x < W; ++x) row[x] = quint16(std::clamp(std::lround(v[size_t(y) * W + size_t(x)] * 65535.0), 0L, 65535L));
+                }
+                if (!q.save(QStringLiteral("%1/%2_%3.png").arg(dir.filePath(name), name).arg(f, 4, 10, QChar('0')))) return Id(0);
+            }
+            ImageSequence run;
+            if (!detectImageSequence(QStringLiteral("%1/%2_0000.png").arg(dir.filePath(name), name).toStdString(), run)) return Id(0);
+            MediaItem m;
+            if (!probeMedia(imageSequencePath(run), m)) return Id(0);
+            m.id = p.newId();
+            m.metadata["scene"] = "7";
+            m.metadata["camera"] = name.toStdString();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id takeA = writeTake("A", [&](int f) { return clean(f, 0); }, 50), takeB = writeTake("B", [&](int f) { return grainy(f, 0, 0.008); }, 50);
+        QVERIFY(takeA && takeB);
+        FocusOptions o;
+        const std::vector<MediaFocus> daily = checkMediaFocus(p, {takeA, takeB}, o);
+        QCOMPARE(daily.size(), size_t(2));
+        QVERIFY2(daily[0].summary == "Soft 00:00:00:20–00:00:01:11", daily[0].summary.c_str());  // (image sequences: 24 a second)
+        QVERIFY2(daily[1].summary == "Sharp", daily[1].summary.c_str());
+        QVERIFY2(daily[0].grain == "grain measured between frames" && daily[1].grain == daily[0].grain, daily[1].grain.c_str());
+        // A still: one frame of the dark angle, 2 px out of focus, held for two seconds.
+        const QString stillPng = dir.filePath("still.png");
+        {
+            std::vector<float> v = grainy(0, 0, 0.008);
+            v = blurred(v, W, H, 2);
+            QImage q(W, H, QImage::Format_Grayscale16);
+            for (int y = 0; y < H; ++y) {
+                auto* row = reinterpret_cast<quint16*>(q.scanLine(y));
+                for (int x = 0; x < W; ++x) row[x] = quint16(std::clamp(std::lround(v[size_t(y) * W + size_t(x)] * 65535.0), 0L, 65535L));
+            }
+            QVERIFY(q.save(stillPng));
+        }
+        MediaItem still;
+        QVERIFY(probeMedia(stillPng.toStdString(), still));
+        QCOMPARE(still.kind, MediaKind::Image);
+        still.id = p.newId();
+        still.metadata["scene"] = "7";
+        still.metadata["camera"] = "C";
+        p.media.push_back(still);
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = Rational{25, 1};
+        QVERIFY(edit::placeMedia(p, s, takeB, 0, 0, 50, {TrackKind::Video, 0}, {}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, still.id, 50, 0, 50, {TrackKind::Video, 0}, {}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, takeA, 100, 0, 20, {TrackKind::Video, 0}, {}, false).ok);
+        std::vector<FocusShot> shots;
+        const std::vector<FocusIssue> found = checkSequenceFocus(p, s, 0, -1, o, {}, nullptr, &shots);
+        QString got;
+        for (const FocusIssue& i : found) got += QStringLiteral("%1-%2 %3; ").arg(i.start).arg(i.end).arg(QString::fromStdString(i.text));
+        qInfo("%s", qPrintable(got));
+        QCOMPARE(shots.size(), size_t(3));
+        QCOMPARE(shots[0].noiseBetween, int64_t(50));
+        QCOMPARE(shots[1].noiseBetween, int64_t(0));
+        QCOMPARE(shots[2].noiseBetween, int64_t(20));
+        QVERIFY2(found.size() == 1 && found[0].kind == FocusFinding::SoftAngle && found[0].start == 50 && found[0].end == 100, qPrintable(got));
+        QVERIFY2(QString::fromStdString(found[0].text).endsWith("(grain measured on each frame alone, as for a still)"), qPrintable(got));
+    }
+
     // Markers as ST 2067-206 event-based metadata in an Application #2E master to ST 2067-21:2026: a Simple Scheme timed
     // events track related to the picture, checked (by Montage, SMPTE's schemas and Photon), read back into markers with
     // their frames, text and colours; a supplemental that changes one marker carries that event alone and plays with its
