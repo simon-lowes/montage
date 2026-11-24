@@ -95,7 +95,7 @@ std::vector<EffectInfo> buildCatalog() {
                      boolean("motion_blur", "Motion Blur"),
                      num("shutter", "Shutter Angle (°)", 0, 720, 180, 1),
                      num("shutter_phase", "Shutter Phase (°)", -360, 360, 0, 1),
-                     num("samples", "Motion Blur Samples (0: Adaptive)", 0, 64, 0, 1),
+                     num("samples", "Samples (0: Auto)", 0, 64, 0, 1),
                  },
                  {}});
     // Time Remapping: a keyframeable speed curve within the clip's length, and
