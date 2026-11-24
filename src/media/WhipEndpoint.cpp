@@ -382,6 +382,7 @@ struct Stream {
     };
     std::deque<Held> held;
     size_t heldBytes = 0;
+    double arrival = 0;    // this computer's time at RTP time 0, by the packets held (the feed's start, without reports)
     int64_t firstExt = 0;  // the RTP time of the first packet handed on
     int64_t unwrap(uint32_t ts) const { return seen ? lastExt + int32_t(ts - lastTs) : int64_t(ts); }
 };
@@ -411,10 +412,21 @@ struct Feed {
         d[4] = uint8_t(ts >> 24), d[5] = uint8_t(ts >> 16), d[6] = uint8_t(ts >> 8), d[7] = uint8_t(ts);
     }
 
-    // A stream's time for an RTP time: by the sender's reports, or by when its first held packet arrived.
-    double timeOf(const Stream& s, int64_t ts, bool reports) const {
+    // A stream's time for an RTP time: by the sender's reports, or by when its held packets arrived (`arrival`).
+    static double timeOf(const Stream& s, int64_t ts, bool reports) {
         if (reports) return s.reportNtp + double(ts - s.reportRtp) / s.clock;
-        return s.held.empty() ? 0 : s.held.front().arrived + double(ts - s.held.front().ts) / s.clock;
+        return s.arrival + double(ts) / s.clock;
+    }
+    // Where a stream's RTP times stand against this computer's clock by arrival: from the packet that came soonest
+    // after its time, of all those held. Not from the first: a sender's first packets come late and bunched (its
+    // sound starting, its pictures paced out while it learns the link), by a different amount in each stream.
+    static void setArrival(Stream& s) {
+        s.arrival = 0;
+        bool any = false;
+        for (const Stream::Held& h : s.held) {
+            const double at = h.arrived - double(h.ts) / s.clock;
+            if (!any || at < s.arrival) s.arrival = at, any = true;
+        }
     }
 
     // The pictures' shift that puts a picture where the sound of the same moment is, by both streams' latest
@@ -511,6 +523,8 @@ struct Feed {
         // (sound that came to nothing in all that time is left out: a reader would wait for it)
         if (video.present && sound && audio.held.empty()) audio.present = false;
         std::vector<std::pair<double, std::vector<uint8_t>>> first;
+        for (Stream* st : {&video, &audio})
+            if (st->present) setArrival(*st);
         if (video.present) {
             const double begins = timeOf(video, video.held.front().ts, reports);
             video.firstExt = video.held.front().ts;
