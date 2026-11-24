@@ -3,7 +3,11 @@
 #include <QHostAddress>
 #include <QUrl>
 #include <algorithm>
+#include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 
 #ifdef MONTAGE_WITH_WEBRTC
 #include <QCryptographicHash>
@@ -180,6 +184,18 @@ video { width: 100%; background: #000; margin-top: 1rem; }
 )html";
 }
 
+namespace {
+std::mutex traceMutex;
+std::function<void(const std::string&)> traceTo;
+std::atomic<bool> tracing{false};
+}  // namespace
+
+void setTimingTrace(std::function<void(const std::string&)> trace) {
+    std::lock_guard lock(traceMutex);
+    traceTo = std::move(trace);
+    tracing = bool(traceTo);
+}
+
 #ifndef MONTAGE_WITH_WEBRTC
 
 struct Endpoint::Impl {};
@@ -215,6 +231,18 @@ constexpr int kFramesHeld = 8;                      // pictures seen before the 
 constexpr double kTimingKept = 15.0;                // seconds of the sender's reports (and of its sound's packets) a stream's timing is taken from
 
 double secondsNow() { return std::chrono::duration<double>(Clock::now().time_since_epoch()).count(); }
+
+// A line for setTimingTrace's, when one is set.
+void trace(const char* format, ...) {
+    if (!tracing) return;
+    char line[256];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof line, format, args);
+    va_end(args);
+    std::lock_guard lock(traceMutex);
+    if (traceTo) traceTo(line);
+}
 
 bool sameBytes(const QByteArray& a, const QByteArray& b) {
     const QByteArray x = QCryptographicHash::hash(a, QCryptographicHash::Sha256), y = QCryptographicHash::hash(b, QCryptographicHash::Sha256);
@@ -492,6 +520,7 @@ struct Feed {
             if (ts != videoTsNow) {
                 if (videoTsNow >= 0) videoShift = videoShiftNext;
                 videoTsNow = ts;
+                trace("picture %lld %lld", (long long)ts, (long long)(ts + videoShift));
                 if (started) {
                     stepTo(ts);
                     if (steps.size() < 600) measureRate();
@@ -595,6 +624,7 @@ struct Feed {
             audio.firstExt = audio.held.front().ts;
         }
         started = true;
+        trace("start reports %d video %lld audio %lld", int(reports), (long long)(video.present ? video.firstExt : 0), (long long)(audio.present ? audio.firstExt : 0));
         // (what was held goes first, the two streams in the order of their times)
         std::vector<std::tuple<double, int, Stream*, Stream::Held*>> order;
         int n = 0;
@@ -647,6 +677,7 @@ struct Feed {
             s.lastSeq = r.seq;
         }
         const int64_t ts = s.unwrap(r.ts);
+        trace("packet %c ts %lld bytes %zu came %.6f", isVideo ? 'V' : 'A', (long long)ts, n, now);
         if (!isVideo) note(s.came, now, now - double(ts) / s.clock, 0.2);
         if (!s.seen || ts > s.lastExt) s.lastExt = ts, s.lastTs = r.ts;
         s.seen = true;
@@ -716,8 +747,12 @@ struct Feed {
                         s.reportRtp = s.unwrap(ts);
                         note(s.origins, now, sent - double(s.reportRtp) / s.clock, 0);
                         note(gaps, now, now - sent, 0);
+                        trace("report %c came %.6f ntp %.6f rtp %lld", isVideo ? 'V' : 'A', now, sent, (long long)s.reportRtp);
                         for (Stream* st : {&video, &audio})
-                            if (st->reported) anchor(*st, now);
+                            if (st->reported) {
+                                anchor(*st, now);
+                                trace("anchor %c ntp %.6f rtp %lld", st == &video ? 'V' : 'A', st->reportNtp, (long long)st->reportRtp);
+                            }
                         placePictures();
                         if (!started) tryStart(now);
                     }

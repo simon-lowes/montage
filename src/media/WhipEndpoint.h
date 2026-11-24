@@ -88,4 +88,13 @@ private:
 // The page a GET of the endpoint gives.
 const char* guestPage();
 
+// Each event of a feed's timing as a line of text, for finding where a sender's sound and pictures stand against
+// each other (a test's, a diagnosis'): every RTP packet as it came ("packet V|A ts <unwrapped RTP time> bytes <n>
+// came <s>"), every sender report ("report V|A came <s> ntp <s> rtp <t>") and the timing taken from the reports
+// ("anchor V|A ntp <s> rtp <t>"), where the feed began ("start reports <0|1> video <t> audio <t>": the RTP times
+// of its first picture and its first sound, silence put before the sender's own included) and each picture's RTP
+// time as it came and as handed on ("picture <t> <t>"). "came" is this computer's clock in seconds. Called on the
+// feed's own threads with its lock held, so it should only keep the line; none (the default) when empty.
+void setTimingTrace(std::function<void(const std::string&)> trace);
+
 }  // namespace montage::whip

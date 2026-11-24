@@ -27127,6 +27127,13 @@ colorspaces:
                 sound[size_t(f->pts) + i] = f->format == AV_SAMPLE_FMT_S32 ? float(reinterpret_cast<const int32_t*>(f->data[0])[i * ch]) / 2147483648.0f
                                                                            : reinterpret_cast<const float*>(f->data[0])[i * ch];
         };
+        // (the feed's timing as the endpoint saw it, to find each flash and beep where the sender put them)
+        std::vector<std::string> timing;
+        whip::setTimingTrace([&](const std::string& line) {
+            std::lock_guard lock(m);
+            timing.push_back(line);
+        });
+        auto stopTracing = qScopeGuard([] { whip::setTimingTrace({}); });
         Recorder rec;
         std::atomic<bool> finished{false}, fine{false};
         std::string finishedWhy;
@@ -27184,11 +27191,12 @@ colorspaces:
             osc.connect(gain).connect(out);
             osc.start();
             const picture = c.captureStream(0).getVideoTracks()[0];
-            const t = window.__test = {flashes: 0, frames: 0, connectedAt: 0, firstSentAt: 0, framesSent: 0, keyframes: 0, sizes: [], stoppedAt: 0};
+            const t = window.__test = {flashes: 0, drawn: [], frames: 0, connectedAt: 0, firstSentAt: 0, framesSent: 0, keyframes: 0, sizes: [], stoppedAt: 0};
             let frame = 0;
             const draw = () => {
               const flash = frame % 36 < 3;
               if (frame % 36 === 0) {
+                t.drawn.push(performance.timeOrigin + performance.now());
                 gain.gain.setValueAtTime(0.8, ac.currentTime);
                 gain.gain.setValueAtTime(0, ac.currentTime + 0.1);
                 ++t.flashes;
@@ -27247,6 +27255,9 @@ colorspaces:
                                       " t.keyframes + ' keyframes, sizes ' + t.sizes.map(s => s.size + ' at ' + Math.round(s.at - t.firstSentAt) + ' ms').join(', ') +"
                                       " (t.heldMost !== undefined ? ', its sound held back up to ' + Math.round((t.heldMost - t.heldLeast) * 1000) + ' ms more than at least' : ''); })()")
                                    .toString();
+        // (when the page drew each flash and began its beep, on this computer's clock: ms since 1970)
+        std::vector<double> drawn;
+        for (const QJsonValue v : tab.js("__test.drawn").toArray()) drawn.push_back(v.toDouble());
         QVERIFY(rec.wait(20));
         QVERIFY2(finished && fine, finishedWhy.c_str());
         stopRecording.dismiss();
@@ -27285,6 +27296,90 @@ colorspaces:
         for (size_t i = from + 1; i < std::min(sound.size(), from + 3840); ++i)
             if ((sound[i - 1] < 0) != (sound[i] < 0)) ++crossings;
         QVERIFY2(crossings > 150 && crossings < 170, std::to_string(crossings).c_str());
+
+        // Where the sender itself put each flash and beep, from what came over the wire: the flash's picture (by the
+        // RTP time it came with, before the endpoint moved it) and the beep's first loud packet of sound (a tone
+        // takes many more bytes than silence), each on the sender's own clock by its reports; against when the page
+        // drew them, and against where the recording has them.
+        struct Report { double ntp = 0; long long rtp = 0; };
+        std::map<char, std::vector<Report>> reported;
+        std::map<char, Report> anchored;
+        long long firstPicture = 0, firstSound = 0;
+        int byReports = -1;
+        std::vector<std::pair<long long, long long>> handed;  // a picture's RTP time as it came, as handed on
+        std::map<long long, long long> pictureBytes;
+        std::map<long long, long long> soundBytes;
+        for (const std::string& line : timing) {
+            char k = 0;
+            long long a = 0, b = 0;
+            size_t n = 0;
+            double x = 0, y = 0;
+            int r = 0;
+            if (std::sscanf(line.c_str(), "packet %c ts %lld bytes %zu came %lf", &k, &a, &n, &x) == 4)
+                (k == 'V' ? pictureBytes : soundBytes)[a] += (long long)n;
+            else if (std::sscanf(line.c_str(), "report %c came %lf ntp %lf rtp %lld", &k, &x, &y, &a) == 4)
+                reported[k].push_back({y, a});
+            else if (std::sscanf(line.c_str(), "anchor %c ntp %lf rtp %lld", &k, &y, &a) == 3)
+                anchored[k] = {y, a};
+            else if (std::sscanf(line.c_str(), "start reports %d video %lld audio %lld", &r, &a, &b) == 3)
+                byReports = r, firstPicture = a, firstSound = b;
+            else if (std::sscanf(line.c_str(), "picture %lld %lld", &a, &b) == 2)
+                handed.emplace_back(a, b);
+        }
+        // (the beeps' first loud packets: the first of three in a row each half as big again as the middling one of
+        // the ten before, which were silence (the encoder's silence changes size as it settles), half a second or
+        // more after the last)
+        std::vector<long long> loud;
+        {
+            std::vector<std::pair<long long, long long>> packets(soundBytes.begin(), soundBytes.end());
+            for (size_t i = 10; i + 2 < packets.size(); ++i) {
+                std::vector<long long> sizes;
+                for (size_t j = i - 10; j < i; ++j) sizes.push_back(packets[j].second);
+                std::nth_element(sizes.begin(), sizes.begin() + 5, sizes.end());
+                const long long before = sizes[5];
+                if (packets[i].second * 2 > before * 3 && packets[i + 1].second * 2 > before * 3 && packets[i + 2].second * 2 > before * 3 &&
+                    (loud.empty() || packets[i].first - loud.back() >= 24000))
+                    loud.push_back(packets[i].first);
+            }
+        }
+        // (the sender's clock at an RTP time, by a report: seconds since 1970)
+        auto onSenderClock = [](const Report& r, long long ts, double clock) { return r.ntp - 2208988800.0 + double(ts - r.rtp) / clock; };
+        double senderSum = 0;
+        int senderPaired = 0;
+        auto wire = [&](double f, double b) {
+            if (handed.empty() || loud.empty()) return std::string("nothing came over the wire to tell by");
+            // The flash's picture: the one handed on nearest its place in the recording.
+            const long long want = firstPicture + std::llround(f * 90000);
+            auto picture = handed.front();
+            for (const auto& h : handed)
+                if (std::llabs(h.second - want) < std::llabs(picture.second - want)) picture = h;
+            // The beep's first loud packet: the one nearest its place in the recording.
+            const long long sound = firstSound + std::llround(b * 48000);
+            long long packet = loud.front();
+            for (const long long l : loud)
+                if (std::llabs(l - sound) < std::llabs(packet - sound)) packet = l;
+            char text[512];
+            int at = std::snprintf(text, sizeof text, "picture %lld (%lld bytes, moved %+.0f ms), loud sound from %lld, recorded %+.0f ms from that packet",
+                                   picture.first, pictureBytes[picture.first], double(picture.second - picture.first) / 90.0, packet, double(sound - packet) / 48.0);
+            if (reported['V'].empty() || reported['A'].empty()) {
+                std::snprintf(text + at, sizeof text - size_t(at), "; no reports from the sender");
+                return std::string(text);
+            }
+            const double pictureAt = onSenderClock(reported['V'].back(), picture.first, 90000);
+            const double latest = onSenderClock(reported['A'].back(), packet, 48000), first = onSenderClock(reported['A'].front(), packet, 48000);
+            const double kept = anchored.count('A') ? onSenderClock(anchored['A'], packet, 48000) : latest;
+            senderSum += latest - pictureAt;
+            ++senderPaired;
+            at += std::snprintf(text + at, sizeof text - size_t(at), "; by the sender's reports the beep was made %+.0f ms after the flash (%+.0f by the first, %+.0f by the timing kept)",
+                                (latest - pictureAt) * 1000, (first - pictureAt) * 1000, (kept - pictureAt) * 1000);
+            double draw = 0;
+            for (const double d : drawn)
+                if (!draw || std::fabs(d / 1000 - pictureAt) < std::fabs(draw / 1000 - pictureAt)) draw = d;
+            if (draw) std::snprintf(text + at, sizeof text - size_t(at), "; after the page drew them, the picture by %+.0f ms and the sound by %+.0f ms", (pictureAt - draw / 1000) * 1000, (latest - draw / 1000) * 1000);
+            return std::string(text);
+        };
+        qInfo("WHIP: begun by %s; %zu reports of pictures, %zu of sound", byReports < 0 ? "nothing" : byReports ? "reports" : "arrival", reported['V'].size(), reported['A'].size());
+
         // Each flash and its beep land within 40 ms of each other on average, and each within 40 ms and a picture's
         // time (a flash is seen only from the picture it falls in).
         int paired = 0;
@@ -27296,10 +27391,10 @@ colorspaces:
             ++paired;
             sum += nearest;
             worst = std::max(worst, std::fabs(nearest));
-            qInfo("WHIP: flash at %.3f s, its beep %+.0f ms", f, nearest * 1000);
+            qInfo("WHIP: flash at %.3f s, its beep %+.0f ms; %s", f, nearest * 1000, wire(f, f + nearest).c_str());
         }
         QVERIFY2(paired >= 4, std::to_string(paired).c_str());
-        QVERIFY2(std::fabs(sum / paired) <= 0.040, std::to_string(sum / paired).c_str());
+        QVERIFY2(std::fabs(sum / paired) <= 0.040, (std::to_string(sum / paired) + (senderPaired ? "; by the sender's own reports " + std::to_string(senderSum / senderPaired) : std::string())).c_str());
         QVERIFY2(worst <= 0.040 + 1 / fps, std::to_string(worst).c_str());
     }
 
