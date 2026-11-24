@@ -292,6 +292,7 @@
 #include "media/Segmenter.h"
 #include "HdrSurface.h"
 #include "MonitorPanel.h"
+#include "StillEdit.h"
 #include "PlaybackController.h"
 #include "Recovery.h"
 #include "RenderQueue.h"
@@ -19421,6 +19422,96 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(timeline()->horizontalScrollBar()->value(),
                  std::max(0, std::min(timeline()->horizontalScrollBar()->maximum(), scrolled + 30) - int(std::lround(viewport()->width() / 4.0))));
         timeline()->zoomToFit();
+    }
+
+    void stillEditedInAnotherApplication() {
+        // A red still on V1, edited "elsewhere": the launcher stands in for the other application and a helper writes
+        // a green picture over the copy it was given.
+        state()->newProject();
+        const QString png = dir_.path() + "/edited-still.png";
+        QImage red(64, 36, QImage::Format_RGB32);
+        red.fill(qRgb(220, 0, 0));
+        QVERIFY(red.save(png));
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 64, s.height = 36;
+            return edit::placeMedia(p, s, ids[0], 0, 0, 30, V1, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        // (saved, so the copies go in "Edited Stills" beside it, in this test's folder)
+        QVERIFY(state()->save(dir_.path() + "/edited-still.montage"));
+        auto shown = [&] {
+            const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), 5, {});
+            return QColor::fromRgbF(f.at(32, 18)[0], f.at(32, 18)[1], f.at(32, 18)[2]);
+        };
+        QVERIFY2(shown().red() > 200 && shown().green() < 30, qPrintable(shown().name()));
+        StillEditor* editor = StillEditor::of(state());
+        QVERIFY(editor->canEdit(ids[0]));
+        const QString program = StillEditor::program();
+        StillEditor::setProgram({});
+        QString why;
+        QVERIFY(!editor->edit(ids[0], &why) && why.contains("Choose"));  // none chosen yet
+        StillEditor::setProgram(QStringLiteral("/opt/Picture Editor/editor"));
+        QStringList launched;
+        StillEditor::setLauncherForTesting([&](const QString& prog, const QString& file) {
+            launched << prog << file;
+            return true;
+        });
+        // From the clip's menu on the timeline.
+        state()->setSelection({clip}, false);
+        bool offered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            for (QAction* a : menu->findChildren<QAction*>())
+                if (a->objectName() == "editStillElsewhere") {
+                    offered = true;
+                    a->trigger();
+                }
+            menu->close();
+        });
+        const QPoint on = pointFor(1, V1);
+        QContextMenuEvent menuEvent(QContextMenuEvent::Mouse, on, viewport()->mapToGlobal(on));
+        QApplication::sendEvent(viewport(), &menuEvent);
+        QVERIFY(offered);
+        QCOMPARE(launched.size(), 2);
+        QCOMPARE(launched[0], QString("/opt/Picture Editor/editor"));
+        const QString copy = launched[1];
+        QCOMPARE(copy, editor->workingCopy(ids[0]));
+        QVERIFY(QFileInfo(copy).fileName().startsWith("edited-still (editing)") && copy != png);
+        QCOMPARE(QFileInfo(copy).absolutePath(), QDir(dir_.path()).filePath("Edited Stills"));
+        // The helper saves a green picture over it: within a second the clip shows it, as one undo step, the still
+        // keeping its name and the original untouched.
+        const size_t steps = state()->history().undoCount();
+        QImage green(64, 36, QImage::Format_RGB32);
+        green.fill(qRgb(0, 210, 0));
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY(green.save(copy));
+        while (shown().green() < 200 && clock.elapsed() < 1000) QTest::qWait(20);
+        QVERIFY2(shown().green() > 200 && shown().red() < 30, qPrintable(QString::number(clock.elapsed())));
+        QCOMPARE(state()->history().undoCount(), steps + 1);
+        QCOMPARE(QString::fromStdString(state()->history().undoLabel()), QString("Edit in Another Application"));
+        QCOMPARE(state()->project().findMedia(ids[0])->name, std::string("edited-still.png"));
+        QVERIFY(QFileInfo(QString::fromStdString(state()->project().findMedia(ids[0])->path)).fileName().startsWith("edited-still v2"));
+        QCOMPARE(QImage(png).pixel(5, 5), qRgb(220, 0, 0));
+        // Undo shows the picture from before; redo the edited one.
+        state()->undo();
+        QVERIFY(shown().red() > 200);
+        state()->redo();
+        QVERIFY(shown().green() > 200);
+        // Saved again (blue): the next version, another undo step.
+        QImage blue(64, 36, QImage::Format_RGB32);
+        blue.fill(qRgb(0, 0, 230));
+        QVERIFY(blue.save(copy));
+        clock.restart();
+        while (shown().blue() < 200 && clock.elapsed() < 1000) QTest::qWait(20);
+        QVERIFY(shown().blue() > 200);
+        QCOMPARE(state()->history().undoCount(), steps + 2);
+        StillEditor::setLauncherForTesting({});
+        StillEditor::setProgram(program);
+        state()->newProject();
     }
 
     void keyframeCopyPaste() {

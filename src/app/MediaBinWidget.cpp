@@ -13,6 +13,7 @@
 #include "media/TextReader.h"
 #include "render/Exporter.h"
 #include "Settings.h"
+#include "StillEdit.h"
 
 #include <QApplication>
 #include <QFormLayout>
@@ -1318,6 +1319,7 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             menu.addAction(tr("Edit Original"), this, [m] {  // in its own application; saved changes reload by themselves
                 QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(mediaFileOnDisk(m->path))));
             });
+        if (m && m->kind == MediaKind::Image) StillEditor::addActions(menu, state_, id, this);
         if (m && !m->path.empty())
             menu.addAction(tr("Reveal in File Manager"), this, [m] {
                 QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(QString::fromStdString(mediaFileOnDisk(m->path))).absolutePath()));

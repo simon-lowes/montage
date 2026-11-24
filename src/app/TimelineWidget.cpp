@@ -33,6 +33,7 @@
 #include "ModelPacks.h"
 #include "PitchCurves.h"
 #include "Settings.h"
+#include "StillEdit.h"
 #include "SoundLibraryPanel.h"
 #include "StackedTimelineWidget.h"
 #include "render/Exporter.h"
@@ -2999,6 +3000,11 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
                     menu.addAction(tr("Restore Unrendered"), this, [this, id] {
                         state_->apply(tr("Restore Unrendered"), [id](Project&, Sequence& s) { return edit::restoreUnrendered(s, id); });
                     });
+                // A still: edited in another application, its clips updated each time it is saved there.
+                if (StillEditor::of(state_)->canEdit(c->mediaId)) {
+                    menu.addSeparator();
+                    StillEditor::addActions(menu, state_, c->mediaId, this);
+                }
             }
     } else if (h.kind == HitKind::Transition) {
         state_->selectTransition(h.transition);
