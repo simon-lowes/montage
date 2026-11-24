@@ -154,6 +154,7 @@ add_library(montage_engine STATIC
   media/CameraSolve.h media/CameraSolve.cpp
   media/Reframe.h media/Reframe.cpp
   media/Capture.h media/Capture.cpp
+  media/WhipEndpoint.h media/WhipEndpoint.cpp
   media/ModelFiles.h media/ModelFiles.cpp
   media/Sofa.h media/Sofa.cpp
   media/LensDatabase.h media/LensDatabase.cpp
@@ -252,6 +253,9 @@ add_library(montage_engine STATIC
   render/LutExport.h render/LutExport.cpp
   render/LutToGrade.h render/LutToGrade.cpp
   render/GrainMatch.h render/GrainMatch.cpp
+  render/Av1FilmGrain.h render/Av1FilmGrain.cpp
+  render/Av1Headers.h render/Av1Headers.cpp
+  render/Av1GrainExport.h render/Av1GrainExport.cpp
   render/ProjectManager.h render/ProjectManager.cpp
   render/AutoBroll.h render/AutoBroll.cpp
   render/AutoMix.h render/AutoMix.cpp
@@ -285,6 +289,7 @@ add_library(montage_engine STATIC
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp
   render/StyleFx.h render/StyleFx.cpp
+  render/BevelFx.h render/BevelFx.cpp
   render/PaintFx.h render/PaintFx.cpp
   render/MeshWarp.h render/MeshWarp.cpp
   render/SurfaceTrack.h render/SurfaceTrack.cpp
@@ -322,6 +327,7 @@ add_library(montage_engine STATIC
   audio/ElasticAudio.h audio/ElasticAudio.cpp
   audio/Sampler.h audio/Sampler.cpp
   audio/AudioDevice.h audio/AudioDevice.cpp audio/AudioDeviceInternal.h audio/JackDevice.cpp audio/PortAudioDevice.cpp
+  audio/RtGuard.h audio/RtGuard.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/LtcChase.h audio/LtcChase.cpp
@@ -457,6 +463,12 @@ if(MONTAGE_WITH_LIBRAW)
 endif()
 if(MONTAGE_WITH_JXL)
   pkg_check_modules(LIBJXL IMPORTED_TARGET GLOBAL libjxl>=0.7 libjxl_threads>=0.7)
+  # A package is built with the libjxl that has the decoder's fixes for hostile files, or not at all.
+  if(MONTAGE_REQUIRE_JXL_VERSION AND NOT LIBJXL_FOUND)
+    message(FATAL_ERROR "libjxl not found (MONTAGE_REQUIRE_JXL_VERSION is ${MONTAGE_REQUIRE_JXL_VERSION})")
+  elseif(MONTAGE_REQUIRE_JXL_VERSION AND LIBJXL_libjxl_VERSION VERSION_LESS "${MONTAGE_REQUIRE_JXL_VERSION}")
+    message(FATAL_ERROR "libjxl ${LIBJXL_libjxl_VERSION} is older than ${MONTAGE_REQUIRE_JXL_VERSION} (MONTAGE_REQUIRE_JXL_VERSION)")
+  endif()
   if(LIBJXL_FOUND)
     message(STATUS "libjxl ${LIBJXL_libjxl_VERSION}: JPEG XL read and written directly")
     target_link_libraries(montage_engine PRIVATE PkgConfig::LIBJXL)
@@ -700,6 +712,15 @@ if(MONTAGE_WITH_OPENEXR)
   target_include_directories(montage_engine PRIVATE ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/common
                                                     ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/openjph
                                                     ${openexr_SOURCE_DIR}/external/zstd/lib)
+  # From 3.5.4 OpenEXR builds its OpenJPH under a namespace of its own (so that it cannot clash with another OpenJPH
+  # in the program): the source that uses OpenJPH's API is compiled with the same names, where this OpenEXR has them.
+  file(STRINGS ${openexr_SOURCE_DIR}/src/lib/OpenEXRCore/CMakeLists.txt MONTAGE_OJPH_RENAMED REGEX "_openexr_ojph_renames")
+  if(MONTAGE_OJPH_RENAMED AND OPENEXR_INTERNAL_IMF_NAMESPACE)
+    set_property(SOURCE render/Jpeg2000.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+      ojph=${OPENEXR_INTERNAL_IMF_NAMESPACE}_ojph
+      ojph_aligned_malloc=${OPENEXR_INTERNAL_IMF_NAMESPACE}_ojph_aligned_malloc
+      ojph_aligned_free=${OPENEXR_INTERNAL_IMF_NAMESPACE}_ojph_aligned_free)
+  endif()
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OPENEXR)
 endif()
 if(WIN32)
@@ -734,6 +755,17 @@ if(MONTAGE_WITH_THORVG)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_THORVG)
 endif()
 
+# The audio callback's guard (audio/RtGuard.h), on Linux: it counts locks and waits by passing the pthread calls through
+# itself, and allocations by having the linker send the program's own calls through its wrappers (nothing is replaced).
+# Off for builds whose tools define those calls themselves (a thread sanitizer).
+option(MONTAGE_RT_GUARD_INTERPOSE "Count allocations, locks and waits inside the audio device's callback (Linux)" ON)
+if(MONTAGE_RT_GUARD_INTERPOSE AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set_source_files_properties(audio/RtGuard.cpp PROPERTIES COMPILE_DEFINITIONS "MONTAGE_RT_GUARD_INTERPOSE;MONTAGE_RT_GUARD_WRAP")
+  foreach(sym malloc calloc realloc free posix_memalign aligned_alloc _Znwm _Znam _ZnwmRKSt9nothrow_t _ZnamRKSt9nothrow_t
+              _ZdlPv _ZdaPv _ZdlPvm _ZdaPvm)
+    target_link_options(montage_engine INTERFACE "LINKER:--wrap=${sym}")
+  endforeach()
+endif()
 if(MONTAGE_WITH_PORTAUDIO)
   target_link_libraries(montage_engine PRIVATE montage_portaudio)
   target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_PORTAUDIO)

@@ -353,6 +353,13 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     segmentedFields_->setToolTip(tr("Each frame's two halves as its fields, as progressive pictures are carried in 1080i, instead of each field rendered at its own moment"));
     segmentedFields_->setChecked(appSettings().value("export/segmentedFields", false).toBool());
     form->addRow(QString(), segmentedFields_);
+    proResBits_ = new QComboBox(form_);
+    proResBits_->setObjectName(QStringLiteral("exportProResBits"));
+    proResBits_->addItem(tr("12 bits a sample"), 12);
+    proResBits_->addItem(tr("10 bits a sample"), 10);
+    proResBits_->setCurrentIndex(std::max(0, proResBits_->findData(appSettings().value("export/proResBits", 12).toInt())));
+    proResBits_->setToolTip(tr("ProRes 4444 and 4444 XQ hold 12 bits a sample; choose 10 for tools that read no more"));
+    form->addRow(tr("ProRes depth:"), proResBits_);
     connect(interlaced_, &QCheckBox::toggled, this, [this] { updateControls(); });
     {
         auto* row = new QWidget(form_);
@@ -423,6 +430,13 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
                               "Uses Analyse HDR Light Levels' measurements while the cut still matches them, else measures first."));
     hdr10Plus_->setChecked(appSettings().value("export/hdr10Plus", false).toBool());
     form->addRow(QString(), hdr10Plus_);
+    filmGrain_ = new QCheckBox(tr("Carry grain as parameters (AV1)"), form_);
+    filmGrain_->setObjectName(QStringLiteral("exportFilmGrain"));
+    filmGrain_->setToolTip(tr("Each shot's grain measured, as Measure Grain measures it, and taken out of the picture before it is encoded, "
+                              "then written beside it as AV1 film grain parameters, which the player's decoder puts back: the bits go "
+                              "to the picture instead of the grain"));
+    filmGrain_->setChecked(appSettings().value("export/filmGrain", false).toBool());
+    form->addRow(QString(), filmGrain_);
     adaptiveHdr_ = new QCheckBox(tr("Adaptive HDR metadata (ST 2094-50, any display's headroom)"), form_);
     adaptiveHdr_->setObjectName(QStringLiteral("exportAdaptiveHdr"));
     adaptiveHdr_->setToolTip(tr("Each scene's reference white, headroom and the gain curve to its SDR rendition (the sequence's SDR trim, "
@@ -438,6 +452,22 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     exrCompression_->setToolTip(tr("How OpenEXR frames are compressed: ZIP, PIZ, Zstandard and HTJ2K keep every value; PXR24, B44 and DWA are smaller and lossy"));
     if (exrAvailable()) form->addRow(tr("OpenEXR compression:"), exrCompression_);
     else exrCompression_->hide();
+    // PNG frames: the compression level (every level keeps every value) and the bits a channel.
+    pngCompression_ = new QComboBox(form_);
+    pngCompression_->setObjectName(QStringLiteral("exportPngCompression"));
+    pngCompression_->addItem(tr("Fastest (largest files)"), 1);
+    pngCompression_->addItem(tr("Balanced"), 6);
+    pngCompression_->addItem(tr("Smallest (slowest)"), 9);
+    pngCompression_->addItem(tr("None (not compressed)"), 0);
+    pngCompression_->setCurrentIndex(std::max(0, pngCompression_->findData(appSettings().value("export/pngCompression", 6).toInt())));
+    pngCompression_->setToolTip(tr("How hard PNG frames are compressed: always lossless; a higher level takes longer and makes smaller files"));
+    form->addRow(tr("PNG compression:"), pngCompression_);
+    pngBits_ = new QComboBox(form_);
+    pngBits_->setObjectName(QStringLiteral("exportPngBits"));
+    pngBits_->addItem(tr("8 bits a channel"), 8);
+    pngBits_->addItem(tr("16 bits a channel"), 16);
+    pngBits_->setCurrentIndex(std::max(0, pngBits_->findData(appSettings().value("export/pngBits", 8).toInt())));
+    form->addRow(tr("PNG depth:"), pngBits_);
     jxlQuality_ = new QComboBox(form_);
     jxlQuality_->setObjectName(QStringLiteral("exportJxlQuality"));
     jxlQuality_->addItem(tr("Lossless"), 0.0);
@@ -919,6 +949,8 @@ void ExportDialog::updateControls() {
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
     color_->setEnabled(video);
+    filmGrain_->setEnabled(video && (p->settings.videoCodec == "libsvtav1" || p->settings.videoCodec == "libaom-av1" || p->settings.videoCodec == "librav1e") &&
+                           (!rate_ || rate_->currentData().toString().isEmpty()) && !(credentials_ && credentials_->isChecked()));
     {
         // HDR10+ is HDR10's: PQ output only.
         const Sequence* sq = state_ ? state_->sequence() : nullptr;
@@ -930,6 +962,8 @@ void ExportDialog::updateControls() {
                                  !sceneReferredWorking(*sq) && vc != "exr");
         adaptiveHdr_->setEnabled(video && out && out->hdr() && vc != "exr" && vc != "gif" && vc != "jxl");
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
+        pngCompression_->setEnabled(video && vc == "png");
+        pngBits_->setEnabled(pngCompression_->isEnabled());
         jxlQuality_->setEnabled(video && vc == "jxl" && jxlAvailable());
         jxlDepth_->setEnabled(jxlQuality_->isEnabled());
         jpegXsRate_->setEnabled(video && vc == "jpegxs" && jpegXsAvailable());
@@ -1009,6 +1043,7 @@ void ExportDialog::updateControls() {
                             nd[0].toDouble() / nd[1].toDouble() < 40;
         interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks" || vc == "ffv1") && d != "as11-dpp" && !fields);
         if (segmentedFields_) segmentedFields_->setEnabled((interlaced_->isEnabled() && interlaced_->isChecked()) || (video && d == "as11-dpp"));
+        if (proResBits_) proResBits_->setEnabled(video && p && vc == "prores_ks" && p->settings.profile.rfind("4444", 0) == 0);
     }
     if (credentials_) {
         ExportSettings would = p ? p->settings : ExportSettings{};
@@ -1220,6 +1255,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/allCaptions", allCaptions_->isChecked());
     s.cea608 = cea608_->isEnabled() && cea608_->isChecked();
     settings.setValue("export/cea608", cea608_->isChecked());
+    s.filmGrain = filmGrain_->isEnabled() && filmGrain_->isChecked() ? "measure" : "";
+    settings.setValue("export/filmGrain", filmGrain_->isChecked());
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
     s.adaptiveHdr = adaptiveHdr_->isEnabled() && adaptiveHdr_->isChecked();
@@ -1228,6 +1265,12 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         const std::string c = exrCompression_->currentData().toString().toStdString();
         s.exrCompression = c == "zip" ? std::string() : c;  // (ZIP: FFmpeg's writer, as before)
         settings.setValue("export/exrCompression", exrCompression_->currentData());
+    }
+    if (pngCompression_->isEnabled()) {
+        s.pngCompression = pngCompression_->currentData().toInt();
+        settings.setValue("export/pngCompression", s.pngCompression);
+        s.pngBits = pngBits_->currentData().toInt();
+        settings.setValue("export/pngBits", s.pngBits);
     }
     if (jxlQuality_->isEnabled()) {
         s.jxlDistance = jxlQuality_->currentData().toDouble();
@@ -1272,6 +1315,12 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/interlaced", interlaced_->isChecked());
     s.segmentedFields = segmentedFields_->isEnabled() && segmentedFields_->isChecked();
     settings.setValue("export/segmentedFields", segmentedFields_->isChecked());
+    if (proResBits_->isEnabled()) {
+        // (4:4:4 Y'CbCr at the depth chosen, with alpha where the preset keeps it: 12 bits is Montage's own encoder)
+        const int bits = proResBits_->currentData().toInt();
+        s.pixFmt = std::string(s.alpha ? "yuva444p" : "yuv444p") + (bits == 10 ? "10le" : "12le");
+        settings.setValue("export/proResBits", bits);
+    }
     if (const QStringList r = rate_->currentData().toString().split(QLatin1Char('|')); rate_->isEnabled() && r.size() == 3) {
         s.rateChange = r[0].toStdString();
         const QStringList nd = r[1].split(QLatin1Char('/'));

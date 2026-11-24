@@ -99,7 +99,7 @@ int initInference() {
         if (!exe.isEmpty()) registered += registerInferenceLibraries((exe + QStringLiteral("/execution-providers")).toStdString());
         registered += registerInferenceLibraries(modelsDirectory() + "/execution-providers");
         InferenceMode saved = InferenceMode::Auto;
-        const QSettings settings(QStringLiteral("Montage"), QStringLiteral("Montage"));
+        const QSettings settings(QSettings::defaultFormat(), QSettings::UserScope, QStringLiteral("Montage"), QStringLiteral("Montage"));
         if (parseInferenceMode(settings.value(QStringLiteral("ai/inference"), QStringLiteral("auto")).toString().toStdString(), saved))
             setInferenceMode(saved);
     });

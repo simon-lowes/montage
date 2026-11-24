@@ -24,6 +24,9 @@
 #include <QInputDialog>
 #include <QTreeWidgetItemIterator>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <QThread>
 #include <thread>
 #include <sstream>
 #include <QElapsedTimer>
@@ -78,6 +81,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 
 #include "AutoDuckDialog.h"
@@ -135,6 +139,8 @@
 #include "render/Titles.h"
 #include "render/DcpFacilities.h"
 #include "render/DcpSecurity.h"
+#include "render/SegmentedExport.h"
+#include "render/DcpMxf.h"
 #include "render/Ofx.h"
 #include "render/OfxRemote.h"
 #include "OfxOverlay.h"
@@ -237,7 +243,11 @@
 #include "CompareDialog.h"
 #include "MergeDialog.h"
 #include "Keymap.h"
+#include "CommandFinder.h"
 #include "LoudnessReadout.h"
+#include "LiveTake.h"
+#include "audio/RtGuard.h"
+#include <QtEndian>
 #include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
 #include "TrackGroupsDialog.h"
@@ -288,6 +298,8 @@
 #include "render/BackgroundJobs.h"
 #include "render/RenderFarm.h"
 #include "DialogJobs.h"
+#include "DialogTasks.h"
+#include "media/AutoDuck.h"
 #include "render/HrdCheck.h"
 #include <QProgressDialog>
 #include <QSaveFile>
@@ -527,10 +539,157 @@ class TestApp : public QObject {
         return double(vw) / double(dur);
     }
 
+    // --- Background tasks (DialogJobs.h) ---
+
+    // Runs `begin` (something that starts a task and watches it) with the task held at its start, and closes its
+    // progress dialog with Run in Background. Returns the task's id: it is still held (setPaused lets it go on).
+    QString startInBackground(DialogJobs* jobs, const std::function<void()>& begin) {
+        const size_t before = jobs->tasks().size();
+        qputenv("MONTAGE_JOBS_PAUSE_AT", "0");
+        QTimer click;
+        connect(&click, &QTimer::timeout, this, [&click] {
+            for (QWidget* w : QApplication::topLevelWidgets())
+                if (w->objectName() == QLatin1String("jobProgress"))
+                    if (auto* b = w->findChild<QPushButton*>("jobBackground")) {
+                        click.stop();
+                        b->click();
+                        return;
+                    }
+        });
+        click.start(5);
+        begin();
+        click.stop();
+        qunsetenv("MONTAGE_JOBS_PAUSE_AT");
+        const auto tasks = jobs->tasks();
+        return tasks.size() > before ? tasks.back().id : QString();
+    }
+
+    // This test binary run again as a helper process (its only test dialogTaskHelper, told what to do by a file).
+    std::unique_ptr<QProcess> taskHelper(const QJsonObject& spec, const QString& pauseAt = {}) {
+        static int n = 0;
+        const QString file = dir_.filePath(QStringLiteral("task-helper-%1.json").arg(++n));
+        QFile f(file);
+        if (!f.open(QIODevice::WriteOnly)) return nullptr;
+        f.write(QJsonDocument(spec).toJson());
+        f.close();
+        auto p = std::make_unique<QProcess>();
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert("MONTAGE_TEST_TASK_HELPER", file);
+        env.insert("QT_QPA_PLATFORM", "offscreen");
+        env.insert("MONTAGE_NO_PLUGIN_SCAN", "1");
+        env.insert("MONTAGE_NO_RECOVERY_PROMPT", "1");
+        env.insert("MONTAGE_RECOVERY_DIR", dir_.filePath("helper-recovery"));
+        env.remove("MONTAGE_JOBS_PAUSE_AT");
+        if (!pauseAt.isEmpty()) env.insert("MONTAGE_JOBS_PAUSE_AT", pauseAt);
+        p->setProcessEnvironment(env);
+        p->setProcessChannelMode(QProcess::MergedChannels);
+        p->start(QCoreApplication::applicationFilePath(), {"dialogTaskHelper"});
+        return p;
+    }
+
+    // A task of `kind` begun on the project open now in a helper process, which is killed once the task has got as far
+    // as `pauseAt` (0 to 1). Then two more helpers are started together, as two Montages are after a crash: one of
+    // them takes the task up and finishes it. Returns the job's id in the store, "" with `why` when something went
+    // otherwise. (The helpers have no project open, so the result is kept and offered here, not applied there.)
+    QString killedAndTakenUp(const QString& kind, const QString& title, const QJsonObject& input, const QString& pauseAt, QString* why,
+                             int waitMs = 120000, const std::function<void(const QString& id)>& between = {}) {
+        const QString project = dir_.filePath("task-helper-project.json");
+        {
+            QFile f(project);
+            if (!f.open(QIODevice::WriteOnly)) return {};
+            f.write(QByteArray::fromStdString(projectToJson(state()->project())));
+        }
+        const QString store = jobs::storeFolder();
+        auto first = taskHelper(QJsonObject{{"mode", "start"}, {"store", store}, {"project", project}, {"kind", kind}, {"title", title}, {"input", input}},
+                                pauseAt);
+        if (!first || !first->waitForStarted(10000)) return *why = "the helper did not start", QString();
+        // Killed where it waits, part-way.
+        QString id;
+        QElapsedTimer t;
+        t.start();
+        while (id.isEmpty() && t.elapsed() < waitMs && first->state() != QProcess::NotRunning) {
+            QTest::qWait(50);
+            for (const jobs::Record& r : jobs::all("app"))
+                if (r.kind == kind && r.pid == first->processId() && r.step == QLatin1String("paused")) id = r.id;
+        }
+        if (id.isEmpty()) {
+            *why = "the task never got that far in the helper: " + QString::fromUtf8(first->readAll()).right(2000);
+            first->kill();
+            first->waitForFinished(10000);
+            return {};
+        }
+        first->kill();
+        first->waitForFinished(10000);
+        jobs::Record r;
+        if (!jobs::load(id, r) || r.status != QLatin1String("interrupted")) return *why = "after the kill the job reads " + r.status, QString();
+        if (between) between(id);
+        // Two Montages started together: the job is taken up once.
+        const QString marks = dir_.filePath("task-helper-took-" + id);
+        QDir().mkpath(marks);
+        std::vector<std::unique_ptr<QProcess>> both;
+        for (int i = 0; i < 2; ++i) both.push_back(taskHelper(QJsonObject{{"mode", "resume"}, {"store", store}, {"marks", marks}}));
+        int took = 0;
+        for (auto& p : both) {
+            if (!p || !p->waitForFinished(waitMs) || p->exitStatus() != QProcess::NormalExit) {
+                *why = "a helper taking the job up did not end: " + (p ? QString::fromUtf8(p->readAll()).right(2000) : QString());
+                if (p) p->kill(), p->waitForFinished(10000);
+                return {};
+            }
+        }
+        for (const QString& name : QDir(marks).entryList(QDir::Files)) {
+            QFile f(marks + "/" + name);
+            if (f.open(QIODevice::ReadOnly)) took += f.readAll().trimmed().toInt();
+        }
+        if (took != 1) return *why = QStringLiteral("the job was taken up %1 times").arg(took), QString();
+        if (!jobs::load(id, r) || r.status != QLatin1String("done")) return *why = "taken up, the job ended " + r.status + ": " + r.error, QString();
+        return id;
+    }
+
+    // The pictures of a DCP (its JPEG 2000 codestreams, in order) or of an IMF master, as its track file holds them.
+    static std::vector<std::vector<uint8_t>> dcpPictures(const QString& folder) {
+        std::vector<std::vector<uint8_t>> out;
+        for (const QString& f : QDir(folder).entryList({"*.mxf"})) {
+            dcp::TrackFileReader r;
+            if (!r.open(QDir(folder).filePath(f).toStdString()) || r.timedText() || r.iab() || r.largestEditUnit() < 10000) continue;
+            for (int64_t k = 0; k < r.editUnits(); ++k) {
+                out.emplace_back();
+                if (!r.read(k, 0, out.back())) out.back().clear();
+            }
+            break;
+        }
+        return out;
+    }
+    static std::vector<std::vector<uint8_t>> imfPictures(const QString& folder) {
+        std::vector<std::vector<uint8_t>> out;
+        for (const QString& f : QDir(folder).entryList({"VIDEO_*.mxf"})) {
+            dcp::ImfTrackReader r;
+            if (!r.open(QDir(folder).filePath(f).toStdString())) continue;
+            for (int64_t k = 0; k < r.frames(); ++k) {
+                out.emplace_back();
+                if (!r.frame(k, out.back())) out.back().clear();
+            }
+            break;
+        }
+        return out;
+    }
+    // The one folder in `parent` whose name starts with `prefix` ("" when there is none, or more than one).
+    static QString onlyPackage(const QString& parent, const QString& prefix) {
+        const QStringList found = QDir(parent).entryList({prefix + "*"}, QDir::Dirs | QDir::NoDotAndDotDot);
+        return found.size() == 1 ? QDir(parent).filePath(found.front()) : QString();
+    }
+
+    static QJsonObject taskResult(const QString& id) {
+        QFile f(jobs::jobFolder(id) + "/result.json");
+        return f.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(f.readAll()).object() : QJsonObject();
+    }
+
 private slots:
     void initTestCase() {
         QVERIFY(dir_.isValid());
-        // Settings of their own: nothing the app saved (window layout, workspace, presets) leaks into the tests.
+        // Settings of their own: nothing the app saved (window layout, workspace, presets) leaks into the tests, nor
+        // what one run of them saved into the next. In a file: the system's own store on Windows and macOS is not moved
+        // by setPath.
+        QSettings::setDefaultFormat(QSettings::IniFormat);
         for (auto format : {QSettings::NativeFormat, QSettings::IniFormat})
             QSettings::setPath(format, QSettings::UserScope, dir_.filePath(QStringLiteral("settings")));
         // DCP signing certificates and DKDMs of their own too.
@@ -541,6 +700,9 @@ private slots:
         qputenv("MONTAGE_SOUND_LIBRARY", dir_.filePath(QStringLiteral("sound-library.sqlite")).toUtf8());
         // And a job store (the render queue kept on disk) of their own.
         qputenv("MONTAGE_JOBS_DIR", dir_.filePath(QStringLiteral("jobs")).toUtf8());
+        // And a recovery folder, in this run's own temporary folder whatever the environment names: a run that is
+        // killed leaves its unsaved work there, where no later run looks.
+        qputenv("MONTAGE_RECOVERY_DIR", dir_.filePath(QStringLiteral("recovery")).toUtf8());
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();
@@ -860,6 +1022,21 @@ private slots:
         for (const char* box : {"qcFlashing", "qcLevels", "qcBlack", "qcFreeze", "qcSilence", "qcClipping", "qcPhase", "qcDcOffset", "qcSpelling", "qcSync"})
             compare.findChild<QCheckBox*>(box)->setChecked(false);
         compare.findChild<QLineEdit*>("qcCompareFile")->setText(QString::fromStdString(st.path));
+        // Quick VMAF scores every fourth frame, and an estimate of VMAF's time is shown before the check starts.
+        auto* quick = compare.findChild<QCheckBox*>("qcVmafQuick");
+        QVERIFY(quick);
+        if (vmafAvailable()) {
+            QVERIFY(quick->isEnabled());
+            QTRY_VERIFY_WITH_TIMEOUT(compare.findChild<QLabel*>("qcVmafEstimate")->text().startsWith("VMAF: about"), 20000);
+            quick->setChecked(true);
+            QCOMPARE(compare.settings().compareVmafEvery, 4);
+            QTRY_VERIFY_WITH_TIMEOUT(compare.findChild<QLabel*>("qcVmafEstimate")->text().startsWith("VMAF: about"), 20000);
+            quick->setChecked(false);
+            compare.findChild<QCheckBox*>("qcVmaf")->setChecked(false);
+            QVERIFY(!quick->isEnabled() && compare.findChild<QLabel*>("qcVmafEstimate")->text().isEmpty());
+            compare.findChild<QCheckBox*>("qcVmaf")->setChecked(true);
+        }
+        QCOMPARE(compare.settings().compareVmafEvery, 1);
         auto* preset = compare.findChild<QComboBox*>("qcQualityPreset");
         preset->setCurrentIndex(preset->findText("Broadcast", Qt::MatchStartsWith));
         QCOMPARE(compare.findChild<QDoubleSpinBox*>("qcMinPsnr")->value(), 38.0);
@@ -1734,6 +1911,24 @@ private slots:
             if (f == 30) learn->releaseHolds();
         });
         QCOMPARE(byController, byMouse);
+        // An NRPN's halves are one value: the pair moves the fader once it is whole; a fine half alone moves it a
+        // moment later (nightly 23 Nov: it could be held and never sent), when no coarse half has followed.
+        {
+            midimap::Mapping wide;
+            wide.key = {midimap::Kind::Nrpn, 0, 3 << 7 | 4};
+            wide.target = "strip:2:volume";
+            wide.pickup = false;
+            learn->addMapping(wide);
+            for (const MidiMessage& m : {MidiMessage{0xB0, 99, 3}, MidiMessage{0xB0, 98, 4}, MidiMessage{0xB0, 6, 64}, MidiMessage{0xB0, 38, 0}}) learn->handle(m);
+            const double whole = learn->targetValue("strip:2:volume");
+            QVERIFY2(std::fabs(whole - 8192 / 16383.0) < 0.01, qPrintable(QString::number(whole)));
+            learn->handle({0xB0, 38, 127});
+            QCOMPARE(learn->targetValue("strip:2:volume"), whole);
+            QTRY_VERIFY(learn->targetValue("strip:2:volume") > whole);
+            QVERIFY(std::fabs(learn->targetValue("strip:2:volume") - (8192 + 127) / 16383.0) < 0.01);
+            learn->releaseHolds();
+            learn->removeMapping(learn->mappings().size() - 1);
+        }
 
         // A colour wheel: one axis per control, its last move made final once the control rests.
         QVERIFY(state()->edit("Palette", [red](Project& p, Sequence& s) {
@@ -1991,7 +2186,12 @@ private slots:
             auto* output = panel->findChild<QComboBox*>("samplerOutput48");
             auto* perHit = panel->findChild<QCheckBox*>("samplerClipPerHit");
             QVERIFY(curve && output && perHit);
-            QVERIFY(!qobject_cast<QStandardItemModel*>(curve->model())->item(3)->isEnabled());  // (drawn: no points)
+            curve->setCurrentIndex(3);  // (drawn, with nothing drawn yet: a straight line to draw from)
+            emit curve->activated(3);
+            QCOMPARE(track().sampler.pads[0].velocityPoints, (std::vector<std::pair<int, int>>{{1, 1}, {127, 127}}));
+            state()->undo();
+            QVERIFY(track().sampler.pads[0].velocityPoints.empty());
+            curve = panel->findChild<QComboBox*>("samplerCurve48");  // (the table made again)
             curve->setCurrentIndex(2);
             emit curve->activated(2);
             QCOMPARE(track().sampler.pads[0].velocityCurve, 2);
@@ -2069,6 +2269,644 @@ private slots:
         QVERIFY(track().lanes.empty() && track().sampler.passes.empty());
         win_->findChild<QDockWidget*>("sampler")->hide();
         QTRY_VERIFY(!panel->isActive());
+    }
+
+    void samplerCurveDrawnInThePanel() {
+        // A slot's velocity curve drawn with the mouse under the Sampler panel's table: points put down and dragged map
+        // every velocity from 1 to 127 as drawn (straight between the points), each stroke one undo step; a point
+        // double-clicked goes, and with the last one the slot plays as played again.
+        {
+            WavWriter w;
+            QVERIFY(w.open(dir_.path() + "/curve-click.wav", 48000, 1));
+            const std::vector<float> x(2400, 0.5f);
+            w.write(x.data(), int64_t(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/sampler-curve.montage"));
+        win_->findChild<QAction*>("showSampler")->trigger();
+        auto* panel = win_->findChild<SamplerPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        panel->setTrack(0);
+        QVERIFY(panel->addSounds(48, {dir_.path() + "/curve-click.wav"}));
+        auto slot = [&]() -> const SamplerSlot& { return state()->sequence()->audioTracks.at(0).sampler.pads.at(0); };
+        auto* view = panel->findChild<VelocityCurveView*>("samplerCurveView");
+        auto* table = panel->findChild<QTableWidget*>("samplerSlots");
+        QVERIFY(view && table);
+        QVERIFY(!view->isEnabled());  // (no slot selected: nothing to draw on)
+        table->setCurrentCell(0, 1);
+        QTRY_VERIFY(view->isEnabled() && view->isVisible());
+        // (a place for every velocity each way, so a point lands on the velocities it is put at)
+        QVERIFY(view->width() >= 160 && view->height() >= 140);
+        using Points = std::vector<std::pair<int, int>>;
+        auto stroke = [&](const QPoint& from, const QPoint& to) {
+            QTest::mousePress(view, Qt::LeftButton, Qt::NoModifier, from);
+            if (to != from) QTest::mouseMove(view, to);
+            QTest::mouseRelease(view, Qt::LeftButton, Qt::NoModifier, to);
+        };
+        // What the points should give: straight between them, level outside them.
+        auto drawn = [&](const Points& pts, int v) {
+            if (v <= pts.front().first) return pts.front().second;
+            if (v >= pts.back().first) return pts.back().second;
+            for (size_t i = 0; i + 1 < pts.size(); ++i)
+                if (v >= pts[i].first && v <= pts[i + 1].first)
+                    return int(std::lround(pts[i].second + (pts[i + 1].second - pts[i].second) * double(v - pts[i].first) /
+                                                              double(pts[i + 1].first - pts[i].first)));
+            return v;
+        };
+        auto mapsAsDrawn = [&](const Points& pts) {
+            if (slot().velocityCurve != 3 || slot().velocityPoints != pts) return false;
+            for (int v = 1; v <= 127; ++v)
+                if (sampler::curveVelocity(slot(), v) != drawn(pts, v)) return false;
+            return true;
+        };
+        // A point put down at (40 in, 90 out): the curve was as played, so it is drawn from that line's two ends.
+        const size_t undoBefore = state()->history().undoCount();
+        stroke(view->pointFor(40, 90), view->pointFor(40, 90));
+        QVERIFY(mapsAsDrawn({{1, 1}, {40, 90}, {127, 127}}));
+        QCOMPARE(state()->history().undoCount(), undoBefore + 1);
+        QCOMPARE(sampler::curveVelocity(slot(), 20), 44);  // (1 + 89 x 19/39 up the first stretch, to the nearest velocity)
+        // A second point put down and dragged before the mouse is let go: one step, where it was let go.
+        stroke(view->pointFor(90, 100), view->pointFor(100, 60));
+        QVERIFY(mapsAsDrawn({{1, 1}, {40, 90}, {100, 60}, {127, 127}}));
+        QCOMPARE(state()->history().undoCount(), undoBefore + 2);
+        // An end dragged up: the lightest touch now comes out at 30. A point cannot be dragged past its neighbour.
+        stroke(view->pointFor(1, 1), view->pointFor(1, 30));
+        QVERIFY(mapsAsDrawn({{1, 30}, {40, 90}, {100, 60}, {127, 127}}));
+        stroke(view->pointFor(100, 60), view->pointFor(20, 70));
+        QVERIFY(mapsAsDrawn({{1, 30}, {40, 90}, {41, 70}, {127, 127}}));
+        state()->undo();
+        QVERIFY(mapsAsDrawn({{1, 30}, {40, 90}, {100, 60}, {127, 127}}));
+        QCOMPARE(view->points(), slot().velocityPoints);  // (the view follows the undo)
+        // The table's box says Drawn, and lists the points (the boxes of the table as it was made before let go first).
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCOMPARE(panel->findChild<QComboBox*>("samplerCurve48")->currentIndex(), 3);
+        QVERIFY(panel->findChild<QComboBox*>("samplerCurve48")->toolTip().contains("40 → 90"));
+        // Double-clicked, a point goes; without any the slot plays as played.
+        QTest::mouseDClick(view, Qt::LeftButton, Qt::NoModifier, view->pointFor(100, 60));
+        QVERIFY(mapsAsDrawn({{1, 30}, {40, 90}, {127, 127}}));
+        for (const auto& pt : Points{{1, 30}, {40, 90}, {127, 127}}) QTest::mouseDClick(view, Qt::LeftButton, Qt::NoModifier, view->pointFor(pt.first, pt.second));
+        QCOMPARE(slot().velocityCurve, 0);
+        QVERIFY(slot().velocityPoints.empty());
+        for (int v = 1; v <= 127; ++v) QCOMPARE(sampler::curveVelocity(slot(), v), v);
+        win_->findChild<QDockWidget*>("sampler")->hide();
+        QTRY_VERIFY(!panel->isActive());
+    }
+    void samplerSlotsLiveOnTheirTracks() {
+        // Through the audio device (the loopback here, with a tap on what it plays): two sampler slots sent to two
+        // tracks, one panned hard left and one hard right, are heard on those sides as they are played, stopped and
+        // playing; the slot sent nowhere is heard on both, as before. A track muted silences what is sent to it.
+        const int rate = 48000;
+        {
+            WavWriter w;
+            QVERIFY(w.open(dir_.path() + "/live-level.wav", rate, 1));
+            const std::vector<float> x(size_t(rate) / 4, 0.5f);  // (a quarter of a second at one level)
+            w.write(x.data(), int64_t(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        // (in a folder of its own: what it records is not numbered among the other tests' takes)
+        QVERIFY(QDir(dir_.path()).mkpath(QStringLiteral("sampler-live")));
+        QVERIFY(state()->save(dir_.path() + "/sampler-live/sampler-live.montage"));
+        QVERIFY(state()->edit("Tracks", [&](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 3) edit::addTrack(p, s, TrackKind::Audio);
+            s.audioTracks[1].pan = -1;
+            s.audioTracks[2].pan = 1;
+            edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 600));  // (twenty seconds to play through)
+            return true;
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 7}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_audio_device"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        audiodev::setLoopbackOptions({256, 512, 0});
+        QJsonObject r = call({{"action", "set"}, {"settings", QJsonObject{{"host", "loopback"}, {"buffer", 256}, {"sample_rate", 0}, {"inputs", 2}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        win_->findChild<QAction*>("showSampler")->trigger();
+        auto* panel = win_->findChild<SamplerPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        panel->setTrack(0);
+        for (int key : {48, 50, 52}) QVERIFY(panel->addSounds(key, {dir_.path() + "/live-level.wav"}));
+        const Id a2 = state()->sequence()->audioTracks[1].id, a3 = state()->sequence()->audioTracks[2].id;
+        for (const auto& [key, index] : {std::pair{50, 1}, std::pair{52, 2}}) {
+            auto* output = panel->findChild<QComboBox*>(QStringLiteral("samplerOutput%1").arg(key));
+            QVERIFY(output);
+            output->setCurrentIndex(index);
+            emit output->activated(index);
+        }
+        QCOMPARE(state()->sequence()->audioTracks[0].sampler.pads[1].output, a2);
+        QCOMPARE(state()->sequence()->audioTracks[0].sampler.pads[2].output, a3);
+        QTRY_VERIFY(panel->isActive());
+        // What the device plays, heard back on its inputs.
+        std::mutex m;
+        float left = 0, right = 0;
+        const int tap = audiodev::Engine::shared().addInput(nullptr, rate, [&](const float* in, int channels, int frames, int64_t) {
+            std::lock_guard<std::mutex> lock(m);
+            for (int i = 0; i < frames; ++i) {
+                left = std::max(left, std::fabs(in[size_t(i) * size_t(channels)]));
+                if (channels > 1) right = std::max(right, std::fabs(in[size_t(i) * size_t(channels) + 1]));
+            }
+        });
+        QVERIFY(tap >= 0);
+        // (the tap reads this test's variables: taken off, and the device and panel put back, however the test ends)
+        bool tapped = true;
+        auto putBack = qScopeGuard([&] {
+            if (tapped) audiodev::Engine::shared().removeInput(tap);
+            program->pause();
+            win_->findChild<QDockWidget*>("sampler")->hide();
+            call({{"action", "set"}, {"settings", QJsonObject{{"host", "qt"}}}});
+            audiodev::setLoopbackOptions({});
+        });
+        // A key played: the loudest it was heard on each side until it had rung out (its sound is 250 ms long).
+        auto heard = [&](int key) {
+            QElapsedTimer quiet;
+            quiet.start();
+            while (quiet.elapsed() < 200) QTest::qWait(20);  // (whatever sounded before has gone)
+            {
+                std::lock_guard<std::mutex> lock(m);
+                left = right = 0;
+            }
+            panel->noteOn(key, 127);
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 700) QTest::qWait(20);
+            panel->noteOff(key);
+            std::lock_guard<std::mutex> lock(m);
+            return std::pair<float, float>{left, right};
+        };
+        auto check = [&](const char* when) {
+            const auto own = heard(48), toLeft = heard(50), toRight = heard(52);
+            const QByteArray what = QStringLiteral("%1: own %2 %3, left %4 %5, right %6 %7")
+                                        .arg(when).arg(own.first).arg(own.second).arg(toLeft.first).arg(toLeft.second).arg(toRight.first).arg(toRight.second).toUtf8();
+            // (at the output as it is, on both sides alike: a mono sound at 0.5 spread over two at -3 dB)
+            QVERIFY2(std::fabs(own.first - 0.5f * float(M_SQRT1_2)) < 0.01f && std::fabs(own.second - own.first) < 0.01f, what.constData());
+            QVERIFY2(toLeft.first > 0.3f && toLeft.second < 1e-4f, what.constData());
+            QVERIFY2(toRight.second > 0.3f && toRight.first < 1e-4f, what.constData());
+        };
+        check("stopped");
+        if (QTest::currentTestFailed()) return;
+        program->seek(0);
+        program->play();
+        QTRY_VERIFY(program->isPlaying());
+        check("playing");
+        if (QTest::currentTestFailed()) return;
+        // The track it is sent to muted: not heard, playing or stopped; the other slots as before.
+        QVERIFY(state()->edit("Mute", [&](Project&, Sequence& s) {
+            s.audioTracks[1].muted = true;
+            return true;
+        }));
+        auto muted = heard(50);
+        QVERIFY2(muted.first < 1e-4f && muted.second < 1e-4f, qPrintable(QStringLiteral("%1 %2").arg(muted.first).arg(muted.second)));
+        QVERIFY(heard(52).second > 0.3f);
+        program->pause();
+        QTRY_VERIFY(!program->isPlaying());
+        muted = heard(50);
+        QVERIFY2(muted.first < 1e-4f && muted.second < 1e-4f, qPrintable(QStringLiteral("%1 %2").arg(muted.first).arg(muted.second)));
+        QVERIFY(heard(52).second > 0.3f);
+        audiodev::Engine::shared().removeInput(tap);
+        tapped = false;
+        win_->findChild<QDockWidget*>("sampler")->hide();
+        QTRY_VERIFY(!panel->isActive());
+        putBack.dismiss();
+        r = call({{"action", "set"}, {"settings", QJsonObject{{"host", "qt"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        audiodev::setLoopbackOptions({});
+    }
+
+    // Sets the audio device chosen in Monitoring through its tool (montage_audio_device), as the panel does.
+    QJsonObject setAudioDevice(const QJsonObject& settings) {
+        QJsonObject answer;
+        const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 7}, {"method", "tools/call"},
+                            {"params", QJsonObject{{"name", "montage_audio_device"}, {"arguments", QJsonObject{{"action", "set"}, {"settings", settings}}}}}};
+        win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                 [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+        return answer;
+    }
+
+    // A JACK server of the tests' own under the dummy driver, when jackd and a JACK library are here; false when not.
+    bool startJackServer(QProcess& jackd) {
+        const QString exe = QStandardPaths::findExecutable(QStringLiteral("jackd"));
+        if (exe.isEmpty() || audiodev::jackLibrary().empty()) return false;
+        const QString server = QStringLiteral("montage-app-test-%1").arg(QCoreApplication::applicationPid());
+        qputenv("JACK_DEFAULT_SERVER", server.toUtf8());
+        qputenv("JACK_NO_AUDIO_RESERVATION", "1");
+        jackd.start(exe, {"--no-realtime", "-n", server, "-d", "dummy", "-r", "48000", "-p", "256"});
+        return jackd.waitForStarted(5000);
+    }
+
+    // Opens the device on `host` ("loopback" or "jack"), trying for ten seconds (a server takes a moment to answer).
+    bool openAudioDevice(const QString& host) {
+        QElapsedTimer t;
+        t.start();
+        do {
+            setAudioDevice({{"host", "qt"}});
+            setAudioDevice({{"host", host}, {"buffer", 256}, {"sample_rate", 0}, {"inputs", 2}});
+            if (audiodev::Engine::shared().isOpen()) return true;
+            QTest::qWait(200);
+        } while (t.elapsed() < 10000);
+        return false;
+    }
+
+    void takeWaveformWhileRecording() {
+        // A take's waveform is drawn on its track while it is recorded. A 1 kHz burst sent out of the loopback device
+        // comes back into the take: before the take stops the track shows the burst where it will lie, and once it has
+        // stopped the take's file has that waveform, bucket for bucket.
+        const int rate = 48000;
+        state()->newProject();
+        // (in a folder of its own: its takes are not numbered among the other tests')
+        QVERIFY(QDir(dir_.path()).mkpath(QStringLiteral("live-take")));
+        QVERIFY(state()->save(dir_.path() + "/live-take/live-take.montage"));
+        const double fps = state()->sequence()->fpsValue();
+        ppf_ = measurePpf();
+        audiodev::setLoopbackOptions({256, 512, 0});
+        // (back to the usual device however the test ends)
+        auto usualDevice = qScopeGuard([&] {
+            setAudioDevice({{"host", "qt"}});
+            audiodev::setLoopbackOptions({});
+        });
+        QVERIFY(openAudioDevice(QStringLiteral("loopback")));
+        auto& engine = audiodev::Engine::shared();
+        {
+            VoiceoverRecorder rec(state());
+            QVERIFY(rec.start(30, 1));
+            QVERIFY(LiveTakes::instance().takeOf(&rec));
+            std::atomic<int64_t> sent{0};
+            const int64_t burstAt = rate / 2, burstLong = 14400;
+            std::string error;
+            int out = engine.addOutput(nullptr, rate, 2, [&](float* o, int channels, int frames) -> int64_t {
+                const int64_t at = sent.load();
+                for (int i = 0; i < frames; ++i) {
+                    const int64_t n = at + i;
+                    const float v = n >= burstAt && n < burstAt + burstLong ? float(0.5 * std::sin(2 * M_PI * 1000 * double(n) / rate)) : 0.0f;
+                    for (int c = 0; c < channels; ++c) o[size_t(i) * size_t(channels) + size_t(c)] = v;
+                }
+                sent = at + frames;
+                return -1;
+            }, &error);
+            QVERIFY2(out >= 0, error.c_str());
+            // (the burst's sender reads this scope's variables: taken off the device however the test ends)
+            auto unhook = qScopeGuard([&] {
+                if (out >= 0) engine.removeOutput(out);
+            });
+            QElapsedTimer clock;
+            clock.start();
+            while (rec.seconds() < 1.6 && clock.elapsed() < 30000) QTest::qWait(20);
+            QVERIFY(rec.seconds() >= 1.6);
+            QVERIFY(rec.isRecording());
+
+            // While it records: the take as the timeline has it (no events run until it has been looked at).
+            const LiveTake* take = LiveTakes::instance().takeOf(&rec);
+            QVERIFY(take);
+            QCOMPARE(take->tracks, std::vector<int>{1});
+            QCOMPARE(take->at, FrameTime(30));
+            const Peaks live = take->peaks.at(0);
+            const qint64 liveFrames = take->frames;
+            const size_t whole = size_t(liveFrames / live.samplesPerBucket);
+            QVERIFY(whole > size_t(1.5 * rate / 256));
+            size_t first = 0, last = 0;
+            for (size_t b = 0; b < whole; ++b)
+                if (live.minmax[b * 2 + 1] > 0.25f) {
+                    if (!first) first = b;
+                    last = b;
+                }
+            QVERIFY(first > 0);
+            // (14400 samples are 56.25 buckets: 57 or 58 hold some of it)
+            QVERIFY2(std::abs(int(last - first + 1) - 57) <= 1, qPrintable(QStringLiteral("%1 to %2").arg(first).arg(last)));
+            for (size_t b = 0; b < whole; ++b)
+                if (b + 1 < first || b > last + 1) QVERIFY2(live.minmax[b * 2 + 1] < 1e-4f && live.minmax[b * 2] > -1e-4f, qPrintable(QString::number(b)));
+            // On the timeline it lies on A2 from frame 30 to where it has reached, the burst inside it at its place.
+            const TrackRef a2{TrackKind::Audio, 1};
+            const QRect drawn = timeline()->liveTakeRectOn(*take, 1);
+            QVERIFY(!drawn.isEmpty());
+            QVERIFY(std::abs(drawn.left() - pointFor(30, a2).x()) <= 1);
+            QVERIFY(std::abs(drawn.center().y() - pointFor(30, a2).y()) <= 8);
+            const double reached = 30 + double(liveFrames) / rate * fps;
+            QVERIFY(std::abs(drawn.right() - pointFor(0, a2).x() - reached * ppf_) <= 2);
+            const double burstFrame = 30 + (double(first) + 28) * 256 / rate * fps, quietFrame = 30 + (double(first) - 12) * 256 / rate * fps;
+            const auto inBurst = timeline()->liveTakeLevelAt(*take, 0, burstFrame);
+            const auto inQuiet = timeline()->liveTakeLevelAt(*take, 0, quietFrame);
+            // (a mono take is drawn as its file reads, -3 dB on each side: 0.5 comes back as 0.354)
+            QVERIFY2(inBurst.second > 0.3f && inBurst.first < -0.3f, qPrintable(QStringLiteral("%1 %2").arg(inBurst.first).arg(inBurst.second)));
+            QVERIFY(inQuiet.second < 1e-4f && inQuiet.first > -1e-4f);
+            // And it is painted: the column at the burst's middle has far more of the waveform's colour than one in
+            // the silence before it.
+            const QImage shot = timeline()->viewport()->grab().toImage();
+            auto inked = [&](double frame) {
+                const int x = drawn.left() + int(std::lround((frame - 30) * ppf_));
+                const int quietX = drawn.left() + int(std::lround((quietFrame - 30) * ppf_));
+                int n = 0;
+                for (int y = drawn.top() + 1; y < drawn.bottom(); ++y)
+                    if (shot.pixel(x, y) != shot.pixel(quietX, y)) ++n;
+                return n;
+            };
+            QVERIFY2(inked(burstFrame) >= drawn.height() / 4, qPrintable(QString::number(inked(burstFrame))));
+
+            // Stopped: the clip takes its place, and its file's waveform is what was drawn.
+            engine.removeOutput(out);
+            out = -1;
+            const Id clip = rec.stop();
+            QVERIFY(clip);
+            QVERIFY(!LiveTakes::instance().takeOf(&rec));
+            const Clip* c = edit::clipById(*state()->sequence(), clip);
+            QVERIFY(c && c->start == 30);
+            QCOMPARE(edit::locate(*state()->sequence(), clip)->track, a2);
+            std::vector<float> lo, hi;
+            QVERIFY(decodeAudioBlocks(rec.lastTake().toStdString(), rate, 256, [&](const std::vector<float>& mono) {
+                lo.push_back(*std::min_element(mono.begin(), mono.end()));
+                hi.push_back(*std::max_element(mono.begin(), mono.end()));
+                return true;
+            }));
+            QVERIFY(lo.size() >= whole);
+            for (size_t b = 0; b < whole; ++b) {
+                QVERIFY2(std::fabs(std::min(lo[b], 0.0f) - live.minmax[b * 2]) < 1e-4f, qPrintable(QString::number(b)));
+                QVERIFY2(std::fabs(std::max(hi[b], 0.0f) - live.minmax[b * 2 + 1]) < 1e-4f, qPrintable(QString::number(b)));
+            }
+        }
+        usualDevice.dismiss();
+        QVERIFY(!setAudioDevice({{"host", "qt"}}).value("isError").toBool());
+        audiodev::setLoopbackOptions({});
+
+        // A loop recording (fed by hand) draws the pass being recorded, from In; a grouped take a channel on each of
+        // its tracks.
+        {
+            const FrameTime in = FrameTime(std::llround(fps * 2)), out = in + FrameTime(std::llround(fps)), preroll = FrameTime(std::llround(fps / 2));
+            VoiceoverRecorder loop(state());
+            QVERIFY(loop.startLoop(in, out, preroll, 0, {}, false, rate, 1));
+            const qint64 lead = qint64(std::llround(double(preroll) / fps * rate)), round = qint64(std::llround(double(out - in) / fps * rate));
+            auto feed = [&](qint64 frames, float v) {
+                std::vector<float> block(size_t(frames), v);
+                loop.feed(block.data(), frames);
+            };
+            feed(lead, 0.1f);
+            const LiveTake* lt = LiveTakes::instance().takeOf(&loop);
+            QVERIFY(lt);
+            qint64 firstSample = -1;
+            FrameTime from = -1;
+            lt->pass(firstSample, from);
+            QCOMPARE(from, in - preroll);  // (the lead-in, drawn from where the take began)
+            feed(round, 0.2f);
+            feed(round / 2, 0.6f);
+            lt = LiveTakes::instance().takeOf(&loop);
+            lt->pass(firstSample, from);
+            QCOMPARE(from, in);
+            QCOMPARE(firstSample, lead + round);
+            const QRect pass = timeline()->liveTakeRectOn(*lt, 0);
+            QVERIFY(std::abs(pass.left() - pointFor(in, A1).x()) <= 1);
+            QVERIFY(std::abs(pass.width() - double(out - in) / 2 * ppf_) <= 2);
+            QVERIFY(std::fabs(timeline()->liveTakeLevelAt(*lt, 0, double(in) + 2).second - 0.6f * float(M_SQRT1_2)) < 1e-6f);  // (this pass, not the one before; mono, -3 dB)
+            QCOMPARE(timeline()->liveTakeLevelAt(*lt, 0, double(out) - 2).second, 0.0f);                     // (not reached yet)
+            loop.cancel();
+            QVERIFY(!LiveTakes::instance().takeOf(&loop));
+        }
+    }
+
+    void lostAudioDeviceKeepsTheTake_data() {
+        QTest::addColumn<QString>("host");
+        QTest::newRow("loopback unplugged") << QStringLiteral("loopback");
+        QTest::newRow("JACK server killed") << QStringLiteral("jack");
+    }
+
+    void lostAudioDeviceKeepsTheTake() {
+        // The audio device goes away during a take (the test device unplugged; a JACK server killed): the take's file
+        // ends whole with the last block the device brought, the take is in the bin and on its track, the user is told
+        // within a second, and playback goes on through what opens next.
+        QFETCH(QString, host);
+        const bool jack = host == QStringLiteral("jack");
+        QProcess jackd;
+        if (jack && !startJackServer(jackd)) QSKIP("No jackd with a JACK library here");
+        state()->newProject();
+        // (in a folder of its own: its takes are not numbered among the other tests')
+        QVERIFY(QDir(dir_.path()).mkpath(QStringLiteral("lost-%1").arg(host)));
+        QVERIFY(state()->save(dir_.path() + QStringLiteral("/lost-%1/lost.montage").arg(host)));
+        QVERIFY(state()->edit("Picture", [&](Project& p, Sequence& s) {
+            return edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 900)).ok;  // (thirty seconds to play through)
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        if (!jack) audiodev::setLoopbackOptions({256, 512, 0});
+        // (playback stopped, the usual device back and the server gone however the test ends: a test after it that
+        // records by hand would otherwise record through the device)
+        auto putBack = qScopeGuard([&] {
+            program->pause();
+            setAudioDevice({{"host", "qt"}});
+            audiodev::setLoopbackOptions({});
+            if (jackd.state() != QProcess::NotRunning) {
+                jackd.kill();
+                jackd.waitForFinished(5000);
+            }
+        });
+        QVERIFY2(openAudioDevice(host), audiodev::Engine::shared().status().error.c_str());
+        {
+            VoiceoverRecorder rec(state());
+            QSignalSpy lost(&rec, &VoiceoverRecorder::deviceLost);
+            QSignalSpy stopped(&rec, &VoiceoverRecorder::stopped);
+            QSignalSpy told(program, &PlaybackController::audioDeviceLost);
+            QStringList said;
+            QObject listener;
+            connect(state(), &EditorState::statusMessage, &listener, [&](const QString& text, int) { said << text; });
+            program->seek(0);
+            program->play();
+            QTRY_VERIFY(program->isPlaying());
+            QVERIFY(rec.start(0, 1));
+            QElapsedTimer clock;
+            clock.start();
+            while (rec.seconds() < 1.0 && clock.elapsed() < 30000) QTest::qWait(20);
+            QVERIFY(rec.seconds() >= 1.0);
+            const double had = rec.seconds();
+
+            QElapsedTimer since;
+            since.start();
+            if (jack) {
+                jackd.kill();
+            } else {
+                audiodev::LoopbackOptions gone = audiodev::loopbackOptions();
+                gone.unplugged = true;
+                audiodev::setLoopbackOptions(gone);
+            }
+            while (lost.isEmpty() && since.elapsed() < 10000) QTest::qWait(5);
+            QVERIFY(!lost.isEmpty());
+            QVERIFY2(since.elapsed() < 1000, qPrintable(QString::number(since.elapsed())));
+            QVERIFY(!rec.isRecording());
+
+            // The file is whole: its header's length is the file's, and it reads to its end with all that had arrived.
+            const QString take = rec.lastTake();
+            QVERIFY(QFileInfo::exists(take));
+            QFile file(take);
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QByteArray header = file.read(12);
+            QCOMPARE(header.left(4), QByteArray("RIFF"));
+            QCOMPARE(qint64(qFromLittleEndian<quint32>(header.constData() + 4)), file.size() - 8);
+            file.close();
+            qint64 read = 0;
+            QVERIFY(decodeAudioBlocks(take.toStdString(), 48000, 4800, [&](const std::vector<float>& mono) {
+                read += qint64(mono.size());
+                return true;
+            }));
+            QVERIFY2(read >= qint64(had * 48000) - 4800, qPrintable(QStringLiteral("%1 of %2").arg(read).arg(had * 48000)));
+            // It is in the bin and on its track.
+            QCOMPARE(stopped.size(), 1);
+            const Id clip = stopped[0][0].toULongLong();
+            const Clip* c = edit::clipById(*state()->sequence(), clip);
+            QVERIFY(c && c->start == 0);
+            QCOMPARE(edit::locate(*state()->sequence(), clip)->track, (TrackRef{TrackKind::Audio, 1}));
+            const MediaItem* media = state()->project().findMedia(c->mediaId);
+            QVERIFY(media && media->bin == "Voiceover" && QString::fromStdString(media->path) == take);
+            // The user is told which take was kept, and that sound goes on through another device.
+            QTRY_VERIFY_WITH_TIMEOUT(!told.isEmpty(), 2000);
+            QVERIFY2(said.filter(QFileInfo(take).fileName()).size() == 1, qPrintable(said.join(" | ")));
+            QVERIFY2(said.filter(QStringLiteral("Sound now goes through")).size() == 1, qPrintable(said.join(" | ")));
+            // Playback was not stopped, and goes on.
+            QVERIFY(program->isPlaying());
+            const FrameTime at = program->position();
+            QElapsedTimer on;
+            on.start();
+            while (on.elapsed() < 1000) QTest::qWait(20);
+            QVERIFY2(program->position() >= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(program->position())));
+            program->pause();
+            QTRY_VERIFY(!program->isPlaying());
+        }
+        QVERIFY(!setAudioDevice({{"host", "qt"}}).value("isError").toBool());
+        audiodev::setLoopbackOptions({});
+        if (jackd.state() != QProcess::NotRunning) {
+            jackd.kill();
+            jackd.waitForFinished(5000);
+        }
+        qunsetenv("JACK_DEFAULT_SERVER");
+    }
+
+    void audioCallbackGuardedForAMinute_data() {
+        QTest::addColumn<QString>("host");
+        QTest::newRow("loopback") << QStringLiteral("loopback");
+        QTest::newRow("JACK dummy driver") << QStringLiteral("jack");
+    }
+
+    void audioCallbackGuardedForAMinute() {
+        // A minute of playback of 32 tracks, one through a hosted plug-in, with the sampler played and a take being
+        // recorded: the guard on the device's callback counts no allocation, no lock and no wait in it. Through the
+        // test device, and under JACK's dummy driver where jackd is installed.
+        QFETCH(QString, host);
+        const bool jack = host == QStringLiteral("jack");
+        QProcess jackd;
+        if (jack && !startJackServer(jackd)) QSKIP("No jackd with a JACK library here");
+        const int rate = 48000;
+        const QString tone = dir_.path() + "/guard-tone.wav", hit = dir_.path() + "/guard-hit.wav";
+        {
+            std::vector<float> x(size_t(rate) * 70);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.01 * std::sin(2 * M_PI * 220 * double(i) / rate));
+            WavWriter w;
+            QVERIFY(w.open(tone, rate, 1));
+            w.write(x.data(), qint64(x.size()));
+            QVERIFY(w.close());
+            WavWriter h;
+            QVERIFY(h.open(hit, rate, 1));
+            h.write(x.data(), rate / 4);
+            QVERIFY(h.close());
+        }
+        plugins::Registry& reg = plugins::Registry::instance();
+        reg.setCachePath((dir_.path() + "/plugin-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        for (plugins::Format f : plugins::kAllFormats) reg.setSearchPaths(f, {"/nonexistent-montage-test-dir"});
+        reg.setSearchPaths(plugins::Format::Clap, {QStringLiteral(MONTAGE_TEST_CLAP_DIR "/good").toStdString()});
+        reg.scan();
+        state()->newProject();
+        // (in a folder of its own: its takes are not numbered among the other tests')
+        QVERIFY(QDir(dir_.path()).mkpath(QStringLiteral("guard-%1").arg(host)));
+        QVERIFY(state()->save(dir_.path() + QStringLiteral("/guard-%1/guard.montage").arg(host)));
+        const auto ids = state()->importFiles({tone});
+        QCOMPARE(ids.size(), size_t(1));
+        std::string pluginError;
+        QVERIFY2(state()->edit("Tracks", [&](Project& p, Sequence& s) {
+            // Thirty-two tracks that sound, the sampler's and the take's.
+            while (s.audioTracks.size() < 34) edit::addTrack(p, s, TrackKind::Audio);
+            for (int i = 0; i < 32; ++i)
+                if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, V1, {TrackKind::Audio, i}, false).ok) return false;
+            auto fx = plugins::makeEffectOfType(p, "plugin:clap:org.montage.test.gain", &pluginError);
+            if (!fx) return false;
+            s.audioTracks[0].clips[0].effects.push_back(*fx);
+            return true;
+        }), pluginError.c_str());
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        if (!jack) audiodev::setLoopbackOptions({256, 512, 0});
+        // (playback stopped, the usual device back and the server gone however the test ends)
+        auto putBack = qScopeGuard([&] {
+            if (auto* p = win_->findChild<PlaybackController*>("programPlayback")) p->pause();
+            setAudioDevice({{"host", "qt"}});
+            audiodev::setLoopbackOptions({});
+            if (jackd.state() != QProcess::NotRunning) {
+                jackd.terminate();
+                jackd.waitForFinished(5000);
+            }
+        });
+        QVERIFY2(openAudioDevice(host), audiodev::Engine::shared().status().error.c_str());
+        win_->findChild<QAction*>("showSampler")->trigger();
+        auto* panel = win_->findChild<SamplerPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        panel->setTrack(32);
+        QVERIFY(panel->addSounds(48, {hit}));
+        QTRY_VERIFY(panel->isActive());
+        {
+            VoiceoverRecorder rec(state());
+            program->seek(0);
+            program->play();
+            QTRY_VERIFY(program->isPlaying());
+            QVERIFY(rec.start(0, 33));
+            QTRY_VERIFY_WITH_TIMEOUT(rec.seconds() > 0.2, 10000);
+            rtguard::reset();
+            QElapsedTimer clock;
+            clock.start();
+            int played = 0;
+            while (clock.elapsed() < 60000) {
+                // A key every half second, and the meters and readouts kept up as they are while a user watches.
+                panel->noteOn(48, 100);
+                QElapsedTimer beat;
+                beat.start();
+                while (beat.elapsed() < 500) QTest::qWait(20);
+                panel->noteOff(48);
+                ++played;
+            }
+            const rtguard::Counts counted = rtguard::counts();
+            QVERIFY(program->isPlaying());
+            QVERIFY2(program->position() > FrameTime(55 * state()->sequence()->fpsValue()), qPrintable(QString::number(program->position())));
+            QVERIFY(rec.isRecording() && rec.seconds() > 55);
+            QVERIFY(played > 100);
+            // (a minute of blocks of 256 at 48 kHz is 11250 callbacks)
+            QVERIFY2(counted.callbacks > 9000, qPrintable(QString::number(counted.callbacks)));
+            QCOMPARE(counted.allocations, int64_t(0));
+            QCOMPARE(counted.locks, int64_t(0));
+            QCOMPARE(counted.waits, int64_t(0));
+#ifdef Q_OS_LINUX
+            QCOMPARE(rtguard::sees(), int(rtguard::Allocations | rtguard::Locks | rtguard::Waits));
+#endif
+            // The dropouts counted are shown beside the loudness meters.
+            const qint64 dropouts = audiodev::Engine::shared().dropouts();
+            QVERIFY(dropouts >= 0);
+            auto* readout = win_->findChild<LoudnessReadout*>();
+            QVERIFY(readout);
+            QTRY_COMPARE_WITH_TIMEOUT(readout->text("DO"), QString::number(audiodev::Engine::shared().dropouts()), 3000);
+            program->pause();
+            QTRY_VERIFY(!program->isPlaying());
+            QVERIFY(rec.stop());
+        }
+        win_->findChild<QDockWidget*>("sampler")->hide();
+        QTRY_VERIFY(!panel->isActive());
+        QVERIFY(!setAudioDevice({{"host", "qt"}}).value("isError").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(win_->findChild<LoudnessReadout*>()->text("DO"), QStringLiteral("—"), 3000);
+        audiodev::setLoopbackOptions({});
+        if (jackd.state() != QProcess::NotRunning) {
+            jackd.terminate();
+            jackd.waitForFinished(5000);
+        }
+        qunsetenv("JACK_DEFAULT_SERVER");
     }
 
     void oscControl() {
@@ -3114,7 +3952,8 @@ private slots:
         // (made before the streams start: one that does not start leaves no inputs behind for the tests after)
         auto finish = qScopeGuard([&] {
             stop = true;
-            for (auto& p : streams) p->kill(), p->waitForFinished(5000);
+            for (auto& p : streams)
+                if (p) p->kill(), p->waitForFinished(5000);
             for (std::thread& t : sending)
                 if (t.joinable()) t.join();
 #ifdef MONTAGE_WITH_OMT
@@ -3127,7 +3966,19 @@ private slots:
             for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
                 if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
         });
-        for (int k = 0; k < (omtOk ? 1 : 2); ++k) {
+        // The streams' senders. One is started again when it has ended (an SRT caller that called between two of the
+        // listener's waits gives up), and when its tile has had no picture since it was started 15 s ago: on macOS a
+        // process started while another thread forks can be held before it runs (a Mac runner's first sender sent
+        // nothing for 90 s, and Qt never heard it start), or run with Qt not told (Qt makes the pipe that says so and
+        // marks it close-on-exec in two steps, and a process another thread starts in between keeps it). So Qt's word
+        // that it started is not waited for, and the wait for pictures runs from the last sender's start.
+        const int streamCount = omtOk ? 1 : 2;
+        streams.resize(size_t(streamCount));
+        std::vector<QElapsedTimer> streamStarted(static_cast<size_t>(streamCount));
+        std::vector<int> streamStarts(size_t(streamCount), 0);
+        QElapsedTimer lastStart;
+        auto startStream = [&](int k) {
+            if (auto& old = streams[size_t(k)]) old->kill(), old->waitForFinished(5000);
             auto p = std::make_unique<QProcess>();
             p->setProcessChannelMode(QProcess::ForwardedChannels);  // (its few errors in the test's own output)
             const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
@@ -3136,18 +3987,42 @@ private slots:
                               "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", QString::number(lifetimeS), "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
                               "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
                               "-c:a", "mp2", "-f", "mpegts", to});
-            // Only a command that could not be run fails here; the pictures below show it sending. (On macOS, which
-            // makes a pipe and marks it close-on-exec in two steps, a process another thread starts in between keeps
-            // the pipe that tells Qt the command has started, so Qt can wait as long as that process lives: a Mac
-            // runner with nothing much to do once waited more than three minutes for a sender that was running.)
-            streams.push_back(std::move(p));
-            if (!streams.back()->waitForStarted(within(30000)))
-                QVERIFY2(streams.back()->error() != QProcess::FailedToStart, qPrintable(streams.back()->errorString()));
+            streams[size_t(k)] = std::move(p);
+            streamStarted[size_t(k)].start();
+            ++streamStarts[size_t(k)];
+            lastStart.start();
+        };
+        // (each at most four times again: a sender that never shows is then left to fail the wait below)
+        auto keepSending = [&] {
+            for (int k = 0; k < streamCount; ++k) {
+                QProcess& p = *streams[size_t(k)];
+                const bool ended = p.state() == QProcess::NotRunning;
+                if (ended && p.error() == QProcess::FailedToStart) continue;  // (failed below)
+                if (streamStarts[size_t(k)] > 4 || !(ended || (mv->tile(2 + k).pictures == 0 && streamStarted[size_t(k)].elapsed() > 15000))) continue;
+                qInfo("multiviewer: stream sender %d started again (%s) after %lld ms", k, ended ? "it ended" : "no picture from it",
+                      sinceStart.elapsed());
+                startStream(k);
+            }
+        };
+        for (int k = 0; k < streamCount; ++k) {
+            startStream(k);
+            // Only a command that could not be run fails here; the pictures below show it sending.
+            if (!streams[size_t(k)]->waitForStarted(within(2000)))
+                QVERIFY2(streams[size_t(k)]->error() != QProcess::FailedToStart, qPrintable(streams[size_t(k)]->errorString()));
         }
         phase("senders started");
-        // (waiting on pictures, not the clock: a busy machine is slow)
-        QVERIFY2(until([&] { return mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10; }, 60000),
-                 qPrintable(QStringLiteral("pictures per tile: %1 %2 %3 %4").arg(mv->tile(0).pictures).arg(mv->tile(1).pictures).arg(mv->tile(2).pictures).arg(mv->tile(3).pictures)));
+        // (waiting on pictures, not the clock: a busy machine is slow; for 60 s from the last sender's start)
+        auto fourShowing = [&] { return mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10; };
+        while (!fourShowing() && lastStart.elapsed() < 60000 && sinceStart.elapsed() < watchdog - 15000) {
+            keepSending();
+            QTest::qWait(20);
+        }
+        QVERIFY2(fourShowing(),
+                 qPrintable(QStringLiteral("pictures per tile: %1 %2 %3 %4 (stream senders started %5 and %6 times)").arg(mv->tile(0).pictures)
+                                .arg(mv->tile(1).pictures).arg(mv->tile(2).pictures).arg(mv->tile(3).pictures).arg(streamStarts[0])
+                                .arg(streamCount > 1 ? streamStarts[1] : 0)));
+        // (the stream's feed as opened by now: a listener's wait that ran out before its sender called opened it again)
+        const int streamOpened = mv->tile(2).opened;
         phase("four tiles showing");
         // Each tile's picture the one its timecode names, its hour the source's, close behind what was sent.
         const int hours[4] = {10, 11, 12, omtOk ? 13 : 14};
@@ -3288,8 +4163,10 @@ private slots:
         phase("stream recorded");
         r = call({{"action", "multiview"}, {"record", false}});
         QVERIFY(!mv->tile(2).recording && mv->tile(2).running);
-        QCOMPARE(mv->tile(2).opened, 1);
-        QCOMPARE(r.value("structuredContent").toObject().value("inputs").toArray()[2].toObject().value("opened").toInt(), 1);
+        QCOMPARE(mv->tile(2).opened, streamOpened);
+        // (its file finished on the recorder's thread, not waited for on the window's)
+        QVERIFY2(until([&] { return mv->tile(2).finishing == 0; }, 20000), "mv->tile(2).finishing == 0");
+        QCOMPARE(r.value("structuredContent").toObject().value("inputs").toArray()[2].toObject().value("opened").toInt(), streamOpened);
         // (not finished: on macOS Qt may never hear that the sender started, leaving it Starting while it sends)
         QVERIFY(streams[0]->state() != QProcess::NotRunning);
         {
@@ -5181,6 +6058,126 @@ private slots:
         state()->newProject();
     }
 
+    // Focus peaking is worked out off the interface thread: a monitor painted while it is shows what it had, the interface
+    // goes on answering however long peaking takes, and frames that come meanwhile are passed over for the latest.
+    void focusPeakingOffTheInterfaceThread() {
+        const int W = 960, H = 540;
+        auto chart = [&](int cell) {
+            QImage img(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) img.setPixel(x, y, (x / cell + y / cell) % 2 ? qRgb(230, 230, 230) : qRgb(20, 20, 20));
+            return img;
+        };
+        const QColor red = peakingColours()[0].first;
+        // Each picture waits at the gate, on the worker's thread, until the test opens it.
+        struct Gate {
+            std::mutex m;
+            std::condition_variable cv;
+            bool open = false, offThread = true;
+            int calls = 0;
+        };
+        auto gate = std::make_shared<Gate>();
+        QThread* const ui = QThread::currentThread();
+        ViewerWidget::setPeakingGateForTesting([gate, ui] {
+            std::unique_lock lock(gate->m);
+            ++gate->calls;
+            if (QThread::currentThread() == ui) gate->offThread = false;
+            gate->cv.wait(lock, [&] { return gate->open; });
+        });
+        auto setOpen = [gate](bool open) {
+            {
+                std::lock_guard lock(gate->m);
+                gate->open = open;
+            }
+            gate->cv.notify_all();
+        };
+        auto calls = [gate] {
+            std::lock_guard lock(gate->m);
+            return gate->calls;
+        };
+        auto putBack = qScopeGuard([&] {
+            setOpen(true);
+            ViewerWidget::setPeakingGateForTesting({});
+        });
+
+        ViewerWidget v;
+        v.resize(660, 380);
+        v.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&v));
+        v.setPeakingAtMonitorSize(false);
+        v.setImage(chart(24), 0);
+        const QImage a = v.image();
+        const QImage peakedA = focusPeakingView(a, red, 1);
+        v.setFocusPeaking(true);
+        // Painted while peaking is held: the paint does not wait, and shows the picture without peaking.
+        v.repaint();
+        QVERIFY(v.peakingPending());
+        QCOMPARE(v.paintedImage(), a);
+        QTRY_COMPARE(calls(), 1);
+        bool answered = false;
+        QTimer::singleShot(0, &v, [&] { answered = true; });
+        QTRY_VERIFY(answered);
+        QVERIFY(v.peakingPending());
+        // Let through: drawn when ready.
+        QSignalSpy shown(&v, &ViewerWidget::peakingShown);
+        setOpen(true);
+        QTRY_COMPARE(shown.count(), 1);
+        QVERIFY(!v.peakingPending());
+        QTRY_COMPARE(v.paintedImage(), peakedA);
+
+        // Two frames while the first of them is held: the last picture peaked shown meanwhile, and only the latest
+        // frame peaked after it.
+        setOpen(false);
+        v.setImage(chart(40), 1);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), peakedA);
+        QTRY_COMPARE(calls(), 2);
+        v.setImage(chart(56), 2);
+        const QImage peakedC = focusPeakingView(v.image(), red, 1);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), peakedA);
+        QCOMPARE(calls(), 2);
+        setOpen(true);
+        QTRY_COMPARE(v.paintedImage(), peakedC);
+        QVERIFY(!v.peakingPending());
+        QCOMPARE(calls(), 3);
+
+        // The picture as drawn, asked for (as tests and drawnImage ask), is worked out on the spot, and a
+        // paint after it peaks nothing again.
+        v.setImage(a, 3);
+        QCOMPARE(v.shownImage(), peakedA);
+        v.repaint();
+        QVERIFY(!v.peakingPending());
+        QCOMPARE(v.paintedImage(), peakedA);
+        QCOMPARE(calls(), 3);
+
+        // Off and on again: no old frame's peaking shown while the new one is worked out.
+        v.setFocusPeaking(false);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), a);
+        setOpen(false);
+        v.setImage(chart(40), 4);
+        const QImage b = v.image();
+        v.setFocusPeaking(true);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), b);
+        QTRY_COMPARE(calls(), 4);
+        setOpen(true);
+        QTRY_COMPARE(v.paintedImage(), focusPeakingView(b, red, 1));
+        QVERIFY(!v.peakingPending());
+        QVERIFY(gate->offThread);
+        // Off with one held: it lands, and nothing peaked is drawn.
+        setOpen(false);
+        v.setImage(a, 5);
+        v.repaint();
+        QTRY_COMPARE(calls(), 5);
+        v.setFocusPeaking(false);
+        setOpen(true);
+        QTRY_VERIFY(!v.peakingPending());
+        v.repaint();
+        QCOMPARE(v.paintedImage(), a);
+    }
+
     void gamutScopeAndChecks() {
         // A Rec.2020 frame: the left half its pure green (outside Rec.709 and P3), the right half grey.
         QImage frame(160, 90, QImage::Format_RGBA64);
@@ -5432,6 +6429,695 @@ private slots:
         report = checkHrd(vbr.path);
         QVERIFY2(report.conforms() && report.signalled && !report.cbr, report.summary().c_str());
         QVERIFY2(std::fabs(report.bitRate - 1200000) < 12000 && std::fabs(report.bufferBits - 1200000) < 12000, report.summary().c_str());
+    }
+
+    void dialogTaskHelper() {
+        // Does nothing by itself. The tests of background tasks run this binary again with this as its only test, to
+        // have a task begun, or taken up, in a process of its own that can be killed.
+        const QString spec = qEnvironmentVariable("MONTAGE_TEST_TASK_HELPER");
+        if (spec.isEmpty()) return;
+        QFile f(spec);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+        DialogJobs jobs(nullptr, o.value("store").toString());
+        if (o.value("mode").toString() == "start") {
+            Project project;
+            std::string err;
+            QFile pf(o.value("project").toString());
+            QVERIFY(pf.open(QIODevice::ReadOnly));
+            QVERIFY2(projectFromJson(pf.readAll().toStdString(), project, &err), err.c_str());
+            QVERIFY(!jobs.startOn(project, nullptr, o.value("kind").toString(), o.value("title").toString(), o.value("input").toObject()).isEmpty());
+            QTest::qWait(600000);  // (killed long before)
+            return;
+        }
+        const int took = jobs.resume();
+        QFile mark(o.value("marks").toString() + QStringLiteral("/%1").arg(QCoreApplication::applicationPid()));
+        QVERIFY(mark.open(QIODevice::WriteOnly));
+        mark.write(QByteArray::number(took));
+        mark.close();
+        QElapsedTimer t;
+        t.start();
+        while (jobs.busy() && t.elapsed() < 600000) QTest::qWait(50);
+        QVERIFY(!jobs.busy());
+    }
+
+    void dialogTasksRunInBackground() {
+        // Auto Duck and Detect Scene Cuts are jobs in the store. Left to run with their dialog closed they give what a
+        // watched run gives. A result whose clip was moved meanwhile is offered and not applied. Killed part-way in
+        // another process, the job is taken up once by the Montages started next and gives the same.
+        DialogJobs* dialogs = win_->dialogJobs();
+        QVERIFY(dialogs);
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Dialogue", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        QVERIFY(state()->apply("Music", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, {TrackKind::Audio, 1}, false);
+        }));
+        const Id music = trackAt(*state()->sequence(), {TrackKind::Audio, 1})->clips.front().id;
+        const auto gain = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), music);
+            return c && c->audio.params.count("gain_db") ? c->audio.params.at("gain_db") : Param(0.0);
+        };
+        const auto latest = [](const QString& kind) {
+            jobs::Record found;
+            for (const jobs::Record& r : jobs::all("app"))
+                if (r.kind == kind && r.order >= found.order) found = r;
+            return found;
+        };
+        DuckOptions o;
+        // Watched: the keyframes to compare with, and the job's record and result in the store.
+        QCOMPARE(AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get()), 1);
+        const Param watched = gain();
+        QVERIFY(watched.animated());
+        const jobs::Record first = latest("auto-duck");
+        QCOMPARE(first.status, QStringLiteral("done"));
+        const QJsonObject watchedResult = taskResult(first.id);
+        QVERIFY(watchedResult.value("spans").toArray().size() >= 1);
+        state()->undo();
+        QVERIFY(!gain().animated());
+        // Its dialog closed while it runs: it is listed, goes on, and writes the same keyframes as one undo step.
+        QString said;
+        connect(dialogs, &DialogJobs::finished, this, [&](const QString&, bool, const QString& text) { said = text; });
+        QString id = startInBackground(dialogs, [&] { QCOMPARE(AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get()), -1); });
+        QVERIFY(!id.isEmpty());
+        QCOMPARE(dialogs->tasks().size(), size_t(1));
+        QVERIFY(dialogs->tasks()[0].paused);
+        QVERIFY(!gain().animated());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+        QVERIFY(gain() == watched);
+        QCOMPARE(state()->undoText(), QString("Auto Duck"));
+        QVERIFY2(said.contains("Ducked 1 clip"), qPrintable(said));
+        QVERIFY(taskResult(id) == watchedResult);
+        state()->undo();
+        // The music moved while it ran: the result is kept and offered with what moved, and is not applied.
+        QString offeredNote;
+        connect(dialogs, &DialogJobs::offered, this, [&](const QString&, const QString&, const QString& note) { offeredNote = note; });
+        id = startInBackground(dialogs, [&] { AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get()); });
+        QVERIFY(!id.isEmpty());
+        QVERIFY(state()->apply("Move", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {music}, 30, 0, 0); }));
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+        QVERIFY(!gain().animated());
+        QCOMPARE(state()->undoText(), QString("Move"));
+        QVERIFY2(offeredNote.contains("was moved"), qPrintable(offeredNote));
+        QCOMPARE(dialogs->offeredNote(id), offeredNote);
+        QVERIFY(taskResult(id) == watchedResult);
+        // Applied from the list when the user says so, onto the clip where it is now.
+        QVERIFY(dialogs->applyOffered(id));
+        QVERIFY(gain().animated());
+        QVERIFY(dialogs->offeredNote(id).isEmpty());
+        state()->undo();
+        state()->undo();
+        QVERIFY(!gain().animated());
+        disconnect(dialogs, &DialogJobs::offered, this, nullptr);
+        // Killed in another process at its start, then taken up by one of two Montages started together: the stretches
+        // of speech are the same, and applied here they write the same keyframes.
+        {
+            const Sequence& s = *state()->sequence();
+            const QJsonObject options{{"amount", o.amountDb},   {"fadeDown", o.fadeDown},   {"fadeUp", o.fadeUp},        {"minPause", o.minPause},
+                                      {"minSpeech", o.minSpeech}, {"threshold", o.thresholdDb}, {"transcripts", o.useTranscripts}};
+            const QJsonObject input{{"sequence", QString::number(s.id)},
+                                    {"clips", QJsonArray{QString::number(music)}},
+                                    {"tracks", QJsonArray{QString::number(s.audioTracks[0].id)}},
+                                    {"options", options},
+                                    {"keep", false}};
+            QString why;
+            const QString job = killedAndTakenUp("auto-duck", "Listening for dialogue…", input, "0", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(taskResult(job) == watchedResult);
+            QVERIFY(!dialogs->offeredNote(job).isEmpty());
+            QVERIFY(dialogs->applyOffered(job));
+            QVERIFY(gain() == watched);
+            state()->undo();
+        }
+
+        // Detect Scene Cuts: three plain shots of two seconds, cut where they change.
+        const QString film = dir_.path() + "/task-shots.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            const double colours[3][3] = {{0.8, 0.1, 0.1}, {0.1, 0.7, 0.2}, {0.1, 0.2, 0.9}};
+            for (int i = 0; i < 3; ++i) {
+                Clip c = makeGeneratorClip(gen, "color", 50);
+                c.start = i * 50;
+                c.generator.params["color.r"] = Param(colours[i][0]);
+                c.generator.params["color.g"] = Param(colours[i][1]);
+                c.generator.params["color.b"] = Param(colours[i][2]);
+                QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, c).ok);
+            }
+            ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+            st.path = film.toStdString();
+            st.preset = "ultrafast";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto shots = state()->importFiles({film});
+        QCOMPARE(shots.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, shots[0], 0, 0, 150, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips[0].id;
+        const auto starts = [&] {
+            std::vector<FrameTime> out;
+            for (const Clip& c : state()->sequence()->videoTracks[0].clips) out.push_back(c.start);
+            return out;
+        };
+        QAction* detect = nullptr;
+        for (QAction* a : win_->findChildren<QAction*>())
+            if (a->text() == QLatin1String("Detect &Scene Cuts")) detect = a;
+        QVERIFY(detect);
+        state()->setSelection({clip});
+        detect->trigger();  // (watched)
+        QCOMPARE(starts(), (std::vector<FrameTime>{0, 50, 100}));
+        QCOMPARE(state()->undoText(), QString("Detect Scene Cuts"));
+        const Sequence cut = *state()->sequence();
+        const QJsonObject cuts = taskResult(latest("scene-detect").id);
+        QCOMPARE(cuts.value("cuts").toArray().size(), 2);
+        state()->undo();
+        QCOMPARE(starts(), std::vector<FrameTime>{0});
+        // Left to run: the same cuts, the same edit.
+        state()->setSelection({clip});
+        id = startInBackground(dialogs, [&] { detect->trigger(); });
+        QVERIFY(!id.isEmpty());
+        QCOMPARE(starts(), std::vector<FrameTime>{0});
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+        QVERIFY(taskResult(id) == cuts);
+        QVERIFY(*state()->sequence() == cut);
+        QVERIFY2(said.contains("Cut the clip at 2 scene change"), qPrintable(said));
+        state()->undo();
+        // Killed part-way (half the film read) in another process and taken up: the same cuts, the same edit.
+        {
+            const QJsonObject input{{"sequence", QString::number(state()->sequence()->id)},
+                                    {"clips", QJsonArray{QString::number(clip)}},
+                                    {"path", film},
+                                    {"markOnly", false}};
+            QString why;
+            const QString job = killedAndTakenUp("scene-detect", "Detecting scene cuts", input, "0.4", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(taskResult(job) == cuts);
+            QVERIFY(dialogs->applyOffered(job));
+            QVERIFY(*state()->sequence() == cut);
+            state()->undo();
+        }
+        disconnect(dialogs, &DialogJobs::finished, this, nullptr);
+        state()->newProject();
+    }
+
+    void dialogTasksLookedOver() {
+        // Auto Mix and the Conform Check are jobs in the store whose results are looked over in their dialogs. Left to
+        // run, Auto Mix's plan is kept and offered, and looked over from there it mixes as a watched run does; the
+        // check's shots are listed in its dialog when it ends, and again in a dialog opened later on the same project.
+        DialogJobs* dialogs = win_->dialogJobs();
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return edit::placeMedia(p, s, ids[0], 60, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 1}, false);
+        });
+        const auto latest = [](const QString& kind) {
+            jobs::Record found;
+            for (const jobs::Record& r : jobs::all("app"))
+                if (r.kind == kind && r.order >= found.order) found = r;
+            return found;
+        };
+        // (the Auto Mix dialog accepted as it comes, whenever it shows)
+        QTimer accept;
+        int shown = 0;
+        connect(&accept, &QTimer::timeout, this, [&] {
+            for (QWidget* w : QApplication::topLevelWidgets())
+                if (auto* d = qobject_cast<AutoMixDialog*>(w); d && d->isVisible()) {
+                    ++shown;
+                    d->accept();
+                }
+        });
+        accept.start(20);
+        const int mixed = AutoMixDialog::run(state(), win_.get());  // (watched)
+        QVERIFY(mixed > 0);
+        QCOMPARE(shown, 1);
+        QCOMPARE(state()->undoText(), QString("Auto Mix"));
+        const Sequence mix = *state()->sequence();
+        const QJsonObject plan = taskResult(latest("auto-mix").id);
+        QCOMPARE(plan.value("plan").toArray().size(), 2);
+        QCOMPARE(mixPlanToJson(mixPlanFromJson(plan.value("plan"))), plan.value("plan").toArray());
+        state()->undo();
+        // Left to run: nothing pops up over the editor's work. The plan is kept and offered.
+        QString offered;
+        connect(dialogs, &DialogJobs::offered, this, [&](const QString&, const QString&, const QString& note) { offered = note; });
+        QString id = startInBackground(dialogs, [&] { QCOMPARE(AutoMixDialog::run(state(), win_.get()), -1); });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+        QCOMPARE(shown, 1);
+        QVERIFY2(!offered.isEmpty(), qPrintable(offered));
+        QVERIFY(taskResult(id) == plan);
+        QVERIFY(!(*state()->sequence() == mix));
+        // Looked over from the list and accepted: the same mix.
+        QVERIFY(dialogs->applyOffered(id));
+        QCOMPARE(shown, 2);
+        QVERIFY(*state()->sequence() == mix);
+        state()->undo();
+        // Killed in another process once it has listened to half, and taken up: the same plan and mix.
+        {
+            QString why;
+            const QString job = killedAndTakenUp("auto-mix", "Listening to the audio…", QJsonObject{{"sequence", QString::number(state()->sequence()->id)}}, "0.3", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(taskResult(job) == plan);
+            QVERIFY(dialogs->applyOffered(job));
+            QVERIFY(*state()->sequence() == mix);
+            state()->undo();
+        }
+        accept.stop();
+        disconnect(dialogs, &DialogJobs::offered, this, nullptr);
+
+        // The Conform Check: a shot and a reference movie that shows it 10 % larger.
+        const QString shot = dir_.path() + "/task-conform-shot.mp4", reference = dir_.path() + "/task-conform-ref.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 25)).ok);
+            Clip t = makeGeneratorClip(gen, "title", 25);
+            t.generator.strings["text"] = "CONFORM 42";
+            t.generator.params["size"] = 40.0;
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 1}, t).ok);
+            ExportSettings st;
+            st.path = shot.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+            Project ref = makeDefaultProject();
+            Sequence& rs = *ref.active();
+            rs.width = 320, rs.height = 180, rs.fps = {25, 1};
+            MediaItem m;
+            m.id = ref.newId();
+            QVERIFY(probeMedia(shot.toStdString(), m));
+            ref.media.push_back(m);
+            Clip c = makeClip(ref, m, TrackKind::Video, rs);
+            c.motion.params["scale"] = Param(110.0);
+            QVERIFY(edit::overwrite(ref, rs, {TrackKind::Video, 0}, c).ok);
+            st.path = reference.toStdString();
+            QVERIFY2(exportSequence(ref, rs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto media = state()->importFiles({shot, reference});
+        QCOMPARE(media.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, media[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        QJsonObject watchedShots;
+        {
+            ConformCheckDialog dlg(state(), win_.get());
+            QVERIFY(dlg.shots().empty());
+            QVERIFY(dlg.runCheck());  // (watched)
+            QCOMPARE(dlg.shots().size(), size_t(1));
+            QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Reframed);
+            watchedShots = taskResult(latest("conform-check").id);
+            QCOMPARE(conformShotsToJson(dlg.shots()), watchedShots.value("shots").toArray());
+        }
+        // The project is still as it was checked, so a dialog opened now lists that check's shots.
+        {
+            ConformCheckDialog dlg(state(), win_.get());
+            QCOMPARE(dlg.shots().size(), size_t(1));
+            QCOMPARE(dlg.findChild<QTableWidget*>("conformShots")->item(0, 2)->text(), QString("Reframed"));
+        }
+        // After a change it lists nothing: that check was of another state.
+        QVERIFY(state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Reel 2";
+            return true;
+        }));
+        {
+            ConformCheckDialog dlg(state(), win_.get());
+            QVERIFY(dlg.shots().empty());
+            // Left to run with the dialog still open: its shots are listed there when it ends.
+            id = startInBackground(dialogs, [&] { QVERIFY(!dlg.runCheck()); });
+            QVERIFY(!id.isEmpty());
+            QVERIFY(dlg.shots().empty());
+            dialogs->setPaused(id, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+            QTRY_COMPARE(dlg.shots().size(), size_t(1));
+            QVERIFY(taskResult(id).value("shots") == watchedShots.value("shots"));
+        }
+        // Left to run and its dialog closed: the next dialog opened lists them.
+        id = startInBackground(dialogs, [&] {
+            ConformCheckDialog dlg(state(), win_.get());
+            QVERIFY(!dlg.runCheck());
+        });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+        {
+            ConformCheckDialog dlg(state(), win_.get());
+            QCOMPARE(dlg.shots().size(), size_t(1));
+            QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Reframed);
+        }
+        // Killed in another process and taken up: the same shots, kept for the dialog.
+        {
+            const Sequence& s = *state()->sequence();
+            QString why;
+            const QString job = killedAndTakenUp("conform-check", "Comparing the shots with the reference…",
+                                                 QJsonObject{{"sequence", QString::number(s.id)}, {"reference", QString::number(media[1])}, {"referenceStart", 0.0}},
+                                                 "0", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(taskResult(job).value("shots") == watchedShots.value("shots"));
+        }
+        state()->newProject();
+    }
+
+    void packagesAsBackgroundJobs() {
+        // A DCP and an IMF master are made as jobs in the store. With the dialog closed the package holds the same
+        // pictures as a watched one's and is reported when it ends; killed part-way in another process and taken up,
+        // the stretches of pictures already coded are left as they were (their files' times unchanged) and the
+        // package again holds the same pictures and passes its check.
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        DialogJobs* dialogs = win_->dialogJobs();
+        state()->newProject();
+        QVERIFY(state()->edit("Mattes", [&](Project& p, Sequence& s) {
+            s.width = 256, s.height = 108, s.fps = Rational{24, 1};
+            // (four pictures that differ, so a stretch in the wrong place would show)
+            for (int i = 0; i < 4; ++i) {
+                Clip c = makeGeneratorClip(p, "color", 6);
+                c.start = i * 6;
+                c.generator.params["color.r"] = 0.2 * i;
+                c.generator.params["color.g"] = 0.6;
+                if (!edit::overwrite(p, s, V1, c).ok) return false;
+            }
+            return true;
+        }));
+        const QString sequence = QString::number(state()->sequence()->id);
+        const auto stretches = [](const QJsonObject& result) {
+            QStringList out;
+            for (const QJsonValue& v : result.value("pictures").toArray())
+                out << QStringLiteral("%1-%2%3").arg(v["from"].toInt()).arg(v["to"].toInt()).arg(v["passedOver"].toBool() ? " passed over" : "");
+            return out.join(", ");
+        };
+        // When each stretch's last picture was written, as the files in the job's pictures folder say now.
+        const auto written = [](const QString& parent, const QString& id, const QList<int>& lastFrames) {
+            QList<qint64> out;
+            const QString pictures = QDir(parent).filePath(".montage-pictures-" + id);
+            for (int k : lastFrames) out << QFileInfo(QString::fromStdString(codestreamFile(pictures.toStdString(), k))).lastModified().toMSecsSinceEpoch();
+            return out;
+        };
+
+        // ---- The DCP.
+        DcpSettings cinema;
+        cinema.title = "Job Test";
+        cinema.kind = "test";
+        cinema.threads = 2;
+        const auto dcpInput = [&](const QString& parent) {
+            return QJsonObject{{"sequence", sequence}, {"parent", parent}, {"settings", dcpSettingsToJson(cinema)}, {"partFrames", 6}};
+        };
+        // Watched to its end.
+        const TaskOutcome watched = dialogs->run(state(), "dcp", "Making the DCP", dcpInput(dir_.filePath("dcp-watched")), win_.get());
+        QVERIFY2(watched.how == TaskOutcome::Done, qPrintable(watched.error));
+        QCOMPARE(watched.result.value("issues").toArray().size(), 0);
+        QCOMPARE(stretches(watched.result), QString("0-6, 6-12, 12-18, 18-24"));
+        const DcpResult one = dcpResultFromJson(watched.result);
+        QCOMPARE(one.frames, int64_t(24));
+        QVERIFY(dcpResultToJson(one) == dcpResultToJson(dcpResultFromJson(dcpResultToJson(one))));
+        const auto pictures = dcpPictures(QString::fromStdString(one.folder));
+        QCOMPARE(pictures.size(), size_t(24));
+        QVERIFY(!pictures[0].empty() && pictures[0] != pictures[6]);
+        QVERIFY(QDir(dir_.filePath("dcp-watched")).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+        // From the File menu's maker with its dialog closed: nothing is returned then, and the DCP is reported when
+        // it ends as a watched one is.
+        win_->statusBar()->clearMessage();
+        QString id = startInBackground(dialogs, [&] { QVERIFY(win_->exportDcpTo(dir_.filePath("dcp-closed"), cinema).isEmpty()); });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+        QVERIFY2(win_->statusBar()->currentMessage().contains("made and checked"), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY(dcpPictures(onlyPackage(dir_.filePath("dcp-closed"), "JobTest_")) == pictures);
+        // Killed in another process while the third stretch is coded, and taken up by one of two started together.
+        {
+            const QString parent = dir_.filePath("dcp-killed");
+            QList<qint64> before;
+            QString why;
+            const QString job = killedAndTakenUp("dcp", "Making the DCP", dcpInput(parent), "0.45", &why, 300000,
+                                                 [&](const QString& killed) { before = written(parent, killed, {5, 11}); });
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            const QJsonObject result = taskResult(job);
+            QCOMPARE(stretches(result), QString("0-6 passed over, 6-12 passed over, 12-18, 18-24"));
+            // The finished stretches' pictures were not written again.
+            QCOMPARE(before.size(), 2);
+            QVERIFY(before[0] > 0 && before[1] > 0);
+            QCOMPARE(qint64(result.value("pictures").toArray().at(0).toObject().value("written").toDouble()), before[0]);
+            QCOMPARE(qint64(result.value("pictures").toArray().at(1).toObject().value("written").toDouble()), before[1]);
+            QCOMPARE(result.value("issues").toArray().size(), 0);
+            QVERIFY(dcpPictures(QString::fromStdString(dcpResultFromJson(result).folder)) == pictures);
+            QVERIFY(verifyDcp(dcpResultFromJson(result).folder).empty());
+            QVERIFY(QDir(parent).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+        }
+        // Killed while the made package is being checked, and taken up: it is checked again, not made again (one
+        // package in the folder, the one made before the kill).
+        {
+            const QString parent = dir_.filePath("dcp-killed-checking");
+            QStringList madeBefore;
+            QString why;
+            const QString job = killedAndTakenUp("dcp", "Making the DCP", dcpInput(parent), "0.9", &why, 300000, [&](const QString&) {
+                madeBefore = QDir(parent).entryList({"JobTest_*"}, QDir::Dirs | QDir::NoDotAndDotDot);
+            });
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QCOMPARE(madeBefore.size(), 1);
+            QCOMPARE(QDir(parent).entryList({"JobTest_*"}, QDir::Dirs | QDir::NoDotAndDotDot), madeBefore);
+            const QJsonObject result = taskResult(job);
+            QCOMPARE(QFileInfo(QString::fromStdString(dcpResultFromJson(result).folder)).fileName(), madeBefore.front());
+            QCOMPARE(result.value("issues").toArray().size(), 0);
+            QCOMPARE(stretches(result), QString("0-6, 6-12, 12-18, 18-24"));
+        }
+        // Stopped by hand part-way: no pictures are left in the folder.
+        {
+            const QString parent = dir_.filePath("dcp-stopped");
+            qputenv("MONTAGE_JOBS_PAUSE_AT", "0.4");
+            const QString job = dialogs->start(state(), "dcp", "Making the DCP", dcpInput(parent));
+            qunsetenv("MONTAGE_JOBS_PAUSE_AT");
+            QVERIFY(!job.isEmpty());
+            const auto paused = [&] {
+                for (const DialogJobs::TaskInfo& t : dialogs->tasks())
+                    if (t.id == job) return t.paused;
+                return false;
+            };
+            QTRY_VERIFY_WITH_TIMEOUT(paused(), 300000);
+            QCOMPARE(QDir(parent).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).size(), 1);
+            dialogs->stop(job);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+            QVERIFY(QDir(parent).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+        }
+
+        // ---- The IMF master.
+        ImfSettings master;
+        master.title = "Job Master";
+        master.threads = 2;
+        const auto imfInput = [&](const QString& parent) {
+            return QJsonObject{{"sequence", sequence}, {"parent", parent}, {"settings", imfSettingsToJson(master)}, {"partFrames", 6}};
+        };
+        const TaskOutcome watchedImf = dialogs->run(state(), "imf", "Making the IMF master", imfInput(dir_.filePath("imf-watched")), win_.get());
+        QVERIFY2(watchedImf.how == TaskOutcome::Done, qPrintable(watchedImf.error));
+        QCOMPARE(watchedImf.result.value("issues").toArray().size(), 0);
+        QCOMPARE(stretches(watchedImf.result), QString("0-6, 6-12, 12-18, 18-24"));
+        const ImfResult oneImf = imfResultFromJson(watchedImf.result);
+        QVERIFY(imfResultToJson(oneImf) == imfResultToJson(imfResultFromJson(imfResultToJson(oneImf))));
+        const auto imfPicturesWatched = imfPictures(QString::fromStdString(oneImf.folder));
+        QCOMPARE(imfPicturesWatched.size(), size_t(24));
+        QVERIFY(!imfPicturesWatched[0].empty() && imfPicturesWatched[0] != imfPicturesWatched[6]);
+        win_->statusBar()->clearMessage();
+        id = startInBackground(dialogs, [&] { QVERIFY(win_->exportImfTo(dir_.filePath("imf-closed"), master).isEmpty()); });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+        QVERIFY2(win_->statusBar()->currentMessage().contains("made and checked"), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY(imfPictures(onlyPackage(dir_.filePath("imf-closed"), "Job_Master_IMF_")) == imfPicturesWatched);
+        {
+            const QString parent = dir_.filePath("imf-killed");
+            QList<qint64> before;
+            QString why;
+            const QString job = killedAndTakenUp("imf", "Making the IMF master", imfInput(parent), "0.45", &why, 300000,
+                                                 [&](const QString& killed) { before = written(parent, killed, {5, 11}); });
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            const QJsonObject result = taskResult(job);
+            QCOMPARE(stretches(result), QString("0-6 passed over, 6-12 passed over, 12-18, 18-24"));
+            QCOMPARE(before.size(), 2);
+            QVERIFY(before[0] > 0 && before[1] > 0);
+            QCOMPARE(qint64(result.value("pictures").toArray().at(0).toObject().value("written").toDouble()), before[0]);
+            QCOMPARE(qint64(result.value("pictures").toArray().at(1).toObject().value("written").toDouble()), before[1]);
+            QCOMPARE(result.value("issues").toArray().size(), 0);
+            QVERIFY(imfPictures(QString::fromStdString(imfResultFromJson(result).folder)) == imfPicturesWatched);
+        }
+        state()->newProject();
+    }
+
+    void autoDuckKeptUpToDate() {
+        // A duck kept up to date follows the dialogue: moved by two seconds, its keyframes move by two seconds in the
+        // same undo step; a muted line leaves no dip; a keyframe moved by hand stays where it was put.
+        state()->newProject();
+        forgetHeardSound();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        const double fps = state()->sequence()->fpsValue();
+        const FrameTime second = FrameTime(std::llround(fps));
+        // The line: three seconds of the speech, two seconds in. The music: the whole file on A2, from the start.
+        QVERIFY(state()->apply("Line", [&](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 2 * second, 0, 3 * second, V1, A1, false); }));
+        QVERIFY(state()->apply("Music", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, {TrackKind::Audio, 1}, false);
+        }));
+        const Id line = trackAt(*state()->sequence(), A1)->clips.front().id;
+        const Id music = trackAt(*state()->sequence(), {TrackKind::Audio, 1})->clips.front().id;
+        const auto clipNow = [&](Id id) { return edit::clipById(*state()->sequence(), id); };
+        const auto keys = [&] {
+            const Clip* c = clipNow(music);
+            return c && c->audio.params.count("gain_db") ? c->audio.params.at("gain_db").keys : std::vector<Keyframe>{};
+        };
+        // The dialog offers it, off for a clip that has none.
+        {
+            AutoDuckDialog dlg(state(), {music}, win_.get());
+            auto* keep = dlg.findChild<QCheckBox*>("duckKeep");
+            QVERIFY(keep && !keep->isChecked() && !dlg.keepUpToDate());
+            keep->setChecked(true);
+            QVERIFY(dlg.keepUpToDate());
+        }
+        DuckOptions o;
+        QCOMPARE(AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get(), true), 1);
+        const std::vector<Keyframe> made = keys();
+        QVERIFY(made.size() >= 4);
+        QVERIFY(clipNow(music)->duck.has_value());
+        QCOMPARE(clipNow(music)->duck->tracks, std::vector<Id>{state()->sequence()->audioTracks[0].id});
+        QCOMPARE(clipNow(music)->duck->keys.size(), made.size());
+        // The dip sits over the line: down by its start, up after its end.
+        const auto dipStart = [](const std::vector<Keyframe>& k) {
+            for (const Keyframe& x : k)
+                if (x.v < -14.9) return x.t;
+            return FrameTime(-1);
+        };
+        QVERIFY2(std::llabs(dipStart(made) - 2 * second) <= second / 2, qPrintable(QString::number(dipStart(made))));
+        {
+            AutoDuckDialog dlg(state(), {music}, win_.get());
+            QVERIFY(dlg.keepUpToDate());  // (as the clip is now)
+        }
+        // The line moved two seconds later: every keyframe of the duck is two seconds later, within a frame, and the
+        // move and the duck are one undo step.
+        QVERIFY(state()->apply("Move Line", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {line}, 2 * second, 0, 0); }));
+        QCOMPARE(state()->undoText(), QString("Move Line"));
+        std::vector<Keyframe> moved = keys();
+        QCOMPARE(moved.size(), made.size());
+        for (size_t i = 0; i < made.size(); ++i) {
+            // (the first and last sit on the clip's ends and stay there)
+            if (i == 0 || i + 1 == made.size()) continue;
+            QVERIFY2(std::llabs(moved[i].t - made[i].t - 2 * second) <= 1, qPrintable(QString("%1: %2 -> %3").arg(i).arg(made[i].t).arg(moved[i].t)));
+            QCOMPARE(moved[i].v, made[i].v);
+        }
+        state()->undo();
+        QCOMPARE(clipNow(line)->start, 2 * second);
+        QVERIFY(keys() == made);
+        state()->redo();
+        QVERIFY(keys() == moved);
+        // Dragged, the duck follows while the line moves and is part of the drag's one undo step.
+        state()->beginGesture("Drag Line");
+        state()->updateGesture([&](Project& p, Sequence& s) { edit::moveClips(p, s, {line}, -second, 0, 0); });
+        QVERIFY(keys() != moved);
+        state()->updateGesture([&](Project& p, Sequence& s) { edit::moveClips(p, s, {line}, -2 * second, 0, 0); });
+        state()->endGesture(true);
+        QVERIFY(keys() == made);
+        QCOMPARE(state()->undoText(), QString("Drag Line"));
+        state()->undo();
+        QVERIFY(keys() == moved);
+        // A keyframe moved by hand stays: here the bottom of the dip, raised to -6 dB.
+        const FrameTime handAt = dipStart(moved);
+        QVERIFY(state()->edit("Raise Keyframe", [&](Project&, Sequence& s) {
+            for (Keyframe& k : edit::clipById(s, music)->audio.params["gain_db"].keys)
+                if (k.t == handAt) k.v = -6;
+            return true;
+        }));
+        QString said;
+        connect(state(), &EditorState::statusMessage, this, [&](const QString& text, int) { said = text; });
+        QVERIFY(state()->apply("Move Line Back", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {line}, -2 * second, 0, 0); }));
+        disconnect(state(), &EditorState::statusMessage, this, nullptr);
+        {
+            const std::vector<Keyframe> k = keys();
+            const auto hand = std::find_if(k.begin(), k.end(), [&](const Keyframe& x) { return x.t == handAt; });
+            QVERIFY(hand != k.end());
+            QCOMPARE(hand->v, -6.0);
+            QCOMPARE(clipNow(music)->duck->kept, 1);
+            QVERIFY2(said.contains("kept 1 keyframe"), qPrintable(said));
+            // (the duck's own are back where they were made first)
+            for (const Keyframe& x : made) QVERIFY(std::any_of(k.begin(), k.end(), [&](const Keyframe& y) { return y.t == x.t && y.v == x.v; }));
+            QCOMPARE(k.size(), made.size() + 1);
+        }
+        // The line's track muted: no dip is left (the keyframe set by hand stays); unmuted, it is back.
+        QVERIFY(state()->edit("Mute", [](Project&, Sequence& s) {
+            s.audioTracks[0].muted = true;
+            return true;
+        }));
+        {
+            const std::vector<Keyframe> k = keys();
+            QCOMPARE(k.size(), size_t(1));
+            QCOMPARE(k[0].t, handAt);
+        }
+        state()->undo();
+        QCOMPARE(keys().size(), made.size() + 1);
+        // More dialogue added later on the track: a second dip, in the step that added it.
+        const size_t before = keys().size();
+        QVERIFY(state()->apply("Second Line", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 8 * second, 4 * second, 6 * second, V1, A1, false);
+        }));
+        QVERIFY(keys().size() > before);
+        QCOMPARE(state()->undoText(), QString("Second Line"));
+        state()->undo();
+        QCOMPARE(keys().size(), before);
+        // Trimmed shorter at its end, the dip ends sooner.
+        const auto dipEnd = [](const std::vector<Keyframe>& k) {
+            FrameTime at = -1;
+            for (const Keyframe& x : k)
+                if (x.v < -14.9) at = x.t;
+            return at;
+        };
+        const FrameTime endBefore = dipEnd(keys());
+        QVERIFY(state()->apply("Trim Line", [&](Project& p, Sequence& s) { return edit::trim(p, s, line, edit::Edge::Out, -second, edit::TrimMode::Normal); }));
+        QVERIFY2(dipEnd(keys()) < endBefore, qPrintable(QString("%1 %2").arg(dipEnd(keys())).arg(endBefore)));
+        state()->undo();
+        // Saved and opened again, the duck is still kept up to date.
+        {
+            Project again;
+            std::string err;
+            QVERIFY2(projectFromJson(projectToJson(state()->project()), again, &err), err.c_str());
+            QVERIFY(again == state()->project());
+            const Clip* c = edit::clipById(*again.active(), music);
+            QVERIFY(c && c->duck && c->duck->kept == 1 && c->duck->keys.size() == made.size());
+            // A project as earlier versions wrote it has none, and opens as it was.
+            Project then;
+            QVERIFY(loadProject(std::string(MONTAGE_TEST_DATA_DIR) + "/projects/five-band-eq.montage", then));
+            for (const Sequence& sq : then.sequences) QVERIFY(!hasKeptDucks(sq));
+        }
+        // Sound that was not heard yet (a project just opened): the edit is made at once, the sound is listened to in
+        // the background, and the duck is then made again as part of that edit's undo step.
+        forgetHeardSound();
+        const std::vector<Keyframe> stale = keys();
+        QVERIFY(state()->apply("Move Unheard", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {line}, 2 * second, 0, 0); }));
+        QElapsedTimer t;
+        t.start();
+        while (keys() == stale && t.elapsed() < 60000) QTest::qWait(20);
+        QVERIFY(keys() != stale);
+        QTRY_VERIFY_WITH_TIMEOUT(win_->dialogJobs()->tasks().empty(), 60000);
+        QCOMPARE(state()->undoText(), QString("Move Unheard"));
+        state()->undo();
+        QVERIFY(keys() == stale);
+        // Ducked again without Keep Up to Date, the clip's duck is forgotten and follows nothing.
+        QCOMPARE(AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get(), false), 1);
+        QVERIFY(!clipNow(music)->duck.has_value());
+        const std::vector<Keyframe> plain = keys();
+        QVERIFY(state()->apply("Move Line", [&](Project& p, Sequence& s) { return edit::moveClips(p, s, {line}, second, 0, 0); }));
+        QVERIFY(keys() == plain);
+        state()->newProject();
     }
 
     void dialogJobsKeptAndResumed() {
@@ -9704,6 +11390,92 @@ private slots:
         state()->newProject();
     }
 
+    void vfxPullsAsABackgroundJob() {
+        // Export VFX Pulls runs as a job in the store: watched, the shots are kept with the sequence as one undo step;
+        // left to run, they are kept when it ends; killed part-way in another process and taken up, the shots it had
+        // pulled are passed over (their frames not written again) and the rest pulled, to the same shots.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 32, gs.height = 18, gs.fps = {25, 1};
+        Clip matte = makeGeneratorClip(gen, "bars", 50);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, matte);
+        ExportSettings st;
+        st.path = (dir_.path() + "/vfx-job-plate.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.fps = Rational{25, 1};
+            for (int k = 0; k < 3; ++k)
+                if (!edit::placeMedia(p, s, ids[0], 20 * k, 4 + 10 * k, 4 + 10 * k + 12, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            return true;
+        }));
+        QJsonArray clips;
+        for (const Clip& c : state()->sequence()->videoTracks[0].clips) clips.append(QString::number(c.id));
+        QCOMPARE(clips.size(), 3);
+        DialogJobs* dialogs = win_->dialogJobs();
+        auto input = [&](const QString& folder) {
+            const QJsonObject options{{"folder", dir_.filePath(folder)}, {"format", "tiff"}, {"handles", 2}, {"namePattern", "{shot}"},
+                                      {"amf", false}, {"fdl", false}, {"returns", dir_.filePath(folder + "-returns")}};
+            return QJsonObject{{"sequence", QString::number(state()->sequence()->id)}, {"clips", clips}, {"options", options}};
+        };
+        // Watched: three shots, kept with the sequence, one undo step.
+        const int steps = int(state()->history().undoCount());
+        const TaskOutcome watched = dialogs->run(state(), "vfx-pull", "Pulling shots...", input("vfx-job-watched"), win_.get());
+        QVERIFY2(watched.done(), qPrintable(watched.error));
+        QVERIFY2(watched.applied.value("message").toString().contains("Pulled 3 shot"), qPrintable(watched.applied.value("message").toString()));
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QCOMPARE(state()->sequence()->vfxShots.size(), size_t(3));
+        QCOMPARE(QString::fromStdString(state()->sequence()->vfxReturns), dir_.filePath("vfx-job-watched-returns"));
+        const QJsonArray shots = watched.result.value("shots").toArray();
+        QCOMPARE(shots.size(), 3);
+        QCOMPARE(shots[0].toObject().value("name").toString(), QString("010"));
+        QVERIFY(QFileInfo::exists(dir_.filePath("vfx-job-watched/pull_list.csv")));
+        QCOMPARE(QDir(dir_.filePath("vfx-job-watched/020")).entryList({"*.tif"}).size(), 16);  // (12 frames and two handles each side)
+        state()->undo();
+        QVERIFY(state()->sequence()->vfxShots.empty());
+        // Left to run: kept with the sequence when it ends.
+        const QString id = startInBackground(dialogs, [&] {
+            const TaskOutcome o = dialogs->run(state(), "vfx-pull", "Pulling shots...", input("vfx-job-closed"), win_.get());
+            QCOMPARE(o.how, TaskOutcome::Background);
+        });
+        QVERIFY(!id.isEmpty());
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+        QCOMPARE(state()->sequence()->vfxShots.size(), size_t(3));
+        state()->undo();
+        // Killed once it is half way (the first shot pulled), and taken up.
+        QString why;
+        QDateTime firstWritten;
+        const QString job = killedAndTakenUp("vfx-pull", "Pulling shots...", input("vfx-job-killed"), "0.5", &why, 120000, [&](const QString&) {
+            firstWritten = QFileInfo(dir_.filePath("vfx-job-killed/010/010.1002.tif")).lastModified();
+        });
+        QVERIFY2(!job.isEmpty(), qPrintable(why));
+        QVERIFY(firstWritten.isValid());
+        QCOMPARE(QFileInfo(dir_.filePath("vfx-job-killed/010/010.1002.tif")).lastModified(), firstWritten);
+        const QJsonObject taken = taskResult(job);
+        QCOMPARE(taken.value("passedOver").toInt(), 1);
+        const QJsonArray again = taken.value("shots").toArray();
+        QCOMPARE(again.size(), 3);
+        for (int k = 0; k < 3; ++k) {
+            QJsonObject a = again[k].toObject(), w = shots[k].toObject();
+            for (const char* key : {"folder", "plate", "script", "amf", "fdl", "undistortMap", "redistortMap"}) a.remove(key), w.remove(key);
+            QCOMPARE(a, w);
+        }
+        QCOMPARE(QDir(dir_.filePath("vfx-job-killed/030")).entryList({"*.tif"}).size(), 16);
+        QFile list(dir_.filePath("vfx-job-killed/pull_list.csv"));
+        QVERIFY(list.open(QIODevice::ReadOnly));
+        QCOMPARE(list.readAll().count('\n'), 4);  // (the heading, and all three shots)
+        // Offered here (the helpers had no project open): applied, the three shots are kept.
+        QVERIFY(dialogs->applyOffered(job));
+        QCOMPARE(state()->sequence()->vfxShots.size(), size_t(3));
+        state()->newProject();
+    }
+
     void vfxReturnsWatched() {
         // A second of footage on the timeline, pulled as one shot whose versions come back to a watched folder.
         Project gen = makeDefaultProject();
@@ -10046,10 +11818,137 @@ private slots:
                     QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
                 }
             QVERIFY(!call("montage_export_markers", {{"path", folder + "/markers.csv"}}).value("content").toArray().at(0).toObject().value("text").toString().contains("where Montage keeps"));
+            // Nightly 23 Nov: other write keys and tools. The path of a tool that changes things (a change list, film
+            // lists, paperwork, a script's PDF) is written, so two such calls naming one file overlap; a production
+            // being made writes its folder; a path after FFmpeg's protocol names is the file it reaches.
+            for (const char* tool : {"montage_reconform", "montage_film_lists", "montage_paperwork", "montage_script"}) {
+                const McpCallPaths a = mcpCallPaths(tool, {{"project", folder + "/p.montage"}, {"path", wav}}, false);
+                QVERIFY2(a.writes == written.writes && a.reads.isEmpty(), tool);
+            }
+            QCOMPARE(mcpCallPaths("montage_production", {{"folder", folder + "/out"}, {"create", true}}, true).writes, render.writes);
+            QVERIFY(mcpCallPaths("montage_production", {{"folder", folder + "/out"}}, true).writes.isEmpty());
+            QCOMPARE(mcpCallPaths("montage_export_adm", {{"path", "file:" + wav}}, true).writes, written.writes);
+            QCOMPARE(mcpCallPaths("montage_export_adm", {{"path", "md5:file:" + wav}}, true).writes, written.writes);
+            for (const char* key : {"export", "chan", "ply", "usd", "destinations"})
+                QVERIFY2(mcpCallPaths("montage_captions", {{key, wav}}, false).writes == written.writes, key);
+            // Each of these names one of Montage's own files and is refused before it runs, whatever the key: the
+            // write keys above, a project, a farm, a key no tool has, a path after "file:", inside an object, a DKDM
+            // anywhere but montage_make_kdm's own.
+            const QString facilities = QString::fromStdString(facilitiesFile());
+            const QByteArray facilitiesBefore = [&] {
+                QFile g(facilities);
+                return g.open(QIODevice::ReadOnly) ? g.readAll() : QByteArray();
+            }();
+            const bool hadFacilities = QFileInfo::exists(facilities);
+            const QString dkdms = QString::fromStdString(dcp::dkdmFolder());
+            const std::pair<const char*, QJsonObject> refused[] = {
+                {"montage_reconform", {{"project", folder + "/p.montage"}, {"path", roots}}},
+                {"montage_film_lists", {{"project", folder + "/p.montage"}, {"path", facilities}}},
+                {"montage_paperwork", {{"project", folder + "/p.montage"}, {"path", roots}, {"async", true}}},
+                {"montage_script", {{"project", folder + "/p.montage"}, {"path", roots}}},
+                {"montage_captions", {{"project", folder + "/p.montage"}, {"export", facilities}}},
+                {"montage_camera_track", {{"project", folder + "/p.montage"}, {"clip", 1}, {"action", "export"}, {"chan", roots}}},
+                {"montage_offload", {{"source", folder}, {"destinations", QJsonArray{folder + "/copy", dkdms}}}},
+                {"montage_create_project", {{"project", roots}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"farm", dkdms}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"output", "file:" + roots}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"output", "md5:file:" + facilities}, {"async", true}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"output", folder + "/x.mov"}, {"streaming", QJsonObject{{"live", QJsonObject{{"anything", roots}}}}}}},
+                {"montage_render", {{"project", folder + "/p.montage"}, {"output", folder + "/x.mov"}, {"dkdm", dkdms + "/new.xml"}}},
+                {"montage_export_markers", {{"path", folder + "/x.csv"}, {"note", QStringLiteral("file:%1/../%2").arg(dkdms, QFileInfo(dkdms).fileName())}}},
+            };
+            for (const auto& [tool, args] : refused) {
+                const QJsonObject r = call(tool, args);
+                QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+            }
+            // Arguments nested past what any tool reads are refused too.
+            QJsonValue deep = QJsonArray{roots};
+            for (int i = 0; i < 20; ++i) deep = QJsonObject{{"in", deep}};
+            const QJsonObject nested = call("montage_render", {{"project", folder + "/p.montage"}, {"output", folder + "/x.mov"}, {"deep", deep}});
+            QVERIFY2(nested.value("isError").toBool() && QJsonDocument(nested).toJson().contains("nested more than 16 deep"), QJsonDocument(nested).toJson().constData());
+            QFile g(facilities);
+            QCOMPARE(QFileInfo::exists(facilities), hadFacilities);
+            if (hadFacilities) QVERIFY(g.open(QIODevice::ReadOnly) && g.readAll() == facilitiesBefore);
             QFile f(roots);
             QCOMPARE(QFileInfo::exists(roots), hadRoots);
             if (hadRoots) QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == rootsBefore);
         }
+    }
+
+    // The guard on Montage's own files takes names as the file system does: letter case and how accented letters are
+    // composed ignored on macOS, those and a stream's name and trailing dots and spaces on Windows, and everywhere one
+    // file by identity under another name (a hard link). Each platform's rules are checked here on every platform.
+    void mcpOwnFilesAsTheFileSystemNamesThem() {
+        // Names folded by each platform's rules.
+        const QString composed = QStringLiteral("/Users/Ana/Caf") + QChar(0x00e9) + QStringLiteral("/DKDMs");
+        const QString decomposed = QStringLiteral("/users/ana/cafe") + QChar(0x0301) + QStringLiteral("/dkdms");
+        QCOMPARE(mcpFoldedName(composed, McpNameRules::Exact), composed);
+        QVERIFY(mcpFoldedName(composed, McpNameRules::Exact) != mcpFoldedName(decomposed, McpNameRules::Exact));
+        QCOMPARE(mcpFoldedName(composed, McpNameRules::Folded), mcpFoldedName(decomposed, McpNameRules::Folded));
+        QCOMPARE(mcpFoldedName(composed, McpNameRules::Windows), mcpFoldedName(decomposed, McpNameRules::Windows));
+        QCOMPARE(mcpFoldedName(QStringLiteral("C:\\Users\\Ana\\DKDMs. \\new.xml::$DATA"), McpNameRules::Windows), QStringLiteral("c:/users/ana/dkdms/new.xml"));
+        QCOMPARE(mcpFoldedName(QStringLiteral("C:/x/Roots.pem:$DATA"), McpNameRules::Windows), mcpFoldedName(QStringLiteral("c:/X/roots.pem"), McpNameRules::Windows));
+        QVERIFY(mcpFoldedName(QStringLiteral("/x/roots.pem:$DATA"), McpNameRules::Folded) != mcpFoldedName(QStringLiteral("/x/roots.pem"), McpNameRules::Folded));
+        // Paths that do not exist yet, under this run's folder, are told apart by name alone.
+        const QString folder = dir_.filePath("own-names");
+        QVERIFY(QDir().mkpath(folder));
+        const QString own = folder + "/Own/DKDMs";
+        const QString other = folder + "/own/dkdms/new.xml";
+        QVERIFY(!mcpPathReaches(other, own, McpNameRules::Exact, false));
+        QVERIFY(mcpPathReaches(other, own, McpNameRules::Folded, false));
+        QVERIFY(mcpPathReaches(other, own, McpNameRules::Windows, false));
+        QVERIFY(!mcpPathReaches(folder + "/own/dkdms./new.xml:$DATA", own, McpNameRules::Folded, false));
+        QVERIFY(mcpPathReaches(folder + "/own/dkdms./new.xml:$DATA", own, McpNameRules::Windows, false));
+        QVERIFY(mcpPathReaches(folder + "/Own/DKDMs", own, McpNameRules::Exact, false));
+        QVERIFY(!mcpPathReaches(folder + "/Own/DKDMs2/new.xml", own, McpNameRules::Windows, false));
+        // A folder that holds it reaches it only when that is asked (a folder written over).
+        QVERIFY(mcpPathReaches(folder + "/own", own, McpNameRules::Folded, true));
+        QVERIFY(!mcpPathReaches(folder + "/own", own, McpNameRules::Folded, false));
+        // One file under another name: a hard link to it is it, by every rule; a neighbour is not.
+        QVERIFY(QDir().mkpath(folder + "/real") && QDir().mkpath(folder + "/elsewhere"));
+        const QString roots = folder + "/real/roots.pem", alias = folder + "/elsewhere/alias.pem";
+        {
+            QFile f(roots);
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write("kept") == 4);
+        }
+        std::error_code ec;
+        std::filesystem::create_hard_link(QFile::encodeName(roots).toStdString(), QFile::encodeName(alias).toStdString(), ec);
+        QVERIFY2(!ec, ec.message().c_str());
+        for (McpNameRules rules : {McpNameRules::Exact, McpNameRules::Folded, McpNameRules::Windows}) {
+            QVERIFY(mcpPathReaches(alias, roots, rules, false));
+            QVERIFY(mcpPathReaches(alias, roots, rules, true));
+            QVERIFY(!mcpPathReaches(folder + "/elsewhere/other.pem", roots, rules, false));
+        }
+        // Through the server: Montage's DKDMs (in a folder of this run's), a hard link to one refused, and on a
+        // computer whose file system ignores letter case, the folder spelt otherwise too; the DKDM unchanged.
+        const QByteArray envBefore = qgetenv("MONTAGE_DCP_DKDMS");
+        const bool hadEnv = qEnvironmentVariableIsSet("MONTAGE_DCP_DKDMS");
+        auto restore = qScopeGuard([&] { hadEnv ? qputenv("MONTAGE_DCP_DKDMS", envBefore) : qunsetenv("MONTAGE_DCP_DKDMS"); });
+        const QString dkdms = folder + "/Montage-DKDMs";
+        QVERIFY(QDir().mkpath(dkdms));
+        qputenv("MONTAGE_DCP_DKDMS", QFile::encodeName(dkdms));
+        const QString kept = dkdms + "/kept.xml", linked = folder + "/elsewhere/kept.xml";
+        {
+            QFile f(kept);
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write("<dkdm/>") == 7);
+        }
+        std::filesystem::create_hard_link(QFile::encodeName(kept).toStdString(), QFile::encodeName(linked).toStdString(), ec);
+        QVERIFY2(!ec, ec.message().c_str());
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_export_markers"}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QStringList refused{linked};
+        if (mcpNameRules() != McpNameRules::Exact) refused << folder + "/montage-dkdms/new.csv";
+        for (const QString& path : refused) {
+            const QJsonObject r = call({{"path", path}});
+            QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+        }
+        QFile f(kept);
+        QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == "<dkdm/>");
+        QVERIFY(!QFileInfo::exists(dkdms + "/new.csv"));
     }
 
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
@@ -10178,6 +12077,12 @@ private slots:
                 QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("not a screen's in the facility list"), QJsonDocument(r).toJson().constData());
             }
             QVERIFY(!QFileInfo::exists(dir_.filePath("mcp-elsewhere")));
+            // Nightly 23 Nov: a chain up to a trusted root whose leaf is not a security manager's (the projector's) is
+            // refused too, and nothing is written.
+            r = call({{"dkdm", dkdm}, {"servers", QJsonArray{pemFile("park-projector-2-chain.pem", projectors[1].certificates)}},
+                      {"folder", dir_.filePath("mcp-projector")}});
+            QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("security manager"), QJsonDocument(r).toJson().constData());
+            QVERIFY(!QFileInfo::exists(dir_.filePath("mcp-projector")));
         }
         // Refused: a screen not in the list, and a window past the DKDM's.
         QVERIFY(call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens/7"}}, {"folder", dir_.filePath("mcp-booking")}}).value("isError").toBool());
@@ -10275,6 +12180,22 @@ private slots:
             QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
                                                 {"prores_profile", "proxy"}})
                         .value("isError").toBool());
+            // Phase 16: a ProRes master carries the sequence's markers as timed events, here as a JSON document; the
+            // check passes it and says what it advises beside the problems.
+            {
+                Project marked = state()->project();
+                marked.active()->markers.push_back(Marker{10, 0, "Act two"});
+                QVERIFY(saveProject(marked, dir_.filePath("imf-marked.montage").toStdString()));
+                r = call("montage_export_imf", {{"project", dir_.filePath("imf-marked.montage")}, {"folder", dir_.filePath("mcp-prores-events")},
+                                                {"title", "Events"}, {"application", "prores"}, {"events_json", true}});
+                QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+                const QJsonObject ev = r.value("structuredContent").toObject();
+                QVERIFY2(ev.value("problems").toArray().isEmpty() && ev.value("events").toInt() == 1 && ev.value("advice").isArray(),
+                         QJsonDocument(ev).toJson().constData());
+                r = call("montage_verify_imf", {{"folder", ev.value("folder").toString()}});
+                QVERIFY2(r.value("structuredContent").toObject().value("ok").toBool() && r.value("structuredContent").toObject().value("advice").isArray(),
+                         QJsonDocument(r).toJson().constData());
+            }
             // Interlaced, Y'CbCr 4:4:4 and full range, each checked.
             for (const QJsonObject& extra : {QJsonObject{{"fields", "tff"}}, QJsonObject{{"prores_profile", "4444"}, {"ycbcr444", true}},
                                              QJsonObject{{"prores_profile", "4444xq"}, {"full_range", true}}}) {
@@ -10385,19 +12306,25 @@ private slots:
             offered = offered && edition && edition->isEnabled() && edition->currentData().toInt() == 2026 && eventsBox && eventsBox->isEnabled() &&
                       eventsBox->isChecked() && offeredIn(sizes, "8k");
             if (offered) {
+                // The events document as JSON is chosen only while the markers go as events.
+                auto* eventsJson = dlg->findChild<QCheckBox*>("imfEventsJson");
+                offered = eventsJson && eventsJson->isEnabled() && !eventsJson->isChecked();
                 edition->setCurrentIndex(edition->findData(2021));
-                offered = !eventsBox->isEnabled() && !offeredIn(sizes, "8k");
+                offered = offered && !eventsBox->isEnabled() && !eventsJson->isEnabled() && !offeredIn(sizes, "8k");
                 edition->setCurrentIndex(edition->findData(2026));
-                offered = offered && eventsBox->isEnabled() && offeredIn(sizes, "8k");
+                offered = offered && eventsBox->isEnabled() && eventsJson->isEnabled() && offeredIn(sizes, "8k");
+                eventsBox->setChecked(false);
+                offered = offered && !eventsJson->isEnabled();
+                eventsBox->setChecked(true);
             }
-            // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
+            // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not; its markers go as events too.
             auto* application = dlg->findChild<QComboBox*>("imfApplication");
             auto* graded = dlg->findChild<QComboBox*>("imfGraded");
             offered = offered && application && graded && !graded->isEnabled() && dlg->findChild<QComboBox*>("imfColour")->isEnabled();
             if (offered && exrAvailable()) {
                 application->setCurrentIndex(application->findData(5));
                 offered = graded->isEnabled() && dlg->findChild<QCheckBox*>("imfTargetFrame")->isEnabled() &&
-                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled() && !edition->isEnabled() && !eventsBox->isEnabled() && !offeredIn(sizes, "8k");
+                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled() && !edition->isEnabled() && eventsBox->isEnabled() && !offeredIn(sizes, "8k");
                 application->setCurrentIndex(application->findData(2));
             }
             // Application ProRes: fields for 4:2:2, Y'CbCr, full range and 12 bits for 4:4:4. Application DPP: 422 HQ, 4444
@@ -11720,6 +13647,165 @@ private slots:
         state()->undo();
         QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.empty() ||
                 edit::clipById(*state()->sequence(), clip)->effects[0].type != "lens_correction");
+    }
+
+    void lensBoardAsABackgroundJob() {
+        // Calibrate Lens finds the board as a job in the store. Watched, the dialog shows its fit; left to run, the
+        // dialog still open shows it when it ends, and one opened later on the same clip shows the last; killed
+        // part-way in another process and taken up, it goes on from the frames already read, to the same fit.
+        QTemporaryDir own;
+        qputenv("MONTAGE_USER_LENSES", own.path().toUtf8());
+        qputenv("MONTAGE_LENS_DB", QFile::encodeName(own.filePath("no-lensfun")));
+        reloadLensDatabase();
+        auto restore = qScopeGuard([] {
+            qunsetenv("MONTAGE_USER_LENSES");
+            qunsetenv("MONTAGE_LENS_DB");
+            reloadLensDatabase();
+            lensCalibrationDialogHook() = nullptr;
+        });
+        // A board of 9 x 6 inner corners at six poses before a lens that bends nothing, each for two frames.
+        const int W = 480, H = 360, cols = 9, rows = 6;
+        const double F = 1.5 * H / 2;
+        struct Pose {
+            double R[9], t[3];
+        };
+        auto pose = [&](double wx, double wy, double wz, double X, double Y, double Z) {
+            Pose p;
+            const double th = std::sqrt(wx * wx + wy * wy + wz * wz);
+            const double kx = th > 0 ? wx / th : 0, ky = th > 0 ? wy / th : 0, kz = th > 0 ? wz / th : 0;
+            const double co = std::cos(th), si = std::sin(th), v = 1 - co;
+            const double R[9] = {co + kx * kx * v,      kx * ky * v - kz * si, kx * kz * v + ky * si,
+                                 ky * kx * v + kz * si, co + ky * ky * v,      ky * kz * v - kx * si,
+                                 kz * kx * v - ky * si, kz * ky * v + kx * si, co + kz * kz * v};
+            std::copy(R, R + 9, p.R);
+            const double mx = (cols - 1) / 2.0, my = (rows - 1) / 2.0;
+            p.t[0] = X - (R[0] * mx + R[1] * my), p.t[1] = Y - (R[3] * mx + R[4] * my), p.t[2] = Z - (R[6] * mx + R[7] * my);
+            return p;
+        };
+        const Pose poses[] = {pose(0.4, 0, 0, 0, 0, 11),    pose(-0.4, 0, 0, 0, 0, 11),          pose(0, 0.5, 0, 0, 0, 11),
+                              pose(0, -0.5, 0, 0, 0, 11),   pose(0.3, 0.35, 0.1, -2.5, -1, 12), pose(-0.25, -0.35, -0.1, 2.5, 1, 12)};
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = W, gs.height = H, gs.fps = {25, 1};
+        for (size_t k = 0; k < std::size(poses); ++k) {
+            const Pose& p = poses[k];
+            QImage img(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    int sum = 0;
+                    for (int s = 0; s < 9; ++s) {
+                        // (the ray through the sample, met with the board's plane, in the board's squares)
+                        const double d[3] = {(x + (s % 3 + 0.5) / 3 - W / 2.0) / F, (y + (s / 3 + 0.5) / 3 - H / 2.0) / F, 1};
+                        const double n[3] = {p.R[2], p.R[5], p.R[8]};
+                        const double at = (n[0] * p.t[0] + n[1] * p.t[1] + n[2] * p.t[2]) / (n[0] * d[0] + n[1] * d[1] + n[2] * d[2]);
+                        const double q[3] = {at * d[0] - p.t[0], at * d[1] - p.t[1], at * d[2] - p.t[2]};
+                        const double u = p.R[0] * q[0] + p.R[3] * q[1] + p.R[6] * q[2], v = p.R[1] * q[0] + p.R[4] * q[1] + p.R[7] * q[2];
+                        int g = 110;  // (the wall)
+                        if (u > -1.6 && u < cols + 0.6 && v > -1.6 && v < rows + 0.6) g = 225;  // (the card)
+                        if (u > -1 && u < cols && v > -1 && v < rows) g = (int(std::floor(u)) + int(std::floor(v))) & 1 ? 30 : 225;
+                        sum += g;
+                    }
+                    img.setPixel(x, y, qRgb(sum / 9, sum / 9, sum / 9));
+                }
+            const QString png = dir_.filePath(QStringLiteral("lens-board-%1.png").arg(k));
+            QVERIFY(img.save(png));
+            MediaItem m;
+            m.id = gen.newId();
+            QVERIFY(probeMedia(png.toStdString(), m));
+            gen.media.push_back(m);
+            Clip c = makeClip(gen, m, TrackKind::Video, gs);
+            c.start = FrameTime(2 * k);
+            c.duration = 2;
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, c).ok);
+        }
+        const QString file = dir_.filePath("lens-board.mp4");
+        {
+            ExportSettings st;
+            st.path = file.toStdString();
+            st.audioCodec = "none";
+            st.crf = 0;
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({file});
+        QCOMPARE(ids.size(), size_t(1));
+        Id clip = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = W, s.height = H, s.fps = {25, 1};
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            clip = s.videoTracks[0].clips[0].id;
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        DialogJobs* dialogs = win_->dialogJobs();
+        QAction* action = win_->findChild<QAction*>("calibrateLens");
+        QVERIFY(action);
+        // Each time the dialog is shown, `check` is run on it, and it is closed.
+        std::function<void(LensCalibrationDialog*)> check;
+        lensCalibrationDialogHook() = [&](LensCalibrationDialog* dlg) {
+            check(dlg);
+            QTimer::singleShot(0, dlg, [dlg] { dlg->reject(); });  // (once it has run: its own waits would close it)
+        };
+        // Watched: the fit, nothing bent, from all six boards.
+        LensFit watched;
+        QJsonObject input;
+        check = [&](LensCalibrationDialog* dlg) {
+            QVERIFY(!dlg->fitted());
+            dlg->setBoard(cols, rows);
+            QVERIFY2(dlg->calibrate(), qPrintable(dlg->resultText()));
+            watched = dlg->fit();
+            QCOMPARE(watched.views, 6);
+            QVERIFY2(watched.rms < 0.2 && std::fabs(watched.terms[0]) < 0.01, qPrintable(dlg->resultText()));
+            QVERIFY(dlg->findChild<QPushButton*>("calibrateSave")->isEnabled());
+        };
+        action->trigger();
+        jobs::Record r;
+        for (const jobs::Record& x : jobs::all("app"))
+            if (x.kind == "lens-board" && x.order >= r.order) r = x;
+        QCOMPARE(r.status, QString("done"));
+        QCOMPARE(lensFitFromJson(taskResult(r.id).value("fit").toObject()).terms[0], watched.terms[0]);
+        // Opened again on the clip: the last fit, ready to save.
+        check = [&](LensCalibrationDialog* dlg) {
+            QVERIFY(dlg->fitted());
+            QCOMPARE(dlg->fit().terms[0], watched.terms[0]);
+            QCOMPARE(dlg->fit().viewRms, watched.viewRms);
+            QCOMPARE(dlg->findChild<QSpinBox*>("calibrateCols")->value(), cols);
+            QVERIFY(dlg->resultText().contains("Corners from 6 frame"));
+        };
+        action->trigger();
+        // Left to run with the dialog open: its fit is shown there when it ends; while it runs the dialog says so.
+        check = [&](LensCalibrationDialog* dlg) {
+            dlg->setBoard(cols, rows);
+            const QString id = startInBackground(dialogs, [&] { QVERIFY(!dlg->calibrate()); });
+            QVERIFY(!id.isEmpty());
+            QVERIFY(!dlg->fitted() && dlg->resultText().contains("in the background"));
+            dialogs->setPaused(id, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dlg->fitted(), 120000);
+            QCOMPARE(dlg->fit().terms[0], watched.terms[0]);
+            input = QJsonObject();
+            QJsonObject result;
+            QVERIFY(dialogs->latestResult("lens-board", nullptr, &result, &input));
+        };
+        action->trigger();
+        // Killed in another process once it has read half the frames, and taken up: it goes on from there (those
+        // frames are not read again), to the same fit.
+        QString why;
+        int keptBefore = 0;
+        const QString job = killedAndTakenUp("lens-board", "Finding the board…", input, "0.5", &why, 120000, [&](const QString& id) {
+            QFile f(jobs::jobFolder(id) + "/part-boards.json");
+            if (f.open(QIODevice::ReadOnly)) keptBefore = QJsonDocument::fromJson(f.readAll()).object().value("v").toObject().value("next").toInt();
+        });
+        QVERIFY2(!job.isEmpty(), qPrintable(why));
+        QVERIFY2(keptBefore >= 6 && keptBefore < 12, qPrintable(QString::number(keptBefore)));
+        const QJsonObject taken = taskResult(job);
+        QCOMPARE(taken.value("passedOver").toInt(), keptBefore);
+        const LensFit again = lensFitFromJson(taken.value("fit").toObject());
+        QCOMPARE(again.views, watched.views);
+        QCOMPARE(again.terms[0], watched.terms[0]);
+        QCOMPARE(again.viewRms, watched.viewRms);
+        state()->newProject();
     }
 
     void contentCredentialsInTheApp() {
@@ -14226,12 +16312,26 @@ const auto seq = [this] { return state()->sequence(); };
         const bool lost = QTest::qWaitFor([&] { return !engine.isOpen(); });
         program->seek(31);
         const bool moved = !program->scrubOutput()->onDevice();
-        audiodev::setLoopbackOptions({});  // (plugged back in before anything is checked)
+        // (plugged back in before anything is checked, and slow to open, as a system listing its devices first: the
+        // asking is done off the window's thread, so no scrub waits for it; nightly 23 Nov)
+        audiodev::LoopbackOptions slow;
+        slow.openMs = 1500;
+        audiodev::setLoopbackOptions(slow);
         QVERIFY(lost && moved);
         QTest::qWait(500);
         QVERIFY(!engine.isOpen());
         int at = 32;
-        QTRY_VERIFY_WITH_TIMEOUT((program->seek(at++ % 2 ? 33 : 32), program->scrubOutput()->onDevice()), 8000);
+        qint64 longest = 0;
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+                                     QElapsedTimer t;
+                                     t.start();
+                                     program->seek(at++ % 2 ? 33 : 32);
+                                     longest = std::max(longest, t.elapsed());
+                                     return program->scrubOutput()->onDevice();
+                                 }()),
+                                 10000);
+        QVERIFY2(longest < 1000, qPrintable(QString::number(longest)));
+        audiodev::setLoopbackOptions({});
         QVERIFY(engine.isOpen());
         engine.setSettings(before);
         state()->newProject();
@@ -14552,6 +16652,46 @@ const auto seq = [this] { return state()->sequence(); };
             const Clip* t = edit::clipById(*state()->sequence(), clip);
             QVERIFY(t->effects.size() == 2 && t->effects[0].type == "denoise" && t->effects[1].type == "dialogue_align" &&
                     dialogueAlignmentApplies(t->effects[1], *t));
+        }
+        // Aligning is a background job (DialogJobs.h): left to run, its dialog closed, the same alignment lands when it
+        // ends; killed in another Montage at its start and taken up by one of two started together, it is the same
+        // again, offered here (the helpers have no project open) and applied onto the take as it is.
+        {
+            QCOMPARE(state()->undoText(), QString("Align to Guide"));
+            const Clip aligned = *edit::clipById(*state()->sequence(), clip);
+            auto same = [&] {
+                const Clip* t = edit::clipById(*state()->sequence(), clip);
+                if (!t || t->effects.size() != 2 || t->duration != aligned.duration) return false;
+                Effect a = t->effects[1], b = aligned.effects[1];
+                a.id = b.id = 0;
+                return t->effects[0] == aligned.effects[0] && a == b;
+            };
+            state()->undo();
+            QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.size(), size_t(1));
+            DialogJobs* dialogs = DialogJobs::of(win_.get());
+            const QString id = startInBackground(dialogs, [&] { QVERIFY(!panel->alignToGuide()); });
+            QVERIFY(!id.isEmpty());
+            QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.size(), size_t(1));
+            dialogs->setPaused(id, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+            QVERIFY(same());
+            QCOMPARE(state()->undoText(), QString("Align to Guide"));
+            state()->undo();
+            const AdrCue& cue = state()->sequence()->adrCues[0];
+            const QJsonObject input{{"sequence", QString::number(state()->sequence()->id)},
+                                    {"clips", QJsonArray{QString::number(clip), QString::number(panel->guideClip())}},
+                                    {"clip", QString::number(clip)},
+                                    {"guide", QString::number(panel->guideClip())},
+                                    {"cue", QString::number(cue.id)},
+                                    {"from", double(cue.start)},
+                                    {"to", double(cue.end)},
+                                    {"precision", int(AlignPrecision::Normal)}};
+            QString why;
+            const QString job = killedAndTakenUp("adr-align", "Aligning to the guide…", input, "0", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(!dialogs->offeredNote(job).isEmpty());
+            QVERIFY(dialogs->applyOffered(job));
+            QVERIFY(same());
         }
 
         // The cue sheet, out and back in.
@@ -16044,6 +18184,51 @@ const auto seq = [this] { return state()->sequence(); };
         else appSettings().remove("export/preset");
     }
 
+    void pngExportSettings() {
+        // The export dialog sets PNG frames' compression level and their bits a channel, for the PNG Sequence preset only.
+        loadDemo();
+        // (the dialog keeps the preset last used: put back as it was, so later exports are not PNG frames)
+        const QVariant lastPreset = appSettings().value("export/preset");
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        int png = -1, mp4 = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i) {
+            if (png < 0 && exportPresets()[i].settings.videoCodec == "png") png = int(i);
+            if (mp4 < 0 && exportPresets()[i].extension == "mp4") mp4 = int(i);
+        }
+        QVERIFY(png >= 0 && mp4 >= 0);
+        ExportDialog ed(state(), win_.get());
+        ed.setQueue(queue);
+        auto* preset = ed.findChild<QComboBox*>("exportPreset");
+        auto* level = ed.findChild<QComboBox*>("exportPngCompression");
+        auto* bits = ed.findChild<QComboBox*>("exportPngBits");
+        QVERIFY(preset && level && bits);
+        preset->setCurrentIndex(mp4);
+        QVERIFY(!level->isEnabled() && !bits->isEnabled());
+        preset->setCurrentIndex(png);
+        QVERIFY(level->isEnabled() && bits->isEnabled());
+        QCOMPARE(level->currentData().toInt(), 6);  // (balanced, and 8 bits, until chosen otherwise)
+        QCOMPARE(bits->currentData().toInt(), 8);
+        level->setCurrentIndex(level->findData(9));
+        bits->setCurrentIndex(bits->findData(16));
+        ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/frames.png");
+        ed.findChild<QPushButton*>("addToQueue")->click();
+        QCOMPARE(queue->jobs().size(), jobs + 1);
+        const RenderQueue::Job& job = queue->jobs().back();
+        QCOMPARE(job.settings.pngCompression, 9);
+        QCOMPARE(job.settings.pngBits, 16);
+        queue->remove(job.id);
+        // The choice is kept for the next export.
+        {
+            ExportDialog again(state(), win_.get());
+            QCOMPARE(again.findChild<QComboBox*>("exportPngCompression")->currentData().toInt(), 9);
+            QCOMPARE(again.findChild<QComboBox*>("exportPngBits")->currentData().toInt(), 16);
+        }
+        for (const char* key : {"export/pngCompression", "export/pngBits"}) appSettings().remove(key);
+        if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
+        else appSettings().remove("export/preset");
+    }
+
     void frameRateDelivery() {
         // 29.97 video made from a 23.976 cut with 2:3 pulldown, then removed in Interpret Footage, starting on A.
         const QString telecined = dir_.filePath("telecined.mov");
@@ -16170,6 +18355,50 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(ExportDialog(state(), win_.get()).findChild<QComboBox*>("exportRate")->currentData().toString(), QString());
         appSettings().remove("export/ratePitch");
         appSettings().setValue("export/preset", rememberedPreset);
+        state()->newProject();
+    }
+
+    void exportDialogProResDepthAndFields() {
+        // Phase 16: ProRes 4444's depth is chosen in the Export dialog, 12 bits (as its presets) or 10, and only for
+        // 4444; with interlaced fields, segmented fields can be chosen too. Both reach the export queued.
+        loadDemo();
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        const QVariant rememberedPreset = appSettings().value("export/preset"), rememberedBits = appSettings().value("export/proResBits"),
+                       rememberedInterlaced = appSettings().value("export/interlaced"), rememberedSegmented = appSettings().value("export/segmentedFields");
+        auto restore = qScopeGuard([&] {
+            for (const auto& [key, value] : {std::pair{"export/preset", rememberedPreset}, std::pair{"export/proResBits", rememberedBits},
+                                             std::pair{"export/interlaced", rememberedInterlaced}, std::pair{"export/segmentedFields", rememberedSegmented}})
+                value.isValid() ? appSettings().setValue(key, value) : appSettings().remove(key);
+        });
+        for (const int bits : {10, 12}) {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* depth = ed.findChild<QComboBox*>("exportProResBits");
+            auto* interlaced = ed.findChild<QCheckBox*>("exportInterlaced");
+            auto* segmented = ed.findChild<QCheckBox*>("exportSegmentedFields");
+            QVERIFY(preset && depth && interlaced && segmented);
+            preset->setCurrentIndex(preset->findText("ProRes 422 HQ"));
+            QVERIFY(preset->currentIndex() >= 0 && !depth->isEnabled());
+            preset->setCurrentIndex(preset->findText("ProRes 4444 (alpha)"));
+            QVERIFY(preset->currentIndex() >= 0 && depth->isEnabled());
+            depth->setCurrentIndex(depth->findData(bits));
+            interlaced->setChecked(bits == 10);
+            QCOMPARE(segmented->isEnabled(), bits == 10);
+            if (segmented->isEnabled()) segmented->setChecked(true);
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.filePath(QStringLiteral("depth-%1.mov").arg(bits)));
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(ed.result(), int(QDialog::Accepted));
+            QCOMPARE(queue->jobs().size(), jobs + 1);
+            const RenderQueue::Job& job = queue->jobs().back();
+            QCOMPARE(job.settings.pixFmt, std::string(bits == 10 ? "yuva444p10le" : "yuva444p12le"));
+            QCOMPARE(job.settings.interlaced, bits == 10);
+            QCOMPARE(job.settings.segmentedFields, bits == 10);
+            queue->remove(job.id);
+            // (remembered for the next export)
+            QCOMPARE(ExportDialog(state(), win_.get()).findChild<QComboBox*>("exportProResBits")->currentData().toInt(), bits);
+        }
         state()->newProject();
     }
 
@@ -18309,6 +20538,99 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(kept.points.size(), size_t(40));
     }
 
+    void inspectorAnalysesAsBackgroundJobs() {
+        // The Inspector's analyses run as jobs in the store. Watched, Analyze Stabilization keys the effect as one undo
+        // step; left to run, what it found is put on the effect as it is when it ends (a setting changed meanwhile
+        // stays); killed part-way in another process and taken up, the same is found and offered here.
+        QImage tex(160, 90, QImage::Format_RGB32);
+        tex.fill(QColor(80, 80, 80));
+        {
+            QPainter pa(&tex);
+            for (int i = 0; i < 60; ++i)
+                pa.fillRect((i * 97) % 150, (i * 53) % 85, 4 + (i * 7) % 12, 4 + (i * 11) % 12, QColor((i * 37) % 255, (i * 71) % 255, (i * 13) % 255));
+        }
+        const QString png = dir_.path() + "/analysis-texture.png";
+        QVERIFY(tex.save(png));
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160, gs.height = 90, gs.fps = {25, 1};
+        MediaItem m;
+        m.id = gen.newId();
+        std::string err;
+        QVERIFY(probeMedia(png.toStdString(), m, &err));
+        gen.media.push_back(m);
+        Clip c = makeClip(gen, m, TrackKind::Video, gs);
+        c.duration = 20;
+        c.motion.params["scale"] = Param(130.0);
+        for (int i = 0; i < 20; ++i) {
+            c.motion.params["pos_x"].addKey(i, 4 * std::sin(i * 1.7), Interp::Hold);
+            c.motion.params["pos_y"].addKey(i, 3 * std::cos(i * 1.1), Interp::Hold);
+        }
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        ExportSettings st;
+        st.path = (dir_.path() + "/analysis-shaky.mp4").toStdString();
+        st.audioCodec = "none";
+        st.crf = 12;
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        Id clip = 0, eid = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            Clip& placed = s.videoTracks[0].clips.at(0);
+            clip = placed.id;
+            placed.effects.push_back(makeEffect(p, "stabilize"));
+            eid = placed.effects.back().id;
+            return true;
+        }));
+        auto effect = [&]() -> const Effect* {
+            const Clip* k = edit::clipById(*state()->sequence(), clip);
+            for (const Effect& e : k->effects)
+                if (e.id == eid) return &e;
+            return nullptr;
+        };
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector);
+        DialogJobs* dialogs = win_->dialogJobs();
+        // Watched.
+        const int steps = int(state()->history().undoCount());
+        inspector->analyzeStabilize(clip, eid);
+        QVERIFY(effect() && !effect()->s("motion").empty());
+        const std::string motion = effect()->s("motion");
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QCOMPARE(state()->undoText(), QString("Analyze Stabilization"));
+        state()->undo();
+        QVERIFY(effect()->s("motion").empty());
+        // Left to run, a setting changed meanwhile: both kept.
+        const QString id = startInBackground(dialogs, [&] { inspector->analyzeStabilize(clip, eid); });
+        QVERIFY(!id.isEmpty());
+        QVERIFY(state()->edit("By hand", [&](Project&, Sequence& s) {
+            Effect* e = edit::ownedEffect(s, clip, eid);
+            if (!e) return false;
+            e->params["crop"] = Param(0.25);
+            return true;
+        }));
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+        QCOMPARE(effect()->s("motion"), motion);
+        QCOMPARE(effect()->p("crop", 0), 0.25);
+        QCOMPARE(state()->undoText(), QString("Analyze Stabilization"));
+        state()->undo();
+        state()->undo();
+        QVERIFY(effect()->s("motion").empty());
+        // Killed in another process part-way, and taken up: the same motion, offered here and applied.
+        QString why;
+        const QJsonObject input{{"sequence", QString::number(state()->sequence()->id)}, {"clips", QJsonArray{QString::number(clip)}},
+                                {"clip", QString::number(clip)}, {"effect", QString::number(eid)}, {"what", "stabilize"}, {"args", QJsonObject{}}};
+        const QString job = killedAndTakenUp("inspector-analysis", "Analysing camera movement...", input, "0.3", &why);
+        QVERIFY2(!job.isEmpty(), qPrintable(why));
+        QVERIFY(dialogs->applyOffered(job));
+        QCOMPARE(effect()->s("motion"), motion);
+        state()->newProject();
+    }
+
     void stabilizeAndTrackFromInspector() {
         // A textured still shaken by a few pixels every frame.
         QImage tex(320, 180, QImage::Format_RGB32);
@@ -18781,6 +21103,40 @@ const auto seq = [this] { return state()->sequence(); };
                 yellow = c.redF() > 0.8 && c.greenF() > 0.8 && c.blueF() < 0.3 && c.alphaF() > 0.9;
             }
         QVERIFY(yellow);
+        // Drafting is a background job (DialogJobs.h): left to run, its dialog closed, the same track is added when it
+        // ends; killed in another Montage at its start and taken up by one of two started together, the same again,
+        // offered here (the helpers have no project open) and added when it is applied.
+        {
+            const CaptionTrack watched = sdh;
+            auto same = [&] {
+                const Sequence* now = state()->sequence();
+                if (now->captionTracks.size() != 1) return false;
+                const CaptionTrack& t = now->captionTracks[0];
+                return t.name == watched.name && t.language == watched.language && t.style == watched.style && t.captions == watched.captions;
+            };
+            state()->undo();
+            QVERIFY(state()->sequence()->captionTracks.empty());
+            DialogJobs* dialogs = DialogJobs::of(win_.get());
+            const QString id = startInBackground(dialogs, [&] { QCOMPARE(panel->draftSdh(o, &error), 0); });
+            QVERIFY(!id.isEmpty());
+            QVERIFY(state()->sequence()->captionTracks.empty());
+            dialogs->setPaused(id, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+            QVERIFY(same());
+            state()->undo();
+            const QJsonObject input{{"sequence", QString::number(state()->sequence()->id)},
+                                    {"options", QJsonObject{{"sdh", QJsonObject{{"style", int(kSdhColours)}, {"lyrics", false}}},
+                                                            {"sounds", false},
+                                                            {"faces", false},
+                                                            {"readText", false}}}};
+            QString why;
+            const QString job = killedAndTakenUp("captions-sdh", "Drafting captions for the deaf and hard of hearing…", input, "0", &why);
+            QVERIFY2(!job.isEmpty(), qPrintable(why));
+            QVERIFY(!dialogs->offeredNote(job).isEmpty());
+            QVERIFY(dialogs->applyOffered(job));
+            QCOMPARE(state()->sequence()->captionTracks.size(), size_t(1));
+            QVERIFY(same());
+        }
         // In the brackets style, a second track, the speakers named (no faces were looked for). It takes the style of the
         // track that was shown and becomes the one shown, the first hidden.
         QVERIFY(state()->edit("Style", [](Project&, Sequence& sq) {
@@ -21580,6 +23936,122 @@ print("added " + ui["name"])
         QVERIFY(!win_->analyseHdrLightLevels(false));
     }
 
+    void av1GrainExportSetting() {
+        // The export dialog offers Carry grain as parameters for AV1 presets only, not with a frame rate change, and
+        // the export it sets up measures each shot's grain; the choice is kept for the next export.
+        loadDemo();
+        // (the dialog keeps the preset last used: put back as it was)
+        const QVariant lastPreset = appSettings().value("export/preset");
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        int av1 = -1, mp4 = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i) {
+            if (av1 < 0 && exportPresets()[i].settings.videoCodec == "libsvtav1") av1 = int(i);
+            if (mp4 < 0 && exportPresets()[i].settings.videoCodec == "libx264") mp4 = int(i);
+        }
+        QVERIFY(av1 >= 0 && mp4 >= 0);
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* grain = ed.findChild<QCheckBox*>("exportFilmGrain");
+            QVERIFY(preset && grain);
+            preset->setCurrentIndex(mp4);
+            QVERIFY(!grain->isEnabled());
+            preset->setCurrentIndex(av1);
+            QVERIFY(grain->isEnabled());
+            if (auto* rate = ed.findChild<QComboBox*>("exportRate"); rate && rate->count() > 1) {
+                rate->setCurrentIndex(1);
+                QVERIFY(!grain->isEnabled());
+                rate->setCurrentIndex(0);
+                QVERIFY(grain->isEnabled());
+            }
+            grain->setChecked(true);
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/grain.mp4");
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(queue->jobs().size(), jobs + 1);
+            const RenderQueue::Job& job = queue->jobs().back();
+            QCOMPARE(job.settings.filmGrain, std::string("measure"));
+            QCOMPARE(job.settings.videoCodec, std::string("libsvtav1"));
+            queue->remove(job.id);
+        }
+        {
+            ExportDialog again(state(), win_.get());
+            QVERIFY(again.findChild<QCheckBox*>("exportFilmGrain")->isChecked());
+        }
+        appSettings().remove("export/filmGrain");
+        if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
+        else appSettings().remove("export/preset");
+    }
+
+    void streamingDialogScoringSettings() {
+        // Export Streaming Package's display size and Lowest CRF: off until rates are set per shot, and the package
+        // they set up is scored at the size chosen and searched no finer than the CRF given, as its ladder.csv says.
+        if (!vmafAvailable()) QSKIP("Built without libvmaf");
+        loadDemo();
+        const QString folder = dir_.path() + "/streaming-dialog";
+        QVERIFY(QDir().mkpath(folder));
+        auto wrong = std::make_shared<QString>();
+        auto opened = std::make_shared<bool>(false), chose = std::make_shared<bool>(false);
+        whenModal<QDialog>(this, [this, wrong, opened, chose, folder](QDialog* d) {
+            *opened = true;
+            auto* perShot = d->findChild<QCheckBox*>("streamingPerShot");
+            auto* size = d->findChild<QComboBox*>("streamingDisplaySize");
+            auto* crf = d->findChild<QDoubleSpinBox*>("streamingCrfFloor");
+            auto* ladder = d->findChild<QListWidget*>("streamingLadder");
+            auto* sound = d->findChild<QComboBox*>("streamingSound");
+            auto fail = [&](const QString& why) {
+                *wrong = why;
+                d->reject();
+            };
+            if (!perShot || !size || !crf || !ladder || !sound || ladder->count() == 0) return fail("a control is missing");
+            if (size->isEnabled() || crf->isEnabled()) return fail("enabled before rates are set per shot");
+            if (size->count() != 4 || size->itemData(0).toSize().isValid() || size->itemData(1).toSize() != QSize(1280, 720) ||
+                size->itemData(3).toSize() != QSize(3840, 2160))
+                return fail("display sizes");
+            if (crf->minimum() != 1 || crf->maximum() != 40 || crf->value() != 18) return fail("Lowest CRF's range or default");
+            perShot->setChecked(true);
+            if (!size->isEnabled() || !crf->isEnabled()) return fail("not enabled with rates set per shot");
+            perShot->setChecked(false);
+            if (size->isEnabled() || crf->isEnabled()) return fail("still enabled with rates set per shot off");
+            perShot->setChecked(true);
+            size->setCurrentIndex(1);
+            crf->setValue(22);
+            // (the smallest rung only, and no sound: quicker)
+            for (int i = 0; i < ladder->count(); ++i) ladder->item(i)->setCheckState(i == ladder->count() - 1 ? Qt::Checked : Qt::Unchecked);
+            sound->setCurrentIndex(sound->findData(QStringLiteral("none")));
+            whenModal<QFileDialog>(this, [chose, folder](QFileDialog* f) {
+                f->setDirectory(folder);
+                if (auto* name = f->findChild<QLineEdit*>(QStringLiteral("fileNameEdit"))) name->setText(folder);
+                *chose = true;
+                static_cast<QDialog*>(f)->accept();
+            });
+            d->accept();
+        });
+        auto* action = win_->findChild<QAction*>("exportStreaming");
+        QVERIFY(action);
+        action->trigger();
+        QVERIFY(*opened);
+        QVERIFY2(wrong->isEmpty(), qPrintable(*wrong));
+        QVERIFY(*chose);
+        QString report;
+        for (QDirIterator it(folder, {QStringLiteral("ladder.csv")}, QDir::Files, QDirIterator::Subdirectories); it.hasNext();) report = it.next();
+        QVERIFY2(!report.isEmpty(), "no ladder.csv");
+        QFile f(report);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QByteArray csv = f.readAll();
+        QVERIFY2(csv.contains("# display_size,1280x720\n") && csv.contains("# crf_floor,22.00\n"), csv.constData());
+        int rows = 0;
+        for (const QByteArray& line : csv.split('\n')) {
+            if (line.isEmpty() || line.startsWith('#') || line.startsWith("rendition,")) continue;
+            const QList<QByteArray> cells = line.split(',');
+            QVERIFY2(cells.size() > 4 && cells[4].toDouble() >= 22, line.constData());
+            ++rows;
+        }
+        QVERIFY2(rows > 0, csv.constData());
+        QDir(folder).removeRecursively();
+    }
+
     void editingFromAnotherSequence() {
         state()->newProject();
         const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg")});
@@ -21894,6 +24366,20 @@ print("added " + ui["name"])
         // ends the connection): whole nits, the minimum in 1/10000 nit, nothing unmeasured sent.
         QCOMPARE(hdrSurfaceLightArgs(full, Transfer::Pq, true), (HdrSurfaceLightArgs{50, 1000, 1000, 300}));
         QCOMPARE(hdrSurfaceLightArgs(HdrSurfaceLight(), Transfer::Pq, true), (HdrSurfaceLightArgs{50, 1000, 0, 0}));
+        // The mastering display's primaries are the sequence's: BT.2020 for BT.2100's PQ and HLG, P3-D65 for P3-D65 PQ
+        // (and for a picture that does not say), each as the protocol takes it, in millionths.
+        QCOMPARE(hdrMasteringPrimaries(*findColorSpace("rec2100pq")), Primaries::Bt2020);
+        QCOMPARE(hdrMasteringPrimaries(*findColorSpace("rec2100hlg")), Primaries::Bt2020);
+        QCOMPARE(hdrMasteringPrimaries(*findColorSpace("p3d65pq")), Primaries::P3D65);
+        QCOMPARE(hdrMasteringPrimaries(*findColorSpace("rec709")), Primaries::P3D65);
+        QCOMPARE(full.masteringPrimaries, Primaries::P3D65);
+        HdrPicture wide = pic;
+        wide.mastering = Primaries::Bt2020;
+        QCOMPARE(hdrSurfaceLight(wide, 8).masteringPrimaries, Primaries::Bt2020);
+        QVERIFY(!(hdrSurfaceLight(wide, 8) == hdrSurfaceLight(pic, 8)));  // (a surface is described again for it)
+        QCOMPARE(hdrSurfacePrimariesArgs(Primaries::Bt2020), (std::array<int32_t, 8>{708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000}));
+        QCOMPARE(hdrSurfacePrimariesArgs(Primaries::P3D65), (std::array<int32_t, 8>{680000, 320000, 265000, 690000, 150000, 60000, 312700, 329000}));
+        QCOMPARE(hdrSurfacePrimariesArgs(Primaries::SGamut3Venice), hdrSurfacePrimariesArgs(Primaries::P3D65));
         // No mastering range for the compositor: the signal's own range bounds the levels (HLG's ends at 1000).
         HdrSurfaceLight odd;
         odd.masteringMaxNits = 4000, odd.maxCll = 5000, odd.maxFall = 6000;
@@ -21942,7 +24428,9 @@ print("added " + ui["name"])
 
     void hdrViewerOnWayland() {
         // Under Weston (scripts/wayland-hdr-check.sh, in CI): headless, its GL renderer, colour management on with a
-        // BT.2100 PQ output (reference white 203 nits, peak 1000; MONTAGE_TEST_WESTON_CM=true), or off.
+        // BT.2100 PQ output (reference white 203 nits, peak 1000; MONTAGE_TEST_WESTON_CM=true), on with an SDR output
+        // (sdr), or off. The surface is described by Montage's binding of the protocol, or by Qt (6.10.2 and later,
+        // the binding switched off): then with PQ's own luminances and no mastering display, and nothing read back.
         const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
         if (log.isEmpty() || !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
             QSKIP("Runs under Weston (scripts/wayland-hdr-check.sh)");
@@ -21950,9 +24438,13 @@ print("added " + ui["name"])
         QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
 #else
         QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
-        const bool cm = qEnvironmentVariable("MONTAGE_TEST_WESTON_CM") == QLatin1String("true");
+        const QString mode = qEnvironmentVariable("MONTAGE_TEST_WESTON_CM");
+        const bool cm = mode == QLatin1String("true"), sdrOutput = mode == QLatin1String("sdr");
+        const bool throughQt = hdrViewerOnWaylandThroughQt();
+        qInfo().noquote() << "The surface is described by" << (throughQt ? "Qt" : "Montage's binding") << "(Qt" << qVersion() << ")";
         // A viewer of its own over the whole output (the kiosk shell gives it the screen), with an SDR picture to stand
-        // for the HDR one, and a PQ grey ramp from a sequence mastered at 800 nits: eight bars, eight texels each.
+        // for the HDR one, and a PQ grey ramp from a sequence mastered at 800 nits on a BT.2020 display: eight bars,
+        // eight texels each.
         win_->hide();
         auto restore = qScopeGuard([this] { win_->show(); });
         ViewerWidget viewer;
@@ -21966,6 +24458,8 @@ print("added " + ui["name"])
         ramp->width = 64, ramp->height = 8;
         ramp->contentPeak = 800.0 / 203;
         ramp->maxCll = 800, ramp->maxFall = 200;
+        ramp->mastering = hdrMasteringPrimaries(*findColorSpace("rec2100pq"));
+        QCOMPARE(ramp->mastering, Primaries::Bt2020);
         std::vector<float> texels(size_t(ramp->width) * size_t(ramp->height) * 4);
         for (int y = 0; y < ramp->height; ++y)
             for (int x = 0; x < ramp->width; ++x) {
@@ -22020,9 +24514,11 @@ print("added " + ui["name"])
             qInfo().noquote() << said;
             QVERIFY2(right, qPrintable(said));
         }
+        QElapsedTimer asked;
+        asked.start();
         viewer.setHdrViewer(true);
         viewer.setHdrPicture(ramp);
-        if (!cm) {
+        if (!cm && !sdrOutput) {
             // No colour management: SDR, and why.
             QTRY_VERIFY(!viewer.hdrStatus().isEmpty());
             QVERIFY(!viewer.hdrShowing());
@@ -22030,13 +24526,35 @@ print("added " + ui["name"])
             QCOMPARE(viewer.hdrHeadroom(), 1.0);
             return;
         }
+        if (sdrOutput && !throughQt) {
+            // Colour management, and an output that is not HDR: SDR, said at once from what Weston prefers for the
+            // viewer's window (no wait for a surface of its own to have been up a while), and why.
+            QTRY_VERIFY(!viewer.hdrStatus().isEmpty());
+            const qint64 took = asked.elapsed();
+            qInfo().noquote() << "An SDR output was told from an HDR one in" << took << "ms";
+            QVERIFY(!viewer.hdrShowing());
+            QCOMPARE(viewer.hdrStatus(), QStringLiteral("This display does not show HDR"));
+            QCOMPARE(viewer.hdrHeadroom(), 1.0);
+            QVERIFY2(took < 1500, qPrintable(QString::number(took)));
+            return;
+        }
         QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);  // (why not, if it is not)
         QVERIFY2(viewer.hdrStatus().isEmpty(), qPrintable(viewer.hdrStatus()));
         HdrSurface* surface = viewer.hdrSurface();
         QVERIFY(surface);
+        if (sdrOutput) {
+            // Described by Qt, which reads nothing back: the surface is BT.2100 PQ on an SDR output too, and Weston
+            // fits it to the output.
+            QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->describedTransfer() == Transfer::Pq,
+                                      qPrintable(viewer.hdrStatus()), 10000);
+            QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->framesDrawn() > 0, qPrintable(viewer.hdrStatus()), 10000);
+            return;
+        }
         // The output's reference white and peak, as Weston prefers them where the viewer is: known as soon as the
-        // surface is made, from the viewer's window, which is on the output already.
-        QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
+        // surface is made, from the viewer's window, which is on the output already. Qt's description asks for none:
+        // PQ's whole range over its reference white, nothing rolled off here.
+        const double headroom = throughQt ? 10000.0 / 203 : 1000.0 / 203;
+        QVERIFY2(std::fabs(viewer.hdrHeadroom() - headroom) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
         QCOMPARE(viewer.hdrSdrWhiteNits(), 203.0);
         QCOMPARE(surface->bufferBits(), 10);
         // Described with its first frame (the surface's own wl_surface is there once it is exposed), and a frame for
@@ -22055,7 +24573,10 @@ print("added " + ui["name"])
         QTest::qWait(2500);
         QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));
         QCOMPARE(viewer.hdrSurface(), surface);
-        QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
+        QVERIFY2(std::fabs(viewer.hdrHeadroom() - headroom) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
+        // (Montage's binding: whether Weston's frame callback said the surface's first frame is up, after which the
+        // surface's own answer stands whatever it is)
+        if (!throughQt) qInfo().noquote() << "The surface's first frame was reported:" << surface->waylandEntered();
         // The surface's own pixels, as they go to Weston: in each bar's middle the linear light (relative to SDR white)
         // within 1% and the ramp's PQ code (read 8 bits a channel) within 2.
         surface->keepNextFrame();
@@ -22088,16 +24609,20 @@ print("added " + ui["name"])
             QVERIFY2(right, qPrintable(said.join(QStringLiteral("; "))));
         }
         QTest::qWait(500);  // (Weston repaints)
-        // Weston's protocol log: the surface described as BT.2100 PQ (named transfer 11, primaries 6) with the master's
-        // light (800 nits from 0.005; MaxCLL 800, MaxFALL 200), and 10-bit buffers (AR30 or XR30).
+        // Weston's protocol log: the surface described as BT.2100 PQ (named transfer 11, primaries 6), and 10-bit
+        // buffers (AR30 or XR30). From Montage's binding also the master's display and light: BT.2020's primaries and
+        // D65 in millionths, 800 nits from 0.005, MaxCLL 800 and MaxFALL 200.
         auto logged = [&](const QString& what) {
             QFile f(log);
             return f.open(QIODevice::ReadOnly) && QString::fromUtf8(f.readAll()).contains(what);
         };
         for (const char* request : {"wp_image_description_creator_params_v1@", ".set_tf_named(11)", ".set_primaries_named(6)",
-                                    ".set_mastering_luminance(50, 800)", ".set_max_cll(800)", ".set_max_fall(200)",
                                     "wp_color_management_surface_v1@", ".set_image_description(wp_image_description_v1@"})
             QTRY_VERIFY2(logged(QString::fromLatin1(request)), request);
+        if (!throughQt)
+            for (const char* request : {".set_mastering_display_primaries(708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000)",
+                                        ".set_mastering_luminance(50, 800)", ".set_max_cll(800)", ".set_max_fall(200)"})
+                QTRY_VERIFY2(logged(QString::fromLatin1(request)), request);
         QFile f(log);
         QVERIFY(f.open(QIODevice::ReadOnly));
         bool tenBit = false;
@@ -23197,6 +25722,340 @@ print("added " + ui["name"])
         QVERIFY(!dlg.findChild<QPushButton*>("openLicencesFolder")->isEnabled());
     }
 
+    void recoveryHelper() {
+        // Does nothing by itself: killedRunLeavesNothingToRecover runs this binary again with this as its only test,
+        // to leave unsaved work behind when it is killed, or to say what a run after that finds to recover.
+        const QString file = qEnvironmentVariable("MONTAGE_TEST_RECOVERY_HELPER");
+        if (file.isEmpty()) return;
+        const bool look = qEnvironmentVariable("MONTAGE_TEST_RECOVERY_MODE") == QStringLiteral("look");
+        QJsonObject said{{"recovery", qEnvironmentVariable("MONTAGE_RECOVERY_DIR")}, {"folder", dir_.path()}};
+        if (look) {
+            RecoveryManager probe(state());
+            said["crashed"] = int(probe.crashedSessions().size());
+        } else {
+            // Unsaved work, and the time its recovery copy takes to be written (a second after the edit).
+            QVERIFY(state()->edit("Unsaved", [](Project& p, Sequence& s) { return edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 30)).ok; }));
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 3000) QTest::qWait(50);
+        }
+        QFile part(file + QStringLiteral(".part"));
+        QVERIFY(part.open(QIODevice::WriteOnly));
+        part.write(QJsonDocument(said).toJson());
+        part.close();
+        QVERIFY(part.rename(file));
+        if (!look)
+            for (;;) QTest::qWait(1000);  // (until the test that started it kills it)
+    }
+
+    void killedRunLeavesNothingToRecover() {
+        // The app tests keep their recovery folder inside their own temporary folder: a run killed with unsaved work
+        // leaves its session there, and the next run has nothing to recover (it would wait at Recover Unsaved Work),
+        // even when both were started with the same folder named in their environment, as ctest starts them.
+        QVERIFY(qEnvironmentVariable("MONTAGE_RECOVERY_DIR").startsWith(dir_.path()));
+        const QString sharedFolder = dir_.filePath(QStringLiteral("recovery-as-ctest-names-it"));
+        auto run = [&](const QString& mode, const QString& file) {
+            auto p = std::make_unique<QProcess>();
+            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            env.insert("MONTAGE_TEST_RECOVERY_HELPER", file);
+            env.insert("MONTAGE_TEST_RECOVERY_MODE", mode);
+            env.insert("QT_QPA_PLATFORM", "offscreen");
+            env.insert("MONTAGE_NO_PLUGIN_SCAN", "1");
+            env.insert("MONTAGE_NO_RECOVERY_PROMPT", "1");
+            env.insert("MONTAGE_RECOVERY_DIR", sharedFolder);
+            p->setProcessEnvironment(env);
+            p->setProcessChannelMode(QProcess::MergedChannels);
+            p->start(QCoreApplication::applicationFilePath(), {"recoveryHelper"});
+            return p;
+        };
+        auto answer = [&](const QString& file, QProcess& p, QJsonObject& out) {
+            QElapsedTimer t;
+            t.start();
+            while (!QFileInfo::exists(file) && t.elapsed() < 120000 && p.state() != QProcess::NotRunning) QTest::qWait(50);
+            QFile f(file);
+            if (!f.open(QIODevice::ReadOnly)) return false;
+            out = QJsonDocument::fromJson(f.readAll()).object();
+            return !out.isEmpty();
+        };
+        // A run with unsaved work, killed.
+        const QString firstFile = dir_.filePath(QStringLiteral("recovery-helper-1.json"));
+        auto first = run(QStringLiteral("leave"), firstFile);
+        QJsonObject left;
+        QVERIFY2(answer(firstFile, *first, left), first->readAll().constData());
+        first->kill();
+        QVERIFY(first->waitForFinished(10000));
+        const QString itsFolder = left.value("folder").toString(), itsRecovery = left.value("recovery").toString();
+        QVERIFY(!itsFolder.isEmpty() && itsRecovery.startsWith(itsFolder) && itsFolder != dir_.path());
+        // The run after it finds nothing.
+        const QString secondFile = dir_.filePath(QStringLiteral("recovery-helper-2.json"));
+        auto second = run(QStringLiteral("look"), secondFile);
+        QJsonObject found;
+        QVERIFY2(answer(secondFile, *second, found), second->readAll().constData());
+        QVERIFY(second->waitForFinished(60000));
+        QCOMPARE(found.value("crashed").toInt(-1), 0);
+        QVERIFY(found.value("recovery").toString() != itsRecovery);
+        // The killed run did leave its unsaved work, in its own folder (which is cleared away here).
+        {
+            RecoveryManager probe(state(), itsRecovery);
+            const auto crashed = probe.crashedSessions();
+            QCOMPARE(crashed.size(), size_t(1));
+            QVERIFY(!crashed[0].recoveryFile.isEmpty());
+        }
+        QVERIFY(!QDir(sharedFolder + QStringLiteral("/sessions")).exists() ||
+                QDir(sharedFolder + QStringLiteral("/sessions")).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty());
+        QVERIFY(QDir(itsFolder).removeRecursively());
+    }
+
+    void effectPointedAtIsPreviewed() {
+        // An effect pointed at in the Effects panel is shown on the Program monitor as it would look on the selected
+        // clip: the same picture, to 1/255, as when the effect is added, and the project is not touched (no undo step,
+        // nothing to save).
+        loadDemo();
+        PlaybackController* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp->controller();
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        QVERIFY(program && browser);
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->setSelection({red}, false);
+        QImage shown;
+        FrameTime shownAt = -1;
+        int frames = 0;
+        QObject listener;
+        connect(program, &PlaybackController::frameRendered, &listener, [&](const QImage& img, FrameTime t) {
+            shown = img;
+            shownAt = t;
+            ++frames;
+        });
+        // The picture once what was asked for has been drawn: a frame has come since, and none for 400 ms after it.
+        auto settled = [&](int since) {
+            QElapsedTimer total, quiet;
+            total.start();
+            quiet.start();
+            int seen = frames;
+            while (total.elapsed() < 30000) {
+                QTest::qWait(20);
+                if (frames != seen) {
+                    seen = frames;
+                    quiet.restart();
+                } else if (frames > since && quiet.elapsed() >= 400) {
+                    break;
+                }
+            }
+            return shown.convertToFormat(QImage::Format_RGBA8888);
+        };
+        auto furthest = [](const QImage& a, const QImage& b) {
+            if (a.size() != b.size() || a.isNull()) return 256;
+            int most = 0;
+            for (int y = 0; y < a.height(); ++y) {
+                const uchar *pa = a.constScanLine(y), *pb = b.constScanLine(y);
+                for (int x = 0; x < a.width() * 4; ++x) most = std::max(most, std::abs(int(pa[x]) - int(pb[x])));
+            }
+            return most;
+        };
+        int since = frames;
+        state()->setPlayhead(20);
+        program->requestFrame();
+        const QImage plain = settled(since);
+        QVERIFY(!plain.isNull());
+        QCOMPARE(shownAt, FrameTime(20));
+
+        const size_t undos = state()->history().undoCount();
+        const bool modified = state()->isModified();
+        const Project before = state()->project();
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("invert")));
+        QVERIFY(program->hasPicturePreview());
+        const QImage previewed = settled(since);
+        QVERIFY2(furthest(previewed, plain) > 100, qPrintable(QString::number(furthest(previewed, plain))));
+        QCOMPARE(shownAt, FrameTime(20));
+        QCOMPARE(state()->history().undoCount(), undos);
+        QCOMPARE(state()->isModified(), modified);
+        QVERIFY(state()->project() == before);
+        // Pointing at another shows that one; an audio effect or a folder shows the frame as it is.
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("gaussian_blur")));
+        QVERIFY(program->hasPicturePreview());
+        QVERIFY(furthest(settled(since), previewed) > 100);
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("compressor")));
+        QVERIFY(!program->hasPicturePreview());
+        QCOMPARE(furthest(settled(since), plain), 0);
+        // The pointer back on it, then off the list: the frame as it was.
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("invert")));
+        QCOMPARE(furthest(settled(since), previewed), 0);
+        since = frames;
+        QVERIFY(browser->pointAt(QString()));
+        QVERIFY(!program->hasPicturePreview());
+        QCOMPARE(furthest(settled(since), plain), 0);
+        QCOMPARE(state()->history().undoCount(), undos);
+        QVERIFY(state()->project() == before);
+
+        // The effect added for real draws what the preview showed.
+        since = frames;
+        emit browser->applyRequested(QStringLiteral("invert"), EffectCategory::VideoFilter);
+        QCOMPARE(state()->history().undoCount(), undos + 1);
+        const QImage added = settled(since);
+        QVERIFY2(furthest(added, previewed) <= 1, qPrintable(QString::number(furthest(added, previewed))));
+        state()->undo();
+        since = frames;
+        program->requestFrame();
+        QCOMPARE(furthest(settled(since), plain), 0);
+
+        // A saved preset is previewed the same way.
+        EffectPreset preset;
+        preset.name = "Preview Negative";
+        Effect negative;
+        negative.id = 1;
+        negative.type = "invert";
+        preset.effects = {negative};
+        const QString file = presets::save(preset);
+        QVERIFY(!file.isEmpty());
+        browser->reload();
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("preset:") + file));
+        QVERIFY(program->hasPicturePreview());
+        QVERIFY(furthest(settled(since), previewed) <= 1);
+        QVERIFY(browser->pointAt(QString()));
+
+        // With the playhead off the selected clip, the clip's middle frame is shown, and the playhead's again after.
+        since = frames;
+        state()->setPlayhead(90);
+        program->requestFrame();
+        settled(since);
+        QCOMPARE(shownAt, FrameTime(90));
+        const Clip* c = edit::clipById(*state()->sequence(), red);
+        const FrameTime middle = c->start + c->duration / 2;
+        since = frames;
+        QVERIFY(browser->pointAt(QStringLiteral("invert")));
+        settled(since);
+        QCOMPARE(shownAt, middle);
+        QCOMPARE(state()->playhead(), FrameTime(90));
+        since = frames;
+        QVERIFY(browser->pointAt(QString()));
+        settled(since);
+        QCOMPARE(shownAt, FrameTime(90));
+        // With no clip selected nothing is previewed.
+        state()->setSelection({}, false);
+        QVERIFY(browser->pointAt(QStringLiteral("invert")));
+        QVERIFY(!program->hasPicturePreview());
+        QVERIFY(browser->pointAt(QString()));
+        QCOMPARE(state()->history().undoCount(), undos);
+        QVERIFY(presets::remove(file));
+        browser->reload();
+    }
+
+    void findCommandListsAndRuns() {
+        // Help › Find Command lists the menus' commands, the effects and the saved presets by name, runs the one chosen
+        // and lists what was run last first.
+        loadDemo();
+        CommandFinder::forgetRecent();
+        QAction* show = win_->findChild<QAction*>("findCommand");
+        QAction* nestAction = win_->findChild<QAction*>("nestInToOut");
+        QVERIFY(show && nestAction);
+        const QString nest = keymap::idOf(nestAction);
+        QVERIFY(!nest.isEmpty());
+        QVERIFY(state()->edit("Marks", [](Project&, Sequence& sq) {
+            sq.inPoint = 30;
+            sq.outPoint = 89;
+            return true;
+        }));
+        state()->setSelection({}, false);
+
+        // "nest" lists Nest In to Out, after the command whose name is nearer what was typed.
+        show->trigger();
+        QPointer<CommandFinder> finder = win_->findChild<CommandFinder*>("commandFinder");
+        QVERIFY(finder && finder->isVisible());
+        auto* text = finder->findChild<QLineEdit*>("commandFinderText");
+        QVERIFY(text);
+        QTRY_VERIFY(text->hasFocus());  // (once its window is the active one)
+        QTest::keyClicks(text, QStringLiteral("nest"));
+        QStringList listed = finder->listed();
+        QVERIFY(listed.contains(nest));
+        QVERIFY(listed.indexOf(nest) > 0);
+        for (const QString& id : listed) QVERIFY2(id.contains(QStringLiteral("nest"), Qt::CaseInsensitive), qPrintable(id));
+        // Down to it and Return: the command runs as from its menu (its own dialog asks for the name).
+        for (int i = 0; i < listed.indexOf(nest); ++i) QTest::keyClick(text, Qt::Key_Down);
+        QCOMPARE(finder->chosen(), nest);
+        const size_t undos = state()->history().undoCount();
+        // (the finder is hidden while the command's own dialog asks, and still there: closed, it is deleted, and it
+        // would be under the Return being handled)
+        bool finderWhileAsked = false;
+        whenModal<QInputDialog>(this, [&finder, &finderWhileAsked](QInputDialog* d) {
+            finderWhileAsked = finder && !finder->isVisible();
+            d->setTextValue(QStringLiteral("Found"));
+            d->accept();
+        });
+        QTest::keyClick(text, Qt::Key_Return);
+        QVERIFY(finderWhileAsked);
+        QCOMPARE(state()->history().undoCount(), undos + 1);
+        const Track& v1 = state()->sequence()->videoTracks[0];
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(QString::fromStdString(state()->project().findMedia(v1.clips[1].mediaId)->name), QStringLiteral("Found"));
+        QCOMPARE(v1.clips[1].duration, FrameTime(60));
+        state()->undo();
+        QTRY_VERIFY(!finder);  // closed and gone once it has run
+
+        // The next time it is first, and what was not run keeps its place after it.
+        QCOMPARE(CommandFinder::recent(), QStringList{nest});
+        show->trigger();
+        finder = win_->findChild<CommandFinder*>("commandFinder");
+        QVERIFY(finder);
+        finder->setText(QStringLiteral("nest"));
+        QStringList again = finder->listed(), rest = listed;
+        QCOMPARE(again.removeAll(QStringLiteral("Edit/Redo")), 1);  // (Redo is found too now: it names the nest undone)
+        rest.removeAll(nest);
+        QCOMPARE(again.value(0), nest);
+        QCOMPARE(again.mid(1), rest);
+        QCOMPARE(finder->chosen(), nest);
+        // With nothing typed too.
+        finder->setText(QString());
+        QCOMPARE(finder->listed().value(0), nest);
+        QVERIFY(finder->listed().size() > 200);
+
+        // An effect is found by its name or its group and applied to the selected clip, as from the Effects panel.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->setSelection({red}, false);
+        QCOMPARE(finder->find(QStringLiteral("gaussian bl")).value(0), QStringLiteral("effect:gaussian_blur"));
+        QVERIFY(finder->find(QStringLiteral("sharpen")).contains(QStringLiteral("effect:gaussian_blur")));  // (its group: Blur & Sharpen)
+        const size_t had = edit::clipById(*state()->sequence(), red)->effects.size();
+        QVERIFY(finder->run(QStringLiteral("effect:gaussian_blur")));
+        const Clip* c = edit::clipById(*state()->sequence(), red);
+        QCOMPARE(c->effects.size(), had + 1);
+        QCOMPARE(c->effects.back().type, std::string("gaussian_blur"));
+        QCOMPARE(CommandFinder::recent(), (QStringList{QStringLiteral("effect:gaussian_blur"), nest}));
+        state()->undo();
+        // A command that cannot be used now is listed greyed and does not run; one that is not there is refused.
+        QVERIFY(!finder->run(QStringLiteral("Clip/No Such Command")));
+        finder->reject();
+        QTRY_VERIFY(!finder);
+
+        // A preset saved on this computer is listed by its name and applied.
+        EffectPreset preset;
+        preset.name = "Finder Soft Glow";
+        Effect blur;
+        blur.id = 1;
+        blur.type = "gaussian_blur";
+        preset.effects = {blur, blur};
+        const QString file = presets::save(preset);
+        QVERIFY(!file.isEmpty());
+        show->trigger();
+        finder = win_->findChild<CommandFinder*>("commandFinder");
+        QVERIFY(finder);
+        const QStringList glow = finder->find(QStringLiteral("soft glow"));
+        QCOMPARE(glow.size(), 1);
+        QVERIFY(glow[0].startsWith(QStringLiteral("preset:")));
+        state()->setSelection({red}, false);
+        QVERIFY(finder->run(glow[0]));
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->effects.size(), had + 2);
+        state()->undo();
+        finder->reject();
+        QTRY_VERIFY(!finder);
+        QVERIFY(presets::remove(file));
+        CommandFinder::forgetRecent();
+    }
+
     void playbackAdvances() {
         loadDemo();
         auto controllers = win_->findChildren<PlaybackController*>();
@@ -23871,6 +26730,24 @@ print("added " + ui["name"])
         QCOMPARE(turn->text(), QStringLiteral("turn:relay.example.com:34780"));
         QVERIFY(user->text().isEmpty() && password->text().isEmpty() && secret->text().isEmpty());
         QTest::keyClick(turn, Qt::Key_Backspace);
+        // A secret typed while no relay is named is the relay's that is entered next: typing another relay in that
+        // one's place clears it as well.
+        turn->selectAll();
+        QTest::keyClick(turn, Qt::Key_Delete);
+        QVERIFY(turn->text().isEmpty());
+        QTest::keyClicks(secret, QStringLiteral("typed before the relay"));
+        QTest::keyClicks(turn, QStringLiteral("turn:first.example.com:3478"));
+        QCOMPARE(secret->text(), QStringLiteral("typed before the relay"));
+        emit turn->editingFinished();
+        QTest::keyClicks(turn, QStringLiteral("9"));
+        QVERIFY2(secret->text().isEmpty(), "the first relay's secret was kept for another");
+        // The relay's certificate can be pinned only for a relay reached over TLS.
+        auto* pin = dlg->findChild<QLineEdit*>("reviewStreamTurnPin");
+        QVERIFY(pin && pin->isVisibleTo(dlg) && !pin->isEnabled());
+        turn->setText(QStringLiteral("turns:relay.example.com:5349"));
+        QVERIFY(pin->isEnabled());
+        turn->setText(QStringLiteral("turn:relay.example.com:3478"));
+        QVERIFY(!pin->isEnabled());
         user->setText(QStringLiteral("ana"));
         password->setText(QStringLiteral("relay-secret"));
         secret->clear();

@@ -477,14 +477,14 @@ void Monitor::reset() {
 }
 
 void Monitor::render(int64_t start, int frames, float* out, float* heard, std::vector<MeterLevels>* tracks, const AdrCycle* cycle,
-                     bool program) {
+                     bool program, bool live) {
     if (frames <= 0) return;
     const bool pair = !seq_ || layout_ == "stereo" || layout_ == "binaural";
     const int nin = pair ? 2 : layoutChannels(layout_);
     full_.resize(size_t(frames) * size_t(nin));
     stereo_.resize(size_t(frames) * 2);
     // Stopped, or calibrating: no programme (the mixers start afresh when it comes back).
-    if (!project_ || !seq_ || !program || section_.calibration() >= 0) {
+    if (!project_ || !seq_ || (!program && !live) || section_.calibration() >= 0) {
         std::fill(full_.begin(), full_.end(), 0.0f);
         std::fill(stereo_.begin(), stereo_.end(), 0.0f);
         section_.process(pair ? "stereo" : layout_, full_.data(), nullptr, frames, out);
@@ -493,10 +493,12 @@ void Monitor::render(int64_t start, int frames, float* out, float* heard, std::v
         return;
     }
     if (pair) {
-        program_.mix(*project_, *seq_, start, frames, full_.data(), tracks);
+        if (program) program_.mix(*project_, *seq_, start, frames, full_.data(), tracks);
+        else program_.mixLive(*project_, *seq_, start, frames, full_.data());  // (stopped: only what is played live)
         std::copy(full_.begin(), full_.end(), stereo_.begin());
     } else {
-        program_.mixLayout(*project_, *seq_, start, frames, full_.data(), tracks);
+        if (program) program_.mixLayout(*project_, *seq_, start, frames, full_.data(), tracks);
+        else program_.mixLive(*project_, *seq_, start, frames, full_.data(), true);
         downmixToStereo(layout_, full_.data(), frames, stereo_.data(), seq_->downmixCentreDb, seq_->downmixSurroundDb);  // (the sequence's levels)
     }
     const float* beeps = nullptr;
@@ -508,7 +510,7 @@ void Monitor::render(int64_t start, int frames, float* out, float* heard, std::v
     section_.process(layout_, full_.data(), beeps, frames, out);
     if (section_.settings().cue.on) {
         const float* guide = nullptr;
-        if (!section_.settings().cue.tracks.empty()) {
+        if (program && !section_.settings().cue.tracks.empty()) {
             guide_.resize(size_t(frames) * 2);
             cue_.mix(*project_, *cueSeq_, start, frames, guide_.data());
             guide = guide_.data();

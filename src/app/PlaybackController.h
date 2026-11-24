@@ -9,6 +9,7 @@
 #include <QTimer>
 #include <QVector>
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +50,11 @@ public:
     // sequence to play (by id). Cheap enough to call on every edit.
     void setProject(const Project& p, Id sequenceId);
     std::shared_ptr<const Project> snapshot() const { return project_; }
+    // A project to draw the paused picture from in place of the snapshot (an effect tried on a clip from the Effects
+    // panel), at frame `at` when that is not negative, else at the playhead. Nothing else reads it: the sound, the
+    // outputs and the project stay as they are. It ends when cleared (null), on a new snapshot, a seek or playback.
+    void setPicturePreview(std::shared_ptr<const Project> p, montage::FrameTime at = -1);
+    bool hasPicturePreview() const { return bool(picturePreview_); }
     const Sequence* sequence() const;
 
     // Preview resolution as a fraction of the sequence size (1, 1/2, 1/4...).
@@ -197,11 +203,16 @@ signals:
     void audioAnalysis(montage::AudioAnalysisPtr analysis);
     void playingChanged(bool playing);
     void monitoringChanged();
+    // The audio device chosen in Monitoring went away (unplugged, its server stopped): `why`, and what sound goes
+    // through now (the device standing in for it as the system names it, "" for the system's own output).
+    void audioDeviceLost(const QString& why, const QString& now);
 
 private slots:
     void tick();
 
 private:
+    void deviceLost(const QString& why);  // (told by the audio engine, on this object's thread)
+    int lostListener_ = -1;
     void startAudio(FrameTime from, bool idle = false);
     void stopAudio(bool force = false);  // (not forced, an idle sink stays for calibration or talkback)
     // The sink as playback and the monitoring section need it: the programme at normal speed, else idle for
@@ -224,6 +235,8 @@ private:
     double renderScale() const;
 
     std::shared_ptr<const Project> project_;
+    std::shared_ptr<const Project> picturePreview_;  // (see setPicturePreview)
+    FrameTime picturePreviewAt_ = -1;
     std::shared_ptr<const Project> heard_;  // project_, or a copy with mutedTracks_ muted and liveMix_ laid over
     std::vector<int> mutedTracks_;
     std::function<void(Sequence&)> liveMix_, audition_;
@@ -261,6 +274,7 @@ private:
     bool scrubNoOutput_ = false, scrubTriedDevice_ = false;
     int scrubTriedRate_ = 0;
     QElapsedTimer scrubRetry_;  // since scrubbing's output was last opened, or the device chosen last asked for
+    std::shared_ptr<std::atomic<bool>> scrubProbing_ = std::make_shared<std::atomic<bool>>(false);  // (the device asked for, off this thread)
     AudioMixer scrubMixer_;
     bool globalMute_ = false;
     bool ambisonicBinaural_ = true;

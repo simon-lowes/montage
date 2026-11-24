@@ -7,7 +7,11 @@
  *   overrun  writes far past the end of the buffer it was given
  *   leak     takes 64 MB more memory each call (touched, never given back)
  *   slow     takes 0.4 s, then goes on as usual
- * The tests set it only while a plug-in host starts, so it reaches the host and never the test's own process. */
+ * The tests set it only while a plug-in host starts, so it reaches the host and never the test's own process.
+ *
+ * "fail" is apart from those (montage_test_fault_fails, for plug-ins that define MONTAGE_TEST_FAULT_FAILS before this
+ * header): the named call returns its failure status and harms nothing, so a test may also set it for a plug-in in
+ * its own process. */
 #ifndef MONTAGE_TEST_FAULT_H
 #define MONTAGE_TEST_FAULT_H
 
@@ -80,5 +84,28 @@ static void montage_test_fault(const char* call, float* buf, size_t n) {
         montage_test_fault_leaked = m;
     }
 }
+
+#ifdef MONTAGE_TEST_FAULT_FAILS
+/* Whether `call` is asked to fail now: MONTAGE_TEST_PLUGIN_FAULT="fail:<call>[:<after>[:<times>]]", failing after
+ * <after> good calls (counted from when the setting last changed), <times> times (for good when left out). */
+static int montage_test_fault_fails(const char* call) {
+    static int calls;
+    static char seen[64];
+    const char* spec = getenv("MONTAGE_TEST_PLUGIN_FAULT");
+    if (!spec || strncmp(spec, "fail:", 5) != 0) return 0;
+    if (strncmp(seen, spec, sizeof seen - 1) != 0) {
+        strncpy(seen, spec, sizeof seen - 1);
+        calls = 0;
+    }
+    const char* which = spec + 5;
+    const char* c2 = strchr(which, ':');
+    const size_t wl = c2 ? (size_t)(c2 - which) : strlen(which);
+    if (strlen(call) != wl || strncmp(which, call, wl) != 0) return 0;
+    const int after = c2 ? atoi(c2 + 1) : 0;
+    const char* c3 = c2 ? strchr(c2 + 1, ':') : NULL;
+    const int n = calls++;
+    return n >= after && (!c3 || n < after + atoi(c3 + 1));
+}
+#endif
 
 #endif

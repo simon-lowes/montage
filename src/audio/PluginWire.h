@@ -16,7 +16,7 @@
 namespace montage::plugins::wire {
 
 constexpr uint32_t kMagic = 0x3148504d;  // "MPH1"
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 constexpr int kMaxChannels = 32;
 constexpr int kMaxFrames = 8192;
 constexpr int kMaxParamChanges = 1024;
@@ -157,7 +157,19 @@ struct Header {
     // (control channel) The plug-in the host is loading now ("" between loads), written before each load: when the
     // host ends during a load, that plug-in alone is blamed, whatever else the host held.
     char loading[256];
+    // The whole id's length and hash (loadingHash below): an id longer than the field is still told from every other,
+    // and named whole by Montage, which knows the ids it asked this host to load.
+    uint32_t loadingBytes;
+    uint32_t pad3;
+    uint64_t loadingHash;
 };
+
+// FNV-1a over an id's bytes (Header::loadingHash).
+inline uint64_t idHash(const char* data, size_t size) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < size; ++i) h = (h ^ uint8_t(data[i])) * 1099511628211ull;
+    return h;
+}
 
 constexpr size_t alignUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
 constexpr size_t kPayloadOffset = alignUp(sizeof(Header), 4096);

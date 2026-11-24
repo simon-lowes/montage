@@ -14,6 +14,7 @@
 #include <QTextLayout>
 #include <QTransform>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -214,14 +215,35 @@ LineLayout layoutLine(const QString& text, int start, const std::vector<CharStyl
     return out;
 }
 
+// A frame's layouts, kept while one frame of a title is drawn at several times through the shutter (letter motion
+// blur): the text is laid out once for the frame, and again only if its lines or its letters' styles differ at one of
+// those times. One for each thread, inside renderTitle only.
+struct FrameLayouts {
+    struct Kept {
+        QStringList lines;
+        std::vector<CharStyle> styles, bases;
+        std::vector<LineLayout> out;
+    };
+    std::vector<Kept> kept;
+};
+thread_local FrameLayouts* tFrameLayouts = nullptr;
+std::atomic<long> gTitleLayouts{0};
+
 std::vector<LineLayout> layoutText(const QStringList& lines, const std::vector<CharStyle>& styles, const Effect& g, double t,
                                    double px, double defaultSize) {
+    std::vector<CharStyle> bases;
+    for (int i = 0; i < lines.size(); ++i) bases.push_back(baseStyle(g, t, px, defaultSize, i));
+    if (tFrameLayouts)
+        for (const FrameLayouts::Kept& k : tFrameLayouts->kept)
+            if (k.lines == lines && k.styles == styles && k.bases == bases) return k.out;
     std::vector<LineLayout> out;
     int start = 0;
     for (int i = 0; i < lines.size(); ++i) {
-        out.push_back(layoutLine(lines[i], start, styles, baseStyle(g, t, px, defaultSize, i)));
+        out.push_back(layoutLine(lines[i], start, styles, bases[size_t(i)]));
         start += int(lines[i].size()) + 1;
     }
+    ++gTitleLayouts;
+    if (tFrameLayouts && tFrameLayouts->kept.size() < 8) tFrameLayouts->kept.push_back({lines, styles, bases, out});
     return out;
 }
 
@@ -807,6 +829,10 @@ struct TitleScene {
 
 bool titleIsStyledAt(const Effect& g, double t);
 
+// A plain title animated by letter or word: the longest line whose units are each placed by measuring the line from
+// its start (see buildTitle). Longer lines are rare, and placing their letters that way costs the letters squared.
+constexpr int kLineMeasuredFromItsStart = 1000;
+
 TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& pathFn,
                       const TitleLayerFn& layerFn) {
     TitleScene sc0;
@@ -1087,6 +1113,23 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     chunk[q] = chunks;
                     pen.rx() += adv[q];
                 }
+            // textLength: the letters take that length from the first one's start, by the same gap more (or less)
+            // after each letter, or, with their glyphs adjusted too, by stretching letters and gaps alike.
+            double stretch = 1;
+            if (svg->textLength > 0 && n > 0) {
+                double a = 1e300, b = -1e300;
+                for (int q = 0; q < n; ++q) a = std::min(a, pos[size_t(q)].x()), b = std::max(b, pos[size_t(q)].x() + adv[size_t(q)]);
+                const double natural = b - a;
+                if (svg->adjustGlyphs) {
+                    if (natural > 1e-9) {
+                        stretch = std::clamp(svg->textLength / natural, 1e-3, 1e3);
+                        for (int q = 0; q < n; ++q) pos[size_t(q)].rx() = a + (pos[size_t(q)].x() - a) * stretch, adv[size_t(q)] *= stretch;
+                    }
+                } else if (n > 1) {
+                    const double gap = (svg->textLength - natural) / (n - 1);
+                    for (int q = 0; q < n; ++q) pos[size_t(q)].rx() += q * gap;
+                }
+            }
             if (svg->anchor != 0) {
                 // (each chunk's extent in one pass over the letters: every letter can be a chunk of its own)
                 std::vector<double> lo(size_t(chunks) + 1, 1e300), hi(size_t(chunks) + 1, -1e300);
@@ -1109,7 +1152,8 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     // The glyph at the text's size, turned about its origin (its baseline's start).
                     QTransform turn;
                     turn.rotate(r);
-                    const QTransform own = QTransform::fromTranslate(-cl.x0, 0) * QTransform::fromScale(1 / k, 1 / k) * turn;
+                    const QTransform own = QTransform::fromTranslate(-cl.x0, 0) * QTransform::fromScale(stretch / k, 1 / k) * turn;
+                    const double y = pos[q].y() + svg->down;
                     if (alongPath) {
                         // Its middle at its distance along the path, turned to the path there, dy across it; off the
                         // ends of an open path it is not drawn.
@@ -1120,12 +1164,14 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                         }
                         QPointF pt;
                         double ang = 0;
-                        along.at(mid, pt, ang);
+                        // (side="right": along the path taken backwards, from its end)
+                        along.at(svg->pathRight ? along.length() - mid : mid, pt, ang);
+                        if (svg->pathRight) ang += M_PI;
                         QTransform onIt;
                         onIt.rotateRadians(ang);
-                        svgPlace[q] = own * QTransform::fromTranslate(-adv[q] / 2, pos[q].y()) * onIt * QTransform::fromTranslate(pt.x(), pt.y()) * textTo;
+                        svgPlace[q] = own * QTransform::fromTranslate(-adv[q] / 2, y) * onIt * QTransform::fromTranslate(pt.x(), pt.y()) * textTo;
                     } else {
-                        svgPlace[q] = own * QTransform::fromTranslate(pos[q].x(), pos[q].y()) * textTo;
+                        svgPlace[q] = own * QTransform::fromTranslate(pos[q].x(), y) * textTo;
                     }
                 }
         }
@@ -1270,14 +1316,33 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
         plain();
     } else {
         bool settled = true;  // every unit in place: drawn as the plain title is, kerned across the units
+        // How far along its line a unit starts: the advance of the line's text before it. In a line of up to
+        // kLineMeasuredFromItsStart characters that text is measured whole for each unit, as it always was. In a
+        // longer line (where that is the letters squared) each stretch from one unit's start to the next is measured
+        // once, with the character after it so that the kerning across the join is counted, and added to the last:
+        // the unit starts where the whole line, laid out at once, has it.
+        const QFontMetricsF fmMain(f), fmSub(fs);
+        int atLine = -1, atFrom = 0;
+        double atX = 0;
+        auto startOf = [&](const Unit& un, const QFontMetricsF& fm) {
+            const QString& ln = lines[un.line];
+            if (ln.size() <= kLineMeasuredFromItsStart) return fm.horizontalAdvance(ln.left(un.from));
+            if (un.line != atLine || un.from < atFrom) atLine = un.line, atFrom = 0, atX = 0;
+            if (un.from > atFrom) {
+                const QString next = ln.mid(un.from, ln.at(un.from).isHighSurrogate() ? 2 : 1);
+                atX += fm.horizontalAdvance(ln.mid(atFrom, un.from - atFrom) + next) - fm.horizontalAdvance(next);
+            }
+            atFrom = un.from;
+            return atX;
+        };
         for (int u = 0; u < n; ++u) {
             const Unit& un = units[size_t(u)];
             const int typedHere = budget - lineStart[size_t(un.line)] - un.from;
             if (typedHere <= 0) continue;  // not typed on yet
             QString shown = lines[un.line].mid(un.from, std::min(un.len, typedHere));
             const QFont& font = fontOfLine(un.line);
-            const QFontMetricsF fm(font);
-            const double x0 = lineX(un.line) + fm.horizontalAdvance(lines[un.line].left(un.from));
+            const QFontMetricsF& fm = un.line > 0 && sub ? fmSub : fmMain;
+            const double x0 = lineX(un.line) + startOf(un, fm);
             const double y = top + tops[size_t(un.line)] + ascents[size_t(un.line)];
             const double uw = fm.horizontalAdvance(shown), uh = heights[size_t(un.line)];
             const double pr = unitProgress(u);
@@ -1603,7 +1668,13 @@ std::string svgTextLayoutJson(const SvgTextLayout& l) {
         o["pm"] = matrix(l.pathMatrix);
         o["start"] = l.start;
         if (l.startPercent) o["start_pct"] = true;
+        if (l.pathRight) o["right"] = true;
     }
+    if (l.textLength > 0) {
+        o["length"] = l.textLength;
+        if (l.adjustGlyphs) o["glyphs"] = true;
+    }
+    if (l.down != 0) o["down"] = l.down;
     if (l.atX != 0 || l.atY != 0) o["at"] = QJsonArray{l.atX, l.atY};
     return QJsonDocument(o).toJson(QJsonDocument::Compact).toStdString();
 }
@@ -1646,6 +1717,10 @@ std::optional<SvgTextLayout> parseSvgTextLayout(const std::string& json) {
     matrix(o.value("pm"), l.pathMatrix);
     l.start = finite(o.value("start").toDouble());
     l.startPercent = o.value("start_pct").toBool();
+    l.pathRight = o.value("right").toBool();
+    l.textLength = std::max(0.0, finite(o.value("length").toDouble()));
+    l.adjustGlyphs = o.value("glyphs").toBool();
+    l.down = finite(o.value("down").toDouble());
     const QJsonArray at = o.value("at").toArray();
     if (at.size() == 2) l.atX = finite(at[0].toDouble()), l.atY = finite(at[1].toDouble());
     return l;
@@ -1775,11 +1850,20 @@ Image drawScene(const Effect& g, double t, const TitleScene& s, int w, int h, do
 
 }  // namespace
 
+long titleLayoutsMade() { return gTitleLayouts.load(); }
+
 Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path,
                   const TitleLayerFn& layer) {
     const double shutter = std::clamp(g.p("letter_shutter", t, 180), 0.0, 720.0) / 360.0;
     const int n = std::clamp(int(std::lround(g.p("letter_samples", t, 16))), 2, 64);
     if (g.p("letter_blur", t) <= 0.5 || shutter <= 0) return renderTitleAt(g, double(t), w, h, scale, duration, fps, path, layer);
+    // (the frame's text laid out once for all its times: see FrameLayouts)
+    FrameLayouts layouts;
+    struct Scope {
+        FrameLayouts* was;
+        explicit Scope(FrameLayouts* now) : was(tFrameLayouts) { tFrameLayouts = now; }
+        ~Scope() { tFrameLayouts = was; }
+    } scope(&layouts);
     // The times through the shutter, centred on the frame; a title that draws the same at the first, middle and last
     // of them is drawn once.
     std::vector<double> times;

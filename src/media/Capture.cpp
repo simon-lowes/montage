@@ -17,8 +17,10 @@
 #include <QFile>
 
 #include "render/ColorSpace.h"
+#include "render/BroadcastMxf.h"
 #include "render/St2110Receive.h"
 #include "JpegXs.h"
+#include "WhipEndpoint.h"
 
 #ifdef MONTAGE_WITH_OMT
 #include "Omt.h"
@@ -320,6 +322,17 @@ struct Input {
     st2110::VideoFormat st2110Video;
     bool st2110Full = false;
     int st2110Channels = 0;
+    // A WHIP endpoint's feed (media/WhipEndpoint.h): the endpoint, and what FFmpeg's RTP reader takes it through (the
+    // endpoint's description first, then its packets, by custom I/O). The endpoint outlives the reader.
+    std::unique_ptr<whip::Endpoint> whip;
+    struct WhipIo {
+        whip::Endpoint* endpoint = nullptr;
+        Interrupt* irq = nullptr;
+        std::string sdp;
+        size_t at = 0;
+    } whipIo;
+    AVIOContext* whipSdp = nullptr;
+    AVIOContext* whipPackets = nullptr;
     bool live() const {
 #ifdef MONTAGE_WITH_OMT
         if (omt) return true;
@@ -332,6 +345,11 @@ struct Input {
         avcodec_free_context(&audio);
         for (Extra& e : extras) avcodec_free_context(&e.dec);
         if (fmt) avformat_close_input(&fmt);
+        for (AVIOContext** io : {&whipSdp, &whipPackets})
+            if (*io) {
+                av_freep(&(*io)->buffer);
+                avio_context_free(io);
+            }
     }
 };
 
@@ -453,6 +471,93 @@ bool openSt2110(Recorder::State* s, const CaptureSource& src, bool wantVideo, bo
     return true;
 }
 
+int whipSdpRead(void* opaque, uint8_t* buf, int size) {
+    auto* io = static_cast<Input::WhipIo*>(opaque);
+    const size_t n = std::min(size_t(std::max(0, size)), io->sdp.size() - io->at);
+    if (n == 0) return AVERROR_EOF;
+    std::memcpy(buf, io->sdp.data() + io->at, n);
+    io->at += n;
+    return int(n);
+}
+
+// (each read one whole RTP packet, waited for until the recording stops or its reader's patience runs out)
+int whipPacketRead(void* opaque, uint8_t* buf, int size) {
+    auto* io = static_cast<Input::WhipIo*>(opaque);
+    for (;;) {
+        if (interrupted(io->irq)) return AVERROR_EXIT;
+        const int n = io->endpoint->read(buf, size, 100);
+        if (n > 0) return n;
+        if (n < 0) return AVERROR_EOF;
+    }
+}
+
+// (the RTP reader's own reports to the sender: libdatachannel's session answers the sender, so these go nowhere)
+#if LIBAVFORMAT_VERSION_MAJOR < 61
+int whipWrite(void*, uint8_t*, int size) { return size; }
+#else
+int whipWrite(void*, const uint8_t*, int size) { return size; }
+#endif
+
+// Listens as a WHIP endpoint and waits for a sender's pictures (until the recording is stopped, or for the "wait"
+// option's seconds), then opens FFmpeg's RTP reader on them. The endpoint's own options (token, certificate, key,
+// ice) are not FFmpeg's.
+bool openWhip(Recorder::State* s, int index, const CaptureSource& src, bool wantVideo, Input& in, std::string* error) {
+    whip::Settings ws;
+    if (!whip::settingsFrom(src.url, src.options, ws, error)) return false;
+    if (ws.port == 0) {
+        if (error) *error = "A WHIP endpoint's address names its port: whip://host:port/path";
+        return false;
+    }
+    in.whip = std::make_unique<whip::Endpoint>();
+    if (!in.whip->start(ws, error)) return false;
+    double waitFor = 0;
+    if (const auto it = src.options.find("wait"); it != src.options.end()) waitFor = std::max(0.0, std::atof(it->second.c_str()));
+    const auto until = Clock::now() + std::chrono::milliseconds(int64_t(waitFor * 1000));
+    std::string sdp;
+    if (!in.whip->waitForMedia(sdp, [s, waitFor, until] { return s->stopping.load() || (waitFor > 0 && Clock::now() > until); }, error)) {
+        if (error && s->stopping) *error = "Stopped";
+        else if (error && waitFor > 0 && error->rfind("Stopped", 0) == 0) *error = "No sender came to " + in.whip->url();
+        return false;
+    }
+    if (wantVideo && sdp.find("m=video") == std::string::npos) {
+        if (error) *error = "The sender sends no picture";
+        return false;
+    }
+    in.irq = {s, index};
+    in.whipIo.endpoint = in.whip.get();
+    in.whipIo.irq = &in.irq;
+    in.whipIo.sdp = sdp;
+    constexpr int kSdpBuffer = 4096, kPacketBuffer = 65536;
+    auto* b1 = static_cast<unsigned char*>(av_malloc(kSdpBuffer));
+    auto* b2 = static_cast<unsigned char*>(av_malloc(kPacketBuffer));
+    if (b1) in.whipSdp = avio_alloc_context(b1, kSdpBuffer, 0, &in.whipIo, whipSdpRead, nullptr, nullptr);
+    if (b2) in.whipPackets = avio_alloc_context(b2, kPacketBuffer, 1, &in.whipIo, whipPacketRead, whipWrite, nullptr);
+    if (!in.whipSdp) av_free(b1);
+    if (!in.whipPackets) av_free(b2);
+    if (!in.whipSdp || !in.whipPackets) {
+        if (error) *error = "Out of memory";
+        return false;
+    }
+    in.fmt = avformat_alloc_context();
+    in.fmt->interrupt_callback = {interrupted, &in.irq};
+    in.fmt->pb = in.whipSdp;
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "sdp_flags", "custom_io", 0);
+    av_dict_set(&opts, "probesize", "1000000", 0);
+    av_dict_set(&opts, "analyzeduration", "1000000", 0);
+    s->deadline[index] = msFromNow(s->settings.openTimeout);
+    const int err = avformat_open_input(&in.fmt, "", av_find_input_format("sdp"), &opts);
+    av_dict_free(&opts);
+    if (err < 0) {
+        in.fmt = nullptr;
+        if (error) *error = s->stopping ? "Stopped" : "Cannot read the sender's feed: " + avError(err);
+        return false;
+    }
+    // (the description read, the packets: one whole packet each read, the reader's reports written nowhere)
+    in.fmt->pb = in.whipPackets;
+    return true;
+}
+
 bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wantVideo, bool wantAudio, Input& in, std::string* error) {
     if (isSt2110(src)) return openSt2110(s, src, wantVideo, wantAudio, in, error);
 #ifdef MONTAGE_WITH_OMT
@@ -463,8 +568,10 @@ bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wan
         return false;
     }
 #endif
+    const bool whipFeed = src.device.empty() && whip::isSource(src.url);
+    if (whipFeed && !openWhip(s, index, src, wantVideo, in, error)) return false;
     const AVInputFormat* ifmt = nullptr;
-    if (!src.device.empty()) {
+    if (!whipFeed && !src.device.empty()) {
 #ifdef MONTAGE_WITH_AVDEVICE
         ifmt = av_find_input_format(src.device.c_str());
 #endif
@@ -473,27 +580,30 @@ bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wan
             return false;
         }
     }
-    AVDictionary* opts = nullptr;
-    for (const auto& [k, v] : src.options) av_dict_set(&opts, k.c_str(), v.c_str(), 0);
-    // (a stream starts sooner when its format is found from a little of it)
-    if (src.device.empty()) {
-        if (!av_dict_get(opts, "probesize", nullptr, 0)) av_dict_set(&opts, "probesize", "1000000", 0);
-        if (!av_dict_get(opts, "analyzeduration", nullptr, 0)) av_dict_set(&opts, "analyzeduration", "1000000", 0);
+    if (!whipFeed) {
+        AVDictionary* opts = nullptr;
+        for (const auto& [k, v] : src.options) av_dict_set(&opts, k.c_str(), v.c_str(), 0);
+        // (a stream starts sooner when its format is found from a little of it)
+        if (src.device.empty()) {
+            if (!av_dict_get(opts, "probesize", nullptr, 0)) av_dict_set(&opts, "probesize", "1000000", 0);
+            if (!av_dict_get(opts, "analyzeduration", nullptr, 0)) av_dict_set(&opts, "analyzeduration", "1000000", 0);
+        }
+        in.fmt = avformat_alloc_context();
+        in.irq = {s, index};
+        in.fmt->interrupt_callback = {interrupted, &in.irq};
+        // Devices are read without blocking (their reads do not look at the interrupt), so stopping is never held up.
+        if (!src.device.empty()) in.fmt->flags |= AVFMT_FLAG_NONBLOCK;
+        s->deadline[index] = msFromNow(s->settings.openTimeout);
+        const int opened = avformat_open_input(&in.fmt, src.url.c_str(), ifmt, &opts);
+        av_dict_free(&opts);
+        if (opened < 0) {
+            in.fmt = nullptr;
+            if (error) *error = s->stopping ? "Stopped" : "Cannot open " + src.url + ": " + avError(opened);
+            return false;
+        }
     }
-    in.fmt = avformat_alloc_context();
-    in.irq = {s, index};
-    in.fmt->interrupt_callback = {interrupted, &in.irq};
-    // Devices are read without blocking (their reads do not look at the interrupt), so stopping is never held up.
-    if (!src.device.empty()) in.fmt->flags |= AVFMT_FLAG_NONBLOCK;
     s->deadline[index] = msFromNow(s->settings.openTimeout);
-    int err = avformat_open_input(&in.fmt, src.url.c_str(), ifmt, &opts);
-    av_dict_free(&opts);
-    if (err < 0) {
-        in.fmt = nullptr;
-        if (error) *error = s->stopping ? "Stopped" : "Cannot open " + src.url + ": " + avError(err);
-        return false;
-    }
-    s->deadline[index] = msFromNow(s->settings.openTimeout);
+    int err = 0;
     if ((err = avformat_find_stream_info(in.fmt, nullptr)) < 0) {
         if (error) *error = "Cannot read " + src.url + ": " + avError(err);
         return false;
@@ -521,6 +631,8 @@ bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wan
         if (!(in.video = openDecoder(st, error, s->settings.path.empty()))) return false;
         in.videoTb = st->time_base;
         in.rate = st->avg_frame_rate.num > 0 && st->avg_frame_rate.den > 0 ? st->avg_frame_rate : st->r_frame_rate;
+        // (a WHIP sender's rate as the endpoint measured it from the pictures' own times: RTP states none)
+        if (in.whip && in.whip->frameRate() > 0) in.rate = av_d2q(in.whip->frameRate(), 1001000);
     }
     if (in.audioStream >= 0) {
         AVStream* st = in.fmt->streams[in.audioStream];
@@ -586,7 +698,8 @@ AVRational standardRate(AVRational r, bool* standard) {
 std::vector<std::pair<std::string, std::string>> captureCodecs() {
     std::vector<std::pair<std::string, std::string>> out;
     for (const Codec& c : kCodecs)
-        if (avcodec_find_encoder_by_name(c.encoder) && (!isJpegXs(c.id) || jpegXsAvailable())) out.push_back({c.id, c.name});
+        // (JPEG XS is recorded in MXF, written through bmx)
+        if (avcodec_find_encoder_by_name(c.encoder) && (!isJpegXs(c.id) || (jpegXsAvailable() && broadcastMxfAvailable()))) out.push_back({c.id, c.name});
     return out;
 }
 

@@ -14,6 +14,7 @@
 #include "render/HdrView.h"
 
 class QLabel;
+template <typename T> class QFutureWatcher;
 class QTimer;
 class QToolButton;
 class QComboBox;
@@ -53,7 +54,16 @@ public:
     // The frame as delivered (code values in `space`), for the out-of-gamut checks: used while it is the picture's.
     void setSignal(const QImage& signal, montage::FrameTime t, const QString& space);
     // The picture as drawn (with the exposure check and focus peaking; at the monitor's size when peaking is), for testing.
+    // Worked out on the spot; painting never waits for peaking (paintedImage).
     QImage shownImage() const;
+    // Focus peaking is worked out off the interface thread: while it is, the monitor goes on showing the last picture
+    // peaked (or, the first time, the picture without peaking), and draws the new one when it is ready (peakingShown).
+    // One is worked out at a time, for the latest picture asked for.
+    bool peakingPending() const { return peakingWatch_ != nullptr; }
+    // The picture the last paint drew, before the display's calibration, for testing.
+    const QImage& paintedImage() const { return painted_; }
+    // Called on the worker's thread before each picture is peaked, for testing (empty: none).
+    static void setPeakingGateForTesting(std::function<void()> gate);
     // That through the display's calibration LUT (app/DisplayCalibration.h), as it reaches the screen.
     QImage drawnImage();
     void setDragSource(bool on) { dragSource_ = on; }
@@ -109,6 +119,7 @@ signals:
     void lookStarted();
     void lookMoved(double dx, double dy);  // since the press
     void lookFinished();
+    void peakingShown();  // a picture peaked off the interface thread is now drawn
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -152,6 +163,11 @@ private:
     mutable QImage peaked_;  // exposed_ (or image_) with focus peaking
     mutable qint64 peakedKey_ = -1;
     mutable QString peakedState_;
+    QFutureWatcher<QImage>* peakingWatch_ = nullptr;  // the picture being peaked off the interface thread
+    QImage painted_;
+    // The picture peaking is found in for what is shown now, the view it is painted over, and the key of what it peaks.
+    QString peakingWanted(QImage& exposed, QSize& size) const;
+    QImage paintedPicture();  // the overlaid picture to paint now, never waiting for peaking
     bool dragSource_ = false;
     bool lookAround_ = false, looking_ = false;
     std::vector<std::function<void(QPainter&, const QRectF&)>> overlays_;

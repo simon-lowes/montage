@@ -133,8 +133,21 @@ void hdrSurfaceSignal(float rgb[3], Transfer transfer) {
     encodeDisplayLight(*findColorSpace(transfer == Transfer::Hlg ? "rec2100hlg" : "rec2100pq"), l, rgb);
 }
 
+Primaries hdrMasteringPrimaries(const ColorSpace& space) {
+    return space.primaries == Primaries::Bt2020 ? Primaries::Bt2020 : Primaries::P3D65;
+}
+
+std::array<int32_t, 8> hdrSurfacePrimariesArgs(Primaries primaries) {
+    double xy[8] = {};
+    if (!primariesChromaticities(primaries, xy)) primariesChromaticities(Primaries::P3D65, xy);
+    std::array<int32_t, 8> out{};
+    for (size_t i = 0; i < 8; ++i) out[i] = int32_t(std::lround(xy[i] * 1e6));
+    return out;
+}
+
 HdrSurfaceLight hdrSurfaceLight(const HdrPicture& picture, double headroom) {
     HdrSurfaceLight out;
+    out.masteringPrimaries = picture.mastering;
     const double shown = std::max(1.0, std::min(picture.contentPeak, std::max(headroom, 1.0)));
     out.masteringMaxNits = std::round(shown * kSdrWhiteNits);
     if (picture.maxCll > 0) {

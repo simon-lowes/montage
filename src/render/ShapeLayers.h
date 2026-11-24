@@ -47,7 +47,9 @@ std::vector<ShapeItem> plainShapeAsContents(Effect& g);
 // An SVG drawing's text, to be a title over its shapes: where its first line starts (or its middle or end, as
 // text-anchor says) on the layer (pixels from its middle, y down, at the size the drawing is made), its font, size
 // (on the layer), weight, slant, fill and opacity, and its layout (render/Titles.h): its transform to the layer, its
-// letters' x, y, dx, dy and rotate, and the path a textPath sets it on.
+// letters' x, y, dx, dy and rotate, the path a textPath sets it on and its side, textLength and lengthAdjust, and its
+// dominant-baseline. Its tspans' own fills, fonts, sizes, weights, slants and baseline shifts are `runs` (sizes and
+// shifts on the layer, as `size`).
 struct SvgText {
     std::string text, font;
     double x = 0, y = 0, size = 16, opacity = 1;
@@ -55,6 +57,7 @@ struct SvgText {
     bool bold = false, italic = false;
     std::array<double, 3> fill{0, 0, 0};
     SvgTextLayout layout;
+    std::vector<TextRun> runs;
 };
 
 // An SVG file as a Shape layer's contents: its groups, paths, rectangles, circles, ellipses, lines and polygons,

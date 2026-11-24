@@ -24,10 +24,14 @@ public:
     DuckOptions options() const;
     std::vector<int> dialogueTracks() const;
 
-    // Finds the speech and writes the music clips' volume keyframes as one
-    // undo step, with a progress dialog. Returns how many clips changed, or -1.
+    bool keepUpToDate() const;
+
+    // Finds the speech, as a background job (DialogJobs.h), and writes the music clips' volume keyframes as one undo
+    // step. Returns how many clips changed, or -1 (nothing to do, cancelled, or left to run in the background: the
+    // keyframes are then written when it ends). `keep`: the duck is kept up to date (media/AutoDuck.h): made again
+    // when the dialogue under it changes.
     static int apply(EditorState* state, const std::vector<Id>& music, const std::vector<int>& tracks, const DuckOptions& o,
-                     QWidget* parent);
+                     QWidget* parent, bool keep = false);
 
 private:
     QListWidget* tracks_;
@@ -36,6 +40,7 @@ private:
     QDoubleSpinBox* fadeUp_;
     QDoubleSpinBox* threshold_;
     QCheckBox* transcripts_;
+    QCheckBox* keep_;
 };
 
 }  // namespace montage

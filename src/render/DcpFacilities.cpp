@@ -613,9 +613,15 @@ bool knownServer(const std::string& certificate, const std::vector<Facility>& li
     for (const Facility& c : list)
         for (const FacilityScreen& s : c.screens)
             if (!s.server.certificates.empty() && certificateKey(s.server.certificates.back()) == leaf) return true;
+    // Up to a trusted root, a security manager's: its leaf names the SM role (ST 430-2), since nothing else here says
+    // it is a server's (a projector or a link encryptor under the same root is not one KDMs go to). Its dates and
+    // its issuers' are checked against the window when the KDM is made.
     if (d.chainComplete)
         for (const std::string& t : trusted)
-            if (certificateKey(t) == certificateKey(d.certificates.front())) return true;
+            if (certificateKey(t) == certificateKey(d.certificates.front())) {
+                if (serverRole(d.commonName) == 1) return true;
+                return fail(error, "The server certificate " + d.commonName + " goes up to a trusted root but does not name a security manager's role (SM)");
+            }
     return fail(error, "The server certificate " + d.commonName + " is not a screen's in the facility list, and " +
                            (d.chainComplete ? "its chain goes up to a root not trusted (" + rootDescription(d.certificates.front()) + ")"
                                             : std::string("it is given without the chain up to its root")));

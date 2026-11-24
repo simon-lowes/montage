@@ -3193,10 +3193,6 @@
         <translation type="unfinished">Modo</translation>
     </message>
     <message>
-        <source>Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ)</source>
-        <translation type="unfinished">Modelo (glTF, GLB, OBJ, USD) o Splats (PLY, SPZ)</translation>
-    </message>
-    <message>
         <source>Modulation</source>
         <translation type="unfinished">Modulación</translation>
     </message>
@@ -6448,6 +6444,210 @@
         <source>Light intra-frame mezzanine at 5 bits a pixel, for live production and contribution</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>A Quarter of the Splats</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A Track&apos;s Picture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An Eighth of the Splats</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>As the Face</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Back</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Back Fill</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Back Gradient&apos;s Bottom</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Back Picture&apos;s Track (V number)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Range</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Range Middle</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Range Width (each channel)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drop Splats Fainter Than (opacity)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drop Splats Farther From Their Neighbours Than (0: none)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drop Splats Larger Than (the file&apos;s units, 0: none)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drop the Splats in It</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edge Bevel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Every Splat</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Face Fill</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Face Gradient&apos;s Bottom</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Face Picture&apos;s Track (V number)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Half the Splats</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Highlight Blend</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Highlight Color</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Highlight Opacity</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Inner Bevel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep Only the Splats in It</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep the Splats Inside It</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep the Splats Outside It</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Layer Bevel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Light Altitude (°)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Light Angle</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ, glTF)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Neighbours a Splat Needs Within That Distance</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Outer Bevel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pillow Emboss</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shadow Blend</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shadow Color</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sides&apos; Fill</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sides&apos; Gradient&apos;s Bottom</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sides&apos; Picture&apos;s Track (V number)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sphere Centre X</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sphere Centre Y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sphere Centre Z</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sphere Radius (distance from its centre)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Splats Removed by Hand (their numbers in the file)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Crop Box Keeps</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Splats Inside It</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Splats Outside It</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Their Centres as Points</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Thickness (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>While Editing, Draw</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -7779,10 +7979,6 @@ Download it now?</source>
         <translation type="unfinished">Alineando con el guía…</translation>
     </message>
     <message>
-        <source>Cancel</source>
-        <translation type="unfinished">Cancelar</translation>
-    </message>
-    <message>
         <source>Aligned to the guide: %1 anchors, stretched %2–%3 %</source>
         <translation type="unfinished">Alineado a la guía: %1 anclas, estirado %2–%3 %</translation>
     </message>
@@ -8281,10 +8477,6 @@ Download it now?</source>
         <translation type="unfinished">Escuchando para el diálogo…</translation>
     </message>
     <message>
-        <source>Cancel</source>
-        <translation type="unfinished">Cancelar</translation>
-    </message>
-    <message>
         <source>Auto Duck</source>
         <translation type="unfinished">Pato automático</translation>
     </message>
@@ -8294,6 +8486,22 @@ Download it now?</source>
     </message>
     <message numerus="yes">
         <source>Ducked %n clip(s) under %1 stretch(es) of dialogue</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Keep up to date</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The duck remembers its dialogue tracks and these settings. When dialogue under it is added, trimmed,
+moved or muted, its keyframes are made again as part of that edit. A keyframe you move by hand is kept.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>(%n keyframe(s) moved by hand kept)</source>
         <translation type="unfinished">
             <numerusform></numerusform>
             <numerusform></numerusform>
@@ -8381,10 +8589,6 @@ Download it now?</source>
     <message>
         <source>Listening to the audio…</source>
         <translation type="unfinished">Escuchando el audio…</translation>
-    </message>
-    <message>
-        <source>Cancel</source>
-        <translation type="unfinished">Cancelar</translation>
     </message>
     <message>
         <source>There is no audio to mix</source>
@@ -8686,10 +8890,6 @@ Download it now?</source>
     <message>
         <source>Translating captions…</source>
         <translation type="unfinished">Traduciendo subtítulos…</translation>
-    </message>
-    <message>
-        <source>Cancel</source>
-        <translation type="unfinished">Cancelar</translation>
     </message>
     <message>
         <source>Translate Captions</source>
@@ -9355,6 +9555,10 @@ Download it now?</source>
     </message>
     <message>
         <source>Clear of shot changes:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Translated into %1</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -10092,6 +10296,41 @@ Download it now?</source>
     </message>
 </context>
 <context>
+    <name>montage::CommandFinder</name>
+    <message>
+        <source>Find Command</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Type the name of a command, an effect or a preset</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Return runs the one chosen; the last used are listed first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Generator</source>
+        <translation type="unfinished">Generador</translation>
+    </message>
+    <message>
+        <source>Transition</source>
+        <translation type="unfinished">Transición</translation>
+    </message>
+    <message>
+        <source>Audio effect</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Effect</source>
+        <translation type="unfinished">Efecto</translation>
+    </message>
+    <message>
+        <source>Preset</source>
+        <translation type="unfinished">Presente</translation>
+    </message>
+</context>
+<context>
     <name>montage::CompareDialog</name>
     <message>
         <source>Change</source>
@@ -10597,10 +10836,6 @@ Download it now?</source>
         <translation type="unfinished">Comparando las tomas con la referencia…</translation>
     </message>
     <message>
-        <source>Cancel</source>
-        <translation type="unfinished">Cancelar</translation>
-    </message>
-    <message>
         <source>(none)</source>
         <translation type="unfinished">(ninguno)</translation>
     </message>
@@ -10634,6 +10869,10 @@ Download it now?</source>
     <message>
         <source>Add Conform Markers</source>
         <translation type="unfinished">Añadir marcadores de conformidad</translation>
+    </message>
+    <message>
+        <source>Checking in the background: the shots are listed here when it is done.</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -11260,6 +11499,69 @@ Download it now?</source>
         <source>Taken up again after Montage stopped, but it failed: %1</source>
         <translation type="unfinished"></translation>
     </message>
+    <message numerus="yes">
+        <source>, %n file(s) already whole left as they were</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Listening for dialogue…</source>
+        <translation type="unfinished">Escuchando para el diálogo…</translation>
+    </message>
+    <message>
+        <source>its sequence is gone</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>another sequence is open</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>“%1” is gone</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>“%1” was moved</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>no project is open</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>it waits to be looked over</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 has finished, but %2: its result was kept and not applied. Apply it from the Render Queue panel&apos;s task list.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Finished: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Working</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Run in Background</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Close this and carry on editing: the job goes on, is listed with the render queue, and its result is applied when it ends</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation type="unfinished">Cancelar</translation>
+    </message>
+    <message>
+        <source>the project changed while it ran</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::EditorState</name>
@@ -11476,6 +11778,13 @@ Download it now?</source>
     <message>
         <source>New VFX Versions</source>
         <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Auto Duck was made again and kept %n keyframe(s) moved by hand</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
     </message>
 </context>
 <context>
@@ -12930,6 +13239,66 @@ Do you want to replace it?</source>
         <source>, no more than %1 kbit/s with its buffer model stated (%2 kbit)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>12 bits a sample</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>10 bits a sample</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ProRes 4444 and 4444 XQ hold 12 bits a sample; choose 10 for tools that read no more</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ProRes depth:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Carry grain as parameters (AV1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each shot&apos;s grain measured, as Measure Grain measures it, and taken out of the picture before it is encoded, then written beside it as AV1 film grain parameters, which the player&apos;s decoder puts back: the bits go to the picture instead of the grain</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fastest (largest files)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Balanced</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smallest (slowest)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>None (not compressed)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How hard PNG frames are compressed: always lossless; a higher level takes longer and makes smaller files</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PNG compression:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>8 bits a channel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>16 bits a channel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PNG depth:</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::FootageNotesDialog</name>
@@ -13530,6 +13899,10 @@ Projects it was inserted into play its pictures from there, so they would need r
     </message>
     <message>
         <source>The compositor did not take the HDR picture&apos;s description (%1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Wayland compositor went away</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -15012,10 +15385,6 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
         <translation type="unfinished">Renderizó el gráfico</translation>
     </message>
     <message>
-        <source>Cancel</source>
-        <translation type="unfinished">Cancelar</translation>
-    </message>
-    <message>
         <source>Set Perforation Reference</source>
         <translation type="unfinished">Establecer referencia de perforación</translation>
     </message>
@@ -15378,6 +15747,10 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Nuke camera (*.chan);;USD scene with the placed models (*.usda);;USD package with the placed models (*.usdz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The clip or its effect is gone: the analysis was not applied</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -16016,10 +16389,6 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
         <source>Finding the board…</source>
         <translation type="unfinished">Encontrar la tabla…</translation>
     </message>
-    <message>
-        <source>Cancel</source>
-        <translation type="unfinished">Cancelar</translation>
-    </message>
     <message numerus="yes">
         <source>%n line(s) drawn</source>
         <translation type="unfinished">
@@ -16060,6 +16429,10 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     <message>
         <source>; squeeze %1</source>
         <translation type="unfinished">; spress %1</translation>
+    </message>
+    <message>
+        <source>Finding the board in the background: the fit is shown here when it is done.</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -16488,6 +16861,14 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     <message>
         <source>Measure again from now</source>
         <translation type="unfinished">Medir de nuevo desde ahora</translation>
+    </message>
+    <message>
+        <source>DO</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Dropouts of the audio device since the last reset: times it ran out of sound or lost a block of its input, as a busy computer makes it. A larger buffer in Monitoring › Audio device helps</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -20813,10 +21194,6 @@ Take it over and edit it?</source>
         <translation type="unfinished">Haciendo el DCP de %1...</translation>
     </message>
     <message>
-        <source>Checking the DCP of %1...</source>
-        <translation type="unfinished">Comprobando el DCP de %1...</translation>
-    </message>
-    <message>
         <source>DCP cancelled</source>
         <translation type="unfinished">DCP cancelado</translation>
     </message>
@@ -20862,10 +21239,6 @@ Take it over and edit it?</source>
     <message>
         <source>Making the IMF master of %1...</source>
         <translation type="unfinished">Hacer el maestro del FMI de %1...</translation>
-    </message>
-    <message>
-        <source>Checking the IMF master of %1...</source>
-        <translation type="unfinished">Comprobando el maestro del FMI de %1...</translation>
     </message>
     <message>
         <source>IMF master cancelled</source>
@@ -23157,10 +23530,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Each shot (between cuts and marked shot changes, a second at the least) starts a segment and is first encoded at several qualities on each rung, then scored by VMAF at the rung&apos;s size: longer to make</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Needs VMAF (libvmaf %1), and for HDR an HDR VMAF model</source>
         <translation type="unfinished"></translation>
     </message>
@@ -23512,6 +23881,53 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     </message>
     <message>
         <source>Taking up again what Montage was doing when it stopped: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Locked tracks keep their clips between In and Out where they are, outside the nested clip: %1.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Find Command…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source> %n events track(s) of the earlier package end before this one does and were left out.</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Each shot (between cuts and marked shot changes, or scene changes where there are none; a second at the least) starts a segment and is first encoded at several qualities on each rung, then scored by VMAF at the size it is shown at: longer to make</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scored at the largest rung&apos;s size</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scored at %1 × %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Every rung&apos;s pictures are scaled to this size and scored against the render at it, so one VMAF target is one quality on every rung</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lowest CRF </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The best quality a shot may be given (H.264 and HEVC; AV1&apos;s is two more): a shot that would need more stops there, and ladder.csv says so</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Markers document as JSON</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The events document as JSON instead of XML; a supplemental keeps the earlier package&apos;s form</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -26261,6 +26677,32 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <source>Xruns reset</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>The audio device was lost (%1). Sound now goes through the system&apos;s output</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The audio device was lost (%1). Sound now goes through %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>; ran out of sound %n time(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>; %n block(s) of input lost</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>The device chosen is not there (%1). Standing in: %2</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MulticamPanel</name>
@@ -27968,6 +28410,22 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <source>Buffer model: %1.</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Quick</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VMAF scored on every fourth frame only, which takes less time; the frames between still count towards its motion, and the other measures are of every frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VMAF: about %1 s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VMAF: about %1 min</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::RecoveryManager</name>
@@ -28824,6 +29282,25 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <source>expiry goes with a TURN relay&apos;s secret</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>%1: %2</source>
+        <translation type="unfinished">%1: %2</translation>
+    </message>
+    <message numerus="yes">
+        <source>, %n answer(s) of the relay&apos;s not signed with the login and not used</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>; through the relay: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>; </source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::RemoteReviewPanel</name>
@@ -29056,10 +29533,6 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <translation type="unfinished">Ninguno</translation>
     </message>
     <message>
-        <source>A TURN relay you run (turn:host:3478, or turns:host:5349 over TLS), for viewers whose networks let nothing through directly. Reviewers&apos; pages are given it, with its user name and password, once they give the passphrase.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>TURN relay:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -29160,6 +29633,22 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     </message>
     <message>
         <source>The secret your relay shares with Montage, for a relay set to make its logins from a shared secret. Each review then has a login of its own, which reviewers&apos; pages are given instead of one that lasts, and the review link and that login end after the time chosen: nobody new gets in, and anyone still watching is told the link has expired.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A TURN relay you run (turn:host:3478, turn:host:3478?transport=tcp over TCP, or turns:host:5349 over TLS; an IPv6 address goes in square brackets), for viewers whose networks let nothing through directly. Reviewers&apos; pages are given it, with its user name and password, once they give the passphrase.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Checked against this computer&apos;s trusted certificates</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>For a relay reached over TLS (turns:) with a certificate of its own making: the certificate&apos;s SHA-256 fingerprint. Montage then takes that certificate and no other, whoever signed it.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Relay certificate:</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -29361,6 +29850,70 @@ background calls MCP runs at once</source>
     </message>
     <message>
         <source>Waiting (stopped part way: renders again)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Background Task</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pause</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hold the picked task where it is, or let it go on</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Move Up</source>
+        <translation type="unfinished">Subir</translation>
+    </message>
+    <message>
+        <source>Run the picked waiting task before the one above it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stop Task</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stop the picked task: nothing is changed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Apply Result</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A result kept because the project changed while its task ran: apply it now, as one undo step</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Discard</source>
+        <translation type="unfinished">Desechar</translation>
+    </message>
+    <message>
+        <source>Set the picked result aside</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The result could not be applied to the project as it is now</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Result kept: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Paused at %1%</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1%</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Resume</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -29755,6 +30308,10 @@ background calls MCP runs at once</source>
     </message>
     <message>
         <source>This Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The selected slot&apos;s velocity curve: press to add a point, drag to move one, double-click to remove one</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -33305,6 +33862,14 @@ so the jump in the picture morphs across instead of cutting</source>
             <numerusform></numerusform>
             <numerusform></numerusform>
         </translation>
+    </message>
+    <message>
+        <source>The audio device was lost (%1): nothing had been recorded</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The audio device was lost (%1): the take was kept up to there, as %2</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

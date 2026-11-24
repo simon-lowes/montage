@@ -48,13 +48,19 @@ public:
     std::atomic<int> instances{0};
     // Set by the first to report this host's end (renders on several threads see it end together; one failure).
     std::atomic<bool> failureTaken{false};
-    // The plug-in it was loading when it ended ("" when it was loading none): that one alone is to blame.
+    // The plug-in it was loading when it ended ("" when it was loading none): that one alone is to blame. Its whole
+    // id, however long (the host notes the beginning of a long one with its length and hash, and the whole is found
+    // among those it was asked to load).
     std::string loading() const;
-    // Whether the plug-in it notes is `id` (a long id is noted cut short, and matched as far as it goes).
+    // Whether the plug-in it notes is `id`, the whole of it.
     bool wasLoading(const std::string& id) const;
+    // A plug-in this host is asked to load (attach), by its id.
+    void asked(const std::string& id);
 
 private:
     std::atomic<bool> dead_{false}, killed_{false};
+    mutable std::mutex askedM_;
+    std::vector<std::string> asked_;
 };
 
 // The running host for a key, or a new one (null with why when none can start).

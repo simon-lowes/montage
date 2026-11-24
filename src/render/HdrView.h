@@ -5,6 +5,7 @@
 // headroom (its peak over its SDR white). Brighter than the display can go, highlights roll off softly, keeping hue.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -24,6 +25,8 @@ struct HdrPicture {
     // sequence's transfer (PQ or HLG) and its measured light levels in nits (0 = not measured).
     Transfer transfer = Transfer::Pq;
     double maxCll = 0, maxFall = 0;
+    // The primaries of the display it was mastered on, as its sequence has them (hdrMasteringPrimaries).
+    Primaries mastering = Primaries::P3D65;
 };
 using HdrPicturePtr = std::shared_ptr<const HdrPicture>;
 
@@ -46,13 +49,22 @@ void hdrViewImage(const Image& in, const ColorSpace& space, double hdrPeakNits, 
 // outside BT.2020 is clipped to it. The viewer's shader does the same on the GPU.
 void hdrSurfaceSignal(float rgb[3], Transfer transfer);
 
-// The light such a surface carries, for its image description: the mastering display (P3-D65 primaries, its peak the
+// The primaries a sequence in `space` is mastered on: its own where they are P3-D65's or BT.2020's (P3-D65 PQ, and
+// BT.2100's PQ and HLG), and P3-D65, as Montage's HDR10 files state it, for any other.
+Primaries hdrMasteringPrimaries(const ColorSpace& space);
+
+// Primaries as wp_image_description_creator_params_v1 takes them: the chromaticities of red, green, blue and white,
+// x then y, in millionths. Primaries with no chromaticities of their own are given as P3-D65's.
+std::array<int32_t, 8> hdrSurfacePrimariesArgs(Primaries primaries);
+
+// The light such a surface carries, for its image description: the mastering display (the picture's primaries, its peak the
 // picture's, no darker than PQ's 0.005 nits so the volume stays inside the signal's) and the measured MaxCLL and
 // MaxFALL, none brighter than the display's peak (`headroom` times 203 nits) where the viewer rolls highlights off
 // to it, so the compositor does not roll them off a second time.
 struct HdrSurfaceLight {
     double masteringMinNits = 0.005, masteringMaxNits = 1000;
     double maxCll = 0, maxFall = 0;  // 0 = not stated
+    Primaries masteringPrimaries = Primaries::P3D65;
     bool operator==(const HdrSurfaceLight&) const = default;
 };
 HdrSurfaceLight hdrSurfaceLight(const HdrPicture& picture, double headroom);

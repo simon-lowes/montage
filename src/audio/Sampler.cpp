@@ -108,7 +108,15 @@ struct HeldDiskSound : DiskSound {
 
 // The file at `path` opened and held (as above); nullptr when it is not there, or was removed while it was opened.
 std::FILE* holdFile(const std::string& path) {
+#ifndef _WIN32
+    // (closed in every program Montage starts: a plug-in host would else keep the file and its lock while it runs, and
+    // the cache could not be tidied of it)
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    std::FILE* f = fd >= 0 ? ::fdopen(fd, "rb") : nullptr;
+    if (!f && fd >= 0) ::close(fd);
+#else
     std::FILE* f = std::fopen(path.c_str(), "rb");
+#endif
     if (!f) return nullptr;
 #ifndef _WIN32
     // (where the file system has no locks, held as well as it can be: open)
@@ -587,6 +595,7 @@ void Engine::startVoice(const Event& e, const KitPtr& kit) {
     v.key = e.key;
     v.id = e.id;
     v.choke = st.choke;
+    v.output = st.output;
     v.oneShot = st.oneShot;
     v.step = pitch != 0 ? std::pow(2.0, pitch / 12.0) : 1.0;
     v.gain = float(std::pow(10.0, (st.gainDb + level) / 20.0) * velocity / 127.0);
@@ -630,9 +639,18 @@ void Engine::release(int key, uint64_t id) {
         if (v.key == key && (!id || v.id == id) && !v.oneShot && v.released < 0) v.released = 0;
 }
 
-void Engine::renderVoices(float* out, int frames) {
+void Engine::renderVoices(float* own, int offset, int frames) {
     static const float silence[2] = {0.0f, 0.0f};
     for (Voice& v : voices_) {
+        // Where it is heard: its slot's send, when the render has one for that track.
+        float* out = own;
+        if (v.output)
+            for (int k = 0; k < sendCount_; ++k)
+                if (sends_[k].output == v.output && sends_[k].out) {
+                    out = sends_[k].out;
+                    break;
+                }
+        out += size_t(offset) * 2;
         const Kit::Sound& s = *v.sound;
         const float* src = s.buffer->samples.data();
         const int64_t len = s.end - s.start;
@@ -706,8 +724,12 @@ void Engine::renderVoices(float* out, int frames) {
     std::erase_if(voices_, [](const Voice& v) { return v.pos >= double(v.sound->end - v.sound->start); });
 }
 
-void Engine::render(int64_t start, int frames, float* out) {
+void Engine::render(int64_t start, int frames, float* out) { render(start, frames, out, nullptr, 0); }
+
+void Engine::render(int64_t start, int frames, float* out, const Send* sends, int count) {
     if (frames <= 0) return;
+    sends_ = sends;
+    sendCount_ = sends ? count : 0;
     if (std::unique_lock<std::mutex> lock(kitMutex_, std::try_to_lock);
         lock.owns_lock() && kit_ != pendingKit_ && (!kit_ || retired_.size() < retired_.capacity())) {
         // (the kit let go of is kept for setKit to free, in the room made for it there)
@@ -745,7 +767,7 @@ void Engine::render(int64_t start, int frames, float* out) {
             else release(e.key, e.id);
         }
         const int64_t next = used < due_.size() ? std::min(dueAt(due_[used]), end) : end;
-        renderVoices(out + size_t(done) * 2, int(next - start - done));
+        renderVoices(out, done, int(next - start - done));
         done = int(next - start);
     }
     // Events left for a later block (all of them were due at or after its end).

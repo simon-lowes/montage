@@ -1,4 +1,6 @@
 #include "Voiceover.h"
+
+#include "LiveTake.h"
 #include "Language.h"
 
 #include <QAudioDevice>
@@ -213,6 +215,19 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         return false;
     }
     stopping_ = false;
+    {
+        // The take's waveform is drawn on its track (a grouped take's on each) as its blocks arrive.
+        LiveTake live;
+        live.owner = this;
+        live.sequence = s->id;
+        live.at = at_;
+        live.fps = s->fpsValue();
+        live.rate = rate_;
+        live.channels = channels_;
+        if (groupTracks_.size() > 1) live.tracks = groupTracks_;
+        else live.tracks = {track_};
+        LiveTakes::instance().begin(std::move(live));
+    }
     if (onDevice) {
         // Placed by the playback it follows (the round trip taken off), else the input's latency taken off its start.
         const int64_t first = std::llround(double(at_) / s->fpsValue() * rate_);
@@ -220,8 +235,12 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         const int64_t fallback = st.rate > 0 ? std::llround(double(st.measured ? st.roundTrip / 2 : st.latency.input) * rate_ / st.rate) : 0;
         aligner_ = audiodev::TakeAligner(first, clock_ != nullptr, fallback, rate_);
         {
+            // Room for a second of sound in each, made before the take: the tap fills one while the other is written.
             std::lock_guard<std::mutex> lock(pendingM_);
             pending_.clear();
+            spare_.clear();
+            pending_.reserve(size_t(rate_) * size_t(channels_));
+            spare_.reserve(size_t(rate_) * size_t(channels_));
         }
         std::string error;
         armed_ = clock_ == nullptr;
@@ -244,6 +263,13 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
             return false;
         }
         drain_.start();
+        // The device going away (unplugged, its server stopped) ends the take with everything it brought: told on the
+        // engine's thread once the tap has had the last block, and acted on here.
+        lostListener_ = engine.addLostListener([this, take = takeNumber_ + (clock_ ? 1 : 0)](const std::string& why) {
+            QMetaObject::invokeMethod(this, [this, take, w = QString::fromStdString(why)] {
+                if (tap_ >= 0 && isRecording() && (take == takeNumber_)) lostDevice(w);
+            }, Qt::QueuedConnection);
+        });
         if (clock_)
             QMetaObject::invokeMethod(this, [this, take = ++takeNumber_] {
                 if (take == takeNumber_ && tap_ >= 0) armed_ = true;
@@ -267,7 +293,10 @@ bool VoiceoverRecorder::startLoop(FrameTime in, FrameTime out, FrameTime preroll
     preroll = std::clamp<FrameTime>(preroll, 0, in);
     loopIn_ = in, loopOut_ = out, preroll_ = preroll;
     // (a grouped track's group records with it, as for a single take; the passes share pass ids and take numbers)
-    if (start(in - preroll, track, -1, input, openDevice, sampleRate, channels)) return true;
+    if (start(in - preroll, track, -1, input, openDevice, sampleRate, channels)) {
+        LiveTakes::instance().setLoop(this, in, out, preroll);
+        return true;
+    }
     loopIn_ = loopOut_ = preroll_ = 0;
     groupTracks_.clear();
     return false;
@@ -300,19 +329,32 @@ void VoiceoverRecorder::readDevice() {
 }
 
 void VoiceoverRecorder::drainDevice() {
-    std::vector<float> got;
     {
         std::lock_guard<std::mutex> lock(pendingM_);
-        got.swap(pending_);
+        spare_.swap(pending_);  // (what has arrived for this thread, the emptied one back to the tap, its room kept)
     }
-    if (!got.empty()) feed(got.data(), qint64(got.size() / size_t(channels_)));
+    if (!spare_.empty()) feed(spare_.data(), qint64(spare_.size() / size_t(channels_)));
+    spare_.clear();
 }
 
 void VoiceoverRecorder::closeDevice() {
+    if (lostListener_ >= 0) audiodev::Engine::shared().removeLostListener(lostListener_);
+    lostListener_ = -1;
     if (tap_ < 0) return;
     audiodev::Engine::shared().removeInput(tap_);
     tap_ = -1;
     drain_.stop();
+}
+
+void VoiceoverRecorder::lostDevice(const QString& why) {
+    // Everything the device brought is in pending_ by now: stop() writes it, closes the file whole, files the take in
+    // the bin and places it, as a take ended by hand.
+    stop();
+    const QString name = QFileInfo(lastTake_).fileName();
+    state_->message(name.isEmpty() ? tr("The audio device was lost (%1): nothing had been recorded").arg(why)
+                                   : tr("The audio device was lost (%1): the take was kept up to there, as %2").arg(why, name),
+                    10000);
+    emit deviceLost(why);
 }
 
 void VoiceoverRecorder::feed(const float* interleaved, qint64 frames) {
@@ -325,6 +367,7 @@ void VoiceoverRecorder::feed(const float* interleaved, qint64 frames) {
     }
     if (frames > 0) {
         writer_.write(interleaved, frames);
+        LiveTakes::instance().add(this, interleaved, frames);
         float peak = 0;
         for (qint64 i = 0; i < frames * channels_; ++i) peak = std::max(peak, std::fabs(interleaved[i]));
         emit level(peak);
@@ -347,6 +390,7 @@ Id VoiceoverRecorder::stop() {
     }
     const qint64 frames = writer_.frames();
     const bool whole = writer_.close();
+    LiveTakes::instance().end(this);
     if (frames == 0) {
         QFile::remove(path_);
         loopIn_ = loopOut_ = 0;
@@ -577,6 +621,7 @@ void VoiceoverRecorder::cancel() {
         writer_.close();
         QFile::remove(path_);
     }
+    LiveTakes::instance().end(this);
 }
 
 // ---------------------------------------------------------------------------

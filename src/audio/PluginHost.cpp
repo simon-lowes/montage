@@ -24,6 +24,13 @@ namespace montage::plugins {
 
 using namespace std::chrono_literals;
 
+// One export's own count of the plug-in failures its render met (ExportScope).
+struct ExportFailures {
+    std::atomic<uint64_t> count{0};
+    std::mutex m;
+    std::string last;
+};
+
 // ---------------------------------------------------------------------------
 // Settings
 
@@ -46,7 +53,16 @@ std::atomic<int> gMemoryLimitMb{4096};
 std::atomic<int> gAutoRestarts{2};
 std::atomic<bool> gInHost{false};
 thread_local bool tRealtime = false;
-thread_local bool tExport = false;
+thread_local ExportFailures* tExport = nullptr;  // (the export rendering on this thread, if one is)
+// Tells it of a failure.
+void tellExport(const std::string& what) {
+    if (!tExport) return;
+    {
+        std::lock_guard lock(tExport->m);
+        tExport->last = what;
+    }
+    ++tExport->count;
+}
 }  // namespace
 
 const char* isolationName(Isolation i) {
@@ -141,9 +157,20 @@ RenderModeScope::RenderModeScope(bool realtime) : previous_(tRealtime) { tRealti
 RenderModeScope::~RenderModeScope() { tRealtime = previous_; }
 bool renderingRealtime() { return tRealtime; }
 
-ExportScope::ExportScope() : previous_(tExport) { tExport = true; }
+ExportScope::ExportScope() : previous_(tExport) {
+    if (!tExport) {
+        own_ = std::make_unique<ExportFailures>();
+        tExport = own_.get();
+    }
+    failures_ = tExport;
+}
 ExportScope::~ExportScope() { tExport = previous_; }
-bool renderingForExport() { return tExport; }
+uint64_t ExportScope::failures() const { return failures_->count.load(); }
+std::string ExportScope::lastFailure() const {
+    std::lock_guard lock(failures_->m);
+    return failures_->last;
+}
+bool renderingForExport() { return tExport != nullptr; }
 
 namespace remote {
 
@@ -186,17 +213,31 @@ void Channel::unlinkNames() {
 
 uint32_t Host::crashCode() const { return control.h ? control.h->crashed.load(std::memory_order_acquire) : 0; }
 
+void Host::asked(const std::string& id) {
+    std::lock_guard lock(askedM_);
+    if (!id.empty() && std::find(asked_.begin(), asked_.end(), id) == asked_.end()) asked_.push_back(id);
+}
+
 std::string Host::loading() const {
     if (!control.h) return {};
     // (written by the host, so read only as far as its field goes)
-    return std::string(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
+    const std::string noted(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
+    if (noted.empty() || control.h->loadingBytes <= noted.size()) return noted;
+    // An id longer than the field: the whole of it is one Montage asked this host to load, found by its length and
+    // hash (the field holds its beginning).
+    std::lock_guard lock(askedM_);
+    for (const std::string& id : asked_)
+        if (wasLoading(id)) return id;
+    return noted;
 }
 
 bool Host::wasLoading(const std::string& id) const {
-    const std::string noted = loading();
-    if (noted.empty() || id.empty()) return false;
-    if (noted.size() == sizeof control.h->loading - 1) return id.compare(0, noted.size(), noted) == 0;
-    return noted == id;
+    if (!control.h || id.empty()) return false;
+    const std::string noted(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
+    if (noted.empty()) return false;
+    // The whole id, however long: its beginning as far as the field goes, its length and its hash.
+    if (id.compare(0, noted.size(), noted) != 0 || id.size() < noted.size()) return false;
+    return control.h->loadingBytes == id.size() && control.h->loadingHash == wire::idHash(id.data(), id.size());
 }
 
 bool Host::alive() {
@@ -341,6 +382,7 @@ Result call(Channel& c, Host& host, int64_t timeoutUs, const std::function<void(
 
 Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json, const std::string& id) {
     Attached a;
+    host.asked(id);
     std::lock_guard lock(host.controlM);
     const bool alone = host.instances == 0;  // (a shared host may end for another plug-in's doing)
     Channel& k = host.control;
@@ -461,6 +503,7 @@ void recordFailure(const std::string& id, const std::string& name, const std::st
             if (const size_t cut = why.rfind("; bypassed"); cut != std::string::npos) why.erase(cut);
             b.lastOffline = f.name + " " + why;
             ++b.offlineSerial;
+            tellExport(b.lastOffline);
         }
     }
     ++b.serial;
@@ -475,6 +518,7 @@ void noteOfflineFailure(const std::string& name, const std::string& why) {
         b.lastOffline = name + " " + why;
     }
     ++b.offlineSerial;
+    tellExport(name + " " + why);
 }
 
 void noteRestart(const std::string& id) {

@@ -3,7 +3,8 @@
 // at once. Below them the render farm
 // (render/RenderFarm.h): a folder shared with other computers, where Send to Farm puts the picked job for the render
 // nodes there, its jobs and nodes shown as they go (read again on a worker every second and a half while the panel shows),
-// with Cancel, Retry and Remove.
+// with Cancel, Retry and Remove. Under the queue's own buttons, while there are any, the tasks the dialogs run in the
+// background (DialogJobs.h).
 #pragma once
 
 #include <QFutureWatcher>
@@ -16,9 +17,11 @@ class QSpinBox;
 class QPushButton;
 class QTimer;
 class QTreeWidget;
+class QVBoxLayout;
 
 namespace montage {
 
+class DialogJobs;
 class RenderQueue;
 
 class RenderQueuePanel : public QWidget {
@@ -33,6 +36,12 @@ public:
     // shown.
     bool sendToFarm(int id);
     void refreshFarm();
+    // The dialogs' background tasks (DialogJobs.h) listed under the queue while there are any: those running or
+    // waiting, with Pause, Move Up and Stop, and the results kept and offered, with Apply Result and Discard.
+    void setDialogJobs(DialogJobs* jobs);
+
+signals:
+    void taskSaid(const QString& text);  // what applying a task's result did, for the status bar
 
 private:
     struct FarmView {
@@ -41,12 +50,23 @@ private:
         std::vector<FarmNodeInfo> nodes;
     };
     void refresh();
+    void refreshTasks();
+    QString selectedTask() const;
     void readFarmLater();
     void showFarm(const FarmView& view);
     int selectedJob() const;
     std::string selectedFarmJob() const;
 
     RenderQueue* queue_;
+    DialogJobs* tasks_ = nullptr;
+    QWidget* taskBox_ = nullptr;
+    QTreeWidget* taskList_ = nullptr;
+    QPushButton* taskPause_ = nullptr;
+    QPushButton* taskUp_ = nullptr;
+    QPushButton* taskStop_ = nullptr;
+    QPushButton* taskApply_ = nullptr;
+    QPushButton* taskDiscard_ = nullptr;
+    QVBoxLayout* localLay_ = nullptr;
     QTreeWidget* list_;
     QPushButton* start_;
     QPushButton* stop_;

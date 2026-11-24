@@ -13,8 +13,15 @@
 
 namespace montage {
 
+// The tracks' pictures a 3D title's faces show where its Front, Sides or Back is set to a track's picture, each
+// premultiplied and fitted to the title's box; an empty one leaves that face its colour.
+struct Title3DPictures {
+    Image front, sides, back;
+};
+
 // The "title3d" generator at frame t of a clip `duration` frames long (for its animation out), w x h output pixels,
 // `scale` output pixels per sequence pixel.
-Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps);
+Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps,
+                    const Title3DPictures* pictures = nullptr);
 
 }  // namespace montage

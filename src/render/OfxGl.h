@@ -89,8 +89,11 @@ bool sendDmaBuf(const std::string& post, const DmaBuf& buf);
 // What process `pid` last sent to `post`, waited for up to `waitMs`: `buf`'s descriptor, and its fence's when `fence`
 // says one came with it. Anything else found waiting there is let go. False, with why, when they did not come whole.
 bool receiveDmaBuf(int post, long long pid, bool fence, int waitMs, DmaBuf& buf, std::string* why = nullptr);
-// Whether a DMA-BUF that came from another process is described as a picture of its size whose rows lie inside the
-// buffer (false, with why, otherwise). Waits (any thread; up to 5 s when `waitMs` is -1) for a fence that came with it.
+// Whether a DMA-BUF that came from another process is described as a picture of its size, in a four-channel format
+// Montage takes, whose rows hold their pixels at that format's size and lie inside the buffer (false, with why,
+// otherwise; for a layout in tiles this is the least the buffer must hold, and the driver checks the layout itself).
+// Waits (any thread; up to 5 s when `waitMs` is -1) for a fence that came with it to signal: a descriptor that
+// cannot be waited for is not a picture drawn.
 bool dmaBufFits(const DmaBuf& buf, std::string* why = nullptr);
 bool awaitDrawn(const DmaBuf& buf, std::string* why = nullptr, int waitMs = -1);
 // How many messages a post holds before a sender must wait (a sender then gives up: sendDmaBuf is false at once).

@@ -6,31 +6,30 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
-#include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QFutureWatcher>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLinearGradient>
 #include <QMenu>
 #include <QPainter>
 #include <QPointer>
 #include <QProgressBar>
-#include <QProgressDialog>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QTimer>
 #include <QVBoxLayout>
-#include <QtConcurrent>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 
+#include "DialogJobs.h"
 #include "EditorState.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -714,82 +713,23 @@ bool AdrPanel::alignToGuide(AlignPrecision precision) {
     const AdrCue* q = s ? findAdrCue(*s, currentCue()) : nullptr;
     const Id guide = guideClip();
     if (!q || !q->clip || cycle_ || !guide) return false;
-    const Id clip = q->clip, cueId = q->id;
-    DialogueAlignOptions o;
-    o.precision = precision;
-    o.from = q->start, o.to = q->end;
-    // Reading and matching the two sounds can take a while: on copies in the background, with progress, the result
-    // then applied as one edit. Edits can still come meanwhile (the dialog shows late and is only window-modal, and
-    // MCP carries on): only the alignment is taken over, onto the clip as it is then, and not if it has moved.
-    struct Out {
-        edit::Result result;
-        DialogueAlignReport report;
-        Clip take;
-    };
-    const Project project = state_->project();
-    const Sequence sequence = *s;
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    QProgressDialog progress(tr("Aligning to the guide…"), tr("Cancel"), 0, 0, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
-    QFutureWatcher<Out> watcher;
-    QEventLoop wait;
-    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([project, sequence, clip, guide, o, cancel] {
-        Out out;
-        Project p = project;
-        Sequence sq = sequence;
-        out.result = edit::alignDialogue(p, sq, clip, guide, o, &out.report, cancel.get());
-        if (const Clip* c = edit::clipById(sq, clip)) out.take = *c;
-        return out;
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
-    progress.close();
-    const Out r = watcher.result();
-    if (*cancel) return false;
-    const Clip* was = edit::clipById(sequence, clip);
-    const Clip* guideWas = edit::clipById(sequence, guide);
-    // What the alignment was made from: the take, the guide and the cue's range as they were.
-    auto moved = [](const Clip& a, const Clip& b) {
-        return a.start != b.start || a.duration != b.duration || a.sourceIn != b.sourceIn || a.mediaId != b.mediaId || a.channels != b.channels ||
-               a.speed != b.speed || a.reverse != b.reverse || a.timing != b.timing || a.linkGroup != b.linkGroup;
-    };
-    const bool ok = state_->apply(tr("Align to Guide"), [&](Project& p, Sequence& sq) {
-        if (!r.result.ok) return r.result;
-        Clip* c = edit::clipById(sq, clip);
-        const Clip* g = edit::clipById(sq, guide);
-        const AdrCue* cue = findAdrCue(sq, cueId);
-        if (!c || !was || !g || !guideWas) return edit::Result::fail("No such clip");
-        const auto loc = edit::locate(sq, clip);
-        if (moved(*c, *was) || moved(*g, *guideWas) || !cue || cue->start != o.from || cue->end != o.to ||
-            g->effects != guideWas->effects || (loc && trackAt(sq, loc->track) && trackAt(sq, loc->track)->locked))
-            return edit::Result::fail("The take, the guide or the cue changed while it was being aligned: align it again");
-        // The alignment made on the copy (the one it added last), in place of the clip's own for that take, at the end
-        // as alignDialogue leaves it.
-        const auto made = std::find_if(r.take.effects.rbegin(), r.take.effects.rend(), [](const Effect& e) { return e.type == "dialogue_align"; });
-        if (made == r.take.effects.rend()) return edit::Result::fail("The alignment was not made");
-        std::erase_if(c->effects, [&](const Effect& e) { return e.type == "dialogue_align" && dialogueAlignmentApplies(e, *c); });
-        Effect e = *made;
-        e.id = p.newId();  // made on the copy
-        c->effects.push_back(e);
-        // (longer to the next clip, as it is now)
-        FrameTime duration = r.take.duration;
-        for (Track& t : sq.audioTracks)
-            if (std::any_of(t.clips.begin(), t.clips.end(), [&](const Clip& x) { return &x == c; }))
-                for (const Clip& x : t.clips)
-                    if (&x != c && x.start >= c->start && x.start < c->start + duration) duration = std::max(c->duration, x.start - c->start);
-        c->duration = duration;
-        return edit::Result{};
-    });
+    // Reading and matching the two sounds can take a while: a background job (DialogJobs.h, the "adr-align" kind in
+    // DialogTasks.cpp), watched behind its progress dialog or left to run. Its alignment is then taken over as one
+    // edit, onto the take as it is then, and not if the take, the guide or the cue has moved meanwhile.
+    const QJsonObject input{{"sequence", QString::number(s->id)},
+                            {"clips", QJsonArray{QString::number(q->clip), QString::number(guide)}},
+                            {"clip", QString::number(q->clip)},
+                            {"guide", QString::number(guide)},
+                            {"cue", QString::number(q->id)},
+                            {"from", double(q->start)},
+                            {"to", double(q->end)},
+                            {"precision", int(precision)}};
+    const TaskOutcome r = DialogJobs::of(this)->run(state_, QStringLiteral("adr-align"), tr("Aligning to the guide…"), input, this);
+    if (r.how == TaskOutcome::Failed && !r.error.isEmpty()) state_->message(r.error, 6000);
     refresh();
-    if (ok)
-        statusLabel_->setText(tr("Aligned to the guide: %1 anchors, stretched %2–%3 %")
-                                  .arg(r.report.anchors)
-                                  .arg(std::lround(100 * r.report.minRate))
-                                  .arg(std::lround(100 * r.report.maxRate)));
-    return ok;
+    if (!r.done() || !r.applied.value("changed").toBool()) return false;
+    statusLabel_->setText(r.applied.value("message").toString());
+    return true;
 }
 
 void AdrPanel::pickTake(int index) {

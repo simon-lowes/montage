@@ -95,10 +95,12 @@ public:
     ~VmafMeter();
     VmafMeter(const VmafMeter&) = delete;
     VmafMeter& operator=(const VmafMeter&) = delete;
-    // `model`: a model's JSON file, or one libvmaf has built in, by its version (as vmafModelFor gives).
-    bool open(const std::string& model, int threads, std::string* error = nullptr);
+    // `model`: a model's JSON file, or one libvmaf has built in, by its version (as vmafModelFor gives). `every` above
+    // 1: only every such pair is scored (the first, then each `every` on), the rest feeding only what VMAF measures
+    // across frames (its motion), and getting no score.
+    bool open(const std::string& model, int threads, std::string* error = nullptr, int every = 1);
     bool add(const QualityPicture& reference, const QualityPicture& encode);
-    bool finish(std::vector<double>& scores);  // a score a pair, in the order they were added
+    bool finish(std::vector<double>& scores);  // a score a pair, in the order they were added (kNoScore where not scored)
     unsigned pictures() const;
 
 private:
@@ -139,6 +141,8 @@ struct CompareOptions {
     // else as QualityPicture's transfer and primaries.
     std::string assumeTransfer, assumePrimaries;
     int maxFrames = 0;       // 0 = all
+    // VMAF of every such frame only (1: every frame). The other metrics are of every frame whatever this is.
+    int vmafEvery = 1;
 };
 
 struct EncodeComparison {
@@ -154,6 +158,7 @@ struct EncodeComparison {
     std::vector<FrameTime> worstFrames;  // the worst first
     bool vmafScored = false;
     std::string vmafModel;       // the model used
+    int vmafEvery = 1;           // VMAF was scored on every such frame
     std::string vmafNote;        // why VMAF was asked for and not measured (HDR with no HDR model), else ""
     // How many frames each has after the alignment's offset is taken off (-1: not known), frames the decoder reported
     // damaged in the encode, and what is wrong but did not stop the comparison (frames missing or extra, damage).
@@ -184,8 +189,13 @@ PictureSource openPictureFile(const std::string& path, const QualityPicture* lik
 // The first picture of a file, as decoded (its layout and tags).
 bool probePictureFile(const std::string& path, QualityPicture& out, const CompareOptions& o, std::string* error = nullptr);
 // The VMAF model a comparison in `like`'s layout and tags uses (o.vmafModel when given); "" when there is none for it
-// (HDR with no HDR model).
+// (HDR with no HDR model). The 4K models are for pictures whose shorter side is over 1440 samples, so an upright
+// 1080 by 1920 picture takes the 1080 model.
 std::string vmafModelFor(const QualityPicture& like, const CompareOptions& o);
+// About how long VMAF takes on `frames` pairs of pictures this size with this model, scoring every `every`th, on this
+// computer with `threads` threads (0: all): from a short run of libvmaf on made-up pictures the first time it is
+// asked, then by the pictures' area. 0 where Montage has no libvmaf.
+double vmafSecondsEstimate(int width, int height, int64_t frames, int every = 1, int threads = 0);
 
 // Two files.
 EncodeComparison compareEncodeFiles(const std::string& reference, const std::string& encode, const CompareOptions& o,

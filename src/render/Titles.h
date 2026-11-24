@@ -114,7 +114,9 @@ TitleLayerFn titleLayerSource(const Project& p, const Sequence& seq, const Clip&
 // An SVG text element's layout, kept on the title it was made into (its string "svg_text", JSON): the text's own
 // coordinates to the layer's pixels (its transform, the drawing's fit and any turn or slant), each character's x, y,
 // dx, dy and rotate (SVG's per-glyph positions and rotations, x and y unset where the SVG leaves them), text-anchor,
-// and a textPath's path (its data and its own coordinates to the text's) with its startOffset.
+// a textPath's path (its data and its own coordinates to the text's) with its startOffset and its side, the length
+// textLength asks the text to take (by spacing its letters out, or by stretching them too), and how far below the
+// text's y its alphabetic baseline sits (dominant-baseline).
 struct SvgTextLayout {
     QTransform matrix;
     std::vector<std::optional<double>> x, y, rotate;
@@ -124,9 +126,16 @@ struct SvgTextLayout {
     QTransform pathMatrix;
     double start = 0;     // startOffset: along the path (the text's units), or a percentage of it
     bool startPercent = false;
+    bool pathRight = false;  // side="right": set along the path taken backwards
+    double textLength = 0;   // textLength (the text's units), 0 for none
+    bool adjustGlyphs = false;  // lengthAdjust="spacingAndGlyphs": the letters stretched too, not only spaced out
+    double down = 0;  // dominant-baseline: the alphabetic baseline this far below the text's y (the text's units)
     // The title's Position when it was laid out: moved from there, the text moves with it (output pixels).
     double atX = 0, atY = 0;
-    bool empty() const { return matrix.isIdentity() && x.empty() && y.empty() && rotate.empty() && dx.empty() && dy.empty() && anchor == 0 && path.empty(); }
+    bool empty() const {
+        return matrix.isIdentity() && x.empty() && y.empty() && rotate.empty() && dx.empty() && dy.empty() && anchor == 0 && path.empty() &&
+               textLength == 0 && down == 0;
+    }
 };
 std::string svgTextLayoutJson(const SvgTextLayout& l);
 std::optional<SvgTextLayout> parseSvgTextLayout(const std::string& json);
@@ -163,6 +172,9 @@ std::vector<TitleGlyph> titleGlyphs(const Effect& g, FrameTime t, int w, int h, 
 // rest at every time.
 Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {},
                   const TitleLayerFn& layer = {});
+// How many times a styled title's text has been laid out so far (tests: with Motion Blur a frame's text is laid out
+// once, not at every time through the shutter, unless its text or its letters' styles change between them).
+long titleLayoutsMade();
 // One render at a time between frames, without motion blur.
 Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {},
                     const TitleLayerFn& layer = {});

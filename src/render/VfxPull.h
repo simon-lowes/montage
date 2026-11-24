@@ -9,6 +9,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,14 @@ struct VfxPullOptions {
     std::string returns, returnsPattern;
 };
 
+struct VfxShot;
+// A pull cut short and taken up again: the shots it had finished, passed over (their files not written again) where
+// they are still the same clip's under the same name; and who is told as each shot is finished.
+struct VfxPullResume {
+    std::vector<VfxShot> finished;
+    std::function<void(const VfxShot&)> pulled;
+};
+
 struct VfxShot {
     std::string name;            // the folder's and files' name
     std::string media;           // source file
@@ -76,6 +85,6 @@ std::string vfxShotName(const std::string& pattern, const Project& p, const Sequ
 // are skipped), writes "pull_list.csv" in the folder, and returns the shots.
 bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>& clips, const VfxPullOptions& options,
                     std::vector<VfxShot>* shots, const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
-                    std::string* error = nullptr);
+                    std::string* error = nullptr, const VfxPullResume* resume = nullptr);
 
 }  // namespace montage

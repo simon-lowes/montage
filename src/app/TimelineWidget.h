@@ -19,6 +19,7 @@ namespace montage {
 
 class EditorState;
 class PitchCurves;
+struct LiveTake;
 
 class TimelineWidget : public QAbstractScrollArea {
     Q_OBJECT
@@ -30,6 +31,11 @@ public:
 
     EditorState* state() const { return state_; }
     Tool tool() const { return tool_; }
+    // A take being recorded (LiveTake.h), as it is drawn: where it lies on audio track `audioTrack` (empty when that
+    // track is not shown), and its lowest and highest sample over the timeline frame `frame` on the take's `track`th
+    // track.
+    QRect liveTakeRectOn(const LiveTake& take, int audioTrack) const;
+    std::pair<float, float> liveTakeLevelAt(const LiveTake& take, size_t track, double frame) const;
     void setTool(Tool t);
 
     void zoomIn();
@@ -304,6 +310,9 @@ private:
     void paintHeaders(QPainter& p, const std::vector<Row>& rs, bool band);
     void paintClip(QPainter& p, const Row& row, const Clip& c, const QRect& r);
     void paintWaveform(QPainter& p, const Clip& c, const QRect& r, const QColor& col);
+    // A take being recorded (LiveTake.h) on one of its tracks: from where it began to where it has reached.
+    void paintLiveTake(QPainter& p, const LiveTake& take, size_t track, const QRect& row);
+    QRect liveTakeRect(const LiveTake& take, const QRect& row) const;
     // Warp markers (and the stretches between them tinted by how far they are slowed or sped up), the pitch curve.
     void paintElastic(QPainter& p, const Clip& c, const QRect& body);
     // The warp marker within a few pixels of x on the clip (group seconds), if any.

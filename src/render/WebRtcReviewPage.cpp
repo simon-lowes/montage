@@ -147,10 +147,12 @@ const char* browserReviewScript() {
     if (w.status !== 201) throw new Error((await w.text()) || ('The review refused: ' + w.status));
     state.session = w.headers.get('Location');
     await pc.setRemoteDescription({ type: 'answer', sdp: await w.text() });
+    // (not waited for: playing begins only once pictures arrive, and the page is the review's from the answer on,
+    // saying how its connection goes; muted where the browser will not play sound unasked)
     const v = $('video');
     v.muted = false;
-    try { await v.play(); } catch (e) { v.muted = true; v.play().catch(() => {}); }
-    $('sound').textContent = v.muted ? 'Sound on' : 'Sound off';
+    $('sound').textContent = 'Sound off';
+    v.play().catch(() => { v.muted = true; $('sound').textContent = 'Sound on'; v.play().catch(() => {}); });
     watchFrames();
   }
   state.join = join;

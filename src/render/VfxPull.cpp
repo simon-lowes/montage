@@ -200,7 +200,7 @@ std::string vfxShotName(const std::string& pattern, const Project& p, const Sequ
 }
 
 bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>& clips, const VfxPullOptions& o, std::vector<VfxShot>* out,
-                    const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+                    const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error, const VfxPullResume* resume) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -279,6 +279,14 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
             for (int k = int(n); std::count(used.begin(), used.end(), name); ++k) name = base + "_" + std::to_string(k + 1);
         }
         used.push_back(name);
+        if (resume) {
+            const auto done = std::find_if(resume->finished.begin(), resume->finished.end(), [&](const VfxShot& d) { return d.clip == c.id && d.name == name; });
+            if (done != resume->finished.end()) {
+                shots.push_back(*done);
+                if (progress) progress(double(n + 1) / double(chosen.size()), 0);
+                continue;
+            }
+        }
         VfxShot shot;
         shot.name = name;
         shot.media = m.path;
@@ -435,6 +443,7 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
                 return fail("Cannot write " + shot.script);
         }
         shots.push_back(shot);
+        if (resume && resume->pulled) resume->pulled(shot);
     }
     // The pull list.
     std::string csv = "Shot,Source File,Source In (s),Source Out (s),Head Handle,Tail Handle,First Frame,Cut In,Cut Out,Last Frame,Folder,Layers,Overscan,Undistort Map,Redistort Map\n";

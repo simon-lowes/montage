@@ -83,6 +83,7 @@ private:
     QSpinBox* width_ = nullptr;
     QSpinBox* height_ = nullptr;
     QSpinBox* quality_ = nullptr;
+    QCheckBox* filmGrain_ = nullptr;  // AV1: each shot's grain carried as film grain parameters (render/Av1GrainExport.h)
     // A stated HRD (H.264, H.265): none, a constant or a variable rate, with the buffer's rate and size (render/HrdCheck.h).
     QComboBox* hrd_ = nullptr;
     QSpinBox* hrdRate_ = nullptr;    // kbit/s
@@ -95,6 +96,8 @@ private:
     QCheckBox* hdr10Plus_ = nullptr;    // HDR10+ dynamic metadata (PQ)
     QCheckBox* adaptiveHdr_ = nullptr;  // adaptive HDR metadata (PQ and HLG)
     QComboBox* exrCompression_ = nullptr;  // OpenEXR frames' compression
+    QComboBox* pngCompression_ = nullptr;  // PNG frames: how hard the compressor works (always lossless)
+    QComboBox* pngBits_ = nullptr;         // and 8 or 16 bits a channel
     QComboBox* jxlQuality_ = nullptr;      // JPEG XL frames: lossless or a distance
     QComboBox* jpegXsRate_ = nullptr;      // JPEG XS: bits a pixel (0: the preset's)
     QComboBox* jxlDepth_ = nullptr;        // and their depth (the preset's, 8 or 16-bit, half or float)
@@ -110,6 +113,7 @@ private:
     QSpinBox* teletextPage_ = nullptr;
     QCheckBox* interlaced_ = nullptr;
     QCheckBox* segmentedFields_ = nullptr;  // (interlaced: both fields the halves of one picture)
+    QComboBox* proResBits_ = nullptr;       // (ProRes 4444 and 4444 XQ: 12 or 10 bits a sample)
     QComboBox* rate_ = nullptr;      // the frame rate delivered (render/RateConversion.h)
     QCheckBox* ratePitch_ = nullptr;
     QString as11Text_;  // "Name=value" lines

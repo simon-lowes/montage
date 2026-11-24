@@ -413,6 +413,9 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
 //  - several audio tracks are nested together only when they are mixed alike (no inserts or sends, the same pan,
 //    output and automation); their faders may differ, each track's difference going into the nested sequence.
 Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks, const std::string& name);
+// The locked tracks among `tracks` with clips in [a, b): nestRange leaves their clips where they are (above or below
+// the compound; one between two tracks that are nested is refused), which a user is told before anything is cut.
+std::vector<TrackRef> nestRangeStays(const Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks);
 
 // ---- Sound to the sample ------------------------------------------------------------------
 // An audio clip's sound moved (picture and linked clips left where they are), its start or end trimmed (positive

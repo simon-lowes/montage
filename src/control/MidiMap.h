@@ -60,10 +60,22 @@ struct Event {
 // pair, when the fine half arrives (or, once the pair has been seen like that a few times, whenever the fine half comes
 // alone, as some devices send it when only it changed). So a fader on CC 0 and a button on CC 32 both keep working,
 // and a 14-bit mapping takes only the pair. Controllers 99/98 and 101/100 choose an NRPN or RPN parameter, whose value
-// then comes in data entry (6, and 38 for the fine half, reported on 38 once the parameter has sent it).
+// then comes in data entry (6 the coarse half, 38 the fine half). A parameter's two halves are one value: a half is
+// held until the other follows, in either order, and the value is reported once, whole. A half that came alone is
+// reported when the same half comes again, when a parameter is next chosen, when the next half comes more than a
+// pair's time (kPairUs) after it (given the times messages arrived at), or by flush(), which the caller runs once a
+// pair's time has passed with holding() true (a controller sends a pair's halves together, under a millisecond apart
+// on a cable). Until a parameter sends a fine half its coarse half is reported at once, as 7 bits.
 class Decoder {
 public:
-    void feed(const MidiMessage& m, const std::function<void(const Event&)>& out);
+    static constexpr int64_t kPairUs = 5000;
+    // `atUs`: when the message arrived, in microseconds on any steady clock (negative: not known, and halves are then
+    // paired by their order alone).
+    void feed(const MidiMessage& m, const std::function<void(const Event&)>& out, int64_t atUs = -1);
+    // Whether a data entry half is held for its other half.
+    bool holding() const;
+    // Reports the halves held as halves that came alone.
+    void flush(const std::function<void(const Event&)>& out);
     void reset();
 
 private:
@@ -73,14 +85,15 @@ private:
         int last = -1;  // the last controller number seen
         int paramMsb = 127, paramLsb = 127;  // 127/127: none chosen (the "null" parameter)
         bool rpn = false;
-        // Data entry's fine half held for the coarse half to follow (-1 none): from a parameter known to send the fine
-        // half first, or one whose coarse half has not come yet.
-        int heldLsb = -1;
+        // Data entry's half held for the other half to follow (-1 none), and which half it is.
+        int held = -1;
+        bool heldFine = false;
+        int64_t heldAt = -1;  // (when it arrived: -1 not known)
         Channel();
     };
+    void release(int ch, const std::function<void(const Event&)>& out);
     Channel ch_[16];
     std::set<std::tuple<int, bool, int>> fine_;  // (channel, rpn, parameter) seen sending data entry's fine half
-    std::set<std::tuple<int, bool, int>> lsbFirst_;  // those seen sending it before the coarse half
     std::map<std::tuple<int, bool, int>, int> coarse_;  // each parameter's last coarse half (for fine-only updates)
 };
 

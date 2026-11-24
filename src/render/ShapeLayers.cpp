@@ -1038,7 +1038,8 @@ Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, con
     static const char* const props[] = {"fill", "stroke", "fill-opacity", "stroke-opacity", "stroke-width", "stroke-linecap", "stroke-linejoin",
                                         "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "fill-rule", "opacity", "display",
                                         "visibility", "stop-color", "stop-opacity", "filter", "mask", "clip-path", "font-family",
-                                        "font-size", "font-weight", "font-style", "text-anchor"};
+                                        "font-size", "font-weight", "font-style", "text-anchor", "baseline-shift", "dominant-baseline",
+                                        "writing-mode"};
     for (const char* p : props)
         if (auto it = n.attrs.find(p); it != n.attrs.end()) s[p] = it->second.trimmed();
     if (sheet && !sheet->empty() && (!work || *work <= kMaxCssWork)) {
@@ -1588,6 +1589,35 @@ public:
         std::vector<Lists> stack;
         const SvgNode* onPath = nullptr;
         int chars = 0;  // characters so far, as SVG counts them (code points: the lists' entries)
+        // The look of the element a character is in, where a tspan gives its own: fill, font, size, weight and slant,
+        // and its baseline's shift (added to those of the spans around it), for the title's runs.
+        struct Span {
+            QString fill, family, weight, slant;
+            double size = 16;  // the text's units
+            double shift = 0;  // up, the text's units
+            bool operator==(const Span&) const = default;
+        };
+        auto lengthIn = [](const QString& value, double em) {
+            const QString v = value.trimmed();
+            const std::vector<double> nums = numbersIn(v);
+            if (nums.empty()) return 0.0;
+            if (v.endsWith("em")) return nums[0] * em;
+            if (v.endsWith("ex")) return nums[0] * em / 2;
+            return lengthOf(v, em, 0);
+        };
+        auto styled = [&](const Style& s, Span sp) {
+            const double em = sp.size;
+            if (s.count("fill")) sp.fill = s.at("fill");
+            if (s.count("font-family")) sp.family = s.at("font-family");
+            if (s.count("font-weight")) sp.weight = s.at("font-weight");
+            if (s.count("font-style")) sp.slant = s.at("font-style");
+            if (s.count("font-size"))
+                if (const double size = lengthIn(s.at("font-size"), em); size > 0 && std::isfinite(size)) sp.size = size;
+            return sp;
+        };
+        std::vector<Span> spans{styled(st, Span())};
+        std::vector<int> spanOf;  // for each UTF-16 unit of `str`, its span
+        int span = 0;
         auto add = [&](const QString& chunk) {
             for (QChar ch : chunk) {
                 if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
@@ -1595,6 +1625,7 @@ public:
                 if (str.size() >= 4096) return;
                 const bool second = ch.isLowSurrogate() && !str.isEmpty() && str.back().isHighSurrogate();
                 str += ch;
+                spanOf.push_back(span);
                 if (second) {  // (the rest of the character before: its entries again)
                     X.push_back(X.back()), Y.push_back(Y.back()), R.push_back(R.back()), DX.push_back(DX.back()), DY.push_back(DY.back());
                     continue;
@@ -1614,6 +1645,7 @@ public:
                 X.push_back(x), Y.push_back(y), R.push_back(r), DX.push_back(dx), DY.push_back(dy);
             }
         };
+        std::vector<const SvgNode*> above = ancestors_;
         std::function<void(const SvgNode&, int)> walk = [&](const SvgNode& e, int depth) {
             Lists l;
             l.start = chars;
@@ -1631,7 +1663,25 @@ public:
                 const SvgNode& c = e.children[i];
                 if (depth < 32 && (c.name == "tspan" || c.name == "textPath" || c.name == "a")) {
                     if (c.name == "textPath" && !onPath) onPath = &c;
+                    // Its own look (attributes, style sheets and style), over that of the element it is in.
+                    const int outer = span;
+                    above.push_back(&e);
+                    const Style cs = styleOf(c, &sheet_, &above, &cssWork_);
+                    Span sp = styled(cs, spans[size_t(outer)]);
+                    if (cs.count("baseline-shift")) {
+                        // (sub and super by the shares of the outer size that Inkscape, which writes them, uses)
+                        const QString v = cs.at("baseline-shift");
+                        const double em = spans[size_t(outer)].size;
+                        const double shift = v == "sub" ? -0.2 * em : v == "super" ? 0.4 * em : v == "baseline" ? 0.0 : lengthIn(v, em);
+                        if (std::isfinite(shift)) sp.shift += shift;
+                    }
+                    if (!(sp == spans[size_t(outer)]) && spans.size() < 4096) {
+                        spans.push_back(sp);
+                        span = int(spans.size()) - 1;
+                    }
                     walk(c, depth + 1);
+                    above.pop_back();
+                    span = outer;
                 }
             }
             add(e.text.mid(from));
@@ -1640,6 +1690,7 @@ public:
         walk(n, 0);
         if (str.endsWith(' ')) {
             str.chop(1);
+            spanOf.pop_back();
             X.pop_back(), Y.pop_back(), R.pop_back(), DX.pop_back(), DY.pop_back();
         }
         if (str.isEmpty()) return;
@@ -1677,10 +1728,25 @@ public:
                 lay.startPercent = so.endsWith('%');
                 const std::vector<double> v = numbersIn(so);
                 lay.start = v.empty() ? 0.0 : v[0];
+                // (side="right": along the path taken backwards)
+                lay.pathRight = onPath->attrs.count("side") && onPath->attrs.at("side").trimmed() == "right";
+                if (onPath->attrs.count("method") && onPath->attrs.at("method").trimmed() == "stretch")
+                    note("Text stretched along its path (its letters are set along it unbent)");
             } else {
                 note("Text on a path that is not there (laid out straight)");
             }
         }
+        // The length the text is to take (the text element's own textLength), by spacing or by stretching its letters.
+        if (n.attrs.count("textLength")) {
+            const double length = lengthIn(n.attrs.at("textLength"), spans[0].size);
+            if (length > 0 && std::isfinite(length)) {
+                lay.textLength = length;
+                lay.adjustGlyphs = n.attrs.count("lengthAdjust") && n.attrs.at("lengthAdjust").trimmed() == "spacingAndGlyphs";
+            }
+        }
+        if (const QString mode = st.count("writing-mode") ? st.at("writing-mode") : QString();
+            mode.startsWith("vertical") || mode.startsWith("tb"))
+            note("Vertical text (set left to right)");
         double x = lay.x.empty() || !lay.x[0] ? 0 : *lay.x[0], y = lay.y.empty() || !lay.y[0] ? 0 : *lay.y[0];
         SvgText t;
         t.text = str.toStdString();
@@ -1688,17 +1754,63 @@ public:
         t.x = at.x(), t.y = at.y();
         const double k = std::sqrt(std::abs(m.determinant()));
         t.size = std::max(1.0, lengthOf(st.count("font-size") ? st.at("font-size") : QString("16"), 16, 16) * k);
-        QString family = st.count("font-family") ? st.at("font-family") : QString();
-        family = family.split(',').value(0).trimmed();
-        family.remove('"').remove('\'');
-        t.font = family.isEmpty() || family == "sans-serif" ? "Sans Serif" : family == "serif" ? "Serif" : family == "monospace" ? "Monospace" : family.toStdString();
-        const QString weight = st.count("font-weight") ? st.at("font-weight") : QString();
-        t.bold = weight == "bold" || weight == "bolder" || (!numbersIn(weight).empty() && numbersIn(weight)[0] >= 600);
-        t.italic = st.count("font-style") && (st.at("font-style") == "italic" || st.at("font-style") == "oblique");
+        auto fontOf = [](const QString& families) {
+            QString family = families.split(',').value(0).trimmed();
+            family.remove('"').remove('\'');
+            return family.isEmpty() || family == "sans-serif" ? std::string("Sans Serif")
+                   : family == "serif" ? std::string("Serif") : family == "monospace" ? std::string("Monospace") : family.toStdString();
+        };
+        auto boldOf = [](const QString& weight) {
+            return weight == "bold" || weight == "bolder" || (!numbersIn(weight).empty() && numbersIn(weight)[0] >= 600);
+        };
+        auto italicOf = [](const QString& slant) { return slant == "italic" || slant == "oblique"; };
+        t.font = fontOf(st.count("font-family") ? st.at("font-family") : QString());
+        t.bold = boldOf(st.count("font-weight") ? st.at("font-weight") : QString());
+        t.italic = st.count("font-style") && italicOf(st.at("font-style"));
         const QString anchor = st.count("text-anchor") ? st.at("text-anchor") : QString();
         t.anchor = anchor == "middle" ? 1 : anchor == "end" ? 2 : 0;
         lay.anchor = t.anchor;
+        // dominant-baseline: where the text's y is on its letters, as far as the font's own measures say (the hanging
+        // and mathematical baselines, which few fonts state, at 0.8 and 0.5 of the ascent).
+        if (const QString base = st.count("dominant-baseline") ? st.at("dominant-baseline") : QString();
+            !base.isEmpty() && base != "auto" && base != "alphabetic") {
+            QFont f(QString::fromStdString(t.font));
+            f.setPixelSize(1000);
+            f.setBold(t.bold);
+            f.setItalic(t.italic);
+            f.setHintingPreference(QFont::PreferNoHinting);
+            const QFontMetricsF fm(f);
+            const double em = spans[0].size / 1000;
+            lay.down = base == "middle" ? fm.xHeight() / 2 * em
+                       : base == "central" ? (fm.ascent() - fm.descent()) / 2 * em
+                       : base == "hanging" ? 0.8 * fm.ascent() * em
+                       : base == "mathematical" ? 0.5 * fm.ascent() * em
+                       : base == "text-before-edge" || base == "text-top" ? fm.ascent() * em
+                       : base == "text-after-edge" || base == "text-bottom" || base == "ideographic" ? -fm.descent() * em : 0.0;
+        }
         t.layout = std::move(lay);
+        // A run for each stretch a tspan gives a look of its own: its fill, font, size, weight, slant and shift.
+        for (int a = 0; a < int(str.size());) {
+            int b = a + 1;
+            while (b < int(str.size()) && spanOf[size_t(b)] == spanOf[size_t(a)]) ++b;
+            const Span& root = spans[0];
+            const Span& sp = spans[size_t(spanOf[size_t(a)])];
+            TextRun r;
+            r.from = a, r.len = b - a;
+            bool any = false;
+            if (sp.size != root.size) r.size = std::max(1.0, sp.size * k), any = true;
+            if (sp.shift != 0) r.baseline = sp.shift * k, any = true;
+            if (sp.family != root.family && fontOf(sp.family) != t.font) r.font = fontOf(sp.family), any = true;
+            if (boldOf(sp.weight) != t.bold) r.bold = boldOf(sp.weight) ? 1 : 0, any = true;
+            if (italicOf(sp.slant) != t.italic) r.italic = italicOf(sp.slant) ? 1 : 0, any = true;
+            if (sp.fill != root.fill) {
+                const QColor own = parseColour(sp.fill);
+                if (sp.fill == "none" || sp.fill.startsWith("url(") || !own.isValid()) note("Part of a text with no fill or a gradient (filled as the rest)");
+                else r.color = std::array<double, 3>{own.redF(), own.greenF(), own.blueF()}, any = true;
+            }
+            if (any) t.runs.push_back(std::move(r));
+            a = b;
+        }
         const QColor c = parseColour(st.count("fill") ? st.at("fill") : QString("black"));
         if (st.count("fill") && (st.at("fill") == "none" || st.at("fill").startsWith("url("))) {
             if (st.at("fill") == "none") return;
@@ -1853,6 +1965,15 @@ Effect svgTextTitle(const SvgText& t, double scale) {
     lay.matrix = lay.matrix * QTransform::fromScale(scale, scale);
     lay.atX = e.p("pos_x", 0), lay.atY = e.p("pos_y", 0);
     e.strings["svg_text"] = svgTextLayoutJson(lay);
+    // Its tspans' own looks as the title's runs, at `scale`.
+    if (!t.runs.empty()) {
+        std::vector<TextRun> runs = t.runs;
+        for (TextRun& r : runs) {
+            if (r.size > 0) r.size = std::clamp(r.size * scale, 4.0, 1000.0);
+            r.baseline *= scale;
+        }
+        e.strings["runs"] = textRunsJson(runs);
+    }
     return e;
 }
 

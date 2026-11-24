@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Runs the HDR viewer under Weston (scripts/build-weston.sh): headless, its GL renderer, one 1280x720 output, the kiosk
-# shell. Twice: with colour management on and the output driven as BT.2100 PQ (BT.2020, reference white 203 nits, a
-# 1000-nit target), where test_app's hdrViewerOnWayland checks the surface's description in Weston's protocol log,
-# its 10-bit buffers, the surface's own pixels and the PQ codes in Weston's screenshot; then with colour management
-# off, where the viewer stays SDR and says why. Both runs first check Weston's screenshot of the SDR viewer. A skipped
-# test fails the check, and so does a Weston that died or did not stop cleanly.
+# shell. Three times: with colour management on and the output driven as BT.2100 PQ (BT.2020, reference white 203
+# nits, a 1000-nit target), where test_app's hdrViewerOnWayland checks the surface's description in Weston's protocol
+# log, its 10-bit buffers, the surface's own pixels and the PQ codes in Weston's screenshot; with colour management on
+# and an SDR output, where a viewer that reads what the compositor prefers stays SDR and says the display is not HDR
+# (one described by Qt is shown, fitted by Weston); then with colour management off, where the viewer stays SDR and
+# says why. Every run first checks Weston's screenshot of the SDR viewer. A skipped test fails the check, and so does a
+# Weston that died or did not stop cleanly. The same checks serve a build with Montage's binding of the protocol and
+# one where Qt describes the surface (-DMONTAGE_WAYLAND_BINDING=OFF, Qt 6.10.2 or later).
 #
 #   scripts/wayland-hdr-check.sh <weston prefix> <test_app> <work directory>
 set -euo pipefail
@@ -25,11 +28,13 @@ cleanup() { [ -z "$weston" ] || kill "$weston" 2> /dev/null || true; }
 trap cleanup EXIT
 
 failed=0
-run() {  # name color-management(true|false)
+run() {  # name color-management(true: a PQ output|sdr: an SDR output|false: off)
   local name=$1 cm=$2 dir="$work/$1"
   rm -rf "$dir"
   mkdir -p "$dir/shots"
-  if [ "$cm" = true ]; then
+  if [ "$cm" = sdr ]; then
+    printf '[core]\ncolor-management=true\n' > "$dir/weston.ini"
+  elif [ "$cm" = true ]; then
     cat > "$dir/weston.ini" << EOF
 [core]
 color-management=true
@@ -125,5 +130,6 @@ EOF
 }
 
 run on true
+run sdr sdr
 run off false
 exit "$failed"

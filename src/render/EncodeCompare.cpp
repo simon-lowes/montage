@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include <QCoreApplication>
@@ -434,7 +436,7 @@ std::string vmafVersion() {
 
 std::string vmafModelFor(const QualityPicture& p, const CompareOptions& o) {
     if (!o.vmafModel.empty()) return o.vmafModel;
-    const bool uhd = p.height > 1440;
+    const bool uhd = std::min(p.width, p.height) > 1440;  // (by the shorter side: an upright picture is not 4K for its height)
     // SDR: the v1 model libvmaf has built in (its 4K form above 1440 lines); below 80 chroma samples either way (as
     // 192 x 108 in 4:2:0), the v0.6.1 model, as the v1 model's chroma feature (SpEED, over four halvings into blocks
     // of five) has nothing left to measure there.
@@ -458,7 +460,7 @@ std::string vmafModelFor(const QualityPicture& p, const CompareOptions& o) {
 struct VmafMeter::Impl {
     VmafContext* vmaf = nullptr;
     VmafModel* model = nullptr;
-    unsigned index = 0;
+    unsigned index = 0, every = 1;
     ~Impl() {
         if (model) vmaf_model_destroy(model);
         if (vmaf) vmaf_close(vmaf);
@@ -512,7 +514,7 @@ struct VmafMeter::Impl {};
 VmafMeter::VmafMeter() : d(std::make_unique<Impl>()) {}
 VmafMeter::~VmafMeter() = default;
 
-bool VmafMeter::open(const std::string& model, int threads, std::string* error) {
+bool VmafMeter::open(const std::string& model, int threads, std::string* error, int every) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -522,8 +524,11 @@ bool VmafMeter::open(const std::string& model, int threads, std::string* error) 
     VmafConfiguration cfg{};
     cfg.log_level = VMAF_LOG_LEVEL_NONE;
     cfg.n_threads = unsigned(std::max(0, threads));
-    cfg.n_subsample = 1;
+    // (libvmaf then measures a model's features on every such picture only, by its index, and what runs across frames,
+    // motion, on them all)
+    cfg.n_subsample = unsigned(std::clamp(every, 1, 1000));
     if (vmaf_init(&d->vmaf, cfg) < 0) return fail("libvmaf would not start");
+    d->every = cfg.n_subsample;
     VmafModelConfig mc{};
     mc.name = "vmaf";
     // (a model's JSON file, or a model libvmaf has built in, by its version)
@@ -534,7 +539,7 @@ bool VmafMeter::open(const std::string& model, int threads, std::string* error) 
     if (vmaf_use_features_from_model(d->vmaf, d->model) < 0) return fail("the VMAF model's features are not built in");
     return true;
 #else
-    (void)model, (void)threads;
+    (void)model, (void)threads, (void)every;
     return fail("This Montage was built without libvmaf, so it cannot measure VMAF");
 #endif
 }
@@ -568,7 +573,7 @@ bool VmafMeter::finish(std::vector<double>& scores) {
     if (!d->vmaf) return false;
     if (d->index > 0 && vmaf_read_pictures(d->vmaf, nullptr, nullptr, 0) < 0) return false;
     scores.assign(d->index, kNoScore);
-    for (unsigned i = 0; i < d->index; ++i) {
+    for (unsigned i = 0; i < d->index; i += d->every) {
         double v = 0;
         if (vmaf_score_at_index(d->vmaf, d->model, &v, i) == 0) scores[i] = v;
     }
@@ -589,6 +594,61 @@ unsigned VmafMeter::pictures() const {
 
 bool vmafMeasures(const QualityPicture& p) {
     return !p.rgb && ((p.log2ChromaW == 1 && p.log2ChromaH <= 1) || (p.log2ChromaW == 0 && p.log2ChromaH == 0));
+}
+
+double vmafSecondsEstimate(int width, int height, int64_t frames, int every, int threads) {
+    if (!vmafAvailable() || width <= 0 || height <= 0 || frames <= 0) return 0;
+    // One thread's seconds for a scored pair and for an unscored one, of kW x kH pictures (textured, so no feature takes
+    // a short cut), measured once: eight pairs scored, then eight with one in eight scored.
+    constexpr int kW = 480, kH = 270, kPairs = 8;
+    static std::mutex mutex;
+    static double scored = -1, unscored = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (scored < 0) {
+            QualityPicture a;
+            a.width = kW, a.height = kH;
+            for (int c = 0; c < 3; ++c) a.plane[c].resize(size_t(a.planeWidth(c)) * size_t(a.planeHeight(c)));
+            QualityPicture b = a;
+            auto fill = [&](int frame) {
+                uint32_t r = 12345u + uint32_t(frame) * 977u;
+                for (int c = 0; c < 3; ++c)
+                    for (size_t i = 0; i < a.plane[c].size(); ++i) {
+                        r = r * 1664525u + 1013904223u;
+                        const int v = int((i % size_t(a.planeWidth(c))) * 200 / size_t(a.planeWidth(c))) + int(r >> 28) + 16;
+                        a.plane[c][i] = uint16_t(v);
+                        b.plane[c][i] = uint16_t(v + int((r >> 20) & 7) - 3);
+                    }
+            };
+            QualityPicture like;
+            like.width = kW, like.height = kH;
+            const std::string model = vmafModelFor(like, CompareOptions{});
+            auto run = [&](int n) {
+                VmafMeter m;
+                std::vector<double> scores;
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!m.open(model, 1, nullptr, n)) return -1.0;
+                for (int i = 0; i < kPairs; ++i) {
+                    fill(i);
+                    if (!m.add(a, b)) return -1.0;
+                }
+                if (!m.finish(scores)) return -1.0;
+                return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / kPairs;
+            };
+            const double all = run(1), eighth = run(kPairs);
+            if (all < 0 || eighth < 0) return 0;
+            // (eighth = (scored + 7 unscored) / 8)
+            unscored = std::clamp((eighth * kPairs - all) / (kPairs - 1), 0.0, all);
+            scored = all;
+        }
+    }
+    const double area = double(width) * double(height) / (double(kW) * kH);
+    const int n = std::clamp(every, 1, 1000);
+    const double scoredPairs = std::ceil(double(frames) / n);
+    const int cores = int(std::max(1u, std::thread::hardware_concurrency()));
+    const int used = std::clamp(threads <= 0 ? cores : threads, 1, cores);
+    // (the scored pairs are measured in parallel; what runs across frames takes them in order)
+    return area * (scoredPairs * (scored - unscored) / used + double(frames) * unscored);
 }
 
 // ---- reading files -----------------------------------------------------------------------------------------------
@@ -1099,7 +1159,8 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
         } else {
             vmaf = std::make_unique<VmafMeter>();
             std::string e;
-            if (!vmaf->open(res.vmafModel, threads, &e)) {
+            res.vmafEvery = std::clamp(o.vmafEvery, 1, 1000);
+            if (!vmaf->open(res.vmafModel, threads, &e, res.vmafEvery)) {
                 res.error = e;
                 return res;
             }
@@ -1598,6 +1659,7 @@ bool writeQualityCsv(const std::string& path, const EncodeComparison& c, const S
     std::fprintf(f, "# worst,psnr_y %s,ssim %s,ms_ssim %s,delta_ictcp %s,vmaf %s\n", fmt(c.worst.psnrY, 3).c_str(), fmt(c.worst.ssim, 6).c_str(),
                  fmt(c.worst.msSsim, 6).c_str(), fmt(c.worst.deltaItp, 4).c_str(), fmt(c.worst.vmaf, 4).c_str());
     if (!c.vmafModel.empty()) std::fprintf(f, "# vmaf_model,%s\n", c.vmafModel.c_str());
+    if (c.vmafScored && c.vmafEvery > 1) std::fprintf(f, "# vmaf_every,%d\n", c.vmafEvery);
     std::fprintf(f, "frame,timecode,psnr_y,psnr_u,psnr_v,psnr_rgb,ssim_y,ssim_all,ms_ssim,delta_ictcp,delta_ictcp_max,vmaf\n");
     for (const FrameQuality& q : c.frames)
         std::fprintf(f, "%lld,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", (long long)q.frame, timecodeOf(q.frame, s).c_str(), fmt(q.psnrY, 4).c_str(),
@@ -1650,7 +1712,9 @@ bool writeQualityPdf(const std::string& path, const EncodeComparison& c, const s
     add("MS-SSIM", c.mean.msSsim, c.worst.msSsim, 5, "");
     add("Delta ICtCp (BT.2124)", c.mean.deltaItp, c.worst.deltaItp, 3, "");
     add("VMAF", c.mean.vmaf, c.worst.vmaf, 2, "");
-    if (c.vmafScored) rows.push_back({"VMAF model", QFileInfo(QString::fromStdString(c.vmafModel)).fileName().toStdString()});
+    if (c.vmafScored)
+        rows.push_back({"VMAF model", QFileInfo(QString::fromStdString(c.vmafModel)).fileName().toStdString() +
+                                          (c.vmafEvery > 1 ? ", every " + std::to_string(c.vmafEvery) + " frames scored" : "")});
     for (const auto& [name, value] : rows) {
         p.drawText(margin, y + 10, QString::fromStdString(name));
         p.drawText(margin + 150, y + 10, QString::fromStdString(value));

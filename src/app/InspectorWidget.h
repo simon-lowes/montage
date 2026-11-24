@@ -2,6 +2,7 @@
 // attributes, effect stacks and transitions, with keyframes on every parameter.
 #pragma once
 
+#include <QJsonObject>
 #include <QScrollArea>
 #include <array>
 #include <functional>
@@ -135,10 +136,10 @@ public:
     void followFootage(Id clip, bool forward, int model, double size);
 
 private:
-    // Runs `work` off the UI thread behind a progress dialog with Cancel;
-    // false (with the error shown) if it fails or is cancelled.
-    bool runAnalysis(const QString& title,
-                     const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work);
+    // Runs the analysis `what` of the clip (and its effect) as a background job (the kind "inspector-analysis",
+    // registerInspectorTaskKinds), watched behind a progress dialog with Cancel and Run in Background; its result is
+    // applied as one undo step when it ends. False (with the error shown) if it failed, was cancelled or left to run.
+    bool runTask(const QString& what, const QString& title, Id clip, Id effect, const QJsonObject& args);
 
     EditorState* state_;
     QWidget* content_ = nullptr;
@@ -150,5 +151,8 @@ private:
     std::map<Id, std::string> shapeSelection_;  // each shape layer's picked item
     std::set<Id> eqSettingsOpen_;  // the Parametric EQs whose band settings are unfolded
 };
+
+// The Inspector's analyses as a kind of background task (DialogJobs.h), registered with the dialogs' own.
+void registerInspectorTaskKinds();
 
 }  // namespace montage

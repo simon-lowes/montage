@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <vector>
 
 #include "media/Image.h"
@@ -27,13 +28,36 @@ struct ProjectedSplat {
 };
 bool projectSplat(const SplatCloud& cloud, size_t i, const Mat4& place, const ModelCamera& camera, ProjectedSplat& out);
 
+// What a render did, when asked: the splats there were to draw (kept by the options), those whose shape and colour
+// were worked out (the rest were told to be off the picture from their centre and largest size alone), and those
+// that reached the picture.
+struct SplatRenderStats {
+    size_t offered = 0, projected = 0, drawn = 0;
+};
+
 struct SplatRenderOptions {
     int threads = 0;  // 0: the shared workers; otherwise this many threads (1: this one alone)
     // Only the splats whose centres are in this box (in the cloud's own space) are drawn.
     bool crop = false;
     std::array<double, 3> cropLo{0, 0, 0}, cropHi{0, 0, 0};
     float opacity = 1;
+    // Only the splats with a 1 here are drawn (one byte a splat, media/Splats.h splatKeep); null: all.
+    std::shared_ptr<const std::vector<uint8_t>> keep;
+    // Splats that cannot reach the picture are passed over before their shape and colour are worked out. The picture
+    // is the same either way (off only to compare).
+    bool cullToView = true;
+    // Each splat's centre alone, as one pixel of its colour, the nearest in front (a quick look at a heavy capture).
+    bool points = false;
+    SplatRenderStats* stats = nullptr;
 };
+
+// The splats of `cloud` (those `keep` keeps, or all) whose centres, placed by `place` and seen by `camera`, fall inside
+// the closed outline `polygon` (picture pixels, even-odd), in front of the camera: one byte a splat.
+std::vector<uint8_t> splatsInOutline(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera,
+                                     const std::vector<std::array<double, 2>>& polygon, const std::vector<uint8_t>* keep = nullptr);
+// The same for a brush: within `radius` pixels of the stroke through `points`.
+std::vector<uint8_t> splatsUnderBrush(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera,
+                                      const std::vector<std::array<double, 2>>& points, double radius, const std::vector<uint8_t>* keep = nullptr);
 
 // The cloud through the camera, w x h, premultiplied. `depth` (w x h): the depth in front of the camera where the
 // splats in front have covered half the pixel (else their weighted mean), 0 where nothing is drawn.

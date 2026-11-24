@@ -1,6 +1,9 @@
 #include "ImfEvents.h"
 
 #include <QCryptographicHash>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QRegularExpression>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
@@ -31,6 +34,125 @@ bool editRateText(const QString& s) {
 bool uriText(const QString& s) {
     static const QRegularExpression re(QStringLiteral("^[A-Za-z][A-Za-z0-9+.-]*:\\S+$"));
     return re.match(s).hasMatch();
+}
+
+
+// Whether a document is the JSON form (A.4): its first character that is not white space opens an object.
+bool jsonDocument(const std::string& text) {
+    size_t i = 0;
+    if (text.size() >= 3 && uint8_t(text[0]) == 0xef && uint8_t(text[1]) == 0xbb && uint8_t(text[2]) == 0xbf) i = 3;
+    while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n')) ++i;
+    return i < text.size() && text[i] == '{';
+}
+
+// An event as the JSON form holds it: A.5's properties, and what a marker has in an object under Montage's scheme.
+QJsonObject eventJson(const ImfEvent& e, size_t index) {
+    QJsonObject o{{"id", QString::fromStdString(e.id.empty() ? "M" + std::to_string(index + 1) : e.id)},
+                  {"startCount", QString::number(e.start)},
+                  {"endCount", QString::number(std::max(e.end, e.start))}};
+    QJsonObject m;
+    if (!e.name.empty()) m["name"] = QString::fromStdString(e.name);
+    if (!e.comment.empty()) m["comment"] = QString::fromStdString(e.comment);
+    if (e.colour > 0) m["colour"] = QString::fromLatin1(labelName(e.colour));
+    QJsonArray kinds;
+    if (e.chapter) kinds.append("chapter");
+    if (e.adBreak) kinds.append("ad-break");
+    if (!kinds.isEmpty()) m["kinds"] = kinds;
+    if (!m.isEmpty()) o[kMarkerNs] = m;
+    return o;
+}
+
+dcp::Uuid nameBasedId(const QByteArray& of) {
+    const QByteArray hash = QCryptographicHash::hash(of, QCryptographicHash::Md5);
+    dcp::Uuid id{};
+    std::copy(hash.begin(), hash.begin() + 16, id.begin());
+    id[6] = uint8_t((id[6] & 0x0f) | 0x30);
+    id[8] = uint8_t((id[8] & 0x3f) | 0x80);
+    return id;
+}
+
+bool parseJsonEvents(const std::string& text, std::vector<ImfEvent>& events, uint32_t& num, uint32_t& den, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    QJsonParseError bad;
+    const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(text), &bad);
+    if (!doc.isObject()) return fail("does not read: " + bad.errorString().toStdString());
+    const QJsonObject o = doc.object();
+    if (!o.value("events").isArray() || !o.contains("editRate")) return fail("not a Simple Scheme Timed Events Resource (ST 2067-206 Annex A)");
+    const QStringList parts = o.value("editRate").toString().trimmed().split(' ', Qt::SkipEmptyParts);
+    if (parts.size() == 2) num = parts[0].toUInt(), den = parts[1].toUInt();
+    if (!num || !den) return fail("has no editRate");
+    const QJsonArray list = o.value("events").toArray();
+    if (list.size() > 1000000) return fail("too many events");
+    for (const QJsonValue& v : list) {
+        const QJsonObject j = v.toObject();
+        ImfEvent e;
+        e.id = j.value("id").toString().trimmed().toStdString();
+        e.start = j.contains("startCount") ? j.value("startCount").toString().trimmed().toLongLong() : std::numeric_limits<int64_t>::min();
+        e.end = j.contains("endCount") ? j.value("endCount").toString().trimmed().toLongLong() : std::numeric_limits<int64_t>::max();
+        const QJsonObject m = j.value(kMarkerNs).toObject();
+        e.name = m.value("name").toString().toStdString();
+        e.comment = m.value("comment").toString().toStdString();
+        e.colour = std::max(0, labelFromName(m.value("colour").toString().trimmed().toStdString()));
+        for (const QJsonValue& k : m.value("kinds").toArray()) {
+            e.chapter = e.chapter || k.toString() == "chapter";
+            e.adBreak = e.adBreak || k.toString() == "ad-break";
+        }
+        events.push_back(std::move(e));
+    }
+    return true;
+}
+
+// What A.4 and A.5 ask of the JSON form.
+std::vector<std::string> checkJsonEvents(const std::string& text) {
+    std::vector<std::string> out;
+    QJsonParseError bad;
+    const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(text), &bad);
+    if (!doc.isObject()) {
+        out.push_back("it is not a JSON object (ST 2067-206 A.4): " + bad.errorString().toStdString());
+        return out;
+    }
+    const QJsonObject o = doc.object();
+    for (const char* name : {"id", "editRate", "objects", "events"})
+        if (!o.contains(name)) out.push_back(std::string("it has no ") + name + " (A.5)");
+    if (o.contains("id") && (!o.value("id").isString() || !uriText(o.value("id").toString())))
+        out.push_back("its id (" + o.value("id").toVariant().toString().toStdString() + ") is not a URI (A.5)");
+    if (o.contains("editRate") && (!o.value("editRate").isString() || !editRateText(o.value("editRate").toString())))
+        out.push_back("its editRate (" + o.value("editRate").toVariant().toString().toStdString() + ") is not two positive whole numbers (A.5)");
+    for (const char* list : {"objects", "events"}) {
+        if (!o.contains(list)) continue;
+        const std::string item = std::string(list) == "objects" ? "object" : "event";
+        if (!o.value(list).isArray()) {
+            out.push_back(std::string("its ") + list + " is not a list (A.5)");
+            continue;
+        }
+        std::set<QString> seen;
+        for (const QJsonValue& v : o.value(list).toArray()) {
+            if (!v.isObject()) {
+                out.push_back(std::string("its ") + list + " holds something that is not an " + item);
+                continue;
+            }
+            const QJsonObject j = v.toObject();
+            const QString id = j.value("id").toString();
+            if (!j.value("id").isString()) out.push_back("an " + item + " has no id (A.5)");
+            else if (id.contains(',')) out.push_back("the " + item + " id \"" + id.toStdString() + "\" holds a comma (A.5)");
+            else if (!seen.insert(id).second) out.push_back("the " + item + " id \"" + id.toStdString() + "\" is not unique (A.5)");
+            if (item != "event") continue;
+            bool counts = true;
+            for (const char* count : {"startCount", "endCount"})
+                if (j.contains(count) && (!j.value(count).isString() || !countText(j.value(count).toString()))) {
+                    out.push_back("an event's " + std::string(count) + " (" + j.value(count).toVariant().toString().toStdString() +
+                                  ") is not a whole number as a string (A.5)");
+                    counts = false;
+                }
+            if (counts && j.contains("startCount") && j.contains("endCount") &&
+                j.value("endCount").toString().toLongLong() < j.value("startCount").toString().toLongLong())
+                out.push_back("event " + id.toStdString() + " ends before it starts (A.5: endCount >= startCount)");
+        }
+    }
+    return out;
 }
 
 }  // namespace
@@ -66,7 +188,21 @@ Marker markerOfImfEvent(const ImfEvent& e, int64_t at, int64_t length) {
     return m;
 }
 
-std::string imfEventsDocument(const std::vector<ImfEvent>& events, uint32_t num, uint32_t den) {
+std::string imfEventsDocument(const std::vector<ImfEvent>& events, uint32_t num, uint32_t den, bool json) {
+    if (json) {
+        QJsonArray list;
+        for (size_t i = 0; i < events.size(); ++i) list.append(eventJson(events[i], i));
+        // (the document's id: a name-based UUID of the events and the rate)
+        const QByteArray body = QJsonDocument(list).toJson(QJsonDocument::Compact);
+        const QString uuid = QString::fromStdString(dcp::uuidString(nameBasedId(body + QByteArray::number(num) + ' ' + QByteArray::number(den))));
+        // (written by hand in A.5's order: a JSON object's keys come out sorted otherwise)
+        QByteArray out = "{\n  \"id\": \"urn:uuid:" + uuid.toLatin1() + "\",\n  \"editRate\": \"" + QByteArray::number(num) + ' ' + QByteArray::number(den) +
+                         "\",\n  \"objects\": [],\n  \"events\": [";
+        for (int i = 0; i < list.size(); ++i)
+            out += (i ? ",\n    " : "\n    ") + QJsonDocument(list[i].toObject()).toJson(QJsonDocument::Compact);
+        out += list.isEmpty() ? "]\n}\n" : "\n  ]\n}\n";
+        return out.toStdString();
+    }
     auto writeEvents = [&](QXmlStreamWriter& x) {
         x.writeStartElement(kResourceNs, "events");
         for (size_t i = 0; i < events.size(); ++i) {
@@ -90,12 +226,7 @@ std::string imfEventsDocument(const std::vector<ImfEvent>& events, uint32_t num,
         QXmlStreamWriter x(&body);
         writeEvents(x);
     }
-    const QByteArray hash = QCryptographicHash::hash(body + QByteArray::number(num) + ' ' + QByteArray::number(den), QCryptographicHash::Md5);
-    dcp::Uuid id{};
-    std::copy(hash.begin(), hash.begin() + 16, id.begin());
-    id[6] = uint8_t((id[6] & 0x0f) | 0x30);
-    id[8] = uint8_t((id[8] & 0x3f) | 0x80);
-    const QString uuid = QString::fromStdString(dcp::uuidString(id));
+    const QString uuid = QString::fromStdString(dcp::uuidString(nameBasedId(body + QByteArray::number(num) + ' ' + QByteArray::number(den))));
     QByteArray out;
     QXmlStreamWriter x(&out);
     x.setAutoFormatting(true);
@@ -120,6 +251,7 @@ bool parseImfEventsDocument(const std::string& xml, std::vector<ImfEvent>& event
     };
     events.clear();
     num = den = 0;
+    if (jsonDocument(xml)) return parseJsonEvents(xml, events, num, den, error);
     QXmlStreamReader r(QByteArray::fromStdString(xml));
     if (!r.readNextStartElement() || r.name() != QLatin1String("document") || r.namespaceUri() != kResourceNs)
         return fail("not a Simple Scheme Timed Events Resource (ST 2067-206 Annex A)");
@@ -168,6 +300,7 @@ bool parseImfEventsDocument(const std::string& xml, std::vector<ImfEvent>& event
 }
 
 std::vector<std::string> checkImfEventsDocument(const std::string& xml) {
+    if (jsonDocument(xml)) return checkJsonEvents(xml);
     std::vector<std::string> out;
     QXmlStreamReader r(QByteArray::fromStdString(xml));
     if (!r.readNextStartElement() || r.name() != QLatin1String("document") || r.namespaceUri() != kResourceNs) {

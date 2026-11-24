@@ -21,6 +21,9 @@
 #include "core/Xlsx.h"
 #include <QtEndian>
 #include <cstring>
+#ifdef Q_OS_LINUX
+#include <fcntl.h>
+#endif
 #include "core/Cdl.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
@@ -1303,6 +1306,35 @@ private slots:
             c0.markers.clear();
             c0.sourceIn = 0;
         }
+        // A shot change marked on a picture goes on its linked sound too, at the sound's own source time for that
+        // frame and once only; a clip that is not linked, or not playing at that frame, gets none; and the sequence
+        // counts the shot change once.
+        {
+            Fixture fx;
+            const Id v = fx.put(V1, 0, 100, 0), a = fx.put(A1, 0, 100, 25);
+            const TrackRef A2{TrackKind::Audio, 1}, A3{TrackKind::Audio, 2};
+            const Id other = fx.put(A2, 0, 100, 0), late = fx.put(A3, 60, 40, 0);
+            for (const Id id : {v, a, late}) edit::clipById(fx.s(), id)->linkGroup = 7;
+            QVERIFY(markShotChange(fx.s(), 40));
+            const Clip& sound = *edit::clipById(fx.s(), a);
+            QCOMPARE(edit::clipById(fx.s(), v)->markers.size(), size_t(1));
+            QCOMPARE(sound.markers.size(), size_t(1));
+            QVERIFY(sound.markers[0].shotChange);
+            QCOMPARE(sound.markers[0].t, FrameTime(65));
+            QCOMPARE(sound.markerFrame(sound.markers[0]), FrameTime(40));
+            QVERIFY(edit::clipById(fx.s(), other)->markers.empty());
+            QVERIFY(edit::clipById(fx.s(), late)->markers.empty());
+            QCOMPARE(captionShotChanges(fx.s()), std::vector<FrameTime>{40});
+            QVERIFY(!markShotChange(fx.s(), 40));
+            QCOMPARE(markShotChangeOnLinked(fx.s(), v, 40), 0);
+            QCOMPARE(sound.markers.size(), size_t(1));
+            // (scene detection's way in: the frame its marker shows at)
+            QCOMPARE(markShotChangeOnLinked(fx.s(), v, 70), 2);
+            QCOMPARE(edit::clipById(fx.s(), late)->markers.at(0).t, FrameTime(10));
+            // The sound keeps it without its picture.
+            QVERIFY(removeClips(fx.p, fx.s(), {v}, false).ok);
+            QCOMPARE(edit::clipById(fx.s(), a)->markers.size(), size_t(2));
+        }
 
         // The half-second rules at each rate: a caption starting just after a cut starts on it; one ending just before a
         // cut, on it, or just after it ends two frames before it; one whose speech is over well before a cut it runs
@@ -1775,6 +1807,66 @@ private slots:
         QVERIFY(std::fabs(hit(80) - 0.5 * 50 / 127.0) < 1e-6);  // (80 comes out 50: the soft layer)
     }
 
+    void samplerSendsSlotsToTheirTracks() {
+        using namespace sampler;
+        // A slot sent to another track is rendered into that track's block and nowhere else. One sent nowhere, or to a
+        // track the render has no block for, stays in the sampler's own. A choke group still cuts across the blocks.
+        const int rate = 48000;
+        auto level = [&](float v) {
+            auto b = std::make_shared<AudioBuffer>();
+            b->sampleRate = rate, b->channels = 2;
+            b->samples.assign(size_t(4800) * 2, v);
+            return AudioBufferPtr(b);
+        };
+        std::map<std::string, AudioBufferPtr> files{{"own", level(0.25f)}, {"seven", level(0.5f)}, {"nine", level(1.0f)}};
+        const Loader load = [&](const std::string& path, int, std::string*) { return files.at(path); };
+        SamplerSettings st;
+        auto slot = [&](int key, const char* sound, Id output, int choke) {
+            SamplerSlot sl;
+            sl.key = key;
+            sl.sounds = {{sound, 0, 0, 1, 127}};
+            sl.output = output;
+            sl.choke = choke;
+            st.pads.push_back(sl);
+        };
+        slot(40, "own", 0, 0);
+        slot(41, "seven", 7, 1);
+        slot(42, "nine", 9, 1);
+        Engine e(rate);
+        e.setKit(loadKit(st, rate, nullptr, load));
+        const int frames = 256;
+        std::vector<float> own(frames * 2, 0.0f), seven(frames * 2, 0.0f), nine(frames * 2, 0.0f);
+        const Engine::Send sends[2] = {{7, seven.data()}, {9, nine.data()}};
+        e.noteOn(40, 127, 0);
+        e.noteOn(41, 127, 0);
+        e.noteOn(42, 127, 100);  // (it cuts key 41, its choke group, from frame 100)
+        e.render(0, frames, own.data(), sends, 2);
+        for (int i = 0; i < frames * 2; ++i) QCOMPARE(own[size_t(i)], 0.25f);
+        for (int i = 0; i < 100 * 2; ++i) {
+            QCOMPARE(seven[size_t(i)], 0.5f);
+            QCOMPARE(nine[size_t(i)], 0.0f);
+        }
+        for (int i = 100 * 2; i < frames * 2; ++i) QCOMPARE(nine[size_t(i)], 1.0f);
+        QVERIFY(seven[100 * 2] < 0.5f);                                            // (fading from the frame it was cut at)
+        for (int i = 150 * 2; i < frames * 2; ++i) QCOMPARE(seven[size_t(i)], 0.0f);  // (gone within a millisecond)
+        // No block for track 9: its slot is heard with the sampler's own.
+        e.reset();
+        std::fill(own.begin(), own.end(), 0.0f);
+        std::fill(seven.begin(), seven.end(), 0.0f);
+        e.noteOn(42, 127, 0);
+        e.render(0, frames, own.data(), sends, 1);
+        for (int i = 0; i < frames * 2; ++i) {
+            QCOMPARE(own[size_t(i)], 1.0f);
+            QCOMPARE(seven[size_t(i)], 0.0f);
+        }
+        // Rendered without sends, everything is in the one block.
+        e.reset();
+        std::fill(own.begin(), own.end(), 0.0f);
+        e.noteOn(41, 127, 0);
+        e.render(0, frames, own.data());
+        for (int i = 0; i < frames * 2; ++i) QCOMPARE(own[size_t(i)], 0.5f);
+    }
+
     void samplerStreamsLongSounds() {
         using namespace sampler;
         // A ten-minute sound (thirty seconds under valgrind: MONTAGE_TEST_SHORT) streamed from a slow disk, its first second
@@ -1813,6 +1905,20 @@ private slots:
         QVERIFY(disk->pads[1].sounds[0].disk && disk->pads[1].sounds[0].start == std::llround(12.5 * rate));
         const std::string cacheFile = sd.disk->file;
         QVERIFY(QFileInfo::exists(QString::fromStdString(cacheFile)));
+#ifdef Q_OS_LINUX
+        {
+            // The cache file is held open, and closed in any program Montage starts (nightly 23 Nov: a plug-in host
+            // inherited it and its lock, so the cache could not be tidied while the host ran).
+            int held = 0;
+            const QDir fds(QStringLiteral("/proc/self/fd"));
+            for (const QString& name : fds.entryList(QDir::Files | QDir::System | QDir::NoDotAndDotDot)) {
+                if (QFile::symLinkTarget(fds.filePath(name)) != QString::fromStdString(cacheFile)) continue;
+                ++held;
+                QVERIFY2(::fcntl(name.toInt(), F_GETFD) & FD_CLOEXEC, qPrintable(name));
+            }
+            QVERIFY(held >= 1);
+        }
+#endif
         {
             // Offline, the disk at 100 MB/s: both keys, the second a little later.
             setDiskThrottle(0.01);
@@ -1927,10 +2033,14 @@ private slots:
         QVERIFY(events[2].key == nrpn && events[2].value == (11 << 7 | 21));
         QVERIFY(events[3].key == (Key{Kind::Rpn, 1, 0}) && events[3].value == 2);
         QVERIFY(events[4].key == (Key{Kind::Cc, 1, 6}) && events[4].value == 9);
-        // Chosen again and moved by its fine half alone: near where it was, not near zero.
+        // Chosen again and moved by its fine half alone: held in case its coarse half follows, then (flush: a pair's
+        // time has passed) near where it was, not near zero.
         events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 22});
+        QVERIFY(events.empty() && decoder.holding());
+        decoder.flush([&](const Event& e) { events.push_back(e); });
         QCOMPARE(events.size(), size_t(1));
         QVERIFY(events[0].key == nrpn && events[0].value == (11 << 7 | 22));
+        QVERIFY(!decoder.holding());
 
         // ---- Names, as maps are saved.
         QCOMPARE(keyName(nrpn), std::string("nrpn:2:388"));
@@ -2300,10 +2410,104 @@ private slots:
         QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
         QVERIFY(events[1].key == nrpn && events[1].value == (11 << 7 | 30));
         QVERIFY(events[2].key == nrpn && events[2].value == (12 << 7 | 40));
-        // (then a fine half alone, twice: the second goes out with the coarse half it has)
+        // (then a fine half alone, twice: each goes out with the coarse half it has, the first when the second
+        // comes, the second once a pair's time has passed)
+        auto rest = [&] {
+            std::vector<Event> held;
+            decoder.flush([&](const Event& e) { held.push_back(e); });
+            return held;
+        };
         events = decode({0xB1, 38, 41, 0xB1, 38, 42});
         QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (12 << 7 | 41));
+        events = rest();
+        QCOMPARE(events.size(), size_t(1));
         QVERIFY(events[0].key == nrpn && events[0].value == (12 << 7 | 42));
+        // Nightly 23 Nov: nothing is learnt about a controller's order, so nothing can be learnt wrong for good.
+        // A controller that sends the coarse half first, the parameter chosen once, its first message a fine half
+        // alone (no telling where the control is yet: nothing is sent): the pairs after it each come once, whole,
+        // and nothing is left held.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 5});
+        QVERIFY(events.empty() && decoder.holding());
+        QVERIFY(rest().empty() && !decoder.holding());
+        events = decode({0xB1, 6, 10, 0xB1, 38, 20, 0xB1, 6, 11, 0xB1, 38, 21});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
+        QVERIFY(events[1].value == (11 << 7 | 21));
+        QVERIFY(!decoder.holding());
+        // (the same with no pause after the lone half, which no order of messages can tell from pairs sent fine
+        // half first: the last half is held, and sent once a pair's time has passed, so the control ends where it is)
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 5, 0xB1, 6, 10, 0xB1, 38, 20, 0xB1, 6, 11, 0xB1, 38, 21});
+        QVERIFY(decoder.holding());
+        events = rest();
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].value == (11 << 7 | 21));
+        // A controller that sends the fine half first, the parameter chosen once: two fine halves alone, each sent
+        // with the coarse half it has; the pairs after them still come once each, whole (not the fine half with the
+        // coarse half before it, the coarse halves lost), and a last fine half alone is sent too.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 20, 0xB1, 6, 10});
+        QCOMPARE(events.size(), size_t(1));
+        for (int fine : {21, 22}) {
+            QVERIFY(decode({0xB1, 38, uint8_t(fine)}).empty());
+            events = rest();
+            QCOMPARE(events.size(), size_t(1));
+            QCOMPARE(events[0].value, 10 << 7 | fine);
+        }
+        events = decode({0xB1, 38, 30, 0xB1, 6, 11, 0xB1, 38, 40, 0xB1, 6, 12});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].value == (11 << 7 | 30) && events[1].value == (12 << 7 | 40));
+        QVERIFY(!decoder.holding());
+        QVERIFY(decode({0xB1, 38, 41}).empty());
+        events = rest();
+        QVERIFY(events.size() == 1 && events[0].value == (12 << 7 | 41) && !decoder.holding());
+        // Given when each message arrived, a lone half is told from a pair by the time between them, with no pause
+        // for the caller's flush: a controller that sends the coarse half first, its first message a fine half alone,
+        // then pairs 20 ms apart, each pair's halves 0.5 ms apart: every value once, whole, its own two halves.
+        auto timed = [&](const std::vector<std::pair<std::vector<uint8_t>, int64_t>>& messages) {
+            std::vector<Event> out;
+            for (const auto& [bytes, at] : messages) decoder.feed(MidiMessage(bytes), [&](const Event& e) { out.push_back(e); }, at);
+            return out;
+        };
+        {
+            const Decoder saved = decoder;
+            decoder.reset();
+            events = timed({{{0xB1, 99, 3}, 0}, {{0xB1, 98, 4}, 100}, {{0xB1, 38, 5}, 200}, {{0xB1, 6, 10}, 20000}, {{0xB1, 38, 20}, 20500},
+                            {{0xB1, 6, 11}, 40000}, {{0xB1, 38, 21}, 40500}, {{0xB1, 6, 12}, 60000}, {{0xB1, 38, 22}, 60500}});
+            QCOMPARE(events.size(), size_t(3));
+            QVERIFY(events[0].key == nrpn && events[0].value == (10 << 7 | 20) && events[0].resolution == 16384);
+            QVERIFY(events[1].value == (11 << 7 | 21) && events[2].value == (12 << 7 | 22));
+            // A controller that sends the fine half first: two fine halves alone, 20 ms apart, then pairs again. Each
+            // lone half goes out with the coarse half the parameter has once the next half shows it came alone (the
+            // last held until a pair's time has passed), and the pairs after them are whole.
+            decoder.reset();
+            events = timed({{{0xB1, 99, 3}, 0}, {{0xB1, 98, 4}, 100}, {{0xB1, 38, 20}, 200}, {{0xB1, 6, 10}, 600}, {{0xB1, 38, 21}, 20000},
+                            {{0xB1, 38, 22}, 40000}, {{0xB1, 38, 30}, 60000}, {{0xB1, 6, 11}, 60500}, {{0xB1, 38, 40}, 80000},
+                            {{0xB1, 6, 12}, 80500}});
+            QCOMPARE(events.size(), size_t(5));
+            QCOMPARE(events[0].value, 10 << 7 | 20);
+            QCOMPARE(events[1].value, 10 << 7 | 21);
+            QCOMPARE(events[2].value, 10 << 7 | 22);
+            QCOMPARE(events[3].value, 11 << 7 | 30);
+            QCOMPARE(events[4].value, 12 << 7 | 40);
+            QVERIFY(!decoder.holding());
+            // (a lone coarse half, 20 ms before a pair: 13 with a fine half of 0, then the pair)
+            events = timed({{{0xB1, 6, 13}, 100000}, {{0xB1, 6, 14}, 120000}, {{0xB1, 38, 1}, 120500}});
+            QCOMPARE(events.size(), size_t(2));
+            QVERIFY(events[0].value == (13 << 7) && events[1].value == (14 << 7 | 1));
+            decoder = saved;
+        }
+        // A coarse half alone, from a parameter that sends fine halves: its fine half is 0 (MIDI 1.0).
+        QVERIFY(decode({0xB1, 6, 13}).empty());
+        events = rest();
+        QVERIFY(events.size() == 1 && events[0].value == (13 << 7) && events[0].resolution == 16384);
+        // A half held when another parameter is chosen goes out for its own parameter.
+        events = decode({0xB1, 38, 7, 0xB1, 99, 3, 0xB1, 98, 9, 0xB1, 6, 1});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].key == nrpn && events[0].value == (13 << 7 | 7));
+        QVERIFY(events[1].key == (Key{Kind::Nrpn, 1, 3 << 7 | 9}) && events[1].value == 1 && events[1].resolution == 128);
 
         // ---- One fader, three targets, each in its own range.
         {
@@ -5576,6 +5780,61 @@ private slots:
         QVERIFY(nestRange(fz.p, fz.s(), 10, 20, allTracks(fz.s()), "Sound").ok);
         QVERIFY(trackAt(*fz.p.active(), V1)->clips.empty());
         QCOMPARE(trackAt(*fz.p.active(), A1)->clips.size(), size_t(3));
+        // A range that ends in an empty stretch: the compound is as long as the range (its picture and its sound),
+        // though the nested sequence ends at its last clip; and one that begins in one keeps the gap inside.
+        Fixture fg;
+        const Result placed = placeMedia(fg.p, fg.s(), fg.media, 0, 0, 30, V1, A1, false);
+        QVERIFY(placed.ok);
+        fg.put(V2, 60, 20);
+        const Id outerId = fg.s().id;
+        const Result gap = nestRange(fg.p, fg.s(), 10, 50, allTracks(fg.s()), "Gap");
+        QVERIFY2(gap.ok, gap.error.c_str());
+        {
+            const Sequence& outer = *fg.p.findSequence(outerId);
+            const Track& v1 = *trackAt(outer, V1);
+            QCOMPARE(v1.clips.size(), size_t(2));
+            QCOMPARE(v1.clips[1].start, FrameTime(10));
+            QCOMPARE(v1.clips[1].duration, FrameTime(40));
+            const Track& a1 = *trackAt(outer, A1);
+            QCOMPARE(a1.clips.size(), size_t(2));
+            QCOMPARE(a1.clips[1].start, FrameTime(10));
+            QCOMPARE(a1.clips[1].duration, FrameTime(40));
+            const MediaItem* m = fg.p.findMedia(v1.clips[1].mediaId);
+            QVERIFY(m && m->kind == MediaKind::Sequence);
+            QCOMPARE(fg.p.findSequence(m->sequenceId)->duration(), FrameTime(20));  // (10 to 30 of the range)
+            QCOMPARE(trackAt(outer, V2)->clips.size(), size_t(1));                  // (after Out: as it was)
+            // Saved and opened again it is as long.
+            Project again;
+            std::string err;
+            QVERIFY2(projectFromJson(projectToJson(fg.p), again, &err), err.c_str());
+            QCOMPARE(trackAt(*again.findSequence(outerId), V1)->clips[1].duration, FrameTime(40));
+        }
+        Fixture fh;
+        fh.put(V1, 20, 30);
+        const Id hId = fh.s().id;
+        QVERIFY(nestRange(fh.p, fh.s(), 10, 40, allTracks(fh.s()), "Lead").ok);
+        {
+            const Track& v1 = *trackAt(*fh.p.findSequence(hId), V1);
+            QCOMPARE(v1.clips.size(), size_t(2));
+            QCOMPARE(v1.clips[0].start, FrameTime(10));
+            QCOMPARE(v1.clips[0].duration, FrameTime(30));
+            const Sequence& nested = *fh.p.findSequence(fh.p.findMedia(v1.clips[0].mediaId)->sequenceId);
+            QCOMPARE(trackAt(nested, V1)->clips[0].start, FrameTime(10));
+        }
+        // The locked tracks whose clips will stay are named before anything is cut: those with clips in the range.
+        Fixture fl;
+        fl.put(V1, 0, 60);
+        fl.put(V2, 20, 10);
+        fl.put(V2, 70, 10);
+        fl.put(V3, 80, 10);
+        trackAt(fl.s(), V2)->locked = true;
+        trackAt(fl.s(), V3)->locked = true;
+        QCOMPARE(nestRangeStays(fl.s(), 10, 50, allTracks(fl.s())), std::vector<TrackRef>{V2});
+        QVERIFY(nestRangeStays(fl.s(), 30, 50, allTracks(fl.s())).empty());
+        QCOMPARE(nestRangeStays(fl.s(), 10, 90, allTracks(fl.s())), (std::vector<TrackRef>{V2, V3}));
+        QVERIFY(nestRangeStays(fl.s(), 50, 50, allTracks(fl.s())).empty());
+        QVERIFY(nestRange(fl.p, fl.s(), 10, 50, allTracks(fl.s()), "Under").ok);
+        QCOMPARE(trackAt(*fl.p.active(), V2)->clips.size(), size_t(2));  // (as they were, above the compound)
     }
 
     // Nightly 15 Nov: Nest In to Out leaves what is seen and heard as it was, or refuses before cutting anything.

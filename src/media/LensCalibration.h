@@ -73,11 +73,22 @@ struct ClipCalibration {
     int framesRead = 0, boardsFound = 0;
     std::vector<double> times;  // the views' times (seconds into the file)
 };
+// What a calibration from a clip has read of it so far, so that one cut short can go on from there.
+struct ClipBoards {
+    int width = 0, height = 0, frames = 0;  // the frames' size, and how many of them are looked at
+    int nextFrame = 0;                       // those before it have been read
+    int framesRead = 0, boardsFound = 0;
+    std::vector<std::vector<Point2>> views;  // the boards kept
+    std::vector<double> times;
+};
 // Calibrates from a clip of a checkerboard (media time `from` to `to`; all of it when `to` is not after `from`): up to
-// `maxViews` frames where the board is seen and has moved since the last one kept.
+// `maxViews` frames where the board is seen and has moved since the last one kept. `boards`, when given, is what an
+// earlier run of the same calibration read (it goes on from there when its frames are the clip's) and is kept up to
+// date as frames are read; `read` is told after each one.
 bool calibrateClip(const std::string& path, double from, double to, int cols, int rows, const LensFitOptions& options,
                    ClipCalibration& out, std::string* error = nullptr, const std::function<void(double)>& progress = {},
-                   const std::atomic<bool>* cancel = nullptr, int maxViews = 40);
+                   const std::atomic<bool>* cancel = nullptr, int maxViews = 40, ClipBoards* boards = nullptr,
+                   const std::function<void(const ClipBoards&)>& read = {});
 
 // ST maps (Nuke's convention: red the source's x over its width, green 1 minus its y over its height, at the output
 // pixel's centre) for a lens's distortion on a width x height recording, as Lens Correction draws it with no fit:

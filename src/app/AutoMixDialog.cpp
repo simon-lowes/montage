@@ -10,7 +10,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
-#include <QProgressDialog>
+#include <QJsonObject>
 #include <QPushButton>
 #include <QTableWidget>
 #include <QTimer>
@@ -18,6 +18,7 @@
 #include <QtConcurrent>
 #include <memory>
 
+#include "DialogJobs.h"
 #include "EditorState.h"
 #include "core/EditOps.h"
 
@@ -192,42 +193,14 @@ int AutoMixDialog::apply(EditorState* state, const std::vector<ClipMix>& plan, c
 int AutoMixDialog::run(EditorState* state, QWidget* parent) {
     const Sequence* seq = state->sequence();
     if (!seq) return -1;
-    const Project project = state->project();
-    const Sequence sequence = *seq;
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    auto done = std::make_shared<std::atomic<double>>(0.0);
-    QProgressDialog progress(tr("Listening to the audio…"), tr("Cancel"), 0, 1000, parent);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    QObject::connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
-    QTimer tick;
-    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
-    tick.start(100);
-    using Out = std::pair<std::vector<ClipMix>, std::string>;
-    QFutureWatcher<Out> watcher;
-    QEventLoop wait;
-    QObject::connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
-    const MixOptions defaults;
-    watcher.setFuture(QtConcurrent::run([project, sequence, defaults, cancel, done] {
-        Out out;
-        out.first = planMix(project, sequence, defaults, [done](double f) { *done = f; }, cancel.get(), &out.second);
-        return out;
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    tick.stop();
-    QObject::disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
-    progress.close();
-    if (*cancel) return -1;
-    Out r = watcher.result();
-    if (r.first.empty()) {
-        state->message(r.second.empty() ? tr("There is no audio to mix") : QString::fromStdString(r.second), 5000);
-        return -1;
-    }
-    AutoMixDialog dlg(state, std::move(r.first), parent);
-    if (dlg.exec() != QDialog::Accepted) return -1;
-    const int n = apply(state, dlg.plan(), dlg.options());
-    state->message(tr("Mixed %n clip(s)", "", n), 5000);
-    return n;
+    // Listening is a background job (DialogJobs.h): watched, the plan is shown here when it ends; left to run, the
+    // plan is kept and offered in the task list, to be looked over and applied from there.
+    const TaskOutcome r = DialogJobs::of(parent)->run(state, QStringLiteral("auto-mix"), tr("Listening to the audio…"),
+                                                      QJsonObject{{"sequence", QString::number(seq->id)}}, parent);
+    if (r.how == TaskOutcome::Failed) state->message(r.error.isEmpty() ? tr("There is no audio to mix") : r.error, 5000);
+    if (!r.done()) return -1;
+    if (r.applied.contains("message")) state->message(r.applied.value("message").toString(), 5000);
+    return r.applied.value("changed").toInt(-1);
 }
 
 }  // namespace montage

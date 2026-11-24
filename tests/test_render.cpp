@@ -65,14 +65,17 @@
 #include "render/AudioFx.h"
 #include "render/ShotGroups.h"
 #include "render/PaintFx.h"
+#include "render/BevelFx.h"
 #include "render/StyleFx.h"
 #include "render/Particles.h"
 #include "render/Titles.h"
+#include "render/Title3D.h"
 #include "core/Expression.h"
 #include "render/GpuCompositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
 #include "render/ImfEvents.h"
+#include "render/PackageFiles.h"
 #include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
@@ -104,6 +107,8 @@
 #include "render/StreamingPackage.h"
 #include "render/LivePackage.h"
 #include "media/Capture.h"
+#include "media/WhipEndpoint.h"
+#include "render/BroadcastMxf.h"
 #include "render/TsSegments.h"
 #include "render/Ac3.h"
 #include "media/Loudness.h"
@@ -120,6 +125,7 @@
 #include "render/TurnRelay.h"
 #include "render/HeadlessBrowser.h"
 #include "render/OGraf.h"
+#include "RelayFake.h"
 #include "ReviewBrowsers.h"
 #ifdef MONTAGE_TEST_TURN
 #include <juice/juice.h>
@@ -160,6 +166,11 @@
 #include "render/TrimPasses.h"
 #include "render/RoomTone.h"
 #include "render/Ocio.h"
+#include "audio/PluginHost.h"
+#include "render/OfxRemote.h"
+#ifdef __linux__
+#include <signal.h>
+#endif
 #include "media/Tracking.h"
 #include "render/Ofx.h"
 #include "render/OfxGl.h"
@@ -170,6 +181,10 @@
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
 #include "render/GrainMatch.h"
+#include "render/Av1FilmGrain.h"
+#include "render/Av1GrainExport.h"
+#include "render/Av1Headers.h"
+#include "Av1Streams.h"
 #include "render/LutToGrade.h"
 #include "render/MonitorSection.h"
 #include "render/LightLevel.h"
@@ -551,6 +566,29 @@ bool writeY4m(const QString& path, int w, int h, int frames, const Y4mFill& fill
     return true;
 }
 
+// Film grain parameters for the AV1 grain tests: two shots' worth of a full set (three luma points, its own chroma
+// points, coefficients two samples back, overlap, restricted range), each frame with its own seed.
+montage::Av1FilmGrain av1TestGrain(int shot, int64_t frame) {
+    montage::Av1FilmGrain g;
+    g.apply = true;
+    g.seed = montage::av1GrainSeed(frame, 7);
+    g.numY = 3;
+    g.yValue[0] = 16, g.yScaling[0] = uint8_t(shot ? 90 : 40);
+    g.yValue[1] = 128, g.yScaling[1] = uint8_t(shot ? 120 : 70);
+    g.yValue[2] = 235, g.yScaling[2] = uint8_t(shot ? 60 : 30);
+    g.numCb = 2, g.cbValue[0] = 16, g.cbScaling[0] = 50, g.cbValue[1] = 240, g.cbScaling[1] = 80;
+    g.numCr = 1, g.crValue[0] = 100, g.crScaling[0] = 64;
+    g.scalingShift = 10;
+    g.arLag = 2;
+    const int8_t y[12] = {2, -5, 9, -4, 1, -6, 20, 33, 18, -7, 12, 41};
+    for (int i = 0; i < 12; ++i) g.arY[i] = y[i], g.arCb[i] = int8_t(y[i] / 2), g.arCr[i] = int8_t(-y[i] / 3);
+    g.arCb[12] = 40, g.arCr[12] = -25;
+    g.arShift = 7;
+    g.cbMult = 140, g.cbLumaMult = 180, g.cbOffset = 250;
+    g.overlap = true, g.clipRestricted = true;
+    return g;
+}
+
 // A moving, textured picture for the comparisons.
 void encodeTestPicture(int frame, int w, int h, std::vector<uint8_t>& y, std::vector<uint8_t>& cb, std::vector<uint8_t>& cr) {
     for (int r = 0; r < h; ++r)
@@ -591,6 +629,143 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
     c.generator.params["color.g"] = g;
     c.generator.params["color.b"] = b;
     return c;
+}
+
+// A picture with detail down to under four samples across, drifting slowly: what a small rung loses when it is shown
+// large.
+void detailedTestPicture(int frame, int w, int h, std::vector<uint8_t>& y, std::vector<uint8_t>& cb, std::vector<uint8_t>& cr) {
+    for (int r = 0; r < h; ++r)
+        for (int c = 0; c < w; ++c) {
+            const double x = c + 0.5 * frame, v = r + 0.25 * frame;
+            const double s = 0.30 * std::sin(x * 0.011 + v * 0.007) + 0.20 * std::sin(x * 0.13) * std::cos(v * 0.11) +
+                             0.12 * std::sin(x * 0.9 + v * 0.4) + 0.10 * std::sin(x * 1.7 - v * 1.3);
+            y[size_t(r) * w + c] = uint8_t(std::clamp(126 + 110 * s, 16.0, 235.0));
+        }
+    for (int r = 0; r < h / 2; ++r)
+        for (int c = 0; c < w / 2; ++c) {
+            cb[size_t(r) * (w / 2) + c] = uint8_t(128 + int(30 * std::sin((c + frame) * 0.02)));
+            cr[size_t(r) * (w / 2) + c] = uint8_t(128 + int(30 * std::cos((r + frame) * 0.03)));
+        }
+}
+
+// A rendition of a streaming package as one file: its init segment, then its segments in order (CMAF), or its
+// MPEG-TS segments in order (`ts`).
+bool joinStreamingRendition(const QString& rendition, const QString& out, bool ts = false) {
+    QFile all(out);
+    if (!all.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    QStringList files = QDir(rendition).entryList({ts ? "seg*.ts" : "seg*.m4s"}, QDir::Files, QDir::Name);
+    if (files.isEmpty()) return false;
+    if (!ts) files.prepend("init.mp4");
+    for (const QString& name : files) {
+        QFile f(rendition + "/" + name);
+        if (!f.open(QIODevice::ReadOnly)) return false;
+        all.write(f.readAll());
+    }
+    return true;
+}
+
+// The bits of each video sample of a file as its packets carry them, by the frame it is shown at (from the first).
+std::vector<int64_t> videoSampleBits(const QString& file, double fps) {
+    std::vector<std::pair<double, int64_t>> samples;
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, file.toUtf8().constData(), nullptr, nullptr) < 0) return {};
+    const int vs = avformat_find_stream_info(fmt, nullptr) >= 0 ? av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0) : -1;
+    AVPacket* pkt = av_packet_alloc();
+    while (vs >= 0 && av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == vs && pkt->pts != AV_NOPTS_VALUE)
+            samples.push_back({double(pkt->pts) * av_q2d(fmt->streams[vs]->time_base), int64_t(pkt->size) * 8});
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    avformat_close_input(&fmt);
+    double first = std::numeric_limits<double>::max();
+    for (const auto& s : samples) first = std::min(first, s.first);
+    std::vector<int64_t> bits;
+    for (const auto& s : samples) {
+        const size_t frame = size_t(std::llround((s.first - first) * fps));
+        if (frame >= bits.size()) bits.resize(frame + 1);
+        bits[frame] += s.second;
+    }
+    return bits;
+}
+
+// A file's pictures as a Y4M of 8-bit 4:2:0 at w by h, scaled where they are another size by libswscale's bicubic
+// filter with accurate rounding and chroma sited left (the scaler ladder.csv names). Returns the frames written.
+int scaledY4m(const QString& file, int w, int h, const QString& y4m) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, file.toUtf8().constData(), nullptr, nullptr) < 0) return -1;
+    const int vs = avformat_find_stream_info(fmt, nullptr) >= 0 ? av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0) : -1;
+    const AVCodecParameters* par = vs >= 0 ? fmt->streams[vs]->codecpar : nullptr;
+    const AVCodec* codec = par && par->codec_id == AV_CODEC_ID_AV1 ? avcodec_find_decoder_by_name("libdav1d") : nullptr;
+    if (!codec && par) codec = avcodec_find_decoder(par->codec_id);
+    AVCodecContext* dec = codec ? avcodec_alloc_context3(codec) : nullptr;
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    SwsContext* sws = nullptr;
+    QFile out(y4m);
+    int frames = -1;
+    if (dec && avcodec_parameters_to_context(dec, par) >= 0 && avcodec_open2(dec, codec, nullptr) >= 0 && out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        frames = 0;
+        out.write(QStringLiteral("YUV4MPEG2 W%1 H%2 F25:1 Ip A1:1 C420mpeg2\n").arg(w).arg(h).toLatin1());
+        std::vector<uint8_t> plane[3] = {std::vector<uint8_t>(size_t(w) * h), std::vector<uint8_t>(size_t(w / 2) * (h / 2)), std::vector<uint8_t>(size_t(w / 2) * (h / 2))};
+        auto take = [&]() {
+            while (avcodec_receive_frame(dec, frame) >= 0) {
+                uint8_t* data[4] = {plane[0].data(), plane[1].data(), plane[2].data(), nullptr};
+                int lines[4] = {w, w / 2, w / 2, 0};
+                if (frame->width == w && frame->height == h && (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P)) {
+                    for (int c = 0; c < 3; ++c)
+                        for (int r = 0; r < (c ? h / 2 : h); ++r)
+                            std::memcpy(data[c] + size_t(r) * lines[c], frame->data[c] + size_t(r) * frame->linesize[c], size_t(lines[c]));
+                } else {
+                    if (!sws) {
+                        sws = sws_alloc_context();
+                        av_opt_set_int(sws, "srcw", frame->width, 0), av_opt_set_int(sws, "srch", frame->height, 0);
+                        av_opt_set_int(sws, "src_format", frame->format, 0);
+                        av_opt_set_int(sws, "dstw", w, 0), av_opt_set_int(sws, "dsth", h, 0);
+                        av_opt_set_int(sws, "dst_format", AV_PIX_FMT_YUV420P, 0);
+                        av_opt_set_int(sws, "sws_flags", SWS_BICUBIC | SWS_ACCURATE_RND, 0);
+                        av_opt_set_int(sws, "src_h_chr_pos", frame->chroma_location == AVCHROMA_LOC_CENTER ? 128 : 0, 0);
+                        av_opt_set_int(sws, "src_v_chr_pos", 128, 0);
+                        av_opt_set_int(sws, "dst_h_chr_pos", 0, 0), av_opt_set_int(sws, "dst_v_chr_pos", 128, 0);
+                        if (sws_init_context(sws, nullptr, nullptr) < 0) return false;
+                    }
+                    sws_scale(sws, frame->data, frame->linesize, 0, frame->height, data, lines);
+                }
+                out.write("FRAME\n");
+                for (const std::vector<uint8_t>& p : plane) out.write(reinterpret_cast<const char*>(p.data()), qint64(p.size()));
+                ++frames;
+                av_frame_unref(frame);
+            }
+            return true;
+        };
+        bool ok = true;
+        while (ok && av_read_frame(fmt, pkt) >= 0) {
+            if (pkt->stream_index == vs) avcodec_send_packet(dec, pkt);
+            av_packet_unref(pkt);
+            ok = take();
+        }
+        avcodec_send_packet(dec, nullptr);
+        if (!ok || !take()) frames = -1;
+    }
+    sws_freeContext(sws);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&dec);
+    avformat_close_input(&fmt);
+    return frames;
+}
+
+// libvmaf's own tool on a reference and an encode (Y4M): each frame's VMAF with a built-in model; empty when it fails.
+std::vector<double> vmafToolScores(const QString& tool, const QString& ref, const QString& dist, const QString& model, const QString& json) {
+    QProcess pr;
+    pr.start(tool, {"-r", ref, "-d", dist, "--model", "version=" + model, "--json", "-o", json, "-q"});
+    if (!pr.waitForFinished(900000) || pr.exitCode() != 0) return {};
+    QFile jf(json);
+    if (!jf.open(QIODevice::ReadOnly)) return {};
+    std::vector<double> scores;
+    for (const QJsonValue& f : QJsonDocument::fromJson(jf.readAll()).object().value("frames").toArray())
+        scores.push_back(f.toObject().value("metrics").toObject().value("vmaf").toDouble());
+    return scores;
 }
 
 // Talks of ten sentences each, a word every 0.4 s and 0.6 s between sentences, as one transcribed clip in the
@@ -1463,6 +1638,92 @@ private slots:
             QVERIFY(c.vmafNote.find("no HDR model") != std::string::npos);
             QVERIFY(std::none_of(c.warnings.begin(), c.warnings.end(), [](const std::string& w) { return w.find("VMAF") != std::string::npos; }));
         }
+    }
+    void vmafEveryFourthFrame() {
+        // Scoring every fourth frame: the mean within half a VMAF of every frame's on the comparison's test clips (the
+        // drifting texture softened and noisy, and in blocks of four samples), the frames between left unscored while the
+        // other measures still cover them all, and the report saying so. The time VMAF is expected to take: less for
+        // it, in proportion to the frames and the picture's area. And the model goes by the shorter side: an upright
+        // 1080 by 1920 picture takes the 1080 model.
+        if (!vmafAvailable()) QSKIP("Montage is built without libvmaf (MONTAGE_WITH_VMAF)");
+        QTemporaryDir dir;
+        const int w = 320, h = 240, frames = 48;
+        const QString ref = dir.filePath("ref.y4m"), soft = dir.filePath("soft.y4m"), coarse = dir.filePath("coarse.y4m");
+        QVERIFY(writeY4m(ref, w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) { encodeTestPicture(f, w, h, y, cb, cr); }));
+        QVERIFY(writeY4m(soft, w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) {
+            encodeTestPicture(f, w, h, y, cb, cr);
+            const std::vector<uint8_t> sharp = y;
+            uint32_t rnd = 77u + uint32_t(f);
+            for (int r = 0; r < h; ++r)
+                for (int c = 4; c < w - 4; ++c) {
+                    const uint8_t* at = &sharp[size_t(r) * w + c];
+                    rnd = rnd * 1664525u + 1013904223u;
+                    int sum = 0;
+                    for (int k = -4; k <= 4; ++k) sum += at[k];
+                    y[size_t(r) * w + c] = uint8_t(std::clamp(sum / 9 + int(rnd >> 27) - 16, 0, 255));
+                }
+        }));
+        QVERIFY(writeY4m(coarse, w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) {
+            encodeTestPicture(f, w, h, y, cb, cr);
+            // (each block of four by four samples at its mean)
+            for (int r = 0; r + 4 <= h; r += 4)
+                for (int c = 0; c + 4 <= w; c += 4) {
+                    int sum = 0;
+                    for (int k = 0; k < 16; ++k) sum += y[size_t(r + k / 4) * w + c + k % 4];
+                    for (int k = 0; k < 16; ++k) y[size_t(r + k / 4) * w + c + k % 4] = uint8_t(sum / 16);
+                }
+        }));
+        for (const QString& dist : {soft, coarse}) {
+            CompareOptions o;
+            o.search = 0;
+            const EncodeComparison all = compareEncodeFiles(ref.toStdString(), dist.toStdString(), o);
+            o.vmafEvery = 4;
+            const EncodeComparison fourth = compareEncodeFiles(ref.toStdString(), dist.toStdString(), o);
+            QVERIFY2(all.ok && all.vmafScored && fourth.ok && fourth.vmafScored, (all.error + fourth.error).c_str());
+            QVERIFY(all.vmafEvery == 1 && fourth.vmafEvery == 4);
+            QCOMPARE(fourth.frames.size(), size_t(frames));
+            for (size_t i = 0; i < fourth.frames.size(); ++i) {
+                // (a scored frame's score is what full scoring gives it: what runs across frames still saw every frame)
+                if (i % 4 == 0) QVERIFY2(std::fabs(fourth.frames[i].vmaf - all.frames[i].vmaf) < 1e-9, QByteArray::number(int(i)));
+                else QVERIFY2(std::isnan(fourth.frames[i].vmaf), QByteArray::number(int(i)));
+                QVERIFY(sameScore(fourth.frames[i].psnrY, all.frames[i].psnrY));
+            }
+            qInfo("%s: VMAF %.3f on every frame, %.3f on every fourth", qPrintable(QFileInfo(dist).baseName()), all.mean.vmaf, fourth.mean.vmaf);
+            QVERIFY2(all.mean.vmaf > 20 && all.mean.vmaf < 99, QByteArray::number(all.mean.vmaf));
+            QVERIFY2(std::fabs(fourth.mean.vmaf - all.mean.vmaf) < 0.5, qPrintable(QString("%1 %2").arg(fourth.mean.vmaf).arg(all.mean.vmaf)));
+            QVERIFY(sameScore(fourth.mean.psnrY, all.mean.psnrY));
+            // The report says how it was scored (a report of every frame says nothing of it).
+            const QString csv = dir.filePath("fourth.csv"), csvAll = dir.filePath("all.csv");
+            std::string err;
+            QVERIFY2(writeQualityCsv(csv.toStdString(), fourth, nullptr, &err) && writeQualityCsv(csvAll.toStdString(), all, nullptr, &err), err.c_str());
+            QFile f(csv), fa(csvAll);
+            QVERIFY(f.open(QIODevice::ReadOnly) && fa.open(QIODevice::ReadOnly));
+            QVERIFY(f.readAll().contains("# vmaf_every,4\n") && !fa.readAll().contains("vmaf_every"));
+        }
+
+        const double full = vmafSecondsEstimate(1920, 1080, 1000), quick = vmafSecondsEstimate(1920, 1080, 1000, 4);
+        qInfo("VMAF of 1000 frames of 1920x1080 here: about %.0f s, %.0f s scoring every fourth", full, quick);
+        QVERIFY2(full > 0 && quick > 0 && quick <= full, qPrintable(QString("%1 %2").arg(full).arg(quick)));
+        QVERIFY(std::fabs(vmafSecondsEstimate(3840, 2160, 1000) - 4 * full) < 1e-6 * full);
+        QVERIFY(std::fabs(vmafSecondsEstimate(1920, 1080, 4000) - 4 * full) < 1e-6 * full);
+        QVERIFY(vmafSecondsEstimate(1920, 1080, 1000, 1, 1) >= full);
+        QCOMPARE(vmafSecondsEstimate(1920, 1080, 0), 0.0);
+
+        QualityPicture q;
+        q.width = 1080, q.height = 1920;
+        QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v1.0.16_3d0h"));
+        q.width = 1440, q.height = 2560;
+        QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v1.0.16_3d0h"));
+        q.width = 2160, q.height = 3840;
+        QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v1.0.16_3d0h_2160"));
+        // (and a comparison of an upright master says which it used)
+        const QString upright = dir.filePath("upright.y4m");
+        QVERIFY(writeY4m(upright, 1080, 1920, 2, [&](int f, auto& y, auto& cb, auto& cr) { encodeTestPicture(f, 1080, 1920, y, cb, cr); }));
+        CompareOptions o;
+        o.search = 0;
+        const EncodeComparison c = compareEncodeFiles(upright.toStdString(), upright.toStdString(), o);
+        QVERIFY2(c.ok && c.vmafScored, c.error.c_str());
+        QCOMPARE(QString::fromStdString(c.vmafModel), QStringLiteral("vmaf_v1.0.16_3d0h"));
     }
 
     // Phase 15 #3: the sequence an encode is compared with has its chroma made by the export's own scaler, so a
@@ -3195,6 +3456,79 @@ colorspaces:
         QVERIFY(near(c[0], 0.3f, 1e-6f));
     }
 
+    void ocioKeyedControlsBuildOneProcessor() {
+        // A keyed exposure on the CPU: ten frames, and four threads at once on different frames, each come out at the
+        // exposure of their own frame, with one OCIO processor built for all of them.
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        QTemporaryDir dir;
+        const QString cfg = dir.filePath("keyed.ocio");
+        QFile f(cfg);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(R"(ocio_profile_version: 2
+roles:
+  default: linear
+  scene_linear: linear
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  Monitor:
+    - !<View> {name: Half, colorspace: half}
+colorspaces:
+  - !<ColorSpace>
+    name: linear
+  - !<ColorSpace>
+    name: half
+    from_scene_reference: !<MatrixTransform> {matrix: [0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1]}
+)");
+        f.close();
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "ocio");
+        e.strings["config"] = cfg.toStdString();
+        e.strings["src"] = "linear";
+        e.strings["dst"] = "half";
+        e.params["exposure"] = Param(0.0);
+        e.params["exposure"].addKey(0, -2.0);
+        e.params["exposure"].addKey(9, 2.5);
+        QVERIFY(ocioLiveControls(e));
+        auto expected = [&](FrameTime t) { return 0.4 * std::exp2(e.p("exposure", t, 0)) * 0.5; };
+        auto drawn = [&](FrameTime t, std::string* err) {
+            Image img = solid(64, 48, 0.4f, 0.4f, 0.4f);
+            if (!applyOcio(e, img, err, t)) return -1.0;
+            double worst = 0;
+            for (size_t i = 0; i < img.px.size(); i += 4) worst = std::max(worst, std::fabs(double(img.px[i]) - expected(t)) / expected(t));
+            return worst;
+        };
+        const long before = ocioProcessorsBuilt();
+        for (FrameTime t = 0; t < 10; ++t) {
+            std::string err;
+            const double off = drawn(t, &err);
+            QVERIFY2(off >= 0, err.c_str());
+            QVERIFY2(off < 1e-5, qPrintable(QString("frame %1 off by %2").arg(t).arg(off)));
+        }
+        QVERIFY2(expected(0) < 0.06 && expected(9) > 1.1, "the exposure did not change over the frames");
+        QCOMPARE(ocioProcessorsBuilt(), before + 1);
+        // (each thread's processor keeps its own values: none draws with another's exposure)
+        std::atomic<int> wrong{0};
+        std::vector<std::thread> threads;
+        for (int k = 0; k < 4; ++k)
+            threads.emplace_back([&, k] {
+                for (int n = 0; n < 25; ++n)
+                    if (const double off = drawn(FrameTime((k * 3 + n) % 10), nullptr); !(off >= 0 && off < 1e-5)) ++wrong;
+            });
+        for (std::thread& th : threads) th.join();
+        QCOMPARE(wrong.load(), 0);
+        // A value that is set and not keyed, and contrast and gamma, draw with the same processor.
+        Effect fixed = e;
+        fixed.params["exposure"] = Param(1.0);
+        fixed.params["contrast"] = Param(1.5);
+        fixed.params["gamma"] = Param(0.8);
+        Image img = solid(8, 8, 0.4f, 0.4f, 0.4f);
+        QVERIFY(applyOcio(fixed, img, nullptr, 0));
+        // (OCIO's linear style: the value over the pivot, 0.18, raised to contrast times gamma)
+        const double want = 0.18 * std::pow(0.4 * 2 / 0.18, 1.5 * 0.8) * 0.5;
+        QVERIFY2(std::fabs(img.px[0] - want) < 1e-4, qPrintable(QString("%1, not %2").arg(img.px[0]).arg(want)));
+        QCOMPARE(ocioProcessorsBuilt(), before + 1);
+    }
     void colorSpaceTransformEffect() {
         Project p = makeDefaultProject();
         Effect e = makeEffect(p, "color_space_transform");
@@ -5982,6 +6316,227 @@ colorspaces:
         applyVideoEffect(fx("camera_shake", {{"amplitude", 20.0}, {"rotation", 3.0}}), 9, frame, 1);
         rgb(frame, 0, 0, c);
         QVERIFY(near(c[3], 1) && near(c[1], 0.6f));
+    }
+
+    void bevelsOnALayersAlpha() {
+        // Edge Bevel and Layer Bevel (Effects > Stylize) work from the distance to the alpha's edge. On a white disc lit
+        // from 45 degrees the lit edge is as wide as Thickness, the side facing the light is the brightest, and inside
+        // the bevel nothing changes. Layer Bevel's four styles light and shade the right sides of the edge, each side
+        // with its colour and blend mode. Drawn through the GPU compositor, they are the same pixels.
+        Project p;
+        auto fx = [&](const char* type, std::initializer_list<std::pair<const char*, double>> params) {
+            if (!findEffectInfo(type)) qFatal("no effect %s", type);
+            Effect e = makeEffect(p, type);
+            for (const auto& [k, v] : params) e.params[k] = v;
+            return e;
+        };
+        for (const char* type : {"edge_bevel", "layer_bevel"}) {
+            QCOMPARE(findEffectInfo(type)->group, std::string("Stylize"));
+            QVERIFY(findEffectInfo(type)->category == EffectCategory::VideoFilter);
+        }
+        QCOMPARE(findEffectInfo("edge_bevel")->displayName, std::string("Edge Bevel"));
+        QCOMPARE(findEffectInfo("layer_bevel")->displayName, std::string("Layer Bevel"));
+        // A disc of one colour with a smooth edge (premultiplied), its centre on a pixel's centre.
+        auto disc = [](int size, double radius, float level) {
+            Image img(size, size);
+            const double c = size / 2;
+            for (int y = 0; y < size; ++y)
+                for (int x = 0; x < size; ++x) {
+                    const float a = float(std::clamp(radius + 0.5 - std::hypot(x - c, y - c), 0.0, 1.0));
+                    float* px = img.at(x, y);
+                    px[0] = px[1] = px[2] = level * a;
+                    px[3] = a;
+                }
+            return img;
+        };
+        // A channel read between pixel centres, `r` pixels from the disc's centre towards `degrees` (anticlockwise, up
+        // the page).
+        auto along = [](const Image& img, double degrees, double r, int ch) {
+            const double c = img.width / 2, x = c + std::cos(degrees * M_PI / 180) * r, y = c - std::sin(degrees * M_PI / 180) * r;
+            const int x0 = int(std::floor(x)), y0 = int(std::floor(y));
+            const double fx = x - x0, fy = y - y0;
+            auto at = [&](int xi, int yi) { return double(img.at(std::clamp(xi, 0, img.width - 1), std::clamp(yi, 0, img.height - 1))[ch]); };
+            return (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) + (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+        };
+        // The distance to the edge is right to a fraction of a pixel, inside and out, whichever way the edge runs.
+        {
+            const Image d = disc(200, 60, 1);
+            const std::vector<float> sd = bevel::edgeDistance(d);
+            QCOMPARE(sd.size(), size_t(200 * 200));
+            double worst = 0;
+            for (int y = 20; y < 180; ++y)
+                for (int x = 20; x < 180; ++x) worst = std::max(worst, std::fabs(sd[size_t(y) * 200 + size_t(x)] - (60 - std::hypot(x - 100, y - 100))));
+            QVERIFY2(worst < 0.35, qPrintable(QString::number(worst)));
+        }
+        // The width of the lit band on the side facing `degrees`: from where the added light falls to half its most (the
+        // band's inner end) out to where the disc's own edge is (its alpha a half).
+        auto litWidth = [&](const Image& img, double degrees, double radius, double reach) {
+            double most = 0;
+            for (double r = radius - reach; r < radius - 1; r += 0.25) most = std::max(most, along(img, degrees, r, 0) - 1);
+            double inner = -1, outer = -1;
+            for (double r = radius - reach; r < radius + 2; r += 0.05) {
+                if (inner < 0 && along(img, degrees, r, 0) - 1 >= most / 2) inner = r;
+                if (outer < 0 && inner >= 0 && r > inner + 1 && along(img, degrees, r, 3) <= 0.5) outer = r;
+            }
+            return most > 0.2 && inner > 0 && outer > 0 ? outer - inner : -1.0;
+        };
+        const Image white = disc(200, 60, 1);
+        for (double thickness : {10.0, 20.0, 4.5}) {
+            Image lit = white;
+            applyVideoEffect(fx("edge_bevel", {{"angle", 45.0}, {"thickness", thickness}, {"height", thickness}, {"strength", 100.0}}), 0, lit, 1);
+            const double width = litWidth(lit, 45, 60, thickness + 8);
+            QVERIFY2(std::fabs(width - thickness) < 0.5, qPrintable(QString("thickness %1: lit over %2 px").arg(thickness).arg(width)));
+            // Inside the bevel, and outside the disc, nothing changed at all.
+            for (int y = 0; y < 200; ++y)
+                for (int x = 0; x < 200; ++x) {
+                    const double r = std::hypot(x - 100, y - 100);
+                    if (r < 60 - thickness - 1.5 || r > 61.5)
+                        for (int c = 0; c < 4; ++c) QCOMPARE(lit.at(x, y)[c], white.at(x, y)[c]);
+                }
+            // The side facing the light is the brightest, the sides at right angles to it are as they were, and the far
+            // side is in shade.
+            const double mid = 60 - thickness / 2;
+            const double facing = along(lit, 45, mid, 0), side = along(lit, 135, mid, 0), far = along(lit, 225, mid, 0);
+            QVERIFY2(facing > 1.5 && std::fabs(side - 1) < 0.05 && far < 0.5, qPrintable(QString("%1 %2 %3").arg(facing).arg(side).arg(far)));
+            double best = 0, bestAt = 0;
+            for (int deg = 0; deg < 360; deg += 5)
+                if (const double v = along(lit, deg, mid, 0); v > best) best = v, bestAt = deg;
+            QVERIFY2(std::fabs(bestAt - 45) <= 10, qPrintable(QString::number(bestAt)));
+        }
+        // The light's colour and strength: a red light at half strength adds half as much, to red alone.
+        {
+            Image lit = white, half = white;
+            applyVideoEffect(fx("edge_bevel", {{"angle", 45.0}, {"thickness", 10.0}, {"height", 10.0}, {"strength", 100.0}}), 0, lit, 1);
+            applyVideoEffect(fx("edge_bevel", {{"angle", 45.0}, {"thickness", 10.0}, {"height", 10.0}, {"strength", 50.0}, {"light.g", 0.0}, {"light.b", 0.0}}), 0, half, 1);
+            const double full = along(lit, 45, 55, 0) - 1, red = along(half, 45, 55, 0) - 1;
+            QVERIFY2(std::fabs(red - full / 2) < 0.01 && std::fabs(along(half, 45, 55, 1) - 1) < 1e-6, qPrintable(QString("%1 %2").arg(full).arg(red)));
+            // No height, or no strength: the picture as it was.
+            Image flat = white;
+            applyVideoEffect(fx("edge_bevel", {{"height", 0.0}}), 0, flat, 1);
+            QVERIFY(flat.px == white.px);
+            applyVideoEffect(fx("edge_bevel", {{"strength", 0.0}}), 0, flat, 1);
+            QVERIFY(flat.px == white.px);
+            // At half resolution the bevel is half as wide in pixels: the same on the picture.
+            Image small = disc(100, 30, 1);
+            applyVideoEffect(fx("edge_bevel", {{"angle", 45.0}, {"thickness", 10.0}, {"height", 10.0}, {"strength", 100.0}}), 0, small, 0.5);
+            const double width = litWidth(small, 45, 30, 12);
+            QVERIFY2(std::fabs(width - 5) < 0.5, qPrintable(QString::number(width)));
+        }
+        // An opaque picture is bevelled along the frame's sides: lit from above, the top is lighter and the bottom darker.
+        {
+            Image full(40, 30);
+            full.fill(0.5f, 0.5f, 0.5f, 1.0f);
+            applyVideoEffect(fx("edge_bevel", {{"angle", 90.0}, {"thickness", 4.0}, {"height", 4.0}, {"strength", 100.0}}), 0, full, 1);
+            QVERIFY(full.at(20, 1)[0] > 0.9f && full.at(20, 28)[0] < 0.2f);
+            QCOMPARE(full.at(20, 15)[0], 0.5f);
+            QVERIFY(std::fabs(full.at(1, 15)[0] - 0.5f) < 0.02f);  // (a side the light runs along)
+        }
+
+        // Layer Bevel on a grey disc, lit from the upper left (120 degrees). Straight colour at a place, and its alpha.
+        const Image grey = disc(200, 60, 0.5f);
+        auto straight = [&](const Image& img, double degrees, double r) {
+            const double a = along(img, degrees, r, 3);
+            return a > 1e-6 ? along(img, degrees, r, 0) / a : 0.0;
+        };
+        auto styled = [&](double style, std::initializer_list<std::pair<const char*, double>> more = {}) {
+            Effect e = fx("layer_bevel", {{"style", style}, {"size", 8.0}, {"highlight_opacity", 100.0}, {"shadow_opacity", 100.0}});
+            for (const auto& [k, v] : more) e.params[k] = v;
+            Image img = grey;
+            applyVideoEffect(e, 0, img, 1);
+            return img;
+        };
+        // Inner Bevel: inside the edge, lighter towards the light and darker away from it; nothing beyond the layer, and
+        // nothing further in than its size.
+        {
+            const Image img = styled(0);
+            QVERIFY2(straight(img, 120, 56) > 0.8 && straight(img, 300, 56) < 0.2, qPrintable(QString("%1 %2").arg(straight(img, 120, 56)).arg(straight(img, 300, 56))));
+            for (int y = 0; y < 200; ++y)
+                for (int x = 0; x < 200; ++x) {
+                    const double r = std::hypot(x - 100, y - 100);
+                    if (r < 60 - 8 - 1.5 || r > 61.5)
+                        for (int c = 0; c < 4; ++c) QCOMPARE(img.at(x, y)[c], grey.at(x, y)[c]);
+                    QCOMPARE(img.at(x, y)[3], grey.at(x, y)[3]);  // (the layer's alpha is as it was everywhere)
+                }
+        }
+        // Outer Bevel: the layer itself untouched; round it, the highlight colour towards the light and the shadow colour
+        // away from it, as far out as its size.
+        {
+            const Image img = styled(1);
+            for (int y = 0; y < 200; ++y)
+                for (int x = 0; x < 200; ++x)
+                    if (std::hypot(x - 100, y - 100) < 58.5)
+                        for (int c = 0; c < 4; ++c) QCOMPARE(img.at(x, y)[c], grey.at(x, y)[c]);
+            QVERIFY2(along(img, 120, 64, 3) > 0.5 && straight(img, 120, 64) > 0.95, qPrintable(QString("%1 %2").arg(along(img, 120, 64, 3)).arg(straight(img, 120, 64))));
+            QVERIFY2(along(img, 300, 64, 3) > 0.5 && straight(img, 300, 64) < 0.05, qPrintable(QString("%1 %2").arg(along(img, 300, 64, 3)).arg(straight(img, 300, 64))));
+            QVERIFY(along(img, 120, 71, 3) < 1e-6 && along(img, 300, 71, 3) < 1e-6);
+        }
+        // Emboss: half its size each side of the edge, lit towards the light inside and out.
+        {
+            const Image img = styled(2);
+            QVERIFY(straight(img, 120, 58) > 0.8 && along(img, 120, 62, 3) > 0.5 && straight(img, 120, 62) > 0.95);
+            QVERIFY(straight(img, 300, 58) < 0.2 && along(img, 300, 62, 3) > 0.5 && straight(img, 300, 62) < 0.05);
+            QVERIFY(std::fabs(straight(img, 120, 54) - 0.5) < 1e-6 && along(img, 120, 66, 3) < 1e-6);
+        }
+        // Pillow Emboss: a groove along the edge, so towards the light the layer's side of it is lit and the far side of
+        // it, outside, is in shade; away from the light the other way round.
+        {
+            const Image img = styled(3);
+            QVERIFY2(straight(img, 120, 58) > 0.8 && along(img, 120, 62, 3) > 0.5 && straight(img, 120, 62) < 0.05,
+                     qPrintable(QString("%1 %2 %3").arg(straight(img, 120, 58)).arg(along(img, 120, 62, 3)).arg(straight(img, 120, 62))));
+            QVERIFY(straight(img, 300, 58) < 0.2 && along(img, 300, 62, 3) > 0.5 && straight(img, 300, 62) > 0.95);
+        }
+        // A blend mode and a colour for each side: the highlight added goes past white where screened it cannot, and a
+        // red shadow laid on as it is (Normal) turns the shaded side red where multiplied it would only darken it.
+        {
+            const Image screened = styled(0), added = styled(0, {{"highlight_mode", 2.0}});
+            QVERIFY(straight(screened, 120, 56) <= 1.0 + 1e-6 && straight(added, 120, 56) > 1.2);
+            const Image red = styled(0, {{"shadow_mode", 0.0}, {"shadow.r", 1.0}});
+            QVERIFY(straight(red, 300, 56) > 0.8 && along(red, 300, 56, 1) < 0.2);
+            // Half the opacity, half the change.
+            const Image halfLit = styled(0, {{"highlight_opacity", 50.0}});
+            QVERIFY(std::fabs((straight(halfLit, 120, 56) - 0.5) - (straight(screened, 120, 56) - 0.5) / 2) < 0.01);
+            // Depth makes the slope steeper, so more light at the same place; softened, the slope is gentler and reaches
+            // further in.
+            const Image shallow = styled(0, {{"depth", 30.0}}), soft = styled(0, {{"soften", 4.0}});
+            QVERIFY(straight(shallow, 120, 56) < straight(screened, 120, 56) - 0.05);
+            QVERIFY(std::fabs(straight(screened, 120, 49) - 0.5) < 1e-6 && straight(soft, 120, 49) > 0.51);
+        }
+
+        // In a sequence, over another picture, with the GPU compositor asked for: the same pixels as without it.
+        {
+            Project q = makeDefaultProject();
+            Sequence& s = *q.active();
+            s.width = 160, s.height = 90;
+            Clip back = makeGeneratorClip(q, "color", 20), top = makeGeneratorClip(q, "color", 20);
+            back.generator.params["color.r"] = 0.1, back.generator.params["color.g"] = 0.3, back.generator.params["color.b"] = 0.6;
+            top.generator.params["color.r"] = 0.8, top.generator.params["color.g"] = 0.7, top.generator.params["color.b"] = 0.2;
+            top.motion.params["scale"] = 50.0;
+            top.motion.params["rotation"] = 15.0;
+            QVERIFY(edit::overwrite(q, s, {TrackKind::Video, 0}, back).ok);
+            edit::addTrack(q, s, TrackKind::Video);
+            const auto placed = edit::overwrite(q, s, {TrackKind::Video, 1}, top);
+            QVERIFY(placed.ok);
+            int n = 0;
+            for (const Effect& e : {fx("edge_bevel", {{"thickness", 6.0}, {"height", 6.0}}), fx("layer_bevel", {{"style", 2.0}, {"size", 6.0}}),
+                                    fx("layer_bevel", {{"style", 3.0}, {"size", 8.0}, {"soften", 1.5}})}) {
+                Effect own = e;
+                own.id = q.newId();
+                s.videoTracks[1].clips[0].effects = {own};
+                RenderOptions o;
+                o.gpu = false;
+                const Image cpu = renderProgramFrame(q, s, 5, o);
+                o.gpu = true;
+                const Image gpuFrame = renderProgramFrame(q, s, 5, o);
+                QCOMPARE(gpuFrame.width, cpu.width);
+                double worst = 0;
+                for (size_t i = 0; i < cpu.px.size(); ++i) worst = std::max(worst, std::fabs(double(cpu.px[i]) - gpuFrame.px[i]));
+                QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("effect %1: off by %2").arg(n).arg(worst)));
+                // (and the bevel is in the picture)
+                s.videoTracks[1].clips[0].effects.clear();
+                QVERIFY(renderProgramFrame(q, s, 5, o).px != cpu.px);
+                ++n;
+            }
+        }
     }
 
     void stopMotion() {
@@ -10196,6 +10751,271 @@ colorspaces:
         }
     }
 
+    void exportsImfEventsInEveryApplication() {
+        // Markers travel as timed events in archival (#5), ProRes and DPP masters too, and as a JSON document when
+        // asked: each package passes the checker and comes back as the same markers. A supplemental to a package with
+        // another maker's events track plays that track again as it is.
+        QTemporaryDir dir;
+        std::string err;
+        auto marker = [](FrameTime t, FrameTime d, const std::string& name, const std::string& comment, int colour) {
+            Marker m;
+            m.t = t, m.duration = d, m.name = name, m.comment = comment, m.color = colour;
+            return m;
+        };
+        auto describe = [](const std::vector<Marker>& ms) {
+            QStringList out;
+            for (const Marker& m : ms)
+                out << QStringLiteral("%1+%2 [%3] [%4] %5%6%7").arg(m.t).arg(m.duration).arg(QString::fromStdString(m.name), QString::fromStdString(m.comment)).arg(m.color)
+                           .arg(m.chapter ? " chapter" : "", m.adBreak ? " ad-break" : "");
+            return out.join("\n");
+        };
+        auto readBack = [&](const std::string& folder) {
+            Project q = makeDefaultProject();
+            const ImportResult in = importImf(q, folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+            const Sequence* opened = in.ok ? q.findSequence(in.sequence) : nullptr;
+            return opened ? opened->markers : std::vector<Marker>{marker(-1, 0, in.error, "", 0)};
+        };
+        auto withMarkers = [&](Sequence& s) {
+            s.markers.push_back(marker(1, 0, "Opening \"titles\"", "Fade in\nfrom black \xe2\x80\x94 \xc3\xbcn\xc3\xaf", 2));
+            s.markers.back().chapter = true;
+            s.markers.push_back(marker(2, 3, "Ad break", "", 0));
+            s.markers.back().adBreak = true;
+            s.markers.push_back(marker(5, 0, "", "", 1));
+        };
+        auto eventsFile = [](const std::string& folder) {
+            const QDir out(QString::fromStdString(folder));
+            const QStringList files = out.entryList({"EVENTS_*.mxf"});
+            return files.size() == 1 ? out.filePath(files[0]) : QString();
+        };
+
+        // ---- The JSON form by itself: what Annex A.4 and A.5 ask, the same events back, and faults named.
+        {
+            std::vector<ImfEvent> events = imfEventsOfMarkers([&] {
+                Sequence s;
+                withMarkers(s);
+                return s.markers;
+            }(), 0, 6, 6);
+            QCOMPARE(events.size(), size_t(3));
+            const std::string json = imfEventsDocument(events, 25, 1, true);
+            const QJsonObject doc = QJsonDocument::fromJson(QByteArray::fromStdString(json)).object();
+            QVERIFY2(doc.value("id").toString().startsWith("urn:uuid:") && doc.value("editRate").toString() == "25 1", json.c_str());
+            QVERIFY(doc.value("objects").isArray() && doc.value("events").toArray().size() == 3);
+            // (counts are strings, as the schema has them)
+            QCOMPARE(doc.value("events").toArray()[1].toObject().value("startCount"), QJsonValue("2"));
+            QCOMPARE(doc.value("events").toArray()[1].toObject().value("endCount"), QJsonValue("5"));
+            QVERIFY2(checkImfEventsDocument(json).empty(), json.c_str());
+            std::vector<ImfEvent> back;
+            uint32_t num = 0, den = 0;
+            QVERIFY2(parseImfEventsDocument(json, back, num, den, &err), err.c_str());
+            QVERIFY(num == 25 && den == 1 && back.size() == 3);
+            for (size_t i = 0; i < 3; ++i) QVERIFY(back[i].same(events[i]) && back[i].id == events[i].id);
+            QCOMPARE(imfEventsDocument(back, 25, 1, true), json);  // (the same events, the same document)
+            // The same events as the XML form holds.
+            std::vector<ImfEvent> fromXml;
+            QVERIFY(parseImfEventsDocument(imfEventsDocument(events, 25, 1), fromXml, num, den));
+            for (size_t i = 0; i < 3; ++i) QVERIFY(fromXml[i].same(back[i]));
+            auto problems = [](const QString& x) { return checkImfEventsDocument(x.toStdString()); };
+            const QString good = QString::fromStdString(json);
+            QVERIFY(!problems(QString(good).replace("\"endCount\":\"5\"", "\"endCount\":\"1\"")).empty());
+            QVERIFY(!problems(QString(good).replace("\"startCount\":\"2\"", "\"startCount\":2")).empty());  // (a number, not a string)
+            QVERIFY(!problems(QString(good).replace("\"id\":\"M2\"", "\"id\":\"M1\"")).empty());
+            QVERIFY(!problems(QString(good).replace("\"id\":\"M3\"", "\"id\":\"M,3\"")).empty());
+            QVERIFY(!problems(QString(good).replace("\"editRate\": \"25 1\"", "\"editRate\": \"25\"")).empty());
+            QVERIFY(!problems(QString(good).replace("\"objects\": [],", "")).empty());
+            QVERIFY(!problems("[1, 2]").empty());
+        }
+
+        // ---- Each application's master, with the document as XML and as JSON.
+        struct Case {
+            const char* name;
+            int application;
+            int width, height, fps;
+            bool json;
+        };
+        const Case cases[] = {{"Archive", 5, 320, 180, 24, false}, {"ProRes", 45, 320, 180, 24, false}, {"ProRes JSON", 45, 320, 180, 24, true},
+                              {"DPP", 59, 1920, 1080, 25, true},   {"Archive JSON", 5, 320, 180, 24, true}};
+        for (const Case& c : cases) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = c.width, s.height = c.height, s.fps = Rational{c.fps, 1};
+            if (c.application == 5) s.workingSpace = "acescct";
+            s.videoTracks[0].clips = {colorClip(p, 0.7f, 0.4f, 0.2f, 0, 3), colorClip(p, 0.2f, 0.4f, 0.7f, 3, 3)};
+            withMarkers(s);
+            ImfSettings st;
+            st.title = c.name;
+            st.captions = false;
+            st.application = c.application;
+            st.prores = "hq";
+            if (c.application == 59) st.kind = "programme";
+            st.eventsJson = c.json;
+            ImfResult r;
+            QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), qPrintable(QString("%1: %2").arg(c.name, QString::fromStdString(err))));
+            QVERIFY2(r.application == c.application && r.events == 3 && r.newEvents == 3, c.name);
+            const std::vector<std::string> issues = verifyImf(r.folder);
+            QVERIFY2(issues.empty(), qPrintable(QString("%1: %2").arg(c.name, issues.empty() ? QString() : QString::fromStdString(issues.front()))));
+            dcp::ImfTrackReader reader;
+            QVERIFY2(reader.open(eventsFile(r.folder).toStdString(), &err), err.c_str());
+            QCOMPARE(reader.textMime(), std::string(c.json ? "application/json" : "text/xml"));
+            std::string text;
+            QVERIFY(reader.text(text));
+            QCOMPARE(QJsonDocument::fromJson(QByteArray::fromStdString(text)).isObject(), c.json);
+            QVERIFY2(checkImfEventsDocument(text).empty(), text.c_str());
+            QFile cpl(QString::fromStdString(r.cpl));
+            QVERIFY(cpl.open(QIODevice::ReadOnly));
+            const QByteArray cplText = cpl.readAll();
+            QVERIFY(cplText.contains("<imfses:SimpleSchemeMediaTimedEventsSequence>") && cplText.contains("<imfebm:TimedEventsVirtualTrackParameterSet>"));
+            QVERIFY(cplText.contains(c.json ? "<r1:TextMIMEType>application/json</r1:TextMIMEType>" : "<r1:TextMIMEType>text/xml</r1:TextMIMEType>"));
+            // Photon's general checks, when it is here (it does not know the events' sequence, and so not its descriptor).
+            if (c.application == 5) {
+                QStringList photon = photonErrors(QString::fromStdString(r.folder));
+                photon.removeIf([](const QString& e) {
+                    return e.contains("Unsupported sequence type or schema Tag: imfses:SimpleSchemeMediaTimedEventsSequence") ||
+                           e.contains("is not referenced by any resource");
+                });
+                QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            }
+            // Read back: the same markers.
+            std::vector<Marker> want = s.markers;
+            std::stable_sort(want.begin(), want.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            QCOMPARE(describe(readBack(r.folder)), describe(want));
+            // Without markers asked for: no events track, as before.
+            if (c.application == 45 && !c.json) {
+                ImfSettings plain = st;
+                plain.events = false;
+                QTemporaryDir other;
+                ImfResult rp;
+                QVERIFY2(exportImf(p, s, plain, other.path().toStdString(), &rp, {}, &err), err.c_str());
+                QVERIFY(rp.events == 0 && eventsFile(rp.folder).isEmpty());
+                QVERIFY(readBack(rp.folder).empty());
+            }
+        }
+
+        // ---- A JSON document's supplemental keeps the form (one virtual track's files are all of one type).
+        if (openJpegAvailable()) {
+            QTemporaryDir json;
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320, s.height = 180, s.fps = Rational{24, 1};
+            s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.25f, 0.75f, 0, 12));
+            withMarkers(s);
+            ImfSettings st;
+            st.title = "Json Events";
+            st.threads = 2;
+            st.eventsJson = true;
+            ImfResult r;
+            QVERIFY2(exportImf(p, s, st, json.path().toStdString(), &r, {}, &err), err.c_str());
+            std::vector<std::string> issues = verifyImf(r.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            Sequence now = s;
+            now.markers[1].comment = "Two minutes";
+            ImfSettings sup = st;
+            sup.supplementOf = r.folder;
+            sup.eventsJson = false;  // (asked for XML: the earlier track's form is kept all the same)
+            ImfResult r2;
+            QVERIFY2(exportImf(p, now, sup, json.path().toStdString(), &r2, {}, &err), err.c_str());
+            QVERIFY(r2.supplemental && r2.events == 3 && r2.newEvents == 1);
+            dcp::ImfTrackReader reader;
+            QVERIFY(reader.open(eventsFile(r2.folder).toStdString(), &err));
+            QCOMPARE(reader.textMime(), std::string("application/json"));
+            issues = verifyImf(r2.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            std::vector<Marker> want = now.markers;
+            std::stable_sort(want.begin(), want.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            QCOMPARE(describe(readBack(r2.folder)), describe(want));
+
+            // ---- Another maker's events track. The fixture is the package above with its events track file made
+            // another scheme's (the scheme's name changed in the track file, its document and its descriptor, and the
+            // hashes that cover them put right), so Montage does not take it for its own markers.
+            QTemporaryDir foreign;
+            ImfResult made;
+            ImfSettings plain = st;
+            plain.title = "Foreign";
+            plain.eventsJson = false;
+            QVERIFY2(exportImf(p, s, plain, foreign.path().toStdString(), &made, {}, &err), err.c_str());
+            const QString theirs = eventsFile(made.folder);
+            QVERIFY(!theirs.isEmpty());
+            auto fileText = [](const QString& path) {
+                QFile f(path);
+                return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+            };
+            auto writeText = [](const QString& path, const QByteArray& bytes) {
+                QFile f(path);
+                return f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(bytes) == bytes.size();
+            };
+            auto utf16 = [](const QByteArray& a) {
+                QByteArray out;
+                for (char ch : a) out.append('\0'), out.append(ch);
+                return out;
+            };
+            const QByteArray mine = kImfMarkerScheme, other = "urn:example:imf:markers";
+            QCOMPARE(mine.size(), other.size());
+            const QDir pkg(QString::fromStdString(made.folder));
+            const QString pkl = pkg.filePath(pkg.entryList({"PKL_*.xml"}).value(0));
+            const QString oldEventsHash = packageFileHash(theirs), oldCplHash = packageFileHash(QString::fromStdString(made.cpl));
+            QByteArray mxf = fileText(theirs);
+            QVERIFY(mxf.contains(mine) || mxf.contains(utf16(mine)));
+            mxf.replace(utf16(mine), utf16(other));
+            mxf.replace(mine, other);
+            QVERIFY(writeText(theirs, mxf));
+            QByteArray cplText = fileText(QString::fromStdString(made.cpl));
+            QVERIFY(cplText.contains(oldEventsHash.toUtf8()));
+            cplText.replace(mine, other);
+            cplText.replace(oldEventsHash.toUtf8(), packageFileHash(theirs).toUtf8());
+            QVERIFY(writeText(QString::fromStdString(made.cpl), cplText));
+            QByteArray pklText = fileText(pkl);
+            QVERIFY(pklText.contains(oldEventsHash.toUtf8()) && pklText.contains(oldCplHash.toUtf8()));
+            pklText.replace(oldEventsHash.toUtf8(), packageFileHash(theirs).toUtf8());
+            pklText.replace(oldCplHash.toUtf8(), packageFileHash(QString::fromStdString(made.cpl)).toUtf8());
+            QVERIFY(writeText(pkl, pklText));
+            issues = verifyImf(made.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            ImfComposition before;
+            QVERIFY2(readImfComposition(made.cpl, before, &err), err.c_str());
+            const ImfVirtualTrack* theirTrack = nullptr;
+            for (const ImfVirtualTrack& t : before.tracks)
+                if (t.kind == "SimpleSchemeMediaTimedEventsSequence") theirTrack = &t;
+            QVERIFY(theirTrack && theirTrack->resources.size() == 1);
+            {
+                dcp::ImfTrackReader r0;
+                QVERIFY(r0.open(theirs.toStdString(), &err));
+                QCOMPARE(r0.eventSchemes(), std::string("urn:example:imf:markers http://www.smpte-ra.org/ns/2067-206/2023/simple-scheme"));
+            }
+            // A supplemental with new markers of Montage's own: the other maker's track is played again as it is (its
+            // id, its track file and hash, its relationship to the picture), beside a track of Montage's markers.
+            for (const bool own : {true, false}) {
+                ImfSettings sup2 = plain;
+                sup2.supplementOf = made.folder;
+                sup2.events = own;
+                ImfResult rs;
+                QVERIFY2(exportImf(p, now, sup2, foreign.path().toStdString(), &rs, {}, &err), err.c_str());
+                QVERIFY2(rs.supplemental && rs.carriedEventTracks == 1 && rs.leftEventTracks == 0 && rs.codedFrames == 0, qPrintable(QString::number(rs.carriedEventTracks)));
+                QCOMPARE(rs.newEvents, own ? 3 : 0);
+                issues = verifyImf(rs.folder);
+                QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+                ImfComposition after;
+                QVERIFY2(readImfComposition(rs.cpl, after, &err), err.c_str());
+                const ImfVirtualTrack* carried = nullptr;
+                int eventTracks = 0;
+                for (const ImfVirtualTrack& t : after.tracks) {
+                    if (t.kind != "SimpleSchemeMediaTimedEventsSequence") continue;
+                    ++eventTracks;
+                    if (t.id == theirTrack->id) carried = &t;
+                }
+                QCOMPARE(eventTracks, own ? 2 : 1);
+                QVERIFY(carried && carried->resources.size() == 1 && carried->length() == theirTrack->length());
+                QCOMPARE(carried->resources[0].trackFile, theirTrack->resources[0].trackFile);
+                QCOMPARE(carried->resources[0].hash, theirTrack->resources[0].hash);
+                QCOMPARE(carried->resources[0].intrinsic, theirTrack->resources[0].intrinsic);
+                const QByteArray supCpl = fileText(QString::fromStdString(rs.cpl));
+                QVERIFY(supCpl.contains("<imfebm:TrackId>urn:uuid:" + QByteArray::fromStdString(theirTrack->id) + "</imfebm:TrackId>"));
+                QVERIFY(supCpl.contains("<r1:EventSchemeURIs>urn:example:imf:markers http://www.smpte-ra.org/ns/2067-206/2023/simple-scheme</r1:EventSchemeURIs>"));
+                QCOMPARE(supCpl.count("<imfebm:TimedEventsVirtualTrackParameterSet>"), own ? 2 : 1);
+                // (the supplemental holds none of the other maker's files: it plays the earlier package's)
+                QCOMPARE(QDir(QString::fromStdString(rs.folder)).entryList({"EVENTS_*.mxf"}).size(), own ? 1 : 0);
+            }
+        }
+    }
+
     void exportsImfMaster() {
         if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
         QTemporaryDir dir;
@@ -11632,6 +12452,114 @@ colorspaces:
         }
     }
 
+    void checksDppSoundLabels() {
+        // An Application DPP master's sound is held to RDD 59-1 8 and ST 2067-2 5.3.6: each channel labelled once, in
+        // one soundfield group that holds only its own channels, by labels of ST 2067-8 or ST 377-42. A fault is
+        // reported with the rule's number. A 5.1 in another order than the customary one is advice, not a fault (no
+        // SMPTE rule orders channels), and the check says that the DPP's own AS-11 metadata is absent.
+        QTemporaryDir dir;
+        std::string err;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1920, s.height = 1080, s.fps = Rational{25, 1};
+        s.audioLayout = "5.1";
+        s.videoTracks[0].clips = {colorClip(p, 0.6f, 0.6f, 0.6f, 0, 3)};
+        ImfSettings st;
+        st.title = "DPP Sound";
+        st.captions = false;
+        st.application = 59;
+        st.prores = "hq";
+        st.kind = "programme";
+        ImfResult r;
+        QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QCOMPARE(r.channels, 6);
+        std::vector<std::string> advice;
+        std::vector<std::string> issues = verifyImf(r.folder, {}, &advice);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        // What a correct one is told: only that DPP003's metadata is not there.
+        QCOMPARE(advice.size(), size_t(1));
+        QVERIFY2(advice[0].find("DPP003") != std::string::npos && advice[0].find("RDD 59-1 9.2") != std::string::npos, advice[0].c_str());
+        // (and nothing is advised about a package of another application)
+        {
+            Project q = makeDefaultProject();
+            Sequence& t = *q.active();
+            t.width = 320, t.height = 180, t.fps = Rational{24, 1};
+            t.videoTracks[0].clips = {colorClip(q, 0.6f, 0.6f, 0.6f, 0, 3)};
+            ImfSettings other = st;
+            other.application = 45;
+            other.kind = "feature";
+            ImfResult ro;
+            QTemporaryDir od;
+            QVERIFY2(exportImf(q, t, other, od.path().toStdString(), &ro, {}, &err), err.c_str());
+            std::vector<std::string> none{"x"};
+            QVERIFY(verifyImf(ro.folder, {}, &none).empty());
+            QVERIFY(none.empty());
+        }
+        // Fixtures: the composition's descriptor of the sound changed (and the packing list's hash of the composition
+        // put right, so only the labels are at fault).
+        const QDir pkg(QString::fromStdString(r.folder));
+        const QString cplPath = QString::fromStdString(r.cpl), pklPath = pkg.filePath(pkg.entryList({"PKL_*.xml"}).value(0));
+        auto fileText = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+        auto writeText = [](const QString& path, const QByteArray& bytes) {
+            QFile f(path);
+            return f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(bytes) == bytes.size();
+        };
+        const QByteArray cpl = fileText(cplPath), pkl = fileText(pklPath);
+        const QByteArray cplHash = packageFileHash(cplPath).toUtf8();
+        QVERIFY(pkl.contains(cplHash));
+        auto sym = [](const char* s) { return QByteArray("<r1:MCATagSymbol>") + s + "</r1:MCATagSymbol>"; };
+        for (const char* want : {"chL", "chR", "chC", "chLFE", "chLs", "chRs", "sg51"}) QVERIFY2(cpl.count(sym(want)) == 1, want);
+        auto checked = [&](const std::function<void(QByteArray&)>& change, std::vector<std::string>* adviceOut) {
+            QByteArray c = cpl;
+            change(c);
+            bool ok = c != cpl && writeText(cplPath, c);
+            QByteArray k = pkl;
+            k.replace(cplHash, packageFileHash(cplPath).toUtf8());
+            ok = ok && writeText(pklPath, k);
+            std::vector<std::string> found = ok ? verifyImf(r.folder, {}, adviceOut) : std::vector<std::string>{"the fixture was not written"};
+            writeText(cplPath, cpl);
+            writeText(pklPath, pkl);
+            return found;
+        };
+        auto has = [](const std::vector<std::string>& list, const char* what) {
+            return std::any_of(list.begin(), list.end(), [&](const std::string& i) { return i.find(what) != std::string::npos; });
+        };
+        auto all = [](const std::vector<std::string>& list) {
+            QStringList out;
+            for (const std::string& i : list) out << QString::fromStdString(i);
+            return out.join("\n");
+        };
+        // The left and right labels the other way round: every channel still labelled once with one of the 5.1's, so
+        // no rule is broken; the order is advised.
+        issues = checked([&](QByteArray& c) {
+            c.replace(sym("chL"), sym("chX"));
+            c.replace(sym("chR"), sym("chL"));
+            c.replace(sym("chX"), sym("chR"));
+        }, &advice);
+        QVERIFY2(!has(issues, "5.3.6") && !has(issues, "RDD 59-1 8"), qPrintable(all(issues)));
+        QVERIFY2(has(advice, "channels are R, L, C, LFE, Ls, Rs") && has(advice, "commonly ask for L, R, C, LFE, Ls, Rs"), qPrintable(all(advice)));
+        // Two channels both labelled Left.
+        issues = checked([&](QByteArray& c) { c.replace(sym("chR"), sym("chL")); }, nullptr);
+        QVERIFY2(has(issues, "more than one channel chL (ST 2067-2 5.3.6.6"), qPrintable(all(issues)));
+        // Two labels for channel 1, none for channel 2.
+        issues = checked([&](QByteArray& c) { c.replace("<r1:MCAChannelID>2</r1:MCAChannelID>", "<r1:MCAChannelID>1</r1:MCAChannelID>"); }, nullptr);
+        QVERIFY2(has(issues, "labels channel 1 2 times (ST 2067-2 5.3.6.2") && has(issues, "labels channel 2 not at all (ST 2067-2 5.3.6.2"), qPrintable(all(issues)));
+        // A channel that is not one of the 5.1's.
+        issues = checked([&](QByteArray& c) { c.replace(sym("chLs"), sym("chLss")); }, nullptr);
+        QVERIFY2(has(issues, "chLss, which is not a channel of sg51 (ST 2067-2 5.3.6.6)"), qPrintable(all(issues)));
+        // A label from outside the registry the two documents draw on.
+        issues = checked([&](QByteArray& c) {
+            c.replace("urn:smpte:ul:060e2b34.0401010d.03020103.00000000", "urn:smpte:ul:060e2b34.0401010d.0e090103.00000000");
+        }, nullptr);
+        QVERIFY2(has(issues, "names channel 3 (chC) by a label of neither ST 2067-8 nor ST 377-42 (RDD 59-1 8)"), qPrintable(all(issues)));
+        // Put back, the package passes again.
+        issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+    }
+
     void ownProResBitstream() {
         // Montage's ProRes encoder against FFmpeg's decoder and Montage's own: 4444 and 4444 XQ with alpha and without,
         // progressive and as fields either way round, at 1280 x 720, at sizes that leave part macroblocks and short
@@ -11761,6 +12689,112 @@ colorspaces:
         QVERIFY(flat.size() < prores::targetFrameBytes(5, W, H) / 20);
         const auto& q = enc.lastQuantization();
         QVERIFY(!q.empty() && std::all_of(q.begin(), q.end(), [](uint8_t v) { return v == 1; }));
+    }
+
+    void ownProResLandsOnItsTarget() {
+        // Each slice's scale is searched, so a busy frame (noise over half the range: the decoders clamp differently
+        // at its ends, as RDD 36 lets them) and a flat one (a soft ramp with a little grain) both come out within 5% of
+        // each profile's target size, never over it. Where the profile's matrix cannot reach the target a coarser or a
+        // finer one is used, which the frame header says. FFmpeg decodes every one as Montage's own decoder does.
+        const int W = 1920, H = 1080;
+        std::mt19937 rng(23);
+        for (int profile = 1; profile <= 6; ++profile) {
+            const bool full = profile >= 5;
+            const int cw = full ? W : W / 2;
+            std::vector<uint16_t> y(size_t(W) * H), cb(size_t(cw) * H), cr(cb.size());
+            for (const bool busy : {true, false}) {
+                for (int j = 0; j < H; ++j)
+                    for (int i = 0; i < W; ++i)
+                        y[size_t(j) * W + size_t(i)] = busy ? uint16_t(1024 + rng() % 2048) : uint16_t(600 + i + j / 2 + int(rng() % 25));
+                for (int j = 0; j < H; ++j)
+                    for (int i = 0; i < cw; ++i) {
+                        cb[size_t(j) * size_t(cw) + size_t(i)] = busy ? uint16_t(1024 + rng() % 2048) : uint16_t(1800 + j / 4 + int(rng() % 25));
+                        cr[size_t(j) * size_t(cw) + size_t(i)] = busy ? uint16_t(1024 + rng() % 2048) : uint16_t(2200 - i / 8 + int(rng() % 25));
+                    }
+                const QString what = QStringLiteral("profile %1, %2").arg(profile).arg(busy ? "busy" : "flat");
+                prores::PlanarPicture pic;
+                pic.y = y.data(), pic.cb = cb.data(), pic.cr = cr.data();
+                pic.yStride = W, pic.cStride = cw;
+                prores::OwnSettings os;
+                os.width = W, os.height = H, os.profile = profile;
+                os.primaries = os.transfer = os.matrix = 1;
+                prores::OwnEncoder enc;
+                std::string err;
+                std::vector<uint8_t> frame, again;
+                QVERIFY2(enc.open(os, &err) && enc.encode(pic, frame, &err), qPrintable(what + ": " + QString::fromStdString(err)));
+                const size_t target = prores::targetFrameBytes(profile, W, H);
+                QVERIFY2(frame.size() <= target && double(frame.size()) >= 0.95 * double(target),
+                         qPrintable(what + QStringLiteral(": %1 bytes of %2").arg(frame.size()).arg(target)));
+                // (the search is the same on any number of threads)
+                os.threads = 1;
+                prores::OwnEncoder one;
+                QVERIFY(one.open(os) && one.encode(pic, again));
+                QVERIFY2(frame == again, qPrintable(what));
+                // The slices are not all at one index: each was searched.
+                const std::vector<uint8_t> q = enc.lastQuantization();
+                QVERIFY2(!q.empty() && *std::min_element(q.begin(), q.end()) < *std::max_element(q.begin(), q.end()), qPrintable(what));
+                // The matrices in the frame header: one value throughout, the profile's or, where it cannot reach
+                // the target (Proxy's busy frame), a coarser one.
+                const int matrix = frame[8 + 20];
+                QVERIFY(std::all_of(frame.begin() + 8 + 20, frame.begin() + 8 + 148, [&](uint8_t v) { return v == matrix; }));
+                QVERIFY2(matrix >= 2 && matrix <= 63, qPrintable(what));
+                qInfo().noquote() << what << "matrix" << matrix << "bytes" << frame.size() << "of" << target;
+                // FFmpeg's decoder and Montage's agree.
+                prores::OwnDecoded own;
+                QVERIFY2(prores::decodeOwn(frame.data(), frame.size(), own, &err), qPrintable(what + ": " + QString::fromStdString(err)));
+                AVFrame* f = ffmpegProResFrame(frame, full);
+                QVERIFY2(f, qPrintable(what));
+                const bool right = f->format == (full ? AV_PIX_FMT_YUV444P12 : AV_PIX_FMT_YUV422P10) && f->width == W && f->height == H;
+                const int depth = full ? 12 : 10, within = full ? 1 : 4;
+                // (compared inside the levels both decoders keep: past them each clamps as RDD 36 7.5.1 lets it,
+                // FFmpeg's to video levels, and coarsely coded noise overshoots that far)
+                auto apart = [&](int plane, const std::vector<uint16_t>& mine, int width) {
+                    int worst = 0;
+                    for (int j = 0; j < H; ++j) {
+                        const auto* row = reinterpret_cast<const uint16_t*>(f->data[plane] + size_t(j) * size_t(f->linesize[plane]));
+                        for (int i = 0; i < width; ++i)
+                            worst = std::max(worst, std::abs(std::clamp(int(row[i]) << (12 - depth), 16, 4076) -
+                                                             std::clamp(int(mine[size_t(j) * size_t(width) + size_t(i)]), 16, 4076)));
+                    }
+                    return worst;
+                };
+                const int dy = right ? apart(0, own.y, W) : 9999;
+                const int dcb = right ? apart(1, own.cb, own.chromaWidth()) : 9999;
+                const int dcr = right ? apart(2, own.cr, own.chromaWidth()) : 9999;
+                av_frame_free(&f);
+                QVERIFY2(right && dy <= within && dcb <= within && dcr <= within, qPrintable(what + QStringLiteral(": differences %1 %2 %3").arg(dy).arg(dcb).arg(dcr)));
+            }
+        }
+        // A quiet frame (a soft ramp, the least grain) in ProRes 4444: under the target at the finest scale with the
+        // profile's own matrix, so it is coded with the finest matrix the format has (twos) and comes back within a
+        // few codes; never over the target.
+        {
+            std::vector<uint16_t> y(size_t(W) * H), cb(y.size()), cr(y.size());
+            for (int j = 0; j < H; ++j)
+                for (int i = 0; i < W; ++i) {
+                    const size_t at = size_t(j) * W + size_t(i);
+                    y[at] = uint16_t(1200 + i / 2 + j / 4 + int(rng() % 3));
+                    cb[at] = uint16_t(1900 + j / 8 + int(rng() % 3));
+                    cr[at] = uint16_t(2100 - i / 16 + int(rng() % 3));
+                }
+            prores::PlanarPicture pic;
+            pic.y = y.data(), pic.cb = cb.data(), pic.cr = cr.data();
+            pic.yStride = pic.cStride = W;
+            prores::OwnSettings os;
+            os.width = W, os.height = H, os.profile = 5;
+            os.primaries = os.transfer = os.matrix = 1;
+            prores::OwnEncoder enc;
+            std::string err;
+            std::vector<uint8_t> frame;
+            QVERIFY2(enc.open(os, &err) && enc.encode(pic, frame, &err), err.c_str());
+            QVERIFY(frame.size() <= prores::targetFrameBytes(5, W, H));
+            QCOMPARE(int(frame[8 + 20]), 2);
+            prores::OwnDecoded own;
+            QVERIFY2(prores::decodeOwn(frame.data(), frame.size(), own, &err), err.c_str());
+            double worst = 0;
+            for (size_t i = 0; i < y.size(); ++i) worst = std::max(worst, std::fabs(double(own.y[i]) - double(y[i])));
+            QVERIFY2(worst <= 4, qPrintable(QStringLiteral("%1 codes off").arg(worst)));
+        }
     }
 
     void proRes12BitRamp() {
@@ -12184,6 +13218,66 @@ colorspaces:
                 return std::abs(first - want) <= 1 && std::abs(second - (want + 8)) <= 1;
             });
             QVERIFY2(n == r.frames && k == 6, order);
+        }
+    }
+
+    void interlacedDissolveAtFieldMoments() {
+        // A dissolve from black to white over ten frames. A frame is mixed at its middle, so the first fields step a
+        // tenth each; a second field belongs half a frame later, halfway between the first fields either side (it was
+        // a quarter of a step short of that, mixed at the middle of its own field).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        s.videoTracks[0].clips = {colorClip(p, 0, 0, 0, 0, 12), colorClip(p, 1, 1, 1, 12, 12)};
+        QVERIFY(edit::addTransition(p, s, s.videoTracks[0].clips[1].id, edit::Edge::In, "cross_dissolve", 10).ok);
+        QCOMPARE(s.videoTracks[0].transitions.size(), size_t(1));
+        QCOMPARE(s.videoTracks[0].transitions[0].phase, 0.5);
+        const Sequence twice = fieldRateSequence(s);
+        QCOMPARE(twice.videoTracks[0].transitions[0].duration, FrameTime(20));
+        QCOMPARE(twice.videoTracks[0].transitions[0].phase, 1.0);
+        RenderOptions ro;
+        ro.highQuality = true;
+        auto level = [&](const Sequence& on, FrameTime t) { return double(renderProgramFrame(p, on, t, ro).at(160, 90)[1]); };
+        // (the transition runs from frame 7 to 17)
+        for (int k = 5; k < 18; ++k) {
+            const double first = level(s, k), next = level(s, k + 1);
+            if (k >= 7 && k < 16) QVERIFY2(std::fabs(next - first - 0.1) < 0.01, qPrintable(QStringLiteral("frame %1: %2 then %3").arg(k).arg(first).arg(next)));
+            QVERIFY2(std::fabs(level(twice, 2 * k) - first) < 1e-4, qPrintable(QString::number(k)));
+            // (halfway where both first fields are inside the dissolve; at its ends, where the ramp stops, between them)
+            const double second = level(twice, 2 * k + 1);
+            QVERIFY2(k >= 7 && k < 16 ? std::fabs(second - (first + next) / 2) < 0.005 : second >= first - 1e-4 && second <= next + 1e-4,
+                     qPrintable(QStringLiteral("frame %1: %2 between %3 and %4").arg(k).arg(second).arg(first).arg(next)));
+        }
+        // The same in an interlaced export (12-bit ProRes, the top field first): line 91, the second field's, is
+        // halfway between line 90 of its frame and of the next; segmented, both lines are the frame's.
+        auto luma = [](const AVFrame* f, int y) { return int(reinterpret_cast<const uint16_t*>(f->data[0] + size_t(y) * size_t(f->linesize[0]))[160]); };
+        QTemporaryDir dir;
+        std::string err;
+        for (const bool segmented : {false, true}) {
+            ExportSettings st;
+            st.videoCodec = "prores_ks";
+            st.profile = "4444";
+            st.pixFmt = "yuv444p12le";
+            st.audioCodec = "none";
+            st.interlaced = true;
+            st.segmentedFields = segmented;
+            st.path = dir.filePath(QStringLiteral("dissolve%1.mov").arg(segmented)).toStdString();
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            std::vector<int> first, second;
+            const int64_t n = decodeMxfPictures(st.path, [&](const AVFrame* f, const AVPacket*) {
+                first.push_back(luma(f, 90));
+                second.push_back(luma(f, 91));
+                return true;
+            });
+            QCOMPARE(n, int64_t(24));
+            // (a tenth of the 12-bit video range a frame: about 350 codes)
+            const int step = first[12] - first[11];
+            QVERIFY2(step > 300 && step < 400, qPrintable(QString::number(step)));
+            for (size_t k = 7; k < 16; ++k) {
+                const int want = segmented ? first[k] : (first[k] + first[k + 1]) / 2;
+                QVERIFY2(std::abs(second[k] - want) <= 12,
+                         qPrintable(QStringLiteral("segmented %1, frame %2: %3, first fields %4 and %5").arg(segmented).arg(k).arg(second[k]).arg(first[k]).arg(first[k + 1])));
+            }
         }
     }
 
@@ -16173,6 +17267,66 @@ colorspaces:
         QVERIFY2(timer.elapsed() < 5000, qPrintable(QString::number(timer.elapsed())));
     }
 
+    void titlePlainAnimatedLettersStayQuick() {
+        // Nightly 23 Nov: a plain title (no styles, no layout of its own) of 60,000 letters in one line, faded in by
+        // letter, half a second into its second. Each letter's place along the line comes from the letter before it,
+        // not from measuring the line from its start again (the letters squared: 1.8 x 10^9 characters measured a
+        // frame), so the frame costs some times what the still title's does (drawing 60,000 letters one by one),
+        // not minutes.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 12.0;
+        t.params["shadow"] = 0.0;
+        const int w = 800, h = 600;
+        // The still title and the title fading in, which shows the line's middle: the letters there are part way in,
+        // and every letter is where the still title has it, so the fading title puts no more ink in any pixel than
+        // the still one does (a letter a pixel out of place would).
+        auto check = [&](const std::string& text, int by, qint64* stillMs, qint64* fadingMs) {
+            t.strings["text"] = text;
+            t.params["text_anim_by"] = double(by);
+            t.params["text_anim"] = 0.0;
+            QElapsedTimer timer;
+            timer.start();
+            const Image still = renderTitle(t, 15, w, h, 1.0, 30, 30);
+            if (stillMs) *stillMs = timer.elapsed();
+            t.params["text_anim"] = 2.0;  // Fade
+            timer.restart();
+            const Image fading = renderTitle(t, 15, w, h, 1.0, 30, 30);
+            if (fadingMs) *fadingMs = timer.elapsed();
+            const size_t mid = (size_t(h / 2) * size_t(w) + size_t(w / 2)) * 4 + 3;
+            size_t most = 3;
+            for (size_t i = 3; i < still.px.size(); i += 4)
+                if (still.px[i] > 0.9f && (still.px[most] <= 0.9f || (i > mid ? i - mid : mid - i) < (most > mid ? most - mid : mid - most))) most = i;
+            QVERIFY2(still.px[most] > 0.9f, qPrintable(QString::number(still.px[most])));
+            const float opacity = fading.px[most] / still.px[most];
+            QVERIFY2(opacity > 0.2f && opacity < 0.95f, qPrintable(QString::number(opacity)));
+            float worst = 0;
+            for (size_t i = 3; i < still.px.size(); i += 4) worst = std::max(worst, fading.px[i] - still.px[i]);
+            QVERIFY2(worst < 0.05f, qPrintable(QString::number(worst)));
+        };
+        qint64 stillMs = 0, fadingMs = 0;
+        check(std::string(60000, 'i'), 0, &stillMs, &fadingMs);
+        qInfo("60,000 plain letters: %lld ms still, %lld ms fading in", static_cast<long long>(stillMs), static_cast<long long>(fadingMs));
+        QVERIFY2(fadingMs < stillMs * 20 + 15000, qPrintable(QString("%1 ms still, %2 ms fading in").arg(stillMs).arg(fadingMs)));
+        // A line short enough to be measured from its start for each letter, as before: 600 letters.
+        check(std::string(600, 'i'), 0, nullptr, nullptr);
+        // Words in a line too long to measure that way (the word "no" 2,000 times, faded in by word).
+        QString words;
+        for (int i = 0; i < 2000; ++i) words += QStringLiteral("no ");
+        words.chop(1);
+        check(words.toStdString(), 1, nullptr, nullptr);
+        // Kerned letters in such a line ("AV" 3,000 times, by letter): each letter starts where the whole line has
+        // it, the kerning between it and the letter before counted.
+        {
+            QFont kf(QStringLiteral("DejaVu Sans"));
+            kf.setPixelSize(12);
+            const QFontMetricsF km(kf);
+            QVERIFY(km.horizontalAdvance(QStringLiteral("AV")) < km.horizontalAdvance(QStringLiteral("A")) + km.horizontalAdvance(QStringLiteral("V")) - 0.1);
+        }
+        check(QString(QStringLiteral("AV")).repeated(3000).toStdString(), 0, nullptr, nullptr);
+    }
+
     void textOnMasksAndShapePaths() {
         // A title set on one of its clip's masks: an ellipse mask drawn as a circle of radius 200 round the middle of
         // an 800 x 600 frame. Every letter's baseline middle on the circle (0.1 px) and its baseline along the circle's
@@ -16474,6 +17628,64 @@ colorspaces:
         worst = 0;
         for (size_t j = 0; j < boxed.px.size(); ++j) worst = std::max(worst, double(std::abs(boxed.px[j] - boxedRef.px[j])));
         QVERIFY2(worst <= 1.0 / 255, qPrintable(QString("boxed: %1 of 255 off").arg(worst * 255)));
+    }
+
+    void titleBlurLaysItsTextOutOnce() {
+        // The title of titleBlurMovesOnlyMovingLetters (40 letters, one of them moving, a 360 degree shutter and 16
+        // samples): a frame is built at seventeen times through the shutter, and its text is laid out once for all
+        // of them, as nothing about the letters' shapes changes between them.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCD";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 40.0;
+        const int k = addTextAnimator(t);
+        const std::string pre = "ta" + std::to_string(k) + ".";
+        t.params[pre + "start"] = Param(47.5);
+        t.params[pre + "end"] = Param(50.0);
+        Param move;
+        move.addKey(0, -200.0);
+        move.addKey(10, 200.0);
+        t.params[pre + "x"] = move;
+        t.params["letter_blur"] = 1.0;
+        t.params["letter_shutter"] = 360.0;
+        t.params["letter_samples"] = 16.0;
+        const int w = 640, h = 360;
+        auto whole = [&] {
+            // Every time's whole title, each laid out for itself, averaged.
+            Image sum(w, h);
+            for (int i = 0; i < 16; ++i) {
+                const Image one = renderTitleAt(t, 5 + ((i + 0.5) / 16 - 0.5), w, h, 1.0, 30, 30);
+                for (size_t j = 0; j < sum.px.size(); ++j) sum.px[j] += one.px[j];
+            }
+            for (float& v : sum.px) v /= 16;
+            return sum;
+        };
+        auto apart = [](const Image& a, const Image& b) {
+            float worst = 0;
+            for (size_t i = 0; i < a.px.size(); ++i) worst = std::max(worst, std::fabs(a.px[i] - b.px[i]));
+            return worst;
+        };
+        long before = titleLayoutsMade();
+        const Image blurred = renderTitle(t, 5, w, h, 1.0, 30, 30);
+        QCOMPARE(titleLayoutsMade() - before, 1L);
+        before = titleLayoutsMade();
+        const Image each = whole();
+        QCOMPARE(titleLayoutsMade() - before, 16L);
+        QVERIFY2(apart(blurred, each) < 1.5f / 255, qPrintable(QString::number(apart(blurred, each))));
+        // With the letters growing through the shutter (Size keyed 40 to 60 px over ten frames, two pixels a frame)
+        // the text is laid out again at each time whose size differs, and at no other: more than once, fewer times
+        // than there are times, and the picture is the average of the times laid out each for itself.
+        Param grow;
+        grow.addKey(0, 40.0);
+        grow.addKey(10, 60.0);
+        t.params["size"] = grow;
+        before = titleLayoutsMade();
+        const Image growing = renderTitle(t, 5, w, h, 1.0, 30, 30);
+        const long made = titleLayoutsMade() - before;
+        QVERIFY2(made >= 2 && made <= 8, qPrintable(QString::number(made)));
+        const Image growingEach = whole();
+        QVERIFY2(apart(growing, growingEach) < 1.5f / 255, qPrintable(QString::number(apart(growing, growingEach))));
     }
 
     void titleLetterMotionBlur() {
@@ -19276,6 +20488,16 @@ colorspaces:
             QVERIFY(as.lostInFrame() == 1 && as.concealedSlices() >= 1 && as.timestamp() == 4000);
             QCOMPARE(as.codestream(), cs);
             QCOMPARE(as.passedOver(), int64_t(0));
+            // Nightly 23 November: between frames the assembler holds the last frame once (it is also the one a
+            // later frame's missing slices come from), not a second copy of it.
+            QCOMPARE(as.heldBytes(), size_t(0));
+            QVERIFY2(as.keptBytes() <= cs.size() + 256, qPrintable(QString("%1 kept for a frame of %2").arg(as.keptBytes()).arg(cs.size())));
+            // (and a frame after it, missing a packet again, is still put together from it)
+            const std::vector<st::RtpPacket> again = packets(5000, seq, 64, false);
+            for (size_t i = 0; i < again.size(); ++i)
+                if (i != 2) done += as.add(again[i]);
+            QCOMPARE(done, 5);
+            QCOMPARE(as.codestream(), cs);
         }
         // A header naming the largest picture its fields can (65,535 a side) is not one to decode: refused by its
         // header alone, and by the decoder before it sets anything aside when the library is built in.
@@ -19297,6 +20519,94 @@ colorspaces:
         QVERIFY(!decoder.decode(huge.data(), huge.size(), picture, &why));
         QVERIFY(picture.planes[0].empty());
         if (montage::jpegXsAvailable()) QVERIFY2(why.find("larger") != std::string::npos, why.c_str());
+        // JPEG XS files in MXF are written through bmx: its export presets and Capture's JPEG XS are offered only in a
+        // build with both.
+        const bool presets = std::any_of(exportPresets().begin(), exportPresets().end(), [](const ExportPreset& p) { return p.settings.videoCodec == "jpegxs"; });
+        const auto codecs = captureCodecs();
+        const bool recorded = std::any_of(codecs.begin(), codecs.end(), [](const auto& c) { return c.first == "jpeg_xs"; });
+        QCOMPARE(presets, montage::jpegXsAvailable() && broadcastMxfAvailable());
+        QCOMPARE(recorded, montage::jpegXsAvailable() && broadcastMxfAvailable());
+    }
+
+    // Interlaced JPEG XS over ST 2110-22 (RFC 9134's picture segments): each field a codestream of its own, sent under
+    // the frame's timestamp and F count with I saying which field, each field's last packet marked; rebuilt as two
+    // codestreams, the first field's and then the second's, and a progressive frame after them as a frame. A field is
+    // its frame's rows of one parity, woven back exactly. The format is taken with an even height, and said in the SDP.
+    void st2110JpegXsFields() {
+        namespace st = montage::st2110;
+        // Two codestreams as far as the assembler reads them (a header, four slices and the end), told apart by their bytes.
+        auto codestream = [](int seed) {
+            std::vector<uint8_t> cs = {0xFF, 0x10, 0xFF, 0x12, 0x00, 0x1A};
+            cs.resize(cs.size() + 24, 0);
+            cs[6 + 9] = 64, cs[6 + 11] = 32, cs[6 + 15] = 1, cs[6 + 16] = 3, cs[6 + 22] = 4;
+            for (int b : {0xFF, 0x13, 0x00, 0x08, 0x0A, 0x11, 0x0A, 0x21, 0x0A, 0x21}) cs.push_back(uint8_t(b));
+            for (int slice = 0; slice < 4; ++slice) {
+                for (int b : {0xFF, 0x20, 0x00, 0x04, 0x00, slice}) cs.push_back(uint8_t(b));
+                for (int i = 0; i < 122; ++i) cs.push_back(uint8_t(1 + (seed * 7 + slice * 31 + i) % 200));
+            }
+            cs.push_back(0xFF), cs.push_back(0x11);
+            cs[8] = uint8_t(cs.size() >> 8), cs[9] = uint8_t(cs.size());
+            return cs;
+        };
+        const std::vector<uint8_t> first = codestream(1), second = codestream(2), progressive = codestream(3);
+        const std::vector<uint32_t> units = {40, 128, 128, 128, 130};
+        QCOMPARE(size_t(40 + 128 * 3 + 130), first.size());
+        for (const int mode : {0, 1}) {
+            std::vector<std::vector<uint8_t>> sent;
+            st::RtpState rtp;
+            rtp.payloadType = 98;
+            auto keep = [&](const uint8_t* d, size_t n) {
+                sent.emplace_back(d, d + n);
+                return true;
+            };
+            QVERIFY(st::packJxsv({}, first.data(), first.size(), units, mode, 7, 90000, rtp, keep, 200, 1));
+            const size_t firstPackets = sent.size();
+            QVERIFY(st::packJxsv({}, second.data(), second.size(), units, mode, 7, 90000, rtp, keep, 200, 2));
+            const size_t fieldPackets = sent.size();
+            QVERIFY(st::packJxsv({}, progressive.data(), progressive.size(), units, mode, 8, 93600, rtp, keep, 200));
+            QVERIFY(!st::packJxsv({}, first.data(), first.size(), units, mode, 9, 97200, rtp, keep, 200, 3));
+            st::JxsvAssembler as;
+            std::vector<std::pair<int, std::vector<uint8_t>>> got;
+            for (size_t i = 0; i < sent.size(); ++i) {
+                st::RtpPacket p;
+                QVERIFY(st::parseRtp(sent[i].data(), sent[i].size(), p));
+                const uint32_t h = uint32_t(p.payload[0]) << 24 | uint32_t(p.payload[1]) << 16 | uint32_t(p.payload[2]) << 8 | p.payload[3];
+                // (I: 2 the first field, 3 the second, 0 a frame; F the frame's; the marker on each picture's last)
+                QCOMPARE(int((h >> 27) & 3), i < firstPackets ? 2 : i < fieldPackets ? 3 : 0);
+                QCOMPARE(int((h >> 22) & 31), i < fieldPackets ? 7 : 8);
+                QCOMPARE(p.timestamp, i < fieldPackets ? 90000u : 93600u);
+                QCOMPARE(p.marker, i + 1 == firstPackets || i + 1 == fieldPackets || i + 1 == sent.size());
+                if (as.add(p)) got.emplace_back(as.field(), as.codestream());
+            }
+            QCOMPARE(got.size(), size_t(3));
+            QCOMPARE(got[0].first, 1);
+            QVERIFY(got[0].second == first);
+            QCOMPARE(got[1].first, 2);
+            QVERIFY(got[1].second == second);
+            QCOMPARE(got[2].first, 0);
+            QVERIFY(got[2].second == progressive);
+            QCOMPARE(as.lost(), int64_t(0));
+        }
+        // A frame's fields, each of its rows of one parity, woven back into the very frame.
+        st::Raster frame(8, 6, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < frame.height; ++y)
+            for (int i = 0; i < frame.rowSamples(); ++i) frame.row(y)[i] = uint16_t(y * 100 + i);
+        const st::Raster top = st::fieldOf(frame, 1), bottom = st::fieldOf(frame, 2);
+        QCOMPARE(top.height, 3);
+        QCOMPARE(int(top.row(1)[0]), 200);
+        QCOMPARE(int(bottom.row(1)[0]), 300);
+        st::Raster woven(8, 6, st::Sampling::Ycc422, 10);
+        st::weaveField(woven, top, 1);
+        st::weaveField(woven, bottom, 2);
+        QVERIFY(woven == frame);
+        // The format: interlaced JPEG XS taken at an even height, and the SDP saying it is interlaced.
+        st::VideoFormat v;
+        v.width = 1920, v.height = 1080, v.fps = {25, 1}, v.interlaced = true, v.codec = "jxsv", v.bpp = 4;
+        std::string why;
+        QVERIFY2(st::videoFormatOk(v, &why), why.c_str());
+        QVERIFY(st::videoSdp(v, {"239.1.1.1", 5004}, 98, {}).find("; interlace") != std::string::npos);
+        v.height = 1081;
+        QVERIFY(!st::videoFormatOk(v));
     }
 
     // ST 2110-22's JPEG XS (RFC 9134), in both packetization modes: packets as the RFC lays them out (a constant number
@@ -19481,6 +20791,7 @@ colorspaces:
             }
             const st::VideoFormat& got = streams[0].video;
             if (!(got.jpegXs() && got.packetMode == v.packetMode && got.width == v.width && got.sampling == v.sampling && got.depth == v.depth &&
+                  got.interlaced == v.interlaced &&
                   got.profile == snd.videoFormat().profile && got.bandwidthKbps == snd.videoFormat().bandwidthKbps && got.bandwidthKbps > 0 &&
                   streams[0].redundant()))
                 return "SDP video format";
@@ -19495,12 +20806,25 @@ colorspaces:
             const montage::JxsPicture pics[2] = {jxsTestPicture(v.width, v.height, v.depth, js, 0), jxsTestPicture(v.width, v.height, v.depth, js, 9)};
             montage::JxsEncoder direct;
             montage::JxsEncodeSettings ds;
-            ds.width = v.width, ds.height = v.height, ds.depth = v.depth, ds.sampling = js, ds.bppNum = int(std::lround(v.bpp * 1000)), ds.bppDen = 1000;
+            // (interlaced: each field coded on its own and the two decoded woven into the frame; no codestream kept as
+            // the frame's)
+            ds.width = v.width, ds.height = v.interlaced ? v.height / 2 : v.height, ds.depth = v.depth, ds.sampling = js;
+            ds.bppNum = int(std::lround(v.bpp * 1000)), ds.bppDen = 1000;
             ds.slices = v.packetMode == 1;
             if (!direct.open(ds, &e)) return e;
             std::vector<uint8_t> codes[2];
             st::Raster expect[2];
-            for (int k = 0; k < 2; ++k) {
+            for (int k = 0; k < 2 && v.interlaced; ++k) {
+                expect[k] = st::Raster(v.width, v.height, v.sampling, v.depth);
+                for (int field : {1, 2}) {
+                    std::vector<uint8_t> code;
+                    montage::JxsPicture p;
+                    if (!direct.encode(st::jxsPictureOf(st::fieldOf(st::rasterOf(pics[k]), field)), code, nullptr, &e)) return e;
+                    if (!dec.decode(code.data(), code.size(), p, &e, js)) return e;
+                    st::weaveField(expect[k], st::rasterOf(p), field);
+                }
+            }
+            for (int k = 0; k < 2 && !v.interlaced; ++k) {
                 if (!direct.encode(pics[k], codes[k], nullptr, &e)) return e;
                 montage::JxsPicture p;
                 if (!dec.decode(codes[k].data(), codes[k].size(), p, &e, js)) return e;
@@ -19555,9 +20879,14 @@ colorspaces:
         v.packetMode = 1, v.sampling = st::Sampling::Rgb, v.depth = 12, v.bpp = 6, v.fps = {50, 1};
         const std::string e = loopback(v, 20);
         QVERIFY2(e.empty(), ("RGB 12-bit: " + e).c_str());
-        // Interlaced JPEG XS is refused, as the RFC's second picture segment is not sent here.
+        // Interlaced JPEG XS, a codestream each field, in both modes: the fields' pictures woven as each decodes alone.
         v.interlaced = true;
-        QVERIFY(!st::videoFormatOk(v));
+        v.sampling = st::Sampling::Ycc422, v.depth = 10, v.bpp = 4, v.fps = {25, 1};
+        for (int mode : {0, 1}) {
+            v.packetMode = mode;
+            const std::string fe = loopback(v, 20);
+            QVERIFY2(fe.empty(), (std::string(mode ? "interlaced, slice mode: " : "interlaced, codestream mode: ") + fe).c_str());
+        }
     }
 
     // JPEG XS coded and decoded through SVT-JPEG-XS: the header read without it, a constant number of bytes a picture
@@ -19976,6 +21305,8 @@ colorspaces:
         const QJsonArray receivers = json("GET", nodeApi + "receivers").second.array();
         QCOMPARE(receivers.size(), 3);
         QCOMPARE(receivers[0].toObject()["caps"].toObject()["media_types"].toArray()[0].toString(), QStringLiteral("video/raw"));
+        // (the sound's receiver takes ST 2110-31's AES3 subframes too, kept bit for bit)
+        QVERIFY(receivers[1].toObject()["caps"].toObject()["media_types"].toArray().contains(QStringLiteral("audio/AM824")));
         QCOMPARE(receivers[0].toObject()["interface_bindings"].toArray().size(), 2);
         QCOMPARE(json("GET", nodeApi + "devices").second.array()[0].toObject()["receivers"].toArray().size(), 3);
         const QString videoId = node.receiverId(0).toString(QUuid::WithoutBraces), audioId = node.receiverId(1).toString(QUuid::WithoutBraces);
@@ -22873,10 +24204,10 @@ colorspaces:
         bad = rig.settings;
         bad.turnPassword.clear();
         QVERIFY(!checkStreamSettings(bad).empty());
-        // (Montage reaches the relay over UDP: one over TLS or TCP only is the browsers', never relay only)
+        // (a relay reached over TCP is taken, only through it or not: reviewRelayThreadFamilyAndExpiry has the rest)
         bad = rig.settings;
         bad.turnServer = "turn:127.0.0.1:3478?transport=tcp";
-        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("UDP"));
+        QVERIFY(checkStreamSettings(bad).empty());
         bad.relayOnly = false;
         QVERIFY(checkStreamSettings(bad).empty());
 #endif
@@ -23147,7 +24478,7 @@ colorspaces:
         auto network = [](int n) { return QStringLiteral("10.%1.%2.0/24").arg(n / 256).arg(n % 256); };
         {
             // One behind a network mistypes: the network is listed, with three tries at once. Six more behind it give
-            // the right passphrase in the same moment and are all tried; wrong ones after them still have only three.
+            // the right passphrase in the same moment and are all tried, and the ration still has its three.
             Gate gate;
             Gate::Verdict v = gate.ask(address(1, 1), network(1), start);
             QCOMPARE(int(v.answer), int(Gate::Answer::Try));
@@ -23159,7 +24490,9 @@ colorspaces:
                 gate.right(address(1, host), network(1), start, v);
                 QVERIFY(gate.trusted(address(1, host)));
             }
-            int tried = 0;
+            // (ten more addresses there, each fresh and each wrong: three of them are tried, on the network's ration;
+            // a fresh address gains nothing over one with a record)
+            int tried = 0, charged = 0;
             for (int host = 20; host < 30; ++host) {
                 v = gate.ask(address(1, host), network(1), start);
                 if (v.answer != Gate::Answer::Try) {
@@ -23168,15 +24501,18 @@ colorspaces:
                     continue;
                 }
                 ++tried;
+                charged += v.charged;
                 gate.wrong(address(1, host), network(1), start);
             }
             QCOMPARE(tried, 3);
+            QCOMPARE(charged, 3);
             // One let in is tried whatever its network has left.
             QCOMPARE(int(gate.ask(address(1, 2), network(1), start).answer), int(Gate::Answer::Try));
         }
         {
-            // 5,000 networks guess wrong once each, a hundred a second: the gate lists 4,096, each tried once, and
-            // the rest share a ration (three at once, five a second).
+            // 5,000 networks guess wrong once each, a hundred a second: the gate lists 4,096, and every network is
+            // tried the once, as none has guessed wrong before. Asking again at once, the networks not listed are
+            // refused untried: they share a ration (three at once, five a second) that their first tries used up.
             Gate gate;
             Gate::Clock::time_point now = start;
             int tried = 0;
@@ -23187,7 +24523,16 @@ colorspaces:
                 gate.wrong(address(n, 9), network(n), now);
             }
             QCOMPARE(gate.networksListed(), Gate::kListed);
-            QVERIFY2(tried >= 4096 + 3 && tried <= 4096 + 3 + 5 * 10 + 2, qPrintable(QString::number(tried)));
+            QCOMPARE(tried, 5000);
+            QCOMPARE(gate.addressesOnRecord(), size_t(5000));
+            QCOMPARE(gate.networksOnRecord(), size_t(5000 - Gate::kListed));
+            int again = 0;
+            for (int n = 4096; n < 5000; ++n) {
+                if (gate.ask(address(n, 9), network(n), now).answer != Gate::Answer::Try) continue;
+                ++again;
+                gate.wrong(address(n, 9), network(n), now);
+            }
+            QVERIFY2(again <= 2, qPrintable(QString::number(again)));
             // A second after the guessers from networks not listed let up, a newcomer from another such network is
             // tried, and let in with the right passphrase.
             now += 1s;
@@ -23280,7 +24625,109 @@ colorspaces:
                 }
             }
             QCOMPARE(newcomers, 24);
+            // (what the network's ration allows: its addresses' being fresh gained them nothing)
             QVERIFY2(wrong <= 5 * 180 + 4, qPrintable(QString::number(wrong)));
+        }
+        {
+            // Phase 16: 5,000 networks guessing a hundred a second between them for five minutes, each from one
+            // address, and from the first moment a newcomer from another network every 0.7 s with the right
+            // passphrase: every newcomer is tried at once, while the list is filling, when it is full and after. A
+            // try is used up only by a wrong passphrase, so the guessers have each network's first try and then
+            // what the rations allow: no more than five a second between those the list holds and five between
+            // the rest.
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            int newcomers = 0, wrong = 0, wrongLater = 0;
+            for (int step = 0; step < 100 * 300; ++step) {
+                now += 10ms;
+                const int n = step % 5000;
+                if (gate.ask(address(n, 9), network(n), now).answer == Gate::Answer::Try) {
+                    ++wrong;
+                    wrongLater += step >= 5000;
+                    gate.wrong(address(n, 9), network(n), now);
+                }
+                if (step % 70 == 35) {
+                    const int fresh = 30000 + step;
+                    const Gate::Verdict v = gate.ask(address(fresh, 5), network(fresh), now);
+                    QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString("the newcomer at %1 s").arg(step * 0.01)));
+                    gate.right(address(fresh, 5), network(fresh), now, v);
+                    QVERIFY(gate.trusted(address(fresh, 5)));
+                    ++newcomers;
+                }
+            }
+            QCOMPARE(newcomers, 429);
+            QVERIFY2(wrong >= 5000, qPrintable(QString::number(wrong)));
+            QVERIFY2(wrongLater <= 600 + 2 * 5 * 250, qPrintable(QString::number(wrongLater)));
+            qInfo("5,000 networks guessing for five minutes: %d tries in all, %d after each one's first", wrong, wrongLater);
+        }
+        {
+            // The record of networks is finite: 20,000 new networks the list cannot hold, all in a minute, are
+            // tried once each only until the record is full (16,384 networks), and after that only as the ration
+            // those networks share allows.
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            for (int n = 0; n < int(Gate::kListed); ++n) {
+                now += 1ms;
+                if (gate.ask(address(n, 9), network(n), now).answer == Gate::Answer::Try) gate.wrong(address(n, 9), network(n), now);
+            }
+            int tried = 0;
+            for (int k = 0; k < 20000; ++k) {
+                now += 3ms;
+                const int n = 5000 + k;
+                if (gate.ask(address(n, 9), network(n), now).answer != Gate::Answer::Try) continue;
+                ++tried;
+                gate.wrong(address(n, 9), network(n), now);
+            }
+            const int room = int(Gate::kRecorded);
+            QVERIFY2(tried >= room && tried <= room + 3 + 5 * 60 + 2, qPrintable(QString::number(tried)));
+            QCOMPARE(gate.networksOnRecord(), Gate::kRecorded);
+            QVERIFY(gate.addressesOnRecord() <= Gate::kRecorded + 1);
+        }
+        {
+            // Nightly 23 November: guessers who send each guess from a fresh address, with nothing ever on record
+            // against the address asking. The list full, they guess a hundred a second for ten minutes from a fresh
+            // /64 each time, spread over 64 /48s the list cannot hold, and so drain the ration those networks share.
+            // A newcomer from another such network every second is tried every time, and let in. The guessers gain
+            // nothing by their fresh addresses: they are tried once for each of their networks and then as the shared
+            // ration allows, five a second. A newcomer behind one of the guessers' own /48s is refused with them (its
+            // network has guessed wrong, as behind a shared carrier's address).
+            Gate gate;
+            Gate::Clock::time_point now = start;
+            for (int n = 0; n < int(Gate::kListed); ++n) {
+                now += 1ms;
+                if (gate.ask(address(n, 9), network(n), now).answer == Gate::Answer::Try) gate.wrong(address(n, 9), network(n), now);
+            }
+            QCOMPARE(gate.networksListed(), Gate::kListed);
+            auto fresh = [](int k) { return QStringLiteral("2001:db8:%1:%2::/64").arg(k % 64, 0, 16).arg(k / 64 % 65536, 0, 16); };
+            auto theirs = [](int k) { return QStringLiteral("2001:db8:%1::/48").arg(k % 64, 0, 16); };
+            int guesses = 0, elsewhere = 0, beside = 0;
+            for (int step = 0; step < 100 * 600; ++step) {
+                now += 10ms;
+                if (gate.ask(fresh(step), theirs(step), now).answer == Gate::Answer::Try) {
+                    ++guesses;
+                    gate.wrong(fresh(step), theirs(step), now);
+                }
+                if (step % 100 == 50) {
+                    const QString newcomer = QStringLiteral("2001:db9:%1::1/64").arg(step / 100, 0, 16);
+                    const QString itsNetwork = QStringLiteral("2001:db9:%1::/48").arg(step / 100, 0, 16);
+                    Gate::Verdict v = gate.ask(newcomer, itsNetwork, now);
+                    QVERIFY2(v.answer == Gate::Answer::Try, qPrintable(QString("the newcomer at %1 s").arg(step * 0.01)));
+                    gate.right(newcomer, itsNetwork, now, v);
+                    QVERIFY(gate.trusted(newcomer));
+                    ++elsewhere;
+                    const QString mine = QStringLiteral("2001:db8:%1:ffff::/64").arg(step / 100 % 64, 0, 16);
+                    v = gate.ask(mine, theirs(step / 100), now);
+                    if (v.answer == Gate::Answer::Try) {
+                        gate.right(mine, theirs(step / 100), now, v);
+                        ++beside;
+                    }
+                }
+            }
+            QCOMPARE(elsewhere, 600);
+            QVERIFY2(guesses <= 64 + 3 + 5 * 600 + 2, qPrintable(QString::number(guesses)));
+            QVERIFY2(guesses >= 5 * 600 - 100, qPrintable(QString::number(guesses)));
+            qInfo("Guessers from a fresh address each time: %d of 60,000 guesses tried; a newcomer behind their networks let in %d of 600 times",
+                  guesses, beside);
         }
     }
 
@@ -23801,9 +25248,10 @@ colorspaces:
         std::vector<std::string> asked;
         const std::string moved = offerThroughRelay(offer, [&](const std::string& ip, uint16_t port) {
             asked.push_back(ip + ":" + std::to_string(port));
-            return uint16_t(ip == "192.0.2.8" ? 0 : 40000 + asked.size());
+            return uint16_t(ip == "192.0.2.8" || ip == "2001:db8::7" ? 0 : 40000 + asked.size() - (asked.size() > 4));
         });
-        QCOMPARE(asked, (std::vector<std::string>{"192.0.2.7:50001", "198.51.100.9:50002", "203.0.113.5:50003", "192.0.2.8:50007"}));
+        // (an IPv6 one is asked about too, and left out here as the test gives it no port)
+        QCOMPARE(asked, (std::vector<std::string>{"192.0.2.7:50001", "198.51.100.9:50002", "203.0.113.5:50003", "2001:db8::7:50005", "192.0.2.8:50007"}));
         QCOMPARE(moved, std::string("v=0\r\na=ice-ufrag:abcd\r\n"
                                     "a=candidate:1 1 UDP 2122260223 127.0.0.1 40001 typ host\r\n"
                                     "a=candidate:2 1 UDP 1686052607 127.0.0.1 40002 typ host\r\n"
@@ -24444,6 +25892,15 @@ colorspaces:
                                  "a=candidate:3 1 udp 41885439 127.0.0.1 " + QByteArray::number(viewer[2]->localPort()) + " typ relay raddr 0.0.0.0 rport 0\r\n" +
                                  "a=candidate:4 1 tcp 1518280447 127.0.0.1 9 typ host tcptype active\r\n"
                                  "a=candidate:5 1 udp 2122262783 ::1 50005 typ host\r\na=end-of-candidates\r\n";
+        // An offer with no address a bridge could carry to (a browser that got none at the relay: only a TCP and a
+        // named candidate) is refused at once, saying so, and holds no bridge.
+        QByteArray none;
+        for (const QByteArray& line : offer.split('\n'))
+            if (!line.startsWith("a=candidate:") || line.contains(" tcp ")) none += line + '\n';
+        none += "a=candidate:6 1 udp 2122260223 4f0c2b1e-0d9a-4e4b-9c55-07c1e41a4f53.local 50006 typ host\r\n";
+        const QByteArray refused = httpsRequest({}, rig.port(), "POST", "/whep", QByteArray::fromStdString(rig.settings.passphrase), none, "application/sdp", 20000);
+        QVERIFY2(httpStatusOf(refused) == 400 && httpBodyOf(refused).contains("no address at the review's relay"), refused.left(400).constData());
+        QCOMPARE(rig.review->stats().bridges.size(), size_t(0));
         const QByteArray response = httpsRequest({}, rig.port(), "POST", "/whep", QByteArray::fromStdString(rig.settings.passphrase), offer, "application/sdp", 20000);
         QVERIFY2(httpStatusOf(response) == 201, response.left(400).constData());
         // The answer offers one candidate: Montage's address at the relay.
@@ -24706,6 +26163,1239 @@ colorspaces:
             const std::string refused = allocateAt(late);
             QVERIFY2(QString::fromStdString(refused).contains("login"), (refused + " " + serverLog().toStdString()).c_str());
         }
+    }
+
+    // Phase 16: the bridge reaches a relay over TCP, over TLS and at an IPv6 address, and carries to IPv6 viewers.
+    // Against a relay of the test's own (tests/RelayFake.h). "as IPv6" rows run on 127.0.0.1 with a relay that
+    // speaks as one whose addresses are IPv6, so everything about IPv6 but the sockets is checked on computers
+    // with none; the "::1" rows need an IPv6 loopback.
+    void reviewRelayTransports_data() {
+        QTest::addColumn<QString>("transport");  // "udp", "tcp", "tls"
+        QTest::addColumn<int>("ipv6");           // 0: IPv4, 1: IPv6 addresses over IPv4 sockets, 2: on ::1
+        QTest::newRow("tcp") << "tcp" << 0;
+        QTest::newRow("tls") << "tls" << 0;
+        QTest::newRow("udp as IPv6") << "udp" << 1;
+        QTest::newRow("tls as IPv6") << "tls" << 1;
+        QTest::newRow("udp on ::1") << "udp" << 2;
+        QTest::newRow("tcp on ::1") << "tcp" << 2;
+        QTest::newRow("tls on ::1") << "tls" << 2;
+    }
+    void reviewRelayTransports() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        QFETCH(QString, transport);
+        QFETCH(int, ipv6);
+        if (ipv6 == 2 && !FakeRelay::hasIpv6()) QSKIP("This computer has no IPv6 loopback address");
+        const bool stream = transport != "udp";
+        FakeRelay::Config config;
+        config.v6 = ipv6 == 2;
+        config.pretendV6 = ipv6 == 1;
+        config.udp = transport == "udp";
+        config.tcp = transport == "tcp";
+        config.tls = transport == "tls";
+        config.user = "reviewer";
+        config.password = "relay-password-16";
+        std::string why;
+        QByteArray fingerprint;
+        if (config.tls) {
+            QVERIFY2(makeReviewCertificate({"127.0.0.1", "::1", "localhost"}, config.certificatePem, config.keyPem, &why), why.c_str());
+            fingerprint = QSslCertificate(QByteArray::fromStdString(config.certificatePem), QSsl::Pem).digest(QCryptographicHash::Sha256).toHex(':').toUpper();
+        }
+        FakeRelay relay(config);
+        QVERIFY2(relay.start(&why), why.c_str());
+        // The relay's address as the settings have it.
+        RelayAddress at;
+        QVERIFY(parseRelayAddress(relay.url(), at));
+        QCOMPARE(at.host, std::string(config.v6 ? "::1" : "127.0.0.1"));
+        QCOMPARE(int(at.port), relay.port());
+        QCOMPARE(int(at.transport), int(config.tls ? RelayAddress::Transport::Tls : config.tcp ? RelayAddress::Transport::Tcp : RelayAddress::Transport::Udp));
+        at.pin = fingerprint.toStdString();
+        const TurnLogin login{"reviewer", "relay-password-16"};
+        const QString over = transport.toUpper();
+        auto allocate = [&](RelayBridge& b) {
+            struct Said {
+                std::mutex m;
+                std::condition_variable cv;
+                bool done = false;
+                std::string error;
+            };
+            auto said = std::make_shared<Said>();
+            b.allocate(ipv6 ? 6 : 4, [said](const std::string& error) {
+                std::lock_guard lock(said->m);
+                said->done = true;
+                said->error = error;
+                said->cv.notify_all();
+            });
+            std::unique_lock lock(said->m);
+            return said->cv.wait_for(lock, std::chrono::seconds(15), [&] { return said->done; }) ? said->error : std::string("nothing said");
+        };
+        const QHostAddress loopback(config.v6 ? QHostAddress::LocalHostIPv6 : QHostAddress::LocalHost);
+        auto socket = [&](const QHostAddress& on) {
+            auto s = std::make_unique<QUdpSocket>();
+            s->setProxy(QNetworkProxy::NoProxy);
+            s->bind(on, 0);
+            return s;
+        };
+        struct Got {
+            QByteArray data;
+            quint16 from = 0;
+        };
+        auto read = [](QUdpSocket& s, int ms) {
+            Got g;
+            if (!s.hasPendingDatagrams() && !s.waitForReadyRead(ms)) return g;
+            g.data.resize(int(s.pendingDatagramSize()));
+            s.readDatagram(g.data.data(), g.data.size(), nullptr, &g.from);
+            return g;
+        };
+        const quint64 threadsBefore = RelayBridge::threadsStarted();
+        {
+            RelayBridge bridge(at, login);
+            QCOMPARE(RelayBridge::threads(), 1);
+            QCOMPARE(allocate(bridge), std::string());
+            QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over %1").arg(over));
+            QCOMPARE(QHostAddress(QString::fromStdString(bridge.relayedAddress())), relay.relayedAddress());
+            const uint16_t relayed = bridge.relayedPort();
+            QVERIFY(relayed != 0);
+            QCOMPARE(relay.allocations.load(), 1);
+            // A viewer at an address of the relay's family has a port standing for it; one of the other family none.
+            auto viewer = socket(loopback), end = socket(QHostAddress(QHostAddress::LocalHost));
+            const std::string viewerAt = relay.peerAddress().toString().toStdString();
+            const uint16_t alias = bridge.peer(viewerAt, viewer->localPort());
+            QVERIFY(alias != 0);
+            QCOMPARE(bridge.peer(viewerAt, viewer->localPort()), alias);
+            QCOMPARE(bridge.peer(ipv6 ? "192.0.2.7" : "2001:db8::7", 5000), uint16_t(0));
+            QCOMPARE(bridge.peer("fe80::1%lo", 5000), uint16_t(0));
+            // Montage's end to the viewer arrives from Montage's address at the relay, and the viewer's answer at
+            // Montage's end from the port that stands for the viewer.
+            Got got;
+            for (int i = 0; i < 50 && got.data.isEmpty(); ++i) {
+                end->writeDatagram("to the viewer", QHostAddress::LocalHost, alias);
+                got = read(*viewer, 100);
+            }
+            QCOMPARE(got.data, QByteArray("to the viewer"));
+            QCOMPARE(got.from, quint16(relayed));
+            while (!read(*viewer, 200).data.isEmpty()) {}
+            viewer->writeDatagram("to Montage", loopback, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("to Montage"));
+            QCOMPARE(got.from, quint16(alias));
+            QVERIFY(relay.sendIndications.load() >= 1);
+            QCOMPARE(relay.channelData.load(), quint64(0));
+            if (stream) QVERIFY(relay.bytesOverStream.load() > 0);
+            QCOMPARE(relay.bytesOverUdp.load() > 0, !stream);
+            // An answer to the viewer's connectivity check names the viewer's own address when it leaves: an IPv6
+            // address takes twelve bytes more than the loopback port it replaces, and the answer is signed and
+            // fingerprinted as if Montage's end had made it so.
+            const QByteArray icePassword = "an ICE password of the test";
+            const QByteArray id(12, 't');
+            bridge.setLocal(end->localPort(), icePassword.toStdString());
+            QThread::msleep(100);
+            end->writeDatagram(FakeRelay::bindingAnswer(QHostAddress(QHostAddress::LocalHost), alias, id, icePassword), QHostAddress::LocalHost, alias);
+            got = read(*viewer, 3000);
+            QCOMPARE(got.data.toHex(), FakeRelay::bindingAnswer(relay.peerAddress(), viewer->localPort(), id, icePassword).toHex());
+            QCOMPARE(got.data.size(), ipv6 ? 76 : 64);
+            // A viewer's check from the controlling end with a tiebreaker of 0 (Chrome's from a relay over TCP or TLS)
+            // reaches Montage's end with 1 in its place, signed again with Montage's ICE password; one with a
+            // tiebreaker of its own reaches it as it was sent.
+            const QByteArray checkId(12, 'c');
+            viewer->writeDatagram(FakeRelay::bindingRequest(checkId, 0, icePassword), loopback, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data.toHex(), FakeRelay::bindingRequest(checkId, 1, icePassword).toHex());
+            const QByteArray own = FakeRelay::bindingRequest(checkId, 0x0123456789abcdefULL, icePassword);
+            viewer->writeDatagram(own, loopback, relayed);
+            QCOMPARE(read(*end, 3000).data.toHex(), own.toHex());
+            // A stream's answers a byte at a time, with a channel's data between them, are read all the same: a
+            // second viewer's address is let in and carried to.
+            relay.trickle = true;
+            relay.channelNoise = true;
+            auto second = socket(loopback);
+            const int permissionsBefore = relay.permissions;
+            viewer->writeDatagram("again", loopback, relayed);
+            QCOMPARE(read(*end, 3000).data, QByteArray("again"));
+            second->writeDatagram("from elsewhere", loopback, relayed);
+            got = read(*end, 3000);
+            QCOMPARE(got.data, QByteArray("from elsewhere"));
+            QVERIFY(got.from != 0);
+            end->writeDatagram("and back", QHostAddress::LocalHost, got.from);
+            QCOMPARE(read(*second, 3000).data, QByteArray("and back"));
+            QVERIFY(relay.permissions >= permissionsBefore);
+            relay.trickle = false;
+            relay.channelNoise = false;
+            QCOMPARE(bridge.lastError(), std::string());
+            QCOMPARE(bridge.answersRefused(), uint64_t(0));
+        }
+        // Let go of, the bridge gave its address back, and its thread ended with it.
+        QCOMPARE(relay.released.load(), 1);
+        QCOMPARE(RelayBridge::threads(), 0);
+        QCOMPARE(RelayBridge::threadsStarted(), threadsBefore + 1);
+        // An answer changed by one byte on its way is not used, and is said: over UDP each sending's answer, over a
+        // stream the one.
+        {
+            relay.corruptAnswers = true;
+            RelayBridge changed(at, login);
+            QElapsedTimer waited;
+            waited.start();
+            const std::string said = allocate(changed);
+            relay.corruptAnswers = false;
+            QVERIFY2(QString::fromStdString(said).contains("did not answer") && QString::fromStdString(said).contains("not signed with this review's login"), said.c_str());
+            QVERIFY2(waited.elapsed() >= 4000 && waited.elapsed() < 12000, std::to_string(waited.elapsed()).c_str());
+            QCOMPARE(changed.lastError(), said);
+            QVERIFY(changed.answersRefused() >= 1);
+            if (stream) QCOMPARE(changed.answersRefused(), uint64_t(1));
+            QCOMPARE(changed.relayedPort(), uint16_t(0));
+            QCOMPARE(QString::fromStdString(changed.state()), QStringLiteral("Ended"));
+        }
+        if (stream) {
+            // Bytes that are not TURN end the connection, and so does the relay's closing it: both are said.
+            relay.garbage = true;
+            RelayBridge lost(at, login);
+            std::string said = allocate(lost);
+            QVERIFY2(QString::fromStdString(said).contains("not TURN"), said.c_str());
+            RelayBridge closed(at, login);
+            QCOMPARE(allocate(closed), std::string());
+            relay.hangUp = true;
+            auto viewer = socket(loopback);
+            QVERIFY(closed.peer(relay.peerAddress().toString().toStdString(), viewer->localPort()) != 0);
+            QTRY_COMPARE_WITH_TIMEOUT(QString::fromStdString(closed.state()), QStringLiteral("Ended"), 5000);
+            said = closed.lastError();
+            QVERIFY2(QString::fromStdString(said).contains(QStringLiteral("The connection to the TURN relay over %1 ended").arg(over)), said.c_str());
+            relay.hangUp = false;
+        }
+        if (config.tls) {
+            // The certificate: one that is not the pinned one is not taken, and neither is one no root signed when
+            // none is pinned.
+            const int allocationsBefore = relay.allocations;
+            RelayAddress other = at;
+            other.pin = std::string(64, 'a');
+            RelayBridge wrongPin(other, login);
+            std::string said = allocate(wrongPin);
+            QVERIFY2(QString::fromStdString(said).contains("not the one pinned"), said.c_str());
+            other.pin.clear();
+            RelayBridge unpinned(other, login);
+            said = allocate(unpinned);
+            QVERIFY2(QString::fromStdString(said).contains("certificate was not accepted"), said.c_str());
+            // (neither got as far as asking the relay for anything)
+            QCOMPARE(relay.allocations.load(), allocationsBefore);
+        }
+        // A wrong login is refused over this transport as over UDP.
+        {
+            RelayBridge wrong(at, {"reviewer", "not the password"});
+            const std::string said = allocate(wrong);
+            QVERIFY2(QString::fromStdString(said).contains("login"), said.c_str());
+        }
+    }
+
+    // Phase 16: what the relay code reads and writes that needs no relay; sixteen bridges on one thread; a relay
+    // with only IPv6 addresses asked for IPv4 first; and a login whose time is up refused at the next refresh.
+    void reviewRelayThreadFamilyAndExpiry() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        // Addresses: RFC 7065's forms.
+        RelayAddress at;
+        QVERIFY(parseRelayAddress("turn:relay.example.com", at));
+        QCOMPARE(at.host, std::string("relay.example.com"));
+        QCOMPARE(int(at.port), 3478);
+        QVERIFY(at.transport == RelayAddress::Transport::Udp);
+        QVERIFY(parseRelayAddress("turn:relay.example.com:443?transport=tcp", at));
+        QCOMPARE(int(at.port), 443);
+        QVERIFY(at.transport == RelayAddress::Transport::Tcp);
+        QVERIFY(parseRelayAddress("turns:relay.example.com", at));
+        QCOMPARE(int(at.port), 5349);
+        QVERIFY(at.transport == RelayAddress::Transport::Tls);
+        QVERIFY(parseRelayAddress("turns:[2001:db8::1]:443?transport=tcp", at));
+        QCOMPARE(at.host, std::string("2001:db8::1"));
+        QCOMPARE(int(at.port), 443);
+        QVERIFY(at.transport == RelayAddress::Transport::Tls);
+        QVERIFY(parseRelayAddress("turn:[::1]", at));
+        QCOMPARE(at.host, std::string("::1"));
+        QCOMPARE(int(at.port), 3478);
+        for (const char* bad : {"stun:relay.example.com", "turn:", "turn:[::1", "turn:[::1]x", "turn:host:0", "turn:host:65536", "relay.example.com"})
+            QVERIFY2(!parseRelayAddress(bad, at), bad);
+        // A pinned certificate's fingerprint, as OpenSSL prints it or bare.
+        const std::string digits(64, 'b');
+        QCOMPARE(relayPin(digits), digits);
+        std::string printed = "sha256 Fingerprint=AB", bare = "ab";
+        for (int k = 0; k < 31; ++k) printed += ":CD", bare += "cd";
+        QCOMPARE(relayPin(printed), bare);
+        QCOMPARE(relayPin("abcd"), std::string());
+        QCOMPARE(relayPin(std::string(64, 'g')), std::string());
+        // The settings: TCP, TLS and IPv6 relays are taken only through the relay too; a pin is a fingerprint, for TLS.
+        StreamSettings st;
+        st.address = "https://127.0.0.1:8443";
+        st.passphrase = generatePassphrase();
+        st.turnUser = "reviewer";
+        st.turnPassword = "relay-password-16";
+        st.relayOnly = true;
+        for (const char* url : {"turn:127.0.0.1:3478?transport=tcp", "turns:relay.example.com", "turn:[2001:db8::1]:3478", "turns:[::1]:5349"}) {
+            st.turnServer = url;
+            QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        }
+        st.turnPin = "not a fingerprint";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("fingerprint"));
+        st.turnPin = digits;
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        st.turnServer = "turn:127.0.0.1:3478";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("TLS"));
+        // An offer with IPv6 candidates alone needs an IPv6 address at the relay; with any IPv4 one, an IPv4 one.
+        const std::string six = "v=0\r\na=candidate:1 1 udp 41885439 2001:db8::5 50003 typ relay raddr :: rport 0\r\n"
+                                "a=candidate:2 1 udp 2122260223 4f0c2b1e.local 50006 typ host\r\na=candidate:3 1 tcp 1518280447 192.0.2.7 9 typ host tcptype active\r\n";
+        QCOMPARE(offerFamily(six), 6);
+        QCOMPARE(offerFamily(six + "a=candidate:4 1 udp 41885439 203.0.113.5 50004 typ relay raddr 0.0.0.0 rport 0\r\n"), 4);
+        QCOMPARE(offerFamily("v=0\r\n"), 4);
+        // (what a bridge can carry to: the UDP candidates with addresses, not names or TCP)
+        QCOMPARE(offerAddresses(six), 1);
+        QCOMPARE(offerAddresses("v=0\r\na=candidate:2 1 udp 2122260223 4f0c2b1e.local 50006 typ host\r\n"), 0);
+        QCOMPARE(offerAddresses("v=0\r\n"), 0);
+        QCOMPARE(offerThroughRelay(six, [](const std::string& ip, uint16_t port) { return uint16_t(ip == "2001:db8::5" && port == 50003 ? 40001 : 0); }),
+                 std::string("v=0\r\na=candidate:1 1 UDP 41885439 127.0.0.1 40001 typ host\r\n"));
+        uint16_t local = 0;
+        QCOMPARE(answerThroughRelay("v=0\r\na=candidate:1 1 UDP 2122317823 127.0.0.1 51234 typ host\r\n", "2001:db8::20", 49160, &local),
+                 std::string("v=0\r\na=candidate:1 1 UDP 2122317823 2001:db8::20 49160 typ relay raddr :: rport 0\r\n"));
+        QCOMPARE(local, uint16_t(51234));
+
+        auto allocate = [](RelayBridge& b, int prefer) {
+            struct Said {
+                std::mutex m;
+                std::condition_variable cv;
+                bool done = false;
+                std::string error;
+            };
+            auto said = std::make_shared<Said>();
+            b.allocate(prefer, [said](const std::string& error) {
+                std::lock_guard lock(said->m);
+                said->done = true;
+                said->error = error;
+                said->cv.notify_all();
+            });
+            std::unique_lock lock(said->m);
+            return said->cv.wait_for(lock, std::chrono::seconds(15), [&] { return said->done; }) ? said->error : std::string("nothing said");
+        };
+        std::string why;
+        {
+            // Sixteen viewers' bridges, each carrying, on one thread: counted by the bridges and, on Linux, by the
+            // system. When the last is let go the thread ends.
+            FakeRelay::Config config;
+            config.tcp = true;
+            config.user = "reviewer";
+            config.password = "relay-password-16";
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            QVERIFY(parseRelayAddress(relay.url(), at));
+            auto systemThreads = [] {
+#ifdef Q_OS_LINUX
+                return int(QDir("/proc/self/task").entryList(QDir::Dirs | QDir::NoDotAndDotDot).size());
+#else
+                return 0;
+#endif
+            };
+            QCOMPARE(RelayBridge::threads(), 0);
+            const quint64 started = RelayBridge::threadsStarted();
+            const int before = systemThreads();
+            std::vector<std::unique_ptr<RelayBridge>> bridges;
+            std::vector<std::unique_ptr<QUdpSocket>> viewers, ends;
+            for (int k = 0; k < 16; ++k) {
+                bridges.push_back(std::make_unique<RelayBridge>(at, TurnLogin{"reviewer", "relay-password-16"}));
+                QCOMPARE(allocate(*bridges.back(), 4), std::string());
+                for (auto* list : {&viewers, &ends}) {
+                    list->push_back(std::make_unique<QUdpSocket>());
+                    list->back()->setProxy(QNetworkProxy::NoProxy);
+                    QVERIFY(list->back()->bind(QHostAddress::LocalHost, 0));
+                }
+            }
+            QCOMPARE(relay.allocations.load(), 16);
+            QCOMPARE(RelayBridge::threads(), 1);
+            QCOMPARE(RelayBridge::threadsStarted(), started + 1);
+#ifdef Q_OS_LINUX
+            QCOMPARE(systemThreads(), before + 1);
+#endif
+            for (int k = 0; k < 16; ++k) {
+                const uint16_t alias = bridges[size_t(k)]->peer("127.0.0.1", viewers[size_t(k)]->localPort());
+                QVERIFY(alias != 0);
+                QByteArray got;
+                for (int i = 0; i < 50 && got.isEmpty(); ++i) {
+                    ends[size_t(k)]->writeDatagram("picture " + QByteArray::number(k), QHostAddress::LocalHost, alias);
+                    if (viewers[size_t(k)]->waitForReadyRead(100)) {
+                        got.resize(int(viewers[size_t(k)]->pendingDatagramSize()));
+                        viewers[size_t(k)]->readDatagram(got.data(), got.size());
+                    }
+                }
+                QCOMPARE(got, "picture " + QByteArray::number(k));
+            }
+            bridges.resize(1);
+            QCOMPARE(RelayBridge::threads(), 1);
+            bridges.clear();
+            QCOMPARE(RelayBridge::threads(), 0);
+            QCOMPARE(relay.released.load(), 16);
+#ifdef Q_OS_LINUX
+            QTRY_COMPARE_WITH_TIMEOUT(systemThreads(), before, 5000);
+#endif
+        }
+        {
+            // A relay whose addresses are all IPv6, which takes an Allocate that names no family as one for IPv4
+            // (RFC 8656): asked for IPv4 first, it refuses (440), and is asked for IPv6.
+            FakeRelay::Config config;
+            config.udp = true;
+            config.pretendV6 = true;
+            config.strictFamily = true;
+            config.user = "reviewer";
+            config.password = "relay-password-16";
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            RelayBridge bridge("127.0.0.1", uint16_t(relay.port()), {"reviewer", "relay-password-16"});
+            QCOMPARE(allocate(bridge, 4), std::string());
+            QCOMPARE(relay.familiesRefused.load(), 1);
+            QCOMPARE(bridge.relayedAddress(), std::string("2001:db8::7e1a"));
+            QCOMPARE(bridge.peer("127.0.0.1", 5000), uint16_t(0));
+            QVERIFY(bridge.peer("2001:db8::1", 5000) != 0);
+        }
+        {
+            // A login made from a secret, whose time is up four seconds on, and a relay that gives addresses for
+            // twenty seconds: the bridge asks to keep its address half way through, the relay refuses the login
+            // (401), which the bridge says, and when the twenty seconds are up the address has run out and the
+            // bridge has ended, saying the relay refused to keep it.
+            const std::string secret = "a secret of the test's";
+            FakeRelay::Config config;
+            config.tls = true;
+            config.secret = secret;
+            config.lifetime = 20;
+            QVERIFY2(makeReviewCertificate({"127.0.0.1"}, config.certificatePem, config.keyPem, &why), why.c_str());
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            QVERIFY(parseRelayAddress(relay.url(), at));
+            at.pin = QSslCertificate(QByteArray::fromStdString(config.certificatePem), QSsl::Pem).digest(QCryptographicHash::Sha256).toHex().toStdString();
+            RelayBridge bridge(at, turnRestLogin(secret, QDateTime::currentSecsSinceEpoch() + 4));
+            QElapsedTimer clock;
+            clock.start();
+            QCOMPARE(allocate(bridge, 4), std::string());
+            QCOMPARE(relay.loginsExpired.load(), 0);
+            while (clock.elapsed() < 16000 && bridge.lastError().empty()) QThread::msleep(100);
+            QVERIFY2(clock.elapsed() >= 9000 && clock.elapsed() < 14000, std::to_string(clock.elapsed()).c_str());
+            QVERIFY2(QString::fromStdString(bridge.lastError()).contains("did not take Montage's login (401)"), bridge.lastError().c_str());
+            QVERIFY(relay.loginsExpired.load() >= 1);
+            QCOMPARE(relay.refreshes.load(), 0);
+            QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over TLS"));
+            while (clock.elapsed() < 26000 && bridge.state() != "Ended") QThread::msleep(100);
+            QVERIFY2(clock.elapsed() >= 19000 && clock.elapsed() < 24000, std::to_string(clock.elapsed()).c_str());
+            const QString ended = QString::fromStdString(bridge.lastError());
+            QVERIFY2(ended.contains("ran out") && ended.contains("the relay refused to keep it"), qPrintable(ended));
+        }
+    }
+
+    // A relay that goes quiet, refuses and takes again, forgets an address, and answers well formed, rightly signed
+    // nonsense.
+    void reviewRelayQuietRecoveredLapsedAndMangled() {
+        using namespace montage::output;
+        using montage::reviewtest::FakeRelay;
+        struct Said {
+            std::mutex m;
+            std::condition_variable cv;
+            bool done = false;
+            std::string error;
+        };
+        auto ask = [](RelayBridge& b) {
+            auto said = std::make_shared<Said>();
+            b.allocate(4, [said](const std::string& error) {
+                std::lock_guard lock(said->m);
+                said->done = true;
+                said->error = error;
+                said->cv.notify_all();
+            });
+            return said;
+        };
+        auto answer = [](const std::shared_ptr<Said>& said, int seconds) {
+            std::unique_lock lock(said->m);
+            return said->cv.wait_for(lock, std::chrono::seconds(seconds), [&] { return said->done; }) ? said->error : std::string("nothing said");
+        };
+        std::string why;
+        FakeRelay::Config config;
+        config.udp = true;
+        config.tcp = true;
+        config.user = "reviewer";
+        config.password = "relay-password-23";
+        config.lifetime = 20;
+        const TurnLogin login{"reviewer", "relay-password-23"};
+        QElapsedTimer clock;
+        {
+            // Sixty-four viewers through a relay that then goes quiet: let go together, their addresses are all
+            // given back at once and the relay's silence is waited out once, not once for each of them.
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            RelayAddress overTcp;
+            QVERIFY(parseRelayAddress("turn:127.0.0.1:" + std::to_string(relay.port()) + "?transport=tcp", overTcp));
+            std::vector<std::unique_ptr<RelayBridge>> bridges;
+            std::vector<std::shared_ptr<Said>> said;
+            for (int k = 0; k < 64; ++k) {
+                bridges.push_back(k % 2 ? std::make_unique<RelayBridge>(overTcp, login) : std::make_unique<RelayBridge>("127.0.0.1", uint16_t(relay.port()), login));
+                said.push_back(ask(*bridges.back()));
+            }
+            for (const auto& one : said) QCOMPARE(answer(one, 15), std::string());
+            QCOMPARE(relay.allocations.load(), 64);
+            relay.silent = true;
+            clock.start();
+            for (const auto& b : bridges) b->letGo();
+            bridges.clear();
+            const qint64 took = clock.elapsed();
+            QVERIFY2(took < 1500, qPrintable(QString("letting 64 bridges go took %1 ms").arg(took)));
+            QCOMPARE(RelayBridge::threads(), 0);
+            qInfo("64 bridges let go of a silent relay in %lld ms", (long long)took);
+            // (and a relay that answers is told of every one)
+            relay.silent = false;
+            said.clear();
+            for (int k = 0; k < 8; ++k) {
+                bridges.push_back(std::make_unique<RelayBridge>("127.0.0.1", uint16_t(relay.port()), login));
+                said.push_back(ask(*bridges.back()));
+            }
+            for (const auto& one : said) QCOMPARE(answer(one, 15), std::string());
+            const int releasedBefore = relay.released.load();
+            for (const auto& b : bridges) b->letGo();
+            bridges.clear();
+            QCOMPARE(relay.released.load(), releasedBefore + 8);
+        }
+        {
+            // A relay that refuses to keep an address once and then takes the asking again: the bridge says the
+            // refusal while it stands and no longer once the address is kept. Then the relay forgets the address
+            // (as one restarted does): the next asking is answered 437, and the bridge has ended and says so; it
+            // asks for no other address, which the viewer would not know.
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            RelayBridge bridge("127.0.0.1", uint16_t(relay.port()), login);
+            clock.start();
+            QCOMPARE(answer(ask(bridge), 15), std::string());
+            relay.refuseRefresh = true;
+            while (clock.elapsed() < 16000 && bridge.lastError().empty()) QThread::msleep(50);
+            QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (508"), bridge.lastError().c_str());
+            QVERIFY(!bridge.ended());
+            relay.refuseRefresh = false;
+            while (clock.elapsed() < 24000 && !bridge.lastError().empty()) QThread::msleep(50);
+            QVERIFY2(bridge.lastError().empty(), bridge.lastError().c_str());
+            QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over UDP"));
+            // Nightly 23 November: a viewer the relay refuses to let in (403) is the bridge's error while the refusal
+            // stands; the bridge asks again a few seconds on, and once the relay lets the viewer in the error is gone
+            // and the viewer has its pictures.
+            {
+                relay.refusePermission = true;
+                QUdpSocket viewer, end;
+                for (auto* s : {&viewer, &end}) {
+                    s->setProxy(QNetworkProxy::NoProxy);
+                    QVERIFY(s->bind(QHostAddress::LocalHost, 0));
+                }
+                const uint16_t alias = bridge.peer("127.0.0.1", viewer.localPort());
+                QVERIFY(alias != 0);
+                QElapsedTimer refused;
+                refused.start();
+                while (refused.elapsed() < 8000 && bridge.lastError().empty()) QThread::msleep(50);
+                QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (403"), bridge.lastError().c_str());
+                relay.refusePermission = false;
+                refused.restart();
+                while (refused.elapsed() < 12000 && !bridge.lastError().empty()) QThread::msleep(50);
+                QVERIFY2(bridge.lastError().empty(), bridge.lastError().c_str());
+                QVERIFY2(refused.elapsed() < 7000, std::to_string(refused.elapsed()).c_str());
+                QByteArray heard;
+                for (int i = 0; i < 50 && heard.isEmpty(); ++i) {
+                    end.writeDatagram("let in at last", QHostAddress::LocalHost, alias);
+                    if (viewer.waitForReadyRead(100)) {
+                        heard.resize(int(viewer.pendingDatagramSize()));
+                        viewer.readDatagram(heard.data(), heard.size());
+                    }
+                }
+                QCOMPARE(heard, QByteArray("let in at last"));
+            }
+            const qint64 recovered = clock.elapsed();
+            relay.forget = true;
+            while (clock.elapsed() < recovered + 16000 && !bridge.ended()) QThread::msleep(50);
+            QVERIFY(bridge.ended());
+            QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (437"), bridge.lastError().c_str());
+            QCOMPARE(relay.allocations.load(), 1);
+        }
+        {
+            // Answers that are well formed and signed with the login's key, and say something else each time: an
+            // attribute's value changed, cut or longer, an attribute missing, twice or under another's name, over
+            // UDP and over TCP; and what peers send changed the same way. These pass the checks that unsigned
+            // nonsense fails. Every asking is told its end, the bridges that got an address carry or drop what
+            // comes, and afterwards a relay that answers straight is used as before.
+            FakeRelay relay(config);
+            QVERIFY2(relay.start(&why), why.c_str());
+            RelayAddress overTcp;
+            QVERIFY(parseRelayAddress("turn:127.0.0.1:" + std::to_string(relay.port()) + "?transport=tcp", overTcp));
+            int got = 0, told = 0, unanswered = 0;
+            quint64 passedOn = 0;
+            for (int round = 0; round < 3; ++round) {
+                relay.mangle = quint32(23112026 + 1000 * round);
+                std::vector<std::unique_ptr<RelayBridge>> bridges;
+                std::vector<std::shared_ptr<Said>> said;
+                std::vector<std::unique_ptr<QUdpSocket>> viewers, ends;
+                std::vector<uint16_t> aliases;
+                for (int k = 0; k < 48; ++k) {
+                    bridges.push_back(k % 2 ? std::make_unique<RelayBridge>(overTcp, login) : std::make_unique<RelayBridge>("127.0.0.1", uint16_t(relay.port()), login));
+                    said.push_back(ask(*bridges.back()));
+                    for (auto* list : {&viewers, &ends}) {
+                        list->push_back(std::make_unique<QUdpSocket>());
+                        list->back()->setProxy(QNetworkProxy::NoProxy);
+                        QVERIFY(list->back()->bind(QHostAddress::LocalHost, 0));
+                    }
+                }
+                for (size_t k = 0; k < bridges.size(); ++k) {
+                    const std::string error = answer(said[k], 20);
+                    QVERIFY2(error != "nothing said", qPrintable(QString("bridge %1 of round %2 was told nothing").arg(k).arg(round)));
+                    got += error.empty();
+                    told += !error.empty() && !QString::fromStdString(error).contains("did not answer");
+                    unanswered += QString::fromStdString(error).contains("did not answer");
+                    aliases.push_back(error.empty() ? bridges[k]->peer("127.0.0.1", viewers[k]->localPort()) : uint16_t(0));
+                    if (aliases.back()) bridges[k]->setLocal(ends[k]->localPort(), "an ICE password of the test");
+                }
+                // (both ways through each that has an address, for a second: the relay's answers to the permissions
+                // and channels asked for meanwhile are changed too, and the viewers' packets as they are passed on)
+                QElapsedTimer run;
+                run.start();
+                while (run.elapsed() < 1000) {
+                    for (size_t k = 0; k < bridges.size(); ++k) {
+                        if (!aliases[k]) continue;
+                        ends[k]->writeDatagram(QByteArray(200, 'p'), QHostAddress::LocalHost, aliases[k]);
+                        const std::string at = bridges[k]->relayedAddress();
+                        if (QHostAddress(QString::fromStdString(at)).protocol() == QAbstractSocket::IPv4Protocol && bridges[k]->relayedPort())
+                            viewers[k]->writeDatagram(QByteArray(120, 'v'), QHostAddress(QString::fromStdString(at)), bridges[k]->relayedPort());
+                        while (ends[k]->hasPendingDatagrams()) ends[k]->receiveDatagram();
+                        while (viewers[k]->hasPendingDatagrams()) viewers[k]->receiveDatagram();
+                    }
+                    QThread::msleep(20);
+                }
+                for (const auto& b : bridges) passedOn += b->fromRelay();
+                for (const auto& b : bridges) b->letGo();
+                bridges.clear();
+                QCOMPARE(RelayBridge::threads(), 0);
+            }
+            qInfo("144 bridges against changed, signed answers: %d got an address, %d were told a refusal, %d no usable answer; %llu packets from viewers passed on",
+                  got, told, unanswered, (unsigned long long)passedOn);
+            // (most changes leave an address that can be used, about one asking in ten is refused or goes unanswered:
+            // both kinds of ending are reached, and every asking had one)
+            QCOMPARE(got + told + unanswered, 144);
+            QVERIFY2(got >= 20 && got < 144, qPrintable(QString::number(got)));
+            QVERIFY2(told + unanswered >= 5, qPrintable(QString("%1 + %2").arg(told).arg(unanswered)));
+            QVERIFY(passedOn > 0);
+            relay.mangle = 0;
+            RelayBridge bridge("127.0.0.1", uint16_t(relay.port()), login);
+            QCOMPARE(answer(ask(bridge), 15), std::string());
+            QUdpSocket viewer, end;
+            for (auto* s : {&viewer, &end}) {
+                s->setProxy(QNetworkProxy::NoProxy);
+                QVERIFY(s->bind(QHostAddress::LocalHost, 0));
+            }
+            const uint16_t alias = bridge.peer("127.0.0.1", viewer.localPort());
+            QVERIFY(alias != 0);
+            QByteArray heard;
+            for (int i = 0; i < 50 && heard.isEmpty(); ++i) {
+                end.writeDatagram("a picture after it all", QHostAddress::LocalHost, alias);
+                if (viewer.waitForReadyRead(100)) {
+                    heard.resize(int(viewer.pendingDatagramSize()));
+                    viewer.readDatagram(heard.data(), heard.size());
+                }
+            }
+            QCOMPARE(heard, QByteArray("a picture after it all"));
+        }
+    }
+
+    // Phase 16: a review only through a relay that is reached over TCP, over TLS, or on ::1 alone, played in Chrome
+    // (and Firefox where there is one and the relay's certificate does not stand in its way). The "fake" rows use the
+    // test's own relay, which counts what it carries: every picture Montage sends goes to it over that transport,
+    // as Send indications in the one connection. The "coturn" rows run coturn listening that one way only (Linux,
+    // MONTAGE_TEST_TURNSERVER).
+    void browserReviewRelayTransports_data() {
+        QTest::addColumn<bool>("coturn");
+        QTest::addColumn<QString>("transport");
+        QTest::addColumn<bool>("ipv6");
+        QTest::newRow("fake udp") << false << "udp" << false;
+        QTest::newRow("fake tcp") << false << "tcp" << false;
+        QTest::newRow("fake tls") << false << "tls" << false;
+        QTest::newRow("fake ::1") << false << "udp" << true;
+        QTest::newRow("fake tls on ::1") << false << "tls" << true;
+        QTest::newRow("coturn tcp") << true << "tcp" << false;
+        QTest::newRow("coturn tls") << true << "tls" << false;
+        QTest::newRow("coturn ::1") << true << "udp" << true;
+    }
+    void browserReviewRelayTransports() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        QFETCH(bool, coturn);
+        QFETCH(QString, transport);
+        QFETCH(bool, ipv6);
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        if (ipv6 && !FakeRelay::hasIpv6()) QSKIP("This computer has no IPv6 loopback address");
+        const std::string secret = "a shared secret made up for this test";
+        const QString host = ipv6 ? QStringLiteral("::1") : QStringLiteral("127.0.0.1");
+        const QHostAddress loopback(ipv6 ? QHostAddress::LocalHostIPv6 : QHostAddress::LocalHost);
+        QTemporaryDir dir;
+        // A certificate for the relay made here and thrown away: by OpenSSL's tool where there is one (an RSA key,
+        // which every coturn reads), else by Montage.
+        std::string certificatePem, keyPem;
+        if (transport == "tls") {
+            const QString openssl = QStandardPaths::findExecutable(QStringLiteral("openssl"));
+            QProcess make;
+            if (!openssl.isEmpty()) {
+                make.start(openssl, {"req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", dir.path() + "/relay-key.pem", "-out", dir.path() + "/relay-cert.pem",
+                                     "-days", "2", "-subj", "/CN=montage-test-relay", "-addext", "subjectAltName=IP:127.0.0.1,IP:::1,DNS:localhost"});
+                make.waitForFinished(60000);
+            }
+            QFile cert(dir.path() + "/relay-cert.pem"), key(dir.path() + "/relay-key.pem");
+            if (cert.open(QIODevice::ReadOnly) && key.open(QIODevice::ReadOnly)) {
+                certificatePem = cert.readAll().toStdString();
+                keyPem = key.readAll().toStdString();
+            } else {
+                QVERIFY2(makeReviewCertificate({"127.0.0.1", "::1", "localhost"}, certificatePem, keyPem, &why), why.c_str());
+                QVERIFY(cert.open(QIODevice::WriteOnly) && key.open(QIODevice::WriteOnly));
+                cert.write(QByteArray::fromStdString(certificatePem));
+                key.write(QByteArray::fromStdString(keyPem));
+            }
+            cert.close();
+            key.close();
+            QVERIFY(!QSslCertificate(QByteArray::fromStdString(certificatePem), QSsl::Pem).isNull());
+        }
+        QProcess server;
+        auto endServer = qScopeGuard([&] {
+            if (server.state() == QProcess::NotRunning) return;
+            server.terminate();
+            if (!server.waitForFinished(5000)) server.kill();
+            server.waitForFinished(3000);
+        });
+        auto serverLog = [&] {
+            QFile f(dir.path() + "/turnserver.log");
+            return f.open(QIODevice::ReadOnly) ? f.readAll().right(3000) : QByteArray();
+        };
+        std::unique_ptr<FakeRelay> fake;
+        int turnPort = 0;
+        if (coturn) {
+#ifndef Q_OS_LINUX
+            QSKIP("coturn is run for this test on Linux only");
+#else
+            QString exe = QString::fromLocal8Bit(qgetenv("MONTAGE_TEST_TURNSERVER"));
+            if (exe.isEmpty()) exe = QStandardPaths::findExecutable(QStringLiteral("turnserver"));
+            if (exe.isEmpty()) QSKIP("Needs coturn's turnserver (MONTAGE_TEST_TURNSERVER, or turnserver on the PATH)");
+            for (int tries = 0; tries < 20 && !turnPort; ++tries) {
+                QUdpSocket udp;
+                QTcpServer tcp;
+                if (udp.bind(loopback, 0) && tcp.listen(loopback, udp.localPort())) turnPort = udp.localPort();
+            }
+            QVERIFY(turnPort != 0);
+            // It listens the one way: over TCP alone, over TLS alone (on the port given, with the certificate), or
+            // on ::1 alone (over UDP and TCP, giving addresses there, of the family its clients reach it by).
+            QStringList args{"-n", "--log-file=stdout", "--no-cli", "--no-dtls", "--listening-ip=" + host, "--relay-ip=" + host, "--min-port=49160", "--max-port=49260",
+                             "--allow-loopback-peers", "--use-auth-secret", "--static-auth-secret=" + QString::fromStdString(secret), "--realm=montage-test",
+                             "--pidfile=" + dir.path() + "/turnserver.pid", "--userdb=" + dir.path() + "/turndb"};
+            if (transport == "tcp") args << "--no-udp" << "--no-tls" << "--listening-port=" + QString::number(turnPort);
+            if (transport == "tls")
+                args << "--no-udp" << "--no-tcp" << "--tls-listening-port=" + QString::number(turnPort) << "--cert=" + dir.path() + "/relay-cert.pem"
+                     << "--pkey=" + dir.path() + "/relay-key.pem";
+            if (transport == "udp") args << "--no-tls" << "--listening-port=" + QString::number(turnPort) << "--keep-address-family";
+            server.setProcessChannelMode(QProcess::MergedChannels);
+            server.setStandardOutputFile(dir.path() + "/turnserver.log");
+            server.start(exe, args);
+            QVERIFY2(server.waitForStarted(15000), qPrintable(server.errorString()));
+            // It is up once it takes a connection (or, over UDP, answers a STUN binding request).
+            bool up = false;
+            QElapsedTimer waited;
+            waited.start();
+            while (!up && waited.elapsed() < 30000 && server.state() != QProcess::NotRunning) {
+                if (transport == "udp") {
+                    QUdpSocket ask;
+                    ask.setProxy(QNetworkProxy::NoProxy);
+                    QVERIFY(ask.bind(loopback, 0));
+                    ask.writeDatagram(QByteArray::fromHex("000100002112a442") + QByteArray(12, 'q'), loopback, quint16(turnPort));
+                    if (ask.waitForReadyRead(300)) {
+                        QByteArray d(int(ask.pendingDatagramSize()), 0);
+                        ask.readDatagram(d.data(), d.size());
+                        up = d.startsWith(QByteArray::fromHex("0101"));
+                    }
+                } else {
+                    QTcpSocket ask;
+                    ask.setProxy(QNetworkProxy::NoProxy);
+                    ask.connectToHost(loopback, quint16(turnPort));
+                    up = ask.waitForConnected(300);
+                    if (!up) QThread::msleep(200);
+                }
+            }
+            QVERIFY2(up, serverLog().constData());
+#endif
+        } else {
+            FakeRelay::Config config;
+            config.v6 = ipv6;
+            config.udp = transport == "udp";
+            config.tcp = transport == "tcp";
+            config.tls = transport == "tls";
+            config.secret = secret;
+            config.certificatePem = certificatePem;
+            config.keyPem = keyPem;
+            fake = std::make_unique<FakeRelay>(config);
+            QVERIFY2(fake->start(&why), why.c_str());
+            turnPort = fake->port();
+        }
+        const bool firefox = transport != "tls" && !GeckoBrowser::firefox().empty() && !GeckoBrowser::geckodriver().empty();
+        bool firefoxPlays = firefox;
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why, {"--allow-loopback-in-peer-connection"}), why.c_str());
+        GeckoBrowser fx;
+        if (firefox) QVERIFY2(fx.start(&why), why.c_str());
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.settings.turnServer = ((transport == "tls" ? "turns:" : "turn:") + (ipv6 ? "[::1]" : host) + ":" + QString::number(turnPort) + (transport == "tcp" ? "?transport=tcp" : ""))
+                                      .toStdString();
+        rig.settings.turnSecret = secret;
+        rig.settings.turnExpirySeconds = 600;
+        rig.settings.relayOnly = true;
+        if (transport == "tls")
+            rig.settings.turnPin = QSslCertificate(QByteArray::fromStdString(certificatePem), QSsl::Pem).digest(QCryptographicHash::Sha256).toHex(':').toStdString();
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        rig.picture = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        // (what went wrong, for a failure's message: the page's stage, the review's last error, each bridge's state,
+        // and what the relay says or counted)
+        auto said = [&] {
+            const ReviewStats now = rig.review->stats();
+            QString text = tab.js("__montage.stage").toString() + " " + QString::fromStdString(now.error) + " (Chrome: " +
+                           tab.js("__montage.pc ? __montage.pc.iceConnectionState + ' ' + __montage.pc.connectionState : 'no connection'").toString() + ")";
+            for (const auto& b : now.bridges) text += QStringLiteral(" [%1: %2 %3]").arg(QString::fromStdString(b.viewer), QString::fromStdString(b.state), QString::fromStdString(b.lastRefusal));
+            if (fake)
+                text += QStringLiteral(" relay: %1 connections, %2 addresses, %3 logins refused, %4 permissions, %5 Send indications, %6 channel data, %7 to peers, %8 from peers")
+                            .arg(fake->connections.load())
+                            .arg(fake->allocations.load())
+                            .arg(fake->loginsRefused.load())
+                            .arg(fake->permissions.load())
+                            .arg(fake->sendIndications.load())
+                            .arg(fake->channelData.load())
+                            .arg(fake->toPeers.load())
+                            .arg(fake->fromPeers.load());
+            // (what the relay did, in order: too long for a failure's message, so told beside it)
+            if (fake)
+                for (const QByteArray& part : fake->told().split(';')) qInfo().noquote() << "relay:" << part.trimmed();
+            return (text + " " + QString::fromUtf8(serverLog())).toUtf8();
+        };
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        const QString joined = tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString();
+        QVERIFY2(joined == QStringLiteral("joined"), (joined.toUtf8() + " " + said()).constData());
+        QVERIFY2(tab.until("__montage.stage === 'connected' && __montage.presented > 10", 30), said().constData());
+        QCOMPARE(tab.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
+        const QString pair = tab.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
+                                    "return p ? r.get(p.localCandidateId).candidateType + ' ' + r.get(p.remoteCandidateId).candidateType + ' ' + r.get(p.localCandidateId).relayProtocol : ''; })")
+                                 .toString();
+        QCOMPARE(pair, QStringLiteral("relay relay %1").arg(transport));
+        // Montage's way through the relay, as the panel is told it: one bridge, carrying over that transport, with
+        // nothing refused, on the one thread.
+        ReviewStats st = rig.review->stats();
+        QCOMPARE(st.bridges.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(st.bridges[0].state), QStringLiteral("Carrying over %1").arg(transport.toUpper()));
+        QCOMPARE(st.bridges[0].lastRefusal, std::string());
+        QCOMPARE(st.bridges[0].answersRefused, uint64_t(0));
+        QCOMPARE(st.bridgeThreads, 1);
+        if (firefox) {
+            auto until = [&](const QString& expression, int seconds) {
+                QElapsedTimer t;
+                t.start();
+                while (t.elapsed() < seconds * 1000) {
+                    if (fx.js(expression).toBool()) return true;
+                    QThread::msleep(100);
+                }
+                return false;
+            };
+            QVERIFY2(fx.navigate(rig.page(), &why), why.c_str());
+            QVERIFY2(until("document.readyState === 'complete' && !!window.__montage", 20), fx.log().right(2000).constData());
+            // (for a failure's message: Firefox's own addresses in its offer, the relay's among them, and how its
+            // checks go)
+            auto fxSaid = [&] {
+                return fx.js("__montage.stage + ' (Firefox: ' + (__montage.pc ? __montage.pc.iceGatheringState + ' ' + __montage.pc.iceConnectionState + '; ' +"
+                             " (__montage.pc.localDescription ? __montage.pc.localDescription.sdp.split('\\r\\n').filter(l => l.startsWith('a=candidate')).join(' | ') : 'no offer') : 'no connection') + ')'")
+                           .toString() +
+                       " " + QString::fromUtf8(said());
+            };
+            const int addressesBefore = fake ? fake->allocations.load() : 0;
+            const QString fxJoined = fx.js("__montage.join('Bo', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString();
+            if (ipv6 && fxJoined != QStringLiteral("joined")) {
+                // Firefox asks a relay at ::1 for nothing (on Linux and macOS alike, the test's relay and coturn
+                // alike: the relay hears nothing from it), so it offers no address there; Montage tells it so at
+                // once, with no bridge begun for it, in place of an answer whose checks could only fail.
+                QVERIFY2(fxJoined.contains(QStringLiteral("no address at the review's relay")), (fxJoined + " " + fxSaid()).toUtf8().constData());
+                if (fake) QCOMPARE(fake->allocations.load(), addressesBefore);
+                QCOMPARE(rig.review->stats().bridges.size(), size_t(1));
+                firefoxPlays = false;
+                qInfo("Firefox got no address at the relay on ::1, and was told so");
+            } else {
+                QVERIFY2(fxJoined == QStringLiteral("joined"), (fxJoined + " " + fxSaid()).toUtf8().constData());
+                QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30), fxSaid().toUtf8().constData());
+                st = rig.review->stats();
+                QCOMPARE(st.bridges.size(), size_t(2));
+                QCOMPARE(st.bridgeThreads, 1);
+            }
+        } else {
+            qInfo("Chrome alone through the relay over %s%s", qPrintable(transport), transport == "tls" ? " (Firefox does not take a relay's certificate no root signed)" : "");
+        }
+        if (fake) {
+            // What the test's relay carried while Chrome played two seconds more: Montage's pictures came to it as
+            // Send indications (Chrome uses channels), over the stream when the transport is one and over UDP when
+            // it is not, and as many as the bridge says it sent.
+            const quint64 before = fake->sendIndications;
+            const quint64 presented = quint64(tab.js("__montage.presented").toDouble());
+            QThread::msleep(2000);
+            QVERIFY(quint64(tab.js("__montage.presented").toDouble()) > presented + 20);
+            const quint64 carried = fake->sendIndications - before;
+            QVERIFY2(carried > 40, std::to_string(carried).c_str());
+            // (those from the bridges' own addresses at the relay, the ones the browsers chose to send to: Chrome's own, from
+            // each address it has at the relay and for as long as it checks pairs it did not choose, are not the
+            // bridge's; and counted here before the bridge's count is read, as the bridge counts each before it goes)
+            // (Firefox gives no transport's stats, and marks the pair chosen itself)
+            const QString chosenPort = QStringLiteral("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
+                                                      "if (!p) r.forEach(s => { if (s.type === 'candidate-pair' && s.selected) p = s; });"
+                                                      "const c = p ? r.get(p.remoteCandidateId) : null; return c ? (c.port || c.portNumber || 0) : 0; })");
+            const quint16 bridgePort = quint16(tab.js(chosenPort).toInt());
+            const quint16 secondPort = firefoxPlays ? quint16(fx.js(chosenPort).toInt()) : quint16(0);
+            QVERIFY(bridgePort > 0 && (!firefoxPlays || (secondPort > 0 && secondPort != bridgePort)));
+            const quint64 fromBridge = fake->sendIndicationsFrom(bridgePort) + (firefoxPlays ? fake->sendIndicationsFrom(secondPort) : 0);
+            st = rig.review->stats();
+            quint64 sent = 0;
+            for (const auto& b : st.bridges) sent += b.toRelay;
+            qInfo("Through the relay: %llu Send indications from the bridges' addresses there, %llu sent by them, %llu from all",
+                  (unsigned long long)fromBridge, (unsigned long long)sent, (unsigned long long)fake->sendIndications.load());
+            // (a few still on their way, or sent before the relay let the viewer in)
+            QVERIFY2(fromBridge <= sent && fromBridge + 64 >= sent, (std::to_string(fromBridge) + " of " + std::to_string(sent)).c_str());
+            QCOMPARE(fake->bytesOverUdp.load() > 0, transport == "udp");
+            QCOMPARE(fake->bytesOverStream.load() > 0, transport != "udp");
+            QVERIFY(fake->channelData.load() > 0);
+            QCOMPARE(fake->loginsRefused.load(), 0);
+        }
+    }
+
+    // Capture as a WHIP endpoint (RFC 9725, media/WhipEndpoint.h): headless Chrome opens the page the endpoint serves
+    // and sends what the page makes (a canvas that flashes white every 1.2 seconds, and a 1 kHz tone that beeps with
+    // each flash) to whip://127.0.0.1:port/whip, and Montage records it to ProRes. A wrong token is answered 401, a
+    // second sender 409, and the page's DELETE ends the recording whole.
+    void captureFromWhip() {
+        using namespace montage::reviewtest;
+        std::string why;
+        if (!whip::available(&why)) QSKIP(why.c_str());
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        QTemporaryDir dir;
+        // (a port free for TCP and UDP both: the endpoint's requests and its media share the number)
+        int port = 0;
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QTcpServer t;
+            QUdpSocket u;
+            if (t.listen(QHostAddress::LocalHost, 0) && u.bind(QHostAddress::LocalHost, t.serverPort())) port = t.serverPort();
+        }
+        QVERIFY(port > 0);
+        const std::string token = "a-token-made-up-for-this-test";
+        const QString url = QStringLiteral("http://127.0.0.1:%1/whip").arg(port);
+        CaptureSettings cs;
+        cs.video.url = "whip://127.0.0.1:" + std::to_string(port) + "/whip";
+        cs.video.options = {{"token", token}, {"wait", "60"}};
+        cs.path = (dir.path() + "/whip.mov").toStdString();
+        cs.codec = "prores_proxy";
+        std::mutex m;
+        std::vector<double> lumas;  // each picture's mean, 0 to 1, in the recording's order
+        int fpsNum = 0, fpsDen = 1;
+        std::vector<float> sound;   // the first channel, whole
+        cs.onPicture = [&](const AVFrame* f, int num, int den) {
+            const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(f->format));
+            if (!d) return;
+            const bool deep = d->comp[0].depth > 8;
+            double sum = 0;
+            int n = 0;
+            for (int y = f->height / 4; y < f->height * 3 / 4; y += 4)
+                for (int x = f->width / 4; x < f->width * 3 / 4; x += 4) {
+                    sum += deep ? reinterpret_cast<const uint16_t*>(f->data[0] + y * f->linesize[0])[x] / double((1 << d->comp[0].depth) - 1)
+                                : f->data[0][y * f->linesize[0] + x] / 255.0;
+                    ++n;
+                }
+            std::lock_guard lock(m);
+            const int64_t at = f->pts;
+            if (at >= 0 && size_t(at) >= lumas.size()) lumas.resize(size_t(at) + 1, -1);
+            if (at >= 0) lumas[size_t(at)] = n ? sum / n : 0;
+            fpsNum = num, fpsDen = den;
+        };
+        cs.onSound = [&](const AVFrame* f) {
+            const int ch = f->ch_layout.nb_channels;
+            if (ch <= 0 || f->pts < 0) return;
+            std::lock_guard lock(m);
+            if (sound.size() < size_t(f->pts) + size_t(f->nb_samples)) sound.resize(size_t(f->pts) + size_t(f->nb_samples), 0);
+            for (int i = 0; i < f->nb_samples; ++i)
+                sound[size_t(f->pts) + i] = f->format == AV_SAMPLE_FMT_S32 ? float(reinterpret_cast<const int32_t*>(f->data[0])[i * ch]) / 2147483648.0f
+                                                                           : reinterpret_cast<const float*>(f->data[0])[i * ch];
+        };
+        // (the feed's timing as the endpoint saw it, to find each flash and beep where the sender put them)
+        std::vector<std::string> timing;
+        whip::setTimingTrace([&](const std::string& line) {
+            std::lock_guard lock(m);
+            timing.push_back(line);
+        });
+        auto stopTracing = qScopeGuard([] { whip::setTimingTrace({}); });
+        Recorder rec;
+        std::atomic<bool> finished{false}, fine{false};
+        std::string finishedWhy;
+        rec.onFinished = [&](bool ok, const std::string& message) {
+            fine = ok;
+            finishedWhy = message;
+            finished = true;
+        };
+        QVERIFY2(rec.start(cs, &why), why.c_str());
+        auto stopRecording = qScopeGuard([&] { rec.stop(); });
+
+        // A request of the endpoint's, its status line (the endpoint listens once the recording has opened it).
+        auto ask = [&](const QByteArray& method, const QByteArray& path, const QByteArray& authorization, const QByteArray& body) -> QByteArray {
+            QTcpSocket c;
+            c.connectToHost(QHostAddress::LocalHost, quint16(port));
+            if (!c.waitForConnected(2000)) return {};
+            QByteArray req = method + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/sdp\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n";
+            if (!authorization.isEmpty()) req += "Authorization: " + authorization + "\r\n";
+            c.write(req + "\r\n" + body);
+            QByteArray got;
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 5000 && !got.contains("\r\n\r\n")) {
+                c.waitForReadyRead(100);
+                got += c.readAll();
+            }
+            return got.left(got.indexOf("\r\n"));
+        };
+        QElapsedTimer listening;
+        listening.start();
+        QByteArray page;
+        while (listening.elapsed() < 10000 && !(page = ask("GET", "/whip", {}, {})).startsWith("HTTP/1.1 200")) QThread::msleep(50);
+        QVERIFY2(page.startsWith("HTTP/1.1 200"), page.constData());
+        QVERIFY(ask("POST", "/whip", "Bearer wrong", "v=0\r\n").startsWith("HTTP/1.1 401"));
+        QVERIFY(ask("POST", "/whip", {}, "v=0\r\n").startsWith("HTTP/1.1 401"));
+        QVERIFY(ask("DELETE", "/whip/nothing", "Bearer " + QByteArray::fromStdString(token), {}).startsWith("HTTP/1.1 404"));
+
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why), why.c_str());
+        tab.js(QStringLiteral("location.href = '%1#%2'; true").arg(url, QString::fromStdString(token)));
+        QVERIFY2(tab.until("document.readyState === 'complete' && !!window.__montageWhip", 20), tab.log().right(1500).constData());
+        // The page's own picture and sound: each flash drawn and its beep begun in the same moment, the canvas's
+        // picture given at once (a stream of pictures asked for, not one at a set rate).
+        tab.js(R"((async () => {
+            const c = document.createElement('canvas');
+            c.width = 640; c.height = 360;
+            const g = c.getContext('2d');
+            const ac = new AudioContext({sampleRate: 48000});
+            await ac.resume();
+            const osc = ac.createOscillator();
+            osc.frequency.value = 1000;
+            const gain = ac.createGain();
+            gain.gain.value = 0;
+            const out = ac.createMediaStreamDestination();
+            osc.connect(gain).connect(out);
+            osc.start();
+            const picture = c.captureStream(0).getVideoTracks()[0];
+            const t = window.__test = {flashes: 0, drawn: [], frames: 0, connectedAt: 0, firstSentAt: 0, framesSent: 0, keyframes: 0, sizes: [], stoppedAt: 0};
+            let frame = 0;
+            const draw = () => {
+              const flash = frame % 36 < 3;
+              if (frame % 36 === 0) {
+                t.drawn.push(performance.timeOrigin + performance.now());
+                gain.gain.setValueAtTime(0.8, ac.currentTime);
+                gain.gain.setValueAtTime(0, ac.currentTime + 0.1);
+                ++t.flashes;
+              }
+              g.fillStyle = flash ? '#fff' : '#000';
+              g.fillRect(0, 0, 640, 360);
+              g.fillStyle = '#808080';
+              g.fillRect((frame * 8) % 600, 300, 40, 40);
+              picture.requestFrame();
+              ++frame;
+              ++t.frames;
+            };
+            t.timer = setInterval(draw, 1000 / 30);
+            await __montageWhip.send(false, new MediaStream([picture, out.stream.getAudioTracks()[0]]));
+            // (what the sender says it has sent, and when it first sent a picture: a sender's encoder may take a moment
+            // after the connection, and its pacer holds pictures for a moment after they are made. And its sound made
+            // against its sound sent: how much more it held back at most than at least, a busy sender's encoder behind)
+            t.poll = setInterval(async () => {
+              const pc = __montageWhip.pc;
+              if (!pc) return;
+              let made = -1, sent = -1;
+              (await pc.getStats()).forEach(s => {
+                if (s.type === 'media-source' && s.kind === 'audio') made = s.totalSamplesDuration || 0;
+                if (s.type === 'outbound-rtp' && s.kind === 'audio') sent = (s.packetsSent || 0) * 0.020;
+                if (s.type !== 'outbound-rtp' || s.kind !== 'video') return;
+                if (s.framesSent > 0 && !t.firstSentAt) t.firstSentAt = performance.now();
+                if (!t.connectedAt && __montageWhip.stage === 'sending') t.connectedAt = performance.now();
+                t.framesSent = s.framesSent || 0;
+                t.keyframes = s.keyFramesEncoded || 0;
+                const size = s.frameWidth + 'x' + s.frameHeight;
+                if (s.frameWidth && (!t.sizes.length || t.sizes[t.sizes.length - 1].size !== size)) t.sizes.push({size, at: performance.now()});
+              });
+              if (made > 0 && sent > 0) {
+                t.heldLeast = Math.min(t.heldLeast ?? 1e9, made - sent);
+                t.heldMost = Math.max(t.heldMost ?? -1e9, made - sent);
+              }
+            }, 20);
+            return true;
+        })())");
+        QVERIFY2(tab.until("__montageWhip.stage === 'sending'", 30), (tab.js("__montageWhip.stage + ': ' + document.getElementById('state').textContent").toString().toStdString() + tab.log().right(1500).toStdString()).c_str());
+        QVERIFY2(tab.until("__test.firstSentAt > 0", 10), "no picture sent");
+        // A second sender while the first is connected: 409.
+        QVERIFY(ask("POST", "/whip", "Bearer " + QByteArray::fromStdString(token), "v=0\r\n").startsWith("HTTP/1.1 409"));
+        QThread::msleep(7000);
+        QVERIFY(rec.recording());
+        // DELETE (the page's stop) ends the recording, all of it written: once the pictures stop being made and the
+        // sender has sent what it held (its count of pictures sent still for a third of a second).
+        tab.js("__test.stoppedAt = performance.now(); clearInterval(__test.timer); true");
+        QVERIFY(tab.until("(() => { const t = __test; if (t.framesSent !== t.lastCount) { t.lastCount = t.framesSent; t.stillSince = performance.now(); }"
+                          " return performance.now() - t.stillSince > 300; })()", 10));
+        tab.js("(async () => { clearInterval(__test.poll); await __montageWhip.stop(); return true; })()");
+        const double sent = (tab.js("__test.stoppedAt - __test.firstSentAt").toDouble()) / 1000;
+        const int framesSent = tab.js("__test.framesSent").toInt();
+        // (for a failure's message: when the sender began after the connection, its keyframes, and its sizes in time)
+        const QString sender = tab.js("(() => { const t = __test; return 'first picture sent ' + Math.round(t.firstSentAt - t.connectedAt) + ' ms after the connection, ' +"
+                                      " t.keyframes + ' keyframes, sizes ' + t.sizes.map(s => s.size + ' at ' + Math.round(s.at - t.firstSentAt) + ' ms').join(', ') +"
+                                      " (t.heldMost !== undefined ? ', its sound held back up to ' + Math.round((t.heldMost - t.heldLeast) * 1000) + ' ms more than at least' : ''); })()")
+                                   .toString();
+        // (when the page drew each flash and began its beep, on this computer's clock: ms since 1970)
+        std::vector<double> drawn;
+        for (const QJsonValue v : tab.js("__test.drawn").toArray()) drawn.push_back(v.toDouble());
+        QVERIFY(rec.wait(20));
+        QVERIFY2(finished && fine, finishedWhy.c_str());
+        stopRecording.dismiss();
+        const CaptureStatus st = rec.status();
+        QVERIFY2(st.error.empty(), st.error.c_str());
+        QVERIFY2(st.width == 640 && st.height == 360, (std::to_string(st.width) + "x" + std::to_string(st.height) + "; " + sender.toStdString()).c_str());
+        MediaItem item;
+        QVERIFY2(probeMedia(cs.path, item, &why), why.c_str());
+        QVERIFY(item.hasVideo && item.hasAudio);
+        QCOMPARE(item.videoCodec, std::string("prores"));
+
+        std::lock_guard lock(m);
+        QVERIFY(fpsNum > 0);
+        const double fps = double(fpsNum) / fpsDen;
+        // Its pictures: as many as the time sent (from the connection to the stop) within a second.
+        const double recorded = double(lumas.size()) / fps;
+        qInfo("WHIP: %zu pictures at %.3f a second (%.2f s; %lld repeated, %lld dropped), %.2f s sent (%d pictures; %s)", lumas.size(), fps, recorded,
+              (long long)st.repeated, (long long)st.dropped, sent, framesSent, qPrintable(sender));
+        QVERIFY2(std::fabs(recorded - sent) < 1.0, (std::to_string(recorded) + " recorded, " + std::to_string(sent) + " sent").c_str());
+        // The flashes and the beeps: each flash's first picture, each beep's first sound, paired.
+        std::vector<double> flashes, beeps;
+        for (size_t i = 1; i < lumas.size(); ++i)
+            if (lumas[i] > 0.6 && lumas[i - 1] >= 0 && lumas[i - 1] < 0.3) flashes.push_back(double(i) / fps);
+        double lastBeep = -1;
+        for (size_t i = 0; i < sound.size(); ++i)
+            if (std::fabs(sound[i]) > 0.3) {
+                const double at = double(i) / 48000;
+                if (at - lastBeep > 0.5) beeps.push_back(at);
+                lastBeep = at;
+            }
+        QVERIFY2(flashes.size() >= 4, std::to_string(flashes.size()).c_str());
+        QVERIFY2(beeps.size() >= 4, std::to_string(beeps.size()).c_str());
+        // The tone itself: 1 kHz, by its crossings over the first beep's 100 ms.
+        const size_t from = size_t(beeps.front() * 48000) + 240;
+        int crossings = 0;
+        for (size_t i = from + 1; i < std::min(sound.size(), from + 3840); ++i)
+            if ((sound[i - 1] < 0) != (sound[i] < 0)) ++crossings;
+        QVERIFY2(crossings > 150 && crossings < 170, std::to_string(crossings).c_str());
+
+        // Where the sender itself put each flash and beep, from what came over the wire: the flash's picture (by the
+        // RTP time it came with, before the endpoint moved it) and the beep's first loud packet of sound (a tone
+        // takes many more bytes than silence), each on the sender's own clock by its reports; against when the page
+        // drew them, and against where the recording has them.
+        struct Report { double ntp = 0; long long rtp = 0; };
+        std::map<char, std::vector<Report>> reported;
+        std::map<char, Report> anchored;
+        long long firstPicture = 0, firstSound = 0;
+        int byReports = -1;
+        std::vector<std::pair<long long, long long>> handed;  // a picture's RTP time as it came, as handed on
+        std::map<long long, long long> pictureBytes;
+        std::map<long long, long long> soundBytes;
+        for (const std::string& line : timing) {
+            char k = 0;
+            long long a = 0, b = 0;
+            size_t n = 0;
+            double x = 0, y = 0;
+            int r = 0;
+            if (std::sscanf(line.c_str(), "packet %c ts %lld bytes %zu came %lf", &k, &a, &n, &x) == 4)
+                (k == 'V' ? pictureBytes : soundBytes)[a] += (long long)n;
+            else if (std::sscanf(line.c_str(), "report %c came %lf ntp %lf rtp %lld", &k, &x, &y, &a) == 4)
+                reported[k].push_back({y, a});
+            else if (std::sscanf(line.c_str(), "anchor %c ntp %lf rtp %lld", &k, &y, &a) == 3)
+                anchored[k] = {y, a};
+            else if (std::sscanf(line.c_str(), "start reports %d video %lld audio %lld", &r, &a, &b) == 3)
+                byReports = r, firstPicture = a, firstSound = b;
+            else if (std::sscanf(line.c_str(), "picture %lld %lld", &a, &b) == 2)
+                handed.emplace_back(a, b);
+        }
+        // (the beeps' first loud packets: the first of three in a row each half as big again as the middling one of
+        // the ten before, which were silence (the encoder's silence changes size as it settles), half a second or
+        // more after the last)
+        std::vector<long long> loud;
+        {
+            std::vector<std::pair<long long, long long>> packets(soundBytes.begin(), soundBytes.end());
+            for (size_t i = 10; i + 2 < packets.size(); ++i) {
+                std::vector<long long> sizes;
+                for (size_t j = i - 10; j < i; ++j) sizes.push_back(packets[j].second);
+                std::nth_element(sizes.begin(), sizes.begin() + 5, sizes.end());
+                const long long before = sizes[5];
+                if (packets[i].second * 2 > before * 3 && packets[i + 1].second * 2 > before * 3 && packets[i + 2].second * 2 > before * 3 &&
+                    (loud.empty() || packets[i].first - loud.back() >= 24000))
+                    loud.push_back(packets[i].first);
+            }
+        }
+        // (the sender's clock at an RTP time, by a report: seconds since 1970)
+        auto onSenderClock = [](const Report& r, long long ts, double clock) { return r.ntp - 2208988800.0 + double(ts - r.rtp) / clock; };
+        double senderSum = 0;
+        int senderPaired = 0;
+        auto wire = [&](double f, double b) {
+            if (handed.empty() || loud.empty()) return std::string("nothing came over the wire to tell by");
+            // The flash's picture: the one handed on nearest its place in the recording.
+            const long long want = firstPicture + std::llround(f * 90000);
+            auto picture = handed.front();
+            for (const auto& h : handed)
+                if (std::llabs(h.second - want) < std::llabs(picture.second - want)) picture = h;
+            // The beep's first loud packet: the one nearest its place in the recording.
+            const long long sound = firstSound + std::llround(b * 48000);
+            long long packet = loud.front();
+            for (const long long l : loud)
+                if (std::llabs(l - sound) < std::llabs(packet - sound)) packet = l;
+            char text[512];
+            int at = std::snprintf(text, sizeof text, "picture %lld (%lld bytes, moved %+.0f ms), loud sound from %lld, recorded %+.0f ms from that packet",
+                                   picture.first, pictureBytes[picture.first], double(picture.second - picture.first) / 90.0, packet, double(sound - packet) / 48.0);
+            if (reported['V'].empty() || reported['A'].empty()) {
+                std::snprintf(text + at, sizeof text - size_t(at), "; no reports from the sender");
+                return std::string(text);
+            }
+            const double pictureAt = onSenderClock(reported['V'].back(), picture.first, 90000);
+            const double latest = onSenderClock(reported['A'].back(), packet, 48000), first = onSenderClock(reported['A'].front(), packet, 48000);
+            const double kept = anchored.count('A') ? onSenderClock(anchored['A'], packet, 48000) : latest;
+            senderSum += latest - pictureAt;
+            ++senderPaired;
+            at += std::snprintf(text + at, sizeof text - size_t(at), "; by the sender's reports the beep was made %+.0f ms after the flash (%+.0f by the first, %+.0f by the timing kept)",
+                                (latest - pictureAt) * 1000, (first - pictureAt) * 1000, (kept - pictureAt) * 1000);
+            double draw = 0;
+            for (const double d : drawn)
+                if (!draw || std::fabs(d / 1000 - pictureAt) < std::fabs(draw / 1000 - pictureAt)) draw = d;
+            if (draw) std::snprintf(text + at, sizeof text - size_t(at), "; after the page drew them, the picture by %+.0f ms and the sound by %+.0f ms", (pictureAt - draw / 1000) * 1000, (latest - draw / 1000) * 1000);
+            return std::string(text);
+        };
+        qInfo("WHIP: begun by %s; %zu reports of pictures, %zu of sound", byReports < 0 ? "nothing" : byReports ? "reports" : "arrival", reported['V'].size(), reported['A'].size());
+
+        // Each flash and its beep land within 40 ms of each other on average, and each within 40 ms and a picture's
+        // time (a flash is seen only from the picture it falls in).
+        int paired = 0;
+        double worst = 0, sum = 0;
+        for (const double f : flashes) {
+            double nearest = 1e9;
+            for (const double b : beeps) nearest = std::fabs(b - f) < std::fabs(nearest) ? b - f : nearest;
+            if (std::fabs(nearest) > 0.5) continue;
+            ++paired;
+            sum += nearest;
+            worst = std::max(worst, std::fabs(nearest));
+            qInfo("WHIP: flash at %.3f s, its beep %+.0f ms; %s", f, nearest * 1000, wire(f, f + nearest).c_str());
+        }
+        QVERIFY2(paired >= 4, std::to_string(paired).c_str());
+        QVERIFY2(std::fabs(sum / paired) <= 0.040, (std::to_string(sum / paired) + (senderPaired ? "; by the sender's own reports " + std::to_string(senderSum / senderPaired) : std::string())).c_str());
+        QVERIFY2(worst <= 0.040 + 1 / fps, std::to_string(worst).c_str());
     }
 
     void ndiOutput() {
@@ -25337,6 +28027,129 @@ colorspaces:
         const std::vector<Run> same = runs(renderGenerator(plain, 0, w, h, 1.0, 90, 30));
         QCOMPARE(int(same.size()), 2);
         QVERIFY(std::abs(deep(same[1]) - deep(same[0])) <= 1 && std::abs(deep(same[0]) - 40) <= 4);
+    }
+
+    void titles3DFacesFilledApart() {
+        // A 3D title's front, sides and back each take a colour, a gradient or a track's picture. "MW" extruded 120 px
+        // and turned so its sides show, lit flat (all ambient, no shine) so every pixel is its face's source exactly.
+        Effect g = makeEffect("title3d", 1);
+        g.strings["text"] = "MW";
+        g.strings["font"] = "DejaVu Sans";
+        g.params["size"] = Param(160.0);
+        g.params["depth"] = Param(120.0);
+        g.params["rot_x"] = Param(-25.0);
+        g.params["rot_y"] = Param(-35.0);
+        g.params["ambient"] = Param(100.0);
+        g.params["specular"] = Param(0.0);
+        for (const char* k : {"color", "side_color", "back_color"})
+            for (const char* c : {".r", ".g", ".b"}) g.params[std::string(k) + c] = Param(0.0);
+        g.params["color.r"] = Param(1.0);  // a red front
+        const int w = 640, h = 360;
+        // Where the front and the sides are: the front red, the sides black.
+        const Image ref = renderGenerator(g, 0, w, h, 1.0, 30, 30);
+        auto is = [](const float* q, float r, float gg, float b) {
+            return q[3] > 0.999f && std::fabs(q[0] - r) < 1.5f / 255 && std::fabs(q[1] - gg) < 1.5f / 255 && std::fabs(q[2] - b) < 1.5f / 255;
+        };
+        std::vector<std::pair<int, int>> front, sides;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                if (is(ref.at(x, y), 1, 0, 0)) front.push_back({x, y});
+                if (is(ref.at(x, y), 0, 0, 0)) sides.push_back({x, y});
+            }
+        QVERIFY2(front.size() > 2000 && sides.size() > 2000, qPrintable(QString("%1 %2").arg(front.size()).arg(sides.size())));
+        // The sides take a track's picture fitted to the title, its left half blue and its right half green: the
+        // front stays red, and the sides are blue on the left of the title and green on its right.
+        Title3DPictures pics;
+        pics.sides = Image(w, h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                float* q = pics.sides.at(x, y);
+                q[0] = 0, q[1] = x < w / 2 ? 0.0f : 1.0f, q[2] = x < w / 2 ? 1.0f : 0.0f, q[3] = 1;
+            }
+        g.params["side_fill"] = Param(2.0);
+        const Image painted = renderTitle3D(g, 0, w, h, 1.0, 30, 30, &pics);
+        size_t red = 0, blue = 0, green = 0;
+        double blueX = 0, greenX = 0;
+        for (auto [x, y] : front) red += is(painted.at(x, y), 1, 0, 0);
+        for (auto [x, y] : sides) {
+            if (is(painted.at(x, y), 0, 0, 1)) ++blue, blueX += x;
+            if (is(painted.at(x, y), 0, 1, 0)) ++green, greenX += x;
+        }
+        QVERIFY2(red >= front.size() * 99 / 100, qPrintable(QString("%1 of %2").arg(red).arg(front.size())));
+        QVERIFY2(blue + green >= sides.size() * 95 / 100 && blue > 500 && green > 500,
+                 qPrintable(QString("%1 + %2 of %3").arg(blue).arg(green).arg(sides.size())));
+        QVERIFY2(blueX / double(blue) < greenX / double(green) - 50, qPrintable(QString("%1 %2").arg(blueX / blue).arg(greenX / green)));
+        // Without the picture the sides keep their colour.
+        QVERIFY(renderTitle3D(g, 0, w, h, 1.0, 30, 30, nullptr).px == ref.px);
+        // A gradient on the front, red at the title's top to blue at its bottom: the front's highest pixels are
+        // nearly red and its lowest nearly blue, and blue grows down the title.
+        g.params["side_fill"] = Param(0.0);
+        g.params["face_fill"] = Param(1.0);
+        g.params["color2.r"] = Param(0.0), g.params["color2.g"] = Param(0.0), g.params["color2.b"] = Param(1.0);
+        const Image grad = renderGenerator(g, 0, w, h, 1.0, 30, 30);
+        int top = h, bottom = 0;
+        for (auto [x, y] : front) top = std::min(top, y), bottom = std::max(bottom, y);
+        bool mixed = true;  // every front pixel red and blue mixed
+        auto blueness = [&](int y0, int y1) {
+            double sum = 0;
+            int n = 0;
+            for (auto [x, y] : front)
+                if (y >= y0 && y <= y1) {
+                    const float* q = grad.at(x, y);
+                    mixed = mixed && std::fabs(q[0] + q[2] - 1) < 2.0f / 255 && q[1] < 1.0f / 255;
+                    sum += q[2], ++n;
+                }
+            return n ? sum / n : -1.0;
+        };
+        const double upper = blueness(top, top + 10), middle = blueness((top + bottom) / 2 - 5, (top + bottom) / 2 + 5),
+                     lower = blueness(bottom - 10, bottom);
+        QVERIFY(mixed);
+        QVERIFY2(upper >= 0 && upper < 0.2 && lower > 0.8 && middle > upper + 0.2 && middle < lower - 0.2,
+                 qPrintable(QString("%1 %2 %3").arg(upper).arg(middle).arg(lower)));
+        // The back, turned to the camera: the front's red, until it has a colour of its own (green). (What is not
+        // black there, the sides seen past the back's edges, is the back.)
+        g.params["face_fill"] = Param(0.0);
+        g.params["rot_x"] = Param(0.0);
+        g.params["rot_y"] = Param(180.0);
+        auto backShare = [&](float r, float gg, float b) {
+            const Image img = renderGenerator(g, 0, w, h, 1.0, 30, 30);
+            size_t n = 0, back = 0;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    if (img.at(x, y)[3] > 0.999f && !is(img.at(x, y), 0, 0, 0)) ++back, n += is(img.at(x, y), r, gg, b);
+            return back > 2000 ? double(n) / double(back) : 0.0;
+        };
+        QVERIFY2(backShare(1, 0, 0) > 0.95, qPrintable(QString::number(backShare(1, 0, 0))));
+        g.params["back_fill"] = Param(1.0);
+        g.params["back_color.g"] = Param(1.0);
+        QVERIFY2(backShare(0, 1, 0) > 0.95, qPrintable(QString::number(backShare(0, 1, 0))));
+        // Through the compositor: the sides show track 1's picture (a blue colour clip under the title on track 2),
+        // where they were black.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = w, s.height = h;
+        s.videoTracks.resize(2);
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.0f, 0.0f, 1.0f, 0, 30));
+        Clip title = makeGeneratorClip(p, "title3d", 30);
+        title.generator = g;
+        title.generator.params["back_fill"] = Param(0.0);
+        title.generator.params["rot_x"] = Param(-25.0);
+        title.generator.params["rot_y"] = Param(-35.0);
+        s.videoTracks[1].clips.push_back(title);
+        RenderOptions o;
+        auto sideBlue = [&] {
+            const Image img = renderSequenceFrame(p, *p.active(), 0, o);
+            size_t n = 0;
+            for (auto [x, y] : sides) n += img.at(x, y)[2] > 0.95f && img.at(x, y)[0] < 0.05f && img.at(x, y)[1] < 0.05f;
+            return double(n) / double(sides.size());
+        };
+        QVERIFY2(sideBlue() < 0.05, qPrintable(QString::number(sideBlue())));
+        p.active()->videoTracks[1].clips[0].generator.params["side_fill"] = Param(2.0);
+        p.active()->videoTracks[1].clips[0].generator.params["side_track"] = Param(1.0);
+        QVERIFY2(sideBlue() > 0.95, qPrintable(QString::number(sideBlue())));
+        // Its own track's picture is not taken (the sides keep their colour).
+        p.active()->videoTracks[1].clips[0].generator.params["side_track"] = Param(2.0);
+        QVERIFY2(sideBlue() < 0.05, qPrintable(QString::number(sideBlue())));
     }
 
     void titles3DLetterTransforms() {
@@ -26535,6 +29348,26 @@ colorspaces:
         d = worst(pixels(plain), cpu);
         QVERIFY2(d <= 1e-6f, qPrintable(QString("switched off: %1").arg(d)));
         QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
+        // (nightly 23 Nov) An OpenGL render that fails now and then (twice in a row here, as on a card short of memory)
+        // is made in memory into the texture, and the plug-in is still given textures; the next render goes on the GPU
+        // again, and it starts the count again. (One failure kept textures from the plug-in for the session.)
+        for (int round = 0; round < 2; ++round) {
+            qputenv("MONTAGE_TEST_PLUGIN_FAULT", round ? "fail:glrender:0:2" : "fail:glrender:0:2 ");
+            for (int miss = 0; miss < 2; ++miss) {
+                direct = ofx::gpuTextureRenders();
+                QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
+                QCOMPARE(ofx::gpuTextureRenders(), direct);
+                d = worst(pixels(plain), cpu);
+                QVERIFY2(d <= 1e-6f, qPrintable(QString("OpenGL failed: %1").arg(d)));
+                QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
+            }
+            direct = ofx::gpuTextureRenders();
+            QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
+            QCOMPARE(ofx::gpuTextureRenders(), direct + 1);
+            QVERIFY(worst(pixels(plain), cpu) <= 1.0f / 1023);
+        }
+        qunsetenv("MONTAGE_TEST_PLUGIN_FAULT");
+        QVERIFY2(ofx::rendersTextures(e, &why), why.c_str());
         // Textures of two sizes are refused.
         QVERIFY(!ofx::applyEffectTexture(e, 0, in, ofx::GlPicture{out.texture, W, H - 2}, 1.0, {}, &err));
         f->glDeleteTextures(GLsizei(textures.size()), textures.data());
@@ -26675,6 +29508,170 @@ colorspaces:
         QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
     }
 
+    // Pictures from plug-in hosts as handles. Asked with MONTAGE_GPU_HANDLES=1 of hosts started for GPU rendering, an
+    // effect's picture, a transition's and a generator's each come as a handle where both sides share, and through
+    // shared memory with the reason where they do not; either way within 1/1023 of the picture made in Montage's
+    // process. A hundred pictures that each carry their number come back in order, none stale or torn. A host killed
+    // in the middle of a frame whose picture was to come as a handle: the frame comes all the same, from a new host
+    // through shared memory, and no handle is asked for after. With MONTAGE_EXPECT_HANDLES=1 (CI's guest, whose driver
+    // shares), a picture that does not come as a handle fails the test.
+    void openFxHandlesForEveryKindAndAfterAHostEnds() {
+        QTemporaryDir dir;
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath((dir.path() + "/ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve, generator, temporal;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.dissolve/1", dissolve) &&
+                reg.find("org.montage.test.generator/1", generator) && reg.find("org.montage.test.temporal/1", temporal));
+        const bool expected = qEnvironmentVariable("MONTAGE_EXPECT_HANDLES") == "1";
+        Project p = makeDefaultProject();
+        // Plug-in hosts for this test only: the host program, the grouping, what is asked and OpenGL for plug-ins are
+        // as they were when it ends, with no host left running.
+        struct Asking {
+            const QByteArray before = qgetenv("MONTAGE_GPU_HANDLES");
+            const bool set = qEnvironmentVariableIsSet("MONTAGE_GPU_HANDLES");
+            const bool gpu = ofx::gpuRendering();
+            const plugins::HostingSettings hosting = plugins::hosting();
+            ~Asking() {
+                ofx::remote::releaseIdle();
+                for (int i = 0; i < 2000 && !plugins::runningHosts().empty(); ++i) QTest::qWait(10);
+                plugins::setHosting(hosting);
+                plugins::setHostExecutable({});
+                plugins::clearHostFailures();
+                if (set) qputenv("MONTAGE_GPU_HANDLES", before);
+                else qunsetenv("MONTAGE_GPU_HANDLES");
+                ofx::setGpuRendering(gpu);
+                ofx::remote::resetPictureStats();
+            }
+        } asking;
+        plugins::setHostExecutable(MONTAGE_PLUGIN_HOST);
+        auto host = [&](plugins::Isolation how) {
+            ofx::remote::releaseIdle();
+            plugins::HostingSettings s = asking.hosting;
+            s.isolation = how;
+            plugins::setHosting(s);
+            plugins::clearHostFailures();
+        };
+        qputenv("MONTAGE_GPU_HANDLES", "1");
+        // (hosts render with OpenGL, and are asked for handles, only where Montage's own OpenGL for plug-ins runs)
+        std::string noOpenGl;
+        const bool openGl = ofx::initializeGpu(&noOpenGl);
+        if (expected) QVERIFY2(openGl, noOpenGl.c_str());
+        ofx::setGpuRendering(true);
+        // A picture that carries a number: every row holds it, so a torn picture has rows of two numbers.
+        auto numbered = [](int n) {
+            Image img(64, 36);
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    float* px = img.at(x, y);
+                    px[0] = float(x) / img.width, px[1] = float(n) / 128, px[2] = float(y) / img.height, px[3] = 1.0f;
+                }
+            return img;
+        };
+        auto worstBetween = [](const Image& a, const Image& b) {
+            if (a.width != b.width || a.height != b.height) return 1e9;
+            double worst = 0;
+            for (size_t k = 0; k < a.px.size(); ++k) worst = std::max(worst, std::fabs(double(a.px[k]) - b.px[k]));
+            return worst;
+        };
+        std::string err;
+        Effect fx = ofx::makeEffect(p, invert);
+        fx.params["param.amount"] = Param(0.9);
+        Effect mix = ofx::makeEffect(p, dissolve);
+        Effect gen = ofx::makeEffect(p, generator);
+        Image from(64, 36), to(64, 36);
+        from.fill(0.9f, 0.2f, 0.1f, 1.0f);
+        to.fill(0.1f, 0.6f, 0.8f, 1.0f);
+        // Each made in Montage's own process first.
+        std::vector<Image> here(100);
+        Image mixedHere, generatedHere;
+        {
+            host(plugins::Isolation::InProcess);
+            for (int n = 0; n < 100; ++n) {
+                here[size_t(n)] = numbered(n);
+                QVERIFY2(ofx::applyEffect(fx, n, here[size_t(n)], 1.0, {}, &err), err.c_str());
+            }
+            QVERIFY2(ofx::applyTransition(mix, 0, 0.25, from, to, mixedHere, 1.0, &err), err.c_str());
+            QVERIFY2(ofx::renderGenerator(gen, 3, 64, 36, 1.0, generatedHere, &err), err.c_str());
+        }
+        QVERIFY(worstBetween(here[10], here[11]) > 1.0 / 256);  // (the number shows in the picture)
+        {
+            host(plugins::Isolation::PerPlugin);
+            ofx::remote::resetPictureStats();
+            // What a picture took, counted: as a handle, or through shared memory with a reason that is not "not asked".
+            long handles = 0, memory = 0;
+            auto took = [&](const QString& what) {
+                const ofx::remote::PictureStats now = ofx::remote::pictureStats();
+                const bool handle = now.handles == handles + 1 && now.sharedMemory == memory;
+                const bool shared = now.handles == handles && now.sharedMemory == memory + 1;
+                handles = now.handles, memory = now.sharedMemory;
+                const QString last = QString::fromStdString(now.last);
+                if (!handle && !shared) return what + ": counted neither once as a handle nor once through shared memory";
+                if (shared && (expected || last.contains("not asked for") || !last.contains("through shared memory: ")))
+                    return what + ": " + last;
+                if (handle && !last.endsWith("as a DMA-BUF")) return what + ": " + last;
+                return QString();
+            };
+            Image there, mixedThere, generatedThere;
+            QVERIFY2(ofx::applyTransition(mix, 0, 0.25, from, to, mixedThere, 1.0, &err), err.c_str());
+            QCOMPARE(took("the transition"), QString());
+            QVERIFY2(worstBetween(mixedHere, mixedThere) <= 1.0 / 1023, qPrintable(QString::number(worstBetween(mixedHere, mixedThere))));
+            QVERIFY2(ofx::renderGenerator(gen, 3, 64, 36, 1.0, generatedThere, &err), err.c_str());
+            QCOMPARE(took("the generator"), QString());
+            QVERIFY2(worstBetween(generatedHere, generatedThere) <= 1.0 / 1023, qPrintable(QString::number(worstBetween(generatedHere, generatedThere))));
+            for (int n = 0; n < 100; ++n) {
+                there = numbered(n);
+                QVERIFY2(ofx::applyEffect(fx, n, there, 1.0, {}, &err), err.c_str());
+                QCOMPARE(took(QString("picture %1").arg(n)), QString());
+                const double worst = worstBetween(here[size_t(n)], there);
+                QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("picture %1 is off by %2 (stale or torn)").arg(n).arg(worst)));
+            }
+            qInfo("%s", ofx::remote::pictureStats().last.c_str());
+#ifdef __linux__
+            // A host killed while it renders: the plug-in asks Montage for the frame before, and the answer kills it.
+            Effect slow = ofx::makeEffect(p, temporal);
+            Image wanted = numbered(7);
+            host(plugins::Isolation::InProcess);
+            QVERIFY2(ofx::applyEffect(slow, 7, wanted, 1.0, [&](double, Image& out) { return out = numbered(6), true; }, &err), err.c_str());
+            host(plugins::Isolation::PerPlugin);
+            ofx::remote::resetPictureStats();
+            const long askedBefore = ofx::remote::pictureStats().asked;
+            bool killed = false;
+            const ofx::FrameFetch killing = [&](double, Image& out) {
+                if (!killed)
+                    for (const plugins::HostInfo& running : plugins::runningHosts())
+                        if (running.key.find("temporal") != std::string::npos && running.pid > 0) killed = ::kill(pid_t(running.pid), SIGKILL) == 0;
+                out = numbered(6);
+                return true;
+            };
+            there = numbered(7);
+            const bool came = ofx::applyEffect(slow, 7, there, 1.0, killing, &err);
+            QVERIFY(killed);
+            const ofx::remote::PictureStats after = ofx::remote::pictureStats();
+            if (after.asked > askedBefore) {
+                // (a handle was asked of the host that was killed: the picture is made again, through shared memory)
+                QVERIFY2(came, err.c_str());
+                QVERIFY2(worstBetween(wanted, there) <= 1.0 / 1023, qPrintable(QString::number(worstBetween(wanted, there))));
+                QCOMPARE(after.handles, 0L);
+                QCOMPARE(after.sharedMemory, 1L);
+                QVERIFY2(QString::fromStdString(after.last).contains("its plug-in host ended while the picture was shared as a handle"), after.last.c_str());
+                // (and none is asked for after)
+                there = numbered(8);
+                QVERIFY2(ofx::applyEffect(slow, 8, there, 1.0, [&](double, Image& out) { return out = numbered(7), true; }, &err), err.c_str());
+                QCOMPARE(ofx::remote::pictureStats().asked, after.asked);
+                QVERIFY(QString::fromStdString(ofx::remote::pictureStats().last).contains("ended while the picture was shared as a handle"));
+            } else {
+                // (no handle was asked for here: a host that ends takes its picture with it, as ever, and says so)
+                QVERIFY(!expected);
+                QVERIFY(!came && !err.empty());
+            }
+            plugins::clearHostFailures();
+#endif
+        }
+    }
+
     void gpuFallback() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
@@ -26692,7 +29689,7 @@ colorspaces:
         cc.params["mask.y"] = 0.5;
         cc.params["mask.w"] = 0.5;
         cc.params["mask.h"] = 0.5;
-        cc.params["mask.refine"] = 50.0;
+        cc.params["mask.show"] = 1.0;  // (the mask shown in place of the picture: drawn on the CPU)
         masked.effects.push_back(cc);
         const Id maskedId = masked.id;
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, masked).ok);
@@ -26867,6 +29864,39 @@ colorspaces:
                     edit::clipById(s, topId)->effects.clear();
                     QVERIFY(renderProgramFrame(p, s, 7 + FrameTime(k), o).px != lit.px);
                 }
+            }
+        edit::clipById(s, topId)->effects.clear();
+        // Mesh Warp and Grid Warp with motion blur: a pin or a point keyed to move through the shutter, at three
+        // settings (the second with a shorter shutter on a denser mesh, the third through a feathered mask), a pass
+        // for each sample through the shutter, each drawn from the picture as the warp began. (They were the CPU's.)
+        for (const char* type : {"mesh_warp", "grid_warp"})
+            for (int k = 0; k < 3; ++k) {
+                Effect e = makeEffect(p, type);
+                e.params["motion_blur"] = 1.0;
+                const char* moving = "g1_1.dx";
+                if (std::string(type) == "mesh_warp") {
+                    e.params["mesh_from"] = 1.0;
+                    e.params["pin1.kind"] = 0.0, e.params["pin1.x"] = 0.3, e.params["pin1.y"] = 0.4;
+                    e.params["pin2.kind"] = 0.0, e.params["pin2.x"] = 0.7, e.params["pin2.y"] = 0.6;
+                    e.params["pin1.to_y"].addKey(0, 0.4), e.params["pin1.to_y"].addKey(12, 0.8);
+                    moving = "pin1.to_x";
+                    if (k == 1) e.params["density"] = 500.0;
+                }
+                Param& at = e.params[moving];
+                at.addKey(0, std::string(type) == "mesh_warp" ? 0.3 : 0.0);
+                at.addKey(12, std::string(type) == "mesh_warp" ? 0.9 : 0.3);
+                if (k == 1) e.params["shutter"] = 90.0;
+                if (k == 2) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.6, e.params["mask.h"] = 0.5, e.params["mask.feather"] = 10.0;
+                edit::clipById(s, topId)->effects = {e};
+                const long passes = gpu::stats().filterPasses;
+                compare(7 + FrameTime(k), QString("%1 through the shutter #%2").arg(type).arg(k + 1));
+                QVERIFY2(gpu::stats().filterPasses >= passes + 2, type);
+                // (blurred: not the picture drawn once at the frame's own time)
+                RenderOptions o;
+                o.gpu = true;
+                const Image blurred = renderProgramFrame(p, s, 7 + FrameTime(k), o);
+                edit::clipById(s, topId)->effects[0].params["motion_blur"] = 0.0;
+                QVERIFY(renderProgramFrame(p, s, 7 + FrameTime(k), o).px != blurred.px);
             }
         edit::clipById(s, topId)->effects.clear();
 
@@ -28482,9 +31512,12 @@ colorspaces:
         QCOMPARE(chooseShotPoints(dip, {50}, {}, 0, 3000), (std::vector<size_t>{2}));
     }
     void streamingPerShot() {
-        // A two-shot programme (fine noise for two seconds, then a flat card), a ladder of two rungs, set per shot to a
-        // VMAF of 90: each shot on each rung within a VMAF of the target, or at the rung's cap, on fewer bits than the
-        // same ladder at fixed rates; every segment starting on a keyframe, and the ladder's report.
+        // A two-shot programme (fine noise for two seconds, then a flat card: an edit between two generators, which
+        // counts as a cut), a ladder of two rungs, set per shot to a VMAF of 90 scored at the top rung's size. Each
+        // shot on each rung is within a VMAF of the target, or held at its cap, the floor or the coarsest setting (the
+        // first two said in the report); no shot's mean rate in the delivered files is past the rung's rate, measured
+        // from the files' packets; the ladder takes fewer bits than at fixed rates; the render is decoded once and a
+        // shot that is settled is not encoded again; every segment starts on a keyframe.
         if (!vmafAvailable()) QSKIP("Built without libvmaf");
         QTemporaryDir dir;
         Project p = makeDefaultProject();
@@ -28496,9 +31529,7 @@ colorspaces:
         bars.effects.push_back(nz);
         s.videoTracks[0].clips.push_back(bars);
         s.videoTracks[0].clips.push_back(colorClip(p, 0.2f, 0.4f, 0.7f, 50, 50));
-        Marker shot;  // (generators' edges are not cuts to shot detection: the change marked, as scene detection would)
-        shot.t = 50, shot.shotChange = true;
-        s.markers.push_back(shot);
+        QCOMPARE(streamingShotChanges(s), (std::vector<FrameTime>{50}));
 
         auto videoBits = [](const QString& folder) {
             int64_t bits = 0;
@@ -28507,10 +31538,31 @@ colorspaces:
                 for (const QFileInfo& f : QDir(pkg.filePath(v)).entryInfoList({"seg*.m4s"}, QDir::Files)) bits += f.size() * 8;
             return bits;
         };
+        // Each shot's bits in a rendition's files, from their packets, against what the result says and the rung's rate.
+        auto withinCaps = [&](const StreamingSettings& st, const StreamingResult& res, QString* why) {
+            for (size_t r = 0; r < res.perShot.size(); ++r) {
+                const StreamingRungShots& rs = res.perShot[r];
+                const QString joined = dir.filePath("joined.mp4");
+                if (!joinStreamingRendition(QString::fromStdString(st.folder + "/" + rs.rendition), joined)) return *why = "no files for " + QString::fromStdString(rs.rendition), false;
+                const std::vector<int64_t> bits = videoSampleBits(joined, 25);
+                if (bits.size() != 100) return *why = QString("%1 packets").arg(bits.size()), false;
+                for (const StreamingShot& sh : rs.shots) {
+                    int64_t sum = 0;
+                    for (FrameTime f = sh.first; f < sh.end; ++f) sum += bits[size_t(f)];
+                    const double seconds = double(sh.end - sh.first) / 25, rate = double(sum) / seconds;
+                    if (sum != sh.bits || rate > double(st.rungs[r].bitrate))
+                        return *why = QString("%1 frames %2-%3: %4 bits in the file, %5 said, %6 b/s of %7")
+                                          .arg(QString::fromStdString(rs.rendition)).arg(sh.first).arg(sh.end).arg(sum).arg(sh.bits).arg(rate).arg(st.rungs[r].bitrate), false;
+                }
+            }
+            return true;
+        };
         std::string err;
-        // H.264 and HEVC (zones), and AV1 (an encoder started afresh at each shot), where there are encoders.
+        // H.264 and HEVC (an encoder for each shot, their parameter sets the same), and AV1 (an encoder started afresh at
+        // each segment), where there are encoders.
         for (const char* codec : {"libx264", "libx265", "libsvtav1"}) {
             if (!avcodec_find_encoder_by_name(codec)) continue;
+            const bool av1 = std::strcmp(codec, "libsvtav1") == 0;
             StreamingSettings st;
             st.segmentSeconds = 2;
             st.rungs = {{320, 180, 700000, codec}, {192, 108, 250000, codec}};
@@ -28519,44 +31571,79 @@ colorspaces:
             const QString name = QString::fromLatin1(codec);
             st.folder = (dir.path() + "/fixed-" + name).toStdString();
             QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &fixed), err.c_str());
-            QVERIFY(fixed.perShot.empty() && fixed.ladderReport.empty());
+            QVERIFY(fixed.perShot.empty() && fixed.ladderReport.empty() && fixed.renderDecodes == 0);
             st.folder = (dir.path() + "/shots-" + name).toStdString();
             st.perShot = true;
             st.vmafTarget = 90;
             QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
             QCOMPARE(res.segments, (std::vector<FrameTime>{0, 50}));
+            // Scored at the top rung's size (the small rung's pictures scaled up to it), every fourth frame in the trials.
+            QVERIFY(res.displayWidth == 320 && res.displayHeight == 180);
+            QCOMPARE(QString::fromStdString(res.scaler), QStringLiteral("bicubic"));
+            QCOMPARE(QString::fromStdString(res.vmafModel), QStringLiteral("vmaf_v1.0.16_3d0h"));
+            QCOMPARE(res.trialVmafEvery, 4);
+            QCOMPARE(res.crfFloor, 18.0);
+            // The render was decoded once for every rung, shot and setting.
+            QCOMPARE(res.renderDecodes, 1);
             QCOMPARE(res.perShot.size(), size_t(2));
+            int64_t encodes = 0;
             for (size_t r = 0; r < res.perShot.size(); ++r) {
                 const StreamingRungShots& rs = res.perShot[r];
                 QCOMPARE(rs.shots.size(), size_t(2));
                 QVERIFY(rs.shots[0].first == 0 && rs.shots[0].end == 50 && rs.shots[1].first == 50 && rs.shots[1].end == 100);
                 for (const StreamingShot& sh : rs.shots) {
-                    qInfo("%s frames %lld-%lld: CRF %.2f, %.0f kb/s, VMAF %.2f (trial %.2f)", rs.rendition.c_str(), (long long)sh.first,
-                          (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.trialVmaf);
-                    const double cap = double(st.rungs[r].bitrate);
-                    // (the rung's cap: its mean within a tenth of the rung's rate, with VBV's give)
-                    QVERIFY2(double(sh.bitrate) <= cap * 1.1, qPrintable(QString::number(sh.bitrate)));
-                    // (or at the best setting tried)
-                    QVERIFY2(sh.vmaf >= st.vmafTarget - 1 || double(sh.bitrate) >= cap * 0.75 || sh.crf <= 20,
-                             qPrintable(QString("%1 %2").arg(sh.vmaf).arg(sh.bitrate)));
-                    // What it delivers is what the trial expected, near enough.
-                    QVERIFY2(std::fabs(sh.vmaf - sh.trialVmaf) < 3, qPrintable(QString("%1 %2").arg(sh.vmaf).arg(sh.trialVmaf)));
+                    qInfo("%s frames %lld-%lld: CRF %.2f, %.0f kb/s, VMAF %.2f (own size %.2f, trial %.2f), %d settings%s%s", rs.rendition.c_str(),
+                          (long long)sh.first, (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.ownVmaf, sh.trialVmaf, sh.trials,
+                          sh.stopped.empty() ? "" : ", stopped at the ", sh.stopped.c_str());
+                    // Within a VMAF of the target; or short of it at the cap or the floor, and said so; or past it
+                    // at the coarsest setting there is to try, or where the shot costs next to nothing at any (the
+                    // still card: the setting that reaches the target in the fewest bits).
+                    const QByteArray what = QString("%1 %2 %3").arg(sh.vmaf).arg(sh.crf).arg(QString::fromStdString(sh.stopped)).toUtf8();
+                    QVERIFY2(sh.vmaf >= st.vmafTarget - 1 || sh.stopped == "cap" || sh.stopped == "floor", what.constData());
+                    QVERIFY2(sh.vmaf <= st.vmafTarget + 1 || sh.crf >= (av1 ? 63 : 48) || sh.bitrate < 30000, what.constData());
+                    QVERIFY2(sh.stopped.empty() || sh.vmaf < st.vmafTarget, what.constData());
+                    // What is delivered is the trial's own encode: its score on every frame is the trial's on every
+                    // fourth, near enough (within one and a half VMAF on 50 frames of noise, 13 of them scored in the
+                    // trial; finer scenes come nearer, as vmafEveryFourthFrame checks).
+                    QVERIFY2(std::fabs(sh.vmaf - sh.trialVmaf) < 1.5, qPrintable(QString("%1 %2").arg(sh.vmaf).arg(sh.trialVmaf)));
+                    // The small rung scores higher at its own size than shown at the display's.
+                    if (r == 0) QCOMPARE(sh.ownVmaf, sh.vmaf);
+                    encodes += sh.trials;
                 }
-                // The flat card takes fewer bits than the noise.
+                // The flat card takes fewer bits than the noise, and is settled by its first six settings: none more.
                 QVERIFY(rs.shots[1].bitrate < rs.shots[0].bitrate);
+                QCOMPARE(rs.shots[1].trials, 6);
+                QVERIFY2(rs.shots[0].trials >= 6 && rs.shots[0].trials <= 13, QByteArray::number(rs.shots[0].trials));
             }
+            // No setting of a shot was encoded twice: as many encodes as settings.
+            QCOMPARE(res.shotEncodes, encodes);
+            QString why;
+            QVERIFY2(withinCaps(st, res, &why), qPrintable(why));
             const int64_t fixedBits = videoBits(dir.path() + "/fixed-" + name), shotBits = videoBits(QString::fromStdString(st.folder));
-            qInfo("%s video: fixed rates %.0f kb, set per shot %.0f kb (%.0f%%)", codec, double(fixedBits) / 1000, double(shotBits) / 1000,
-                  100.0 * double(shotBits) / double(fixedBits));
+            qInfo("%s video: fixed rates %.0f kb, set per shot %.0f kb (%.0f%%), %lld encodes of a shot", codec, double(fixedBits) / 1000,
+                  double(shotBits) / 1000, 100.0 * double(shotBits) / double(fixedBits), (long long)res.shotEncodes);
             QVERIFY2(shotBits < fixedBits, qPrintable(QString("%1 %2").arg(shotBits).arg(fixedBits)));
 
-            // The report: a row for each shot on each rung.
+            // The report: how it was scored, then a row for each shot on each rung.
             QFile csv(QString::fromStdString(res.ladderReport));
             QVERIFY(csv.open(QIODevice::ReadOnly));
             const QStringList rows = QString::fromUtf8(csv.readAll()).split('\n', Qt::SkipEmptyParts);
-            QCOMPARE(rows.size(), 5);
-            QVERIFY(rows[0].startsWith("rendition,shot,first_frame,end_frame,crf,kbps,vmaf"));
-            QVERIFY(rows[1].startsWith(QString::fromStdString(res.perShot[0].rendition) + ",1,0,50,"));
+            QCOMPARE(rows.size(), 11);
+            QCOMPARE(rows[0], QStringLiteral("# display_size,320x180"));
+            QVERIFY2(rows[1].startsWith("# scaler,bicubic (libswscale"), qPrintable(rows[1]));
+            QCOMPARE(rows[2], QStringLiteral("# vmaf_model,vmaf_v1.0.16_3d0h"));
+            QCOMPARE(rows[3], QStringLiteral("# trial_vmaf_every,4"));
+            QCOMPARE(rows[4], QStringLiteral("# crf_floor,18.00"));
+            QCOMPARE(rows[5], QStringLiteral("# vmaf_target,90.00"));
+            QCOMPARE(rows[6], QStringLiteral("rendition,shot,first_frame,end_frame,crf,kbps,vmaf,vmaf_own_size,trial_vmaf,stopped_at,trials"));
+            QVERIFY(rows[7].startsWith(QString::fromStdString(res.perShot[0].rendition) + ",1,0,50,"));
+            for (size_t r = 0; r < 2; ++r)
+                for (size_t k = 0; k < 2; ++k) {
+                    const QStringList cells = rows[int(7 + r * 2 + k)].split(',');
+                    QCOMPARE(cells.size(), 11);
+                    QCOMPARE(cells[9], QString::fromStdString(res.perShot[r].shots[k].stopped));
+                    QCOMPARE(cells[10].toInt(), res.perShot[r].shots[k].trials);
+                }
             // Every segment of every rung starts on a keyframe.
             const QDir pkg(QString::fromStdString(st.folder));
             for (const QString& v : pkg.entryList({"v*"}, QDir::Dirs))
@@ -28578,12 +31665,804 @@ colorspaces:
                 }
         }
 
-        // Refused: a target out of range.
+        // With no target each rung's rate is spent over the shots for the most VMAF: every shot's points are found in
+        // one pass over the render and each shot encoded at its setting in a second, each still within the rung's rate
+        // and the rung within its rate over all.
+        {
+            StreamingSettings st;
+            st.segmentSeconds = 2;
+            st.rungs = {{320, 180, 700000, "libx264"}, {192, 108, 250000, "libx264"}};
+            st.audioCodec = "none";
+            st.perShot = true;
+            st.folder = (dir.path() + "/budget").toStdString();
+            StreamingResult res;
+            QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+            QCOMPARE(res.renderDecodes, 2);
+            QString why;
+            QVERIFY2(withinCaps(st, res, &why), qPrintable(why));
+            int64_t encodes = 0;
+            for (size_t r = 0; r < res.perShot.size(); ++r) {
+                QVERIFY2(res.perShot[r].bitrate <= st.rungs[r].bitrate, QByteArray::number(qlonglong(res.perShot[r].bitrate)));
+                for (const StreamingShot& sh : res.perShot[r].shots) {
+                    qInfo("budget %s frames %lld-%lld: CRF %.2f, %.0f kb/s, VMAF %.2f (trial %.2f), %d settings", res.perShot[r].rendition.c_str(),
+                          (long long)sh.first, (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.trialVmaf, sh.trials);
+                    QVERIFY2(std::fabs(sh.vmaf - sh.trialVmaf) < 3, qPrintable(QString("%1 %2").arg(sh.vmaf).arg(sh.trialVmaf)));
+                    encodes += sh.trials;
+                }
+                // The noise is given what the card leaves: more of the rung's rate than the card.
+                QVERIFY(res.perShot[r].shots[0].bitrate > res.perShot[r].shots[1].bitrate);
+            }
+            QCOMPARE(res.shotEncodes, encodes);
+        }
+
+        // MPEG-TS segments, set per shot too: the same pictures as the CMAF beside them (an access unit delimiter and,
+        // at keyframes, the parameter sets more), each segment starting with a keyframe.
+        {
+            StreamingSettings st;
+            st.segmentSeconds = 2;
+            st.segmentFormat = "ts";
+            st.rungs = {{320, 180, 700000, "libx264"}};
+            st.audioCodec = "none";
+            st.perShot = true;
+            st.vmafTarget = 90;
+            st.folder = (dir.path() + "/ts").toStdString();
+            StreamingResult res;
+            QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+            QString why;
+            QVERIFY2(withinCaps(st, res, &why), qPrintable(why));
+            QCOMPARE(res.perShot.size(), size_t(1));
+            const QString rendition = QString::fromStdString(st.folder + "/" + res.perShot[0].rendition), joined = dir.filePath("joined.ts");
+            QVERIFY(joinStreamingRendition(rendition, joined, true));
+            const std::vector<int64_t> bits = videoSampleBits(joined, 25);
+            QCOMPARE(bits.size(), size_t(100));
+            for (const StreamingShot& sh : res.perShot[0].shots) {
+                int64_t sum = 0;
+                for (FrameTime f = sh.first; f < sh.end; ++f) sum += bits[size_t(f)];
+                qInfo("TS frames %lld-%lld: %lld bits in the TS, %lld in the CMAF", (long long)sh.first, (long long)sh.end, (long long)sum, (long long)sh.bits);
+                QVERIFY2(sum >= sh.bits - 50 * 8 * 4 && sum <= sh.bits + 50 * 8 * 8 + 8 * 256, qPrintable(QString("%1 %2").arg(sum).arg(sh.bits)));
+            }
+            for (int k = 1; k <= 2; ++k) {
+                QFile f(rendition + QString("/seg%1.ts").arg(k, 5, 10, QChar('0')));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                const TsRead t = readTs(f.readAll());
+                QVERIFY(t.synced && t.firstPes.size() == 1);
+                const std::vector<uint8_t>& pes = t.firstPes.begin()->second;
+                int first = -1;
+                for (size_t i = 0; i + 3 < pes.size() && first < 0; ++i)
+                    if (pes[i] == 0 && pes[i + 1] == 0 && pes[i + 2] == 1 && ((pes[i + 3] & 0x1f) == 5 || (pes[i + 3] & 0x1f) == 1)) first = pes[i + 3] & 0x1f;
+                QCOMPARE(first, 5);
+            }
+        }
+
+        // Refused: a target out of range, a floor that is no CRF, a display size too small to score at.
         StreamingSettings st;
         st.rungs = {{320, 180, 700000, "libx264"}};
         st.perShot = true, st.vmafTarget = 120;
         st.folder = (dir.path() + "/bad").toStdString();
         QVERIFY(!exportStreamingPackage(p, s, st, nullptr, nullptr, &err, nullptr) && err.find("VMAF target") != std::string::npos);
+        st.vmafTarget = 90, st.crfFloor = 60;
+        QVERIFY2(!exportStreamingPackage(p, s, st, nullptr, nullptr, &err, nullptr) && err.find("lowest CRF") != std::string::npos, err.c_str());
+        st.crfFloor = 0, st.displayWidth = 32;
+        QVERIFY2(!exportStreamingPackage(p, s, st, nullptr, nullptr, &err, nullptr) && err.find("display size") != std::string::npos, err.c_str());
+    }
+    void streamingDisplaySizeVmaf() {
+        // A detailed 1080-line second and one 360-line rung, set per shot to a VMAF target scored at 1080 lines: what
+        // is delivered is within a VMAF of the target as a 1080-line display shows it, and scores higher at its own
+        // size (both in the report). Both scores are libvmaf's own tool's on the same pictures: the render and the
+        // rendition, each scaled where it is another size by libswscale's bicubic filter as ladder.csv names it.
+        if (!vmafAvailable()) QSKIP("Built without libvmaf");
+        QTemporaryDir dir;
+        const int w = 1920, h = 1080, frames = 25;
+        const QString source = dir.filePath("detail.y4m");
+        QVERIFY(writeY4m(source, w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) { detailedTestPicture(f, w, h, y, cb, cr); }));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = w, s.height = h, s.fps = {25, 1};
+        MediaItem m;
+        QVERIFY(probeMedia(source.toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false).ok);
+        QCOMPARE(s.duration(), FrameTime(frames));
+        StreamingSettings st;
+        st.folder = (dir.path() + "/package").toStdString();
+        st.segmentSeconds = 2;
+        st.rungs = {{640, 360, 4000000, "libx264"}};
+        st.audioCodec = "none";
+        st.perShot = true;
+        st.vmafTarget = 45;  // (where the rate–quality curve of this picture at this size is smooth enough to land within a VMAF)
+        st.displayWidth = 1920;  // (the height follows the picture's shape)
+        st.keepWork = true;
+        std::string err;
+        StreamingResult res;
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        QVERIFY(res.displayWidth == 1920 && res.displayHeight == 1080);
+        QCOMPARE(QString::fromStdString(res.vmafModel), QStringLiteral("vmaf_v1.0.16_3d0h"));
+        QCOMPARE(res.perShot.size(), size_t(1));
+        QCOMPARE(res.perShot[0].shots.size(), size_t(1));
+        const StreamingShot sh = res.perShot[0].shots[0];
+        qInfo("360 lines at 1080: CRF %.2f, %.0f kb/s, VMAF %.3f at the display's size, %.3f at its own (trial %.3f), %d settings%s%s", sh.crf,
+              double(sh.bitrate) / 1000, sh.vmaf, sh.ownVmaf, sh.trialVmaf, sh.trials, sh.stopped.empty() ? "" : ", stopped at the ", sh.stopped.c_str());
+        QVERIFY2(std::fabs(sh.vmaf - st.vmafTarget) <= 1 && sh.stopped.empty(), QByteArray::number(sh.vmaf));
+        QVERIFY2(sh.ownVmaf > sh.vmaf + 5, qPrintable(QString("%1 %2").arg(sh.ownVmaf).arg(sh.vmaf)));
+        QFile csv(QString::fromStdString(res.ladderReport));
+        QVERIFY(csv.open(QIODevice::ReadOnly));
+        const QStringList rows = QString::fromUtf8(csv.readAll()).split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(rows.size(), 8);
+        QCOMPARE(rows[0], QStringLiteral("# display_size,1920x1080"));
+        const QStringList cells = rows[7].split(',');
+        QCOMPARE(cells.size(), 11);
+        QVERIFY(std::fabs(cells[6].toDouble() - sh.vmaf) < 0.001 && std::fabs(cells[7].toDouble() - sh.ownVmaf) < 0.001);
+
+#ifdef MONTAGE_TEST_VMAF_TOOL
+        const QString tool = QStringLiteral(MONTAGE_TEST_VMAF_TOOL);
+#else
+        const QString tool = qEnvironmentVariable("MONTAGE_TEST_VMAF");
+#endif
+        if (tool.isEmpty() || !QFileInfo::exists(tool)) QSKIP("libvmaf's vmaf program was not built (MONTAGE_TEST_VMAF_TOOL)");
+        const QString render = QString::fromStdString(st.folder) + "/work/render.mkv", rendition = dir.filePath("rendition.mp4");
+        QVERIFY(QFileInfo::exists(render));
+        QVERIFY(joinStreamingRendition(QString::fromStdString(st.folder + "/" + res.perShot[0].rendition), rendition));
+        auto mean = [](const std::vector<double>& v) { return v.empty() ? -1.0 : std::accumulate(v.begin(), v.end(), 0.0) / double(v.size()); };
+        // At the display's size: the render as it is, the rendition scaled up.
+        QCOMPARE(scaledY4m(render, 1920, 1080, dir.filePath("ref1080.y4m")), frames);
+        QCOMPARE(scaledY4m(rendition, 1920, 1080, dir.filePath("dist1080.y4m")), frames);
+        const std::vector<double> shown = vmafToolScores(tool, dir.filePath("ref1080.y4m"), dir.filePath("dist1080.y4m"), "vmaf_v1.0.16_3d0h", dir.filePath("shown.json"));
+        QCOMPARE(shown.size(), size_t(frames));
+        QVERIFY2(std::fabs(mean(shown) - sh.vmaf) < 1e-4, qPrintable(QString::number(mean(shown), 'f', 6) + " vs " + QString::number(sh.vmaf, 'f', 6)));
+        QFile::remove(dir.filePath("ref1080.y4m")), QFile::remove(dir.filePath("dist1080.y4m"));
+        // At the rung's own size: the render scaled down, the rendition as it is.
+        QCOMPARE(scaledY4m(render, 640, 360, dir.filePath("ref360.y4m")), frames);
+        QCOMPARE(scaledY4m(rendition, 640, 360, dir.filePath("dist360.y4m")), frames);
+        const std::vector<double> own = vmafToolScores(tool, dir.filePath("ref360.y4m"), dir.filePath("dist360.y4m"), "vmaf_v1.0.16_3d0h", dir.filePath("own.json"));
+        QCOMPARE(own.size(), size_t(frames));
+        QVERIFY2(std::fabs(mean(own) - sh.ownVmaf) < 1e-4, qPrintable(QString::number(mean(own), 'f', 6) + " vs " + QString::number(sh.ownVmaf, 'f', 6)));
+    }
+    void streamingCrfFloor() {
+        // Fine noise needs a finer setting than CRF 18 to reach a high target: at the floor as it comes the shot stops
+        // there, short of the target, and the report says so; with the floor lowered it reaches the target. AV1's
+        // floor is two more.
+        if (!vmafAvailable()) QSKIP("Built without libvmaf");
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        Clip bars = makeGeneratorClip(p, "bars", 50);
+        Effect nz = makeEffect(p, "noise");
+        nz.params["amount"] = 25.0;
+        bars.effects.push_back(nz);
+        s.videoTracks[0].clips.push_back(bars);
+        StreamingSettings st;
+        st.segmentSeconds = 2;
+        st.rungs = {{320, 180, 40000000, "libx264"}};  // (a rate that holds nothing back)
+        st.audioCodec = "none";
+        st.perShot = true;
+        st.vmafTarget = 99;
+        st.folder = (dir.path() + "/floor").toStdString();
+        std::string err;
+        StreamingResult res;
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        QCOMPARE(res.perShot[0].shots.size(), size_t(1));
+        StreamingShot sh = res.perShot[0].shots[0];
+        qInfo("floor 18: CRF %.2f, %.0f kb/s, VMAF %.2f, stopped at \"%s\"", sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.stopped.c_str());
+        QCOMPARE(sh.crf, 18.0);
+        QCOMPARE(QString::fromStdString(sh.stopped), QStringLiteral("floor"));
+        QVERIFY2(sh.vmaf < st.vmafTarget, QByteArray::number(sh.vmaf));
+        QFile csv(QString::fromStdString(res.ladderReport));
+        QVERIFY(csv.open(QIODevice::ReadOnly));
+        const QStringList rows = QString::fromUtf8(csv.readAll()).split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(rows.size(), 8);
+        QCOMPARE(rows[4], QStringLiteral("# crf_floor,18.00"));
+        QCOMPARE(rows[7].split(',').value(9), QStringLiteral("floor"));
+
+        st.crfFloor = 4;
+        st.folder = (dir.path() + "/lower").toStdString();
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        sh = res.perShot[0].shots[0];
+        qInfo("floor 4: CRF %.2f, %.0f kb/s, VMAF %.2f, stopped at \"%s\"", sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.stopped.c_str());
+        QCOMPARE(res.crfFloor, 4.0);
+        QVERIFY2(sh.crf < 18 && sh.crf >= 4, QByteArray::number(sh.crf));
+        QVERIFY2(sh.stopped.empty() && std::fabs(sh.vmaf - st.vmafTarget) <= 1, QByteArray::number(sh.vmaf));
+
+        if (avcodec_find_encoder_by_name("libsvtav1")) {
+            st.crfFloor = 0;
+            st.rungs[0].codec = "libsvtav1";
+            st.folder = (dir.path() + "/av1").toStdString();
+            QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+            sh = res.perShot[0].shots[0];
+            qInfo("AV1, floor 18: CRF %.2f, %.0f kb/s, VMAF %.2f, stopped at \"%s\"", sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.stopped.c_str());
+            QVERIFY2(sh.crf >= 20, QByteArray::number(sh.crf));
+            QVERIFY2(sh.crf > 20 ? sh.stopped.empty() || sh.stopped == "cap" : sh.vmaf >= st.vmafTarget || sh.stopped == "floor", sh.stopped.c_str());
+        }
+    }
+    void streamingShotsFromScenes() {
+        // One clip with three scene changes in it and no cut in the sequence: scene detection on the render gives four
+        // shots, each starting a segment. A shot too long for the memory its frames may take is tried in parts, each
+        // from a segment's start. And which edits count as shot changes: one between two generators with nothing under
+        // them, not one under a title, across a transition or over a clip.
+        if (!vmafAvailable()) QSKIP("Built without libvmaf");
+        QTemporaryDir dir;
+        const int w = 320, h = 180, each = 30;
+        const QString source = dir.filePath("scenes.y4m");
+        QVERIFY(writeY4m(source, w, h, each * 4, [&](int f, auto& y, auto& cb, auto& cr) {
+            // (four scenes: the drifting texture brighter or darker, tinted differently)
+            const int scene = f / each;
+            encodeTestPicture(f + scene * 37, w, h, y, cb, cr);
+            for (uint8_t& v : y) v = uint8_t(scene % 2 ? 40 + v / 3 : v);
+            for (uint8_t& v : cb) v = uint8_t(std::clamp(int(v) + (scene - 1) * 35, 16, 240));
+            for (uint8_t& v : cr) v = uint8_t(std::clamp(int(v) + (scene == 3 ? 50 : scene == 0 ? -40 : 0), 16, 240));
+        }));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = w, s.height = h, s.fps = {25, 1};
+        MediaItem m;
+        QVERIFY(probeMedia(source.toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false).ok);
+        QCOMPARE(s.duration(), FrameTime(each * 4));
+        QVERIFY(streamingShotChanges(s).empty());
+        StreamingSettings st;
+        st.segmentSeconds = 6;
+        st.rungs = {{320, 180, 2000000, "libx264"}};
+        st.audioCodec = "none";
+        st.perShot = true;
+        st.vmafTarget = 85;
+        st.folder = (dir.path() + "/scenes").toStdString();
+        std::string err;
+        StreamingResult res;
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        QCOMPARE(res.perShot.size(), size_t(1));
+        std::vector<FrameTime> starts;
+        for (const StreamingShot& sh : res.perShot[0].shots) starts.push_back(sh.first);
+        QCOMPARE(starts, (std::vector<FrameTime>{0, each, each * 2, each * 3}));
+        QCOMPARE(res.segments, starts);
+
+        // A long shot and little memory: two-second segments, each a part of its own.
+        Project q = makeDefaultProject();
+        Sequence& one = *q.active();
+        one.width = w, one.height = h, one.fps = {25, 1};
+        one.videoTracks[0].clips.push_back(colorClip(q, 0.3f, 0.5f, 0.2f, 0, 150));
+        st.segmentSeconds = 2;
+        st.folder = (dir.path() + "/whole").toStdString();
+        QVERIFY2(exportStreamingPackage(q, one, st, nullptr, nullptr, &err, &res), err.c_str());
+        QCOMPARE(res.segments, (std::vector<FrameTime>{0, 50, 100}));
+        QCOMPARE(res.perShot[0].shots.size(), size_t(1));
+        st.shotMemory = 4 << 20;  // (room for some 45 frames of this size)
+        st.folder = (dir.path() + "/parts").toStdString();
+        QVERIFY2(exportStreamingPackage(q, one, st, nullptr, nullptr, &err, &res), err.c_str());
+        starts.clear();
+        for (const StreamingShot& sh : res.perShot[0].shots) starts.push_back(sh.first);
+        QCOMPARE(starts, (std::vector<FrameTime>{0, 50, 100}));
+        QCOMPARE(res.renderDecodes, 1);
+
+        // Which edits are shot changes.
+        Project g = makeDefaultProject();
+        Sequence& e = *g.active();
+        e.fps = {25, 1};
+        while (e.videoTracks.size() < 2) e.videoTracks.push_back(e.videoTracks[0]);
+        e.videoTracks[0].clips = {colorClip(g, 1, 0, 0, 0, 50), colorClip(g, 0, 1, 0, 50, 50), colorClip(g, 0, 0, 1, 100, 50), colorClip(g, 1, 1, 0, 150, 50)};
+        e.videoTracks[1].clips.clear();
+        QCOMPARE(streamingShotChanges(e), (std::vector<FrameTime>{50, 100, 150}));
+        // (a title over the second edit: the card changes under it, not the shot)
+        Clip title = makeGeneratorClip(g, "title", 40);
+        title.start = 80;
+        e.videoTracks[1].clips.push_back(title);
+        QCOMPARE(streamingShotChanges(e), (std::vector<FrameTime>{50, 150}));
+        // (a dissolve across the third)
+        Transition tr;
+        tr.id = g.newId();
+        tr.clipA = e.videoTracks[0].clips[2].id, tr.clipB = e.videoTracks[0].clips[3].id;
+        tr.duration = 10;
+        e.videoTracks[0].transitions.push_back(tr);
+        QCOMPARE(streamingShotChanges(e), (std::vector<FrameTime>{50}));
+        // (a muted track's edits are not seen)
+        e.videoTracks[0].muted = true;
+        QVERIFY(streamingShotChanges(e).empty());
+    }
+    void av1GrainWrittenIntoHeaders() {
+        // Film grain parameters written into the frame headers of AV1 made by this FFmpeg's encoders (libaom's, which
+        // keeps frames to show later, at 8 bits; SVT-AV1's at 10): dav1d, through FFmpeg, finds on every shown frame the
+        // parameters it was given, with a seed of its own and the second shot's scaling points from the cut on, and none
+        // on the frames given none; with the grain left off its pictures are the stream's as it was; Montage's own
+        // reading of the headers finds what dav1d does; and Montage's run of the grain synthesis on those pictures is
+        // dav1d's picture with its grain, to the code.
+        if (!avcodec_find_decoder_by_name("libdav1d")) QSKIP("This FFmpeg has no dav1d");
+        struct Case {
+            const char* encoder;
+            int depth;
+            std::vector<std::pair<std::string, std::string>> options;
+        };
+        const std::vector<Case> cases = {{"libaom-av1", 8, {{"cpu-used", "8"}, {"crf", "40"}, {"b", "0"}, {"lag-in-frames", "16"}}},
+                                         {"libsvtav1", 10, {{"preset", "12"}, {"crf", "45"}}}};
+        const int w = 192, h = 128, frames = 48, cut = 24;
+        int tried = 0;
+        for (const Case& k : cases) {
+            if (!avcodec_find_encoder_by_name(k.encoder)) continue;
+            ++tried;
+            av1streams::Stream s;
+            std::string err;
+            QVERIFY2(av1streams::encode(k.encoder, k.options, w, h, k.depth, frames, [&](int f, AVFrame* fr) {
+                const int unit = k.depth > 8 ? 4 : 1;
+                for (int p = 0; p < 3; ++p) {
+                    const int pw = p ? w / 2 : w, ph = p ? h / 2 : h;
+                    for (int y = 0; y < ph; ++y)
+                        for (int x = 0; x < pw; ++x) {
+                            int v = p ? 128 + ((x + f) % 32) - 16 : 20 + (x * 200) / pw + (((x / 16 + y / 16 + f / 4) % 2) ? 15 : 0);
+                            if (f >= cut && !p) v = 235 - (v - 20);  // (the second shot: the ramp the other way)
+                            v *= unit;
+                            if (k.depth > 8) reinterpret_cast<uint16_t*>(fr->data[p] + ptrdiff_t(y) * fr->linesize[p])[x] = uint16_t(v);
+                            else fr->data[p][ptrdiff_t(y) * fr->linesize[p] + x] = uint8_t(v);
+                        }
+                }
+            }, s, &err), err.c_str());
+            // (frames 30 to 33 carry none)
+            auto given = [&](int64_t f) { return f >= 30 && f < 34 ? Av1FilmGrain{} : av1TestGrain(f >= cut, f); };
+            Av1GrainWriter writer;
+            av1streams::Stream t;
+            t.config = s.config;
+            QVERIFY2(t.config.empty() || writer.configure(t.config, &err), err.c_str());
+            for (size_t i = 0; i < s.packets.size(); ++i) {
+                std::vector<uint8_t> out;
+                QVERIFY2(writer.rewrite(s.packets[i].data(), s.packets[i].size(), int64_t(i), given, out, &err), err.c_str());
+                t.packets.push_back(std::move(out));
+            }
+            QCOMPARE(writer.framesWithGrain >= frames - 4, true);
+            qInfo("%s: %lld frames given grain, %lld by a reference's parameters, %lld bytes added", k.encoder, (long long)writer.framesWithGrain,
+                  (long long)writer.framesByReference, (long long)writer.bytesAdded);
+
+            std::vector<av1streams::Picture> before, beside, applied;
+            QVERIFY(av1streams::decode(s, true, before) && av1streams::decode(t, true, beside) && av1streams::decode(t, false, applied));
+            QCOMPARE(int(before.size()), frames);
+            QCOMPARE(int(beside.size()), frames);
+            QCOMPARE(int(applied.size()), frames);
+            // Montage's own reading of the stream written: each shown frame's parameters.
+            Av1HeaderReader reader;
+            QVERIFY2(t.config.empty() || reader.configure(t.config.data(), t.config.size(), &err), err.c_str());
+            std::vector<Av1FilmGrain> shown;
+            for (const auto& pk : t.packets) {
+                std::vector<Av1FrameHeader> hs;
+                QVERIFY2(reader.read(pk.data(), pk.size(), hs, &err), err.c_str());
+                for (const Av1FrameHeader& hd : hs)
+                    if (hd.shown()) shown.push_back(hd.grain);
+            }
+            QVERIFY(reader.sequence().filmGrainPresent);
+            QCOMPARE(int(shown.size()), frames);
+            int worst = 0;
+            for (int i = 0; i < frames; ++i) {
+                const Av1FilmGrain want = given(i);
+                const av1streams::Picture& b = beside[size_t(i)];
+                for (int p = 0; p < 3; ++p) QVERIFY2(before[size_t(i)].plane[p] == b.plane[p], qPrintable(QString("frame %1 plane %2").arg(i).arg(p)));
+                QCOMPARE(b.hasGrain, want.apply);
+                QCOMPARE(shown[size_t(i)].apply, want.apply);
+                if (!want.apply) continue;
+                QVERIFY2(b.grain.seed == want.seed && b.grain.sameParameters(want), qPrintable(QString("frame %1").arg(i)));
+                QVERIFY2(shown[size_t(i)].seed == want.seed && shown[size_t(i)].sameParameters(want), qPrintable(QString("frame %1").arg(i)));
+                if (i > 0 && given(i - 1).apply) QVERIFY(b.grain.seed != beside[size_t(i) - 1].grain.seed);
+                QCOMPARE(int(b.grain.yScaling[1]), i >= cut ? 120 : 70);
+                // The synthesis here on the picture without its grain, against dav1d's with it.
+                av1streams::Picture mine = b;
+                Av1GrainPicture pic = mine.forGrain();
+                av1ApplyFilmGrain(b.grain, pic);
+                for (int p = 0; p < 3; ++p)
+                    for (size_t j = 0; j < mine.plane[p].size(); ++j) worst = std::max(worst, std::abs(int(mine.plane[p][j]) - int(applied[size_t(i)].plane[p][j])));
+            }
+            QVERIFY2(worst <= 1, qPrintable(QString("%1: the synthesis is off dav1d's by up to %2").arg(k.encoder).arg(worst)));
+            qInfo("%s: the synthesis here is off dav1d's by %d at most", k.encoder, worst);
+        }
+        if (tried == 0) QSKIP("This FFmpeg has no AV1 encoder");
+    }
+    void av1GrainParametersFromAProfile() {
+        // A measured grain (a model's: fine grain whose strength follows the square root of the light, its colours
+        // correlated 0.7) fitted to AV1's parameters for a 640-wide coded picture; the synthesis run on stripes a stop
+        // apart, nine frames of it, and measured again as Measure Grain measures: its strength in every stop and channel
+        // within 15 % of the profile's, its size within half a pixel. The parameters are within what a frame header
+        // may carry, and come back the same from a film grain table's text; a profile with no grain gives none.
+        const ColorSpace& space = rec709Space();
+        const WorkingSpaceScope working(&space);
+        const int W = 640, H = 192, kFrames = 9;
+        GrainModel m;
+        m.strength = 0.04, m.response = 0.5, m.correlation = 0.7, m.fineSize = 1, m.clusters = 0.2, m.clusterSize = 3, m.width = W;
+        const GrainProfile g = grainModelProfile(m);
+        Av1GrainTarget t;
+        t.width = W, t.bitDepth = 8;
+        const Av1FilmGrain fg = av1FilmGrainFrom(g, space, t);
+        std::string why;
+        QVERIFY2(fg.apply && fg.valid(&why), why.c_str());
+        QVERIFY(fg.numY >= 2 && fg.arLag > 0);
+        QVERIFY(!av1FilmGrainFrom(GrainProfile{}, space, t).apply);
+        std::vector<Image> frames;
+        const double kr = 0.2126, kb = 0.0722, kg = 1 - kr - kb;
+        for (int f = 0; f < kFrames; ++f) {
+            std::vector<uint16_t> Y(size_t(W) * H), Cb(size_t(W / 2) * (H / 2), 128), Cr(Cb.size(), 128);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    Y[size_t(y) * W + x] = uint16_t(std::lround(16 + 219 * fromLinear(space.transfer, std::exp2(x * 8 / W - 7.5))));
+            Av1GrainPicture pic;
+            pic.plane[0] = Y.data(), pic.plane[1] = Cb.data(), pic.plane[2] = Cr.data();
+            pic.stride[0] = W, pic.stride[1] = pic.stride[2] = W / 2;
+            pic.width = W, pic.height = H, pic.bitDepth = 8;
+            Av1FilmGrain each = fg;
+            each.seed = av1GrainSeed(f, 3);
+            av1ApplyFilmGrain(each, pic);
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double yy = (double(Y[size_t(y) * W + x]) - 16) / 219;
+                    auto chroma = [&](const std::vector<uint16_t>& c) {  // (between its samples, sited left)
+                        const double fx = x / 2.0, fy = (y - 0.5) / 2.0;
+                        const int x0 = std::clamp(int(std::floor(fx)), 0, W / 2 - 1), x1 = std::min(x0 + 1, W / 2 - 1);
+                        const int y0 = std::clamp(int(std::floor(fy)), 0, H / 2 - 1), y1 = std::min(y0 + 1, H / 2 - 1);
+                        const double ax = std::clamp(fx - x0, 0.0, 1.0), ay = std::clamp(fy - y0, 0.0, 1.0);
+                        const double v = (c[size_t(y0) * (W / 2) + x0] * (1 - ax) + c[size_t(y0) * (W / 2) + x1] * ax) * (1 - ay) +
+                                         (c[size_t(y1) * (W / 2) + x0] * (1 - ax) + c[size_t(y1) * (W / 2) + x1] * ax) * ay;
+                        return (v - 128) / 224;
+                    };
+                    const double cb = chroma(Cb), cr = chroma(Cr);
+                    const double r = yy + cr * 2 * (1 - kr), b = yy + cb * 2 * (1 - kb), gg = (yy - kr * r - kb * b) / kg;
+                    float* p = img.at(x, y);
+                    p[0] = float(r), p[1] = float(gg), p[2] = float(b), p[3] = 1;
+                }
+            frames.push_back(std::move(img));
+        }
+        GrainProfile again;
+        QVERIFY2(measureGrain(frames, space, {}, again, &why), why.c_str());
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(again.amplitude[c][b] / g.amplitude[c][b] - 1) < 0.15,
+                         qPrintable(QString("stop %1 channel %2: %3 for %4").arg(b).arg(c).arg(again.amplitude[c][b]).arg(g.amplitude[c][b])));
+        qInfo("size %.2f px for %.2f; colours correlated %.2f %.2f %.2f for 0.70", grainSize(again), grainSize(g), again.correlation[0],
+              again.correlation[1], again.correlation[2]);
+        QVERIFY2(std::fabs(grainSize(again) - grainSize(g)) < 0.5, qPrintable(QString("%1 for %2").arg(grainSize(again)).arg(grainSize(g))));
+
+        // As a film grain table (the text SvtAv1EncApp's --fgs-table and aomenc's --film-grain-table read), and back.
+        // (the table has no place for clip_to_restricted_range)
+        std::vector<Av1GrainTableEntry> entries{{0, 10000000, fg}, {10000000, 20000000, av1TestGrain(1, 5)}};
+        for (Av1GrainTableEntry& e : entries) e.grain.clipRestricted = false;
+        const std::string text = av1FilmGrainTable(entries);
+        QVERIFY(text.rfind("filmgrn1", 0) == 0);
+        std::vector<Av1GrainTableEntry> back;
+        QVERIFY2(parseAv1FilmGrainTable(text, back, &why), why.c_str());
+        QCOMPARE(back.size(), entries.size());
+        for (size_t i = 0; i < back.size(); ++i) {
+            QVERIFY(back[i].start == entries[i].start && back[i].end == entries[i].end);
+            QVERIFY(back[i].grain.sameParameters(entries[i].grain) && back[i].grain.seed == entries[i].grain.seed);
+        }
+        QVERIFY(!parseAv1FilmGrainTable("filmgrn1\nE 0 10 1 7 1\nnonsense", back, &why));
+        // Out of what a header may carry: refused.
+        Av1FilmGrain bad = fg;
+        bad.yValue[1] = bad.yValue[0];
+        QVERIFY(!bad.valid(&why));
+        bad = fg, bad.arLag = 4;
+        QVERIFY(!bad.valid(&why));
+    }
+    void av1ExportCarriesGrain() {
+        // Two shots, each a clip of stripes a stop apart with grain of its own strength (Grain Match's model, made in
+        // linear light, its colours correlated), exported to AV1 with the grain carried as parameters. Each shot's grain
+        // is measured and the picture cleaned; Montage's reading of the file's headers finds grain on every shown frame,
+        // a seed that changes every frame and scaling points that change at the cut. Decoded by dav1d, the grain it puts
+        // back measures as each shot's did (its strength in every stop measured within 15 %, the darkest within 25 %, its
+        // size within half a pixel); with dav1d's grain left off the picture is the clean one, well above the grainy
+        // one's PSNR. At an equal VMAF (90; the carried file's picture against the cleaned master, the other against the
+        // grainy one) the file is at least 30 % smaller than one coding the grain as picture; at the same CRF it is smaller
+        // too (all sizes reported).
+        const char* encoder = avcodec_find_encoder_by_name("libsvtav1") ? "libsvtav1" : avcodec_find_encoder_by_name("libaom-av1") ? "libaom-av1" : nullptr;
+        if (!encoder || !avcodec_find_decoder_by_name("libdav1d")) QSKIP("This FFmpeg has no AV1 encoder, or no dav1d");
+        const ColorSpace& space = rec709Space();
+        QTemporaryDir dir;
+        const int W = 512, H = 192, kFrames = 24;
+        auto cleanCode = [&](int x) { return fromLinear(space.transfer, std::exp2(x / 64 - 7.5)); };
+        // An image (R′G′B′) as 8-bit 4:2:0 Y′CbCr, BT.709, limited range, chroma sited left.
+        auto toYuv = [&](const Image& img, std::vector<uint8_t>& y, std::vector<uint8_t>& cb, std::vector<uint8_t>& cr) {
+            const double kr = 0.2126, kb = 0.0722, kg = 1 - kr - kb;
+            std::vector<double> u(size_t(W) * H), v(u.size());
+            for (int r = 0; r < H; ++r)
+                for (int c = 0; c < W; ++c) {
+                    const float* p = img.at(c, r);
+                    const double l = kr * p[0] + kg * p[1] + kb * p[2];
+                    y[size_t(r) * W + c] = uint8_t(std::clamp(std::lround(16 + 219 * l), 0L, 255L));
+                    u[size_t(r) * W + c] = (p[2] - l) / (2 * (1 - kb)), v[size_t(r) * W + c] = (p[0] - l) / (2 * (1 - kr));
+                }
+            for (int r = 0; r < H / 2; ++r)
+                for (int c = 0; c < W / 2; ++c) {
+                    const size_t a = size_t(2 * r) * W + size_t(2 * c), b = a + size_t(W);
+                    cb[size_t(r) * (W / 2) + c] = uint8_t(std::clamp(std::lround(128 + 224 * (u[a] + u[b]) / 2), 0L, 255L));
+                    cr[size_t(r) * (W / 2) + c] = uint8_t(std::clamp(std::lround(128 + 224 * (v[a] + v[b]) / 2), 0L, 255L));
+                }
+        };
+        const double strengths[2] = {0.03, 0.07};
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {24, 1};
+        for (int shot = 0; shot < 2; ++shot) {
+            GrainModel gm;
+            gm.strength = strengths[shot], gm.response = 0.5, gm.correlation = 0.6, gm.fineSize = 1.2, gm.clusters = 0.2, gm.clusterSize = 3.5, gm.width = W;
+            const GrainProfile made = grainModelProfile(gm);
+            const QString file = dir.filePath(QString("shot%1.y4m").arg(shot));
+            QVERIFY(writeY4m(file, W, H, kFrames, [&](int f, auto& y, auto& cb, auto& cr) {
+                Image img(W, H);
+                for (int r = 0; r < H; ++r)
+                    for (int c = 0; c < W; ++c) {
+                        float* q = img.at(c, r);
+                        q[0] = q[1] = q[2] = float(cleanCode(c)), q[3] = 1;
+                    }
+                GrainSettings gs;
+                gs.seed = uint32_t(17 + shot);
+                addGrain(img, space, made, gs, f);
+                toYuv(img, y, cb, cr);
+            }, 24));
+            MediaItem m;
+            QVERIFY(probeMedia(file.toStdString(), m));
+            m.id = p.newId();
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, shot * kFrames, 0, -1, {TrackKind::Video, 0}, {}, false).ok);
+        }
+        QCOMPARE(s.duration(), FrameTime(2 * kFrames));
+        ExportSettings es;
+        es.videoCodec = encoder;
+        es.audioCodec = "none";
+        es.crf = 32;
+        es.preset = std::strcmp(encoder, "libsvtav1") == 0 ? "10" : "";
+        es.path = dir.filePath("grain.mkv").toStdString();
+        es.filmGrain = "measure";
+        std::string err;
+        Av1GrainReport rep;
+        QVERIFY2(exportCarryingGrain(p, s, es, {}, nullptr, &err, nullptr, nullptr, nullptr, &rep), err.c_str());
+        QCOMPARE(rep.shots.size(), size_t(2));
+        for (const Av1GrainShot& sh : rep.shots) QVERIFY2(sh.source == "measured" && sh.grain.apply, sh.note.c_str());
+        QCOMPARE(rep.framesWithGrain, int64_t(2 * kFrames));
+        // Coded as picture, at the same setting; and not for any other codec.
+        ExportSettings plain = es;
+        plain.filmGrain.clear();
+        plain.path = dir.filePath("plain.mkv").toStdString();
+        QVERIFY2(exportSequence(p, s, plain, {}, nullptr, &err), err.c_str());
+        ExportSettings h264 = es;
+        h264.videoCodec = "libx264";
+        h264.path = dir.filePath("h264.mp4").toStdString();
+        QVERIFY(!exportSequence(p, s, h264, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("AV1"), err.c_str());
+        const qint64 carried = QFileInfo(QString::fromStdString(es.path)).size(), coded = QFileInfo(QString::fromStdString(plain.path)).size();
+        qInfo("%s at CRF 32: %lld bytes with the grain carried as parameters, %lld coded as picture (%.0f %%)", encoder, (long long)carried,
+              (long long)coded, 100.0 * double(carried) / double(coded));
+        QVERIFY(carried < coded);
+
+        // The file's frame headers as Montage reads them.
+        av1streams::Stream st;
+        {
+            AVFormatContext* f = nullptr;
+            QVERIFY(avformat_open_input(&f, es.path.c_str(), nullptr, nullptr) >= 0 && avformat_find_stream_info(f, nullptr) >= 0);
+            const int v = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            QVERIFY(v >= 0);
+            const AVCodecParameters* par = f->streams[v]->codecpar;
+            st.config.assign(par->extradata, par->extradata + par->extradata_size);
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(f, pkt) >= 0) {
+                if (pkt->stream_index == v) st.packets.emplace_back(pkt->data, pkt->data + pkt->size);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&f);
+        }
+        Av1HeaderReader reader;
+        QVERIFY2(reader.configure(st.config.data(), st.config.size(), &err), err.c_str());
+        QVERIFY(reader.sequence().filmGrainPresent);
+        std::vector<Av1FilmGrain> shown;
+        for (const auto& pk : st.packets) {
+            std::vector<Av1FrameHeader> hs;
+            QVERIFY2(reader.read(pk.data(), pk.size(), hs, &err), err.c_str());
+            for (const Av1FrameHeader& hd : hs)
+                if (hd.shown()) shown.push_back(hd.grain);
+        }
+        QCOMPARE(int(shown.size()), 2 * kFrames);
+        for (int i = 0; i < 2 * kFrames; ++i) {
+            QVERIFY2(shown[size_t(i)].apply, qPrintable(QString("frame %1").arg(i)));
+            if (i > 0) QVERIFY(shown[size_t(i)].seed != shown[size_t(i) - 1].seed);
+            QVERIFY(shown[size_t(i)].sameParameters(shown[i < kFrames ? 0 : size_t(kFrames)]));
+        }
+        QVERIFY(!shown[0].sameParameters(shown[size_t(kFrames)]));
+        QVERIFY(shown[size_t(kFrames)].yScaling[shown[size_t(kFrames)].numY / 2] > shown[0].yScaling[shown[0].numY / 2]);
+
+        // Decoded with dav1d's grain, and without it.
+        std::vector<av1streams::Picture> grainy, cleaned;
+        QVERIFY(av1streams::decode(st, false, grainy) && av1streams::decode(st, true, cleaned));
+        QCOMPARE(int(grainy.size()), 2 * kFrames);
+        auto toImage = [&](const av1streams::Picture& d) {
+            const double kr = 0.2126, kb = 0.0722, kg = 1 - kr - kb;
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double yy = (double(d.plane[0][size_t(y) * W + x]) - 16) / 219;
+                    auto chroma = [&](const std::vector<uint16_t>& c) {
+                        const double fx = x / 2.0, fy = (y - 0.5) / 2.0;
+                        const int x0 = std::clamp(int(std::floor(fx)), 0, W / 2 - 1), x1 = std::min(x0 + 1, W / 2 - 1);
+                        const int y0 = std::clamp(int(std::floor(fy)), 0, H / 2 - 1), y1 = std::min(y0 + 1, H / 2 - 1);
+                        const double ax = std::clamp(fx - x0, 0.0, 1.0), ay = std::clamp(fy - y0, 0.0, 1.0);
+                        const double v = (c[size_t(y0) * (W / 2) + x0] * (1 - ax) + c[size_t(y0) * (W / 2) + x1] * ax) * (1 - ay) +
+                                         (c[size_t(y1) * (W / 2) + x0] * (1 - ax) + c[size_t(y1) * (W / 2) + x1] * ax) * ay;
+                        return (v - 128) / 224;
+                    };
+                    const double cb = chroma(d.plane[1]), cr = chroma(d.plane[2]);
+                    const double r = yy + cr * 2 * (1 - kr), b = yy + cb * 2 * (1 - kb), g = (yy - kr * r - kb * b) / kg;
+                    float* q = img.at(x, y);
+                    q[0] = float(r), q[1] = float(g), q[2] = float(b), q[3] = 1;
+                }
+            return img;
+        };
+        auto lumaPsnr = [&](const av1streams::Picture& d) {
+            double se = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double e = double(d.plane[0][size_t(y) * W + x]) - (16 + 219 * cleanCode(x));
+                    se += e * e;
+                }
+            return 10 * std::log10(255.0 * 255.0 / std::max(1e-9, se / (double(W) * H)));
+        };
+        const WorkingSpaceScope working(&space);
+        for (int shot = 0; shot < 2; ++shot) {
+            std::vector<Image> frames;
+            double clean = 0, withGrain = 0;
+            for (int f = shot * kFrames; f < (shot + 1) * kFrames; ++f) {
+                if (f < shot * kFrames + 9) frames.push_back(toImage(grainy[size_t(f)]));
+                clean += lumaPsnr(cleaned[size_t(f)]) / kFrames, withGrain += lumaPsnr(grainy[size_t(f)]) / kFrames;
+            }
+            GrainProfile back;
+            QVERIFY2(measureGrain(frames, space, {}, back, &err), err.c_str());
+            const GrainProfile& source = rep.shots[size_t(shot)].profile;
+            qInfo("shot %d: PSNR %.2f dB without the grain, %.2f with; size %.2f px for %.2f", shot, clean, withGrain, grainSize(back), grainSize(source));
+            double off = 0;
+            for (int b = 0; b < GrainProfile::kBands; ++b) {
+                if (!(source.measuredBands & back.measuredBands & (1 << b))) continue;
+                for (int c = 0; c < 3; ++c) off = std::max(off, std::fabs(back.amplitude[c][b] / source.amplitude[c][b] - 1));
+                for (int c = 0; c < 3; ++c)
+                    QVERIFY2(std::fabs(back.amplitude[c][b] / source.amplitude[c][b] - 1) < (b == 0 ? 0.25 : 0.15),
+                             qPrintable(QString("shot %1 stop %2 channel %3: %4 for %5").arg(shot).arg(b).arg(c).arg(back.amplitude[c][b]).arg(source.amplitude[c][b])));
+            }
+            qInfo("shot %d: its strength measured again within %.0f %% at every stop measured, the darkest included", shot, off * 100);
+            QVERIFY2(std::fabs(grainSize(back) - grainSize(source)) < 0.5, qPrintable(QString("%1 for %2").arg(grainSize(back)).arg(grainSize(source))));
+            QVERIFY2(clean > 38 && clean > withGrain + 3, qPrintable(QString("%1 %2").arg(clean).arg(withGrain)));
+        }
+
+        // At an equal VMAF: for each file the coarsest whole CRF at which it reaches VMAF 90, the file carrying the grain
+        // scored (its picture, as a decoder shows it with the grain left off) against the cleaned master, the one coding
+        // the grain as picture against the grainy master. Both masters are lossless (FFV1) and each encode is made from its
+        // own; the carried file's size is taken after its parameters are written.
+        if (!vmafAvailable()) return;
+        Project clean = p;
+        {
+            std::vector<Clip>& clips = clean.active()->videoTracks[0].clips;
+            QCOMPARE(clips.size(), size_t(2));
+            for (size_t shot = 0; shot < clips.size(); ++shot) {
+                Effect e = makeEffect(clean, "grain_match");
+                e.params["source"] = 0.0, e.params["mode"] = 1.0, e.params["amount"] = 0.0;
+                e.strings["profile"] = grainProfileText(rep.shots[shot].profile);
+                clips[shot].effects.push_back(e);
+            }
+        }
+        auto master = [&](const Project& from, const QString& name) {
+            ExportSettings m;
+            m.videoCodec = "ffv1", m.pixFmt = "yuv420p", m.audioCodec = "none";
+            m.path = dir.filePath(name).toStdString();
+            std::string why;
+            return exportSequence(from, *from.active(), m, {}, nullptr, &why) ? m.path : std::string();
+        };
+        const std::string cleanMaster = master(clean, "clean-master.mkv"), grainyMaster = master(p, "grainy-master.mkv");
+        QVERIFY(!cleanMaster.empty() && !grainyMaster.empty());
+        // (each CRF tried once; a file, its VMAF and its size)
+        auto search = [&](const std::string& from, const QString& name, double target, int* crf, double* vmaf) {
+            Project mp = makeDefaultProject();
+            Sequence& ms = *mp.active();
+            ms.width = W, ms.height = H, ms.fps = {24, 1};
+            MediaItem m;
+            if (!probeMedia(from, m)) return std::string();
+            m.id = mp.newId();
+            mp.media.push_back(m);
+            if (!edit::placeMedia(mp, ms, m.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false).ok) return std::string();
+            CompareOptions o;
+            o.metrics = MetricVmaf;
+            std::map<int, double> tried;
+            auto score = [&](int c) {
+                if (!tried.count(c)) {
+                    ExportSettings e = es;
+                    e.filmGrain.clear();
+                    e.crf = c;
+                    e.path = dir.filePath(QString("%1-%2.mkv").arg(name).arg(c)).toStdString();
+                    std::string why;
+                    const EncodeComparison cmp = exportSequence(mp, ms, e, {}, nullptr, &why) ? compareEncodeFiles(from, e.path, o) : EncodeComparison{};
+                    tried[c] = cmp.ok && cmp.vmafScored ? cmp.mean.vmaf : -1;
+                    qInfo("%s CRF %d: VMAF %.2f, %lld bytes", qPrintable(name), c, tried[c], (long long)QFileInfo(QString::fromStdString(e.path)).size());
+                }
+                return tried[c];
+            };
+            int lo = 4, hi = 63;
+            if (score(lo) < target) return std::string();
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) / 2;
+                if (score(mid) >= target) lo = mid;
+                else hi = mid - 1;
+            }
+            *crf = lo, *vmaf = tried[lo];
+            return dir.filePath(QString("%1-%2.mkv").arg(name).arg(lo)).toStdString();
+        };
+        const double target = 90;
+        int crfCarried = 0, crfCoded = 0;
+        double vmafCarried = 0, vmafCoded = 0;
+        const std::string carriedFile = search(cleanMaster, "carried", target, &crfCarried, &vmafCarried);
+        const std::string codedFile = search(grainyMaster, "coded", target, &crfCoded, &vmafCoded);
+        QVERIFY2(!carriedFile.empty() && !codedFile.empty(), "a file short of the target at the finest CRF tried");
+        QVERIFY2(carryAv1Grain(carriedFile, [&](int64_t frame) {
+            const Av1GrainShot& sh = rep.shots[frame < kFrames ? 0 : 1];
+            Av1FilmGrain g = sh.grain;
+            g.seed = av1GrainSeed(frame);
+            return g;
+        }, &err), err.c_str());
+        const qint64 atVmafCarried = QFileInfo(QString::fromStdString(carriedFile)).size(), atVmafCoded = QFileInfo(QString::fromStdString(codedFile)).size();
+        const double saving = 1 - double(atVmafCarried) / double(atVmafCoded);
+        qInfo("%s at VMAF %.0f: %lld bytes with the grain carried as parameters (CRF %d, VMAF %.2f against the cleaned master), %lld coding it "
+              "as picture (CRF %d, VMAF %.2f against the grainy master): %.0f %% smaller",
+              encoder, target, (long long)atVmafCarried, crfCarried, vmafCarried, (long long)atVmafCoded, crfCoded, vmafCoded, saving * 100);
+        QVERIFY2(saving >= 0.30, qPrintable(QString("%1 bytes against %2").arg(atVmafCarried).arg(atVmafCoded)));
+    }
+    void av1GrainTableReadBySvtAv1() {
+        // A film grain table as Montage writes it, two shots of parameters, given to SVT-AV1's own encoder
+        // (SvtAv1EncApp --fgs-table, built in CI from v4.3.0): Montage's reading of the frame headers it writes finds on
+        // every shown frame the parameters of the shot the table gives for its time, as dav1d does.
+        const QString bin = qEnvironmentVariable("MONTAGE_TEST_SVTAV1");
+        QString app = bin.isEmpty() ? QString() : QDir(bin).filePath("SvtAv1EncApp");
+        if (!app.isEmpty() && !QFileInfo::exists(app)) app += ".exe";
+        if (app.isEmpty() || !QFileInfo::exists(app)) QSKIP("SVT-AV1's encoder was not built (MONTAGE_TEST_SVTAV1)");
+        QTemporaryDir dir;
+        const int w = 192, h = 128, frames = 48, cut = 24;
+        QVERIFY(writeY4m(dir.filePath("in.y4m"), w, h, frames, [&](int f, auto& y, auto& cb, auto& cr) {
+            for (int r = 0; r < h; ++r)
+                for (int c = 0; c < w; ++c) y[size_t(r) * w + c] = uint8_t(20 + c + ((c / 16 + r / 16 + f / 4) % 2 ? 15 : 0));
+            std::fill(cb.begin(), cb.end(), uint8_t(120)), std::fill(cr.begin(), cr.end(), uint8_t(136));
+        }, 24));
+        // (times in units of 100 ns: frame f at 24 a second starts at f × 10^7 / 24)
+        auto at = [](int f) { return int64_t(f) * 10000000 / 24; };
+        std::vector<Av1GrainTableEntry> table{{at(0), at(cut), av1TestGrain(0, 0)}, {at(cut), at(frames), av1TestGrain(1, cut)}};
+        for (Av1GrainTableEntry& e : table) e.grain.clipRestricted = false;  // (the table has no place for it)
+        {
+            QFile f(dir.filePath("grain.tbl"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString(av1FilmGrainTable(table)));
+        }
+        QProcess pr;
+        pr.start(app, {"-i", dir.filePath("in.y4m"), "-b", dir.filePath("out.ivf"), "--preset", "12", "--crf", "45", "--keyint", "240",
+                       "--fgs-table", dir.filePath("grain.tbl")});
+        QVERIFY(pr.waitForFinished(300000));
+        QVERIFY2(pr.exitCode() == 0, pr.readAllStandardError().constData());
+        // The IVF's packets: a 32-byte header, then each frame's size, time and bytes.
+        QFile ivf(dir.filePath("out.ivf"));
+        QVERIFY(ivf.open(QIODevice::ReadOnly));
+        const QByteArray all = ivf.readAll();
+        av1streams::Stream st;
+        auto le32 = [&](qsizetype i) { return uint32_t(uint8_t(all[i])) | uint32_t(uint8_t(all[i + 1])) << 8 | uint32_t(uint8_t(all[i + 2])) << 16 | uint32_t(uint8_t(all[i + 3])) << 24; };
+        QVERIFY(all.size() >= 32 && all.startsWith("DKIF"));
+        for (qsizetype i = 32; i + 12 <= all.size();) {
+            const uint32_t n = le32(i);
+            QVERIFY(i + 12 + qsizetype(n) <= all.size());
+            st.packets.emplace_back(reinterpret_cast<const uint8_t*>(all.constData()) + i + 12, reinterpret_cast<const uint8_t*>(all.constData()) + i + 12 + n);
+            i += 12 + qsizetype(n);
+        }
+        Av1HeaderReader reader;
+        std::vector<Av1FilmGrain> shown;
+        std::string err;
+        for (const auto& pk : st.packets) {
+            std::vector<Av1FrameHeader> hs;
+            QVERIFY2(reader.read(pk.data(), pk.size(), hs, &err), err.c_str());
+            for (const Av1FrameHeader& hd : hs)
+                if (hd.shown()) shown.push_back(hd.grain);
+        }
+        QVERIFY(reader.sequence().filmGrainPresent);
+        QCOMPARE(int(shown.size()), frames);
+        std::vector<av1streams::Picture> beside;
+        QVERIFY(av1streams::decode(st, true, beside));
+        QCOMPARE(int(beside.size()), frames);
+        for (int i = 0; i < frames; ++i) {
+            const Av1FilmGrain& want = table[i < cut ? 0 : 1].grain;
+            QVERIFY2(shown[size_t(i)].apply && shown[size_t(i)].sameParameters(want), qPrintable(QString("frame %1").arg(i)));
+            QVERIFY(beside[size_t(i)].hasGrain && beside[size_t(i)].grain.sameParameters(shown[size_t(i)]) && beside[size_t(i)].grain.seed == shown[size_t(i)].seed);
+        }
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the
@@ -29204,6 +33083,70 @@ colorspaces:
         }
         drain(steady, steadyIn, steadyBody, 20000);
         QCOMPARE(steadyBody, qint64(size));
+    }
+
+    // Nightly 23 Nov: clients that ask for a file, or for the segment being made, and read none of it make the origin
+    // hold a quarter of a megabyte each, not the files they asked for; and 256 of them on the growing segment do not
+    // keep the next player out.
+    void liveOriginUnreadFilesAndSegments() {
+        QTemporaryDir dir;
+        const int size = 24 << 20;  // (more than a loopback connection holds on its way, on any of the systems)
+        for (const char* name : {"big.mp4", "seg_7.m4s"}) {
+            QFile f(dir.filePath(name));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const QByteArray block(1 << 20, 'x');
+            for (int i = 0; i < size / block.size(); ++i) f.write(block);
+        }
+        LiveOrigin origin;
+        std::string err;
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, [](const std::string& rel) { return rel == "seg_7.m4s"; }, &err), err.c_str());
+        auto ask = [&](QTcpSocket& s, const QByteArray& path) {
+            s.setReadBufferSize(1024);
+            s.connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            if (!s.waitForConnected(5000)) return false;
+            s.setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 64 << 10);
+            s.write("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n");
+            return s.flush() || s.bytesToWrite() == 0;
+        };
+        // What waits in the origin, once it has stopped rising (the largest seen over a second and a half).
+        auto waiting = [&] {
+            qint64 most = 0;
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 1500) {
+                QTest::qWait(50);
+                most = std::max<qint64>(most, origin.bytesWaiting());
+            }
+            return most;
+        };
+        // Forty clients that take nothing of a 24 MB file: what waits for each is a piece of it.
+        std::vector<std::unique_ptr<QTcpSocket>> idle;
+        for (int i = 0; i < 40; ++i) {
+            idle.push_back(std::make_unique<QTcpSocket>());
+            QVERIFY(ask(*idle.back(), "/big.mp4"));
+        }
+        const qint64 forFiles = waiting();
+        QVERIFY2(forFiles > 0 && forFiles <= 40 * ((256 << 10) + 4096), qPrintable(QString::number(forFiles)));
+        idle.clear();
+        QTest::qWait(300);
+        // 256 that ask for the segment being made and read nothing: the same, and the next client is answered.
+        for (int i = 0; i < 256; ++i) {
+            idle.push_back(std::make_unique<QTcpSocket>());
+            QVERIFY(ask(*idle.back(), "/seg_7.m4s"));
+        }
+        const qint64 forSegments = waiting();
+        QVERIFY2(forSegments > 0 && forSegments <= 256 * ((256 << 10) + 4096), qPrintable(QString::number(forSegments)));
+        for (int i = 0; i < 3; ++i) {
+            QTcpSocket s;
+            s.connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            QVERIFY(s.waitForConnected(5000));
+            s.write("GET /time HTTP/1.1\r\nHost: x\r\n\r\n");
+            QByteArray in;
+            QElapsedTimer t;
+            t.start();
+            while (!in.contains("\r\n\r\n") && t.elapsed() < 5000 && (s.waitForReadyRead(200) || s.state() == QAbstractSocket::ConnectedState)) in += s.readAll();
+            QVERIFY2(in.startsWith("HTTP/1.1 200"), in.left(40).constData());
+        }
     }
 
     // Nightly 15 Nov: low latency HLS as a player is promised it. The preload hint after a segment's last part
@@ -30567,6 +34510,73 @@ colorspaces:
                     compare(2, QString("%1 #%2%3").arg(self ? "its own map" : "V2's map").arg(k + 1).arg(turned ? ", turned" : ""));
                 }
             }
+        // Through a mask drawn from its shape alone (a feathered ellipse, a rectangle inverted and faded), on the
+        // picture placed square and turned: moved within it, as it was outside, on the GPU too.
+        for (int masked = 0; masked < 2; ++masked)
+            for (int turned = 0; turned < 2; ++turned) {
+                Effect fx = makeEffect(p, "displace_by_layer");
+                for (const auto& [key, v] : settings[size_t(masked)]) fx.params[key] = v;
+                fx.params["mask.shape"] = masked ? 2.0 : 1.0;
+                fx.params["mask.x"] = 0.45, fx.params["mask.y"] = 0.55, fx.params["mask.w"] = 0.5, fx.params["mask.h"] = 0.4;
+                fx.params["mask.feather"] = masked ? 4.0 : 12.0;
+                if (masked) fx.params["mask.invert"] = 1.0, fx.params["mask.opacity"] = 70.0;
+                c.effects = {fx};
+                c.motion.params = {};
+                c.motion.params["scale"] = turned ? 80.0 : 70.0;
+                c.motion.params["pos_x"] = turned ? -20.0 : 31.0;
+                if (turned) c.motion.params["rotation"] = 25.0;
+                compare(2, QString("through %1%2").arg(masked ? "a rectangle inverted" : "an ellipse").arg(turned ? ", turned" : ""));
+            }
+        // A mask made from the picture as well (its edge refined onto it) is the CPU's.
+        c.effects.front().params["mask.refine"] = 60.0;
+        RenderOptions o;
+        o.gpu = true;
+        const gpu::Stats before = gpu::stats();
+        renderProgramFrame(p, s, 2, o);
+        QCOMPARE(gpu::stats().gpuFrames, before.gpuFrames);
+        QVERIFY(QString::fromStdString(gpu::stats().lastFallback).contains("Displace by Layer through a mask made from the picture"));
+        // On an adjustment layer over the picture (V3, V2's map): the canvas beneath it moved, at its full opacity and
+        // faded, through a mask and not.
+        c.effects.clear();
+        c.motion.params = {};
+        c.motion.params["scale"] = 70.0, c.motion.params["pos_x"] = 31.0;
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        Clip adj = makeGeneratorClip(p, "adjustment", 30);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
+        Clip& a = s.videoTracks[2].clips.at(0);
+        for (int k = 0; k < 3; ++k) {
+            Effect fx = makeEffect(p, "displace_by_layer");
+            for (const auto& [key, v] : settings[size_t(k)]) fx.params[key] = v;
+            fx.params["track"] = 2.0;
+            if (k == 2) fx.params["mask.shape"] = 1.0, fx.params["mask.w"] = 0.6, fx.params["mask.h"] = 0.5, fx.params["mask.feather"] = 10.0;
+            a.effects = {fx};
+            a.motion.params = {};
+            if (k == 1) a.motion.params["opacity"] = 60.0;
+            RenderOptions co;
+            co.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, 2, co);
+            a.effects.front().enabled = false;
+            const Image still = renderProgramFrame(p, s, 2, co);
+            a.effects.front().enabled = true;
+            const gpu::Stats was = gpu::stats();
+            co.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, 2, co);
+            const gpu::Stats now = gpu::stats();
+            const QString what = QString("an adjustment layer, #%1").arg(k + 1);
+            QVERIFY2(now.gpuFrames == was.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(now.lastFallback)));
+            QVERIFY2(now.mixPasses > was.mixPasses, qPrintable(what + ": not moved on the GPU"));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0, moved = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int ch = 0; ch < 4; ++ch) {
+                        if (const double d = std::fabs(double(cpu.at(x, y)[ch]) - onGpu.at(x, y)[ch]); d > worst) worst = d, wx = x, wy = y;
+                        moved += std::fabs(cpu.at(x, y)[ch] - still.at(x, y)[ch]);
+                    }
+            QVERIFY2(moved > 50, qPrintable(what + ": nothing moved"));
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
+        }
     }
     void gpuAdjustmentLayersInTransitions() {
         std::string why;
@@ -30634,6 +34644,152 @@ colorspaces:
                 QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
             }
     }
+    void gpuEffectsMatchCpuUhd() {
+        // Six effects on a 3840 by 2160 frame, on the GPU within 1/1023 of the CPU: each at a setting that reaches far
+        // across the picture, the last three through a feathered mask, the picture scaled and turned over another.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 3840, s.height = 2160;
+        auto addPicture = [&](const char* name, int w, int h, bool alpha, float phase) {
+            QImage q(w, h, QImage::Format_RGBA64);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.021f + phase), float(y) / h,
+                                                           0.5f + 0.4f * std::sin(x * 0.007f - y * 0.013f + phase) * std::cos(y * 0.05f),
+                                                           alpha ? std::min(1.0f, 0.1f + 0.9f * float((x / 9 + y / 7) % 61) / 60) : 1.0f));
+            const QString path = dir.filePath(name);
+            if (!q.save(path)) return Id{};
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id wide = addPicture("wide.png", 3840, 2160, false, 0), small = addPicture("small.png", 2500, 1700, true, 0.6f);
+        QVERIFY(wide && small);
+        QVERIFY(edit::placeMedia(p, s, wide, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+        auto r2 = edit::placeMedia(p, s, small, 0, 0, 10, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(r2.ok);
+        Clip* top = edit::clipById(s, r2.created[0]);
+        QVERIFY(top);
+        top->motion.params["scale"] = 120.0, top->motion.params["rotation"] = 11.0, top->motion.params["pos_x"] = 90.0;
+        using Settings = std::vector<std::pair<const char*, double>>;
+        const Settings mask = {{"mask.shape", 1}, {"mask.x", 0.45}, {"mask.y", 0.55}, {"mask.w", 0.5}, {"mask.h", 0.4}, {"mask.feather", 60}};
+        const std::vector<std::pair<const char*, Settings>> effects = {
+            {"gaussian_blur", {{"radius", 60}}},
+            {"glow", {{"threshold", 0.4}, {"radius", 80}, {"intensity", 1.5}}},
+            {"directional_blur", {{"length", 120}, {"angle", 30}}},
+            {"sharpen", {{"amount", 2}, {"radius", 6}}},
+            {"turbulent_displace", {{"amount", 60}, {"size", 200}, {"complexity", 4}, {"seed", 3}}},
+            {"chromatic_aberration", {{"amount", 25}}},
+        };
+        for (size_t k = 0; k < effects.size(); ++k) {
+            Effect e = makeEffect(p, effects[k].first);
+            for (const auto& [key, v] : effects[k].second) e.params[key] = v;
+            if (k >= 3)
+                for (const auto& [key, v] : mask) e.params[key] = v;
+            top->effects = {e};
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, 3, o);
+            top->effects.front().enabled = false;
+            const Image still = renderProgramFrame(p, s, 3, o);
+            top->effects.front().enabled = true;
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, 3, o);
+            const gpu::Stats after = gpu::stats();
+            const QString what = QString::fromUtf8(effects[k].first) + (k >= 3 ? " through a mask" : "");
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QCOMPARE(onGpu.width, 3840);
+            QCOMPARE(cpu.width, 3840);
+            double worst = 0, changed = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c) {
+                        if (const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]); d > worst) worst = d, wx = x, wy = y;
+                        changed += std::fabs(cpu.at(x, y)[c] - still.at(x, y)[c]);
+                    }
+            QVERIFY2(changed > 1000, qPrintable(what + ": the effect did nothing"));
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
+            qInfo("%s at 3840x2160: GPU within %.2g of the CPU", qPrintable(what), worst);
+        }
+    }
+    void gpuEveryEffect() {
+        // Every video effect Montage has, at its defaults on a picture over another (and through a feathered mask):
+        // drawn on the GPU, nothing made on the CPU, except the ones listed here, which are still the CPU's (so one that
+        // newly falls back fails here, and so does one listed that the GPU now draws).
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90;
+        QImage q(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x)
+                q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.21f), float(y) / 90, 0.5f + 0.4f * std::sin(x * 0.07f - y * 0.13f),
+                                                       std::min(1.0f, 0.2f + 0.8f * float((x * 3 + y) % 61) / 60)));
+        const QString path = dir.filePath("picture.png");
+        QVERIFY(q.save(path));
+        MediaItem m;
+        QVERIFY(probeMedia(path.toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 1}, {}, false).ok);
+        Clip& top = s.videoTracks[1].clips.at(0);
+        top.motion.params["scale"] = 80.0, top.motion.params["rotation"] = 9.0;
+        const std::set<std::string> cpuOnly = {
+            // (from other frames, or an analysis of the clip over time)
+            "stabilize", "camera_track", "rolling_shutter", "surface_track", "stop_motion", "motion_blur", "deflicker", "frame_repair",
+            "perf_lock", "scratch_removal", "chart_match", "clean_plate",
+            // (a model's, or drawn around the faces found)
+            "object_removal", "learned_effect", "face_refine", "face_shape", "look_at_lens", "blemish_remover", "redact_faces",
+            "remove_background", "focus_repair", "relight", "behind_people", "sky_replace",
+            // (deep pictures and layers in 3D)
+            "make_deep", "deep_holdout", "deep_grade", "deep_slice", "flatten_deep", "layer_3d",
+            // (with no GPU form yet)
+            "texture_pop", "broadcast_safe", "film_look", "magnify", "lens_distortion", "lens_correction", "drop_shadow", "edge_bevel",
+            "layer_bevel", "patch_fill", "paint", "film_negative", "fade_restore"};
+        // (through a mask: on the CPU, not run on the camera's picture as they are without one)
+        const std::set<std::string> cpuOnlyMasked = {"aces_gamut_compress", "ocio"};
+        std::vector<std::string> fellBack, unlisted, nowGpu;
+        int tried = 0;
+        for (const EffectInfo& info : effectCatalog()) {
+            if (info.hidden || info.category != EffectCategory::VideoFilter) continue;
+            for (int masked = 0; masked < 2; ++masked) {
+                Effect e = makeEffect(p, info.type);
+                if (masked) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.5, e.params["mask.h"] = 0.4, e.params["mask.feather"] = 8.0;
+                top.effects = {e};
+                RenderOptions o;
+                o.gpu = true;
+                const gpu::Stats before = gpu::stats();
+                renderProgramFrame(p, s, 3, o);
+                const gpu::Stats after = gpu::stats();
+                ++tried;
+                const bool onGpu = after.gpuFrames == before.gpuFrames + 1 && after.cpuLayers == before.cpuLayers;
+                const std::string name = info.type + (masked ? " (masked)" : "");
+                const bool listed = cpuOnly.count(info.type) || (masked && cpuOnlyMasked.count(info.type));
+                if (!onGpu) {
+                    fellBack.push_back(name + ": " + (after.gpuFrames == before.gpuFrames ? after.lastFallback : after.lastCpuLayer));
+                    if (!listed) unlisted.push_back(fellBack.back());
+                } else if (listed) {
+                    nowGpu.push_back(name);
+                }
+            }
+        }
+        for (const std::string& f : fellBack) qInfo("on the CPU: %s", f.c_str());
+        qInfo("%d of %d drawn on the GPU", tried - int(fellBack.size()), tried);
+        QVERIFY(tried > 100);
+        QVERIFY2(unlisted.empty(), qPrintable(QString::fromStdString("on the CPU and not listed: " + (unlisted.empty() ? "" : unlisted.front()))));
+        QVERIFY2(nowGpu.empty(), qPrintable(QString::fromStdString("listed but drawn on the GPU: " + (nowGpu.empty() ? "" : nowGpu.front()))));
+    }
     void gpuApertureGlareUhd() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
@@ -30689,6 +34845,420 @@ colorspaces:
             QVERIFY(added > 100);  // (there is glare)
             QVERIFY2(worst <= 1.0 / 1023, qPrintable(QStringLiteral("size %1 at %2: differs by %3").arg(k.size).arg(k.scale).arg(worst)));
             qInfo("size %g at scale %g: GPU within %.2g of the CPU", k.size, k.scale, worst);
+        }
+    }
+    void gpuTextureBudget() {
+        // The compositor counts every texture it holds against a budget: what frames hold is told, a frame that would
+        // hold more than the budget is refused once and not tried again, textures of earlier frames make way for a
+        // frame of another size, and Aperture Glare's tables go once no frame is drawn with them.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        Project p = makeDefaultProject();
+        auto picture = [](int w, int h) {
+            Image img(w, h, Image::Uninitialized{});
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    float* px = img.at(x, y);
+                    const bool spot = x % 61 == 30 && y % 47 == 20;
+                    for (int c = 0; c < 3; ++c) px[c] = spot ? 5.0f + float(c) : 0.3f + 0.3f * float(std::sin(x * 0.05 + y * 0.03 + c));
+                    px[3] = 1;
+                }
+            return img;
+        };
+        auto frameOf = [&](const Image& in, const char* effect, std::initializer_list<std::pair<const char*, double>> settings = {}) {
+            gpu::Frame frame;
+            frame.width = in.width, frame.height = in.height;
+            frame.flatten = false;
+            gpu::Item item;
+            item.a.image = in;
+            item.a.place.full = true;
+            if (effect) {
+                Effect e = makeEffect(p, effect);
+                for (const auto& [name, value] : settings) e.params[name] = value;
+                if (!gpuColorOps(e, 0, item.a.ops, in.width, in.height)) frame.width = 0;  // (not the GPU's: the caller sees nothing drawn)
+            }
+            frame.items.push_back(std::move(item));
+            return frame;
+        };
+        const Image small = picture(640, 360), square = picture(512, 512);
+        const size_t smallBytes = size_t(640) * 360 * 16, squareBytes = size_t(512) * 512 * 16;
+        gpu::setTextureLimitForTesting(0);
+        Image out;
+        // (tables earlier frames left on the GPU, such as Aperture Glare's while its kernel is kept, go once nine
+        // frames have not used them)
+        for (int i = 0; i < 9; ++i) QVERIFY(gpu::execute(frameOf(small, nullptr), &out));
+        gpu::resetStats();
+        // What a frame holds is counted: its picture, the canvas and what is read back at the least.
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        gpu::Stats st = gpu::stats();
+        QVERIFY2(st.textureBytes >= 3 * smallBytes, qPrintable(QString::number(st.textureBytes)));
+        QVERIFY(st.textureBytesPeak >= st.textureBytes);
+        QCOMPARE(st.tableBytes, size_t(0));
+        QCOMPARE(st.textureBudget, gpu::textureBudget());
+        qInfo("texture budget of %s: %zu MB", gpu::deviceName().c_str(), st.textureBudget >> 20);
+        // What each of two frames holds by itself (nothing kept from the frame before).
+        gpu::setTextureBudgetForTesting(1);
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        const size_t needSmall = gpu::stats().textureBytes;
+        QVERIFY(gpu::execute(frameOf(square, "gaussian_blur", {{"radius", 6}}), &out));
+        const size_t needSquare = gpu::stats().textureBytes;
+        gpu::setTextureBudgetForTesting(0);
+        QVERIFY(needSmall >= 3 * smallBytes && needSquare >= 3 * squareBytes);
+        // Under a budget both fit alone but not together: each is drawn, the other's textures making way, and no more
+        // than the budget is ever held.
+        const size_t limit = std::max(needSmall, needSquare) + std::min(needSmall, needSquare) / 4;
+        gpu::setTextureLimitForTesting(limit);
+        QCOMPARE(gpu::textureBudget(), limit);
+        gpu::resetStats();
+        const Image plainSmall = [&] {
+            Image img;
+            return gpu::execute(frameOf(small, nullptr), &img) ? img : Image();
+        }();
+        QVERIFY(!plainSmall.empty());
+        for (int n = 0; n < 6; ++n) {
+            std::string cause;
+            QVERIFY2(gpu::execute(frameOf(n % 2 ? square : small, "gaussian_blur", {{"radius", 6}}), &out, nullptr, &cause), cause.c_str());
+        }
+        st = gpu::stats();
+        QCOMPARE(st.overBudget, 0L);
+        QVERIFY2(st.textureBytesPeak <= limit, qPrintable(QString("%1 held under a budget of %2").arg(st.textureBytesPeak).arg(limit)));
+        QVERIFY(st.textureBytesPeak >= std::max(needSmall, needSquare));
+        // A frame that would hold more than the budget is not drawn, says so, and is not tried a second time (no
+        // texture is made for it); the picture then comes from the CPU as any fallback's does.
+        gpu::setTextureLimitForTesting(needSmall - smallBytes);
+        std::string cause;
+        QVERIFY(!gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out, nullptr, &cause));
+        QVERIFY2(QString::fromStdString(cause).contains("budget"), cause.c_str());
+        const gpu::Stats refused = gpu::stats();
+        QCOMPARE(refused.overBudget, st.overBudget + 1);
+        cause.clear();
+        QVERIFY(!gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out, nullptr, &cause));
+        QVERIFY2(QString::fromStdString(cause).contains("a frame like it"), cause.c_str());
+        QCOMPARE(gpu::stats().texturesMade, refused.texturesMade);
+        QCOMPARE(gpu::stats().overBudget, refused.overBudget + 1);
+        // (a frame of another shape is still tried, and the same one again once the budget has changed)
+        const Image tiny = picture(64, 48);
+        QVERIFY(gpu::execute(frameOf(tiny, nullptr), &out));
+        gpu::setTextureLimitForTesting(0);
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        // Aperture Glare keeps its kernel's spectra and twiddles on the GPU while frames are drawn with it; a few
+        // frames after the last one, none of them is held any more.
+        gpu::resetStats();
+        const gpu::Frame glare = frameOf(small, "aperture_glare", {{"size", 40}, {"threshold", 1.0}});
+        QVERIFY(glare.width > 0);
+        QVERIFY(gpu::execute(glare, &out));
+        const size_t tables = gpu::stats().tableBytes;
+        QVERIFY2(tables > 0, "Aperture Glare kept no tables on the GPU");
+        QVERIFY(gpu::execute(glare, &out));
+        QCOMPARE(gpu::stats().tableBytes, tables);  // (kept, not made again)
+        QVERIFY(out.px != plainSmall.px);
+        const size_t withGlare = gpu::stats().textureBytes;
+        for (int n = 0; n < 10; ++n) QVERIFY(gpu::execute(frameOf(small, nullptr), &out));
+        QCOMPARE(gpu::stats().tableBytes, size_t(0));
+        QVERIFY(gpu::stats().textureBytes + tables <= withGlare);
+        QCOMPARE(out.px.size(), plainSmall.px.size());
+        // (nightly 23 Nov) What the last frames kept for later ones is let go once no frame has been drawn for a while
+        // (a fifth of a second here, 10 s outside tests); the next frame is drawn as before. (They were kept until
+        // frames came again: over a gigabyte after Lens Blur (Depth) at 4K.)
+        gpu::setIdleReleaseForTesting(200);
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        const Image blurred = out;
+        QVERIFY2(gpu::stats().textureBytes >= 3 * smallBytes, qPrintable(QString::number(gpu::stats().textureBytes)));
+        QElapsedTimer idle;
+        idle.start();
+        while (gpu::stats().textureBytes >= smallBytes && idle.elapsed() < 20000) QTest::qWait(50);
+        QVERIFY2(gpu::stats().textureBytes < smallBytes, qPrintable(QString::number(gpu::stats().textureBytes)));
+        QVERIFY(idle.elapsed() >= 150);
+        gpu::setIdleReleaseForTesting(0);
+        QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
+        QCOMPARE(out.px, blurred.px);
+        QVERIFY(gpu::stats().textureBytes >= 3 * smallBytes);
+    }
+    // Masks and effects finished from the picture, drawn on the GPU as on the CPU: People masks and a depth worked out
+    // from the picture (the models' places taken by stand-ins), Cryptomatte masks, masks bent with a surface track,
+    // Refine Edges, the Keyer's clean plate made from the picture itself, Mesh Warp over the picture's alpha and a
+    // Lens Blur focused on the nearest face; each at three settings and through a feathered mask.
+    void gpuMasksAndStepsFromThePicture() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        qputenv("MONTAGE_DEPTH_CACHE", (dir.path() + "/depth").toUtf8());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        // The footage: a subject (red, textured) in front of an uneven green screen, cut out of the frame by a soft oval.
+        QImage q(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) {
+                const float subject = std::clamp(1.5f - float(std::hypot((x - 60) / 22.0, (y - 45) / 26.0)) * 1.2f, 0.0f, 1.0f);
+                const float screen = 0.6f + 0.15f * std::sin(x * 0.07f) + 0.1f * std::cos(y * 0.11f);
+                const float r = subject * (0.7f + 0.2f * std::sin(x * 0.9f + y * 0.4f)) + (1 - subject) * 0.12f * screen;
+                const float g = subject * 0.25f + (1 - subject) * screen;
+                const float b = subject * (0.2f + 0.1f * std::cos(y * 0.7f)) + (1 - subject) * 0.18f * screen;
+                const float a = std::clamp(4.0f - float(std::hypot((x - 80) / 70.0, (y - 45) / 38.0)) * 4.0f, 0.0f, 1.0f);
+                q.setPixelColor(x, y, QColor::fromRgbF(r, g, b, a));
+            }
+        QVERIFY(q.save(dir.filePath("subject.png")));
+        MediaItem still;
+        QVERIFY(probeMedia(dir.filePath("subject.png").toStdString(), still));
+        still.id = p.newId();
+        p.media.push_back(still);
+        auto r = edit::placeMedia(p, s, still.id, 0, 0, 60, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(r.ok);
+        const Id clipId = r.created[0];
+        edit::clipById(s, clipId)->motion.params["scale"] = 110.0;
+        edit::clipById(s, clipId)->motion.params["rotation"] = 5.0;
+        // In the models' places: the people are where the picture is red, its depth is its brightness, and one face.
+        ModelStandIns standIns;
+        standIns.people = [](const Image& img) {
+            auto m = std::make_shared<ValueMap>();
+            m->width = img.width, m->height = img.height;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    const float* px = img.at(x, y);
+                    m->values.push_back(px[3] > 0 ? std::clamp((px[0] - px[1]) / px[3] * 3 + 0.5f, 0.0f, 1.0f) : 0.0f);
+                }
+            return std::shared_ptr<const ValueMap>(m);
+        };
+        standIns.depth = [](const Image& img) {
+            auto d = std::make_shared<DepthMap>();
+            d->width = img.width, d->height = img.height;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    const float* px = img.at(x, y);
+                    d->values.push_back(0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2]);
+                }
+            return std::shared_ptr<const DepthMap>(d);
+        };
+        standIns.faces = [](const Image&) {
+            FaceBox f;
+            f.x = 0.3f, f.y = 0.35f, f.w = 0.15f, f.h = 0.3f, f.score = 1;
+            return std::make_shared<const std::vector<FaceBox>>(std::vector<FaceBox>{f});
+        };
+        setModelStandInsForTesting(standIns);
+        const auto standInsOff = qScopeGuard([] { setModelStandInsForTesting({}); });
+        auto compare = [&](FrameTime t, const QString& what) {
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c)
+                        if (const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]); d > worst) worst = d, wx = x, wy = y;
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
+        };
+        compare(1, "the footage alone");
+        RenderOptions plain;
+        plain.gpu = false;
+        const Image untouched = renderProgramFrame(p, s, 2, plain);
+        using Settings = std::vector<std::pair<const char*, double>>;
+        struct Case {
+            const char* type;
+            Settings settings;
+            int readBacks;  // pictures read back from the GPU for it
+        };
+        const std::vector<Case> cases = {
+            // People masks, the last through a qualifier and a range of depths too.
+            {"invert", {{"mask.shape", 4}, {"mask.feather", 6}}, 0},
+            {"gaussian_blur", {{"radius", 4}, {"mask.shape", 4}, {"mask.expansion", 3}, {"mask.invert", 1}}, 0},
+            {"hue_sat", {{"hue", 90}, {"mask.shape", 4}, {"mask.feather", 12}, {"mask.qualify", 1}, {"mask.lum_low", 20}, {"mask.depth", 1},
+                                {"mask.depth_low", 20}, {"mask.depth_high", 70}},
+             0},
+            // Refine Edges, on a drawn shape, through a filter and on the people's.
+            {"invert", {{"mask.shape", 1}, {"mask.x", 0.4}, {"mask.w", 0.4}, {"mask.h", 0.7}, {"mask.feather", 10}, {"mask.refine", 100}, {"mask.refine_radius", 6}}, 1},
+            {"gaussian_blur", {{"radius", 3}, {"mask.shape", 2}, {"mask.x", 0.4}, {"mask.w", 0.45}, {"mask.h", 0.7}, {"mask.feather", 8}, {"mask.refine", 50}}, 1},
+            {"invert", {{"mask.shape", 4}, {"mask.feather", 8}, {"mask.refine", 70}, {"mask.refine_radius", 10}, {"mask.depth", 1}, {"mask.depth_low", 10}}, 1},
+            // The Keyer with a clean plate made from the picture: keyed, its matte shrunk and softened, the plate shown,
+            // and through a feathered mask.
+            {"screen_key", {{"clean_plate", 1}, {"plate_erode", 6}, {"key.r", 0.07}, {"key.g", 0.6}, {"key.b", 0.1}}, 1},
+            {"screen_key", {{"clean_plate", 1}, {"plate_erode", 3}, {"key.r", 0.07}, {"key.g", 0.6}, {"key.b", 0.1}, {"shrink", 2}, {"soften", 3}}, 1},
+            {"screen_key", {{"clean_plate", 1}, {"plate_erode", 6}, {"key.r", 0.07}, {"key.g", 0.6}, {"key.b", 0.1}, {"view", 3}}, 1},
+            {"screen_key",
+             {{"clean_plate", 1}, {"plate_erode", 6}, {"key.r", 0.07}, {"key.g", 0.6}, {"key.b", 0.1}, {"mask.shape", 1}, {"mask.w", 0.6}, {"mask.h", 0.6},
+              {"mask.feather", 10}},
+             1},
+            // Mesh Warp over the picture's alpha, and through a feathered mask.
+            {"mesh_warp", {{"pin1.kind", 0}, {"pin1.x", 0.3}, {"pin1.y", 0.4}, {"pin1.to_x", 0.4}, {"pin1.to_y", 0.47}, {"pin2.kind", 0}, {"pin2.x", 0.7}, {"pin2.y", 0.6}}, 1},
+            {"mesh_warp",
+             {{"density", 500}, {"expand", 6}, {"pin1.kind", 0}, {"pin1.x", 0.25}, {"pin1.y", 0.3}, {"pin1.to_x", 0.2}, {"pin2.kind", 2}, {"pin2.x", 0.6}, {"pin2.y", 0.5},
+              {"pin2.angle", 30}, {"pin2.radius", 40}},
+             1},
+            {"mesh_warp", {{"pin1.kind", 0}, {"pin1.x", 0.5}, {"pin1.y", 0.5}, {"pin1.to_x", 0.7}, {"pin1.to_y", 0.35}, {"pin2.kind", 1}, {"pin2.x", 0.25}, {"pin2.y", 0.7}}, 1},
+            {"mesh_warp",
+             {{"pin1.kind", 0}, {"pin1.x", 0.3}, {"pin1.y", 0.4}, {"pin1.to_x", 0.4}, {"pin1.to_y", 0.47}, {"pin2.kind", 0}, {"pin2.x", 0.7}, {"pin2.y", 0.6},
+              {"mask.shape", 1}, {"mask.w", 0.6}, {"mask.h", 0.6}, {"mask.feather", 10}},
+             1},
+            // Lens Blur focused on the nearest face, its depth worked out from the picture.
+            {"depth_blur", {{"follow", 2}, {"radius", 8}}, 0},
+            {"depth_blur", {{"follow", 2}, {"radius", 12}, {"blades", 6}, {"highlights", 60}}, 0},
+            {"depth_blur", {{"follow", 2}, {"radius", 6}, {"mask.shape", 2}, {"mask.w", 0.6}, {"mask.h", 0.5}, {"mask.feather", 10}}, 0},
+        };
+        for (size_t k = 0; k < cases.size(); ++k) {
+            Effect e = makeEffect(p, cases[k].type);
+            if (std::string(cases[k].type) == "mesh_warp") e.params["mesh_from"] = 0.0;
+            for (const auto& [name, value] : cases[k].settings) e.params[name] = value;
+            edit::clipById(s, clipId)->effects = {e};
+            const QString what = QString("%1 #%2").arg(cases[k].type).arg(k + 1);
+            const long readBacks = gpu::stats().pictureReadBacks;
+            compare(2, what);
+            // (it is drawn: the frame is not the footage alone; and the picture came back only where the step is made from it)
+            RenderOptions o;
+            o.gpu = true;
+            QVERIFY2(renderProgramFrame(p, s, 2, o).px != untouched.px, qPrintable(what + ": nothing drawn"));
+            QVERIFY2(gpu::stats().pictureReadBacks - readBacks == 2 * cases[k].readBacks,
+                     qPrintable(QString("%1: %2 pictures read back").arg(what).arg(gpu::stats().pictureReadBacks - readBacks)));
+        }
+        // The nearest face's depth is what the blur is focused on: with the face elsewhere, another picture.
+        {
+            RenderOptions o;
+            o.gpu = true;
+            const Image there = renderProgramFrame(p, s, 2, o);
+            ModelStandIns moved = standIns;
+            moved.faces = [](const Image&) {
+                FaceBox f;
+                f.x = 0.75f, f.y = 0.1f, f.w = 0.1f, f.h = 0.2f, f.score = 1;
+                return std::make_shared<const std::vector<FaceBox>>(std::vector<FaceBox>{f});
+            };
+            setModelStandInsForTesting(moved);
+            QVERIFY(renderProgramFrame(p, s, 3, o).px != there.px);
+            compare(3, "Lens Blur on a face elsewhere");
+            setModelStandInsForTesting(standIns);
+        }
+        // An adjustment layer's People mask needs the canvas's picture, which is the GPU's: that frame is the CPU's, and says so.
+        {
+            Clip adj = makeGeneratorClip(p, "adjustment", 60);
+            Effect e = makeEffect(p, "invert");
+            e.params["mask.shape"] = 4.0;
+            adj.effects = {e};
+            edit::clipById(s, clipId)->effects.clear();
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, adj).ok);
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, 4, o);
+            o.gpu = true;
+            const Image mixed = renderProgramFrame(p, s, 4, o);
+            double worst = 0;
+            for (size_t i = 0; i < cpu.px.size(); ++i) worst = std::max(worst, std::fabs(double(cpu.px[i]) - mixed.px[i]));
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString::number(worst)));
+            s.videoTracks[1].clips.clear();
+        }
+
+        // A mask bent with a surface track (the track only, nothing shown by the tracker): footage with a media time,
+        // its surface sliding and bulging over the frames.
+        {
+            ExportSettings st;
+            st.path = (dir.path() + "/shot.mkv").toStdString();
+            st.videoCodec = "ffv1";
+            st.pixFmt = "gbrp16le";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            s.videoTracks[0].clips.clear();
+            MediaItem shot;
+            QVERIFY(probeMedia(st.path, shot));
+            shot.id = p.newId();
+            p.media.push_back(shot);
+            auto placed = edit::placeMedia(p, s, shot.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
+            QVERIFY(placed.ok);
+            SurfaceTrack track;
+            track.width = 160, track.height = 90;
+            track.frameSeconds = 1.0 / (shot.fps.valid() ? shot.fps.toDouble() : 25);
+            track.mesh = buildWarpMesh(160, 90, 150);
+            for (int f = 0; f < 20; ++f) {
+                std::vector<MeshPoint> at = track.mesh.rest;
+                for (MeshPoint& v : at) {
+                    const double bulge = std::exp(-(std::pow(v[0] - 70, 2) + std::pow(v[1] - 45, 2)) / 900.0);
+                    v[0] += f * 1.5 + f * 0.4 * bulge, v[1] += f * 0.5 * bulge;
+                }
+                track.frames.push_back(std::move(at));
+            }
+            Effect tracker = makeEffect(p, "surface_track");
+            tracker.params["mode"] = 4.0;
+            tracker.strings["track"] = surfaceTrackToString(track);
+            const std::vector<Settings> bent = {
+                {{"mask.shape", 1}, {"mask.x", 0.4}, {"mask.w", 0.3}, {"mask.h", 0.5}, {"mask.feather", 6}},
+                {{"mask.shape", 2}, {"mask.x", 0.45}, {"mask.w", 0.25}, {"mask.h", 0.4}, {"mask.feather", 12}, {"mask.invert", 1}},
+                {{"mask.shape", 1}, {"mask.x", 0.4}, {"mask.w", 0.3}, {"mask.h", 0.5}, {"mask.feather", 6}, {"mask.refine", 60}},
+            };
+            for (size_t k = 0; k < bent.size(); ++k) {
+                Effect e = makeEffect(p, k == 1 ? "gaussian_blur" : "invert");
+                if (k == 1) e.params["radius"] = 3.0;
+                for (const auto& [name, value] : bent[k]) e.params[name] = value;
+                e.params["mask.surface"] = 1.0;
+                edit::clipById(s, placed.created[0])->effects = {tracker, e};
+                compare(12, QString("a mask bent with the surface #%1").arg(k + 1));
+                // (bent: not where the mask is without the surface)
+                RenderOptions o;
+                o.gpu = true;
+                const Image with = renderProgramFrame(p, s, 12, o);
+                edit::clipById(s, placed.created[0])->effects[1].params["mask.surface"] = 0.0;
+                QVERIFY(renderProgramFrame(p, s, 12, o).px != with.px);
+            }
+            s.videoTracks[0].clips.clear();
+        }
+
+        // Cryptomatte masks: a render whose left half is one object, the right another, with a soft edge between.
+        if (exrAvailable()) {
+            const int W = 160, H = 90;
+            const float ball = cryptomatteId("ball"), floor = cryptomatteId("floor");
+            std::vector<ExrOutLayer> layers(2);
+            layers[0].channels = {"R", "G", "B", "A"};
+            layers[1].name = "CryptoObject00", layers[1].channels = {"R", "G", "B", "A"}, layers[1].fullFloat = true;
+            for (auto& l : layers) l.data.resize(size_t(W) * H * 4);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float left = std::clamp((80.5f + 6 * std::sin(y * 0.2f) - x) / 4 + 0.5f, 0.0f, 1.0f);
+                    const size_t i = (size_t(y) * W + x) * 4;
+                    const float main[4] = {0.2f + 0.5f * float(x) / W, 0.4f, 0.3f + 0.5f * float(y) / H, 1.0f};
+                    const bool ballFirst = left >= 0.5f;
+                    const float ranks[4] = {ballFirst ? ball : floor, ballFirst ? left : 1 - left, ballFirst ? floor : ball, ballFirst ? 1 - left : left};
+                    for (int c = 0; c < 4; ++c) layers[0].data[i + c] = main[c], layers[1].data[i + c] = ranks[c];
+                }
+            const std::map<std::string, std::string> attrs{
+                {"cryptomatte/0a1b2c3/name", "CryptoObject"}, {"cryptomatte/0a1b2c3/hash", "MurmurHash3_32"},
+                {"cryptomatte/0a1b2c3/conversion", "uint32_to_float32"},
+                {"cryptomatte/0a1b2c3/manifest", "{\"ball\":\"" + cryptomatteHex(ball) + "\",\"floor\":\"" + cryptomatteHex(floor) + "\"}"}};
+            std::string err;
+            const std::string file = (dir.path() + "/render.exr").toStdString();
+            QVERIFY2(writeExr(file, W, H, layers, "zip", attrs, &err), err.c_str());
+            MediaItem render;
+            QVERIFY(probeMedia(file, render));
+            render.id = p.newId();
+            p.media.push_back(render);
+            auto placed = edit::placeMedia(p, s, render.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
+            QVERIFY(placed.ok);
+            const std::vector<std::pair<const char*, Settings>> crypto = {
+                {"invert", {{"mask.feather", 0}}},
+                {"gaussian_blur", {{"radius", 4}, {"mask.expansion", 3}, {"mask.invert", 1}}},
+                {"hue_sat", {{"hue", 120}, {"mask.expansion", -2}, {"mask.qualify", 1}, {"mask.lum_low", 30}}},
+                {"invert", {{"mask.refine", 80}, {"mask.refine_radius", 5}}},
+            };
+            for (size_t k = 0; k < crypto.size(); ++k) {
+                Effect e = makeEffect(p, crypto[k].first);
+                e.params["mask.shape"] = 7.0;
+                for (const auto& [name, value] : crypto[k].second) e.params[name] = value;
+                e.strings["mask.crypto_ids"] = cryptomatteHex(ball);
+                edit::clipById(s, placed.created[0])->effects = {e};
+                compare(3, QString("a Cryptomatte mask #%1").arg(k + 1));
+                // (the mask is the object's: the right half, the floor's, is as it was)
+                RenderOptions o;
+                o.gpu = true;
+                const Image masked = renderProgramFrame(p, s, 3, o);
+                edit::clipById(s, placed.created[0])->effects.clear();
+                const Image bare = renderProgramFrame(p, s, 3, o);
+                QVERIFY(std::fabs(masked.at(150, 45)[0] - bare.at(150, 45)[0]) < 1e-3f);
+                if (k == 0) QVERIFY(std::fabs(masked.at(10, 45)[0] - bare.at(10, 45)[0]) > 0.1f);
+            }
         }
     }
     void footageWordsReadAnswers() {

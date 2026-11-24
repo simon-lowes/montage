@@ -298,6 +298,9 @@ Sequence fieldRateSequence(const Sequence& seq) {
             for (Clip& c : t.clips) twice(c);
             for (Transition& x : t.transitions) {
                 x.duration *= 2;
+                // (the same moment within the frame, counted in fields: frame 2f is mixed as the sequence's frame f
+                // is, 2f + 1 halfway between f and f + 1)
+                x.phase *= 2;
                 twice(x.params);
             }
             twice(t.effects);

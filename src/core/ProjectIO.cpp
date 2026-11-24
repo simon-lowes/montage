@@ -392,6 +392,15 @@ QJsonObject clipToJson(const Clip& c) {
     if (c.linkGroup) o["link"] = double(c.linkGroup);
     if (c.colorLabel) o["label"] = c.colorLabel;
     if (!c.role.empty()) o["role"] = qs(c.role);
+    if (c.duck) {
+        const DuckLink& d = *c.duck;
+        QJsonArray tracks, keys;
+        for (Id t : d.tracks) tracks.append(double(t));
+        for (const auto& [t, v] : d.keys) keys.append(QJsonArray{double(t), v});
+        o["duck"] = QJsonObject{{"tracks", tracks},       {"amount", d.amountDb},       {"fadeDown", d.fadeDown}, {"fadeUp", d.fadeUp},
+                                {"minPause", d.minPause}, {"minSpeech", d.minSpeech},   {"threshold", d.thresholdDb},
+                                {"transcripts", d.useTranscripts}, {"base", d.base},    {"keys", keys},           {"kept", d.kept}};
+    }
     if (c.blendMode != "normal") o["blend"] = qs(c.blendMode);
     if (!c.generator.empty()) o["generator"] = effectToJson(c.generator);
     if (!c.motion.empty()) o["motion"] = effectToJson(c.motion);
@@ -473,6 +482,22 @@ Clip clipFromJson(const QJsonObject& o) {
     c.linkGroup = Id(i64(o.value("link")));
     c.colorLabel = o.value("label").toInt(0);
     c.role = ss(o.value("role"));
+    if (const QJsonObject d = o.value("duck").toObject(); !d.isEmpty()) {
+        DuckLink link;
+        for (const QJsonValue& t : d.value("tracks").toArray()) link.tracks.push_back(Id(i64(t)));
+        link.amountDb = d.value("amount").toDouble(link.amountDb);
+        link.fadeDown = d.value("fadeDown").toDouble(link.fadeDown);
+        link.fadeUp = d.value("fadeUp").toDouble(link.fadeUp);
+        link.minPause = d.value("minPause").toDouble(link.minPause);
+        link.minSpeech = d.value("minSpeech").toDouble(link.minSpeech);
+        link.thresholdDb = d.value("threshold").toDouble(link.thresholdDb);
+        link.useTranscripts = d.value("transcripts").toBool(true);
+        link.base = d.value("base").toDouble(0);
+        for (const QJsonValue& k : d.value("keys").toArray())
+            if (const QJsonArray pair = k.toArray(); pair.size() == 2) link.keys.emplace_back(FrameTime(i64(pair.at(0))), pair.at(1).toDouble());
+        link.kept = d.value("kept").toInt(0);
+        c.duck = std::move(link);
+    }
     c.blendMode = o.contains("blend") ? ss(o.value("blend")) : "normal";
     c.generator = effectFromJson(o.value("generator"));
     c.motion = effectFromJson(o.value("motion"));
@@ -1334,6 +1359,13 @@ std::string clipToJsonString(const Clip& c) {
 
 std::string captionTrackToJsonString(const CaptionTrack& t) {
     return QJsonDocument(captionTrackToJson(t)).toJson(QJsonDocument::Compact).toStdString();
+}
+
+bool captionTrackFromJsonString(const std::string& json, CaptionTrack& out) {
+    const QJsonDocument d = QJsonDocument::fromJson(QByteArray::fromStdString(json));
+    if (!d.isObject()) return false;
+    out = captionTrackFromJson(d.object());
+    return true;
 }
 
 std::string objectMaskToJsonString(const ObjectMask& m) {

@@ -5,8 +5,11 @@
 #include <QGridLayout>
 #include <QLabel>
 #include <QSettings>
+#include <QTimer>
 #include <QToolButton>
 #include <cmath>
+
+#include "audio/AudioDevice.h"
 
 namespace montage {
 
@@ -47,6 +50,13 @@ LoudnessReadout::LoudnessReadout(QWidget* parent) : QWidget(parent) {
     row(7, tr("INT"), tr("Dialogue intelligibility at the playhead (0 to 1; under about 0.45 hard to follow), from the last "
                          "Sequence › Dialogue Intelligibility… analysis"), int_);
     int_->setObjectName(QStringLiteral("intelligibility"));
+    row(8, tr("DO"), tr("Dropouts of the audio device since the last reset: times it ran out of sound or lost a block of its input, "
+                        "as a busy computer makes it. A larger buffer in Monitoring › Audio device helps"), do_);
+    do_->setObjectName(QStringLiteral("audioDropouts"));
+    auto* dropouts = new QTimer(this);
+    dropouts->setInterval(500);
+    connect(dropouts, &QTimer::timeout, this, &LoudnessReadout::showDropouts);
+    dropouts->start();
     target_ = new QComboBox(this);
     target_->setObjectName(QStringLiteral("loudnessTarget"));
     target_->addItems({tr("-23 (EBU R128)"), tr("-24 (ATSC A/85)"), tr("-14 (Streaming)"), tr("-16 (Apple, podcasts)"),
@@ -57,17 +67,27 @@ LoudnessReadout::LoudnessReadout(QWidget* parent) : QWidget(parent) {
     reset_->setObjectName(QStringLiteral("loudnessReset"));
     reset_->setText(tr("Reset"));
     reset_->setToolTip(tr("Measure again from now"));
-    grid->addWidget(target_, 8, 0, 1, 2);
-    grid->addWidget(reset_, 9, 0, 1, 2);
-    grid->setRowStretch(10, 1);
+    grid->addWidget(target_, 9, 0, 1, 2);
+    grid->addWidget(reset_, 10, 0, 1, 2);
+    grid->setRowStretch(11, 1);
     connect(target_, &QComboBox::currentIndexChanged, this, [this](int i) {
         appSettings().setValue(QStringLiteral("loudness/target"), i);
         colour();
     });
     connect(reset_, &QToolButton::clicked, this, [this] {
         clear();
+        audiodev::Engine::shared().resetXruns();
+        showDropouts();
         emit resetRequested();
     });
+}
+
+void LoudnessReadout::showDropouts() {
+    const qint64 n = audiodev::Engine::shared().dropouts();
+    const QString text = n < 0 ? QStringLiteral("—") : QString::number(n);
+    if (do_->text() == text) return;
+    do_->setText(text);
+    do_->setStyleSheet(n > 0 ? QStringLiteral("color: #e0a030") : QString());
 }
 
 double LoudnessReadout::target() const { return kTargets[std::clamp(target_->currentIndex(), 0, kLastTarget)]; }
@@ -78,7 +98,7 @@ void LoudnessReadout::setTargetIndex(int index) { target_->setCurrentIndex(std::
 
 QString LoudnessReadout::text(const char* field) const {
     const QString f = QString::fromLatin1(field);
-    const QLabel* l = f == "M" ? m_ : f == "S" ? s_ : f == "I" ? i_ : f == "LRA" ? lra_ : f == "D" ? d_ : f == "SP" ? sp_ : f == "INT" ? int_ : tp_;
+    const QLabel* l = f == "M" ? m_ : f == "S" ? s_ : f == "I" ? i_ : f == "LRA" ? lra_ : f == "D" ? d_ : f == "SP" ? sp_ : f == "INT" ? int_ : f == "DO" ? do_ : tp_;
     return l->text();
 }
 

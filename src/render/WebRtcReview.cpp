@@ -255,42 +255,6 @@ QString network(const QHostAddress& a) {
 
 QString lower(QString s) { return s.toLower(); }
 
-// "turn:host:3478" or "turns:host" as host, port and whether over TLS or TCP (`tls`: one Montage cannot reach; false
-// when it is not one).
-bool parseRelay(const std::string& url, std::string& host, uint16_t& port, bool& tls) {
-    const size_t colon = url.find(':');
-    if (colon == std::string::npos) return false;
-    const std::string scheme = url.substr(0, colon);
-    if (scheme != "turn" && scheme != "turns") return false;
-    tls = scheme == "turns";
-    std::string rest = url.substr(colon + 1);
-    if (const size_t q = rest.find('?'); q != std::string::npos) {
-        // (RFC 7065's ?transport=: over TCP, like TLS, a relay only browsers reach; Montage's ICE takes UDP alone)
-        if (QString::fromStdString(rest.substr(q + 1)).toLower().contains(QLatin1String("transport=tcp"))) tls = true;
-        rest = rest.substr(0, q);
-    }
-    port = scheme == "turns" ? 5349 : 3478;
-    if (!rest.empty() && rest[0] == '[') {
-        const size_t end = rest.find(']');
-        if (end == std::string::npos) return false;
-        host = rest.substr(1, end - 1);
-        rest = rest.substr(end + 1);
-        if (!rest.empty() && rest[0] != ':') return false;
-        if (!rest.empty()) rest = rest.substr(1);
-    } else {
-        const size_t c = rest.rfind(':');
-        host = rest.substr(0, c);
-        rest = c == std::string::npos ? std::string() : rest.substr(c + 1);
-    }
-    if (!rest.empty()) {
-        bool ok = false;
-        const int p = QString::fromStdString(rest).toInt(&ok);
-        if (!ok || p < 1 || p > 65535) return false;
-        port = uint16_t(p);
-    }
-    return !host.empty();
-}
-
 // An ICE server as the settings name it ("turn:user:password@host:3478") and as a browser takes it.
 QJsonObject browserIceServer(const std::string& url) {
     const QString u = QString::fromStdString(url);
@@ -809,8 +773,7 @@ struct BrowserReviewBackend::Impl {
     bool relayInUse = false;  // a TURN relay among them, which Montage reaches too
     // Only through the relay: where it is, for the bridge each viewer is given (Montage's ICE is then given no server
     // at all), and the bridges of offers still waiting for the relay's answer.
-    std::string relayHost;
-    uint16_t relayPort = 0;
+    RelayAddress relay;
     std::set<std::shared_ptr<RelayBridge>> bridging;
     // The relay's login for this review: the settings' own, or one made from the shared secret that runs out at
     // `expires` (seconds since 1970; 0: none), when the link ends too.
@@ -838,6 +801,7 @@ struct BrowserReviewBackend::Impl {
     std::map<std::string, Pointer> pointing;  // by viewer
     int joined = 0;  // viewers so far (their colours)
     std::string lastError;
+    std::optional<Clock::time_point> relayErrorAt;  // when lastError was last a viewer's way through the relay failing
 
     // Encoding (send's thread; the encoders map is changed under m, as stats() reads it).
     std::map<EncoderKey, std::unique_ptr<VideoEncoder>> encoders;
@@ -1156,7 +1120,11 @@ struct BrowserReviewBackend::Impl {
                 return respond(c, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
         }
         if (!settings.relayOnly) return answerOffer(c, sdp, hdr, nullptr);
-        auto bridge = std::make_shared<RelayBridge>(relayHost, relayPort, relayLogin);
+        // (only through the relay, a viewer is reached at its address there: a browser that got none, as Firefox
+        // gets none from a relay at ::1, is told so, not left to fail its checks)
+        if (offerAddresses(sdp.toStdString()) == 0)
+            return respond(c, "400 Bad Request", {}, "This browser got no address at the review's relay, so it cannot watch through it");
+        auto bridge = std::make_shared<RelayBridge>(relay, relayLogin);
         {
             std::lock_guard lock(m);
             bridging.insert(bridge);
@@ -1164,7 +1132,8 @@ struct BrowserReviewBackend::Impl {
         QPointer<QSslSocket> sock(c);
         std::weak_ptr<RelayBridge> wb = bridge;
         // (the bridge calls back on its own thread, where it must not be let go of: the rest is done here, at home)
-        bridge->allocate([this, sock, wb, sdp, hdr](const std::string& error) {
+        // (an address of the family the viewer's own addresses have: a relay carries IPv4 to IPv4 and IPv6 to IPv6)
+        bridge->allocate(offerFamily(sdp.toStdString()), [this, sock, wb, sdp, hdr](const std::string& error) {
             std::lock_guard lock(m);
             if (!home) return;
             QMetaObject::invokeMethod(
@@ -1585,6 +1554,9 @@ struct BrowserReviewBackend::Impl {
             v->pc->close();
         } catch (const std::exception&) {
         }
+        // (the address at the relay is given back now, unwaited: by the time the viewer is let go for good the
+        // relay has answered or the moment for it has passed, so a relay gone quiet holds nobody up)
+        if (v->bridge) v->bridge->letGo();
         std::lock_guard lock(m);
         retired.emplace_back(Clock::now(), v);
     }
@@ -1608,9 +1580,10 @@ struct BrowserReviewBackend::Impl {
             const bool letGo = endedAt && now - *endedAt >= std::chrono::seconds(1);
             for (auto it = viewers.begin(); it != viewers.end();) {
                 const auto& v = it->second;
-                if (letGo || v->gone || (!v->connected && now - v->created > std::chrono::seconds(30))) {
+                // (a viewer whose address at the relay is gone is let go at once: joining again gives them a new one)
+                if (letGo || v->gone || (!v->connected && now - v->created > std::chrono::seconds(30)) || (v->bridge && v->bridge->ended())) {
                     if (v->bridge)
-                        if (std::string why = v->bridge->lastError(); !why.empty()) lastError = why;
+                        if (std::string why = v->bridge->lastError(); !why.empty()) lastError = why, relayErrorAt = now;
                     drop.push_back(v);
                     pointing.erase(v->id);
                     it = viewers.erase(it);
@@ -1619,6 +1592,14 @@ struct BrowserReviewBackend::Impl {
                 }
             }
             for (auto it = pointing.begin(); it != pointing.end();) it = now - it->second.at > kPointerLife ? pointing.erase(it) : std::next(it);
+            // (a relay's refusal is the review's error until a viewer who came after it is carried through the relay)
+            if (relayErrorAt)
+                for (const auto& [id, v] : viewers)
+                    if (v->connected && !v->gone && v->bridge && v->created > *relayErrorAt && v->bridge->lastError().empty()) {
+                        lastError.clear();
+                        relayErrorAt.reset();
+                        break;
+                    }
         }
         for (const auto& v : told) sendText(*v, {{"t", "end"}, {"why", "This review link has expired"}});
         for (const auto& v : drop) closeViewer(v);
@@ -1772,6 +1753,7 @@ struct BrowserReviewBackend::Impl {
         encoderErrors[key] = why;
         std::lock_guard lock(m);
         lastError = why;
+        relayErrorAt.reset();  // (not the relay's: nothing a viewer's arrival clears)
         return nullptr;
     }
 
@@ -2231,23 +2213,21 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
             d.expires = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() + d.settings.turnExpirySeconds;
             d.relayLogin = turnRestLogin(d.settings.turnSecret, d.expires);
         }
-        // (Montage reaches the relay over UDP; one over TLS only, turns:, is the browsers' alone)
-        std::string relayHost;
-        uint16_t relayPort = 0;
-        bool tls = false;
-        if (!parseRelay(d.settings.turnServer, relayHost, relayPort, tls)) return fail("The TURN relay's address is turn:host:port");
-        if (tls && d.settings.relayOnly)
-            return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)");
+        RelayAddress relay;
+        if (!parseRelayAddress(d.settings.turnServer, relay)) return fail("The TURN relay's address is turn:host:port");
+        relay.pin = d.settings.turnPin;
         if (d.settings.relayOnly) {
             // Only through the relay: Montage's end of each connection stays on this computer's loopback behind a
             // bridge to the relay, and its ICE is told of no server, so no media leaves for anywhere but the relay
-            // (the page and its signalling are HTTPS, between the viewer and this review's own address).
-            d.relayHost = relayHost;
-            d.relayPort = relayPort;
+            // (the page and its signalling are HTTPS, between the viewer and this review's own address). The bridge
+            // reaches the relay as its address says: over UDP, TCP or TLS, at an IPv4 or an IPv6 address.
+            d.relay = relay;
             d.iceServers.clear();
             d.relayInUse = false;
-        } else if (!tls) {
-            d.iceServers.emplace_back(relayHost, relayPort, d.relayLogin.user, d.relayLogin.password, rtc::IceServer::RelayType::TurnUdp);
+        } else if (relay.transport == RelayAddress::Transport::Udp) {
+            // (not only through the relay, Montage's own ICE uses it, which reaches a relay over UDP alone: one over
+            // TCP or TLS is then the browsers' own)
+            d.iceServers.emplace_back(relay.host, relay.port, d.relayLogin.user, d.relayLogin.password, rtc::IceServer::RelayType::TurnUdp);
             d.relayInUse = true;
         }
     }
@@ -2284,6 +2264,7 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
         d.woken = false;
         d.endedAt.reset();
         d.lastError.clear();
+        d.relayErrorAt.reset();
         d.received.clear();
         d.markerCount = 0;
         d.pointing.clear();
@@ -2411,8 +2392,19 @@ ReviewStats BrowserReviewBackend::stats() const {
     s.linkExpires = d_->open ? d_->expires.load() : 0;
     s.error = d_->lastError;
     // (a viewer's way through the relay that failed: the relay's refusal, or its address for them running out)
-    for (const auto& [id, v] : d_->viewers)
-        if (s.error.empty() && v->bridge) s.error = v->bridge->lastError();
+    for (const auto& [id, v] : d_->viewers) {
+        if (!v->bridge) continue;
+        ReviewStats::Bridge b;
+        b.viewer = v->address.toStdString();
+        b.state = v->bridge->state();
+        b.lastRefusal = v->bridge->lastError();
+        b.toRelay = v->bridge->toRelay();
+        b.fromRelay = v->bridge->fromRelay();
+        b.answersRefused = v->bridge->answersRefused();
+        if (s.error.empty()) s.error = b.lastRefusal;
+        s.bridges.push_back(std::move(b));
+    }
+    s.bridgeThreads = RelayBridge::threads();
     s.markers = d_->markerCount;
     return s;
 }

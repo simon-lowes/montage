@@ -5,7 +5,8 @@
 // cuts a recording of hits onto successive keys. While the panel is shown the sampler is heard over the programme,
 // playing or stopped. Record plays the sequence and keeps the notes; when it stops the pass is rendered to a file beside
 // the project and put on a new take lane, the comp taking it. Voice Again renders a pass's notes through the slots as
-// they are now.
+// they are now. Under the table the selected slot's velocity curve is shown, and drawn with the mouse. A slot sent to
+// another track (Output) is heard through that track's strip as it is played, as its part of a pass will be.
 #pragma once
 
 #include <QPointer>
@@ -32,6 +33,41 @@ namespace montage {
 
 class EditorState;
 class PlaybackController;
+
+// A slot's velocity curve, drawn: the force a key is played with across (1-127), what comes out of it up (1-127),
+// straight between its points. Pressing where there is no point makes one, a drag moves a point, a double click takes
+// one away. Drawing over a curve that is not drawn (As Played, Soft, Hard) starts from that curve's two ends.
+class VelocityCurveView : public QWidget {
+    Q_OBJECT
+public:
+    explicit VelocityCurveView(QWidget* parent = nullptr);
+    void setSlot(const SamplerSlot* slot);  // null: nothing shown, nothing drawn
+    // (tall and wide enough for a place for every velocity each way: a point lands on the velocities it is put at)
+    QSize sizeHint() const override { return {280, 142}; }
+    QSize minimumSizeHint() const override { return {160, 142}; }
+    // Where a pair of velocities is in the widget, and the pair at a place (clamped to 1-127).
+    QPoint pointFor(int in, int out) const;
+    std::pair<int, int> velocitiesAt(const QPoint& p) const;
+    const std::vector<std::pair<int, int>>& points() const { return points_; }
+
+signals:
+    void drawn(const std::vector<std::pair<int, int>>& points);  // (when the mouse is let go: one change)
+
+protected:
+    void paintEvent(QPaintEvent* e) override;
+    void mousePressEvent(QMouseEvent* e) override;
+    void mouseMoveEvent(QMouseEvent* e) override;
+    void mouseReleaseEvent(QMouseEvent* e) override;
+    void mouseDoubleClickEvent(QMouseEvent* e) override;
+
+private:
+    QRect plot() const;
+    int pointNear(const QPoint& p) const;
+    SamplerSlot slot_;
+    bool has_ = false;
+    std::vector<std::pair<int, int>> points_;  // (in order of the velocity in)
+    int drag_ = -1;
+};
 
 class SamplerPanel : public QWidget {
     Q_OBJECT
@@ -82,6 +118,7 @@ private:
     void updateActive();
     void reloadKit();
     void refreshTable();
+    void refreshCurve();  // the curve drawn for the slot selected
     void refreshPasses();
     void cellEdited(int row, int column);
     void finishPass();
@@ -118,6 +155,7 @@ private:
     QCheckBox* keysBox_;
     QSpinBox* velocityBox_;
     QTableWidget* table_;
+    VelocityCurveView* curveView_;
     QPushButton* recordButton_;
     QCheckBox* clipPerHitBox_;
     QComboBox* passBox_;

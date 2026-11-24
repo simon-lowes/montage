@@ -26,6 +26,8 @@ bool hdrViewerBuilt();
 // Whether it can describe its surface to Wayland compositors (Linux: Montage's binding of Wayland's colour management,
 // built where wayland-protocols 1.41 or later is found, else Qt's own from 6.10.2).
 bool hdrViewerOnWaylandBuilt();
+// Whether that is Qt's own (the window's colour space; Montage's binding switched off or not built).
+bool hdrViewerOnWaylandThroughQt();
 
 #ifdef MONTAGE_HDR_VIEWER
 
@@ -55,6 +57,9 @@ public:
     int bufferBits() const;
     // On Wayland, the transfer the surface is described with (PQ or HLG; Transfer::Linear while not yet described).
     Transfer describedTransfer() const;
+    // On Wayland with Montage's binding: the compositor has said the surface's first frame is up (it is on an output,
+    // and what the compositor prefers for it stands).
+    bool waylandEntered() const;
     // Why HDR stopped or was refused (empty while it shows).
     const QString& problem() const { return problem_; }
 
@@ -94,6 +99,11 @@ private:
         double headroom = 1, whiteNits = 0;
     };
     WaylandDisplay waylandDisplay();
+    // Wayland: the compositor's word about the surface taken in (its first frame up, another output, the output's
+    // brightness), and HDR stopped or the picture drawn again where that changed what the display shows.
+    void waylandEvents();
+    // Wayland: the connection the surface was made on has gone (Qt connected to a compositor again): HDR stops.
+    bool waylandGone();
 
     QPointer<QWidget> target_;
     std::unique_ptr<HdrSurfaceGpu> gpu_;
@@ -109,7 +119,7 @@ private:
     bool encoded_ = false;  // Linux: drawn as linear light, then written as PQ or HLG into a 10-bit swap chain
     std::unique_ptr<WaylandColor> wayland_;
     QPointer<QObject> waylandWindow_;  // (Qt's Wayland window, whose surfaceDestroyed lets the description go)
-    QElapsedTimer ownFrame_;           // Wayland: since the surface's wl_surface first had a frame (not valid before)
+    QTimer waylandTimer_;              // Wayland: takes in what the compositor said about the surface, as it comes
     int frames_ = 0;
     bool keepFrame_ = false;
     QImage keptSignal_, keptLight_;

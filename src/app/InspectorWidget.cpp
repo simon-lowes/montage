@@ -43,6 +43,8 @@
 #include <cmath>
 #include <utility>
 
+#include "DialogJobs.h"
+#include "core/ProjectIO.h"
 #include "EditorState.h"
 #include "EqPanel.h"
 #include "LensCorrectionDialog.h"
@@ -1261,33 +1263,12 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             exportMaps->setObjectName(QStringLiteral("exportSurfaceMaps"));
             exportMaps->setToolTip(tr("An OpenEXR for each frame with the ST map and the surface's motion vectors"));
             exportMaps->setEnabled(bool(tracked));
-            connect(exportMaps, &QPushButton::clicked, this, [this, tracked] {
+            connect(exportMaps, &QPushButton::clicked, this, [this, tracked, owner, eid] {
                 if (!tracked) return;
                 const QString dir = QFileDialog::getExistingDirectory(window(), tr("Export ST Maps"));
                 if (dir.isEmpty()) return;
-                // (a few frames at a time, off the UI thread, with progress and Cancel)
-                const std::string base = QDir(dir).filePath(QStringLiteral("surface")).toStdString();
-                const auto track = tracked;
-                int written = 0;
-                const bool ok = runAnalysis(tr("Writing ST maps..."), [track, base, &written](const auto& progress, const auto* cancel, std::string* err) {
-                    const int frames = int(track->frames.size());
-                    for (int at = 0; at < frames; at += 8) {
-                        if (cancel && cancel->load()) return false;
-                        // (a stretch where the surface was lost has nothing to write: passed over)
-                        const int last = std::min(frames, at + 8) - 1;
-                        bool any = false;
-                        for (int f = at; f <= last; ++f) any |= track->frames[size_t(f)].size() == track->mesh.rest.size();
-                        if (!any) continue;
-                        if (err) err->clear();
-                        const std::vector<std::string> files = writeSurfaceExrs(*track, base, at, last, err);
-                        if (files.empty()) return false;
-                        written += int(files.size());
-                        progress(double(std::min(frames, at + 8)) / frames);
-                    }
-                    if (!written && err && err->empty()) *err = "No frame of the surface is tracked";
-                    return written > 0;
-                });
-                if (ok) state_->message(tr("Wrote %n ST map(s)", "", written), 4000);
+                // (a few frames at a time, as a background job)
+                runTask(QStringLiteral("stmaps"), tr("Writing ST maps..."), owner, eid, {{"base", QDir(dir).filePath(QStringLiteral("surface"))}});
             });
             h->addWidget(track);
             h->addWidget(arm);
@@ -3782,44 +3763,11 @@ void InspectorWidget::renderOGrafClip(Id clip) {
     const Sequence* s = state_->sequence();
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     if (!c || c->generator.type != "ograf") return;
-    const OGrafJob job = ografClipJob(c->generator, s->width, s->height, s->fpsValue(), c->duration);
-    if (ografCached(job)) {
+    if (ografCached(ografClipJob(c->generator, s->width, s->height, s->fpsValue(), c->duration))) {
         state_->message(tr("The graphic is rendered"), 3000);
         return;
     }
-    if (runAnalysis(tr("Rendering the graphic..."), [job](const auto& progress, const auto* cancel, std::string* err) {
-            return prepareOGraf(job, progress, cancel, err);
-        }))
-        state_->message(tr("Rendered the graphic"), 3000);
-}
-
-bool InspectorWidget::runAnalysis(
-    const QString& title, const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work) {
-    QProgressDialog progress(title, tr("Cancel"), 0, 1000, window());
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    auto done = std::make_shared<std::atomic<double>>(0.0);
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    connect(&progress, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
-    tick.start(100);
-    using Out = std::pair<bool, std::string>;
-    QFutureWatcher<Out> watcher;
-    QEventLoop wait;
-    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([work, done, cancel] {
-        std::string err;
-        const bool ok = work([done](double f) { *done = f; }, cancel.get(), &err);
-        return Out{ok, err};
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    tick.stop();
-    progress.disconnect(this);  // closing a progress dialog emits canceled()
-    progress.close();
-    const Out r = watcher.result();
-    if (!r.first && !*cancel && !r.second.empty()) state_->message(QString::fromStdString(r.second), 6000);
-    return r.first && !*cancel;
+    runTask(QStringLiteral("ograf"), tr("Rendering the graphic..."), clip, 0, {});
 }
 
 void InspectorWidget::takeFromFrame(Id clip, Id effect) {
@@ -3850,67 +3798,14 @@ void InspectorWidget::analyzeStabilize(Id clip, Id effect) {
     const Sequence* s = state_->sequence();
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     if (!c) return;
-    // The analysis reads a copy: editing can go on meanwhile.
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
-    std::string motion, gyro, gyroNote;
-    // (camera motion data is for Stabilize only)
-    bool steadies = false;
-    for (const Effect& e : c->effects)
-        if (e.id == effect) steadies = e.type == "stabilize";
-    const bool ok = runAnalysis(tr("Analysing camera movement..."), [&, project, seqId, clip](const auto& progress, const auto* cancel, std::string* err) {
-        const Sequence* sq = project->findSequence(seqId);
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        return cl && analyzeClipStabilization(*project, *sq, *cl, motion, progress, cancel, err, steadies ? &gyro : nullptr,
-                                              steadies ? &gyroNote : nullptr);
-    });
-    if (!ok) return;
-    // Motion data found switches Stabilize to Camera Gyro (once: a method picked afterwards stays).
-    bool usingGyro = false;
-    state_->edit(steadies ? tr("Analyze Stabilization") : tr("Analyze Camera Motion"), [clip, effect, motion, gyro, &usingGyro](Project&, Sequence& sq) {
-        Effect* e = edit::ownedEffect(sq, clip, effect);
-        if (!e) return false;
-        e->strings["motion"] = motion;
-        if (e->type == "stabilize") {
-            const bool had = !e->s("gyro").empty();
-            if (gyro.empty()) {
-                e->strings.erase("gyro");
-                if (std::lround(e->p("method", 0, 2)) == 3) e->params["method"] = Param(2);
-            } else {
-                e->strings["gyro"] = gyro;
-                if (!had) e->params["method"] = Param(3);
-                usingGyro = std::lround(e->p("method", 0, 2)) == 3;
-            }
-        }
-        return true;
-    });
-    if (usingGyro) state_->message(tr("Stabilizing with the camera's motion data"), 5000);
-    else if (!gyroNote.empty() && gyroNote != "The clip has no camera motion data")
-        state_->message(tr("Camera motion data not used: %1").arg(QString::fromStdString(gyroNote)), 8000);
+    // A background job (DialogJobs.h): the analysis reads the project as it is now, and editing can go on meanwhile.
+    runTask(QStringLiteral("stabilize"), tr("Analysing camera movement..."), clip, effect, {});
 }
 
 void InspectorWidget::solveCameraTrack(Id clip, Id effect) {
     const Sequence* s = state_->sequence();
     if (!s || !edit::clipById(*s, clip)) return;
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
-    CameraSolve cs;
-    const bool ok = runAnalysis(tr("Solving the camera..."), [&, project, seqId, clip](const auto& progress, const auto* cancel, std::string* err) {
-        const Sequence* sq = project->findSequence(seqId);
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        return cl && solveClipCamera(*project, *sq, *cl, {}, cs, [&](double f, const char*) { progress(f); }, cancel, err);
-    });
-    if (!ok) return;
-    const std::string solve = cameraSolveToString(cs);
-    state_->edit(tr("Solve Camera"), [clip, effect, solve](Project&, Sequence& sq) {
-        Effect* e = edit::ownedEffect(sq, clip, effect);
-        if (!e) return false;
-        e->strings["solve"] = solve;
-        return true;
-    });
-    state_->message(cs.oriented ? tr("Solved the camera: %1 px error").arg(cs.error, 0, 'f', 2)
-                                : tr("Solved the camera, but found no ground to place titles on"),
-                    5000);
+    runTask(QStringLiteral("solve"), tr("Solving the camera..."), clip, effect, {});
 }
 
 Id InspectorWidget::placeTitleInScene(Id clip, Id effect, const QString& text) {
@@ -3949,25 +3844,8 @@ void InspectorWidget::trackMask(Id clip, Id effect, bool forward, int model) {
         state_->message(tr("Draw a mask first (choose a shape), then track it"), 5000);
         return;
     }
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
     const FrameTime from = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
-    const MotionModel m = model == 0 ? MotionModel::Translation : model == 1 ? MotionModel::TranslationScale : MotionModel::Similarity;
-    std::vector<std::pair<FrameTime, TrackRegion>> keys;
-    const bool ok = runAnalysis(tr("Tracking the mask..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
-        const Sequence* sq = project->findSequence(seqId);
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), clip, effect) : nullptr;
-        return cl && ef && trackClipMask(*project, *sq, *cl, *ef, from, forward, m, keys, progress, cancel, err);
-    });
-    if (!ok) return;
-    state_->edit(tr("Track Mask"), [clip, effect, keys](Project&, Sequence& sq) {
-        Effect* ef = edit::ownedEffect(sq, clip, effect);
-        if (!ef) return false;
-        applyMaskTrack(*ef, keys);
-        return true;
-    });
-    state_->message(tr("Tracked %n frame(s)", "", int(keys.size())), 4000);
+    runTask(QStringLiteral("mask"), tr("Tracking the mask..."), clip, effect, {{"from", double(from)}, {"forward", forward}, {"model", model}});
 }
 
 void InspectorWidget::trackCorners(Id clip, Id effect, bool forward) {
@@ -3975,48 +3853,16 @@ void InspectorWidget::trackCorners(Id clip, Id effect, bool forward) {
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     const Effect* e = s ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
     if (!c || !e) return;
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
     const FrameTime from = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
-    std::vector<std::pair<FrameTime, TrackQuad>> keys;
-    const bool ok = runAnalysis(tr("Tracking the surface..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
-        const Sequence* sq = project->findSequence(seqId);
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), clip, effect) : nullptr;
-        return cl && ef && trackClipCorners(*project, *sq, *cl, *ef, from, forward, keys, progress, cancel, err);
-    });
-    if (!ok) return;
-    state_->edit(tr("Track Corners"), [clip, effect, keys](Project&, Sequence& sq) {
-        Effect* ef = edit::ownedEffect(sq, clip, effect);
-        if (!ef) return false;
-        applyCornerTrack(*ef, keys);
-        return true;
-    });
-    state_->message(tr("Tracked %n frame(s)", "", int(keys.size())), 4000);
+    runTask(QStringLiteral("corners"), tr("Tracking the surface..."), clip, effect, {{"from", double(from)}, {"forward", forward}});
 }
 
 void InspectorWidget::followFootage(Id clip, bool forward, int model, double size) {
     const Sequence* s = state_->sequence();
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     if (!c) return;
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
     const FrameTime from = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
-    const MotionModel m = model == 0 ? MotionModel::Translation : model == 1 ? MotionModel::TranslationScale : MotionModel::Similarity;
-    std::vector<FollowKey> keys;
-    const bool ok = runAnalysis(tr("Following the footage..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
-        const Sequence* sq = project->findSequence(seqId);
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        return cl && trackClipFollow(*project, *sq, *cl, from, forward, m, size, keys, progress, cancel, err);
-    });
-    if (!ok) return;
-    state_->edit(tr("Follow"), [clip, keys, m](Project&, Sequence& sq) {
-        Clip* cl = edit::clipById(sq, clip);
-        if (!cl) return false;
-        applyFollow(*cl, keys, m);
-        return true;
-    });
-    state_->message(tr("Followed for %n frame(s)", "", int(keys.size())), 4000);
+    runTask(QStringLiteral("follow"), tr("Following the footage..."), clip, 0, {{"from", double(from)}, {"forward", forward}, {"model", model}, {"size", size}});
 }
 
 void InspectorWidget::trackObject(Id clip, Id effect, bool forward) {
@@ -4030,43 +3876,15 @@ void InspectorWidget::trackObject(Id clip, Id effect, bool forward) {
         return;
     }
     if (!ensureObjectModel(window())) return;
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
     const FrameTime from = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
-    std::shared_ptr<const ObjectMask> result;
-    const bool ok = runAnalysis(tr("Tracking the object..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
-        const Sequence* sq = project->findSequence(seqId);
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), clip, effect) : nullptr;
-        if (!cl || !ef || !ef->object) return false;
-        result = trackClipObject(*project, *sq, *cl, *ef->object, from, forward, progress, cancel, err, which);
-        return result != nullptr;
-    });
-    if (!ok) return;
-    state_->edit(tr("Track Object"), [clip, effect, result](Project&, Sequence& sq) {
-        Effect* ef = edit::ownedEffect(sq, clip, effect);
-        if (!ef) return false;
-        ef->object = result;
-        return true;
-    });
-    state_->message(tr("Tracked the object: %n frame(s) segmented", "", int(result->object(which).frames.size())), 4000);
+    runTask(QStringLiteral("object"), tr("Tracking the object..."), clip, effect, {{"from", double(from)}, {"forward", forward}, {"which", which}});
 }
 
 void InspectorWidget::analyzeDepth(Id clip) {
     const Sequence* s = state_->sequence();
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     if (!c || !ensureEffectModel(window(), "video_depth")) return;
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
-    const bool ok = runAnalysis(tr("Analysing depth over the clip..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
-        const Sequence* sq = project->findSequence(seqId);
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        return cl && analyzeClipDepth(*project, *sq, *cl, 518, [&](double f) { progress(f); return !*cancel; }, err);
-    });
-    if (!ok) return;
-    // Drawn again with it (nothing in the project changed).
-    state_->amend([](Project&, Sequence&) { return true; });
-    state_->message(tr("Depth analysed over the clip: depth effects on it are steady"), 4000);
+    runTask(QStringLiteral("depth"), tr("Analysing depth over the clip..."), clip, 0, {});
 }
 
 void InspectorWidget::trackWarpPins(Id clip, Id effect) {
@@ -4074,26 +3892,7 @@ void InspectorWidget::trackWarpPins(Id clip, Id effect) {
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     if (!c || c->duration <= 0 || !edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect)) return;
     const FrameTime at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
-    std::map<int, std::pair<Param, Param>> keys;
-    const bool ok = runAnalysis(tr("Tracking pins..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
-        Sequence* sq = const_cast<Sequence*>(project->findSequence(seqId));
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        const Effect* ef = sq ? edit::ownedEffect(*sq, clip, effect) : nullptr;
-        return cl && ef && trackMeshPins(*project, *sq, *cl, *ef, at, keys, [&](double f) { progress(f); return !*cancel; }, err);
-    });
-    if (!ok) return;
-    state_->edit(tr("Track Pins"), [clip, effect, keys](Project&, Sequence& sq) {
-        Effect* ef = edit::ownedEffect(sq, clip, effect);
-        if (!ef) return false;
-        for (const auto& [k, xy] : keys) {
-            ef->params["pin" + std::to_string(k) + ".to_x"] = xy.first;
-            ef->params["pin" + std::to_string(k) + ".to_y"] = xy.second;
-        }
-        return true;
-    });
-    state_->message(tr("Tracked %n pin(s)", "", int(keys.size())), 4000);
+    runTask(QStringLiteral("pins"), tr("Tracking pins..."), clip, effect, {{"from", double(at)}});
 }
 
 void InspectorWidget::trackSurfaceOf(Id clip, Id effect, bool again) {
@@ -4101,26 +3900,7 @@ void InspectorWidget::trackSurfaceOf(Id clip, Id effect, bool again) {
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     if (!c || c->duration <= 0 || !edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect)) return;
     const FrameTime at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
-    std::string track;
-    const bool ok = runAnalysis(tr("Tracking the surface..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
-        Sequence* sq = const_cast<Sequence*>(project->findSequence(seqId));
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        const Effect* ef = sq ? edit::ownedEffect(*sq, clip, effect) : nullptr;
-        return cl && ef && trackClipSurface(*project, *sq, *cl, *ef, at, track, again, [&](double f) { progress(f); return !*cancel; }, err);
-    });
-    if (!ok) return;
-    state_->edit(again ? tr("Solve Surface Again") : tr("Track Surface"), [clip, effect, track](Project&, Sequence& sq) {
-        Effect* ef = edit::ownedEffect(sq, clip, effect);
-        if (!ef) return false;
-        ef->strings["track"] = track;
-        return true;
-    });
-    int on = 0;
-    if (const auto t = cachedSurfaceTrack(track))
-        for (const auto& fr : t->frames) on += fr.empty() ? 0 : 1;
-    state_->message(tr("Tracked the surface on %n frame(s)", "", on), 4000);
+    runTask(QStringLiteral("surface"), tr("Tracking the surface..."), clip, effect, {{"from", double(at)}, {"again", again}});
 }
 
 void InspectorWidget::followFocusOn(Id clip, Id effect, FocusTarget target) {
@@ -4134,25 +3914,280 @@ void InspectorWidget::followFocusOn(Id clip, Id effect, FocusTarget target) {
     fs.target = target;
     fs.at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
     fs.x = e->p("point_x", fs.at, 0.5), fs.y = e->p("point_y", fs.at, 0.5);
-    auto project = std::make_shared<const Project>(state_->project());
-    const Id seqId = s->id;
-    Param focus;
-    const bool ok = runAnalysis(tr("Following focus..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
-        Sequence* sq = const_cast<Sequence*>(project->findSequence(seqId));
-        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        const Effect* ef = sq ? edit::ownedEffect(*sq, clip, effect) : nullptr;
-        return cl && ef && followFocus(*project, *sq, *cl, *ef, fs, focus, [&](double f) { progress(f); return !*cancel; }, err);
-    });
-    if (!ok) return;
-    // The Focus Depth keyed, and focused on it.
-    state_->edit(tr("Follow Focus"), [clip, effect, focus](Project&, Sequence& sq) {
-        Effect* ef = edit::ownedEffect(sq, clip, effect);
-        if (!ef) return false;
-        ef->params["focus"] = focus;
-        ef->params["follow"] = Param(0.0);
+    runTask(QStringLiteral("focus"), tr("Following focus..."), clip, effect,
+            {{"from", double(fs.at)}, {"target", int(fs.target)}, {"x", fs.x}, {"y", fs.y}});
+}
+
+// --- The Inspector's analyses as background jobs (DialogJobs.h) ---
+//
+// Each runs on the project as it was, on a copy of the effect (or of the clip, for Follow), and its result is what it
+// changed there: new parameters and texts, those taken away, the object mask. Applied, these are put on the effect as it
+// is then, as one undo step (unless the clip has moved meanwhile: then they are offered). Analyses that change nothing
+// in the project (depth, a graphic's frames) only leave their caches; ST maps are written a stretch at a time, and taken
+// up after a crash, go on from the stretch being written.
+
+namespace {
+
+struct InspectorText {
+    Q_DECLARE_TR_FUNCTIONS(montage::InspectorWidget)
+};
+
+Id taskId(const QJsonValue& v) { return Id(v.toString().toULongLong()); }
+
+QJsonObject effectChanges(const Effect& before, const Effect& after) {
+    Effect changed;
+    changed.type = after.type;
+    changed.id = after.id;
+    QJsonArray erasedParams, erasedStrings;
+    for (const auto& [k, v] : after.params)
+        if (const auto it = before.params.find(k); it == before.params.end() || !(it->second == v)) changed.params[k] = v;
+    for (const auto& [k, v] : before.params)
+        if (!after.params.count(k)) erasedParams.append(QString::fromStdString(k));
+    for (const auto& [k, v] : after.strings)
+        if (const auto it = before.strings.find(k); it == before.strings.end() || it->second != v) changed.strings[k] = v;
+    for (const auto& [k, v] : before.strings)
+        if (!after.strings.count(k)) erasedStrings.append(QString::fromStdString(k));
+    const bool object = after.object && after.object != before.object;
+    if (object) changed.object = after.object;
+    return QJsonObject{{"effect", QString::fromStdString(effectToJsonString(changed))}, {"erasedParams", erasedParams},
+                       {"erasedStrings", erasedStrings}, {"object", object}};
+}
+
+bool putEffectChanges(Effect& e, const QJsonObject& c) {
+    Effect changed;
+    if (!effectFromJsonString(c.value("effect").toString().toStdString(), changed)) return false;
+    for (const auto& [k, v] : changed.params) e.params[k] = v;
+    for (const auto& [k, v] : changed.strings) e.strings[k] = v;
+    for (const QJsonValue& k : c.value("erasedParams").toArray()) e.params.erase(k.toString().toStdString());
+    for (const QJsonValue& k : c.value("erasedStrings").toArray()) e.strings.erase(k.toString().toStdString());
+    if (c.value("object").toBool() && changed.object) e.object = changed.object;
+    return true;
+}
+
+MotionModel motionModel(int model) {
+    return model == 0 ? MotionModel::Translation : model == 1 ? MotionModel::TranslationScale : MotionModel::Similarity;
+}
+
+bool runInspectorAnalysis(TaskRun& t) {
+    const QJsonObject& in = t.input;
+    const QJsonObject a = in.value("args").toObject();
+    const QString what = in.value("what").toString();
+    // (the analyses read the project; some take its sequence as one they could change, and do not)
+    auto* sq = const_cast<Sequence*>(t.project->findSequence(taskId(in.value("sequence"))));
+    const Id clip = taskId(in.value("clip")), effect = taskId(in.value("effect"));
+    const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+    const Effect* ef = cl && effect ? edit::ownedEffect(*sq, clip, effect) : nullptr;
+    if (!cl || (effect && !ef)) {
+        t.error = !sq ? "The sequence is gone" : !cl ? "The clip is gone" : "The effect is gone";
+        return false;
+    }
+    const Project& p = *t.project;
+    const std::function<void(double)> progress = [&](double f) {
+        if (t.progress) t.progress(f);
+    };
+    const auto going = [&](double f) {
+        progress(f);
+        return !t.cancelled();
+    };
+    std::string* err = &t.error;
+    const std::atomic<bool>* cancel = t.cancel;
+    const FrameTime from = FrameTime(a.value("from").toDouble());
+    const bool forward = a.value("forward").toBool(true);
+    QJsonObject& r = t.result;
+    Effect after = ef ? *ef : Effect();
+    bool ok = false;
+    if (what == "stabilize") {
+        const bool steadies = ef->type == "stabilize";
+        std::string motion, gyro, gyroNote;
+        ok = analyzeClipStabilization(p, *sq, *cl, motion, progress, cancel, err, steadies ? &gyro : nullptr, steadies ? &gyroNote : nullptr);
+        if (ok) {
+            // Motion data found switches Stabilize to Camera Gyro (once: a method picked afterwards stays).
+            after.strings["motion"] = motion;
+            if (steadies) {
+                const bool had = !after.s("gyro").empty();
+                if (gyro.empty()) {
+                    after.strings.erase("gyro");
+                    if (std::lround(after.p("method", 0, 2)) == 3) after.params["method"] = Param(2);
+                } else {
+                    after.strings["gyro"] = gyro;
+                    if (!had) after.params["method"] = Param(3);
+                }
+            }
+            r["gyroNote"] = QString::fromStdString(gyroNote);
+        }
+    } else if (what == "solve") {
+        CameraSolve cs;
+        ok = solveClipCamera(p, *sq, *cl, {}, cs, [&](double f, const char*) { progress(f); }, cancel, err);
+        if (ok) {
+            after.strings["solve"] = cameraSolveToString(cs);
+            r["oriented"] = cs.oriented;
+            r["error"] = cs.error;
+        }
+    } else if (what == "mask") {
+        std::vector<std::pair<FrameTime, TrackRegion>> keys;
+        ok = trackClipMask(p, *sq, *cl, *ef, from, forward, motionModel(a.value("model").toInt()), keys, progress, cancel, err);
+        if (ok) applyMaskTrack(after, keys), r["count"] = int(keys.size());
+    } else if (what == "corners") {
+        std::vector<std::pair<FrameTime, TrackQuad>> keys;
+        ok = trackClipCorners(p, *sq, *cl, *ef, from, forward, keys, progress, cancel, err);
+        if (ok) applyCornerTrack(after, keys), r["count"] = int(keys.size());
+    } else if (what == "follow") {
+        std::vector<FollowKey> keys;
+        const MotionModel m = motionModel(a.value("model").toInt());
+        ok = trackClipFollow(p, *sq, *cl, from, forward, m, a.value("size").toDouble(), keys, progress, cancel, err);
+        if (ok) {
+            Clip moved = *cl;
+            applyFollow(moved, keys, m);
+            r["changes"] = effectChanges(cl->motion, moved.motion);
+            r["count"] = int(keys.size());
+        }
+    } else if (what == "object") {
+        const int which = a.value("which").toInt();
+        std::shared_ptr<const ObjectMask> mask = ef->object ? trackClipObject(p, *sq, *cl, *ef->object, from, forward, progress, cancel, err, which) : nullptr;
+        ok = mask != nullptr;
+        if (ok) after.object = mask, r["count"] = int(mask->object(which).frames.size());
+    } else if (what == "depth") {
+        ok = analyzeClipDepth(p, *sq, *cl, 518, going, err);
+    } else if (what == "pins") {
+        std::map<int, std::pair<Param, Param>> keys;
+        ok = trackMeshPins(p, *sq, *cl, *ef, from, keys, going, err);
+        for (const auto& [k, xy] : keys) {
+            after.params["pin" + std::to_string(k) + ".to_x"] = xy.first;
+            after.params["pin" + std::to_string(k) + ".to_y"] = xy.second;
+        }
+        r["count"] = int(keys.size());
+    } else if (what == "surface") {
+        std::string track;
+        ok = trackClipSurface(p, *sq, *cl, *ef, from, track, a.value("again").toBool(), going, err);
+        if (ok) {
+            after.strings["track"] = track;
+            int on = 0;
+            if (const auto tr = cachedSurfaceTrack(track))
+                for (const auto& fr : tr->frames) on += fr.empty() ? 0 : 1;
+            r["count"] = on;
+        }
+    } else if (what == "focus") {
+        FollowFocusSettings fs;
+        fs.target = FocusTarget(a.value("target").toInt());
+        fs.at = from;
+        fs.x = a.value("x").toDouble(0.5), fs.y = a.value("y").toDouble(0.5);
+        Param focus;
+        ok = followFocus(p, *sq, *cl, *ef, fs, focus, going, err);
+        if (ok) {
+            // The Focus Depth keyed, and focused on it.
+            after.params["focus"] = focus;
+            after.params["follow"] = Param(0.0);
+            r["count"] = int(focus.keys.size());
+        }
+    } else if (what == "ograf") {
+        ok = prepareOGraf(ografClipJob(cl->generator, sq->width, sq->height, sq->fpsValue(), cl->duration), progress, cancel, err);
+    } else if (what == "stmaps") {
+        // A few frames at a time (a stretch where the surface was lost has nothing to write: passed over), each stretch
+        // written noted.
+        const auto track = cachedSurfaceTrack(*ef);
+        const std::string base = a.value("base").toString().toStdString();
+        const int frames = track ? int(track->frames.size()) : 0;
+        QJsonValue kept;
+        QJsonObject done = t.part(QStringLiteral("maps"), &kept) ? kept.toObject() : QJsonObject();
+        int written = done.value("written").toInt();
+        ok = bool(track);
+        for (int at = done.value("next").toInt(); ok && at < frames; at += 8) {
+            if (t.cancelled()) return false;
+            const int last = std::min(frames, at + 8) - 1;
+            bool any = false;
+            for (int f = at; f <= last; ++f) any |= track->frames[size_t(f)].size() == track->mesh.rest.size();
+            if (any) {
+                err->clear();
+                const std::vector<std::string> files = writeSurfaceExrs(*track, base, at, last, err);
+                if (files.empty()) return false;
+                written += int(files.size());
+            }
+            t.keepPart(QStringLiteral("maps"), QJsonObject{{"next", at + 8}, {"written", written}});
+            progress(double(std::min(frames, at + 8)) / frames);
+        }
+        if (ok && !written) {
+            if (err->empty()) *err = "No frame of the surface is tracked";
+            ok = false;
+        }
+        r["count"] = written;
+    } else {
+        t.error = "Not an analysis Montage knows";
+        return false;
+    }
+    if (!ok || t.cancelled()) return false;
+    if (ef && !r.contains("changes")) r["changes"] = effectChanges(*ef, after);
+    return true;
+}
+
+QJsonObject applyInspectorAnalysis(EditorState* state, const QJsonObject& in, const QJsonObject& r) {
+    const QString what = in.value("what").toString();
+    const Id clip = taskId(in.value("clip")), effect = taskId(in.value("effect"));
+    const int n = r.value("count").toInt();
+    auto said = [](const QString& text, int ms) { return QJsonObject{{"message", text}, {"timeout", ms}}; };
+    if (what == "depth") {
+        // Drawn again with it (nothing in the project changed).
+        state->amend([](Project&, Sequence&) { return true; });
+        return said(InspectorText::tr("Depth analysed over the clip: depth effects on it are steady"), 4000);
+    }
+    if (what == "ograf") return said(InspectorText::tr("Rendered the graphic"), 3000);
+    if (what == "stmaps") return said(InspectorText::tr("Wrote %n ST map(s)", "", n), 4000);
+    const QJsonObject changes = r.value("changes").toObject();
+    QString label;
+    bool steadies = false, usingGyro = false;
+    if (const Sequence* s = state->sequence())
+        if (Effect* e = edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect)) steadies = e->type == "stabilize";
+    if (what == "stabilize") label = steadies ? InspectorText::tr("Analyze Stabilization") : InspectorText::tr("Analyze Camera Motion");
+    else if (what == "solve") label = InspectorText::tr("Solve Camera");
+    else if (what == "mask") label = InspectorText::tr("Track Mask");
+    else if (what == "corners") label = InspectorText::tr("Track Corners");
+    else if (what == "follow") label = InspectorText::tr("Follow");
+    else if (what == "object") label = InspectorText::tr("Track Object");
+    else if (what == "pins") label = InspectorText::tr("Track Pins");
+    else if (what == "surface") label = in.value("args").toObject().value("again").toBool() ? InspectorText::tr("Solve Surface Again") : InspectorText::tr("Track Surface");
+    else if (what == "focus") label = InspectorText::tr("Follow Focus");
+    const bool done = state->edit(label, [&](Project&, Sequence& sq) {
+        Clip* c = edit::clipById(sq, clip);
+        Effect* e = what == "follow" ? (c ? &c->motion : nullptr) : edit::ownedEffect(sq, clip, effect);
+        if (!e || !putEffectChanges(*e, changes)) return false;
+        usingGyro = e->type == "stabilize" && !e->s("gyro").empty() && std::lround(e->p("method", 0, 2)) == 3;
         return true;
     });
-    state_->message(tr("Follow Focus: %n key(s) on Focus Depth", "", int(focus.keys.size())), 4000);
+    if (!done) return said(InspectorText::tr("The clip or its effect is gone: the analysis was not applied"), 6000);
+    if (what == "stabilize") {
+        const QString note = r.value("gyroNote").toString();
+        if (usingGyro) return said(InspectorText::tr("Stabilizing with the camera's motion data"), 5000);
+        if (!note.isEmpty() && note != QLatin1String("The clip has no camera motion data"))
+            return said(InspectorText::tr("Camera motion data not used: %1").arg(note), 8000);
+        return {};
+    }
+    if (what == "solve")
+        return said(r.value("oriented").toBool() ? InspectorText::tr("Solved the camera: %1 px error").arg(r.value("error").toDouble(), 0, 'f', 2)
+                                                 : InspectorText::tr("Solved the camera, but found no ground to place titles on"),
+                    5000);
+    if (what == "mask" || what == "corners") return said(InspectorText::tr("Tracked %n frame(s)", "", n), 4000);
+    if (what == "follow") return said(InspectorText::tr("Followed for %n frame(s)", "", n), 4000);
+    if (what == "object") return said(InspectorText::tr("Tracked the object: %n frame(s) segmented", "", n), 4000);
+    if (what == "pins") return said(InspectorText::tr("Tracked %n pin(s)", "", n), 4000);
+    if (what == "surface") return said(InspectorText::tr("Tracked the surface on %n frame(s)", "", n), 4000);
+    if (what == "focus") return said(InspectorText::tr("Follow Focus: %n key(s) on Focus Depth", "", n), 4000);
+    return {};
+}
+
+}  // namespace
+
+void registerInspectorTaskKinds() {
+    DialogJobs::registerKind(QStringLiteral("inspector-analysis"), {runInspectorAnalysis, applyInspectorAnalysis, false, nullptr});
+}
+
+bool InspectorWidget::runTask(const QString& what, const QString& title, Id clip, Id effect, const QJsonObject& args) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const QJsonObject input{{"sequence", QString::number(s->id)}, {"clips", QJsonArray{QString::number(clip)}}, {"clip", QString::number(clip)},
+                            {"effect", QString::number(effect)}, {"what", what}, {"args", args}};
+    const TaskOutcome out = DialogJobs::of(this)->run(state_, QStringLiteral("inspector-analysis"), title, input, window());
+    if (out.how == TaskOutcome::Failed && !out.error.isEmpty()) state_->message(out.error, 6000);
+    if (out.done() && out.applied.contains("message")) state_->message(out.applied.value("message").toString(), out.applied.value("timeout").toInt(4000));
+    return out.done();
 }
 
 }  // namespace montage

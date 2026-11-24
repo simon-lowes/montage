@@ -137,6 +137,7 @@ private:
     QComboBox* turnExpiry_;
     QString turnFor_;  // the relay the login and secret shown were given for
     QCheckBox* relayOnly_;
+    QLineEdit* turnPin_;
     QComboBox* rungs_;
     QCheckBox* hdr_;
     QFormLayout* form_;

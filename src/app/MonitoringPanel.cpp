@@ -65,6 +65,10 @@ QJsonObject statusJson(const audiodev::EngineStatus& st) {
                   {"round_trip", st.roundTrip},
                   {"round_trip_measured", st.measured},
                   {"xruns", double(st.xruns)},
+                  {"underruns", double(st.underruns)},
+                  {"inputs_lost", double(st.inputsLost)},
+                  {"mixed_ahead", st.cushion},
+                  {"stand_in", st.standIn},
                   {"rate_changes", st.rateChanges},
                   {"ports", ports},
                   {"clock", QString::fromStdString(st.clock)},
@@ -198,6 +202,13 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     statusTimer_->setInterval(500);
     connect(statusTimer_, &QTimer::timeout, this, &MonitoringPanel::showDeviceStatus);
     statusTimer_->start();
+    // The device going away is said where the user is looking, with what sound goes through now.
+    connect(program_, &PlaybackController::audioDeviceLost, this, [this](const QString& why, const QString& now) {
+        state_->message(now.isEmpty() ? tr("The audio device was lost (%1). Sound now goes through the system's output").arg(why)
+                                      : tr("The audio device was lost (%1). Sound now goes through %2").arg(why, now),
+                        10000);
+        showDeviceStatus();
+    });
 
     // The room: the device, the speaker set and each speaker.
     on_ = new QCheckBox(tr("Monitoring section"), body);
@@ -531,7 +542,10 @@ void MonitoringPanel::showDeviceStatus() {
                    .arg(st.buffer)
                    .arg(ms(st.latency.input), ms(st.latency.output), ms(st.roundTrip), st.measured ? tr("measured") : tr("as reported"))
                    .arg(st.xruns);
+        if (st.underruns > 0) text += tr("; ran out of sound %n time(s)", nullptr, int(std::min<int64_t>(st.underruns, 1000000)));
+        if (st.inputsLost > 0) text += tr("; %n block(s) of input lost", nullptr, int(std::min<int64_t>(st.inputsLost, 1000000)));
         if (st.rateChanges > 0) text += tr("; the rate changed %n time(s)", nullptr, st.rateChanges);
+        if (st.standIn) text = tr("The device chosen is not there (%1). Standing in: %2").arg(QString::fromStdString(st.error), text);
     }
     if (deviceStatus_->text() != text) deviceStatus_->setText(text);
 }

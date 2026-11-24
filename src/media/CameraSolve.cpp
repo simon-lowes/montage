@@ -1302,6 +1302,10 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
     const bool package = info.suffix().compare("usdz", Qt::CaseInsensitive) == 0;
     const std::string stem = info.completeBaseName().toStdString();
     auto pictureName = [&](size_t m) { return (package ? std::string() : stem + "_") + meshName(m) + ".png"; };
+    // (a picture that changes: one at each time code it changes at)
+    auto sampleName = [&](size_t m, double at) {
+        return (package ? std::string() : stem + "_") + meshName(m) + "_" + formatNumber(at) + ".png";
+    };
     if (!models.empty()) {
         o << "\n    def Scope \"Models\"\n    {\n";
         for (size_t m = 0; m < models.size(); ++m) {
@@ -1371,7 +1375,13 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
             if (!mesh.picture.empty()) {
                 o << "\n            def Shader \"Picture\"\n            {\n"
                   << "                uniform token info:id = \"UsdUVTexture\"\n"
-                  << "                asset inputs:file = @./" << pictureName(m) << "@\n"
+                  << "                asset inputs:file = @./" << (mesh.pictures.empty() ? pictureName(m) : sampleName(m, mesh.pictures.front().first)) << "@\n";
+                if (!mesh.pictures.empty()) {
+                    o << "                asset inputs:file.timeSamples = {\n";
+                    for (const auto& [at, bytes] : mesh.pictures) o << "                    " << formatNumber(at) << ": @./" << sampleName(m, at) << "@,\n";
+                    o << "                }\n";
+                }
+                o
                   << "                token inputs:sourceColorSpace = \"sRGB\"\n"
                   << "                float2 inputs:st.connect = " << look << "/Uvs.outputs:result>\n"
                   << "                token inputs:wrapS = \"clamp\"\n                token inputs:wrapT = \"clamp\"\n"
@@ -1399,12 +1409,20 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
         ZipWriter zip;
         zip.add(stem + ".usda", o.str(), 64);
         for (size_t m = 0; m < models.size(); ++m)
-            if (!models[m].picture.empty()) zip.add(pictureName(m), models[m].picture, 64);
+            if (!models[m].pictures.empty())
+                for (const auto& [at, bytes] : models[m].pictures) zip.add(sampleName(m, at), bytes, 64);
+            else if (!models[m].picture.empty())
+                zip.add(pictureName(m), models[m].picture, 64);
         return write(path, zip.finish());
     }
     const std::string dir = info.absolutePath().toStdString() + "/";
     for (size_t m = 0; m < models.size(); ++m)
-        if (!models[m].picture.empty() && !write(dir + pictureName(m), models[m].picture)) return false;
+        if (!models[m].pictures.empty()) {
+            for (const auto& [at, bytes] : models[m].pictures)
+                if (!write(dir + sampleName(m, at), bytes)) return false;
+        } else if (!models[m].picture.empty() && !write(dir + pictureName(m), models[m].picture)) {
+            return false;
+        }
     return write(path, o.str());
 }
 

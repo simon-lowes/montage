@@ -21,15 +21,6 @@ namespace {
 // code was generated from.
 constexpr uint32_t kVersion = 1;
 
-// Primaries' chromaticities (red, green, blue, white) in millionths, as the protocol takes them.
-std::array<int32_t, 8> millionths(Primaries p) {
-    double xy[8] = {};
-    primariesChromaticities(p, xy);
-    std::array<int32_t, 8> out{};
-    for (size_t i = 0; i < 8; ++i) out[i] = int32_t(std::lround(xy[i] * 1e6));
-    return out;
-}
-
 }  // namespace
 
 struct WaylandColor::State {
@@ -44,6 +35,8 @@ struct WaylandColor::State {
     wl_surface* surface = nullptr;
     wp_color_management_surface_v1* cmSurface = nullptr;
     wp_color_management_surface_feedback_v1* feedback = nullptr;
+    wl_callback* frame = nullptr;  // asked of the surface when attached; gone once the frame is up
+    bool entered = false;
     bool preferredChanged = false;
     Preferred preferred;
     bool hasDescribed = false;
@@ -148,6 +141,15 @@ const wp_color_management_surface_feedback_v1_listener kFeedbackListener = [] {
     return l;
 }();
 
+// The surface's first frame is up: it is on an output now, and what the compositor prefers for it is read again.
+const wl_callback_listener kFrameListener = {[](void* data, wl_callback* callback, uint32_t) {
+    auto* s = static_cast<WaylandColor::State*>(data);
+    wl_callback_destroy(callback);
+    if (s->frame == callback) s->frame = nullptr;
+    s->entered = true;
+    s->preferredChanged = true;
+}};
+
 }  // namespace
 
 WaylandColor::State::Answer WaylandColor::State::read(wp_color_management_surface_feedback_v1* from, Preferred& out) {
@@ -212,6 +214,10 @@ WaylandColor::~WaylandColor() {
 
 bool WaylandColor::available() const { return s_->manager && s_->managerDone; }
 
+wl_display* WaylandColor::display() const { return s_->display; }
+
+void WaylandColor::abandon() { s_ = std::make_unique<State>(); }
+
 std::string WaylandColor::unsupported() const {
     const State& s = *s_;
     if (!available()) return "no colour manager";
@@ -234,6 +240,14 @@ bool WaylandColor::attach(wl_surface* surface) {
     s.cmSurface = wp_color_manager_v1_get_surface(s.manager, surface);
     s.feedback = wp_color_manager_v1_get_surface_feedback(s.manager, surface);
     wp_color_management_surface_feedback_v1_add_listener(s.feedback, &kFeedbackListener, &s);
+    // A frame callback on this queue (asked through a wrapper of Qt's wl_surface, so its answer comes here): it is
+    // answered when the frame of the surface's next commit is up.
+    if (auto* wrapper = static_cast<wl_surface*>(wl_proxy_create_wrapper(surface))) {
+        wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(wrapper), s.queue);
+        s.frame = wl_surface_frame(wrapper);
+        wl_proxy_wrapper_destroy(wrapper);
+        if (s.frame) wl_callback_add_listener(s.frame, &kFrameListener, &s);
+    }
     s.preferredChanged = false;
     s.read(s.feedback, s.preferred);
     return wl_display_get_error(s.display) == 0;
@@ -242,8 +256,11 @@ bool WaylandColor::attach(wl_surface* surface) {
 void WaylandColor::detach() {
     State& s = *s_;
     // (destroying is allowed when the wl_surface has gone: the objects are inert then)
+    if (s.frame) wl_callback_destroy(s.frame);
     if (s.feedback) wp_color_management_surface_feedback_v1_destroy(s.feedback);
     if (s.cmSurface) wp_color_management_surface_v1_destroy(s.cmSurface);
+    s.frame = nullptr;
+    s.entered = false;
     s.feedback = nullptr;
     s.cmSurface = nullptr;
     s.surface = nullptr;
@@ -269,7 +286,7 @@ bool WaylandColor::describe(const Description& d, std::string* error) {
     if (s.has(s.primaries, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020))
         wp_image_description_creator_params_v1_set_primaries_named(c, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
     else {
-        const std::array<int32_t, 8> p = millionths(Primaries::Bt2020);
+        const std::array<int32_t, 8> p = hdrSurfacePrimariesArgs(Primaries::Bt2020);
         wp_image_description_creator_params_v1_set_primaries(c, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
     }
     // (the luminances are PQ's and HLG's defaults: 0.005 nits, 10 000 or 1000, and reference white at 203)
@@ -277,8 +294,8 @@ bool WaylandColor::describe(const Description& d, std::string* error) {
     // (kept inside what the protocol allows whatever the caller gave: a light outside it is a protocol error)
     const HdrSurfaceLightArgs light = hdrSurfaceLightArgs(d.light, hlg ? Transfer::Hlg : Transfer::Pq, mastering);
     if (mastering) {
-        // (P3-D65, as Montage's HDR10 files state it: render/Exporter)
-        const std::array<int32_t, 8> m = millionths(Primaries::P3D65);
+        // (the sequence's: BT.2020, or P3-D65 as Montage's HDR10 files state it)
+        const std::array<int32_t, 8> m = hdrSurfacePrimariesArgs(d.light.masteringPrimaries);
         wp_image_description_creator_params_v1_set_mastering_display_primaries(c, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
         wp_image_description_creator_params_v1_set_mastering_luminance(c, light.masteringMin10k, light.masteringMax);
     }
@@ -301,16 +318,19 @@ const WaylandColor::Description* WaylandColor::described() const { return s_->ha
 
 const WaylandColor::Preferred& WaylandColor::preferred() const { return s_->preferred; }
 
-void WaylandColor::dispatch() {
+bool WaylandColor::dispatch() {
     State& s = *s_;
-    if (!s.display || !s.queue) return;
+    if (!s.display || !s.queue) return false;
     wl_display_dispatch_queue_pending(s.display, s.queue);
-    if (!s.preferredChanged || !s.feedback) return;
+    if (!s.preferredChanged || !s.feedback) return false;
     s.preferredChanged = false;
     // (what was known is kept if the compositor cannot say just now, an output going or coming; not if it has
     // nothing to say for where the surface is now)
     if (s.read(s.feedback, s.preferred) == State::Answer::Unknown) s.preferred = Preferred();
+    return true;
 }
+
+bool WaylandColor::entered() const { return s_->entered; }
 
 WaylandColor::Preferred WaylandColor::preferredFor(wl_surface* surface) {
     State& s = *s_;

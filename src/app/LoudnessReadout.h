@@ -26,7 +26,7 @@ public:
     // Where the loudness that counts stands against the target: 0 on it (within 1 LU, 2 for Netflix), 1 near (1 LU
     // more), 2 off.
     int integratedStatus() const { return status_; }
-    QString text(const char* field) const;  // "M", "S", "I", "LRA", "TP", "D", "SP" or "INT" as shown
+    QString text(const char* field) const;  // "M", "S", "I", "LRA", "TP", "D", "SP", "INT" or "DO" as shown
 
 public slots:
     void setReading(double momentary, double shortTerm, double integrated, double range, double truePeak);
@@ -50,12 +50,14 @@ private:
     QLabel* d_;
     QLabel* sp_;
     QLabel* int_;
+    QLabel* do_;  // dropouts of the audio device chosen in Monitoring (audio/AudioDevice.h)
     double integrated_ = -200;
     double truePeak_ = -200;
     double dialogue_ = -200;
     double share_ = -1;
     int status_ = 2;
     void colour();
+    void showDropouts();
 };
 
 }  // namespace montage

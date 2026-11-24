@@ -70,7 +70,7 @@ if ! install_packages 240; then
 fi
 # ONNX Runtime (object masks): Ubuntu does not package it, so Microsoft's
 # release goes to /opt/onnxruntime, where CMake looks for it.
-ORT_VERSION=1.30.0
+ORT_VERSION=1.32.0
 case "$(uname -m)" in
   x86_64) ORT_ARCH=x64; ORT_NUGET_ARCH=x64 ;;
   aarch64) ORT_ARCH=aarch64; ORT_NUGET_ARCH=arm64 ;;

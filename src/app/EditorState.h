@@ -307,6 +307,9 @@ signals:
     void historyChanged();
     // An edit made, undone or redone: its name ("Insert", "Undo Insert", "Redo Insert"), to announce.
     void edited(const QString& what);
+    // An Auto Duck kept up to date could not follow an edit: sound under it has not been heard yet (it is listened
+    // to in the background, then the duck is made again).
+    void ducksUnheard();
     void sourceChanged();             // source monitor media or marks changed
     void sequencesAsClipsChanged(bool on);
     void sourceKindsChanged();
@@ -324,6 +327,9 @@ private:
     LiveParameter liveParameter_;
     uint64_t projectGeneration_ = 0;
     void pruneSelection();
+    // Auto Ducks kept up to date are made again where the edit changed the dialogue under them (media/AutoDuck.h), so
+    // that they are part of the edit's own undo step. `say`: tell of keyframes moved by hand that were kept.
+    void followDucks(const Project& before, bool say);
     bool refuseReadOnly();     // true, with a message, when the project cannot be changed
     void releaseLock();        // lets go of the current project's lock, if held
     bool reloadFromDisk();     // a read-only project, read again (keeping what is shown)

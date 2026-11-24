@@ -972,7 +972,7 @@ int64_t unitsAt(int64_t n, uint64_t fromNum, uint64_t fromDen, uint64_t toNum, u
 
 // The events a timed events virtual track plays, in composition edit units: each resource's document's events within
 // the stretch it plays (cut to it), moved to where it plays it; the pieces of an event a resource's end cut joined
-// again. Simple Scheme XML documents only.
+// again. Simple Scheme documents, XML or JSON.
 bool playedEvents(const ImfVirtualTrack& t, TrackFiles& files, dcp::EditRate comp, std::vector<ImfEvent>& out, std::string* error = nullptr) {
     out.clear();
     std::map<std::string, std::pair<std::vector<ImfEvent>, dcp::EditRate>> docs;
@@ -1768,6 +1768,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         int ownFile = -1;
         int64_t ownDuration = 0;
         std::vector<Run> runs;
+        // A timed events track: the tracks it relates to and how (ST 2067-206 9.2.3). Montage's markers: the picture.
+        bool events = false;
+        std::vector<std::pair<QString, QString>> related;
     };
     std::vector<Virtual> virtuals;
     auto trackIdFor = [&](const ImfVirtualTrack* t) { return t ? QStringLiteral("urn:uuid:") + QString::fromStdString(t->id) : urn(dcp::newUuid()); };
@@ -2078,22 +2081,33 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     // Markers: event-based metadata (ST 2067-206), each of the programme's an event of a Simple Scheme document whose
     // timeline is the composition's. A supplemental plays the earlier package's events again where they are the same,
     // and carries only the stretches where they changed (an empty document where they were taken away).
-    int eventCount = 0, newEventCount = 0;
-    if (settings.events && settings.application == 2 && edition >= 2026) {
+    // In every application (Application #2E to the 2026 edition: its 2021 identification is made as before); as XML
+    // or, when asked, JSON (a supplemental keeps the form of the earlier track, as ST 2067-206 9.2.2 holds a virtual
+    // track's files to one).
+    int eventCount = 0, newEventCount = 0, carriedEventTracks = 0, leftEventTracks = 0;
+    const ImfVirtualTrack* wasMarkers = nullptr;
+    const bool eventsHere = settings.application != 2 || edition >= 2026;
+    if (eventsHere) {
+        // (the earlier package's markers: a media events track whose files list Montage's markers scheme)
+        for (const ImfVirtualTrack& t : old.tracks) {
+            if (wasMarkers || t.kind != kEventsSequence || t.resources.empty()) continue;
+            const dcp::ImfTrackReader* f = oldFiles.get(t.resources.front().trackFile);
+            if (f && QString::fromStdString(f->eventSchemes()).split(' ', Qt::SkipEmptyParts).contains(QLatin1String(kImfMarkerScheme))) wasMarkers = &t;
+        }
+    }
+    if (settings.events && eventsHere) {
         const std::vector<ImfEvent> events = imfEventsOfMarkers(s.markers, first, programme, frames);
         eventCount = int(events.size());
-        // (the earlier package's markers: a media events track whose files list Montage's markers scheme)
-        const ImfVirtualTrack* was = nullptr;
-        for (const ImfVirtualTrack& t : old.tracks) {
-            if (was || t.kind != kEventsSequence || t.resources.empty()) continue;
-            const dcp::ImfTrackReader* f = oldFiles.get(t.resources.front().trackFile);
-            if (f && QString::fromStdString(f->eventSchemes()).split(' ', Qt::SkipEmptyParts).contains(QLatin1String(kImfMarkerScheme))) was = &t;
-        }
+        const ImfVirtualTrack* was = wasMarkers;
+        bool json = settings.eventsJson;
+        if (was)
+            if (const dcp::ImfTrackReader* f = oldFiles.get(was->resources.front().trackFile)) json = f->textMime() == "application/json";
         if (!events.empty() || was) {
             Virtual vt;
             vt.kind = QString::fromLatin1(kEventsSequence);
             vt.editRate = editRate;
             vt.trackId = trackIdFor(was);
+            vt.events = true;
             // Where the events differ from the earlier track's: all of it, unless that is at this edit rate and read.
             std::vector<std::pair<int64_t, int64_t>> stretches{{0, frames}};
             std::vector<ImfEvent> before;
@@ -2132,7 +2146,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 const size_t fileIndex = ownFile("EVENTS", vt.kind);
                 dcp::ImfTimedEventsWriter writer;
                 if (!writer.open(QDir(folder).filePath(own[fileIndex].file).toStdString(), own[fileIndex].id, rate, &err) ||
-                    !writer.write(imfEventsDocument(mine, rate.num, rate.den), span, "text/xml", {kImfMarkerScheme, kImfSimpleScheme}, &err) ||
+                    !writer.write(imfEventsDocument(mine, rate.num, rate.den, json), span, json ? "application/json" : "text/xml",
+                                  {kImfMarkerScheme, kImfSimpleScheme}, &err) ||
                     !writer.close(&err))
                     return fail(err);
                 own[fileIndex].descriptor = descriptorXml([&](QXmlStreamWriter& x) { timedEventsDescriptor(x, writer); });
@@ -2141,6 +2156,43 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 newEventCount = int(mine.size());
             }
             virtuals.push_back(std::move(vt));
+        }
+    }
+    // Other makers' timed events tracks in the earlier package (any that is not Montage's markers): carried into a
+    // supplemental as they are, each playing its track files again for as long as the composition lasts, with the
+    // relationships its parameter set gave. One shorter than the new composition is left out (there is nothing to
+    // play past its end), which the result says.
+    if (supplemental) {
+        std::map<std::string, std::vector<std::pair<QString, QString>>> relationships;
+        {
+            std::string of;
+            QString to;
+            for (const auto& [path, text] : packageXmlItems(QString::fromStdString(old.path))) {
+                if (path.endsWith("ExtensionProperties/TimedEventsVirtualTrackParameterSet")) of.clear();
+                else if (path.endsWith("ExtensionProperties/TimedEventsVirtualTrackParameterSet/TrackId")) of = packageBareId(text).toStdString();
+                else if (path.endsWith("TimedEventsVirtualTrackParameterSet/TrackRelationship/RelatedTrackId")) to = text.trimmed();
+                else if (path.endsWith("TimedEventsVirtualTrackParameterSet/TrackRelationship/RelationshipKind") && !of.empty() && !to.isEmpty())
+                    relationships[of].push_back({to, text.trimmed()});
+            }
+        }
+        for (const ImfVirtualTrack& t : old.tracks) {
+            if (!isEventsSequence(t.kind) || &t == wasMarkers || t.resources.empty()) continue;
+            const ImfResource& r0 = t.resources.front();
+            const int64_t want = unitsAt(frames, rate.num, rate.den, r0.rateNum, r0.rateDen);
+            if (t.length() < want || want <= 0) {
+                ++leftEventTracks;
+                continue;
+            }
+            Virtual vt;
+            vt.kind = QString::fromStdString(t.kind);
+            vt.editRate = QStringLiteral("%1 %2").arg(r0.rateNum).arg(r0.rateDen);
+            vt.trackId = trackIdFor(&t);
+            vt.old = &t;
+            vt.events = true;
+            if (const auto set = relationships.find(t.id); set != relationships.end()) vt.related = set->second;
+            addRun(vt.runs, true, 0, want);
+            virtuals.push_back(std::move(vt));
+            ++carriedEventTracks;
         }
     }
 
@@ -2448,9 +2500,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                                 .arg(runSeconds / 3600, 2, 10, QLatin1Char('0'))
                                 .arg(runSeconds / 60 % 60, 2, 10, QLatin1Char('0'))
                                 .arg(runSeconds % 60, 2, 10, QLatin1Char('0'));
-    const Virtual* eventsTrack = nullptr;
-    for (const Virtual& v : virtuals)
-        if (v.kind == kEventsSequence) eventsTrack = &v;
+    const bool eventsTracks = std::any_of(virtuals.begin(), virtuals.end(), [](const Virtual& v) { return v.events; });
     const bool cplOk = writeXml(cplFile, [&](QXmlStreamWriter& x) {
         x.writeStartElement("CompositionPlaylist");
         x.writeDefaultNamespace("http://www.smpte-ra.org/schemas/2067-3/2016");
@@ -2460,7 +2510,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (settings.immersive) x.writeNamespace(QString::fromLatin1(kIabNs), "iab");
         if (settings.sadm) x.writeNamespace(QString::fromLatin1(kSadmNs), "imfsadm");
         if (settings.adm) x.writeNamespace(QString::fromLatin1(kAdmNs), "imfadm");
-        if (eventsTrack) {
+        if (eventsTracks) {
             x.writeNamespace(QString::fromLatin1(kEventsSequenceNs), "imfses");
             x.writeNamespace(QString::fromLatin1(kEventsCplNs), "imfebm");
         }
@@ -2511,16 +2561,27 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             x.writeTextElement(ns, sadm ? "MGASADMOperationalMode" : "ADMOperationalMode", ns + "#Operational-Mode-A");
             x.writeEndElement();
         }
-        // The markers' virtual track's parameters (ST 2067-206 9.2.3): the picture, which its events mark.
-        if (eventsTrack) {
+        // Each timed events virtual track's parameters (ST 2067-206 9.2.3). The markers': the picture, which its
+        // events mark. A carried track's: what the earlier composition gave it, where those tracks are still played.
+        for (const Virtual& v : virtuals) {
+            if (!v.events) continue;
+            std::vector<std::pair<QString, QString>> related;
+            for (const auto& [to, how] : v.related)
+                if (to != v.trackId && std::any_of(virtuals.begin(), virtuals.end(), [&](const Virtual& o) { return o.trackId == to; }))
+                    related.push_back({to, how});
+            const bool media = v.kind == kEventsSequence;
+            if (related.empty() && media) related.push_back({virtuals.front().trackId, QString::fromLatin1(kMarksRelationship)});
+            if (related.empty()) continue;  // (a generic events track need relate to none)
             const QString ns = QString::fromLatin1(kEventsCplNs);
             x.writeStartElement(ns, "TimedEventsVirtualTrackParameterSet");
             x.writeTextElement(ns, "Id", urn(dcp::newUuid()));
-            x.writeTextElement(ns, "TrackId", eventsTrack->trackId);
-            x.writeStartElement(ns, "TrackRelationship");
-            x.writeTextElement(ns, "RelatedTrackId", virtuals.front().trackId);
-            x.writeTextElement(ns, "RelationshipKind", QString::fromLatin1(kMarksRelationship));
-            x.writeEndElement();
+            x.writeTextElement(ns, "TrackId", v.trackId);
+            for (const auto& [to, how] : related) {
+                x.writeStartElement(ns, "TrackRelationship");
+                x.writeTextElement(ns, "RelatedTrackId", to);
+                x.writeTextElement(ns, "RelationshipKind", how);
+                x.writeEndElement();
+            }
             x.writeEndElement();
         }
         x.writeEndElement();
@@ -2533,7 +2594,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             if (virtuals[i].kind == "IABSequence") x.writeStartElement(QString::fromLatin1(kIabNs), virtuals[i].kind);
             else if (virtuals[i].kind == "MGASADMSignalSequence") x.writeStartElement(QString::fromLatin1(kSadmNs), virtuals[i].kind);
             else if (virtuals[i].kind == "ADMAudioSequence") x.writeStartElement(QString::fromLatin1(kAdmNs), virtuals[i].kind);
-            else if (virtuals[i].kind == kEventsSequence) x.writeStartElement(QString::fromLatin1(kEventsSequenceNs), virtuals[i].kind);
+            else if (virtuals[i].events) x.writeStartElement(QString::fromLatin1(kEventsSequenceNs), virtuals[i].kind);
             else x.writeStartElement("cc:" + virtuals[i].kind);
             x.writeTextElement("Id", urn(dcp::newUuid()));
             x.writeTextElement("TrackId", virtuals[i].trackId);
@@ -2651,6 +2712,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         result->edition = edition;
         result->events = eventCount;
         result->newEvents = newEventCount;
+        result->carriedEventTracks = carriedEventTracks;
+        result->leftEventTracks = leftEventTracks;
         result->prores = proresApp ? prores::profileName(proresProfile) : std::string();
         result->fields = fields == 1 ? "tff" : fields == 2 ? "bff" : "";
         result->ycbcr444 = ycbcr444;
@@ -2844,9 +2907,111 @@ std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const Im
 
 }  // namespace
 
-std::vector<std::string> verifyImf(const std::string& folderPath, const std::function<bool(double)>& progress) {
+namespace {
+
+// What ST 2067-2 5.3.6 and RDD 59-1 8 ask of a sound track file's labels that this descriptor (RegXML) lacks. `order`
+// (when given) takes a note when a 5.1's or a 7.1's channels are not in the order broadcasters commonly ask for: no
+// SMPTE document orders them (channels are told by their labels), so that is advice, not a fault.
+QStringList dppSoundLabelIssues(const std::string& regXml, QStringList* order) {
+    struct Label {
+        QString symbol, dictionary, link, group;
+        int channel = 1;  // (5.3.6.5: the id may be left out of channel 1's)
+    };
+    std::vector<Label> channels, groups;
+    int channelCount = 0;
+    QXmlStreamReader x(QByteArray::fromStdString(regXml));
+    Label* cur = nullptr;
+    while (!x.atEnd()) {
+        x.readNext();
+        if (x.isEndElement() && (x.name() == QLatin1String("AudioChannelLabelSubDescriptor") || x.name() == QLatin1String("SoundfieldGroupLabelSubDescriptor"))) cur = nullptr;
+        if (!x.isStartElement()) continue;
+        const QString name = x.name().toString();
+        if (name == "AudioChannelLabelSubDescriptor") cur = &channels.emplace_back();
+        else if (name == "SoundfieldGroupLabelSubDescriptor") cur = &groups.emplace_back();
+        else if (name == "ChannelCount") channelCount = x.readElementText().trimmed().toInt();
+        else if (cur && name == "MCATagSymbol") cur->symbol = x.readElementText().trimmed();
+        else if (cur && name == "MCALabelDictionaryID") cur->dictionary = x.readElementText().trimmed().toLower();
+        else if (cur && name == "MCALinkID") cur->link = x.readElementText().trimmed().toLower();
+        else if (cur && name == "SoundfieldGroupLinkID") cur->group = x.readElementText().trimmed().toLower();
+        else if (cur && name == "MCAChannelID") cur->channel = x.readElementText().trimmed().toInt();
+    }
+    QStringList out;
+    if (groups.size() != 1) {
+        out << QStringLiteral("has %1 soundfield group labels, not exactly one (ST 2067-2 5.3.6.3)").arg(groups.size());
+        if (groups.empty()) return out;
+    }
+    const Label& group = groups.front();
+    // Each channel one label, each label one channel.
+    std::map<int, int> labelled;
+    for (const Label& c : channels) ++labelled[c.channel];
+    for (int ch = 1; ch <= channelCount; ++ch) {
+        const int n = labelled.count(ch) ? labelled[ch] : 0;
+        if (n != 1) out << QStringLiteral("labels channel %1 %2 (ST 2067-2 5.3.6.2: each channel exactly one label)").arg(ch).arg(n ? QStringLiteral("%1 times").arg(n) : QStringLiteral("not at all"));
+    }
+    for (const auto& [ch, n] : labelled)
+        if (ch < 1 || ch > channelCount) out << QStringLiteral("labels channel %1, which it does not have (ST 2067-2 5.3.6.2)").arg(ch);
+    for (const Label& c : channels)
+        if (c.group != group.link)
+            out << QStringLiteral("has the channel label %1 outside its soundfield group (ST 2067-2 5.3.6.3)").arg(c.symbol);
+    // The labels: of the MCA label registry both documents draw on (RDD 59-1 8), and a known soundfield's channels its own.
+    auto registered = [](const QString& ul) {
+        QString hex = ul;
+        hex.remove(QStringLiteral("urn:smpte:ul:")).remove('.');
+        return hex.size() == 32 && hex.startsWith(QStringLiteral("060e2b3404010")) && hex.mid(16, 4) == QStringLiteral("0302");
+    };
+    if (!registered(group.dictionary))
+        out << QStringLiteral("names its soundfield group %1 by a label of neither ST 2067-8 nor ST 377-42 (RDD 59-1 8)").arg(group.symbol);
+    for (const Label& c : channels)
+        if (!registered(c.dictionary)) out << QStringLiteral("names channel %1 (%2) by a label of neither ST 2067-8 nor ST 377-42 (RDD 59-1 8)").arg(c.channel).arg(c.symbol);
+    static const std::map<QString, QStringList> known = {{"sgST", {"chL", "chR"}},
+                                                         {"sg51", {"chL", "chR", "chC", "chLFE", "chLs", "chRs"}},
+                                                         {"sg71", {"chL", "chR", "chC", "chLFE", "chLss", "chRss", "chLrs", "chRrs"}}};
+    if (const auto own = known.find(group.symbol); own != known.end()) {
+        std::map<QString, int> used;
+        for (const Label& c : channels) {
+            if (!own->second.contains(c.symbol))
+                out << QStringLiteral("labels channel %1 %2, which is not a channel of %3 (ST 2067-2 5.3.6.6)").arg(c.channel).arg(c.symbol, group.symbol);
+            else if (++used[c.symbol] == 2)
+                out << QStringLiteral("labels more than one channel %1 (ST 2067-2 5.3.6.6: %2 has one)").arg(c.symbol, group.symbol);
+        }
+        if (order && out.isEmpty()) {
+            std::vector<Label> sorted = channels;
+            std::sort(sorted.begin(), sorted.end(), [](const Label& a, const Label& b) { return a.channel < b.channel; });
+            QStringList has;
+            for (const Label& c : sorted) has << c.symbol.mid(2);
+            QStringList usual;
+            for (const QString& sym : own->second)
+                if (used.count(sym)) usual << sym.mid(2);
+            if (has != usual)
+                *order << QStringLiteral("its %1 sound's channels are %2; broadcasters commonly ask for %3 (no SMPTE rule orders them: they are told by their labels)")
+                              .arg(group.symbol.mid(2), has.join(", "), usual.join(", "));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::string> verifyImf(const std::string& folderPath, const std::function<bool(double)>& progress, std::vector<std::string>* advice) {
     std::vector<std::string> issues;
     auto issue = [&](const QString& s) { issues.push_back(s.toStdString()); };
+    if (advice) advice->clear();
+    QStringList orderAdvice;
+    bool dpp = false;
+    // (said once the package has been looked at, however the check ends)
+    struct Advise {
+        std::vector<std::string>* advice;
+        QStringList& order;
+        bool& dpp;
+        ~Advise() {
+            if (!advice) return;
+            for (const QString& o : order) advice->push_back(o.toStdString());
+            if (dpp)
+                advice->push_back("Application DPP's additional metadata for making AS-11 files (Recommendation DPP003, RDD 59-1 9.2) is not in this "
+                                  "package: Montage neither writes nor checks it, and RDD 59-1 has no sound or timed text rules beyond its labels, so "
+                                  "a broadcaster's own delivery checks may ask for more");
+        }
+    } advise{advice, orderAdvice, dpp};
     const QDir dir(QString::fromStdString(folderPath));
     if (!dir.exists("ASSETMAP.xml")) {
         issue("No ASSETMAP.xml");
@@ -2960,6 +3125,20 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
             if (comp.contentKind.empty()) issue(c.path + " has no ContentKind, which Application DPP asks for (RDD 59-1 9.1)");
             else if (dppKind(comp.contentKind) && comp.contentKindScope != kDppKindScope)
                 issue(c.path + " gives the content kind " + QString::fromStdString(comp.contentKind) + " outside the DPP's scope (RDD 59-1 9.1)");
+            // Its sound (RDD 59-1 8, which takes ST 377-42's labels beside ST 2067-8's, and ST 2067-2 5.3.6): each
+            // sound track file's channels labelled once each, in one soundfield group that holds only its own.
+            std::set<std::string> looked;
+            for (const ImfVirtualTrack& t : comp.tracks) {
+                if (t.kind != "MainAudioSequence") continue;
+                for (const ImfResource& r : t.resources) {
+                    if (!looked.insert(r.encoding).second) continue;
+                    const auto d = comp.descriptors.find(r.encoding);
+                    if (d == comp.descriptors.end()) continue;
+                    for (const QString& found : dppSoundLabelIssues(d->second, advice ? &orderAdvice : nullptr))
+                        issue(QStringLiteral("%1: the sound of track file %2 %3").arg(c.path, QString::fromStdString(r.trackFile), found));
+                }
+            }
+            dpp = true;
         }
         // Application #2E's sizes: to 8192 x 6224 (the 8K profiles) in ST 2067-21:2026, to 4096 x 3112 before it.
         if (comp.application == 2 && comp.width > 0) {
@@ -3058,9 +3237,10 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     if (!uris.contains(QLatin1String(kImfSimpleScheme)))
                         issue(QStringLiteral("%1 does not list the Simple Scheme among its event schemes").arg(name));
                     if (QSet<QString>(uris.begin(), uris.end()).size() != uris.size()) issue(QStringLiteral("%1 lists an event scheme twice").arg(name));
-                    // (a Simple Scheme document is XML or JSON, Annex A; Montage reads the XML ones)
-                    const bool xmlDocument = reader.textMime() == "text/xml" || reader.textMime() == "application/xml";
-                    if (!xmlDocument && reader.textMime() != "application/json")
+                    // (a Simple Scheme document is XML or JSON, Annex A)
+                    const bool jsonForm = reader.textMime() == "application/json";
+                    const bool xmlDocument = reader.textMime() == "text/xml" || reader.textMime() == "application/xml" || jsonForm;
+                    if (!xmlDocument)
                         issue(QStringLiteral("%1's document is %2, neither XML nor JSON (ST 2067-206 Annex A)").arg(name, QString::fromStdString(reader.textMime())));
                     if (!firstFile && (reader.textEncoding() != encoding || reader.textMime() != mime || reader.eventSchemes() != schemes))
                         issue(QStringLiteral("%1's encoding, type or schemes differ from the rest of its %2's (ST 2067-206 9.2.2)").arg(name, kind));
@@ -3070,6 +3250,13 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     if (!reader.text(xml, &err)) {
                         issue(QStringLiteral("%1 holds no document Montage reads: %2").arg(name, QString::fromStdString(err)));
                         continue;
+                    }
+                    {
+                        // (the document in the form its descriptor says: A.3's XML or A.4's JSON)
+                        size_t i = 0;
+                        while (i < xml.size() && (uint8_t(xml[i]) <= ' ' || uint8_t(xml[i]) >= 0xef)) ++i;
+                        if (i < xml.size() && (xml[i] == '{') != jsonForm)
+                            issue(QStringLiteral("%1's document is not the %2 its descriptor says").arg(name, QString::fromStdString(reader.textMime())));
                     }
                     for (const std::string& problem : checkImfEventsDocument(xml)) issue(QStringLiteral("%1: %2").arg(name, QString::fromStdString(problem)));
                     std::vector<ImfEvent> events;

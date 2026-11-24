@@ -109,6 +109,14 @@ public:
     // Adds `frames` stereo samples from timeline sample `start` to `out` (interleaved). Notes due before `start` start
     // at its first sample.
     void render(int64_t start, int frames, float* out);
+    // The same with the slots sent to another track (SamplerSlot::output) kept apart: each adds to the block of the
+    // send that names its track, and to `out` when none does (or its block is null). A choke group still cuts across
+    // them. Nothing is allocated here.
+    struct Send {
+        Id output = 0;
+        float* out = nullptr;  // `frames` stereo samples, added to
+    };
+    void render(int64_t start, int frames, float* out, const Send* sends, int count);
     void reset();  // silence, queued notes dropped, round robin from the start
     int activeVoices() const { return int(voices_.size()); }
 
@@ -128,6 +136,7 @@ private:
         const Kit::Sound* sound = nullptr;
         Window* window = nullptr;  // a streamed sound's frames past its head, read ahead from disk
         int key = 0, choke = 0;
+        Id output = 0;  // the track its slot is sent to (0 the sampler's own)
         uint64_t id = 0;
         bool oneShot = true;
         double pos = 0, step = 1;
@@ -141,7 +150,7 @@ private:
     };
     void startVoice(const Event& e, const KitPtr& kit);
     void release(int key, uint64_t id);
-    void renderVoices(float* out, int frames);
+    void renderVoices(float* out, int offset, int frames);
     void letGo(Voice& v);  // its window back to the disk thread
 
     int rate_;
@@ -157,6 +166,8 @@ private:
     std::vector<uint32_t> robinTurns_;
     bool resetPending_ = false;
     bool blocking_ = false;
+    const Send* sends_ = nullptr;  // (of the render under way)
+    int sendCount_ = 0;
     std::shared_ptr<Disk> disk_;  // (made by setKit for a kit with streamed sounds)
 };
 

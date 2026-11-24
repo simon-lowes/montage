@@ -20,6 +20,7 @@
 #include <QPainterPath>
 #include <QPixmap>
 #include <QStyle>
+#include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <functional>
@@ -203,6 +204,26 @@ EffectsBrowser::EffectsBrowser(QWidget* parent) : QWidget(parent) {
     layout->addWidget(tree_, 1);
 
     populate();
+
+    // What the pointer rests on is shown on the Program monitor (the main window does that), until it moves off.
+    tree_->setMouseTracking(true);
+    tree_->viewport()->installEventFilter(this);
+    rest_ = new QTimer(this);
+    rest_->setSingleShot(true);
+    rest_->setInterval(200);
+    connect(rest_, &QTimer::timeout, this, [this] { point(resting_, restingCategory_); });
+    connect(tree_, &QTreeWidget::itemEntered, this, [this](QTreeWidgetItem* item) {
+        const QString type = isLeaf(item) ? item->data(0, kTypeRole).toString() : QString();
+        if (type == resting_) return;
+        resting_ = type;
+        restingCategory_ = EffectCategory(item->data(0, kCategoryRole).toInt());
+        if (type.isEmpty()) {
+            rest_->stop();
+            point(QString(), restingCategory_);
+        } else {
+            rest_->start();
+        }
+    });
 
     connect(search_, &QLineEdit::textChanged, this, [this](const QString& text) { applyFilter(text); });
     connect(search_, &QLineEdit::returnPressed, this, [this] { focusFirstMatch(); });
@@ -427,6 +448,39 @@ void EffectsBrowser::focusFirstMatch() {
             return;
         }
     }
+}
+
+void EffectsBrowser::point(const QString& type, EffectCategory category) {
+    if (type == pointed_) return;
+    pointed_ = type;
+    if (type.isEmpty()) emit previewEnded();
+    else emit previewRequested(type, category);
+}
+
+bool EffectsBrowser::pointAt(const QString& type) {
+    rest_->stop();
+    resting_ = type;
+    if (type.isEmpty()) {
+        point(QString(), EffectCategory::VideoFilter);
+        return true;
+    }
+    for (QTreeWidgetItemIterator it(tree_); *it; ++it)
+        if ((*it)->data(0, kTypeRole).toString() == type) {
+            restingCategory_ = EffectCategory((*it)->data(0, kCategoryRole).toInt());
+            point(type, restingCategory_);
+            return true;
+        }
+    return false;
+}
+
+bool EffectsBrowser::eventFilter(QObject* watched, QEvent* event) {
+    // The pointer off the list: nothing is pointed at.
+    if (watched == tree_->viewport() && event->type() == QEvent::Leave) {
+        rest_->stop();
+        resting_.clear();
+        point(QString(), EffectCategory::VideoFilter);
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 void EffectsBrowser::requestApply(QTreeWidgetItem* item) {

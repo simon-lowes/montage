@@ -33,6 +33,9 @@ std::vector<std::string> ocioChoices(const Effect& e, const std::string& param);
 // (OCIO's ExposureContrastTransform, linear style, pivot 0.18).
 bool applyOcio(const Effect& e, Image& img, std::string* error = nullptr, FrameTime t = 0);
 bool ocioLiveControls(const Effect& e);  // exposure, contrast or gamma set or keyed
+// How many OCIO processors have been built from transforms since the program began (one a transform: a keyed
+// exposure, contrast or gamma changes values of the one processor, on the CPU as on the GPU).
+long ocioProcessorsBuilt();
 // The same transform as OCIO's GPU shader, for render/GpuCompositor (its textures declared from binding 2 up). Its
 // exposure, contrast and gamma are OCIO's dynamic properties there, the shader's `uniforms`, so changing them draws
 // with new values and does not build the shader again. Null (with why) where the config or transform cannot be made,

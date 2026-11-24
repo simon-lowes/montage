@@ -189,6 +189,9 @@ public:
     bool start(const std::string& folder, int port, std::function<bool(const std::string&)> growing, std::string* error = nullptr,
                const std::string& address = "127.0.0.1", double waitSeconds = 10);
     int port() const;
+    // The bytes handed to connections that their clients have not taken yet (as of the last hundredth of a second):
+    // what clients that do not read can make the origin hold.
+    int64_t bytesWaiting() const;
     void stop();
 
     struct State;

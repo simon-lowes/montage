@@ -31,6 +31,7 @@
 #include <QToolButton>
 #include <QJsonDocument>
 #include <algorithm>
+#include <chrono>
 #include <set>
 #include <cmath>
 
@@ -49,6 +50,9 @@ using midimap::Mapping;
 namespace {
 
 const QString kMergeKey = QStringLiteral("midi-learn");
+// How long an NRPN's half waits for its other half: a controller sends the two together (under a millisecond apart on
+// a cable), and a half alone is this late.
+constexpr int kPairMs = int(midimap::Decoder::kPairUs / 1000);
 
 double unit(double v, double lo, double hi) { return hi > lo ? std::clamp((v - lo) / (hi - lo), 0.0, 1.0) : 0.0; }
 
@@ -76,6 +80,15 @@ MidiLearn::MidiLearn(EditorState* state, MixerPanel* mixer, QWidget* window, QOb
     learnTimer_->setInterval(600);
     connect(learnTimer_, &QTimer::timeout, this, [this] {
         if (auto l = learner_.finish()) learnControl(*l);
+    });
+    pairTimer_ = new QTimer(this);
+    pairTimer_->setSingleShot(true);
+    pairTimer_->setTimerType(Qt::PreciseTimer);
+    pairTimer_->setInterval(kPairMs);
+    connect(pairTimer_, &QTimer::timeout, this, [this] {
+        std::vector<midimap::Event> events;
+        decoder_.flush([&](const midimap::Event& e) { events.push_back(e); });
+        handleEvents(events);
     });
     refreshTimer_ = new QTimer(this);
     refreshTimer_->setInterval(33);
@@ -133,6 +146,7 @@ void MidiLearn::setConnection(std::unique_ptr<MidiConnection> connection, const 
     const bool another = device != device_;
     device_ = device;
     decoder_.reset();
+    pairTimer_->stop();
     if (another || mapper_.mappings().empty()) loadMap();
     mapper_.resetTakeover();
     mapper_.reshow();
@@ -163,8 +177,11 @@ void MidiLearn::restore() {
 }
 
 void MidiLearn::receive(const MidiMessage& m) {
+    // (stamped as it arrives: an NRPN's halves are paired by how close together they came, which the GUI thread,
+    // taking them in batches, cannot tell)
+    const int64_t at = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     std::lock_guard<std::mutex> lock(inboxMutex_);
-    inbox_.push_back(m);
+    inbox_.emplace_back(m, at);
     if (!drainPending_) {
         drainPending_ = true;
         QMetaObject::invokeMethod(this, [this] { drain(); }, Qt::QueuedConnection);
@@ -203,19 +220,26 @@ void MidiLearn::reconnect() {
 }
 
 void MidiLearn::drain() {
-    std::vector<MidiMessage> batch;
+    std::vector<std::pair<MidiMessage, int64_t>> batch;
     {
         std::lock_guard<std::mutex> lock(inboxMutex_);
         batch.swap(inbox_);
         drainPending_ = false;
     }
     if (!connection_) return;
-    for (const MidiMessage& m : batch) handle(m);
+    for (const auto& [m, at] : batch) handle(m, at);
 }
 
-void MidiLearn::handle(const MidiMessage& m) {
+void MidiLearn::handle(const MidiMessage& m, int64_t atUs) {
     std::vector<midimap::Event> events;
-    decoder_.feed(m, [&](const midimap::Event& e) { events.push_back(e); });
+    decoder_.feed(m, [&](const midimap::Event& e) { events.push_back(e); }, atUs);
+    // (an NRPN's half held for its other half: taken as one that came alone if none follows)
+    if (decoder_.holding()) pairTimer_->start();
+    else pairTimer_->stop();
+    handleEvents(events);
+}
+
+void MidiLearn::handleEvents(const std::vector<midimap::Event>& events) {
     if (events.empty()) return;
     if (learning_) {
         const qint64 now = QDateTime::currentMSecsSinceEpoch();

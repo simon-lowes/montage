@@ -109,6 +109,10 @@ struct ExportSettings {
     // pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256 or htj2k32 (High-Throughput JPEG 2000, lossless); "" = FFmpeg's
     // writer, ZIP in blocks of 16 lines.
     std::string exrCompression;
+    // PNG frames (videoCodec "png"): how hard the compressor works at each, 0 (fastest, largest files) to 9 (slowest,
+    // smallest); every level keeps every value. -1: the encoder's own choice. And 8 or 16 bits a channel.
+    int pngCompression = -1;
+    int pngBits = 8;
     // JPEG XL frames (videoCodec "jxl", written with libjxl): depth "8", "16", "half" or "float" ("" = 16 bits, half
     // floats in linear light), 0 lossless or libjxl's distance (1 visually lossless), its effort (1-9), and alpha
     // written premultiplied rather than straight.
@@ -140,6 +144,10 @@ struct ExportSettings {
     // while it still matches the cut, else before the render) and carried in HEVC and AV1 video on every frame; the
     // same goes beside the file as name.hdr10plus.json, for other codecs and for encoders and checks that read it.
     bool hdr10Plus = false;
+    // Carry Grain as Parameters (AV1 only, render/Av1GrainExport.h): each shot's grain taken out of the picture before
+    // it is encoded and written beside it as AV1 film grain parameters, which the decoder puts back. "measure" (each
+    // shot's measured as Measure Grain does), a grain profile's text (one for every shot), or "" / "off".
+    std::string filmGrain;
     // Adaptive HDR metadata (PQ and HLG exports, render/AdaptiveHdr.h): each scene's reference white, headroom and the
     // gain curve to its SDR rendition (its SDR trim, else Montage's own mapping), carried in HEVC and AV1 video on every
     // frame so displays of any headroom tone map it as the grade did.
@@ -355,8 +363,9 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
 // when it cannot be stamped.
 bool extractClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                       const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
-// What such a WAV is stamped with: the source's timecode at the clip's first frame (its media's start timecode, or
-// midnight without one, plus the clip's in-point; round again past midnight), the recording's timecode rate (its own,
+// What such a WAV is stamped with: the source's timecode at the clip's first sample played (its media's start timecode,
+// or midnight without one, plus the clip's in-point, or for a reversed clip the last sample of its stretch of the
+// source, where its sound begins; round again past midnight), the recording's timecode rate (its own,
 // else its frame rate, else the sequence's), the clip's name as its description and the media's project, scene, take
 // and tape.
 struct BroadcastStamp;

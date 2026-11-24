@@ -1014,6 +1014,22 @@ std::vector<EffectInfo> buildCatalog() {
                      {angle("direction", "Direction", 135), num("relief", "Relief (px)", 0.25, 50, 2, 0.25), pct("contrast", "Contrast", 0, 500, 100),
                       pct("blend", "Blend With Original", 0, 100, 0)},
                      {}});
+        // Bevels on a layer's alpha (render/BevelFx.h): a lit chamfer along its edge, and the layer raised from what is
+        // behind it, with a blend mode each for the lit and the shaded side.
+        c.push_back({"edge_bevel", "Edge Bevel", EffectCategory::VideoFilter, "Stylize",
+                     {angle("angle", "Light Angle", 45), num("height", "Height (px)", 0, 500, 8, 0.5),
+                      num("thickness", "Thickness (px)", 0.5, 500, 8, 0.5), color("light", "Light Color", 1, 1, 1),
+                      pct("strength", "Light Strength", 0, 100, 40)},
+                     {}});
+        c.push_back({"layer_bevel", "Layer Bevel", EffectCategory::VideoFilter, "Stylize",
+                     {choice("style", "Style", {"Inner Bevel", "Outer Bevel", "Emboss", "Pillow Emboss"}, 0), pct("depth", "Depth", 1, 1000, 100),
+                      num("size", "Size (px)", 0.5, 500, 5, 0.5), num("soften", "Soften (px)", 0, 100, 0, 0.5), angle("angle", "Light Angle", 120),
+                      num("altitude", "Light Altitude (°)", 1, 89, 30, 1), color("highlight", "Highlight Color", 1, 1, 1),
+                      choice("highlight_mode", "Highlight Blend", {"Normal", "Screen", "Add", "Multiply", "Overlay"}, 1),
+                      pct("highlight_opacity", "Highlight Opacity", 0, 100, 75), color("shadow", "Shadow Color", 0, 0, 0),
+                      choice("shadow_mode", "Shadow Blend", {"Normal", "Screen", "Add", "Multiply", "Overlay"}, 3),
+                      pct("shadow_opacity", "Shadow Opacity", 0, 100, 75)},
+                     {}});
         // Paint (render/PaintFx.h): oil paint by the anisotropic Kuwahara filter, or a smear along the contours.
         c.push_back({"painterly", "Painterly", EffectCategory::VideoFilter, "Stylize",
                      {choice("style", "Style", {"Oil Paint", "Contour Smear"}, 0), num("radius", "Brush Size (px)", 1, 40, 6, 0.5),
@@ -1325,6 +1341,18 @@ std::vector<EffectInfo> buildCatalog() {
                                num("size", "Font Size (px)", 4, 1000, 120, 1),
                                color("color", "Face", 0.95, 0.95, 0.95),
                                color("side_color", "Sides", 0.45, 0.5, 0.6),
+                               // Each face filled with its colour, a gradient down the title to a second colour, or
+                               // a track's picture fitted to the title; the back as the face unless set apart.
+                               choice("face_fill", "Face Fill", {"Colour", "Gradient", "A Track's Picture"}, 0),
+                               color("color2", "Face Gradient's Bottom", 0.55, 0.6, 0.7),
+                               num("face_track", "Face Picture's Track (V number)", 1, 99, 1, 1),
+                               choice("side_fill", "Sides' Fill", {"Colour", "Gradient", "A Track's Picture"}, 0),
+                               color("side_color2", "Sides' Gradient's Bottom", 0.2, 0.22, 0.3),
+                               num("side_track", "Sides' Picture's Track (V number)", 1, 99, 1, 1),
+                               choice("back_fill", "Back Fill", {"As the Face", "Colour", "Gradient", "A Track's Picture"}, 0),
+                               color("back_color", "Back", 0.95, 0.95, 0.95),
+                               color("back_color2", "Back Gradient's Bottom", 0.55, 0.6, 0.7),
+                               num("back_track", "Back Picture's Track (V number)", 1, 99, 1, 1),
                                num("depth", "Extrusion (px)", 0, 1000, 40, 0.5),
                                num("rot_x", "Tilt (X°)", -360, 360, 10, 0.5),
                                num("rot_y", "Turn (Y°)", -360, 360, -20, 0.5),
@@ -1422,10 +1450,27 @@ std::vector<EffectInfo> buildCatalog() {
                          num("crop_y1", "Crop Box Top (Y)", -100000, 100000, 10, 0.01),
                          num("crop_z0", "Crop Box Back (Z)", -100000, 100000, -10, 0.01),
                          num("crop_z1", "Crop Box Front (Z)", -100000, 100000, 10, 0.01),
+                         // Cleaning a capture (media/Splats.h SplatFilter): every test that is set must pass.
+                         choice("clean_box", "The Crop Box Keeps", {"The Splats Inside It", "The Splats Outside It"}, 0),
+                         pct("clean_opacity", "Drop Splats Fainter Than (opacity)", 0, 100, 0),
+                         num("clean_size", "Drop Splats Larger Than (the file's units, 0: none)", 0, 100000, 0, 0.001),
+                         num("clean_near", "Drop Splats Farther From Their Neighbours Than (0: none)", 0, 100000, 0, 0.001),
+                         num("clean_near_count", "Neighbours a Splat Needs Within That Distance", 1, 64, 3, 1),
+                         choice("clean_sphere", "Sphere", {"Off", "Keep the Splats Inside It", "Keep the Splats Outside It"}, 0),
+                         num("clean_sphere_x", "Sphere Centre X", -100000, 100000, 0, 0.01),
+                         num("clean_sphere_y", "Sphere Centre Y", -100000, 100000, 0, 0.01),
+                         num("clean_sphere_z", "Sphere Centre Z", -100000, 100000, 0, 0.01),
+                         num("clean_sphere_radius", "Sphere Radius (distance from its centre)", 0, 100000, 1, 0.01),
+                         choice("clean_color", "Colour Range", {"Off", "Drop the Splats in It", "Keep Only the Splats in It"}, 0),
+                         color("clean_color_value", "Colour Range Middle", 0, 0, 0),
+                         pct("clean_color_range", "Colour Range Width (each channel)", 0, 100, 10),
+                         choice("draft", "While Editing, Draw",
+                                {"Every Splat", "Half the Splats", "A Quarter of the Splats", "An Eighth of the Splats", "Their Centres as Points"}, 0),
                      },
-                     {str("file", "Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ)", StringKind::File),
+                     {str("file", "Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ, glTF)", StringKind::File),
                       str("camera_file", "Take The File's Camera From (USD, glTF; else the model)", StringKind::File),
-                      str("proj_camera_file", "Projector: Take The Camera From (USD, glTF)", StringKind::File)}});
+                      str("proj_camera_file", "Projector: Take The Camera From (USD, glTF)", StringKind::File),
+                      str("clean_removed", "Splats Removed by Hand (their numbers in the file)", StringKind::Text)}});
         // The scene's camera (render/ModelClip.h): 3D layers, models and splats that choose The Scene's Camera are seen
         // through the one on the highest track at the time. Draws nothing itself.
         c.push_back({"camera3d", "Camera", EffectCategory::Generator, "Titles",

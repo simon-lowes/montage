@@ -28,6 +28,7 @@
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <set>
 
 #include "EditorState.h"
@@ -53,6 +54,9 @@ struct Multiviewer::Slot {
     Id media = 0;
     int64_t notedFrames = -1;
     MultiviewTile* widget = nullptr;
+    // Recordings ended by recordTo and still being finished on the recorder's thread, each true when it ended before
+    // its first second was written (so not yet imported): imported once the recorder says it is finished.
+    std::map<QString, bool> finishing;
 };
 
 namespace {
@@ -269,6 +273,7 @@ Multiviewer::Tile Multiviewer::tile(int i) const {
     t.path = s.path;
     if (s.recorder) t.repeated = s.recorder->status().repeated;
     t.opened = s.opened;
+    t.finishing = int(s.finishing.size());
     t.media = s.media;
     t.error = s.error;
     return t;
@@ -285,8 +290,10 @@ QString Multiviewer::nextPath(const QString& label) const {
     name.replace(QRegularExpression(QStringLiteral("[/\\\\:*?\"<>|]")), QStringLiteral("_"));
     name = name.trimmed().isEmpty() ? tr("Input") : name.trimmed();
     std::set<QString> taken;
-    for (const auto& s : inputs_)
+    for (const auto& s : inputs_) {
         if (!s->path.isEmpty()) taken.insert(s->path);
+        for (const auto& f : s->finishing) taken.insert(f.first);  // (an MXF file is written whole at its end)
+    }
     // (JPEG XS records to MXF, the rest to QuickTime)
     const QString ext = codec_->currentData().toString() == QLatin1String("jpeg_xs") ? QStringLiteral("mxf") : QStringLiteral("mov");
     for (int n = 1;; ++n) {
@@ -305,16 +312,16 @@ bool Multiviewer::startSlot(Slot& s, bool record, QString* error) {
     }
     // A feed being received is recorded, or no longer, from the same reception: nothing is opened again (an SRT
     // caller does not have to call again, and no picture is missed between watching and recording).
-    // (a feed still being opened takes the file once it runs: not waited for, as this thread draws the window)
+    // (never waited for, as this thread draws the window: the file being recorded is finished on the recorder's own
+    // thread, and one not yet imported is imported once onFileFinished says so)
     if (s.recorder && s.recorder->recording() && !s.ended) {
-        const bool running = s.feed->look().running;
         CaptureFile to;
         to.codec = codec_->currentData().toString().toStdString();
         const QString path = record ? nextPath(labelOf(s.input)) : QString();
         to.path = path.toStdString();
         std::string why;
-        if (s.recorder->recordTo(to, &why, running)) {
-            if (s.recording) importSlot(s);  // (a recording shorter than its first fragment, whole now)
+        if (s.recorder->recordTo(to, &why, false)) {
+            if (s.recording && !s.path.isEmpty()) s.finishing[s.path] = !s.media;
             s.recording = record;
             s.error = refused;
             if (record) {
@@ -378,6 +385,22 @@ bool Multiviewer::startSlot(Slot& s, bool record, QString* error) {
         QMetaObject::invokeMethod(self.data(), [self, id, generation, path, ok, m] {
             if (!self) return;
             Slot* s = self->find(id);
+            if (const auto it = s ? s->finishing.find(path) : std::map<QString, bool>::iterator(); s && it != s->finishing.end()) {
+                // (a recording recordTo ended, finished now: imported if it ended before its first second was written)
+                const bool import = it->second;
+                s->finishing.erase(it);
+                QStringList errors;
+                if (import && ok && QFileInfo::exists(path)) {
+                    const std::vector<Id> ids = self->state_->importFiles({path}, &errors, tr("Captures"));
+                    // (the tile's last recording, when no other has begun since)
+                    if (!ids.empty() && s->path == path && !s->recording) {
+                        s->media = ids.front();
+                        if (const MediaItem* item = self->state_->project().findMedia(s->media)) s->importedPath = QString::fromStdString(mediaFileOnDisk(item->path));
+                    }
+                }
+                emit self->changed();
+                return;
+            }
             if (!s || s->generation != generation || s->path != path) return;
             if (!m.isEmpty()) s->error = m;
             if (!ok && s->recording) {

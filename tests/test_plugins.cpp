@@ -4,6 +4,7 @@
 #include <QtTest>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QScopeGuard>
 #include <QThread>
 #include <QProcess>
 #include <QStandardPaths>
@@ -33,6 +34,7 @@
 #include "audio/AraHost.h"
 #include "audio/AudioDevice.h"
 #include "audio/PluginEffect.h"
+#include "audio/RtGuard.h"
 #include "audio/PluginHost.h"
 #include "audio/PluginIpc.h"
 #include "audio/Plugins.h"
@@ -267,12 +269,16 @@ struct Take {
     }
 };
 
+using DeviceTake = Take;  // (the name for it inside the test class, where montage's Take is seen too)
+
 // Records a click through `e` (open): where it lands in the take.
 int64_t recordClick(audiodev::Engine& e, int rate = 48000) {
     Clicker clicker;
     Take take;
     const int out = e.addOutput(&clicker, rate, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
+    auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
     const int in = e.addInput(&clicker, rate, [&](const float* i, int ch, int n, int64_t at) { take.add(i, ch, n, at); });
+    auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
     if (out < 0 || in < 0) return -2;
     QElapsedTimer t;
     t.start();
@@ -462,7 +468,7 @@ private slots:
 
     void findsPluginFiles() {
         auto files = findPluginFiles(Format::Clap, {kClapDir.toStdString()});
-        QCOMPARE(files.size(), size_t(6));  // good, hang, crash, latency, sidechain, convolver
+        QCOMPARE(files.size(), size_t(8));  // good, hang, crash, latency, the two long ids, sidechain, convolver
         auto good = findPluginFiles(Format::Clap, {clapDir("good")});
         QCOMPARE(good.size(), size_t(1));
         QVERIFY(QString::fromStdString(good[0]).endsWith("MontageTestPlugins.clap"));
@@ -2813,6 +2819,20 @@ private slots:
             QVERIFY(!ofx::gl::dmaBufFits(b, &why));
             b.stride = 0xffffffffu;
             QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            // (nightly 23 Nov) A row holds its pixels at the format's size, eight bytes each here, not a byte a pixel
+            // (rows as long as the picture is wide were taken, and read past their ends); a format of four bytes a
+            // pixel is held to that; and a format Montage does not know the size of is not taken.
+            b.stride = 16;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.stride = 16 * 8 - 1;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.fourcc = 0x34324241, b.stride = 16 * 4;  // (AB24)
+            QVERIFY2(ofx::gl::dmaBufFits(b, &why), why.c_str());
+            b.stride = 16 * 4 - 1;
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why));
+            b.fourcc = 0x3231564e, b.stride = 16 * 8;  // (NV12: not one plane of four channels)
+            QVERIFY(!ofx::gl::dmaBufFits(b, &why) && why.find("format") != std::string::npos);
+            b.fourcc = 0x48344241;
             int fence[2] = {-1, -1};
             QCOMPARE(::pipe(fence), 0);
             b.stride = 16 * 8, b.fence = fence[0];
@@ -2821,6 +2841,13 @@ private slots:
             QVERIFY(ofx::gl::awaitDrawn(b, &why, 50));
             ::close(fence[0]);
             ::close(fence[1]);
+            // (nightly 23 Nov) A fence whose other end has gone says so at once, and that is not a picture drawn.
+            int gone[2] = {-1, -1};
+            QCOMPARE(::pipe(gone), 0);
+            ::close(gone[1]);
+            b.fence = gone[0];
+            QVERIFY(!ofx::gl::awaitDrawn(b, &why, 50) && why.find("cannot be waited for") != std::string::npos);
+            ::close(gone[0]);
             QVERIFY(!ofx::gl::sendDmaBuf(name, sent));  // (the post is gone with its socket)
         }
 #endif
@@ -3040,6 +3067,62 @@ private slots:
             QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
             ofx::remote::releaseIdle();
         }
+    }
+
+    // Nightly 23 Nov: an export stops for the plug-in failures of its own render only. Two exports run at once. One
+    // has an OpenFX plug-in that fails to render in Montage's own process at its third picture: it stops, naming the
+    // plug-in. The other, held in the middle of its frames until the first has stopped, goes through. (Failures were
+    // counted for all exports together, so the second stopped as well.)
+    void exportsAtOnceStopForTheirOwnPluginFailures() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-export-two-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert));
+        Hosting inProcess(Isolation::InProcess);
+        auto project = [&](bool withPlugin) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+            Clip clip = makeGeneratorClip(p, "color", 10);
+            if (withPlugin) clip.effects.push_back(ofx::makeEffect(p, invert));
+            edit::overwrite(p, s, {TrackKind::Video, 0}, clip);
+            return p;
+        };
+        const Project failing = project(true), plain = project(false);
+        ExportSettings stFailing, stPlain;
+        stFailing.path = path("ofx-export-fails.mkv").toStdString();
+        stPlain.path = path("ofx-export-beside.mkv").toStdString();
+        stFailing.videoCodec = stPlain.videoCodec = "ffv1";
+        stFailing.audioCodec = stPlain.audioCodec = "none";
+        std::atomic<bool> started{false}, release{false};
+        bool besideOk = false;
+        std::string besideError;
+        std::thread beside([&] {
+            besideOk = exportSequence(plain, *plain.active(), stPlain,
+                                      [&](double, FrameTime) {
+                                          started = true;
+                                          while (!release) QThread::msleep(2);
+                                      },
+                                      nullptr, &besideError);
+        });
+        const bool running = eventually([&] { return started.load(); });
+        bool failedOk = true;
+        std::string failedError;
+        if (running) {
+            Fault f("fail:render:2");
+            failedOk = exportSequence(failing, *failing.active(), stFailing, nullptr, nullptr, &failedError);
+        }
+        release = true;
+        beside.join();
+        QVERIFY(running);
+        QVERIFY(!failedOk);
+        QVERIFY2(QString::fromStdString(failedError).startsWith("Export stopped because the plug-in Test Invert "), failedError.c_str());
+        QVERIFY2(besideOk, besideError.c_str());
+        // With the plug-in rendering again, the first goes through too.
+        QVERIFY2(exportSequence(failing, *failing.active(), stFailing, nullptr, nullptr, &failedError), failedError.c_str());
     }
 
     // Phase 15 #2: OpenFX on-screen controls drawn by the plug-in's host. The host draws them (the Draw Suite and
@@ -3443,6 +3526,61 @@ private slots:
         QVERIFY(reg.find("clap:org.montage.test.delay64").has_value());
     }
 
+    // Ids of 300 bytes that differ in their last byte alone, in one shared host: the one that crashes the host as it
+    // loads is blocked and named whole, and the other, loaded before it, is not taken for it.
+    void longPlugInIdIsBlamedWhole() {
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-long.json"), {clapDir("longa"), clapDir("longb")});
+        reg.scan();
+        const std::string stem = "clap:org.montage.test.long." + std::string(277, 'x');
+        const auto crashes = reg.find(stem + "a"), stays = reg.find(stem + "b");
+        QVERIFY(crashes && stays);
+        QCOMPARE(crashes->id.size(), size_t(305));
+        QCOMPARE(crashes->vendor, stays->vendor);
+        QVERIFY(crashes->path != stays->path);
+        Hosting hostingMode(Isolation::PerVendor, [](HostingSettings& s) { s.autoRestarts = 0; });
+        std::string err;
+        std::unique_ptr<Instance> first;
+        {
+            Fault f("crash:long-a-init");
+            first = instantiate(*stays, &err);
+        }
+        QVERIFY2(first && first->activate(48000, 128), err.c_str());
+        const int64_t shared = hostProcessOf(first.get());
+        QVERIFY(shared > 0);
+        RenderModeScope playing(true);
+        std::vector<float> l(128), r(128);
+        float* ch[2] = {l.data(), r.data()};
+        auto block = [&] {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            first->process(ch, 2, 128);
+        };
+        block();
+        QVERIFY(!instantiate(*crashes, &err));  // (in the same host, which crashes as it loads it)
+        QVERIFY2(err.find("while loading it") != std::string::npos, err.c_str());
+        bool crashesBlocked = false, staysBlocked = false;
+        for (const Blocked& b : reg.blocklist()) {
+            crashesBlocked |= b.path == crashes->path;
+            staysBlocked |= b.path == stays->path;
+        }
+        QVERIFY(crashesBlocked && !staysBlocked);
+        QVERIFY(!reg.find(stem + "a") && reg.find(stem + "b"));
+        // The failure is filed under the whole id, and none under the other's.
+        const auto failure = failureOf(crashes->id);
+        QVERIFY(failure.has_value());
+        QCOMPARE(QString::fromStdString(failure->kind), QString("load"));
+        // The other plays on in a new host: it was only in the one that ended.
+        QVERIFY(eventually([&] {
+            block();
+            return !bypassed(first.get()) && hostProcessOf(first.get()) > 0 && hostProcessOf(first.get()) != shared;
+        }));
+        QVERIFY(!failureOf(stays->id).has_value());
+        reg.unblock(crashes->path);
+        reg.scan();
+        QVERIFY(reg.find(stem + "a").has_value());
+    }
+
     // A host for each instance: a crash in one leaves its sibling (the same plug-in) untouched, for audio and OpenFX.
     void hostPerInstanceKeepsSiblingsApart() {
         const auto gain = testPlugin("gain");
@@ -3699,6 +3837,44 @@ private slots:
         audiodev::setLoopbackOptions({});
     }
 
+    void recordingLandsWherePlayedAfterADropout() {
+        // The device held up for 120 ms (a busy computer) catches up at once, block after block, faster than sound is
+        // made ahead for it: the output runs dry and the timeline stands still while the device goes on. A click played
+        // after that is recorded where it was played, not later by what ran dry.
+        audiodev::setLoopbackOptions({256, 512, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QTest::qWait(100);
+        e.resetXruns();
+        Clicker clicker;
+        DeviceTake take;
+        std::atomic<bool> held{false};
+        const int out = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) {
+            const int64_t p = clicker.render(o, ch, n);
+            if (p >= 1200 && !held.exchange(true)) audiodev::loopbackStall(120);  // (a quarter of the way to the click)
+            return p;
+        });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
+        const int in = e.addInput(&clicker, 48000, [&](const float* i, int ch, int n, int64_t at) { take.add(i, ch, n, at); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
+        QVERIFY(out >= 0 && in >= 0);
+        QElapsedTimer t;
+        t.start();
+        while (take.size() < size_t(clicker.clickAt + 4800) && t.elapsed() < 10000) QThread::msleep(10);
+        const audiodev::EngineStatus st = e.status();
+        e.removeInput(in);
+        e.removeOutput(out);
+        QVERIFY(held.load());
+        QVERIFY2(st.underruns > 0, "the device's catching up did not run the output dry");
+        QCOMPARE(take.click(), clicker.clickAt);
+        audiodev::setLoopbackOptions({});
+    }
+
     void loopbackFollowsRateChanges() {
         // The device's rate changed mid-session (as a server's is): Montage follows it, resampling its 48 kHz both ways,
         // and recordings still land where they were played.
@@ -3720,6 +3896,7 @@ private slots:
         // The playback still runs in real time at its own rate: about 48000 of its samples a second (of the time waited).
         Clicker clicker;
         const int id = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
+        auto unhookId = qScopeGuard([&] { e.removeOutput(id); });
         QVERIFY(id >= 0);
         QElapsedTimer t;
         t.start();
@@ -3732,6 +3909,7 @@ private slots:
         // clock): a second at 96 kHz, then a second at 48 kHz, is two seconds heard.
         Clicker steady;
         const int out = e.addOutput(&steady, 48000, 2, [&](float* o, int ch, int n) { return steady.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
         QVERIFY(out >= 0);
         QTRY_VERIFY(e.heardSeconds(out) > 0);
         QElapsedTimer heard;
@@ -3808,6 +3986,7 @@ private slots:
         QVERIFY(e.isOpen());
         Listener heard;
         const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
         QVERIFY(in >= 0);
         audiodev::Feed f(e);
         QVERIFY2(f.open(44100, 2, 0.25, &why), why.c_str());
@@ -3815,6 +3994,10 @@ private slots:
         QCOMPARE(f.room(), int64_t(11025));
         std::vector<float> tone(size_t(44100) * 2);
         for (int i = 0; i < 44100; ++i) tone[size_t(i) * 2] = tone[size_t(i) * 2 + 1] = float(0.4 * std::sin(2 * M_PI * 1000 * i / 44100.0));
+        // (settled first: the cushion as deep as this computer needs. A device thread woken late runs the ring dry once
+        // before the cushion has grown for it, and that gap, heard in the tone, would lower its pitch as counted)
+        QThread::msleep(300);
+        e.resetXruns();
         heard.take();
         int64_t sent = 0;
         QElapsedTimer t;
@@ -3834,12 +4017,23 @@ private slots:
             if (std::fabs(v) > 1e-4f || !sounding.empty()) sounding.push_back(v);
         while (!sounding.empty() && std::fabs(sounding.back()) < 1e-4f) sounding.pop_back();
         for (float v : sounding) energy += double(v) * v;
+        const audiodev::EngineStatus st = e.status();
+        // (the longest silence inside the tone, where a gap would be: the sine is never silent two samples running)
+        size_t gap = 0, gapAt = 0;
+        for (size_t i = 0, run = 0; i < sounding.size(); ++i) {
+            run = std::fabs(sounding[i]) < 1e-6f ? run + 1 : 0;
+            if (run > gap) gap = run, gapAt = i + 1 - run;
+        }
+        const auto told = [&](const QString& what) {
+            return QStringLiteral("%1 (%2 underruns, %3 xruns, %4 frames the feed was short, longest silence %5 frames at %6)")
+                .arg(what).arg(st.underruns).arg(st.xruns).arg(f.starved()).arg(gap).arg(gapAt);
+        };
         // A second of it at 48 kHz (the resampler's edges aside), at its pitch.
-        QVERIFY2(std::llabs(int64_t(sounding.size()) - 48000) < 600, qPrintable(QString::number(sounding.size())));
-        QVERIFY2(std::fabs(energy - 48000 * 0.08) < 48000 * 0.08 * 0.05, qPrintable(QString::number(energy)));
+        QVERIFY2(std::llabs(int64_t(sounding.size()) - 48000) < 600, qPrintable(told(QString::number(sounding.size()))));
+        QVERIFY2(std::fabs(energy - 48000 * 0.08) < 48000 * 0.08 * 0.05, qPrintable(told(QString::number(energy))));
         // (counted away from the ends, where the resampler's ringing crosses zero at a whisper)
         const double hz = toneHz(std::vector<float>(sounding.begin() + 1000, sounding.end() - 1000), 48000);
-        QVERIFY2(std::fabs(hz - 1000) < 1, qPrintable(QString::number(hz)));
+        QVERIFY2(std::fabs(hz - 1000) < 1, qPrintable(told(QString::number(hz))));
         // Let go: what was queued is not played.
         const int64_t played = f.played();
         QCOMPARE(f.push(tone.data(), 11025), int64_t(11025));
@@ -3907,7 +4101,9 @@ private slots:
         TonePump tone;
         Listener heard;
         const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
         const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
         QVERIFY(out >= 0 && in >= 0);
         auto listen = [&](double seconds) {
             heard.take();
@@ -3941,6 +4137,330 @@ private slots:
         quit();
     }
 
+    void callbackGuardCounts() {
+        // The guard on the device's callback counts what a thread does inside a scope and nothing outside it: here an
+        // allocation, a lock and a sleep, each made on purpose (where this build can see them at all).
+        const int sees = rtguard::sees();
+#ifdef Q_OS_LINUX
+        QCOMPARE(sees, int(rtguard::Allocations | rtguard::Locks | rtguard::Waits));
+#endif
+        std::mutex m;
+        auto misbehave = [&] {
+            std::vector<float>* v = new std::vector<float>(4096);
+            {
+                std::lock_guard<std::mutex> lock(m);
+                v->at(0) = 1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            delete v;
+        };
+        rtguard::reset();
+        misbehave();
+        rtguard::Counts c = rtguard::counts();
+        QCOMPARE(c.callbacks, int64_t(0));
+        QCOMPARE(c.allocations + c.locks + c.waits, int64_t(0));
+        QVERIFY(!rtguard::inCallback());
+        {
+            const rtguard::Scope scope;
+            QVERIFY(rtguard::inCallback());
+            misbehave();
+        }
+        QVERIFY(!rtguard::inCallback());
+        c = rtguard::counts();
+        QCOMPARE(c.callbacks, int64_t(1));
+        if (sees & rtguard::Allocations) QVERIFY2(c.allocations >= 4, qPrintable(QString::number(c.allocations)));  // (two made, two freed)
+        if (sees & rtguard::Locks) QVERIFY2(c.locks >= 1, qPrintable(QString::number(c.locks)));
+        if (sees & rtguard::Waits) QVERIFY2(c.waits >= 1, qPrintable(QString::number(c.waits)));
+        // Another thread's work while this one is inside a scope is not counted.
+        std::atomic<int> turn{0};
+        std::thread other([&] {
+            while (turn.load() == 0) std::this_thread::yield();
+            misbehave();
+            turn = 2;
+        });
+        rtguard::reset();
+        {
+            const rtguard::Scope scope;
+            turn = 1;
+            while (turn.load() != 2) std::this_thread::yield();
+        }
+        other.join();
+        c = rtguard::counts();
+        QCOMPARE(c.allocations, int64_t(0));
+        QCOMPARE(c.locks, int64_t(0));
+        QCOMPARE(c.waits, int64_t(0));
+        rtguard::reset();
+    }
+
+    void callbackTakesNoLockAndAllocatesNothing() {
+        // Through the loopback: a tone played at the device's rate, a second output at another rate (resampled), a
+        // feed, and an input listening. Over two seconds the device's callbacks count no allocation, no lock and no
+        // wait, while the callers' side adds and removes outputs and asks what has been heard.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        TonePump tone, other;
+        other.rate = 44100;
+        Listener heard;
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
+        const int out2 = e.addOutput(&other, 44100, 2, [&](float* o, int ch, int n) { return other.render(o, ch, n); });
+        auto unhookOut2 = qScopeGuard([&] { e.removeOutput(out2); });
+        const int in = e.addInput(&tone, 44100, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
+        QVERIFY(out >= 0 && out2 >= 0 && in >= 0);
+        QTRY_VERIFY(e.heardSeconds(out) > 0);
+        rtguard::reset();
+        QElapsedTimer t;
+        t.start();
+        Clicker extra;
+        while (t.elapsed() < 2000) {
+            const int id = e.addOutput(&extra, 48000, 2, [&](float* o, int ch, int n) { return extra.render(o, ch, n); });
+            auto unhookId = qScopeGuard([&] { e.removeOutput(id); });
+            QVERIFY(id >= 0);
+            QVERIFY(e.heardSeconds(out) > 0);
+            (void)e.status();
+            QThread::msleep(20);
+            e.removeOutput(id);
+        }
+        const rtguard::Counts c = rtguard::counts();
+        QVERIFY2(c.callbacks > 200, qPrintable(QString::number(c.callbacks)));  // (about 375 blocks of 256 in two seconds)
+        QCOMPARE(c.allocations, int64_t(0));
+        QCOMPARE(c.locks, int64_t(0));
+        QCOMPARE(c.waits, int64_t(0));
+        QVERIFY(heard.size() > 44100);
+        // Both resamplers (the second output's, the input's) were built, on the feed thread.
+        QVERIFY(e.status().resamplers >= 2);
+        e.removeInput(in);
+        e.removeOutput(out2);
+        e.removeOutput(out);
+        audiodev::setLoopbackOptions({});
+    }
+
+    void heldStateLeavesTheToneWhole() {
+        // While another thread holds everything a caller can hold in the engine for 100 ms at a time (as a window's
+        // thread opening a device, or stuck), a 1 kHz tone through the loopback has no gap and no jump in phase: every
+        // sample that comes back is the sine's next one. Judged on a run the computer kept up with (no underrun, no
+        // xrun, nothing lost), of three tries.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        QString last;
+        bool whole = false;
+        for (int attempt = 0; attempt < 3 && !whole; ++attempt) {
+            audiodev::Engine e;
+            audiodev::DeviceSettings s;
+            s.host = audiodev::Host::Loopback;
+            s.bufferFrames = 256;
+            s.sampleRate = 48000;
+            e.setSettings(s);
+            QVERIFY(e.isOpen());
+            TonePump tone;
+            Listener heard;
+            const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+            auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
+            const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+            auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
+            QVERIFY(out >= 0 && in >= 0);
+            QThread::msleep(300);  // (settled: the cushion as deep as this computer needs)
+            e.resetXruns();
+            heard.take();
+            std::atomic<bool> stop{false};
+            std::atomic<int> holds{0};
+            std::thread holder([&] {
+                while (!stop.load()) {
+                    e.holdStateForTest(100);
+                    ++holds;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            });
+            QThread::msleep(2000);
+            stop = true;
+            holder.join();
+            QVERIFY(holds.load() >= 10);
+            const std::vector<float> got = heard.take();
+            const audiodev::EngineStatus st = e.status();
+            e.removeInput(in);
+            e.removeOutput(out);
+            QVERIFY2(got.size() > 80000, qPrintable(QString::number(got.size())));
+            // Each sample against the sine's own recurrence, x[n+1] = 2 cos(w) x[n] - x[n-1]: a gap or a jump breaks it.
+            const double k = 2 * std::cos(2 * M_PI * 1000 / 48000.0);
+            double worst = 0;
+            size_t at = 0;
+            for (size_t i = 2; i < got.size(); ++i)
+                if (const double err = std::fabs(double(got[i]) - (k * got[i - 1] - got[i - 2])); err > worst) worst = err, at = i;
+            double peak = 0;
+            for (float v : got) peak = std::max(peak, double(std::fabs(v)));
+            last = QStringLiteral("worst step %1 at %2 of %3, peak %4, %5 underruns, %6 xruns, %7 inputs lost")
+                       .arg(worst).arg(at).arg(got.size()).arg(peak).arg(st.underruns).arg(st.xruns).arg(st.inputsLost);
+            if (st.underruns == 0 && st.xruns == 0 && st.inputsLost == 0) {
+                QVERIFY2(worst < 1e-4 && std::fabs(peak - 0.4) < 1e-3, qPrintable(last));
+                whole = true;
+            }
+        }
+        QVERIFY2(whole, qPrintable(last));
+        audiodev::setLoopbackOptions({});
+    }
+
+    void rateChangeBuildsItsResamplerOutsideTheCallback() {
+        // The device's rate changes in mid-playback: the resamplers for the new rate are built on the feed thread (the
+        // engine counts them), the callbacks go on counting no allocation, lock or wait, and the tone keeps its pitch.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        TonePump tone;
+        Listener heard;
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
+        const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
+        QVERIFY(out >= 0 && in >= 0);
+        QThread::msleep(300);
+        QCOMPARE(e.status().resamplers, int64_t(0));  // (48 kHz through a 48 kHz device: none needed)
+        rtguard::reset();
+        audiodev::loopbackChangeRate(96000);
+        QTRY_COMPARE(e.status().rate, 96000);
+        QTRY_VERIFY(e.status().resamplers >= 2);  // (the output's and the input's)
+        QThread::msleep(300);
+        heard.take();
+        QThread::msleep(1000);
+        const std::vector<float> got = heard.take();
+        const double hz = toneHz(got, 48000);
+        QVERIFY2(std::fabs(hz - 1000) < 5, qPrintable(QString::number(hz)));
+        const rtguard::Counts c = rtguard::counts();
+        QVERIFY(c.callbacks > 100);
+        QCOMPARE(c.allocations, int64_t(0));
+        QCOMPARE(c.locks, int64_t(0));
+        QCOMPARE(c.waits, int64_t(0));
+        e.removeInput(in);
+        e.removeOutput(out);
+        audiodev::setLoopbackOptions({});
+    }
+
+    void lostDeviceHandsOnWhatArrivedAndTells() {
+        // The device is pulled out while an input listens: every block it brought before it went reaches the input's
+        // tap, then the listeners are told why, within a second, and the tap is not called again. The engine says why it
+        // is not open, and opens again once the device is back.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        TonePump tone;
+        std::atomic<int64_t> frames{0}, framesWhenTold{-1};
+        std::atomic<int> order{0}, toldAt{0}, lastTapAt{0};
+        std::mutex m;
+        std::string why;
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
+        const int in = e.addInput(&tone, 48000, [&](const float*, int, int n, int64_t) {
+            frames += n;
+            lastTapAt = ++order;
+        });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
+        const int listener = e.addLostListener([&](const std::string& w) {
+            std::lock_guard<std::mutex> lock(m);
+            why = w;
+            framesWhenTold = frames.load();
+            toldAt = ++order;
+        });
+        auto unhookListener = qScopeGuard([&] { e.removeLostListener(listener); });
+        QVERIFY(out >= 0 && in >= 0 && listener >= 0);
+        QTRY_VERIFY(frames.load() > 24000);
+        QElapsedTimer t;
+        t.start();
+        audiodev::LoopbackOptions gone{256, 256, 0};
+        gone.unplugged = true;
+        audiodev::setLoopbackOptions(gone);
+        while (toldAt.load() == 0 && t.elapsed() < 5000) QThread::msleep(2);
+        QVERIFY2(toldAt.load() > 0 && t.elapsed() < 1000, qPrintable(QString::number(t.elapsed())));
+        {
+            std::lock_guard<std::mutex> lock(m);
+            QVERIFY(!why.empty());
+        }
+        QThread::msleep(200);
+        QVERIFY(lastTapAt.load() < toldAt.load());  // (told after the last block, and none since)
+        QCOMPARE(frames.load(), framesWhenTold.load());
+        QCOMPARE(frames.load() % 256, int64_t(0));  // (whole blocks, to the last the device brought)
+        QVERIFY(!e.isOpen());
+        QVERIFY(!e.status().error.empty());
+        // Back again: the same output and input go on through it.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        e.setSettings(audiodev::DeviceSettings{});
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        const int64_t before = frames.load();
+        QTRY_VERIFY(frames.load() > before + 4800);
+        e.removeLostListener(listener);
+        e.removeInput(in);
+        e.removeOutput(out);
+        audiodev::setLoopbackOptions({});
+    }
+
+    // Nightly 23 Nov: PortAudio lists the devices when it starts and never again, so a device plugged in later (or
+    // unplugged and plugged back in) was not there until Montage was started again. A device added to ALSA's
+    // configuration stands in for one plugged in: it is listed within a few seconds, and opens by its name.
+    void portAudioListsADevicePluggedInLater() {
+#ifndef Q_OS_LINUX
+        QSKIP("ALSA's configuration stands in for plugging a device in: on Linux only");
+#else
+        using namespace audiodev;
+        const std::vector<Host> hosts = availableHosts();
+        if (std::find(hosts.begin(), hosts.end(), Host::Alsa) == hosts.end()) QSKIP("No ALSA through PortAudio here");
+        if (!QFile::exists("/usr/share/alsa/alsa.conf")) QSKIP("No ALSA configuration to add a device to");
+        auto listed = [] {
+            const std::vector<DeviceInfo> all = devices(Host::Alsa);
+            return std::any_of(all.begin(), all.end(), [](const DeviceInfo& d) { return d.id == "montage_plugged_in" && d.outputs > 0; });
+        };
+        QVERIFY(!listed());
+        QTemporaryDir dir;
+        QFile conf(dir.filePath("asound.conf"));
+        QVERIFY(conf.open(QIODevice::WriteOnly));
+        conf.write("</usr/share/alsa/alsa.conf>\npcm.montage_plugged_in { type null }\n");
+        conf.close();
+        const bool had = qEnvironmentVariableIsSet("ALSA_CONFIG_PATH");
+        const QByteArray before = qgetenv("ALSA_CONFIG_PATH");
+        qputenv("ALSA_CONFIG_PATH", conf.fileName().toLocal8Bit());
+        QElapsedTimer waited;
+        waited.start();
+        bool there = false;
+        while (!(there = listed()) && waited.elapsed() < 20000) QTest::qWait(250);
+        QString opened;
+        if (there) {
+            Engine e;
+            DeviceSettings s;
+            s.host = Host::Alsa;
+            s.output = "montage_plugged_in";
+            s.bufferFrames = 256;
+            s.sampleRate = 48000;
+            e.setSettings(s);
+            Feed feed(e);
+            std::string why;
+            if (feed.open(48000, 2, 0.1, &why)) opened = QString::fromStdString(e.status().device);
+            else opened = QString::fromStdString("not opened: " + why);
+        }
+        // (ALSA's configuration as it was, the devices listed again without the stand-in)
+        if (had) qputenv("ALSA_CONFIG_PATH", before);
+        else qunsetenv("ALSA_CONFIG_PATH");
+        QVERIFY(there);
+        QCOMPARE(opened, QString("montage_plugged_in"));
+        waited.start();
+        while (listed() && waited.elapsed() < 20000) QTest::qWait(250);
+        QVERIFY(!listed());
+#endif
+    }
+
     void overloadedCallbackIsAnXrun() {
         // A callback held past its period (an overloaded computer) is counted as an xrun, and the count can be reset.
         audiodev::Engine e;
@@ -3963,8 +4483,8 @@ private slots:
     void jackPortsAndLoopback() {
         // Under JACK's dummy driver (a test tool), or a PipeWire server with its JACK library: Montage's ports appear with
         // the monitoring section's names, a click looped from an output port back into an input port is recorded and,
-        // the loop measured, lands where it was played at buffers of 64, 256 and 1024, and an overloaded callback is an
-        // xrun.
+        // the loop measured, lands where it was played at buffers of 64, 256 and 1024, and an output too slow for the
+        // device is an underrun.
         QProcess jackd;
         const QString server = QStringLiteral("montage-test-%1").arg(QCoreApplication::applicationPid());
         const QString exe = QStandardPaths::findExecutable(QStringLiteral("jackd"));
@@ -4016,17 +4536,21 @@ private slots:
             QVERIFY2(trip > 0, why.c_str());
             QCOMPARE(recordClick(e, e.status().rate), int64_t(4800));
         }
-        // A callback that overruns its period.
+        // An output that takes longer than a period over its sound: the device's callback is not held up for it (the
+        // server is not made late); what was mixed ahead runs out, which is counted as an underrun and shown with the
+        // xruns.
         e.resetXruns();
-        const int64_t before = e.status().xruns;
-        std::atomic<int> slow{1};
-        const int id = e.addOutput(&slow, 48000, 2, [&](float* o, int ch, int n) {
+        QCOMPARE(e.status().underruns, int64_t(0));
+        std::atomic<int> calls{0};
+        const int id = e.addOutput(&calls, 48000, 2, [&](float* o, int ch, int n) {
             std::fill(o, o + size_t(n) * size_t(ch), 0.0f);
-            if (slow.exchange(0)) QThread::msleep(100);
+            if (++calls == 50) QThread::msleep(300);
             return int64_t(-1);
         });
+        auto unhookId = qScopeGuard([&] { e.removeOutput(id); });
         QVERIFY(id >= 0);
-        QTRY_VERIFY_WITH_TIMEOUT(e.status().xruns > before, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(e.status().underruns > 0, 5000);
+        QVERIFY(e.dropouts() > 0);
         e.removeOutput(id);
         e.setSettings(audiodev::DeviceSettings{});
         if (jackd.state() != QProcess::NotRunning) {

@@ -19,6 +19,7 @@
 #include <QVBoxLayout>
 #include <algorithm>
 
+#include "DialogJobs.h"
 #include "RenderQueue.h"
 #include "Settings.h"
 #include "render/BackgroundJobs.h"
@@ -81,6 +82,7 @@ RenderQueuePanel::RenderQueuePanel(RenderQueue* queue, QWidget* parent) : QWidge
     second->addWidget(atOnce_);
     second->addStretch(1);
     localLay->addLayout(second);
+    localLay_ = localLay;
 
     // The render farm.
     auto* farmBox = new QWidget(split);
@@ -184,6 +186,100 @@ void RenderQueuePanel::setFarmFolder(const QString& folder) {
     else farmTimer_->start();
     refresh();
     refreshFarm();
+}
+
+void RenderQueuePanel::setDialogJobs(DialogJobs* jobs) {
+    if (tasks_ || !jobs) return;
+    tasks_ = jobs;
+    taskBox_ = new QWidget(this);
+    auto* lay = new QVBoxLayout(taskBox_);
+    lay->setContentsMargins(0, 0, 0, 0);
+    taskList_ = new QTreeWidget(taskBox_);
+    taskList_->setObjectName(QStringLiteral("backgroundTasks"));
+    taskList_->setColumnCount(2);
+    taskList_->setHeaderLabels({tr("Background Task"), tr("Status")});
+    taskList_->setRootIsDecorated(false);
+    taskList_->setUniformRowHeights(true);
+    taskList_->header()->setStretchLastSection(true);
+    taskList_->header()->resizeSection(0, 260);
+    taskList_->setMaximumHeight(110);
+    lay->addWidget(taskList_);
+    auto* row = new QHBoxLayout;
+    auto button = [&](const QString& text, const char* name, const QString& tip) {
+        auto* b = new QPushButton(text, taskBox_);
+        b->setObjectName(QString::fromLatin1(name));
+        b->setToolTip(tip);
+        row->addWidget(b);
+        return b;
+    };
+    taskPause_ = button(tr("Pause"), "taskPause", tr("Hold the picked task where it is, or let it go on"));
+    taskUp_ = button(tr("Move Up"), "taskMoveUp", tr("Run the picked waiting task before the one above it"));
+    taskStop_ = button(tr("Stop Task"), "taskStop", tr("Stop the picked task: nothing is changed"));
+    taskApply_ = button(tr("Apply Result"), "taskApply",
+                        tr("A result kept because the project changed while its task ran: apply it now, as one undo step"));
+    taskDiscard_ = button(tr("Discard"), "taskDiscard", tr("Set the picked result aside"));
+    row->addStretch(1);
+    lay->addLayout(row);
+    localLay_->addWidget(taskBox_);
+    connect(taskPause_, &QPushButton::clicked, this, [this] {
+        const QString id = selectedTask();
+        for (const DialogJobs::TaskInfo& t : tasks_->tasks())
+            if (t.id == id) tasks_->setPaused(id, !t.paused);
+    });
+    connect(taskUp_, &QPushButton::clicked, this, [this] { tasks_->moveUp(selectedTask()); });
+    connect(taskStop_, &QPushButton::clicked, this, [this] { tasks_->stop(selectedTask()); });
+    connect(taskApply_, &QPushButton::clicked, this, [this] {
+        QString said;
+        if (!tasks_->applyOffered(selectedTask(), &said) && said.isEmpty()) said = tr("The result could not be applied to the project as it is now");
+        if (!said.isEmpty()) emit taskSaid(said);
+    });
+    connect(taskDiscard_, &QPushButton::clicked, this, [this] { tasks_->discardOffered(selectedTask()); });
+    connect(taskList_, &QTreeWidget::itemSelectionChanged, this, [this] { refreshTasks(); });
+    connect(tasks_, &DialogJobs::tasksChanged, this, &RenderQueuePanel::refreshTasks);
+    refreshTasks();
+}
+
+QString RenderQueuePanel::selectedTask() const {
+    const QTreeWidgetItem* item = taskList_ ? taskList_->currentItem() : nullptr;
+    return item ? item->data(0, Qt::UserRole).toString() : QString();
+}
+
+void RenderQueuePanel::refreshTasks() {
+    if (!tasks_) return;
+    std::vector<DialogJobs::TaskInfo> rows = tasks_->tasks();
+    const size_t live = rows.size();
+    for (const DialogJobs::TaskInfo& t : tasks_->offeredTasks()) rows.push_back(t);
+    const QString picked = selectedTask();
+    {
+        const QSignalBlocker block(taskList_);
+        // (rows are kept while their tasks are: only texts change as one goes on)
+        while (taskList_->topLevelItemCount() > int(rows.size())) delete taskList_->takeTopLevelItem(taskList_->topLevelItemCount() - 1);
+        while (taskList_->topLevelItemCount() < int(rows.size())) new QTreeWidgetItem(taskList_);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const DialogJobs::TaskInfo& t = rows[i];
+            QTreeWidgetItem* item = taskList_->topLevelItem(int(i));
+            item->setData(0, Qt::UserRole, t.id);
+            item->setData(0, Qt::UserRole + 1, i >= live);
+            item->setText(0, t.title);
+            item->setText(1, i >= live   ? tr("Result kept: %1").arg(t.note)
+                             : t.paused  ? tr("Paused at %1%").arg(int(t.progress * 100))
+                             : t.running ? tr("%1%").arg(int(t.progress * 100))
+                                         : tr("Waiting"));
+            if (t.id == picked) taskList_->setCurrentItem(item);
+        }
+    }
+    const QTreeWidgetItem* item = taskList_->currentItem();
+    const bool offered = item && item->data(0, Qt::UserRole + 1).toBool(), running = item && !offered;
+    bool waiting = false, paused = false;
+    for (const DialogJobs::TaskInfo& t : tasks_->tasks())
+        if (item && t.id == item->data(0, Qt::UserRole).toString()) waiting = !t.running, paused = t.paused;
+    taskPause_->setEnabled(running && !waiting);
+    taskPause_->setText(paused ? tr("Resume") : tr("Pause"));
+    taskUp_->setEnabled(running && waiting);
+    taskStop_->setEnabled(running);
+    taskApply_->setEnabled(offered);
+    taskDiscard_->setEnabled(offered);
+    taskBox_->setVisible(!rows.empty());
 }
 
 bool RenderQueuePanel::sendToFarm(int id) {

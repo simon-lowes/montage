@@ -773,15 +773,33 @@ bool exportDmaBuf(unsigned texture, int width, int height, DmaBuf& out, std::str
     return true;
 }
 
+namespace {
+// How many bytes a pixel takes in the one-plane formats a picture is shared in: the half floats Montage's hosts export
+// (AB4H), and the other four-channel layouts of 16 and of 8 or 10 bits a driver may name the same storage by. 0 for
+// anything else, which is not taken.
+unsigned bytesPerPixel(unsigned fourcc) {
+    auto code = [](const char* c) { return unsigned(c[0]) | unsigned(c[1]) << 8 | unsigned(c[2]) << 16 | unsigned(c[3]) << 24; };
+    for (const char* wide : {"AB4H", "XB4H", "AR4H", "XR4H", "AB48", "XB48", "AR48", "XR48"})
+        if (fourcc == code(wide)) return 8;
+    for (const char* narrow : {"AB24", "XB24", "AR24", "XR24", "RA24", "RX24", "BA24", "BX24", "AB30", "XB30", "AR30", "XR30"})
+        if (fourcc == code(narrow)) return 4;
+    return 0;
+}
+}  // namespace
+
 bool dmaBufFits(const DmaBuf& buf, std::string* why) {
     auto no = [&](const std::string& reason) {
         if (why) *why = reason;
         return false;
     };
     if (buf.fd < 0 || buf.width <= 0 || buf.height <= 0 || !buf.fourcc || !buf.stride) return no("the shared picture is not described");
-    // (a row holds a byte a pixel at the least; the rows from the offset on lie inside the buffer, where it says how
-    // large it is)
-    if (buf.stride < unsigned(buf.width) || buf.stride > (1u << 30) || buf.offset > (1u << 30))
+    const unsigned pixel = bytesPerPixel(buf.fourcc);
+    if (!pixel) return no("the shared picture is in a format Montage does not take");
+    // A row holds its pixels at the format's size, and the rows from the offset on lie inside the buffer, where it
+    // says how large it is. (Exact for rows laid one after another. A layout in tiles, which a modifier names, needs
+    // no less than that, so this is the least such a buffer must hold: the driver that owns the layout checks the
+    // rest when it takes the buffer.)
+    if (uint64_t(buf.stride) < uint64_t(buf.width) * pixel || buf.stride > (1u << 30) || buf.offset > (1u << 30))
         return no("the shared picture's rows are not of its size");
     const off_t size = ::lseek(buf.fd, 0, SEEK_END);
     if (size >= 0 && uint64_t(buf.offset) + uint64_t(buf.stride) * uint64_t(buf.height) > uint64_t(size))
@@ -796,8 +814,11 @@ bool awaitDrawn(const DmaBuf& buf, std::string* why, int waitMs) {
     do {
         r = ::poll(&p, 1, waitMs < 0 ? kFenceWaitMs : waitMs);
     } while (r < 0 && errno == EINTR);
-    if (r > 0) return true;
-    if (why) *why = "the shared picture was not drawn within " + std::to_string(std::max(1, (waitMs < 0 ? kFenceWaitMs : waitMs) / 1000)) + " s";
+    // (a fence signals by becoming readable; a descriptor that is closed, or no fence at all, says something else)
+    if (r > 0 && (p.revents & POLLIN)) return true;
+    if (why)
+        *why = r > 0 ? std::string("the shared picture's fence cannot be waited for")
+                     : "the shared picture was not drawn within " + std::to_string(std::max(1, (waitMs < 0 ? kFenceWaitMs : waitMs) / 1000)) + " s";
     return false;
 }
 
@@ -811,6 +832,10 @@ unsigned importDmaBuf(const DmaBuf& buf, std::string* why) {
     if (!e.imports || !f) return no(e.whyNoImport);
     std::string bad;
     if (!dmaBufFits(buf, &bad)) return no(bad);
+    // A layout in tiles (any but rows one after another, or the driver's own) is told to the driver with the picture;
+    // a driver that cannot be told it would read the tiles as rows.
+    if (!e.modifiers && buf.modifier != 0 && buf.modifier != kNoModifier)
+        return no("the shared picture is laid out in tiles, which this driver cannot be told");
     if (!awaitDrawn(buf, &bad)) return no(bad);  // (at once when the caller has waited for it already)
     std::vector<int> a = {kEglWidth, buf.width, kEglHeight, buf.height, kEglFourcc, int(buf.fourcc), kEglPlane0Fd, buf.fd,
                           kEglPlane0Offset, int(buf.offset), kEglPlane0Pitch, int(buf.stride)};

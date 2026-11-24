@@ -25,18 +25,38 @@
 namespace montage {
 
 // The paths a tool call's arguments name, each as one name for its file (symbolic links followed, letter case folded
-// where the file system ignores it): what the call writes (output, report, any *_output or *_report; an export
-// tool's path and file; and of a tool that changes the project its folders too: folder, dir, any *_folder or *_dir)
-// and what it reads (path, file, files, paths, any *_path or *_file, and a read-only tool's folders; lists of them
-// too), in the objects inside the arguments as well; a recording (record, any *_record, and a live package's own,
-// beside its folder, when montage_render names none) is written. A path it both reads and writes counts as written.
-// Background calls wait on these, so two never write one file at once.
+// where the file system ignores it): what the call writes (output, report, any *_output or *_report; export, chan,
+// ply, usd, save and destinations; the path and file, any *_path or *_file, of an export tool and of any tool that is
+// not read-only; and of a tool that is not read-only its folders too: folder, dir, any *_folder or *_dir) and what it
+// reads (a read-only tool's path, file and folders; files and paths; lists of them too), in the objects inside the
+// arguments as well; a recording (record, any *_record, and a live package's own, beside its folder, when
+// montage_render names none) is written. A path it both reads and writes counts as written. Background calls wait
+// on these, so two never write one file at once. (project and farm are left out: many calls share them, and a call
+// that changes a project runs alone.) montage_production's folder is written when it makes one. A path given after
+// protocol names ("file:", "md5:file:"), as FFmpeg takes them, is the file they reach.
 struct McpCallPaths {
     QStringList writes, reads;
 };
 McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& arguments, bool readOnly);
 // Whether two such paths are one file, or one lies inside the other (a file in a folder another call writes).
 bool mcpPathsOverlap(const QString& a, const QString& b);
+// How a file system tells names apart: exactly (Linux), with letter case and the composition of accented letters
+// ignored (macOS), or as Windows does, which also takes a component with a stream name after it ("x:$DATA") or with
+// dots or spaces after it as the same file. mcpNameRules: this computer's.
+enum class McpNameRules { Exact, Folded, Windows };
+McpNameRules mcpNameRules();
+// A name as those rules fold it, so that two spellings of one file are the same text.
+QString mcpFoldedName(const QString& name, McpNameRules rules);
+// Whether `path` is `own` or a file inside it (with `orHolding`, also a folder that holds it): by name, symbolic links
+// followed where the path exists and the names folded by `rules`, or by file identity where both exist (a hard link,
+// a folder mounted twice, a short or differently spelled name the file system takes as the same file).
+bool mcpPathReaches(const QString& path, const QString& own, McpNameRules rules, bool orHolding);
+// Why a call is refused for what only Montage writes, and only as the user asks (the roots the user trusts for
+// facility lists, the facility list, Montage's DCP certificates and the DKDMs); empty when it names none of them. A
+// path the call writes may not be one of them, inside one, or a folder that holds one; and no other text anywhere in
+// the arguments, whatever its key, may name one of them or a file inside them, but for montage_make_kdm's DKDM
+// (dkdm) and servers' certificates (servers), which it reads. Arguments nested more than 16 deep are refused.
+QString mcpOwnFileNamed(const QString& tool, const QJsonObject& arguments, const McpCallPaths& paths);
 
 class McpServer {
 public:

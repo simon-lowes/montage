@@ -421,6 +421,11 @@ struct Input::Stream {
     std::unique_ptr<VideoAssembler> assembler;
     std::unique_ptr<JxsvAssembler> jxsv;  // (ST 2110-22's, and its decoder)
     std::unique_ptr<JxsDecoder> decoder;
+    // (an interlaced stream's first field, decoded, until its second comes under the same timestamp)
+    Raster firstField;
+    bool haveFirst = false;
+    uint32_t firstTs = 0;
+    int64_t firstLost = 0;
     std::chrono::steady_clock::time_point last[2];  // when each path last brought a packet
     // Ancillary data and metadata: the latest RTP timestamp this stream brought (the input's lock held).
     bool dataSeen = false;
@@ -587,19 +592,46 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         const JxsSampling s444 = s.sdp.video.sampling == Sampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444;
         const std::vector<uint8_t>& cs = s.jxsv->codestream();
         const JxsSampling want = video_.sampling == Sampling::Ycc422 ? JxsSampling::Ycc422 : s444;
-        // (a codestream of another size or depth than the SDP's is not decoded at all)
+        // (an interlaced stream: a codestream each field, half the frame's height, the first held until its second)
+        const bool interlaced = video_.interlaced;
+        const int field = s.jxsv->field();
+        const int height = interlaced ? video_.height / 2 : video_.height;
+        // (a codestream of another size or depth than the SDP's, or a field where a frame belongs, is not decoded at all)
         JxsHeader h;
-        const bool ok = readJxsHeader(cs.data(), cs.size(), h) && h.width == video_.width && h.height == video_.height && h.depth == video_.depth &&
-                        s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && pic.width == video_.width && pic.height == video_.height &&
-                        pic.depth == video_.depth && pic.sampling == want;
+        const bool ok = (field != 0) == interlaced && readJxsHeader(cs.data(), cs.size(), h) && h.width == video_.width && h.height == height &&
+                        h.depth == video_.depth && s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && pic.width == video_.width &&
+                        pic.height == height && pic.depth == video_.depth && pic.sampling == want;
+        if (interlaced && ok && field == 1) {
+            s.firstField = rasterOf(pic);
+            s.haveFirst = true;
+            s.firstTs = s.jxsv->timestamp();
+            s.firstLost = s.jxsv->lostInFrame();
+            std::lock_guard lock(m_);
+            stats_.concealedSlices += s.jxsv->concealedSlices();
+            return;
+        }
         std::lock_guard lock(m_);
-        if (!ok) {
+        if (!ok || (interlaced && (!s.haveFirst || s.firstTs != s.jxsv->timestamp()))) {
+            // (a second field without its first is a frame lost)
+            s.haveFirst = false;
             ++stats_.incomplete;
             return;
         }
+        Raster frame;
+        int64_t lost = s.jxsv->lostInFrame();
+        if (interlaced) {
+            frame = Raster(video_.width, video_.height, s.firstField.sampling, s.firstField.depth);
+            weaveField(frame, s.firstField, 1);
+            weaveField(frame, rasterOf(pic), 2);
+            lost += s.firstLost;
+            s.haveFirst = false;
+        } else {
+            frame = rasterOf(pic);
+        }
         while (pending_.size() >= pendingLimit_) pending_.pop_front(), ++stats_.dropped;
-        pending_.push_back({rasterOf(pic), s.jxsv->timestamp(), s.jxsv->lostInFrame(), std::chrono::steady_clock::now(), cs});
-        if (s.jxsv->lostInFrame()) ++stats_.incomplete;
+        // (an interlaced frame's codestreams are its fields': none kept as the frame's)
+        pending_.push_back({std::move(frame), s.jxsv->timestamp(), lost, std::chrono::steady_clock::now(), interlaced ? std::vector<uint8_t>() : cs});
+        if (lost) ++stats_.incomplete;
         stats_.concealedSlices += s.jxsv->concealedSlices();
         cv_.notify_all();
     } else if (s.kind == 0) {

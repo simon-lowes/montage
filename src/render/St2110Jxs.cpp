@@ -161,17 +161,34 @@ std::vector<uint8_t> jxsvBoxes(const VideoFormat& f, uint16_t ppih, uint16_t ple
     return out;
 }
 
+Raster fieldOf(const Raster& frame, int field) {
+    const int first = field == 2 ? 1 : 0;
+    Raster out(frame.width, (frame.height - first + 1) / 2, frame.sampling, frame.depth);
+    const size_t n = size_t(frame.rowSamples());
+    for (int y = 0; y < out.height; ++y) std::memcpy(out.row(y), frame.row(first + 2 * y), n * sizeof(uint16_t));
+    return out;
+}
+
+void weaveField(Raster& frame, const Raster& field, int which) {
+    if (field.width != frame.width || field.sampling != frame.sampling) return;
+    const int first = which == 2 ? 1 : 0;
+    const size_t n = size_t(frame.rowSamples());
+    for (int y = 0; y < field.height && first + 2 * y < frame.height; ++y) std::memcpy(frame.row(first + 2 * y), field.row(y), n * sizeof(uint16_t));
+}
+
 namespace {
 
-// The payload header: T (sequential), K, L, I (progressive), F, SEP and P.
-uint32_t payloadHeader(int mode, bool last, int64_t frame, uint32_t sep, uint32_t p) {
-    return 1u << 31 | uint32_t(mode & 1) << 30 | uint32_t(last) << 29 | uint32_t(frame & 31) << 22 | (sep & 0x7FF) << 11 | (p & 0x7FF);
+// The payload header: T (sequential), K, L, I (0 progressive; 2 and 3 an interlaced frame's first and second field), F,
+// SEP and P.
+uint32_t payloadHeader(int mode, bool last, int field, int64_t frame, uint32_t sep, uint32_t p) {
+    const uint32_t interlace = field == 1 ? 2u : field == 2 ? 3u : 0u;
+    return 1u << 31 | uint32_t(mode & 1) << 30 | uint32_t(last) << 29 | interlace << 27 | uint32_t(frame & 31) << 22 | (sep & 0x7FF) << 11 | (p & 0x7FF);
 }
 
 // A packetization unit of `size` bytes from `parts` (pieces read in turn) in packets of `chunk` bytes.
 template <typename Read>
-bool packUnit(size_t size, size_t chunk, int mode, bool endsFrame, int64_t frame, uint32_t sep, uint32_t timestamp, RtpState& rtp, const PacketSink& send,
-              const Read& read) {
+bool packUnit(size_t size, size_t chunk, int mode, bool endsFrame, int field, int64_t frame, uint32_t sep, uint32_t timestamp, RtpState& rtp,
+              const PacketSink& send, const Read& read) {
     std::vector<uint8_t> packet;
     uint32_t index = 0;
     for (size_t at = 0; at < size || (size == 0 && index == 0); at += chunk, ++index) {
@@ -185,7 +202,7 @@ bool packUnit(size_t size, size_t chunk, int mode, bool endsFrame, int64_t frame
         put32(packet.data() + 8, rtp.ssrc);
         // (the codestream mode's packets counted on by SEP past P's 2048)
         const uint32_t s = mode == 0 ? index >> 11 : sep, p = index & 0x7FF;
-        put32(packet.data() + 12, payloadHeader(mode, last, frame, s, p));
+        put32(packet.data() + 12, payloadHeader(mode, last, field, frame, s, p));
         read(at, n, packet.data() + 16);
         ++rtp.sequence;
         if (!send(packet.data(), packet.size())) return false;
@@ -197,13 +214,13 @@ bool packUnit(size_t size, size_t chunk, int mode, bool endsFrame, int64_t frame
 }  // namespace
 
 bool packJxsv(const std::vector<uint8_t>& boxes, const uint8_t* codestream, size_t size, const std::vector<uint32_t>& units, int packetMode,
-              int64_t frameCount, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload) {
-    if (!codestream || size == 0) return false;
+              int64_t frameCount, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload, int field) {
+    if (!codestream || size == 0 || field < 0 || field > 2) return false;
     const size_t chunk = size_t(std::max(64, maxPayload));
     if (packetMode == 0) {
         // One unit: the boxes, then the codestream.
         const size_t total = boxes.size() + size;
-        return packUnit(total, chunk, 0, true, frameCount, 0, timestamp, rtp, send, [&](size_t at, size_t n, uint8_t* out) {
+        return packUnit(total, chunk, 0, true, field, frameCount, 0, timestamp, rtp, send, [&](size_t at, size_t n, uint8_t* out) {
             for (size_t i = 0; i < n; ++i) {
                 const size_t k = at + i;
                 out[i] = k < boxes.size() ? boxes[k] : codestream[k - boxes.size()];
@@ -215,7 +232,7 @@ bool packJxsv(const std::vector<uint8_t>& boxes, const uint8_t* codestream, size
     for (uint32_t u : units) sum += u;
     if (units.size() < 2 || sum != size) return false;
     const size_t head = boxes.size() + units[0];
-    if (!packUnit(head, chunk, 1, false, frameCount, 0x7FF, timestamp, rtp, send, [&](size_t at, size_t n, uint8_t* out) {
+    if (!packUnit(head, chunk, 1, false, field, frameCount, 0x7FF, timestamp, rtp, send, [&](size_t at, size_t n, uint8_t* out) {
             for (size_t i = 0; i < n; ++i) {
                 const size_t k = at + i;
                 out[i] = k < boxes.size() ? boxes[k] : codestream[k - boxes.size()];
@@ -225,7 +242,7 @@ bool packJxsv(const std::vector<uint8_t>& boxes, const uint8_t* codestream, size
     size_t at = units[0];
     for (size_t s = 1; s < units.size(); ++s) {
         const uint8_t* slice = codestream + at;
-        if (!packUnit(units[s], chunk, 1, s + 1 == units.size(), frameCount, uint32_t((s - 1) % 2047), timestamp, rtp, send,
+        if (!packUnit(units[s], chunk, 1, s + 1 == units.size(), field, frameCount, uint32_t((s - 1) % 2047), timestamp, rtp, send,
                       [&](size_t from, size_t n, uint8_t* out) { std::memcpy(out, slice + from, n); }))
             return false;
         at += units[s];
@@ -255,7 +272,10 @@ bool JxsvAssembler::add(const RtpPacket& p) {
     lastSeq_ = p.sequence;
     lost_ += gap;
     bool completed = false;
-    if (started_ && p.timestamp != timestamp_) {
+    // (an interlaced frame's two fields share its timestamp: a picture begins where the field changes too)
+    const int field = int((get32(p.payload) >> 27) & 3);
+    const int pictureField = field == 2 ? 1 : field == 3 ? 2 : 0;
+    if (started_ && (p.timestamp != timestamp_ || pictureField != field_)) {
         // (the frame being built ended without its last packet: what went missing between was its)
         frameLost_ += gap;
         gap = 0;
@@ -264,6 +284,7 @@ bool JxsvAssembler::add(const RtpPacket& p) {
     if (!started_) {
         started_ = true;
         timestamp_ = p.timestamp;
+        field_ = pictureField;
         parts_.clear();
         frameLost_ = 0;
         bytes_ = 0;
@@ -323,11 +344,17 @@ bool JxsvAssembler::finish() {
     const bool startsWhole = first.p == 0 && (slices ? first.sep == 0x7FF : first.sep == 0);
     if (lost == 0 && startsWhole && parts.back().last) {
         // Whole: its units in turn, the boxes taken off the front.
+        // (each packet's bytes let go as they are copied, so that the frame is held once, not twice, meanwhile)
         std::vector<uint8_t> unit;
+        std::vector<size_t> partSizes(parts.size());
         size_t total = 0;
         for (const Part& q : parts) total += q.data.size();
         unit.reserve(total);
-        for (const Part& q : parts) unit.insert(unit.end(), q.data.begin(), q.data.end());
+        for (size_t i = 0; i < parts.size(); ++i) {
+            partSizes[i] = parts[i].data.size();
+            unit.insert(unit.end(), parts[i].data.begin(), parts[i].data.end());
+            std::vector<uint8_t>().swap(parts[i].data);
+        }
         const size_t boxes = boxBytes(unit.data(), unit.size());
         JxsHeader h;
         if (boxes == 0 && !(unit.size() >= 2 && unit[0] == 0xFF && unit[1] == 0x10)) return ++passedOver_, false;
@@ -344,18 +371,19 @@ bool JxsvAssembler::finish() {
                 const int s = parts[i].sep == 0x7FF ? -1 : sliceOf[i];
                 if (s != current && s >= 0) starts.push_back(at >= boxes ? at - boxes : 0);
                 current = s;
-                at += parts[i].data.size();
+                at += partSizes[i];
             }
             starts.push_back(cs.size());
         } else {
             starts = sliceStarts(cs);
         }
         if (frameUnit) unit_ = frameUnit;
-        prev_ = cs;
+        // (the frame kept to take a later frame's missing slices from is this one, done_: not a copy of it)
         prevSlices_ = starts;
         prevBoxes_ = boxes;
         done_ = std::move(cs);
         doneTimestamp_ = timestamp_;
+        doneField_ = field_;
         doneLost_ = 0;
         doneConcealed_ = 0;
         return true;
@@ -363,9 +391,11 @@ bool JxsvAssembler::finish() {
     // Missing packets: what came put in its place in the frame before's layout, the slices with anything missing taken
     // whole from that frame.
     if (unit_ == 0) unit_ = frameUnit;
-    if (prev_.empty() || prevSlices_.size() < 2 || unit_ == 0) return ++passedOver_, false;
-    const size_t size = prev_.size();
-    std::vector<uint8_t> cs(size, 0), known(size, 0);
+    const std::vector<uint8_t>& prev = done_;
+    if (prev.empty() || prevSlices_.size() < 2 || unit_ == 0) return ++passedOver_, false;
+    const size_t size = prev.size();
+    std::vector<uint8_t> cs(size, 0);
+    std::vector<bool> known(size, false);
     size_t boxes = prevBoxes_;
     for (const Part& q : parts)
         if (q.p == 0 && (slices ? q.sep == 0x7FF : q.sep == 0)) {
@@ -391,12 +421,12 @@ bool JxsvAssembler::finish() {
             if (to < 0) continue;  // (the boxes)
             if (to >= int64_t(size)) return ++passedOver_, false;  // (not the frame before's layout)
             cs[size_t(to)] = q.data[k];
-            known[size_t(to)] = 1;
+            known[size_t(to)] = true;
         }
     }
-    auto whole = [&](size_t a, size_t b) { return std::all_of(known.begin() + ptrdiff_t(a), known.begin() + ptrdiff_t(b), [](uint8_t k) { return k != 0; }); };
+    auto whole = [&](size_t a, size_t b) { return std::all_of(known.begin() + ptrdiff_t(a), known.begin() + ptrdiff_t(b), [](bool k) { return k; }); };
     // The header (the same each frame), and each slice.
-    if (!whole(0, prevSlices_[0])) std::copy(prev_.begin(), prev_.begin() + ptrdiff_t(prevSlices_[0]), cs.begin());
+    if (!whole(0, prevSlices_[0])) std::copy(prev.begin(), prev.begin() + ptrdiff_t(prevSlices_[0]), cs.begin());
     int concealed = 0;
     for (size_t s = 0; s < sliceCount; ++s) {
         const size_t a = prevSlices_[s], b = prevSlices_[s + 1];
@@ -406,14 +436,14 @@ bool JxsvAssembler::finish() {
             if (b - a < 6 || cs[a] != 0xFF || cs[a + 1] != 0x20 || get16(&cs[a + 4]) != uint32_t(s)) return ++passedOver_, false;
             continue;
         }
-        std::copy(prev_.begin() + ptrdiff_t(a), prev_.begin() + ptrdiff_t(b), cs.begin() + ptrdiff_t(a));
+        std::copy(prev.begin() + ptrdiff_t(a), prev.begin() + ptrdiff_t(b), cs.begin() + ptrdiff_t(a));
         ++concealed;
     }
     JxsHeader h;
     if (!readJxsHeader(cs.data(), cs.size(), h) || (h.lcod && h.lcod != cs.size())) return ++passedOver_, false;
-    prev_ = cs;
     done_ = std::move(cs);
     doneTimestamp_ = timestamp_;
+    doneField_ = field_;
     doneLost_ = std::max<int64_t>(1, lost);
     doneConcealed_ = concealed;
     return true;

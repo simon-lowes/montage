@@ -19,7 +19,9 @@
 #include <QIODevice>
 #include <QMediaDevices>
 #include <QMutex>
+#include <QRunnable>
 #include <QThread>
+#include <QThreadPool>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -231,6 +233,7 @@ private:
                 pic->height = img.height;
                 pic->contentPeak = hdrContentPeak(trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim));
                 pic->transfer = trimTargetSpace(*s, r.trim).transfer;
+                pic->mastering = hdrMasteringPrimaries(trimTargetSpace(*s, r.trim));
                 if (r.trim.empty()) pic->maxCll = s->hdrMaxCll, pic->maxFall = s->hdrMaxFall;  // (measured on the master)
                 hdrViewImage(img, trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim), pic->contentPeak, pic->rgba);  // (rolled off as drawn)
                 // The master's adaptive HDR metadata (render/AdaptiveHdr.h), while it matches the cut: tone mapped by its
@@ -344,6 +347,7 @@ public:
     explicit MixerDevice(QObject* parent) : QIODevice(parent) {
         mixer_.setNonBlocking(true);
         mixer_.setOfflineProxies(true);  // (an offline file's proxy is heard while editing)
+        mixer_.setLiveInput(liveInput());
     }
 
     void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16, int channels = 2, bool idle = false) {
@@ -431,6 +435,7 @@ public:
             monitor_->setNonBlocking(true);
             monitor_->setOfflineProxies(true);
             monitor_->setAmbisonicBinaural(binaural_);
+            monitor_->setLiveInput(liveInput());
         }
         monitor_->setSettings(m, rate);
         monitor_->prepare(project_, seq_);
@@ -504,6 +509,7 @@ protected:
         int rate = 48000;
         int monitored = 0;  // the monitoring section's channels, when it is on
         const bool idle = idle_;
+        bool liveIdle = false;  // stopped, with sampler slots sounding on other tracks' strips
         {
             QMutexLocker lock(&m_);
             const Sequence* s = project_ ? project_->findSequence(seq_) : nullptr;
@@ -511,19 +517,54 @@ protected:
                 monitored = monitor_->outputs();
                 mon_.resize(size_t(frames) * size_t(monitored));
             }
+            // The sampler's voices first. A slot sent to another track of this sequence is kept apart and joins that
+            // track's strip in the mix below (its inserts, fader, pan and bus); the rest is added at the output.
+            sends_.clear();
+            if (sampler_) {
+                smp_.assign(size_t(frames) * 2, 0.0f);
+                if (s)
+                    if (const sampler::KitPtr kit = sampler_->kit())
+                        for (const auto& pad : kit->pads) {
+                            const Id to = pad.settings.output;
+                            if (!to || std::any_of(sends_.begin(), sends_.end(), [&](const auto& sd) { return sd.output == to; })) continue;
+                            if (std::any_of(s->audioTracks.begin(), s->audioTracks.end(), [&](const Track& t) { return t.id == to; }))
+                                sends_.push_back({to, nullptr});
+                        }
+                if (sendBufs_.size() < sends_.size()) sendBufs_.resize(sends_.size());
+                for (size_t k = 0; k < sends_.size(); ++k) {
+                    sendBufs_[k].assign(size_t(frames) * 2, 0.0f);
+                    sends_[k].out = sendBufs_[k].data();
+                }
+                sampler_->render(samplerClock_, frames, smp_.data(), sends_.data(), int(sends_.size()));
+                samplerClock_ += frames;
+                if (samplerGain_ != 1.0f)
+                    for (float& v : smp_) v *= samplerGain_;
+                // Stopped, the strips are mixed only while something sent to them sounds, and ten seconds on (tails).
+                bool sounding = false;
+                for (size_t k = 0; k < sends_.size() && !sounding; ++k)
+                    sounding = std::any_of(sendBufs_[k].begin(), sendBufs_[k].end(), [](float v) { return v != 0.0f; });
+                if (sounding) liveTail_ = int64_t(s ? s->sampleRate : 48000) * 10;
+                else liveTail_ = std::max<int64_t>(0, liveTail_ - frames);
+            } else {
+                smp_.clear();
+                liveTail_ = 0;
+            }
+            liveIdle = idle && s && !sends_.empty() && liveTail_ > 0;
             // (In pieces where a loop wraps.)
             for (int done = 0; done < frames;) {
                 const int64_t v = sample_ + done;
                 const int n = int(std::min<int64_t>(frames - done, untilWrap(v)));
                 const int64_t at = looped(v);
+                sendOffset_ = done;
                 if (monitor_)
                     monitor_->render(at, n, mon_.data() + size_t(done) * size_t(monitored), buf_.data() + size_t(done) * 2, &tl,
-                                     s && cycle_ && !idle ? &*cycle_ : nullptr, s && !idle);
+                                     s && cycle_ && !idle ? &*cycle_ : nullptr, s && !idle, liveIdle);
                 else if (s && !idle) mixer_.mix(*project_, *s, at, n, buf_.data() + size_t(done) * 2, &tl);
+                else if (liveIdle) mixer_.mixLive(*project_, *s, at, n, buf_.data() + size_t(done) * 2);
                 else std::fill(buf_.begin() + done * 2, buf_.begin() + (done + n) * 2, 0.0f);
                 done += n;
             }
-            if (s && cycle_ && !monitored) {
+            if (s && cycle_ && !monitored && !idle) {
                 cycle = cycle_;
                 fps = s->fpsValue();
                 rate = s->sampleRate;
@@ -531,15 +572,6 @@ protected:
             first = looped(sample_);
             lastFirst_ = idle || !s ? -1 : first;
             if (!idle) sample_ += frames;
-            if (sampler_) {
-                smp_.assign(size_t(frames) * 2, 0.0f);
-                sampler_->render(samplerClock_, frames, smp_.data());
-                samplerClock_ += frames;
-                if (samplerGain_ != 1.0f)
-                    for (float& v : smp_) v *= samplerGain_;
-            } else {
-                smp_.clear();
-            }
         }
         const bool sampled = !smp_.empty() && !muted_;
         if (sampled && monitored)  // (onto the first two of the monitoring section's channels)
@@ -560,9 +592,9 @@ protected:
                     for (int c = 0; c < channels; ++c)
                         d[size_t(i) * size_t(channels) + size_t(c)] = muted_ || c >= monitored ? 0.0f : mon_[size_t(i) * size_t(monitored) + size_t(c)];
             }
-        } else if (idle && !sampled) {
+        } else if (idle && !liveIdle && !sampled) {
             std::memset(data, 0, size_t(frames) * size_t(bytesPerFrame));
-        } else if (idle) {
+        } else if (idle && !liveIdle) {
             for (int i = 0; i < frames; ++i)
                 for (int c = 0; c < channels; ++c) {
                     const float v = c < 2 ? smp_[size_t(i) * 2 + size_t(c)] : 0.0f;
@@ -667,6 +699,22 @@ private:
     int64_t samplerClock_ = 0;  // (the sampler's own timeline: its notes start at the next block)
     std::vector<float> smp_;
     float samplerGain_ = 1.0f;
+    // The sampler's slots sent to other tracks, this block: their sound apart, added to those strips by the mixer.
+    std::vector<sampler::Engine::Send> sends_;
+    std::vector<std::vector<float>> sendBufs_;
+    int sendOffset_ = 0;     // (frames of the block mixed so far: a loop's wrap mixes it in pieces)
+    int64_t liveTail_ = 0;   // (samples the strips are still mixed for while stopped)
+    AudioMixer::LiveInput liveInput() {
+        return [this](Id track, int frames, float* stereo) {
+            for (const auto& sd : sends_)
+                if (sd.output == track && sd.out) {
+                    const float* from = sd.out + size_t(sendOffset_) * 2;
+                    for (int i = 0; i < frames * 2; ++i) stereo[i] += from[i];
+                    return true;
+                }
+            return false;
+        };
+    }
     AudioMixer mixer_;
     std::unique_ptr<Monitor> monitor_;  // the monitoring section, while it is on
     bool binaural_ = false;
@@ -749,9 +797,14 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     timer_.setTimerType(Qt::PreciseTimer);
     timer_.setInterval(8);
     connect(&timer_, &QTimer::timeout, this, &PlaybackController::tick);
+    // The audio device going away: told on the engine's thread, acted on here.
+    lostListener_ = audiodev::Engine::shared().addLostListener([this](const std::string& why) {
+        QMetaObject::invokeMethod(this, [this, w = QString::fromStdString(why)] { deviceLost(w); }, Qt::QueuedConnection);
+    });
 }
 
 PlaybackController::~PlaybackController() {
+    audiodev::Engine::shared().removeLostListener(lostListener_);  // (not called again once this returns)
     players().erase(std::remove(players().begin(), players().end(), this), players().end());
     worker_->setSinks({});
     stopAudio(true);
@@ -762,6 +815,7 @@ PlaybackController::~PlaybackController() {
 
 void PlaybackController::setProject(const Project& p, Id sequenceId) {
     project_ = std::make_shared<const Project>(p);
+    picturePreview_.reset();
     sequenceId_ = sequenceId;
     updateHeard();
     device_->setProject(heard_);
@@ -948,13 +1002,24 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale (a reference output its own).
-    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_, scopesWorking_});
+    const bool preview = picturePreview_ && !isPlaying();
+    worker_->request({preview ? picturePreview_ : project_, sequenceId_, preview && picturePreviewAt_ >= 0 ? picturePreviewAt_ : position_, renderScale(),
+                      useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_,
+                      hdrHeadroom_, scopesWorking_});
+}
+
+void PlaybackController::setPicturePreview(std::shared_ptr<const Project> p, FrameTime at) {
+    if (!p && !picturePreview_) return;
+    picturePreview_ = std::move(p);
+    picturePreviewAt_ = at;
+    if (!isPlaying()) requestFrame();
 }
 
 void PlaybackController::seek(FrameTime t) {
     t = clampToSequence(t);
     bool playing = isPlaying();
     if (t == position_ && !playing) return;
+    picturePreview_.reset();
     position_ = t;
     if (playing) {
         startFrame_ = t;
@@ -997,10 +1062,19 @@ void PlaybackController::scrubAudio(FrameTime t) {
     // A device that went away may be back, and nothing else opens it again until playback starts: it is asked for
     // every few seconds while scrubbing (opened, when it is there, with what plays meanwhile left as it is), and the
     // snippets move to it below.
-    if (asTried && device && !scrubOut_->onDevice() && !engine.isOpen() && scrubRetry_.isValid() && scrubRetry_.elapsed() >= 3000) {
+    // The asking is done on a pool thread (nightly 23 Nov: on this one it held the window up every few seconds, the
+    // more so as an open that does not find its device has PortAudio list them all again); a scrub after it has the
+    // device open moves the snippets to it.
+    if (asTried && device && !scrubOut_->onDevice() && !engine.isOpen() && scrubRetry_.isValid() && scrubRetry_.elapsed() >= 3000 &&
+        !scrubProbing_->exchange(true)) {
         scrubRetry_.start();
-        audiodev::Feed probe(engine);
-        probe.open(s->sampleRate, 2, 0.05);
+        QThreadPool::globalInstance()->start(QRunnable::create([probing = scrubProbing_, rate = s->sampleRate] {
+            {
+                audiodev::Feed probe(audiodev::Engine::shared());
+                probe.open(rate, 2, 0.05);
+            }
+            probing->store(false);
+        }));
     }
     const bool deviceMoved = asTried && device && scrubOut_->onDevice() != engine.isOpen();  // (gone, or back)
     if (!asTried || deviceMoved || (!scrubNoOutput_ && !scrubOut_->isOpen())) {
@@ -1270,6 +1344,19 @@ bool PlaybackController::startDeviceAudio(FrameTime from, bool idle) {
     engineRate_ = s->sampleRate;
     outputChannels_ = channels;
     return true;
+}
+
+void PlaybackController::deviceLost(const QString& why) {
+    // Sound goes on through the next device that opens: the host's own choice where the one named is gone, else the
+    // system's output (Qt Multimedia's), as when no device is chosen. Playback is not stopped for it.
+    const bool was = engineOut_ >= 0;
+    if (was) {
+        audiodev::Engine::shared().removeOutput(engineOut_);
+        engineOut_ = -1;
+        refreshAudio(true);
+    }
+    const audiodev::EngineStatus st = audiodev::Engine::shared().status();
+    emit audioDeviceLost(why, st.open ? QString::fromStdString(st.device) : QString());
 }
 
 double PlaybackController::devicePlayed() const {

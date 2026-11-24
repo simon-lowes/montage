@@ -345,7 +345,7 @@ bool videoFormatOk(const VideoFormat& f, std::string* why) {
     if (double(f.width) * f.height * f.fps.toDouble() > 8192.0 * 4320 * 60)
         return fail("ST 2110 pictures here are at most as many pixels a second as 8192 x 4320 at 60 frames");
     if (f.jpegXs()) {
-        if (f.interlaced) return fail("ST 2110-22's JPEG XS is sent and received here progressive");
+        if (f.interlaced && f.height % 2) return fail("Interlaced JPEG XS needs an even height (a codestream each field)");
         if (f.sampling == Sampling::Ycc422 && f.width % 2) return fail("JPEG XS at 4:2:2 needs an even width");
         if (f.width < 16 || f.height < 16) return fail("JPEG XS pictures here are at least 16 x 16");
         if (!(f.bpp >= 0.5 && f.bpp <= 24)) return fail("JPEG XS is coded here at 0.5 to 24 bits a pixel");
@@ -424,7 +424,7 @@ std::string videoSdp(const VideoFormat& f, const Endpoint& to, int pt, const Sdp
         if (!f.sublevel.empty()) s << "; sublevel=" << f.sublevel;
         s << "; sampling=" << samplingName(f.sampling) << "; width=" << f.width << "; height=" << f.height << "; depth=" << f.depth
           << "; exactframerate=" << rateText(f.fps) << "; colorimetry=" << f.colorimetry << "; TCS=" << f.tcs
-          << "; RANGE=NARROW; SSN=ST2110-22:2022; TP=2110TPW\r\n"
+          << "; RANGE=NARROW; SSN=ST2110-22:2022; TP=2110TPW" << (f.interlaced ? "; interlace" : "") << "\r\n"
           << sdpClock(o);
         return sdpStreams(to, o, to2, "video", pt, s.str(), f.bandwidthKbps);
     }
@@ -1285,6 +1285,8 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
     VideoFormat vf = video;
     jxs_.reset();
     codestream_.clear();
+    codestream2_.clear();
+    units2_.clear();
     boxes_.clear();
     units_.clear();
     if (vf.jpegXs() && o.sendVideo) {
@@ -1292,14 +1294,15 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
         jxs_ = std::make_unique<Jxs>();
         JxsEncodeSettings es;
         es.width = vf.width;
-        es.height = vf.height;
+        // (interlaced: each field coded on its own, RFC 9134's picture segments)
+        es.height = vf.interlaced ? vf.height / 2 : vf.height;
         es.depth = vf.depth;
         es.sampling = vf.sampling == Sampling::Ycc422 ? JxsSampling::Ycc422 : vf.sampling == Sampling::Ycc444 ? JxsSampling::Ycc444 : JxsSampling::Rgb;
         es.bppNum = int(std::lround(vf.bpp * 1000));
         es.bppDen = 1000;
         es.slices = vf.packetMode == 1;
         if (!jxs_->encoder.open(es, &why)) return fail(why);
-        Raster grey(vf.width, vf.height, vf.sampling, vf.depth);
+        Raster grey(vf.width, es.height, vf.sampling, vf.depth);
         std::fill(grey.samples.begin(), grey.samples.end(), uint16_t(1 << (vf.depth - 1)));
         std::vector<uint8_t> cs;
         std::vector<uint32_t> units;
@@ -1311,9 +1314,9 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
         vf.sublevel = withoutSpaces(jxsSublevelName(h.plev));
         boxes_ = jxsvBoxes(vf, h.ppih, h.plev, uint32_t(cs.size()));
         // (ST 2110-22's b=AS: each frame's IP packets, their IPv4, UDP and RTP headers and RFC 9134's, in kilobits a
-        // second, rounded up)
+        // second, rounded up; an interlaced frame is two fields' codestreams)
         const int packets = jxsvPacketCount(boxes_.size(), cs.size(), units, vf.packetMode, o.maxPayload);
-        const double bits = (double(boxes_.size() + cs.size()) + double(packets) * (20 + 8 + 12 + 4)) * 8;
+        const double bits = (double(boxes_.size() + cs.size()) + double(packets) * (20 + 8 + 12 + 4)) * 8 * (vf.interlaced ? 2 : 1);
         vf.bandwidthKbps = int64_t(std::ceil(bits * vf.fps.num / vf.fps.den / 1000));
     }
     s_ = std::make_unique<Sockets>();
@@ -1436,14 +1439,26 @@ bool Sender::send(const Raster& picture, const float* audio, int audioFrames, co
 bool Sender::sendJxs(const Raster& picture, const float* audio, int audioFrames, const output::Timecode* timecode, const std::vector<AncPacket>& anc,
                      const std::atomic<bool>* stop) {
     // Coded before its slot comes (a constant number of bytes, so of packets), then sent as the slot's packets are.
+    // An interlaced frame: each field a codestream of its own, both under the frame's (its first field's) timestamp.
+    const bool fields = video_.interlaced;
     if (o_.sendVideo) {
         if (!jxs_) return false;
         std::string why;
-        if (!jxs_->encoder.encode(jxsPictureOf(picture), codestream_, &units_, &why)) return false;
+        if (fields) {
+            if (!jxs_->encoder.encode(jxsPictureOf(fieldOf(picture, 1)), codestream_, &units_, &why) ||
+                !jxs_->encoder.encode(jxsPictureOf(fieldOf(picture, 2)), codestream2_, &units2_, &why))
+                return false;
+        } else if (!jxs_->encoder.encode(jxsPictureOf(picture), codestream_, &units_, &why)) {
+            return false;
+        }
     }
     const int64_t frame = frames_;
-    return sendFrame([&](int, uint32_t ts, const PacketSink& keep) {
-        return packJxsv(boxes_, codestream_.data(), codestream_.size(), units_, video_.packetMode, frame, ts, rtpVideo_, keep, o_.maxPayload);
+    uint32_t frameTs = 0;
+    return sendFrame([&](int field, uint32_t ts, const PacketSink& keep) {
+        if (field <= 1) frameTs = ts;
+        const std::vector<uint8_t>& cs = field == 2 ? codestream2_ : codestream_;
+        return packJxsv(boxes_, cs.data(), cs.size(), field == 2 ? units2_ : units_, video_.packetMode, frame, fields ? frameTs : ts, rtpVideo_, keep,
+                        o_.maxPayload, fields ? field : 0);
     }, audio, audioFrames, timecode, anc, stop);
 }
 

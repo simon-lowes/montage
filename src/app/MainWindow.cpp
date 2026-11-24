@@ -22,6 +22,7 @@
 #include "CleanFeed.h"
 #include "Settings.h"
 
+#include "CommandFinder.h"
 #include "CompareDialog.h"
 #include "MergeDialog.h"
 
@@ -180,6 +181,7 @@ extern "C" {
 #include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
 #include "DialogJobs.h"
+#include "DialogTasks.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
 #include "render/BackgroundJobs.h"
@@ -252,6 +254,7 @@ extern "C" {
 #include "render/AvidMedia.h"
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
+#include "render/RenderFarm.h"
 #include "render/Compositor.h"
 #include "render/GpuCompositor.h"
 #include "render/AutoBroll.h"
@@ -551,6 +554,47 @@ void MainWindow::buildPanels() {
     });
     effects_ = new EffectsBrowser(this);
     connect(effects_, &EffectsBrowser::applyRequested, this, &MainWindow::applyFromBrowser);
+    // A video effect or preset pointed at in the Effects panel is shown on the Program monitor as it would look on
+    // the selected clips: drawn from a copy of the project, which itself is not touched (no undo step, nothing to
+    // save). The frame is the playhead's when it is on the clip, else the clip's middle one. Not while playing, and
+    // not for plug-ins (one would have to be loaded to be looked at) or effects that ask something first.
+    connect(effects_, &EffectsBrowser::previewRequested, this, [this](const QString& typeQ, EffectCategory category) {
+        const Sequence* s = state_->sequence();
+        const std::string type = typeQ.toStdString();
+        EffectPreset preset;
+        const bool isPreset = typeQ.startsWith(QStringLiteral("preset:"));
+        bool can = s && !program_->isPlaying();
+        if (can && isPreset) can = presets::load(typeQ.mid(7), preset) && preset.video;
+        else if (can) can = category == EffectCategory::VideoFilter && findEffectInfo(type) && type != "lens_correction";
+        std::vector<Id> targets;
+        if (can)
+            for (Id id : state_->selectedClips())
+                if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) targets.push_back(id);
+        if (targets.empty()) {
+            program_->setPicturePreview(nullptr);
+            return;
+        }
+        auto copy = std::make_shared<Project>(state_->project());
+        Sequence* sq = copy->findSequence(s->id);
+        bool added = false;
+        for (Id id : targets)
+            if (Clip* c = sq ? edit::clipById(*sq, id) : nullptr) {
+                if (isPreset) {
+                    added = applyPreset(*copy, *c, preset) > 0 || added;
+                } else if (auto e = plugins::makeEffectOfType(*copy, type, nullptr)) {
+                    c->effects.push_back(*e);
+                    added = true;
+                }
+            }
+        if (!added) {
+            program_->setPicturePreview(nullptr);
+            return;
+        }
+        const Clip* first = edit::clipById(*s, targets.front());
+        const bool under = s->playhead >= first->start && s->playhead < first->end();
+        program_->setPicturePreview(std::move(copy), under ? FrameTime(-1) : first->start + first->duration / 2);
+    });
+    connect(effects_, &EffectsBrowser::previewEnded, this, [this] { program_->setPicturePreview(nullptr); });
     inspector_ = new InspectorWidget(state_, this);
     scopes_ = new ScopesWidget(this);
     // The selected clip's Crosstalk shown moving the primaries on the chromaticity scope.
@@ -816,12 +860,21 @@ void MainWindow::buildPanels() {
     // The dialogs' jobs are kept there too: a consolidation cut short by a crash is taken up again now, in the
     // background, and says so when it is done.
     dialogJobs_ = new DialogJobs(this, jobs::storeFolder());
+    dialogJobs_->setState(state_);  // (where a task nobody watches has its result applied)
     connect(dialogJobs_, &DialogJobs::resumed, this, [this](const QString& title) {
         statusBar()->showMessage(tr("Taking up again what Montage was doing when it stopped: %1").arg(title), 8000);
     });
     connect(dialogJobs_, &DialogJobs::finished, this, [this](const QString&, bool, const QString& text) { statusBar()->showMessage(text, 10000); });
+    // A package made with its dialog closed is reported when it ends, as a watched one is.
+    connect(dialogJobs_, &DialogJobs::taskDone, this, [this](const QString&, const QString& kind, const QJsonObject&, const QJsonObject& result) {
+        if (kind == QLatin1String("dcp")) dcpMade(result, nullptr);
+        if (kind == QLatin1String("imf")) imfMade(result, nullptr);
+    });
     dialogJobs_->resume();
-    queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
+    auto* queuePanel = new RenderQueuePanel(queue_, this);
+    queuePanel->setDialogJobs(dialogJobs_);
+    connect(queuePanel, &RenderQueuePanel::taskSaid, this, [this](const QString& text) { statusBar()->showMessage(text, 8000); });
+    queueDock_ = makeDock(tr("Render Queue"), "renderqueue", queuePanel);
     production_ = new ProductionPanel(state_, this);
     productionDock_ = makeDock(tr("Production"), "production", production_);
     connect(production_, &ProductionPanel::openRequested, this, [this](const QString& path, bool readOnly) {
@@ -1693,7 +1746,15 @@ void MainWindow::buildMenus() {
             return;
         }
         bool ok = false;
-        const QString name = QInputDialog::getText(this, tr("Nest In to Out"), tr("Compound clip name:"), QLineEdit::Normal, tr("Nested Sequence"), &ok);
+        // What a locked track will do is said before anything is cut.
+        QString label = tr("Compound clip name:");
+        QStringList locked;
+        for (TrackRef r : edit::nestRangeStays(*s, s->inPoint, s->outPoint + 1, allTracks(*s)))
+            locked << (r.kind == TrackKind::Video ? QStringLiteral("V%1") : QStringLiteral("A%1")).arg(r.index + 1);
+        if (!locked.isEmpty())
+            label = tr("Locked tracks keep their clips between In and Out where they are, outside the nested clip: %1.").arg(locked.join(QStringLiteral(", "))) +
+                    QStringLiteral("\n\n") + label;
+        const QString name = QInputDialog::getText(this, tr("Nest In to Out"), label, QLineEdit::Normal, tr("Nested Sequence"), &ok);
         if (ok && !name.isEmpty()) nestInToOut(name);
     })->setObjectName(QStringLiteral("nestInToOut"));
     add(clipM, QT_TR_NOOP("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
@@ -1791,7 +1852,7 @@ void MainWindow::buildMenus() {
                 return;
             }
             AutoDuckDialog dlg(state_, music, this);
-            if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
+            if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this, dlg.keepUpToDate());
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, QT_TR_NOOP("Breath Control…"), QKeySequence(), withSeq([this] {
             bool ok = false;
@@ -3316,6 +3377,13 @@ void MainWindow::buildMenus() {
     syncWorkspaceUi();
     QMenu* help = menuIn(menuBar(), QT_TR_NOOP("&Help"));
     add(help, QT_TR_NOOP("&Keyboard Shortcuts"), QKeySequence(Qt::Key_F1), [this] { showShortcuts(); });
+    add(help, QT_TR_NOOP("&Find Command…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_P), [this] {
+        // (made each time: the commands, effects and presets as they are now)
+        auto* finder = new CommandFinder(this);
+        finder->setAttribute(Qt::WA_DeleteOnClose);
+        connect(finder, &CommandFinder::applyRequested, this, &MainWindow::applyFromBrowser);
+        finder->open();
+    })->setObjectName(QStringLiteral("findCommand"));
     add(help, QT_TR_NOOP("&Licences…"), QKeySequence(), [this] { LicencesDialog(this).exec(); })->setObjectName("showLicences");
     add(help, QT_TR_NOOP("About &Qt"), QKeySequence(), [] { QApplication::aboutQt(); });
     add(help, QT_TR_NOOP("&About Montage"), QKeySequence(), [this] { about(); });
@@ -4484,29 +4552,20 @@ void MainWindow::vfxPullDialog() {
     // (the returns folder kept, if the sequence has one; else one in the pulls' folder)
     o.returns = !s->vfxReturns.empty() ? s->vfxReturns : QDir(folder).filePath(QStringLiteral("returns")).toStdString();
     o.returnsPattern = s->vfxPattern;
-    QProgressDialog progress(tr("Pulling shots..."), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    std::atomic<bool> cancel{false};
-    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
-    std::vector<VfxShot> shots;
-    std::string err;
-    const bool ok = exportVfxPulls(state_->project(), *s, clips, o, &shots, [&](double f, FrameTime) {
-        progress.setValue(int(f * 1000));
-        QApplication::processEvents();
-    }, &cancel, &err);
-    progress.close();
-    if (!ok) {
-        QMessageBox::warning(this, tr("Export VFX Pulls"), QString::fromStdString(err));
-        return;
-    }
-    // The shots kept with the sequence, their versions looked for in the returns folder from now on.
-    QDir().mkpath(QString::fromStdString(o.returns));
-    state_->edit(tr("Export VFX Pulls"), [&](Project&, Sequence& seq) {
-        recordVfxShots(seq, shots);
-        seq.vfxReturns = o.returns;
-        return true;
-    });
-    statusBar()->showMessage(tr("Pulled %n shot(s) with a pull list into %1", "", int(shots.size())).arg(QDir::toNativeSeparators(folder)), 8000);
+    // A background job (DialogJobs.h): the shots are kept with the sequence as one undo step when it ends
+    // (DialogTasks.cpp), unless the clips have moved meanwhile. Taken up after a crash, the shots it had pulled are
+    // passed over.
+    QJsonArray ids;
+    for (Id c : clips) ids.append(QString::number(c));
+    const QJsonObject options{{"folder", folder}, {"format", QString::fromStdString(o.format)}, {"handles", o.handles}, {"cutIn", o.cutIn},
+                              {"colorSpace", QString::fromStdString(o.colorSpace)}, {"amf", o.amf}, {"fdl", o.fdl},
+                              {"compression", QString::fromStdString(o.compression)}, {"sourceLayers", o.sourceLayers}, {"mattes", o.mattes},
+                              {"stMaps", o.stMaps}, {"namePattern", QString::fromStdString(o.namePattern)}, {"scripts", o.scripts},
+                              {"returns", QString::fromStdString(o.returns)}, {"returnsPattern", QString::fromStdString(o.returnsPattern)}};
+    const TaskOutcome r = dialogJobs_->run(state_, QStringLiteral("vfx-pull"), tr("Pulling shots..."),
+                                           QJsonObject{{"sequence", QString::number(s->id)}, {"clips", ids}, {"options", options}}, this);
+    if (r.how == TaskOutcome::Failed && !r.error.isEmpty()) QMessageBox::warning(this, tr("Export VFX Pulls"), r.error);
+    if (r.done() && r.applied.contains("message")) statusBar()->showMessage(r.applied.value("message").toString(), 8000);
 }
 
 CleanFeedWindow* MainWindow::showCleanFeed(int screenIndex) {
@@ -5659,80 +5718,14 @@ void MainWindow::detectScenes(bool markOnly) {
     }
     const Id clipId = c->id;
     const std::string path = analysisSource(*m);  // (a proxy reads quicker, and is there when the file is not)
-    auto* dlg = new QProgressDialog(tr("Detecting scene cuts in %1...").arg(QString::fromStdString(m->name)), tr("Cancel"), 0, 1000, this);
-    dlg->setWindowModality(Qt::WindowModal);
-    dlg->setMinimumDuration(300);
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    connect(dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
-    QPointer<QProgressDialog> guard(dlg);
-    auto* watcher = new QFutureWatcher<std::vector<double>>(this);
-    connect(watcher, &QFutureWatcher<std::vector<double>>::finished, this, [this, watcher, dlg, clipId, cancel, markOnly] {
-        std::vector<double> cuts = watcher->result();
-        dlg->close();
-        dlg->deleteLater();
-        watcher->deleteLater();
-        if (*cancel) return;
-        int made = 0;
-        state_->apply(markOnly ? tr("Detect Shot Changes") : tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
-            Clip* clip = edit::clipById(sq, clipId);
-            if (!clip) return edit::Result::fail("The clip is gone");
-            // Map source times to timeline frames inside the clip.
-            std::vector<FrameTime> frames;
-            std::vector<FrameTime> sources;
-            for (double sec : cuts) {
-                double src = sec * sq.fpsValue();
-                double local = clip->ramped() ? clip->localForSource(src) : (src - clip->sourceIn) / clip->speed;
-                if (clip->reverse) local = double(clip->duration) - local;
-                FrameTime f = clip->start + FrameTime(std::llround(local));
-                if (f > clip->start && f < clip->end()) frames.push_back(f), sources.push_back(FrameTime(std::llround(src)));
-            }
-            // Each a shot-change marker on the clip's source, so it stays on that moment of the footage as the clip
-            // is moved, slipped or trimmed (the razor's cuts are through edits, which captions do not count as shot
-            // changes).
-            for (FrameTime src : sources)
-                if (std::none_of(clip->markers.begin(), clip->markers.end(), [src](const Marker& mk) { return mk.shotChange && mk.t == src; })) {
-                    Marker mk;
-                    mk.t = src;
-                    mk.name = tr("Shot change").toStdString();
-                    mk.shotChange = true;
-                    clip->markers.push_back(mk);
-                    if (markOnly) ++made;
-                }
-            std::sort(clip->markers.begin(), clip->markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
-            if (markOnly) {
-                if (!made) return edit::Result::fail("No new shot changes found in this clip");
-                return edit::Result{};
-            }
-            std::vector<TrackRef> tracks;
-            for (Id l : edit::linkedClips(sq, clipId))
-                if (auto loc = edit::locate(sq, l)) tracks.push_back(loc->track);
-            for (FrameTime f : frames) {
-                std::map<Id, Id> regroup;
-                for (TrackRef t : tracks) {
-                    const Clip* under = edit::clipAt(sq, t, f);
-                    Id group = under ? under->linkGroup : 0;
-                    auto r = edit::razor(p, sq, t, f);
-                    if (r.ok && group && !r.created.empty()) {
-                        auto it = regroup.find(group);
-                        if (it == regroup.end()) it = regroup.emplace(group, p.newId()).first;
-                        if (Clip* rc = edit::clipById(sq, r.created[0])) rc->linkGroup = it->second;
-                    }
-                }
-                ++made;
-            }
-            if (!made) return edit::Result::fail("No scene cuts found in this clip");
-            return edit::Result{};
-        });
-        if (made)
-            state_->message(markOnly ? tr("Marked %n shot change(s)", "", made) : tr("Cut the clip at %n scene change(s)", "", made), 5000);
-    });
-    watcher->setFuture(QtConcurrent::run([path, cancel, guard] {
-        return detectSceneCuts(path, 0.5, [guard](double f) {
-            QMetaObject::invokeMethod(qApp, [guard, f] {
-                if (guard) guard->setValue(int(f * 1000));
-            }, Qt::QueuedConnection);
-        }, cancel.get());
-    }));
+    // A background job (DialogJobs.h): watched behind its progress dialog or left to run, its cuts are applied as one
+    // undo step when it ends (DialogTasks.cpp), unless the clip has moved meanwhile.
+    const QJsonObject input{{"sequence", QString::number(s->id)}, {"clips", QJsonArray{QString::number(clipId)}},
+                            {"path", QString::fromStdString(path)}, {"markOnly", markOnly}};
+    const TaskOutcome r = dialogJobs_->run(state_, QStringLiteral("scene-detect"),
+                                           tr("Detecting scene cuts in %1...").arg(QString::fromStdString(m->name)), input, this);
+    if (r.how == TaskOutcome::Failed && !r.error.isEmpty()) state_->message(r.error, 6000);
+    if (r.done() && r.applied.contains("message")) state_->message(r.applied.value("message").toString(), 5000);
 }
 
 void MainWindow::normalizeLoudness() {
@@ -8113,59 +8106,31 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
         state_->message(tr("Nothing to export"));
         return {};
     }
-    // Made from a copy, off the UI thread (a feature takes a while: every frame is compressed to JPEG 2000).
-    const Project project = state_->project();
-    const Sequence seq = *s;
-    QProgressDialog progress(tr("Making the DCP of %1...").arg(QString::fromStdString(seq.name)), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    std::atomic<int> done{0};
-    std::atomic<bool> cancel{false};
-    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
-    DcpResult result;
-    std::string err;
-    QFutureWatcher<bool> watcher;
-    QEventLoop loop;
-    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, this, [&] { progress.setValue(done.load()); });
-    tick.start(100);
-    // Then checked as a server would, reading every file back (also off the UI thread: a feature is many gigabytes).
-    std::vector<std::string> issues, advice;
-    std::atomic<bool> checking{false};
-    connect(&tick, &QTimer::timeout, this, [&] {
-        if (checking.load()) progress.setLabelText(tr("Checking the DCP of %1...").arg(QString::fromStdString(seq.name)));
-    });
-    watcher.setFuture(QtConcurrent::run([&] {
-        if (!exportDcp(project, seq, settings, parent.toStdString(), &result, [&](double f) {
-                done = int(f * 850);
-                return !cancel.load();
-            }, &err))
-            return false;
-        checking = true;
-        issues = verifyDcp(result.folder, [&](double f) {
-            done = 850 + int(f * 150);
-            return !cancel.load();
-        }, &advice);
-        return true;
-    }));
-    if (!watcher.isFinished()) loop.exec();
-    tick.stop();
-    progress.close();
-    if (!watcher.result()) {
-        state_->message(cancel ? tr("DCP cancelled") : tr("No DCP: %1").arg(QString::fromStdString(err)), 8000);
+    // A background job, made from a copy off the UI thread (a feature takes a while: every frame is compressed to
+    // JPEG 2000) and then checked as a server would. Its dialog can be closed: it goes on in the jobs list.
+    const QJsonObject input{{"sequence", QString::number(qulonglong(s->id))}, {"parent", parent}, {"settings", dcpSettingsToJson(settings)}};
+    const TaskOutcome made = dialogJobs_->run(state_, QStringLiteral("dcp"), tr("Making the DCP of %1...").arg(QString::fromStdString(s->name)), input, this);
+    if (made.how == TaskOutcome::Background) return {};
+    if (made.how != TaskOutcome::Done) {
+        state_->message(made.how == TaskOutcome::Cancelled ? tr("DCP cancelled") : tr("No DCP: %1").arg(made.error), 8000);
         return {};
     }
-    if (cancel.load() && !issues.empty() && issues.back() == "Stopped") {
+    return dcpMade(made.result, problems);
+}
+
+QString MainWindow::dcpMade(const QJsonObject& made, QStringList* problems) {
+    const DcpResult result = dcpResultFromJson(made);
+    const QString folder = QString::fromStdString(result.folder);
+    if (made.value("stopped").toBool()) {
         state_->message(tr("DCP %1 made; its check was stopped").arg(QString::fromStdString(result.name)), 8000);
-        return QString::fromStdString(result.folder);
+        return folder;
     }
-    QStringList found;
-    for (const std::string& i : issues) found << QString::fromStdString(i);
+    QStringList found, advice;
+    for (const QJsonValue& i : made.value("issues").toArray()) found << i.toString();
+    for (const QJsonValue& i : made.value("advice").toArray()) advice << i.toString();
     if (result.overLoudnessLimit())
         found << tr("its sound is %1 Leq(M), over the %2 its kind is held to").arg(result.leqm, 0, 'f', 1).arg(result.leqmLimit, 0, 'f', 0);
     if (problems) *problems = found;
-    const QString folder = QString::fromStdString(result.folder);
     if (!found.isEmpty())
         state_->message(tr("DCP %1 made, but the check found: %2").arg(QString::fromStdString(result.name), found.join("; ")), 12000);
     else if (!result.cinemaProfile)
@@ -8177,9 +8142,8 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
         QString more;
         if (result.encrypted) more += tr(" It is encrypted: make KDMs for the cinemas' servers with File › Make KDMs (its keys are kept in %1).")
                                           .arg(QDir::toNativeSeparators(QString::fromStdString(result.dkdm)));
-        if (!advice.empty())
-            more += tr(" Advice: %1").arg(QString::fromStdString(advice.front())) +
-                    (advice.size() > 1 ? tr(" (and %n more)", nullptr, int(advice.size() - 1)) : QString());
+        if (!advice.isEmpty())
+            more += tr(" Advice: %1").arg(advice.front()) + (advice.size() > 1 ? tr(" (and %n more)", nullptr, int(advice.size() - 1)) : QString());
         state_->message(tr("DCP %1 made and checked (%2 fps, %3 x %4, %5 channels): copy the folder to a drive for the cinema.")
                                 .arg(QString::fromStdString(result.name))
                                 .arg(result.fps)
@@ -8199,67 +8163,50 @@ QString MainWindow::exportImfTo(const QString& parent, const ImfSettings& settin
         state_->message(tr("Nothing to export"));
         return {};
     }
-    // Made from a copy, off the UI thread, then checked there too (every frame is compressed, every file read back).
-    const Project project = state_->project();
-    const Sequence seq = *s;
-    QProgressDialog progress(tr("Making the IMF master of %1...").arg(QString::fromStdString(seq.name)), tr("Cancel"), 0, 1000, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(400);
-    std::atomic<int> done{0};
-    std::atomic<bool> cancel{false}, checking{false};
-    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
-    ImfResult result;
-    std::string err;
-    std::vector<std::string> issues;
-    QFutureWatcher<bool> watcher;
-    QEventLoop loop;
-    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
-    QTimer tick;
-    connect(&tick, &QTimer::timeout, this, [&] {
-        progress.setValue(done.load());
-        if (checking.load()) progress.setLabelText(tr("Checking the IMF master of %1...").arg(QString::fromStdString(seq.name)));
-    });
-    tick.start(100);
-    watcher.setFuture(QtConcurrent::run([&] {
-        if (!exportImf(project, seq, settings, parent.toStdString(), &result, [&](double f) {
-                done = int(f * 850);
-                return !cancel.load();
-            }, &err))
-            return false;
-        checking = true;
-        issues = verifyImf(result.folder, [&](double f) {
-            done = 850 + int(f * 150);
-            return !cancel.load();
-        });
-        return true;
-    }));
-    if (!watcher.isFinished()) loop.exec();
-    tick.stop();
-    progress.close();
-    if (!watcher.result()) {
-        state_->message(cancel ? tr("IMF master cancelled") : tr("No IMF master: %1").arg(QString::fromStdString(err)), 8000);
+    // A background job, made from a copy off the UI thread, then checked there too (every frame is compressed, every
+    // file read back). Its dialog can be closed: it goes on in the jobs list.
+    const QJsonObject input{{"sequence", QString::number(qulonglong(s->id))}, {"parent", parent}, {"settings", imfSettingsToJson(settings)}};
+    const TaskOutcome made =
+        dialogJobs_->run(state_, QStringLiteral("imf"), tr("Making the IMF master of %1...").arg(QString::fromStdString(s->name)), input, this);
+    if (made.how == TaskOutcome::Background) return {};
+    if (made.how != TaskOutcome::Done) {
+        state_->message(made.how == TaskOutcome::Cancelled ? tr("IMF master cancelled") : tr("No IMF master: %1").arg(made.error), 8000);
         return {};
     }
+    return imfMade(made.result, problems);
+}
+
+QString MainWindow::imfMade(const QJsonObject& made, QStringList* problems) {
+    const ImfResult result = imfResultFromJson(made);
     const QString folder = QString::fromStdString(result.folder);
     const QString name = QFileInfo(folder).fileName();
-    if (cancel.load() && !issues.empty() && issues.back() == "Stopped") {
+    if (made.value("stopped").toBool()) {
         state_->message(tr("IMF master %1 made; its check was stopped").arg(name), 8000);
         return folder;
     }
     QStringList found;
-    for (const std::string& i : issues) found << QString::fromStdString(i);
+    for (const QJsonValue& i : made.value("issues").toArray()) found << i.toString();
     if (problems) *problems = found;
     if (!found.isEmpty())
         state_->message(tr("IMF master %1 made, but the check found: %2").arg(name, found.join("; ")), 12000);
-    else
+    else {
+        // What else to know: what the check advises (for a DPP master, what the DPP's own checks may still ask for).
+        QString more;
+        const QJsonArray advice = made.value("advice").toArray();
+        if (!advice.isEmpty())
+            more = tr(" Advice: %1").arg(advice.first().toString()) + (advice.size() > 1 ? tr(" (and %n more)", nullptr, int(advice.size() - 1)) : QString());
+        if (result.leftEventTracks > 0)
+            more += tr(" %n events track(s) of the earlier package end before this one does and were left out.", nullptr, result.leftEventTracks);
         state_->message(tr("IMF master %1 made and checked (%2 x %3, %4-bit %5, %6 channels)")
-                            .arg(name)
-                            .arg(result.width)
-                            .arg(result.height)
-                            .arg(result.bits)
-                            .arg(QString::fromStdString(result.colour))
-                            .arg(result.channels),
-                        12000);
+                                .arg(name)
+                                .arg(result.width)
+                                .arg(result.height)
+                                .arg(result.bits)
+                                .arg(QString::fromStdString(result.colour))
+                                .arg(result.channels) +
+                            more,
+                        15000);
+    }
     return folder;
 }
 
@@ -8472,8 +8419,25 @@ void MainWindow::exportStreamingDialog() {
     target->setPrefix(tr("VMAF "));
     target->setToolTip(tr("Each shot gets the quality that reaches this VMAF for the fewest bits, the rung's rate its cap; at 0, the "
                           "rung's rate spread over the shots for the most VMAF. The package gets ladder.csv, each shot's rate and score."));
-    perShot->setToolTip(tr("Each shot (between cuts and marked shot changes, a second at the least) starts a segment and is "
-                           "first encoded at several qualities on each rung, then scored by VMAF at the rung's size: longer to make"));
+    perShot->setToolTip(tr("Each shot (between cuts and marked shot changes, or scene changes where there are none; a second at the "
+                           "least) starts a segment and is first encoded at several qualities on each rung, then scored by VMAF at "
+                           "the size it is shown at: longer to make"));
+    // The size every rung is scored at, and the best quality a shot may be given.
+    auto* displaySize = new QComboBox;
+    displaySize->setObjectName(QStringLiteral("streamingDisplaySize"));
+    displaySize->addItem(tr("Scored at the largest rung's size"), QSize());
+    for (const QSize& z : {QSize(1280, 720), QSize(1920, 1080), QSize(3840, 2160)})
+        displaySize->addItem(tr("Scored at %1 × %2").arg(z.width()).arg(z.height()), z);
+    displaySize->setToolTip(tr("Every rung's pictures are scaled to this size and scored against the render at it, so one VMAF target is "
+                           "one quality on every rung"));
+    auto* lowestCrf = new QDoubleSpinBox;
+    lowestCrf->setObjectName(QStringLiteral("streamingCrfFloor"));
+    lowestCrf->setRange(1, 40);
+    lowestCrf->setDecimals(0);
+    lowestCrf->setValue(18);
+    lowestCrf->setPrefix(tr("Lowest CRF "));
+    lowestCrf->setToolTip(tr("The best quality a shot may be given (H.264 and HEVC; AV1's is two more): a shot that would need more "
+                         "stops there, and ladder.csv says so"));
     const bool vmaf = vmafAvailable() && !(hdr && vmafModelFor([&] {
                                                      QualityPicture q;
                                                      q.width = s->width, q.height = s->height, q.transfer = cs->transfer == Transfer::Pq ? "pq" : "hlg";
@@ -8481,11 +8445,16 @@ void MainWindow::exportStreamingDialog() {
                                                  }(), CompareOptions{}).empty());
     perShot->setEnabled(vmaf);
     if (!vmaf) perShot->setToolTip(tr("Needs VMAF (libvmaf %1), and for HDR an HDR VMAF model").arg(QString::fromStdString(vmafVersion())));
-    target->setEnabled(false);
+    target->setEnabled(false), displaySize->setEnabled(false), lowestCrf->setEnabled(false);
     connect(perShot, &QCheckBox::toggled, target, &QWidget::setEnabled);
+    connect(perShot, &QCheckBox::toggled, displaySize, &QWidget::setEnabled);
+    connect(perShot, &QCheckBox::toggled, lowestCrf, &QWidget::setEnabled);
     auto* rates = new QHBoxLayout;
     rates->addWidget(perShot), rates->addWidget(target), rates->addStretch();
     form->addRow(tr("Rates:"), rates);
+    auto* scoring = new QHBoxLayout;
+    scoring->addWidget(displaySize), scoring->addWidget(lowestCrf), scoring->addStretch();
+    form->addRow(QString(), scoring);
     auto* hls = new QCheckBox(tr("HLS"));
     auto* dash = new QCheckBox(tr("DASH"));
     hls->setChecked(true), dash->setChecked(true);
@@ -8542,6 +8511,11 @@ void MainWindow::exportStreamingDialog() {
     st.hls = hls->isChecked(), st.dash = dash->isChecked();
     st.perShot = perShot->isChecked();
     st.vmafTarget = st.perShot ? target->value() : 0;
+    if (st.perShot) {
+        const QSize z = displaySize->currentData().toSize();
+        st.displayWidth = z.isValid() ? z.width() : 0, st.displayHeight = z.isValid() ? z.height() : 0;
+        st.crfFloor = lowestCrf->value();
+    }
     st.audioCodec = audio->currentData().toString().toStdString();
     st.segmentFormat = segmentFormat->currentData().toString().toStdString();
     if (st.segmentFormat == "ts" && (st.audioCodec == "libopus" || codec->currentData().toString() != "libx264")) {
@@ -8643,6 +8617,11 @@ void MainWindow::exportImfDialog() {
     events->setChecked(true);
     events->setToolTip(tr("Event-based metadata (SMPTE ST 2067-206) on a track of its own, read back as markers when the package is imported"));
     form->addRow(QString(), events);
+    auto* eventsJson = new QCheckBox(tr("Markers document as JSON"), &dlg);
+    eventsJson->setObjectName(QStringLiteral("imfEventsJson"));
+    eventsJson->setToolTip(tr("The events document as JSON instead of XML; a supplemental keeps the earlier package's form"));
+    form->addRow(QString(), eventsJson);
+    connect(events, &QCheckBox::toggled, eventsJson, [events, eventsJson] { eventsJson->setEnabled(events->isEnabled() && events->isChecked()); });
     // Application ProRes: the profile (4:2:2 Y'CbCr, or 4:4:4 R'G'B').
     auto* proresProfile = new QComboBox(&dlg);
     proresProfile->setObjectName(QStringLiteral("imfProResProfile"));
@@ -8839,7 +8818,9 @@ void MainWindow::exportImfDialog() {
         const bool eightK = app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026);
         offer(size, "8k", eightK);
         if (!eightK && size->currentData().toString() == "8k") size->setCurrentIndex(size->findData("uhd"));
-        events->setEnabled(app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026));
+        // (markers travel in every application; in #2E from the 2026 edition)
+        events->setEnabled(!app2 || supplemental->isChecked() || edition->currentData().toInt() == 2026);
+        eventsJson->setEnabled(events->isEnabled() && events->isChecked());
         offer(colour, "p3d65-pq", !dpp);
         offer(proresProfile, "422", !dpp);
         offer(proresProfile, "lt", !dpp);
@@ -8931,6 +8912,7 @@ void MainWindow::exportImfDialog() {
     st.application = application->currentData().toInt();
     st.edition = edition->currentData().toInt();
     st.events = events->isEnabled() && events->isChecked();
+    st.eventsJson = eventsJson->isEnabled() && eventsJson->isChecked();
     if (st.application == 45 || st.application == 59) {
         st.prores = proresProfile->currentData().toString().toStdString();
         if (fields->isEnabled()) st.fields = fields->currentData().toString().toStdString();

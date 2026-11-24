@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "AudioDeviceInternal.h"
+#include "RtGuard.h"
 
 #ifdef MONTAGE_WITH_PORTAUDIO
 #include <portaudio.h>
@@ -35,11 +36,32 @@ std::unique_ptr<Stream> openPortAudio(const DeviceSettings&, int, int, int, Stre
 
 namespace {
 
-// PortAudio is started once, the first time it is asked for, and kept (its device lists are taken then).
+// PortAudio is started the first time it is asked for, and kept. It lists the devices when it starts and never again,
+// so a device plugged in later (or unplugged and plugged back in) is not there until it is started again, which it
+// allows with no stream open: done for a list of devices, and for an open that does not find the device it was given,
+// no more often than every few seconds (starting it asks every device what it can do).
 std::mutex gPaM;
+bool gPaTried = false, gPaUp = false;
+int gPaStreams = 0;  // streams open (under gPaM)
+std::chrono::steady_clock::time_point gPaListed;
+constexpr std::chrono::seconds kRelistEvery{3};
+
 bool paReady() {
-    static const bool ok = Pa_Initialize() == paNoError;
-    return ok;
+    if (!gPaTried) {
+        gPaTried = true;
+        gPaUp = Pa_Initialize() == paNoError;
+        gPaListed = std::chrono::steady_clock::now();
+    }
+    return gPaUp;
+}
+
+// (under gPaM) True when the devices were listed again.
+bool paRelist() {
+    if (!paReady() || gPaStreams > 0 || std::chrono::steady_clock::now() - gPaListed < kRelistEvery) return false;
+    Pa_Terminate();
+    gPaUp = Pa_Initialize() == paNoError;
+    gPaListed = std::chrono::steady_clock::now();
+    return gPaUp;
 }
 
 PaHostApiTypeId paType(Host h) {
@@ -80,14 +102,27 @@ PaDeviceIndex findDevice(PaHostApiIndex api, const std::string& id, bool output)
     return output ? h->defaultOutputDevice : h->defaultInputDevice;
 }
 
+// Whether the host lists a device of this name (with outputs, or with inputs).
+bool listed(PaHostApiIndex api, const std::string& id, bool output) {
+    const PaHostApiInfo* h = Pa_GetHostApiInfo(api);
+    for (int k = 0; h && k < h->deviceCount; ++k) {
+        const PaDeviceIndex d = Pa_HostApiDeviceIndexToDeviceIndex(api, k);
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(d);
+        if (info && deviceId(d) == id && (output ? info->maxOutputChannels : info->maxInputChannels) > 0) return true;
+    }
+    return false;
+}
+
 class PaStreamBox : public Stream {
 public:
     explicit PaStreamBox(StreamCallbacks cb) : cb_(std::move(cb)) {}
     ~PaStreamBox() override {
         if (stream_) {
             closing_ = true;
+            std::lock_guard<std::mutex> lock(gPaM);
             Pa_StopStream(stream_);
             Pa_CloseStream(stream_);
+            --gPaStreams;
         }
     }
     bool open(const DeviceSettings& s, int rate, int inputs, int outputs, std::string* error) {
@@ -96,7 +131,11 @@ public:
             if (error) *error = "PortAudio could not start";
             return false;
         }
-        const PaHostApiIndex api = paIndex(s.host);
+        PaHostApiIndex api = paIndex(s.host);
+        // (a device asked for by name that is not listed may have been plugged in since the devices were listed)
+        if (api >= 0 && ((!s.output.empty() && outputs > 0 && !listed(api, s.output, true)) || (!s.input.empty() && inputs > 0 && !listed(api, s.input, false))) &&
+            paRelist())
+            api = paIndex(s.host);
         if (api < 0) {
             if (error) *error = std::string("This build or system has no ") + hostId(s.host);
             return false;
@@ -161,6 +200,7 @@ public:
             if (error) *error = std::string("The device could not be opened: ") + Pa_GetErrorText(e);
             return false;
         }
+        ++gPaStreams;
         const PaStreamInfo* info = Pa_GetStreamInfo(stream_);
         rate_ = info && info->sampleRate > 0 ? int(info->sampleRate + 0.5) : rate;
         latency_.input = info && inputs_ > 0 ? int(info->inputLatency * rate_ + 0.5) : 0;
@@ -168,6 +208,7 @@ public:
         watch_.reset(rate_);
         name_ = oi ? oi->name : ii->name;
         in_.assign(size_t(kMaxBuffer) * size_t(std::max(1, inputs_)), 0.0f);
+        none_.assign(size_t(std::max(buffer_, kMaxBuffer)) * 2, 0.0f);  // (made here: the callback allocates nothing)
         // (a stream that ends without being stopped: its device went away, unplugged or taken; the engine is told)
         Pa_SetStreamFinishedCallback(stream_, &PaStreamBox::finished);
         if ((e = Pa_StartStream(stream_)) != paNoError) {
@@ -190,6 +231,7 @@ private:
     static int callback(const void* input, void* output, unsigned long frames, const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags flags,
                         void* arg) {
         auto* self = static_cast<PaStreamBox*>(arg);
+        const rtguard::Scope scope;
         // PortAudio says nothing when the device's rate is changed under it (its control panel, another program): the
         // rate is judged from the frames the callbacks bring, and followed.
         const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -205,10 +247,8 @@ private:
         }
         float* out = static_cast<float*>(output);
         if (!out) {
-            // (an input-only stream: the outputs go nowhere)
-            static thread_local std::vector<float> none;
-            none.resize(size_t(frames) * 2);
-            if (self->cb_.process) self->cb_.process(in, self->inputs_, none.data(), 0, int(frames));
+            // (an input-only stream: the outputs go nowhere; a block longer than the stream was opened for is passed over)
+            if (self->cb_.process && size_t(frames) * 2 <= self->none_.size()) self->cb_.process(in, self->inputs_, self->none_.data(), 0, int(frames));
             return paContinue;
         }
         if (self->cb_.process) self->cb_.process(in, self->inputs_, out, self->outputs_, int(frames));
@@ -228,7 +268,7 @@ private:
     RateWatch watch_;  // (the audio thread's)
     Latency latency_;
     std::string name_;
-    std::vector<float> in_;
+    std::vector<float> in_, none_;
     std::atomic<int64_t> xruns_{0};
 };
 
@@ -242,6 +282,7 @@ bool portAudioHas(Host h) {
 std::vector<DeviceInfo> portAudioDevices(Host h, std::string* error) {
     std::lock_guard<std::mutex> lock(gPaM);
     std::vector<DeviceInfo> out;
+    paRelist();
     const PaHostApiIndex api = paReady() ? paIndex(h) : -1;
     const PaHostApiInfo* info = api >= 0 ? Pa_GetHostApiInfo(api) : nullptr;
     if (!info) {

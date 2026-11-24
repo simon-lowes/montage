@@ -915,6 +915,19 @@ void noteNoTextures(const PluginDesc& d, const std::string& why) {
     std::lock_guard<std::mutex> lock(gNoTexturesMutex);
     gNoTextures.emplace(d.id, why);
 }
+// Renders from the compositor's textures that failed one after another, by plug-in: one can fail for a moment (the
+// card short of memory, a driver's hiccup), so textures go off for it only after three in a row, and a render that
+// goes through starts the count again.
+constexpr int kTextureMissesInARow = 3;
+std::map<std::string, int> gTextureMisses;  // (gNoTexturesMutex)
+void noteTextureMiss(const PluginDesc& d, const std::string& why) {
+    std::lock_guard<std::mutex> lock(gNoTexturesMutex);
+    if (++gTextureMisses[d.id] >= kTextureMissesInARow) gNoTextures.emplace(d.id, why);
+}
+void noteTextureRender(const PluginDesc& d) {
+    std::lock_guard<std::mutex> lock(gNoTexturesMutex);
+    gTextureMisses.erase(d.id);
+}
 
 // Whether the plug-in is to be given the compositor's texture for input `name` at `time`: the picture now (another
 // frame of a filter's source comes from the fetch, where there is one).
@@ -2657,7 +2670,7 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
         if (!ran) st = kOfxStatFailed, direct = false;
         rendered = ok(st);
         if (rendered) ++gGpuRenders;
-        if (direct) ++gGpuTextureRenders;
+        if (direct) ++gGpuTextureRenders, noteTextureRender(d);
         else if (d.openGL == "needed") {
             clear();
             return fail(inst->error.empty() ? d.label + " failed to render with OpenGL" : d.label + ": " + inst->error);
@@ -2665,8 +2678,9 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
         // (else on the CPU, as kOfxStatGLRenderFailed asks)
     }
     if (!rendered) {
-        // (From the compositor's textures: they are read back as the plug-in asks for them, and it is not given them again.)
-        if (job.outTexture && !inMemory) noteNoTextures(d, "it did not render them with OpenGL");
+        // (From the compositor's textures: they are read back as the plug-in asks for them, and after a few such
+        // renders in a row it is not given them again.)
+        if (job.outTexture && !inMemory) noteTextureMiss(d, "it did not render them with OpenGL");
         inst->error.clear();
         inst->wrote = false;
         st = sendRender(*inst, job.t, false);

@@ -704,9 +704,35 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     return true;
 }
 
+SplatFilter splatClipFilter(const Clip& c, FrameTime lt) {
+    const Effect& g = c.generator;
+    auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
+    SplatFilter f;
+    if (P("crop", 0) > 0.5) {
+        f.box = P("clean_box", 0) > 0.5 ? 2 : 1;
+        const char* names[3][2] = {{"crop_x0", "crop_x1"}, {"crop_y0", "crop_y1"}, {"crop_z0", "crop_z1"}};
+        for (int a = 0; a < 3; ++a) {
+            const double u = P(names[a][0], -10), v = P(names[a][1], 10);
+            f.boxLo[size_t(a)] = float(std::min(u, v)), f.boxHi[size_t(a)] = float(std::max(u, v));
+        }
+    }
+    f.minOpacity = float(std::clamp(P("clean_opacity", 0) / 100, 0.0, 1.0));
+    f.maxSize = float(std::max(0.0, P("clean_size", 0)));
+    f.neighbourDistance = float(std::max(0.0, P("clean_near", 0)));
+    f.neighbours = int(std::clamp<long>(std::lround(P("clean_near_count", 3)), 1, 64));
+    f.sphere = int(std::clamp<long>(std::lround(P("clean_sphere", 0)), 0, 2));
+    f.sphereCentre = {float(P("clean_sphere_x", 0)), float(P("clean_sphere_y", 0)), float(P("clean_sphere_z", 0))};
+    f.sphereRadius = float(std::max(0.0, P("clean_sphere_radius", 1)));
+    f.color = int(std::clamp<long>(std::lround(P("clean_color", 0)), 0, 2));
+    f.colorValue = {float(P("clean_color_value.r", 0)), float(P("clean_color_value.g", 0)), float(P("clean_color_value.b", 0))};
+    f.colorRange = float(std::clamp(P("clean_color_range", 10) / 100, 0.0, 1.0));
+    f.removed = g.s("clean_removed");
+    return f;
+}
+
 bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double scale,
                     std::shared_ptr<const SplatCloud>& cloud, Mat4& place, ModelCamera& cam, SplatRenderOptions& options,
-                    std::string* error) {
+                    std::string* error, bool draft) {
     const Effect& g = c.generator;
     const FrameTime lt = t - c.start;
     auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
@@ -738,11 +764,19 @@ bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     const int ti = trackOf(seq, c);
     if (!clipCamera(p, seq, c, c.generator, t, scale, ti, mode, cam, groundY, onGround, error)) return false;
     options = SplatRenderOptions{};
-    options.crop = P("crop", 0) > 0.5;
-    const char* names[3][2] = {{"crop_x0", "crop_x1"}, {"crop_y0", "crop_y1"}, {"crop_z0", "crop_z1"}};
-    for (int a = 0; a < 3; ++a) {
-        const double u = P(names[a][0], -10), v = P(names[a][1], 10);
-        options.cropLo[size_t(a)] = std::min(u, v), options.cropHi[size_t(a)] = std::max(u, v);
+    // What the clip's cleaning keeps (worked out once while the cloud and the settings are the same), thinned for a
+    // draft. A crop box alone is tested as the splats are drawn, as it was before there was anything else.
+    SplatFilter filter = splatClipFilter(c, lt);
+    const long quality = draft ? std::clamp<long>(std::lround(P("draft", 0)), 0, 4) : 0;
+    if (quality >= 1 && quality <= 3) filter.share = 1.0 / double(1 << quality);
+    options.points = quality == 4;
+    SplatFilter rest = filter;
+    rest.box = 0;
+    if (filter.box == 1 && !rest.any()) {
+        options.crop = true;
+        for (size_t a = 0; a < 3; ++a) options.cropLo[a] = filter.boxLo[a], options.cropHi[a] = filter.boxHi[a];
+    } else {
+        options.keep = cachedSplatKeep(cloud, filter);
     }
     options.opacity = float(std::clamp(P("opacity", 100) / 100, 0.0, 1.0));
     return true;
@@ -825,7 +859,8 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
                 }
             }
         }
-    // The 3D layers' cards seen through that solve, as they stand at their clips' first frames.
+    // The 3D layers' cards seen through that solve, as they stand at their clips' first frames, their pictures at each
+    // frame they play over (one picture when it does not change).
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
         for (const Clip& c : seq.videoTracks[ti].clips) {
             if (!c.enabled || (c.isGenerator() && c.generator.type == "model3d")) continue;
@@ -845,6 +880,8 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
                 const int frame = cameraSolveFrame(seq, footage, *solve, t - footage.start);
                 if (frame < 0 || (!m.motion.empty() && m.motion.back().first >= frame)) continue;
                 const Layer3DPlace at = layer3dPlace(*e, t - c.start, seq.width, seq.height);
+                if (std::string pic = cardPicturePng(p, seq, ti, c, t); m.pictures.empty() || pic != m.pictures.back().second)
+                    m.pictures.push_back({double(frame), std::move(pic)});
                 const double k = firstUnit > 0 ? at.unit / firstUnit : 1;
                 m.motion.push_back({double(frame), {at.axisU[0] * k, at.axisU[1] * k, at.axisU[2] * k, 0, at.axisV[0] * k, at.axisV[1] * k, at.axisV[2] * k, 0,
                                                     at.normal[0] * k, at.normal[1] * k, at.normal[2] * k, 0, at.origin[0], at.origin[1], at.origin[2], 1}});
@@ -856,7 +893,12 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             }
             std::shared_ptr<const Model> plane;
             const PosedTriangles tr = layer3dTriangles(place, plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));
-            m.picture = cardPicturePng(p, seq, ti, c, from < to ? from : c.start);
+            if (!m.pictures.empty()) {
+                m.picture = m.pictures.front().second;
+                if (m.pictures.size() == 1 || m.picture.empty()) m.pictures.clear();
+            } else {
+                m.picture = cardPicturePng(p, seq, ti, c, from < to ? from : c.start);
+            }
             m.card = true;
             m.name = c.name;
             m.color = {1, 1, 1, 1};
@@ -871,14 +913,14 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
 
 Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
                       const std::function<Image(int track)>& trackLayer, std::vector<float>* depth, std::string* error,
-                      const std::function<Image(int track, FrameTime at)>& trackLayerAt) {
+                      const std::function<Image(int track, FrameTime at)>& trackLayerAt, bool draft) {
     if (std::lround(c.generator.p("shape", t - c.start, 0)) == 0 && isSplatFile(c.generator.s("file"))) {
         // (already in the values the splats were trained on, as the other generators draw)
         std::shared_ptr<const SplatCloud> cloud;
         Mat4 place;
         ModelCamera cam;
         SplatRenderOptions options;
-        if (!splatClipScene(p, seq, c, t, scale, cloud, place, cam, options, error)) {
+        if (!splatClipScene(p, seq, c, t, scale, cloud, place, cam, options, error, draft)) {
             if (depth) depth->assign(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
             return Image(std::max(1, w), std::max(1, h));
         }

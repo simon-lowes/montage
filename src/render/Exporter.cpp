@@ -8,6 +8,7 @@
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
 #include "media/Av2.h"
+#include "render/Av1GrainExport.h"
 #include "media/JpegXs.h"
 #include "media/ProResEncoder.h"
 #include "render/ProRes.h"
@@ -141,6 +142,7 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
     if (c == "liboapv") return s.alpha ? AV_PIX_FMT_YUVA444P12LE : s.profile == "4444" ? AV_PIX_FMT_YUV444P12LE : AV_PIX_FMT_YUV422P10LE;
     if (c == "mjpeg") return AV_PIX_FMT_YUVJ420P;
     if (c == "libvpx-vp9" && s.alpha) return AV_PIX_FMT_YUVA420P;
+    if (c == "png" && s.pngBits == 16 && s.videoCodec == "png") return s.alpha ? AV_PIX_FMT_RGBA64BE : AV_PIX_FMT_RGB48BE;
     if (c == "png") return s.alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
     if (c == "tiff") return AV_PIX_FMT_RGB48LE;
     if (c == "exr") return s.alpha ? AV_PIX_FMT_GBRAPF32LE : AV_PIX_FMT_GBRPF32LE;
@@ -492,9 +494,10 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
             a.settings.alpha = true;
             v.push_back(a);
         }
-        if (everyBuild || jpegXsAvailable()) {
+        if (everyBuild || (jpegXsAvailable() && broadcastMxfAvailable())) {
             // JPEG XS (SVT-JPEG-XS, media/JpegXs.h): a light intra codec at a constant number of bytes a picture, in MXF
-            // (ST 2124) with 24-bit sound; the rate is its bits a pixel.
+            // (ST 2124, written through bmx: not offered in a build without it) with 24-bit sound; the rate is its bits
+            // a pixel.
             ExportPreset x = preset("JPEG XS 4:2:2 10-bit (MXF)", "mxf", "Light intra-frame mezzanine at 5 bits a pixel, for live production and contribution",
                                     "jpegxs", "pcm_s24le", 0, "", "", "yuv422p10le");
             x.settings.jpegXsBpp = 5;
@@ -834,7 +837,8 @@ void addChapters(AVFormatContext* oc, const Sequence& seq, FrameTime in, FrameTi
 // ---- Smart rendering --------------------------------------------------------------------------------------------
 // Frames that are one untouched clip of footage already in the export's intra-frame codec (ProRes, DNxHR) are
 // copied from the source file instead of being decoded and encoded again, as Premiere's and Final Cut's smart
-// rendering do: faster, and exactly the original pictures.
+// rendering do: faster, and exactly the original pictures. ProRes 4444 and 4444 XQ at 12 bits too (the export
+// Montage's own encoder codes): any 4444 or 4444 XQ source of the same flavour is 12-bit pictures, whoever coded it.
 
 bool isIntraCodec(const std::string& encoder) { return encoder == "prores_ks" || encoder == "dnxhd"; }
 
@@ -890,16 +894,18 @@ namespace {
 
 class SmartRenderer {
 public:
-    // `profile` is the export's ProRes or DNxHR profile option ("hq", "4444", "dnxhr_sq"...).
+    // `profile` is the export's ProRes or DNxHR profile option ("hq", "4444", "dnxhr_sq"...). The pictures the export
+    // makes are those its stream says (`vst`'s parameters: for 12-bit ProRes the encoder context is only raw pictures).
     SmartRenderer(const Project& p, const Sequence& seq, const ColorSpace& seqSpace, AVCodecContext* vctx, AVStream* vst, bool alpha,
                   const std::string& profile)
-        : p_(p), seq_(seq), seqSpace_(seqSpace), vctx_(vctx), vst_(vst), alpha_(alpha) {
+        : p_(p), seq_(seq), seqSpace_(seqSpace), vctx_(vctx), vst_(vst), alpha_(alpha), codec_(vst->codecpar->codec_id),
+          format_(vst->codecpar->format) {
         // The FourCC a ProRes flavour is stored under, and DNxHR's profile numbers.
         static const std::map<std::string, uint32_t> prores{{"proxy", MKTAG('a', 'p', 'c', 'o')}, {"lt", MKTAG('a', 'p', 'c', 's')},
                                                             {"standard", MKTAG('a', 'p', 'c', 'n')}, {"hq", MKTAG('a', 'p', 'c', 'h')},
                                                             {"4444", MKTAG('a', 'p', '4', 'h')}, {"4444xq", MKTAG('a', 'p', '4', 'x')}};
         static const std::map<std::string, int> dnxhr{{"dnxhr_lb", 1}, {"dnxhr_sq", 2}, {"dnxhr_hq", 3}, {"dnxhr_hqx", 4}, {"dnxhr_444", 5}};
-        if (vctx->codec_id == AV_CODEC_ID_PRORES) {
+        if (codec_ == AV_CODEC_ID_PRORES) {
             auto it = prores.find(profile.empty() ? "hq" : profile);
             tag_ = it != prores.end() ? it->second : 0;
         } else {
@@ -965,8 +971,8 @@ private:
         const AVRational rate = st->avg_frame_rate.num > 0 ? st->avg_frame_rate : st->r_frame_rate;
         const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(par->format));
         // The same pictures the encoder would make: codec, size, sampling, rate, progressive, the same flavour.
-        const bool same = par->codec_id == vctx_->codec_id && par->width == vctx_->width && par->height == vctx_->height &&
-                          par->format == vctx_->pix_fmt && av_cmp_q(rate, vctx_->framerate) == 0 &&
+        const bool same = par->codec_id == codec_ && par->width == vctx_->width && par->height == vctx_->height &&
+                          par->format == format_ && av_cmp_q(rate, vctx_->framerate) == 0 &&
                           (par->field_order == AV_FIELD_PROGRESSIVE || par->field_order == AV_FIELD_UNKNOWN) &&
                           (alpha_ || !(d && (d->flags & AV_PIX_FMT_FLAG_ALPHA))) && sameFlavour(*par);
         if (!same || seq_.width != par->width || seq_.height != par->height) return nullptr;
@@ -981,7 +987,7 @@ private:
 
     // ProRes and DNxHR come in flavours (Proxy, LT, 422, HQ, 4444; SQ, HQ, HQX, 444): only the same one may mix.
     bool sameFlavour(const AVCodecParameters& par) const {
-        if (vctx_->codec_id == AV_CODEC_ID_PRORES) return tag_ && par.codec_tag == tag_;
+        if (codec_ == AV_CODEC_ID_PRORES) return tag_ && par.codec_tag == tag_;
         return profile_ >= 0 && par.profile == profile_;
     }
 
@@ -1011,6 +1017,8 @@ private:
     AVCodecContext* vctx_;
     AVStream* vst_;
     bool alpha_;
+    AVCodecID codec_;
+    int format_;
     std::map<Id, Source> sources_;
     AVPacket* pkt_ = nullptr;
     int copied_ = 0;
@@ -1026,9 +1034,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         return false;
     };
     // A plug-in that fails in its host while this renders stops the export, naming it (audio/PluginHost.h). Only one
-    // this export's own mixers meet: this thread is marked as an export's while it renders.
+    // this export's own mixers meet: this thread is marked as an export's while it renders, and the failures counted
+    // are this export's own (another export running beside it stops for its own only).
     const plugins::ExportScope exporting;
-    const uint64_t pluginFailures = plugins::offlineFailureSerial();
+    const uint64_t pluginFailures = exporting.failures();
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
     if (seq.duration() > 0) out = std::min(out, seq.duration());  // nothing past the end of the cut
@@ -1056,6 +1065,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const bool imageSequence = exportIsImageSequence(s);
     const bool floatFrames = s.videoCodec == "exr";
     // JPEG XL frames written with libjxl (media/Jxl.h), in the delivery's own encoding, float and alpha kept.
+    if (s.videoCodec == "png" && (s.pngCompression < -1 || s.pngCompression > 9)) return fail("A PNG compression level is 0 (fastest) to 9 (smallest)");
+    if (s.videoCodec == "png" && s.pngBits != 8 && s.pngBits != 16) return fail("PNG frames have 8 or 16 bits a channel");
     const bool jxlFrames = s.videoCodec == "jxl";
     if (jxlFrames && wantVideo && !jxlAvailable()) return fail("This build of Montage writes no JPEG XL (libjxl)");
     if (jxlFrames && !s.jxlDepth.empty() && s.jxlDepth != "8" && s.jxlDepth != "16" && s.jxlDepth != "half" && s.jxlDepth != "float")
@@ -1252,7 +1263,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->colorspace = tags.matrix;
         o.vctx->color_range = c == "mjpeg" ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
         // (Raw pictures for spatial video are only copied: frames in flight on many threads would just hold memory.)
-        o.vctx->thread_count = spatial ? 1 : 0;
+        // (12-bit ProRes too: Montage's own encoder has its own threads, and with frames in flight here a picture
+        // would come out after the copied ones that follow it)
+        o.vctx->thread_count = spatial || ownProRes ? 1 : 0;
         // Smart rendering interleaves copied packets with encoded ones, so the encoder must not hold frames back.
         if (s.smartRender && isIntraCodec(c)) o.vctx->thread_type = FF_THREAD_SLICE;
         // One pass of two (x264 and x265): the first at constant quality, measuring; the second at the bitrate.
@@ -1271,6 +1284,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->flags |= AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME;
             o.vctx->field_order = AV_FIELD_TT;
         }
+        // PNG frames: how hard the compressor works (every level is lossless).
+        if (s.videoCodec == "png" && s.pngCompression >= 0) o.vctx->compression_level = s.pngCompression;
         AVDictionary* opts = nullptr;
         const bool hwEncoder = hasSuffix(c, "_videotoolbox") || hasSuffix(c, "_nvenc") || hasSuffix(c, "_qsv") ||
                                hasSuffix(c, "_amf") || hasSuffix(c, "_mf");
@@ -2313,7 +2328,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.cancel = cancel;
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
-    if (wantVideo && s.smartRender && o.vctx && !av2Out && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
+    if (wantVideo && s.smartRender && o.vctx && !av2Out && (o.prores || isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "")) && W == seq.width && H == seq.height &&
+        !seq.stereo3d &&
         !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && sameColorSpace(outSpace, seqSpace) && !trim && !sceneGraded &&
         !conv.active())
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
@@ -2558,8 +2574,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     } freeSecond{secondField};
     for (FrameTime f = din; f < dout; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
-        if (plugins::offlineFailureSerial() != pluginFailures)
-            return fail("Export stopped because the plug-in " + plugins::lastOfflineFailure());
+        if (exporting.failures() != pluginFailures) return fail("Export stopped because the plug-in " + exporting.lastFailure());
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         int longGopCopied = 0;
         std::string longGopError;
@@ -3288,13 +3303,13 @@ bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSetti
     // Smart rendering that cannot go on as planned (HEVC copied as hvc1 whose footage is not found where it was): made
     // again, encoded whole.
     const plugins::ExportScope exporting;
-    const uint64_t pluginFailures = plugins::offlineFailureSerial();
+    const uint64_t pluginFailures = exporting.failures();
     auto exportOnce = [&](const Sequence& q, const ExportSettings& st) {
         bool again = false;
         if (exportImpl(p, q, st, progress, cancel, error, opened, encoderUsed, smartRendered, light, &again)) {
             // (the last blocks, after the last check)
-            if (plugins::offlineFailureSerial() == pluginFailures) return true;
-            if (error) *error = "Export stopped because the plug-in " + plugins::lastOfflineFailure();
+            if (exporting.failures() == pluginFailures) return true;
+            if (error) *error = "Export stopped because the plug-in " + exporting.lastFailure();
             return false;
         }
         if (!again || (cancel && cancel->load())) return false;
@@ -3375,6 +3390,12 @@ bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames) {
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light, bool* keptUnsigned, HrdReport* hrd) {
+    // (grain carried as parameters: the cleaned sequence exported through here, then its frame headers written again)
+    if (exportCarriesGrain(s)) {
+        if (smartRendered) *smartRendered = 0;
+        if (hrd) *hrd = HrdReport{};
+        return exportCarryingGrain(p, seq, s, progress, cancel, error, encoderUsed, light, keptUnsigned);
+    }
     // (the outermost call checks: two passes export again through here)
     static thread_local int depth = 0;
     int copied = 0;
@@ -3703,7 +3724,11 @@ BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip&
     const MediaItem* m = p.findMedia(c.mediaId);
     // The source's timecode where the clip starts: its media's start (midnight without one) plus the clip's offset.
     // Samples since midnight: past 24:00:00 it goes round.
-    st.seconds = std::fmod(std::max(0.0, (m && m->timecode >= 0 ? m->timecode : 0.0) + c.sourceAt(0) / seq.fpsValue()), 86400.0);
+    // A reversed clip's sound begins with the last sample of its stretch of the source and runs back from there: its
+    // stamp is that sample's time (one sample of the clip's speed before the stretch's end), not its first frame's.
+    double first = c.sourceAt(0) / seq.fpsValue();
+    if (c.reverse) first = (double(c.sourceIn) + double(c.duration) * c.speed) / seq.fpsValue() - c.speed / double(std::max(1, seq.sampleRate));
+    st.seconds = std::fmod(std::max(0.0, (m && m->timecode >= 0 ? m->timecode : 0.0) + first), 86400.0);
     st.timecodeRate = m && m->fps.valid() ? m->fps : seq.fps;
     st.description = c.name;
     if (m) {

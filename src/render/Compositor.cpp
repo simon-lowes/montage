@@ -1094,6 +1094,37 @@ TitleLayerFn titleLayerSource(const Project& p, const Sequence& seq, const Clip&
 }
 
 namespace {
+Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t, const RenderOptions& o, int W, int H,
+                   bool* displayReferred);  // (below)
+thread_local int tTitle3DPictureDepth = 0;
+}  // namespace
+
+// The tracks' pictures a 3D title's faces show (render/Title3D.h): never its own track's, and a step deep at most where
+// such a picture holds a 3D title showing pictures in turn.
+Title3DPictures title3dPictures(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, int w, int h) {
+    Title3DPictures out;
+    if (tTitle3DPictureDepth >= 2) return out;
+    struct Depth {
+        Depth() { ++tTitle3DPictureDepth; }
+        ~Depth() { --tTitle3DPictureDepth; }
+    } depth;
+    const Effect& g = c.generator;
+    const FrameTime lt = t - c.start;
+    const auto own = edit::locate(seq, c.id);
+    auto picture = [&](const char* fill, long kind, const char* track, Image& into) {
+        if (std::lround(g.p(fill, lt, 0)) != kind) return;
+        const int m = int(std::lround(g.p(track, lt, 1))) - 1;
+        if (m < 0 || m >= int(seq.videoTracks.size())) return;
+        if (own && own->track.kind == TrackKind::Video && int(own->track.index) == m) return;
+        into = trackPicture(p, seq, size_t(m), t, o, w, h, nullptr);
+    };
+    picture("face_fill", 2, "face_track", out.front);
+    picture("side_fill", 2, "side_track", out.sides);
+    picture("back_fill", 3, "back_track", out.back);
+    return out;
+}
+
+namespace {
 
 // False when the clip has no picture.
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
@@ -1160,13 +1191,18 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             return true;
         }
         src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError,
-                                                                      modelLayerAt(p, seq, o))
+                                                                      modelLayerAt(p, seq, o), !o.highQuality)
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
               : c.generator.type == "title" ? renderTitle(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), titlePathSource(p, seq, c, w, h),
                                                           titleLayerSource(p, seq, c, w, h))
-                                              : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
+              : c.generator.type == "title3d"
+                  ? [&] {
+                        const Title3DPictures pictures = title3dPictures(p, seq, c, t, o, w, h);
+                        return renderTitle3D(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), &pictures);
+                    }()
+                  : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         if (!modelError.empty() && o.issues) o.issues->note(modelError);
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white (graded scene-referred, back
         // through the output transform, so a white title stays white).
@@ -1629,6 +1665,15 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     return !src.empty();
 }
 
+// The models that read a clip's picture for its effects and masks, or what tests put in their place.
+ModelStandIns gStandIns;
+bool depthFindable() { return gStandIns.depth || (depthAvailable() && depthModel().installed()); }
+std::shared_ptr<const DepthMap> depthIn(const Image& shown) { return gStandIns.depth ? gStandIns.depth(shown) : cachedDepth(shown); }
+bool peopleFindable() { return gStandIns.people || (mattingAvailable() && mattingModel().installed()); }
+std::shared_ptr<const ValueMap> peopleIn(const Image& shown) { return gStandIns.people ? gStandIns.people(shown) : cachedPersonMatte(shown); }
+bool facesFindable() { return gStandIns.faces || (faceSearchAvailable() && faceModel().installed()); }
+std::shared_ptr<const std::vector<FaceBox>> facesIn(const Image& shown) { return gStandIns.faces ? gStandIns.faces(shown) : cachedFaces(shown); }
+
 // The rest of a clip's layer from its source: its effects (and grade graph), then its transform onto the canvas.
 Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o, ClipSource& cs) {
     const FrameTime lt = cs.lt;
@@ -1658,14 +1703,15 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     // The picture's depth, once, for the effects that work by distance.
     std::shared_ptr<const DepthMap> depth;
     // (The clip's analysed depth where it has one, steady through the shot: not of a reframed view or the other eye.)
-    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); }))
-        depth = frameDepth(scene ? asShown(src, scene->working) : src, reframed ? std::string() : cs.sourcePath, sourceSeconds);
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); })) {
+        if (!reframed && !cs.sourcePath.empty() && sourceSeconds >= 0) depth = analysedDepth(cs.sourcePath, sourceSeconds);
+        if (!depth && depthFindable()) depth = depthIn(scene ? asShown(src, scene->working) : src);
+    }
     DepthScope depthScope(depth);
     // And the people in it, for Remove Background and People masks.
     std::shared_ptr<const ValueMap> people;
-    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsPersonMatte(*e, lt); }) && mattingAvailable() &&
-        mattingModel().installed())
-        people = cachedPersonMatte(scene ? asShown(src, scene->working) : src);
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsPersonMatte(*e, lt); }) && peopleFindable())
+        people = peopleIn(scene ? asShown(src, scene->working) : src);
     PersonScope personScope(people);
     // And the OpenEXR file the frame came from, for Cryptomatte masks.
     CryptomatteScope cryptoScope(std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsCryptomatte(*e, lt); }) ? cs.exrFile : std::string());
@@ -1675,9 +1721,8 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     // (Redact Faces only where its analysis does not reach.)
     if (std::any_of(chain.begin(), chain.end(),
                     [&](const Effect* e) { return e->type == "redact_faces" ? redactNeedsLiveFaces(*e, sourceSeconds) : needsFaces(*e); }) &&
-        faceSearchAvailable() &&
-        faceModel().installed())
-        faces = cachedFaces(scene ? asShown(src, scene->working) : src);
+        facesFindable())
+        faces = facesIn(scene ? asShown(src, scene->working) : src);
     FaceScope faceScope(faces);
     // And its surface track, for masks that bend with it and paint that follows it.
     SurfaceContext surface;
@@ -1971,7 +2016,7 @@ Image transitionLayer(const Project& p, const Sequence& seq, const Track& track,
                       const std::function<void(const Clip&, FrameTime, Image&)>& finish = {}, bool* displayReferred = nullptr) {
     const Clip* A = findClip(track, tr.clipA);
     const Clip* B = findClip(track, tr.clipB);
-    const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+    const double u = std::min(1.0, (double(t - from) + tr.phase) / double(std::max<FrameTime>(1, to - from)));
     bool shown = false;
     auto layerOf = [&](const Clip& c, FrameTime at) {
         bool display = false;
@@ -2128,9 +2173,10 @@ bool canvasToFrame(const Sequence& seq, const Geometry& g, double scale, int X, 
 }
 
 // A clip effect's mask (empty: none) drawn over the clip's own frame and carried onto the canvas, for the effects run
-// where tracks are composited.
+// where tracks are composited: `layer` (null for a mask that does not look at the picture, maskSeesPicture's false)
+// on a canvas LW by LH pixels.
 std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
-                                      const Effect& e, const Image& layer, int W, int H) {
+                                      const Effect& e, const Image* layer, int LW, int LH) {
     const FrameTime lt = t - c.start;
     std::vector<float> mask;
     // A mask on the effect is drawn over the clip's own frame, as every effect's is: made there, from the layer seen
@@ -2139,21 +2185,21 @@ std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, con
     Geometry g;
     if (hasMask(e, lt) && clipGeometry(p, seq, c, t, g)) {
         const double cr = std::cos(g.rot), sn = std::sin(g.rot);
-        const int pw = std::clamp(int(std::lround(g.mw * std::fabs(g.sx) * o.scale)), 1, 4 * W);
-        const int ph = std::clamp(int(std::lround(g.mh * std::fabs(g.sy) * o.scale)), 1, 4 * H);
+        const int pw = std::clamp(int(std::lround(g.mw * std::fabs(g.sx) * o.scale)), 1, 4 * LW);
+        const int ph = std::clamp(int(std::lround(g.mh * std::fabs(g.sy) * o.scale)), 1, 4 * LH);
         Image pic(pw, ph);
         for (int j = 0; j < ph; ++j)
             for (int i = 0; i < pw; ++i) {
                 const double rx = ((i + 0.5) / pw * g.mw - g.mw / 2 - g.ax) * g.sx, ry = ((j + 0.5) / ph * g.mh - g.mh / 2 - g.ay) * g.sy;
                 const int X = int(std::floor((seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale));
                 const int Y = int(std::floor((seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale));
-                if (X >= 0 && Y >= 0 && X < layer.width && Y < layer.height) std::copy(layer.at(X, Y), layer.at(X, Y) + 4, pic.at(i, j));
+                if (layer && X >= 0 && Y >= 0 && X < LW && Y < LH) std::copy(layer->at(X, Y), layer->at(X, Y) + 4, pic.at(i, j));
             }
         const std::vector<float> m = effectMatte(e, lt, pic, effectPixelScale(c, lt, g.sx, g.mw, pw), c.sourceFrameAt(t) / seq.fpsValue());
         if (m.size() == size_t(pw) * size_t(ph)) {
-            mask.assign(size_t(layer.width) * size_t(layer.height), 0.0f);
-            for (int Y = 0; Y < layer.height; ++Y)
-                for (int X = 0; X < layer.width; ++X) {
+            mask.assign(size_t(LW) * size_t(LH), 0.0f);
+            for (int Y = 0; Y < LH; ++Y)
+                for (int X = 0; X < LW; ++X) {
                     double u, v;
                     if (!canvasToFrame(seq, g, o.scale, X, Y, u, v)) continue;
                     u = u * pw - 0.5, v = v * ph - 0.5;
@@ -2161,12 +2207,22 @@ std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, con
                     const int i1 = std::min(i0 + 1, pw - 1), j1 = std::min(j0 + 1, ph - 1);
                     const float fu = float(std::clamp(u - i0, 0.0, 1.0)), fv = float(std::clamp(v - j0, 0.0, 1.0));
                     auto at = [&](int i, int j) { return m[size_t(j) * size_t(pw) + size_t(i)]; };
-                    mask[size_t(Y) * size_t(layer.width) + size_t(X)] =
+                    mask[size_t(Y) * size_t(LW) + size_t(X)] =
                         (at(i0, j0) * (1 - fu) + at(i1, j0) * fu) * (1 - fv) + (at(i0, j1) * (1 - fu) + at(i1, j1) * fu) * fv;
                 }
         }
     }
     return mask;
+}
+
+// Whether an effect's mask at a clip's time lt is made from the picture or what is known of the frame, not drawn from
+// its shape alone: its edge settled on the picture's (Refine Edges), its colours qualified, an object's, the people's
+// or a Cryptomatte's, bent with a surface's track, or the frame's depths ranged.
+bool maskSeesPicture(const Effect& e, FrameTime lt) {
+    const int shape = int(std::lround(e.p("mask.shape", lt)));
+    if (shape == 3 || shape == 4 || shape == 7 || (shape > 0 && shape != 6 && e.p("mask.refine", lt) > 0)) return true;  // (maskRefine's)
+    if ((shape == 1 || shape == 2 || shape == 5) && e.p("mask.surface", lt) > 0.5) return true;
+    return e.p("mask.qualify", lt) > 0.5 || e.p("mask.depth", lt) > 0.5;
 }
 
 // Displace by Layer's settings on clip `c` at t, with the edges of the clip's picture on a W x H canvas: false when
@@ -2230,7 +2286,7 @@ void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip&
     if (map.width != layer.width || map.height != layer.height) return;
     if (const SceneGrading* sg = currentSceneGrading()) outputTransform(map, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
     // (a mask on the effect: moved within it, as it was outside)
-    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, layer, W, H);
+    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, &layer, layer.width, layer.height);
     const Image before = mask.empty() ? Image() : layer;
     DisplaceSettings ds;
     if (!displaceGeometry(p, seq, c, *e, t, o, layer.width, layer.height, ds)) return;
@@ -2260,7 +2316,7 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
     shown(sky);
     // A mask on the effect is drawn over the clip's own frame, as every effect's is (so a moved, turned or keyed
     // picture keeps it in place).
-    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *sr, layer, W, H);
+    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *sr, &layer, layer.width, layer.height);
     // The clip's analysed depth carried onto the layer (null: found in the layer, if at all), and the frames either side
     // for a steady sky.
     auto analysedOnLayer = [&](FrameTime at, int w, int h) -> std::shared_ptr<const ValueMap> {
@@ -2399,7 +2455,7 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         Geometry g;
         if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
         Image layer = renderModelClip(p, seq, c, t, W, H, double(W) / seq.width, modelLightLayer(p, seq, t, o), &depth, &error,
-                                      modelLayerAt(p, seq, o));
+                                      modelLayerAt(p, seq, o), !o.highQuality);
         if (!error.empty() && o.issues) o.issues->note(error);
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         intoWorking(layer, rec709Space(), seq, true);
@@ -3039,18 +3095,68 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     canvasSize.width = W, canvasSize.height = H;
     if (!clipSource(p, seq, c, t, o, adjustment ? &canvasSize : nullptr, true, cs)) return GpuLayerResult::Nothing;
     CleanPlateScope plateScope(cleanPlateFor(p, seq, c, t, o));  // (a Keyer's plate track, made here as clipLayer makes it)
-    // The clip's analysed depth, for the depth effects and masks (as clipLayer finds it; the still model's would need
-    // the picture here), and the media time, for object masks.
+    // What the models find in the clip's picture, for the effects and masks that work from it, as finishClipLayer has
+    // them: the source's picture is made on the CPU for a model to read (once, and only when one is asked), while the
+    // GPU draws from the decoded frame. An adjustment layer's picture and a Shape layer's are the GPU's alone: theirs
+    // stay on the CPU when a model must read them.
+    const std::vector<const Effect*> chain = gradeChain(seq, c);
+    const bool readable = !adjustment && !cs.shapes && (cs.frame || !cs.src.empty());
+    Image modelPicture;
+    auto shown = [&]() -> const Image& {
+        if (modelPicture.empty()) {
+            if (cs.frame) {
+                modelPicture = toImage(*cs.frame);
+                inputTransform(modelPicture, *cs.frameSpace, cs.adaptive, seq);
+            } else {
+                modelPicture = cs.src;
+            }
+            if (const SceneGrading* scene = currentSceneGrading()) modelPicture = asShown(std::move(modelPicture), scene->working);
+        }
+        return modelPicture;
+    };
+    // The clip's analysed depth, for the depth effects and masks (as clipLayer finds it), else the still model's, and
+    // the media time, for object masks.
     std::shared_ptr<const DepthMap> depth;
-    {
-        const std::vector<const Effect*> chain = gradeChain(seq, c);
-        if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, cs.lt); })) {
-            if (!cs.reframed && !cs.sourcePath.empty() && cs.sourceSeconds >= 0) depth = analysedDepth(cs.sourcePath, cs.sourceSeconds);
-            if (!depth && depthAvailable() && depthModel().installed()) return cpu("its depth, worked out from the picture");
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, cs.lt); })) {
+        if (!cs.reframed && !cs.sourcePath.empty() && cs.sourceSeconds >= 0) depth = analysedDepth(cs.sourcePath, cs.sourceSeconds);
+        if (!depth && depthFindable()) {
+            if (!readable) return cpu("its depth, worked out from the picture");
+            depth = depthIn(shown());
         }
     }
     DepthScope depthScope(depth);
     SourceSecondsScope sourceTime(cs.sourceSeconds);
+    // The people in it, for People masks.
+    std::shared_ptr<const ValueMap> people;
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsPersonMatte(*e, cs.lt); }) && peopleFindable()) {
+        if (!readable) return cpu("the people in its picture, found on the CPU");
+        people = peopleIn(shown());
+    }
+    PersonScope personScope(people);
+    // The OpenEXR file the frame came from, for Cryptomatte masks.
+    CryptomatteScope cryptoScope(std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsCryptomatte(*e, cs.lt); }) ? cs.exrFile
+                                                                                                                                       : std::string());
+    // The faces, for a Lens Blur focused on the nearest one.
+    TrackedSourceScope trackedSource(cs.sourceMedia, cs.reframed);
+    std::shared_ptr<const std::vector<FaceBox>> faces;
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsFaces(*e); }) && facesFindable()) {
+        if (!readable) return cpu("the faces in its picture, found on the CPU");
+        faces = facesIn(shown());
+    }
+    FaceScope faceScope(faces);
+    // Its surface track, for masks that bend with it.
+    SurfaceContext surface;
+    for (const Effect* e : chain)
+        if (e->enabled && e->type == "surface_track") {
+            surface.track = cachedSurfaceTrack(*e);
+            if (!surface.track) continue;  // (not tracked yet: a later one may be)
+            surface.mediaSeconds = [&c, &seq](FrameTime f) {
+                return c.sourceFrameAt(c.start + std::clamp<FrameTime>(f, 0, std::max<FrameTime>(0, c.duration - 1))) / seq.fpsValue();
+            };
+            break;
+        }
+    SurfaceScope surfaceScope(std::move(surface));
+    modelPicture = {};  // (read; the layer is the GPU's from here)
     int w = 0, h = 0;
     if (adjustment) {
         out.canvas = true;
@@ -3192,10 +3298,11 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
                 if (const Effect* e = enabledEffect(seq, *c, "displace_by_layer")) {
-                    // (drawn there alone, with another track's picture as it is, or its own; not through a mask)
+                    // (drawn there alone, with another track's picture as it is, or its own; through a mask drawn
+                    // from its shape alone)
                     if (tr) return fallback("Displace by Layer in a transition");
-                    if (c->isGenerator() && c->generator.type == "adjustment") return fallback("Displace by Layer on an adjustment layer");
-                    if (hasMask(*e, t - c->start)) return fallback("Displace by Layer through a mask");
+                    if (hasMask(*e, t - c->start) && maskSeesPicture(*e, t - c->start))
+                        return fallback("Displace by Layer through a mask made from the picture");
                     FrameTime mf = 0, mt = 0;
                     if (const int m = std::lround(e->p("source", t - c->start, 0)) == 0 ? matteTrack(seq, ti, *c, *e, t) : -1;
                         m >= 0 && activeTransition(seq.videoTracks[size_t(m)], t, mf, mt))
@@ -3233,7 +3340,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             const Clip* top = B ? B : A;
             gpu::Item item;
             item.blendMode = blendModeIndex(top ? top->blendMode : "normal");
-            const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+            const double u = std::min(1.0, (double(t - from) + active->phase) / double(std::max<FrameTime>(1, to - from)));
             const int kind = active->type == "cross_dissolve" ? 0 : gpuTransitionParams(active->type, active->params, u, W, H, item.transitionParams);
             // Smooth Cut: the transition's first frame of A and last of B, each drawn here, morphed along their flow (as
             // transitionLayer does: measured once from the pair, on the CPU, and kept), gpumix.frag's 18.
@@ -3296,7 +3403,8 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                     gpu::Frame part;
                     part.width = W, part.height = H, part.flatten = false, part.part = true;
                     part.items = std::move(frame.items);
-                    if (!gpu::execute(part, &below)) return fallback("the GPU could not draw it");
+                    if (std::string cause; !gpu::execute(part, &below, nullptr, &cause))
+                        return fallback("the GPU could not draw it" + (cause.empty() ? std::string() : ": " + cause));
                     frame.items.clear();
                     gpu::Item canvasItem;
                     canvasItem.a = cpuLayer(Image(below));
@@ -3351,6 +3459,17 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                         q[21] = float(std::min(0.5, reach / std::max(1e-9, std::hypot(ds.down[0], ds.down[1]))));
                         q[22] = across ? 1 : 0, q[23] = down ? 1 : 0;
                         if (ds.turned && !(std::fabs(ds.across[0] * ds.down[1] - ds.across[1] * ds.down[0]) > 1e-9 && q[19] > 0)) item.displace = false;
+                        // (through its mask, drawn on the canvas from its shape alone: four values to a texel)
+                        if (item.displace && hasMask(*e, t - c->start))
+                            if (const std::vector<float> mask = effectMaskOnCanvas(p, seq, *c, t, o, *e, nullptr, W, H);
+                                mask.size() == size_t(W) * size_t(H)) {
+                                item.displaceMaskWidth = (W + 3) / 4;
+                                item.displaceMask.assign(size_t(item.displaceMaskWidth) * 4 * size_t(H), 0.0f);
+                                for (int y = 0; y < H; ++y)
+                                    std::copy(mask.begin() + std::ptrdiff_t(size_t(y) * size_t(W)), mask.begin() + std::ptrdiff_t(size_t(y + 1) * size_t(W)),
+                                              item.displaceMask.begin() + std::ptrdiff_t(size_t(y) * size_t(item.displaceMaskWidth) * 4));
+                                q[24] = 1;
+                            }
                         // (the map's blur: gaussian's passes, as Painterly's)
                         if (const GaussianPlan plan = gaussianPlan(ds.mapBlur / 2); ds.mapBlur > 0 && (plan.byBoxes || !plan.kernel.empty())) {
                             gpu::ColorOp f;
@@ -3398,7 +3517,8 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
     const ColorSpace* display = opts.displaySpace.empty() ? nullptr : findColorSpace(opts.displaySpace);
     if (display && !captions) frame.display = conversionLut(trimTargetSpace(seq, {}), *display, trimTargetPeak(seq, {}));
     Image img;
-    if (!gpu::execute(frame, captions || !out8 ? &img : nullptr, captions ? nullptr : out8)) return fallback("the GPU could not draw it");
+    if (std::string cause; !gpu::execute(frame, captions || !out8 ? &img : nullptr, captions ? nullptr : out8, &cause))
+        return fallback("the GPU could not draw it" + (cause.empty() ? std::string() : ": " + cause));
     if (captions) {
         drawCaption(img, *captions, t, &trimTargetSpace(seq, {}));
         if (display) convertColor(img, trimTargetSpace(seq, {}), *display, trimTargetPeak(seq, {}));
@@ -4560,6 +4680,7 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
         }
         nextStart_ = start + frames;
         startTape();
+        const LiveScope live(liveNow_);
         mixInto(p, seq, start, frames, out, trackLevels, 0);
         return;
     }
@@ -4577,6 +4698,7 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
         }
         nextStart_ = start + frames;
         startTape();
+        const LiveScope live(liveNow_);
         mixInto(p, seq, start, frames, full.data(), trackLevels, 0, 0, -1, n);
         // An ambisonic mix heard binaurally (the decoder keeps its state from block to block).
         if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
@@ -4603,7 +4725,37 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
     }
     nextStart_ = start + frames;
     startTape();
+    const LiveScope live(liveNow_);
     mixInto(p, seq, start, frames, out, trackLevels, 0, 0, -1, n);
+}
+
+void AudioMixer::mixLive(const Project& p, const Sequence& seq, int64_t at, int frames, float* out, bool layout) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    plugins::RenderModeScope pluginTiming(nonBlocking_);
+    const int n = layoutChannels(seq.audioLayout);
+    std::vector<float> full;
+    {
+        std::lock_guard lock(m_);
+        // (not a stretch of the programme: its next block starts the effects afresh, as after any stop)
+        nextStart_ = -1;
+        const LiveScope live(liveNow_), only(liveOnly_);
+        TapeOff off(tape_);
+        if (n == 2) {
+            mixInto(p, seq, at, frames, out, nullptr, 0);
+            return;
+        }
+        if (layout) {
+            mixInto(p, seq, at, frames, out, nullptr, 0, 0, -1, n);
+            return;
+        }
+        full.assign(size_t(frames) * size_t(n), 0.0f);
+        mixInto(p, seq, at, frames, full.data(), nullptr, 0, 0, -1, n);
+        if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
+            binauralFor(monitor_, ambisonicOrder(seq.audioLayout), seq.sampleRate).process(full.data(), frames, out);
+            return;
+        }
+    }
+    downmixToStereo(seq.audioLayout, full.data(), frames, out, seq.downmixCentreDb, seq.downmixSurroundDb);
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
@@ -5129,9 +5281,11 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const bool dialogueApart = upmix && upmix->p("dialogue_centre", 0, 1) > 0.5 &&
                                    std::any_of(track.clips.begin(), track.clips.end(), [](const Clip& c) { return c.role == "Dialogue"; });
         if (dialogueApart) dialogueBuf.assign(trackBuf.size(), 0.0f);
-        const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
-                                       keepsField ? trackField.data() : nullptr, fieldStart, nch,
-                                       dialogueApart ? dialogueBuf.data() : nullptr);
+        bool any = !(liveOnly_ && depth == 0) &&
+                   mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
+                                 keepsField ? trackField.data() : nullptr, fieldStart, nch, dialogueApart ? dialogueBuf.data() : nullptr);
+        // Live sound sent to this strip (a sampler's slot): with its clips, before its inserts.
+        if (depth == 0 && liveNow_ && live_ && live_(track.id, frames, trackBuf.data())) any = true;
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
         if (!track.effects.empty()) {
@@ -5359,5 +5513,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     const float g = dbToLin(seq.masterVolumeDb);
     for (int i = 0; i < frames * nch; ++i) out[i] = master[size_t(i)] * g;
 }
+
+void setModelStandInsForTesting(ModelStandIns standIns) { gStandIns = std::move(standIns); }
 
 }  // namespace montage

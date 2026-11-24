@@ -33,6 +33,7 @@
 #include "Relight.h"
 #include "FilmLook.h"
 #include "PaintFx.h"
+#include "BevelFx.h"
 #include "StyleFx.h"
 #include "Deconvolve.h"
 #include "GpuCompositor.h"
@@ -1611,11 +1612,12 @@ void drawMaskShape(const Effect& e, FrameTime t, int shape, std::vector<float>& 
 }
 }  // namespace
 
-std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
-    std::vector<float> matte;
-    if (img.empty() || !hasMask(e, t)) return matte;
-    const int W = img.width, H = img.height;
-    matte.assign(size_t(W) * size_t(H), 1.0f);
+namespace {
+// A mask's shape as drawn (an object's from its segmentation, the people's from the model's matte, a Cryptomatte's
+// from the frame's file), its holes closed and bent with the clip's surface: what a mask is before the picture is read
+// (Refine Edges, the qualifier) and before its range of depths. All 1 for a mask with no shape.
+std::vector<float> maskShape(const Effect& e, FrameTime t, int W, int H, double pixelScale, double sourceSeconds) {
+    std::vector<float> matte(size_t(W) * size_t(H), 1.0f);
     const int shape = int(std::lround(e.p("mask.shape", t)));
     if (shape == 3) {
         // The objects picked by the model (those added, less those subtracted): nothing where none was segmented.
@@ -1653,15 +1655,49 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
     }
     drawMaskShape(e, t, shape, matte, W, H, pixelScale);
     if (shape > 0 && shape != 6) {
-        // The shape's holes and gaps closed (Consolidate), then its edge settled on the picture's own (Refine Edges,
-        // as Photoshop's Refine Edge and Resolve's Smart Refine). A gradient has neither holes nor an object's edge.
+        // The shape's holes and gaps closed (Consolidate). A gradient has none.
         consolidateMatte(matte, W, H, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
         // (A shape drawn on the surface track's reference frame bent as the surface is on this one, before its edge
         // is fitted to this frame's picture.)
         if ((shape == 1 || shape == 2 || shape == 5) && e.p("mask.surface", t) > 0.5) bendWithSurface(matte, W, H, sourceSeconds);
-        const double refine = std::clamp(e.p("mask.refine", t) / 100.0, 0.0, 1.0);
-        if (refine > 0) refineMatteEdges(matte, img, std::max(1.0, e.p("mask.refine_radius", t, 8) * pixelScale), refine);
     }
+    return matte;
+}
+
+// How far Refine Edges settles a mask's edge on the picture's own (0: not at all), and within what radius.
+double maskRefine(const Effect& e, FrameTime t, double pixelScale, double& radius) {
+    const int shape = int(std::lround(e.p("mask.shape", t)));
+    radius = std::max(1.0, e.p("mask.refine_radius", t, 8) * pixelScale);
+    return shape > 0 && shape != 6 ? std::clamp(e.p("mask.refine", t) / 100.0, 0.0, 1.0) : 0.0;
+}
+
+// A mask's range of distances at each pixel: 1 between From and To, falling to 0 over the softness either side.
+// Nothing (all 0) without the frame's depth.
+std::vector<float> maskDepthRange(const Effect& e, FrameTime t, int W, int H) {
+    std::vector<float> range(size_t(W) * size_t(H), 0.0f);
+    const DepthMap* depth = currentDepth();
+    if (!depth) return range;
+    const double lo = e.p("mask.depth_low", t, 50) / 100, hi = e.p("mask.depth_high", t, 100) / 100;
+    const double ramp = std::max(1e-4, e.p("mask.depth_soft", t, 10) / 100);
+    const std::vector<float> d = depth->resized(W, H);
+    for (size_t i = 0; i < range.size(); ++i) {
+        const double v = d[i];
+        const double out = v < lo ? lo - v : v > hi ? v - hi : 0.0;
+        const double k = std::clamp(1.0 - out / ramp, 0.0, 1.0);
+        range[i] = float(k * k * (3 - 2 * k));
+    }
+    return range;
+}
+}  // namespace
+
+std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
+    std::vector<float> matte;
+    if (img.empty() || !hasMask(e, t)) return matte;
+    const int W = img.width, H = img.height;
+    matte = maskShape(e, t, W, H, pixelScale, sourceSeconds);
+    // Its edge settled on the picture's own (Refine Edges). A gradient has no object's edge.
+    double radius = 1;
+    if (const double refine = maskRefine(e, t, pixelScale, radius); refine > 0) refineMatteEdges(matte, img, radius, refine);
     if (e.p("mask.qualify", t) > 0.5) {
         const double hc = e.p("mask.hue", t), hw = e.p("mask.hue_width", t, 60) / 2;
         const double soft = std::clamp(e.p("mask.softness", t, 20) / 100.0, 0.0, 1.0);
@@ -1702,21 +1738,8 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
         });
     }
     if (e.p("mask.depth", t) > 0.5) {
-        // A range of distances: 1 between From and To, falling to 0 over the softness either side.
-        const DepthMap* depth = currentDepth();
-        const double lo = e.p("mask.depth_low", t, 50) / 100, hi = e.p("mask.depth_high", t, 100) / 100;
-        const double ramp = std::max(1e-4, e.p("mask.depth_soft", t, 10) / 100);
-        if (!depth) {
-            std::fill(matte.begin(), matte.end(), 0.f);
-        } else {
-            const std::vector<float> d = depth->resized(W, H);
-            for (size_t i = 0; i < matte.size(); ++i) {
-                const double v = d[i];
-                const double out = v < lo ? lo - v : v > hi ? v - hi : 0.0;
-                const double k = std::clamp(1.0 - out / ramp, 0.0, 1.0);
-                matte[i] *= float(k * k * (3 - 2 * k));
-            }
-        }
+        const std::vector<float> range = maskDepthRange(e, t, W, H);
+        for (size_t i = 0; i < matte.size(); ++i) matte[i] *= range[i];
     }
     const bool invert = e.p("mask.invert", t) > 0.5;
     const float opacity = float(std::clamp(e.p("mask.opacity", t, 100) / 100.0, 0.0, 1.0));
@@ -2040,7 +2063,7 @@ EffectDomain effectDomain(const std::string& type) {
                               "rgb_mixer", "mosaic", "focus_repair"})
             m[t] = EffectDomain::Linear;
         for (const char* t : {"posterize", "painterly", "halftone", "duotone", "vhs", "find_edges", "emboss", "invert", "chroma_key", "luma_key",
-                              "screen_key", "clean_plate", "broadcast_safe", "noise", "depth_map"})
+                              "screen_key", "clean_plate", "broadcast_safe", "noise", "depth_map", "edge_bevel", "layer_bevel"})
             m[t] = EffectDomain::Display;
         return m;
     }();
@@ -2540,6 +2563,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "motion_tile") sfx::motionTile(e, t, img, pixelScale);
     else if (ty == "find_edges") sfx::findEdges(e, t, img);
     else if (ty == "emboss") sfx::emboss(e, t, img, pixelScale);
+    else if (ty == "edge_bevel") bevel::edgeBevel(e, t, img, pixelScale);
+    else if (ty == "layer_bevel") bevel::layerBevel(e, t, img, pixelScale);
     else if (ty == "halftone") sfx::halftone(e, t, img, pixelScale);
     else if (ty == "painterly") paintEffect(e, t, img, pixelScale);
     else if (ty == "duotone") sfx::duotone(e, t, img);
@@ -3585,43 +3610,93 @@ void transferTableRows(gpu::ColorOp::FilterPass& fp, const ColorSpace& space, in
     for (size_t i = 0; i < tables.dec.size(); ++i) fp.table[i * 4] = tables.dec[i];
     for (size_t i = 0; i < tables.enc.size(); ++i) fp.table[i * 4 + 1] = tables.enc[i];
 }
+// drawWarp's triangles as a filter pass (gpufilter.frag's mode 33): listed by the 8-pixel tiles they may reach, in the
+// order drawn.
+gpu::ColorOp::FilterPass warpFilterPass(const WarpMesh& mesh, const std::vector<MeshPoint>& moved, const std::vector<double>& depth, int width,
+                                        int height) {
+    const std::vector<WarpTriangle> tris = warpTriangles(mesh, moved, depth, width, height);
+    constexpr int kTile = 8;
+    const int across = (width + kTile - 1) / kTile, down = (height + kTile - 1) / kTile;
+    std::vector<std::vector<int>> lists(size_t(across) * size_t(down));
+    for (size_t i = 0; i < tris.size(); ++i)
+        for (int ty0 = tris[i].y0 / kTile; ty0 <= tris[i].y1 / kTile; ++ty0)
+            for (int tx0 = tris[i].x0 / kTile; tx0 <= tris[i].x1 / kTile; ++tx0) lists[size_t(ty0) * size_t(across) + size_t(tx0)].push_back(int(i));
+    size_t entries = 0;
+    for (const auto& l : lists) entries += l.size();
+    const size_t start = lists.size() + entries, texels = start + tris.size() * 6;
+    gpu::ColorOp::FilterPass fp;
+    fp.mode = 33;
+    fp.params[0] = float(kTile), fp.params[1] = float(across), fp.params[2] = float(start);
+    fp.tableWidth = int(std::min<size_t>(4096, std::max<size_t>(1, texels)));
+    const size_t rows = (texels + size_t(fp.tableWidth) - 1) / size_t(fp.tableWidth);
+    fp.table.assign(rows * size_t(fp.tableWidth) * 4, 0.0f);
+    float* tb = fp.table.data();
+    size_t at = lists.size();
+    for (size_t k = 0; k < lists.size(); ++k) {
+        tb[k * 4] = float(at), tb[k * 4 + 1] = float(lists[k].size());
+        for (int i : lists[k]) tb[at++ * 4] = float(i);
+    }
+    for (size_t i = 0; i < tris.size(); ++i) {
+        const WarpTriangle& d = tris[i];
+        float* q = tb + (start + i * 6) * 4;
+        for (int k = 0; k < 3; ++k) {
+            q[k * 4] = float(d.A[k]), q[k * 4 + 1] = float(d.B[k]);
+            q[k * 4 + 2] = float(d.P[k][0]), q[k * 4 + 3] = float(d.P[k][1]);
+        }
+        q[12] = float(d.at[0]), q[13] = float(d.at[1]), q[14] = float(d.at[2]);
+        q[15] = float((d.own[0] ? 1 : 0) | (d.own[1] ? 2 : 0) | (d.own[2] ? 4 : 0));
+        q[16] = float(d.r[0][0]), q[17] = float(d.r[0][1]), q[18] = float(d.r[1][0]), q[19] = float(d.r[1][1]);
+        q[20] = float(d.r[2][0]), q[21] = float(d.r[2][1]);
+    }
+    return fp;
+}
+// The passes of a warp: its one drawing, or with samples through the shutter, each drawn from the picture as the warp
+// began (p[1].w) and laid over the mean of those before it (p[2].x of them, kept in slot 0).
+std::vector<gpu::ColorOp::FilterPass> warpFilterPasses(const WarpMesh& mesh, const std::vector<MeshPoint>& moved, const std::vector<double>& depth,
+                                                       const std::vector<WarpSample>& shutter, int width, int height) {
+    if (shutter.empty()) return {warpFilterPass(mesh, moved, depth, width, height)};
+    std::vector<gpu::ColorOp::FilterPass> passes;
+    for (size_t i = 0; i < shutter.size(); ++i) {
+        gpu::ColorOp::FilterPass fp = warpFilterPass(mesh, shutter[i].moved, shutter[i].depth, width, height);
+        fp.params[3] = 1;
+        fp.params[4] = float(i);
+        if (i > 0) fp.extra = 0;
+        if (i + 1 < shutter.size()) fp.save = 0;
+        passes.push_back(std::move(fp));
+    }
+    return passes;
+}
 }  // namespace
 
-bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale, bool showing) {
+bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale, bool showing, bool reads) {
     const int shape = int(std::lround(e.p("mask.shape", t)));
-    if (shape == 4 || shape > 6 || (!showing && e.p("mask.show", t) > 0.5) || e.p("mask.surface", t) > 0.5 ||
-        (shape > 0 && shape != 6 && e.p("mask.refine", t) > 0))
-        return false;  // (what the picture holds, or the mask shown)
-    // As effectMatte makes it: the shape (an object's from its segmentation) with its holes closed and the range of
-    // depths here, the qualifier, inverting and fading there.
+    double radius = 1;
+    const double refine = maskRefine(e, t, pixelScale, radius);
+    // (the mask shown; or its edge settled on the picture where the step cannot be given the picture)
+    if ((!showing && e.p("mask.show", t) > 0.5) || (refine > 0 && !reads)) return false;
+    // As effectMatte makes it: the shape (an object's from its segmentation, the people's, a Cryptomatte's) with its
+    // holes closed, bent with the surface, and the range of depths here; the qualifier, inverting and fading there.
     op.masked = true;
     const bool depthRange = e.p("mask.depth", t) > 0.5;
     if ((shape > 0 || depthRange) && width > 0 && height > 0) {
-        op.mask.assign(size_t(width) * size_t(height), 1.0f);
-        if (shape == 3) {
-            std::vector<float> logits;
-            if (e.object && tSourceSeconds >= 0 && e.object->maskLogitsAt(tSourceSeconds, logits))
-                op.mask = objectMatte(logits, width, height, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
-            else
-                std::fill(op.mask.begin(), op.mask.end(), 0.f);
-        }
-        if (shape > 0) drawMaskShape(e, t, shape, op.mask, width, height, pixelScale);
-        if (shape > 0 && shape != 6) consolidateMatte(op.mask, width, height, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
-        if (depthRange) {
-            const DepthMap* depth = currentDepth();
-            const double lo = e.p("mask.depth_low", t, 50) / 100, hi = e.p("mask.depth_high", t, 100) / 100;
-            const double ramp = std::max(1e-4, e.p("mask.depth_soft", t, 10) / 100);
-            if (!depth) {
-                std::fill(op.mask.begin(), op.mask.end(), 0.f);
-            } else {
-                const std::vector<float> d = depth->resized(width, height);
-                for (size_t i = 0; i < op.mask.size(); ++i) {
-                    const double v = d[i];
-                    const double out = v < lo ? lo - v : v > hi ? v - hi : 0.0;
-                    const double k = std::clamp(1.0 - out / ramp, 0.0, 1.0);
-                    op.mask[i] *= float(k * k * (3 - 2 * k));
-                }
-            }
+        op.mask = shape > 0 ? maskShape(e, t, width, height, pixelScale, tSourceSeconds) : std::vector<float>(size_t(width) * size_t(height), 1.0f);
+        std::vector<float> range;
+        if (depthRange) range = maskDepthRange(e, t, width, height);
+        if (refine > 0) {
+            // Its edge settled on the picture as it is when the step runs, read back from the GPU then (and the range
+            // of depths after it, as effectMatte has them).
+            auto depths = std::make_shared<const std::vector<float>>(std::move(range));
+            auto earlier = op.prepare;
+            op.prepare = [radius, refine, depths, earlier](const Image& picture, gpu::ColorOp& step) {
+                if (earlier && !earlier(picture, step)) return false;
+                if (step.mask.size() != size_t(picture.width) * size_t(picture.height)) return false;
+                refineMatteEdges(step.mask, picture, radius, refine);
+                if (!depths->empty())
+                    for (size_t i = 0; i < step.mask.size(); ++i) step.mask[i] *= (*depths)[i];
+                return true;
+            };
+        } else if (depthRange) {
+            for (size_t i = 0; i < op.mask.size(); ++i) op.mask[i] *= range[i];
         }
     }
     const bool qualify = e.p("mask.qualify", t) > 0.5;
@@ -3644,7 +3719,7 @@ bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int heig
 bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, int width, int height, double pixelScale) {
     if (!e.enabled) return true;
     gpu::ColorOp op;
-    if (hasMask(e, t) && !gpuMask(e, t, op, 0, 0, pixelScale)) return false;
+    if (hasMask(e, t) && !gpuMask(e, t, op, 0, 0, pixelScale, false, true)) return false;
     if (e.type == "color_correct") {
         const ColorCorrectSetup s = colorCorrectSetup(e, t);
         if (s.printing) return false;  // (printer lights on the light, which the shader does not decode)
@@ -3777,7 +3852,6 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[2] = e.p("invert", t) > 0.5 ? 1 : 0;
     } else if (e.type == "screen_key") {
         const int plateMode = int(std::lround(e.p("clean_plate", t, 0)));
-        if (plateMode == 1) return false;  // (a clean plate made from the picture itself: on the CPU, which has it)
         // (as screenKey, the matte shrunk or grown and softened by passes of its own when asked)
         const double shrink = e.p("shrink", t, 0) * pixelScale, soften = e.p("soften", t, 0) * pixelScale;
         op.kind = gpu::ColorOp::ScreenKey;
@@ -3804,9 +3878,32 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                 op.params[13] = std::max(1e-3f, float(std::clamp(e.p("plate_threshold", t, 50), 1.0, 100.0) / 100) * op.params[3]);
             }
         }
+        // A clean plate made from the picture itself (keyerPlate's makeCleanPlate): from the picture read back when
+        // the key runs, in the place it was asked for.
+        if (plateMode == 1 && width > 0 && height > 0) {
+            const float threshold = std::max(1e-3f, float(std::clamp(e.p("plate_threshold", t, 50), 1.0, 100.0) / 100) * op.params[3]);
+            const ExpressionContext where = currentExpressionContext();
+            const ColorSpace* working = &currentWorkingSpace();
+            op.prepare = [effect = e, t, pixelScale, threshold, working, where, fetch = ofx::currentFetch(), plates = currentCleanPlate()](
+                             const Image& picture, gpu::ColorOp& step) {
+                ExpressionScope expressions(where.project, where.sequence, where.clip, where.cancel);
+                const WorkingSpaceScope space(working);
+                const ofx::FetchScope otherFrames(fetch);  // (a plate over several frames takes the clip's others)
+                const CleanPlateScope plateScope(plates);
+                const Image plate = keyerPlate(effect, t, picture, pixelScale);
+                if (plate.empty()) return true;  // (no screen found: keyed without one, as the CPU does)
+                if (plate.width != picture.width || plate.height != picture.height) return false;
+                step.plate.assign(plate.px.begin(), plate.px.end());
+                step.params[12] = 1, step.params[13] = threshold;
+                return true;
+            };
+        }
         for (int k = 0; k < 3; ++k) op.params[16 + k] = sk[k];
     } else if (e.type == "track_matte" || e.type == "displace_by_layer") {
         return true;  // (the compositor applies them, render/Compositor)
+    } else if (e.type == "surface_track") {
+        // The track only (for masks that bend with it): nothing is drawn. Any other mode draws on the CPU.
+        return std::lround(e.p("mode", t, 0)) == 4;
     } else if (isGpuFilter(e.type)) {
         // gpufilter.frag's passes, as the effect runs on the CPU; through its mask, marked before and mixed after.
         gpu::ColorOp f;
@@ -4010,52 +4107,35 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         } else if (ty == "mesh_warp" || ty == "grid_warp") {
             // drawWarp's triangles (render/MeshWarp: the mesh solved on the CPU, as there), listed by the 8-pixel tiles
             // they may reach, in the order drawn (gpufilter.frag's mode 33)
+            // With motion blur, a drawing for each sample through the shutter, each from the picture as the warp
+            // began, kept as the mean of those so far (as throughShutter averages them).
             WarpMesh mesh;
             std::vector<MeshPoint> moved;
             std::vector<double> depth;
-            const int how = warpDrawing(e, t, width, height, pixelScale, mesh, moved, depth);
+            std::vector<WarpSample> shutter;
+            const int how = warpDrawing(e, t, width, height, pixelScale, mesh, moved, depth, nullptr, &shutter);
             if (how < 0) return false;
-            const std::vector<WarpTriangle> tris = how > 0 ? warpTriangles(mesh, moved, depth, width, height) : std::vector<WarpTriangle>{};
-            if (how > 0) {
-                constexpr int kTile = 8;
-                const int across = (width + kTile - 1) / kTile, down = (height + kTile - 1) / kTile;
-                std::vector<std::vector<int>> lists(size_t(across) * size_t(down));
-                for (size_t i = 0; i < tris.size(); ++i)
-                    for (int ty0 = tris[i].y0 / kTile; ty0 <= tris[i].y1 / kTile; ++ty0)
-                        for (int tx0 = tris[i].x0 / kTile; tx0 <= tris[i].x1 / kTile; ++tx0) lists[size_t(ty0) * size_t(across) + size_t(tx0)].push_back(int(i));
-                size_t entries = 0;
-                for (const auto& l : lists) entries += l.size();
-                const size_t start = lists.size() + entries, texels = start + tris.size() * 6;
-                add(33, {float(kTile), float(across), float(start)});
-                gpu::ColorOp::FilterPass& fp = f.passes.back();
-                fp.tableWidth = int(std::min<size_t>(4096, std::max<size_t>(1, texels)));
-                const size_t rows = (texels + size_t(fp.tableWidth) - 1) / size_t(fp.tableWidth);
-                fp.table.assign(rows * size_t(fp.tableWidth) * 4, 0.0f);
-                float* tb = fp.table.data();
-                size_t at = lists.size();
-                for (size_t k = 0; k < lists.size(); ++k) {
-                    tb[k * 4] = float(at), tb[k * 4 + 1] = float(lists[k].size());
-                    for (int i : lists[k]) tb[at++ * 4] = float(i);
-                }
-                for (size_t i = 0; i < tris.size(); ++i) {
-                    const WarpTriangle& d = tris[i];
-                    float* q = tb + (start + i * 6) * 4;
-                    for (int k = 0; k < 3; ++k) {
-                        q[k * 4] = float(d.A[k]), q[k * 4 + 1] = float(d.B[k]);
-                        q[k * 4 + 2] = float(d.P[k][0]), q[k * 4 + 3] = float(d.P[k][1]);
-                    }
-                    q[12] = float(d.at[0]), q[13] = float(d.at[1]), q[14] = float(d.at[2]);
-                    q[15] = float((d.own[0] ? 1 : 0) | (d.own[1] ? 2 : 0) | (d.own[2] ? 4 : 0));
-                    q[16] = float(d.r[0][0]), q[17] = float(d.r[0][1]), q[18] = float(d.r[1][0]), q[19] = float(d.r[1][1]);
-                    q[20] = float(d.r[2][0]), q[21] = float(d.r[2][1]);
-                }
+            if (how == 1) f.passes = warpFilterPasses(mesh, moved, depth, shutter, width, height);
+            if (how == 2 && width > 0 && height > 0) {
+                // A mesh made over the picture's alpha: from the picture read back when the warp runs.
+                add(33, {});
+                const ExpressionContext where = currentExpressionContext();
+                f.prepare = [effect = e, t, pixelScale, where](const Image& picture, gpu::ColorOp& step) {
+                    ExpressionScope expressions(where.project, where.sequence, where.clip, where.cancel);
+                    WarpMesh made;
+                    std::vector<MeshPoint> to;
+                    std::vector<double> depths;
+                    std::vector<WarpSample> samples;
+                    if (warpDrawing(effect, t, picture.width, picture.height, pixelScale, made, to, depths, &picture, &samples) != 1) return false;
+                    step.passes = warpFilterPasses(made, to, depths, samples, picture.width, picture.height);
+                    return true;
+                };
             }
         } else if (ty == "depth_blur") {
             // lensBlur's plan (render/LensBlur), from the frame's depth, as passes: the state S (what is laid down, in
             // light, beside its coverage) twice the layer's width, each layer laid down sharp, or what is behind it
             // filled through a pyramid and the layer gathered at 1/f through the aperture's taps and laid over S. (The
-            // nearest face's depth needs the faces, found on the CPU.)
-            if (std::lround(e.p("follow", t, 0)) == 2) return false;
+            // nearest face's depth is a value here: read at the faces the compositor found, currentFaces().)
             const DepthMap* depth = currentDepth();
             // (its state twice the layer's width, and a table a row more than its height: a layer too big for them
             // stays on the CPU)
@@ -4504,7 +4584,7 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         out.push_back(std::move(mark));
         out.push_back(std::move(f));
         op.kind = gpu::ColorOp::Mix;
-        gpuMask(e, t, op, width, height, pixelScale);
+        gpuMask(e, t, op, width, height, pixelScale, false, true);
         out.push_back(std::move(op));
         return true;
     } else if (e.type == "ofx") {
@@ -4541,7 +4621,7 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
     } else {
         return false;
     }
-    if (op.masked) gpuMask(e, t, op, width, height, pixelScale);  // (now with its shape drawn)
+    if (op.masked) gpuMask(e, t, op, width, height, pixelScale, false, true);  // (now with its shape drawn)
     out.push_back(std::move(op));
     return true;
 }

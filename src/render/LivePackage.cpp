@@ -15,6 +15,7 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <climits>
@@ -1994,13 +1995,16 @@ struct LiveOrigin::State {
     std::mutex m;
     QEventLoop* loop = nullptr;
     int port = 0;
+    std::atomic<int64_t> heldBytes{0};  // (bytes handed to connections that their clients have not taken yet)
 
     // A connection's one request (each answered, then closed). Kept until its socket is gone.
     struct Request {
         QTcpSocket* socket = nullptr;
         QByteArray in;
         // (gone: let go, its socket deleted once control is back in the loop)
-        bool parsed = false, head = false, streaming = false, done = false, skip = false, gone = false;
+        // (sending: a whole file going out a piece at a time, as its client takes it; `length` bytes in all)
+        bool parsed = false, head = false, streaming = false, sending = false, done = false, skip = false, gone = false;
+        qint64 length = 0;
         QString rel;
         int64_t msn = -1;
         int part = -1;
@@ -2049,10 +2053,15 @@ struct LiveOrigin::State {
         r.socket->abort();
         r.socket->deleteLater();
     }
-    // Whether a request is an answer, or a growing segment, that its client has not taken any of for 20 s.
+    // Whether a request is an answer, a file or a growing segment that its client has not taken any of for 20 s.
     static bool stalled(const Request& r, Clock::time_point now) {
-        return !r.gone && (r.done || r.streaming) && r.socket->bytesToWrite() > 0 && now - r.moved > std::chrono::seconds(20);
+        return !r.gone && (r.done || r.streaming || r.sending) && r.socket->bytesToWrite() > 0 && now - r.moved > std::chrono::seconds(20);
     }
+    // A file's bytes are read as its client takes them: no more than this waits in a connection at once, so clients
+    // that read nothing hold a quarter of a megabyte each and not the files they asked for.
+    static constexpr qint64 kHeld = 256 << 10;
+    // How much more of a file a connection can be handed now.
+    static qint64 room(const Request& r) { return std::max<qint64>(0, kHeld - r.socket->bytesToWrite()); }
     void answer(Request& r, int code, const QByteArray& type, const QByteArray& body) {
         send(r, headers(code, type, body.size(), false));
         if (!r.head) send(r, body);
@@ -2170,10 +2179,12 @@ struct LiveOrigin::State {
         QFile f(QString::fromStdString(folder + "/" + r.rel.toStdString()));
         const bool grows = growing && growing(r.rel.toStdString());
         if (r.streaming) {
-            // A segment as it grows: what is new, then (once finished) the end.
+            // A segment as it grows: what is new (as much as its client has room for), then (once finished) the end.
             if (grows && QFileInfo(f).size() <= r.sent) return;  // (nothing new yet)
+            const qint64 most = room(r);
+            if (most <= 0) return;  // (its client has yet to take what it was sent)
             if (f.open(QIODevice::ReadOnly) && f.size() > r.sent && f.seek(r.sent)) {
-                const QByteArray more = f.read(f.size() - r.sent);
+                const QByteArray more = f.read(std::min(f.size() - r.sent, most));
                 if (!more.isEmpty()) {
                     send(r, QByteArray::number(qlonglong(more.size()), 16) + "\r\n" + more + "\r\n");
                     r.sent += more.size();
@@ -2183,6 +2194,19 @@ struct LiveOrigin::State {
                 send(r, "0\r\n\r\n");
                 close(r);
             }
+            return;
+        }
+        if (r.sending) {
+            // A whole file: the next piece, read when its client has taken the last. (Opened for each: a file held
+            // open could not be renamed or deleted under Windows.) A file that went, or was cut short, cannot be
+            // finished at the length promised: the connection is let go.
+            const qint64 most = std::min(room(r), r.length - r.sent);
+            if (most <= 0) return;
+            const QByteArray more = f.open(QIODevice::ReadOnly) && f.seek(r.sent) ? f.read(most) : QByteArray();
+            if (more.isEmpty()) return drop(r);
+            send(r, more);
+            r.sent += more.size();
+            if (r.sent >= r.length) close(r);
             return;
         }
         if (!f.exists()) {
@@ -2210,6 +2234,15 @@ struct LiveOrigin::State {
         if (!f.open(QIODevice::ReadOnly)) {
             if (after(r, waitSeconds)) answer(r, 404, "text/plain", "Not found");
             return;
+        }
+        if (f.size() > kHeld && !r.rel.endsWith(".mpd") && !r.rel.endsWith(".m3u8")) {
+            // (a file larger than a connection may hold: its headers now, its bytes as the client takes them)
+            r.length = f.size();
+            send(r, headers(200, contentType(r.rel), r.length, false));
+            if (r.head) return close(r);
+            r.sending = true;
+            f.close();
+            return attempt(r);
         }
         QByteArray body = f.readAll();
         if (r.rel.endsWith(".mpd")) {
@@ -2244,10 +2277,20 @@ struct LiveOrigin::State {
                     // (all whole requests: the one held longest for something not yet made is told to come back, so
                     // requests for what is not there cannot keep players out either)
                     for (auto& q : requests)
-                        if (q->parsed && !q->done && !q->streaming && (!oldest || q->came < oldest->came)) oldest = q.get();
+                        if (q->parsed && !q->done && !q->streaming && !q->sending && (!oldest || q->came < oldest->came)) oldest = q.get();
                     if (oldest) {
                         answer(*oldest, 503, "text/plain", "Busy");
                         --open;
+                    } else {
+                        // (all being sent a file or a growing segment: the one whose client has taken nothing for
+                        // longest is let go, so clients that ask for a segment and read none of it cannot keep
+                        // players out while it is made)
+                        for (auto& q : requests)
+                            if (!q->done && (q->streaming || q->sending) && (!oldest || q->moved < oldest->moved)) oldest = q.get();
+                        if (oldest) {
+                            drop(*oldest);
+                            --open;
+                        }
                     }
                 }
             }
@@ -2282,7 +2325,11 @@ struct LiveOrigin::State {
                 raw->in += raw->socket->readAll();
                 attempt(*raw);
             });
-            QObject::connect(socket, &QTcpSocket::bytesWritten, &server, [raw] { raw->moved = Clock::now(); });
+            QObject::connect(socket, &QTcpSocket::bytesWritten, &server, [this, raw] {
+                raw->moved = Clock::now();
+                // (a file or a growing segment: its next piece as soon as there is room for it)
+                if (!raw->done && (raw->sending || raw->streaming)) attempt(*raw);
+            });
             QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
             // (the request goes with its socket)
             QObject::connect(socket, &QObject::destroyed, &server, [this, raw] {
@@ -2307,6 +2354,10 @@ struct LiveOrigin::State {
                 else if (!r->done && now - r->accepted > std::chrono::seconds(10)) slow.push_back(r.get());
             for (Request* r : waiting) attempt(*r);
             for (Request* r : slow) drop(*r);
+            int64_t held = 0;
+            for (auto& r : requests)
+                if (!r->gone && r->socket) held += r->socket->bytesToWrite();
+            heldBytes.store(held);
         });
         tick.start(10);
         {
@@ -2357,6 +2408,8 @@ bool LiveOrigin::start(const std::string& folder, int port, std::function<bool(c
 }
 
 int LiveOrigin::port() const { return s_->port; }
+
+int64_t LiveOrigin::bytesWaiting() const { return s_->heldBytes.load(); }
 
 void LiveOrigin::stop() {
     if (!s_->thread.joinable()) return;

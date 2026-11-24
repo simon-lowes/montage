@@ -1115,9 +1115,15 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
         for (size_t idx = 0; idx < set->cpbs.size(); ++idx) {
             const hrd::Cpb& c = set->cpbs[idx];
             if (c.bitRate <= 0 || c.size <= 0) continue;
-            auto delaysOf = [&](const hrd::BufferingPeriod& bp, double& delay, double& sum) {
-                const auto& d = nalSet ? bp.nalDelay : bp.vclDelay;
-                const auto& o = nalSet ? bp.nalOffset : bp.vclOffset;
+            // (C.2.3: a BLA picture without RASL pictures, with irap_cpb_params_present_flag, starts on the alternative
+            // delays, which leave out the pictures that were dropped; a CRA's UseAltCpbParamsFlag is set by external
+            // means and is not modelled)
+            auto altParams = [&](const Unit& u) { return codec == kHevc && u.au.bp.present && u.au.bp.irapCpbParams && (u.type == 17 || u.type == 18); };
+            auto delaysOf = [&](const hrd::BufferingPeriod& bp, bool alt, double& delay, double& sum) {
+                const auto& altD = nalSet ? bp.nalAltDelay : bp.vclAltDelay;
+                const bool useAlt = alt && idx < altD.size();
+                const auto& d = useAlt ? altD : nalSet ? bp.nalDelay : bp.vclDelay;
+                const auto& o = useAlt ? (nalSet ? bp.nalAltOffset : bp.vclAltOffset) : nalSet ? bp.nalOffset : bp.vclOffset;
                 if (idx >= d.size()) return false;
                 delay = double(d[idx]) / 90000.0;
                 sum = double(d[idx] + (idx < o.size() ? o[idx] : 0)) / 90000.0;
@@ -1125,6 +1131,13 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
             };
             double curDelay = c.size / c.bitRate, curSum = curDelay;
             double bpRemoval = 0, prevNonDiscardable = 0;
+            double cpbDelayOffset = 0;  // C.2.3's CpbDelayOffset, in clock ticks: set by each buffering period's picture
+            double lastArrival = 0;     // AuFinalArrivalTime of the access unit before
+            struct Wait {
+                size_t unit;
+                double asked, ready;
+            };
+            std::vector<Wait> waits;  // joins whose buffering period asks for a removal before the buffer allows
             HrdSchedule sched;
             sched.model = nalSet ? "NAL HRD" : "VCL HRD";
             sched.index = int(idx);
@@ -1136,20 +1149,32 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
                 const double tc = s->tick() > 0 ? s->tick() : model.tick();
                 const bool bp = u.au.bp.present || (k == 0);
                 double delay = curDelay, sum = curSum;
-                if (u.au.bp.present) delaysOf(u.au.bp, delay, sum);
+                if (u.au.bp.present) delaysOf(u.au.bp, altParams(u), delay, sum);
                 if (k == 0) {
                     removal[0] = delay;
                     sched.initialDelay = delay;
                 } else if (usePt) {
-                    const double base = bp && codec == kHevc && u.au.bp.concatenation ? 0 : bpRemoval;
                     const int64_t ticks = u.au.pt.cpbRemovalDelay;
                     const hrd::Params* sp = s->active() ? s->active() : p;
                     const double wrap = std::ldexp(1.0, sp->cpbDelayLength);
-                    double t = base + tc * double(ticks);
+                    double t = 0;
                     if (bp && codec == kHevc && u.au.bp.concatenation) {
-                        // (C-10 with concatenation_flag: from the last picture that is not discardable, or as the buffer allows)
-                        t = prevNonDiscardable + tc * double(u.au.bp.auCpbRemovalDelayDeltaMinus1 + 1);
+                        // (C-10 with concatenation_flag) Two candidates, and the later one stands: the delta the
+                        // buffering period gives from the last picture that is not discardable, or the earliest tick
+                        // at which the buffer holds this period's initial delay after the picture before has all
+                        // arrived. No delay offset applies to either.
+                        const double first = prevNonDiscardable + tc * double(u.au.bp.auCpbRemovalDelayDeltaMinus1 + 1);
+                        // (an initial delay rounded up to its 90 kHz unit, as C.2.2 lets an encoder state it, is
+                        // not held against the join: that last unit is left out of the second)
+                        const double second = removal[k - 1] + tc * std::ceil((delay - 1.0 / 90000 + lastArrival - removal[k - 1]) / tc - 1e-9);
+                        t = first;
+                        if (first < second - 1e-9) {
+                            t = second;
+                            waits.push_back({k, first, second});
+                        }
                     } else {
+                        // (C-10, C-11: from the buffering period's first picture, less the offset that period set)
+                        t = bpRemoval + tc * (double(ticks) - (codec == kHevc ? cpbDelayOffset : 0));
                         // (cpb_removal_delay counts modulo 2^length: the next time after the access unit before)
                         while (t <= removal[k - 1] + 1e-9 && wrap * tc < 1e6) t += tc * wrap;
                     }
@@ -1161,6 +1186,13 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
                 if (bp) {
                     bpRemoval = removal[k];
                     curDelay = delay, curSum = sum;
+                    // (after its own removal time is settled: the offset is for the pictures that follow it)
+                    cpbDelayOffset = altParams(u) ? double(u.au.bp.cpbDelayOffset) : 0;
+                }
+                {
+                    // (the arrival schedule, as runCpb reckons it: the second candidate above needs it as it goes)
+                    const double arrives = k == 0 ? 0 : c.cbr ? lastArrival : std::max(lastArrival, removal[k] - (bp ? delay : curSum));
+                    lastArrival = arrives + double(setBits[k]) / c.bitRate;
                 }
                 bpStart[k] = bp;
                 initDelay[k] = delay;
@@ -1170,6 +1202,12 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
             }
             // Run on its own, then its findings joined to the others': each problem says which schedule it is on.
             HrdReport one;
+            for (const Wait& w : waits)
+                addIssue(one, int64_t(w.unit), shown[w.unit], "concatenation",
+                         format("its buffering period joins it %.1f ms after the picture before, but the buffer cannot hold its initial delay until %.1f ms: "
+                                "a decoder waits (the later of the two removal times), so the join is not seamless",
+                                (w.asked - removal[w.unit - 1]) * 1000, (w.ready - removal[w.unit - 1]) * 1000));
+            sched.lastRemoval = removal.empty() ? 0 : removal.back();
             runCpb(one, removal, setBits, shown, bpStart, initDelay, initSum, c.bitRate, c.size, c.cbr, set->lowDelay);
             sched.lowest = one.lowest, sched.highest = one.highest, sched.issueCount = one.issueCount;
             const int at = int(r.schedules.size());
@@ -1557,9 +1595,15 @@ void checkAv1(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>
     constexpr int64_t kGroupBytes = int64_t(sizeof(Av1Group) + 5 * sizeof(double)), kUnitBytes = 4 * int64_t(sizeof(int64_t));
     int64_t bytesRead = 0;
     bool tooMany = false;
+    // (a full vector's next block counted as well: while it grows, its old block and its new one, twice the size, are
+    // both held, so what is kept never passes the limit even then)
+    // (a frame header adds up to 32 removal times)
+    auto growing = [](const auto& v, size_t adds) {
+        return v.size() + adds > v.capacity() ? int64_t(std::max<size_t>(v.size() + adds, v.capacity() * 2) * sizeof(v[0])) : int64_t(0);
+    };
     auto kept = [&] {
         return int64_t(units.capacity() * sizeof(Obu) + headers.capacity() * sizeof(Av1Frame) + removals.capacity() * sizeof(int64_t)) +
-               int64_t(headers.size()) * kGroupBytes + int64_t(ptsOf.size()) * kUnitBytes;
+               growing(units, 1) + growing(headers, 1) + growing(removals, 32) + int64_t(headers.size()) * kGroupBytes + int64_t(ptsOf.size()) * kUnitBytes;
     };
     Av1Seq running = seq;  // (the sequence header in force as the stream is read)
     bool modelStated = true;
@@ -1787,11 +1831,17 @@ HrdReport checkHrd(const std::string& path, const std::atomic<bool>* cancel) {
         r.error = "cannot open " + path;
         return r;
     }
-    // (AV1 is read OBU by OBU from its packets, its sequence header in them or the container's: a container that
-    // names it needs no probe, which would only decode frames the check never looks at)
-    bool namesAv1 = false;
-    for (unsigned i = 0; i < fmt->nb_streams; ++i)
-        namesAv1 = namesAv1 || (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && fmt->streams[i]->codecpar->codec_id == kAv1);
+    // (AV1 is read OBU by OBU from its packets, its sequence header in them or the container's: a container whose
+    // video is all AV1 needs no probe, which would only decode frames the check never looks at. With another codec's
+    // video beside it the file is probed as any other, since that stream may be the one checked and needs what the
+    // probe finds: its frame rate, for one.)
+    bool namesAv1 = false, otherVideo = false;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        if (fmt->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+        if (fmt->streams[i]->codecpar->codec_id == kAv1) namesAv1 = true;
+        else otherVideo = true;
+    }
+    namesAv1 = namesAv1 && !otherVideo;
     // (nor its parser, which FFmpeg 9 runs over IVF: it reads only what the check reads again, and on a crafted stream
     // logs an error for every packet)
     if (namesAv1) fmt->flags |= AVFMT_FLAG_NOPARSE;

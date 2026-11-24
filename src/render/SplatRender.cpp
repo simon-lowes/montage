@@ -16,6 +16,11 @@ constexpr size_t kMaxEntries = size_t(1) << 27;  // splats in all the tiles toge
 
 using M3 = std::array<double, 9>;  // row-major
 
+float linearToSrgb(float v) {
+    v = std::max(0.0f, v);
+    return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f;
+}
+
 M3 mul(const M3& a, const M3& b) {
     M3 r{};
     for (int i = 0; i < 3; ++i)
@@ -61,15 +66,39 @@ struct View {
         }
     }
 
-    bool project(const SplatCloud& c, size_t i, ProjectedSplat& out) const {
+    // Splat i's centre in the camera (q) and on the picture; false when it is not in front of the camera.
+    bool centre(const SplatCloud& c, size_t i, double q[3], ProjectedSplat& out) const {
         const float* p = &c.positions[i * 3];
-        double q[3];
         for (int r = 0; r < 3; ++r) q[r] = T[size_t(r * 3)] * p[0] + T[size_t(r * 3 + 1)] * p[1] + T[size_t(r * 3 + 2)] * p[2] + o[size_t(r)];
         if (!(q[2] > nearZ)) return false;
         const double u = q[0] / q[2], v = q[1] / q[2];
         out.x = a[0] * u + a[1] * v + sx;
         out.y = a[2] * u + a[3] * v + sy;
         out.depth = q[2];
+        return true;
+    }
+
+    // No splat at camera-space q with `largest` as its largest scale and this opacity reaches farther from its centre
+    // on the picture than this: its covariance there is (J L) S² (J L)ᵀ, whose largest eigenvalue is at most
+    // |J|² |T|² largest² (L being T times a rotation), with the Frobenius norms standing in for the matrices' own.
+    double reachBound(const double q[3], double largest, double opacity) const {
+        const double u = std::clamp(q[0] / q[2], limLo[0], limHi[0]), v = std::clamp(q[1] / q[2], limLo[1], limHi[1]);
+        const double j2 = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2] + a[3] * a[3]) * (2 + u * u + v * v) / (q[2] * q[2]);
+        double t2 = 0;
+        for (const double t : T) t2 += t * t;
+        const double widest = j2 * t2 * largest * largest * 1.0001 + kBlur;
+        return std::sqrt(2 * std::log(255 * opacity) * widest) * 1.0001 + 1e-6;
+    }
+
+    bool project(const SplatCloud& c, size_t i, ProjectedSplat& out) const {
+        double q[3];
+        if (!centre(c, i, q, out)) return false;
+        return shape(c, i, q, out);
+    }
+
+    // Its covariance on the picture, its centre already found.
+    bool shape(const SplatCloud& c, size_t i, const double q[3], ProjectedSplat& out) const {
+        const double u = q[0] / q[2], v = q[1] / q[2];
         // Its covariance, R S² Rᵀ, into the camera.
         const float* rq = &c.rotations[i * 4];
         const double x = rq[0], y = rq[1], z = rq[2], w = rq[3];
@@ -144,9 +173,21 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
 
     // Each splat projected, coloured, and given the tiles it reaches.
     std::vector<Drawn> drawn(cloud.count);
+    const std::vector<uint8_t>* keep = options.keep && options.keep->size() == cloud.count ? options.keep.get() : nullptr;
+    std::atomic<size_t> offeredAll{0}, projectedAll{0}, reachedAll{0};
+    // A linear cloud's colours are blended as they are and brought to display values after.
+    auto toDisplay = [&](float v) { return cloud.linearColor ? linearToSrgb(v) : v; };
+    auto colour = [&](size_t i, const float* p, Drawn& d) {
+        const double dir[3] = {p[0] - view.eye[0], p[1] - view.eye[1], p[2] - view.eye[2]};
+        const double dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        const std::array<float, 3> col = splatColor(cloud, i, dl > 0 ? std::array<double, 3>{dir[0] / dl, dir[1] / dl, dir[2] / dl}
+                                                                    : std::array<double, 3>{0, 0, 1});
+        d.r = col[0], d.g = col[1], d.b = col[2];
+    };
     constexpr size_t kChunk = 4096;
     eachTask(int((cloud.count + kChunk - 1) / kChunk), options.threads, [&](int task) {
         const size_t end = std::min(cloud.count, (size_t(task) + 1) * kChunk);
+        size_t offered = 0, projected = 0, reached = 0;
         for (size_t i = size_t(task) * kChunk; i < end; ++i) {
             Drawn& d = drawn[i];
             d.shown = false;
@@ -154,8 +195,27 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
             if (options.crop && (p[0] < options.cropLo[0] || p[0] > options.cropHi[0] || p[1] < options.cropLo[1] ||
                                  p[1] > options.cropHi[1] || p[2] < options.cropLo[2] || p[2] > options.cropHi[2]))
                 continue;
+            if (keep && !(*keep)[i]) continue;
+            ++offered;
             ProjectedSplat s;
-            if (cloud.opacities[i] < 1.0f / 255 || !view.project(cloud, i, s)) continue;
+            double q[3];
+            if (cloud.opacities[i] < 1.0f / 255 || !view.centre(cloud, i, q, s)) continue;
+            if (options.cullToView || options.points) {
+                // Off the picture whatever its shape: passed over here, before its shape and colour cost anything.
+                const double reach = options.points ? 0.0
+                                                    : view.reachBound(q, std::max({cloud.scales[i * 3], cloud.scales[i * 3 + 1], cloud.scales[i * 3 + 2]}),
+                                                                      cloud.opacities[i]);
+                if (s.x + reach < 0 || s.x - reach > w || s.y + reach < 0 || s.y - reach > h) continue;
+            }
+            ++projected;
+            if (options.points) {
+                d.x = float(s.x), d.y = float(s.y), d.depth = float(s.depth), d.opacity = 1;
+                colour(i, p, d);
+                d.tx0 = d.tx1 = d.ty0 = d.ty1 = 0;
+                d.shown = true;
+                continue;
+            }
+            view.shape(cloud, i, q, s);
             const double a = s.xx + kBlur, b = s.xy, c = s.yy + kBlur, det = a * c - b * b;
             if (!(det > 1e-12) || !std::isfinite(det)) continue;
             double opacity = cloud.opacities[i];
@@ -169,18 +229,44 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
             auto tileOf = [](double v, double size, int tiles) { return std::clamp(int(std::floor(std::clamp(v, 0.0, size) / kTile)), 0, tiles - 1); };
             d.tx0 = tileOf(s.x - r, w, tilesX), d.tx1 = tileOf(s.x + r, w, tilesX);
             d.ty0 = tileOf(s.y - r, h, tilesY), d.ty1 = tileOf(s.y + r, h, tilesY);
-            const double dir[3] = {p[0] - view.eye[0], p[1] - view.eye[1], p[2] - view.eye[2]};
-            const double dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-            const std::array<float, 3> col = splatColor(cloud, i, dl > 0 ? std::array<double, 3>{dir[0] / dl, dir[1] / dl, dir[2] / dl}
-                                                                        : std::array<double, 3>{0, 0, 1});
+            colour(i, p, d);
             d.x = float(s.x), d.y = float(s.y);
             d.ia = float(c / det), d.ib = float(-b / det), d.ic = float(a / det);
             d.opacity = float(opacity);
-            d.r = col[0], d.g = col[1], d.b = col[2];
             d.depth = float(s.depth);
             d.shown = true;
+            ++reached;
         }
+        offeredAll += offered, projectedAll += projected, reachedAll += reached;
     });
+    if (options.stats) options.stats->offered = offeredAll, options.stats->projected = projectedAll, options.stats->drawn = reachedAll;
+    const float layer = std::clamp(options.opacity, 0.0f, 1.0f);
+
+    if (options.points) {
+        // The nearest centre in each pixel (equal depths: the first in the file), drawn whole.
+        std::vector<uint32_t> nearest(size_t(w) * size_t(h), UINT32_MAX);
+        size_t shown = 0;
+        for (size_t i = 0; i < drawn.size(); ++i) {
+            const Drawn& d = drawn[i];
+            if (!d.shown) continue;
+            const int x = int(std::floor(d.x)), y = int(std::floor(d.y));
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            ++shown;
+            uint32_t& at = nearest[size_t(y) * size_t(w) + size_t(x)];
+            if (at == UINT32_MAX || d.depth < drawn[at].depth) at = uint32_t(i);
+        }
+        if (options.stats) options.stats->drawn = shown;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const uint32_t at = nearest[size_t(y) * size_t(w) + size_t(x)];
+                if (at == UINT32_MAX) continue;
+                const Drawn& d = drawn[at];
+                float* q = img.at(x, y);
+                q[0] = toDisplay(std::min(1.0f, d.r)) * layer, q[1] = toDisplay(std::min(1.0f, d.g)) * layer, q[2] = toDisplay(std::min(1.0f, d.b)) * layer, q[3] = layer;
+                if (depthOut) (*depthOut)[size_t(y) * size_t(w) + size_t(x)] = d.depth;
+            }
+        return img;
+    }
 
     // At most kMaxEntries splats in all the tiles together (a few huge splats in a small file could otherwise ask for
     // more memory than there is): past that the farthest are left out.
@@ -219,7 +305,6 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
         }
     }
 
-    const float layer = std::clamp(options.opacity, 0.0f, 1.0f);
     eachTask(tilesX * tilesY, options.threads, [&](int tile) {
         uint32_t* first = list.data() + start[size_t(tile)];
         uint32_t* last = list.data() + start[size_t(tile) + 1];
@@ -245,11 +330,76 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
                     T = next;
                 }
                 float* q = img.at(x, y);
+                if (cloud.linearColor && T < 1) {  // (straight, to display values, and back under its coverage)
+                    const float cover = 1 - T;
+                    for (float& v : rgb) v = linearToSrgb(std::min(1.0f, v / cover)) * cover;
+                }
                 q[0] = rgb[0] * layer, q[1] = rgb[1] * layer, q[2] = rgb[2] * layer, q[3] = (1 - T) * layer;
                 if (depthOut && weight > 0) (*depthOut)[size_t(y) * size_t(w) + size_t(x)] = median >= 0 ? median : depthSum / weight;
             }
     });
     return img;
+}
+
+namespace {
+
+// Each offered splat's centre on the picture handed to `inside`; one byte a splat.
+std::vector<uint8_t> splatsWhere(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera, const std::vector<uint8_t>* keep,
+                                 const std::function<bool(double, double)>& inside) {
+    std::vector<uint8_t> set(cloud.count, 0);
+    if (keep && keep->size() != cloud.count) keep = nullptr;
+    const View view(place, camera);
+    constexpr size_t kChunk = 4096;
+    eachTask(int((cloud.count + kChunk - 1) / kChunk), 0, [&](int task) {
+        const size_t end = std::min(cloud.count, (size_t(task) + 1) * kChunk);
+        for (size_t i = size_t(task) * kChunk; i < end; ++i) {
+            if (keep && !(*keep)[i]) continue;
+            ProjectedSplat s;
+            double q[3];
+            if (view.centre(cloud, i, q, s) && std::isfinite(s.x) && std::isfinite(s.y) && inside(s.x, s.y)) set[i] = 1;
+        }
+    });
+    return set;
+}
+
+}  // namespace
+
+std::vector<uint8_t> splatsInOutline(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera,
+                                     const std::vector<std::array<double, 2>>& polygon, const std::vector<uint8_t>* keep) {
+    if (polygon.size() < 3) return std::vector<uint8_t>(cloud.count, 0);
+    double lo[2] = {polygon[0][0], polygon[0][1]}, hi[2] = {lo[0], lo[1]};
+    for (const auto& p : polygon)
+        for (size_t k = 0; k < 2; ++k) lo[k] = std::min(lo[k], p[k]), hi[k] = std::max(hi[k], p[k]);
+    return splatsWhere(cloud, place, camera, keep, [&](double x, double y) {
+        if (x < lo[0] || x > hi[0] || y < lo[1] || y > hi[1]) return false;
+        bool in = false;  // crossings of the ray to the right
+        for (size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+            const auto& a = polygon[i];
+            const auto& b = polygon[j];
+            if ((a[1] > y) != (b[1] > y) && x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0]) in = !in;
+        }
+        return in;
+    });
+}
+
+std::vector<uint8_t> splatsUnderBrush(const SplatCloud& cloud, const Mat4& place, const ModelCamera& camera,
+                                      const std::vector<std::array<double, 2>>& points, double radius, const std::vector<uint8_t>* keep) {
+    if (points.empty() || !(radius > 0)) return std::vector<uint8_t>(cloud.count, 0);
+    double lo[2] = {points[0][0], points[0][1]}, hi[2] = {lo[0], lo[1]};
+    for (const auto& p : points)
+        for (size_t k = 0; k < 2; ++k) lo[k] = std::min(lo[k], p[k]), hi[k] = std::max(hi[k], p[k]);
+    const double r2 = radius * radius;
+    return splatsWhere(cloud, place, camera, keep, [&](double x, double y) {
+        if (x < lo[0] - radius || x > hi[0] + radius || y < lo[1] - radius || y > hi[1] + radius) return false;
+        if (points.size() == 1) return (x - points[0][0]) * (x - points[0][0]) + (y - points[0][1]) * (y - points[0][1]) <= r2;
+        for (size_t i = 0; i + 1 < points.size(); ++i) {
+            const double ax = points[i][0], ay = points[i][1], dx = points[i + 1][0] - ax, dy = points[i + 1][1] - ay;
+            const double len = dx * dx + dy * dy, t = len > 0 ? std::clamp(((x - ax) * dx + (y - ay) * dy) / len, 0.0, 1.0) : 0.0;
+            const double ex = x - (ax + t * dx), ey = y - (ay + t * dy);
+            if (ex * ex + ey * ey <= r2) return true;
+        }
+        return false;
+    });
 }
 
 }  // namespace montage
