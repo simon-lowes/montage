@@ -10387,6 +10387,21 @@ private slots:
         QVERIFY(QFileInfo::exists(QString::fromStdString(mediaFileOnDisk(moved))));
         ImageSequence ms;
         QVERIFY(parseImageSequencePath(moved, ms) && QFileInfo::exists(QString::fromStdString(imageSequenceFrame(ms, 1048))));
+        // Collected again as the same job taken up (the folder it wrote its own), with every frame whole: the run is
+        // passed over as one file, as it was copied as one (nightly 25 Nov: each frame was counted as a file).
+        {
+            ConsolidateOptions job = co;
+            job.folder = path("collected-again");
+            std::vector<std::string> begun;
+            job.began = [&](const std::string& f) { begun.push_back(f); };
+            ConsolidateResult first, again;
+            QVERIFY2(consolidateProject(p, job, &first, {}, nullptr, &err), err.c_str());
+            QVERIFY(first.copied == 1 && first.passedOver == 0 && begun.size() == 1);
+            job.replace = begun;
+            QVERIFY2(consolidateProject(p, job, &again, {}, nullptr, &err), err.c_str());
+            QCOMPARE(again.copied, 0);
+            QCOMPARE(again.passedOver, 1);
+        }
         // Relinked to any frame of the copy: the whole run there, at the rate it had.
         QVERIFY2(relinkMedia(p, m.id, imageSequenceFrame(ms, 1020), RelinkCheck::Strict, &err), err.c_str());
         ImageSequence relinked;

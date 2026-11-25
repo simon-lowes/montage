@@ -203,20 +203,20 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             begin(folder);
             const bool mine = own.count(utf8(folder)) > 0;
             fs::create_directories(folder, ec);
+            bool wrote = false;
             for (int n = frames.first; n <= frames.last; ++n) {
                 const fs::path from = u8path(imageSequenceFrame(frames, n)), to = folder / from.filename();
                 // (a frame the run before had finished stays as it is)
-                if (mine && alreadyWhole(from, to)) {
-                    res.passedOver++;
-                    continue;
-                }
+                if (mine && alreadyWhole(from, to)) continue;
                 if (!fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec)) return fail("Cannot copy " + utf8(from) + ": " + ec.message());
                 res.bytes += int64_t(fs::file_size(to, ec));
+                wrote = true;
             }
             frames.pattern = utf8(folder / u8path(frames.pattern).filename());
             m.path = interpretedPath(imageSequencePath(frames), reading);
             m.proxyPath.clear();
-            res.copied++;
+            // (counted as one file, as it is copied: passed over when the run before had finished every frame)
+            ++(wrote || frames.last < frames.first ? res.copied : res.passedOver);
             continue;
         }
         // The span the kept sequences use, in media seconds.
