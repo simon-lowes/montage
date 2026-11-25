@@ -530,7 +530,14 @@ void MonitoringPanel::refreshDevice() {
 
 void MonitoringPanel::showDeviceStatus() {
     if (!isVisible() && deviceStatus_->text().size() > 0 && sender() == statusTimer_) return;
-    const audiodev::EngineStatus st = audiodev::Engine::shared().status();
+    // (asked every half second: not waited for while another thread opens the device, as the scrub retry's does on a
+    // pool thread through PortAudio's listing of every device; the line says what it said until then)
+    audiodev::EngineStatus st;
+    if (sender() == statusTimer_) {
+        if (!audiodev::Engine::shared().statusIfFree(st)) return;
+    } else {
+        st = audiodev::Engine::shared().status();
+    }
     QString text;
     if (st.host == audiodev::Host::Qt) text = tr("Through the system's devices (Qt Multimedia): their latency is not known");
     else if (!st.open) text = tr("Not open: %1").arg(QString::fromStdString(st.error));

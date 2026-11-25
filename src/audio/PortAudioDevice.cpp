@@ -47,7 +47,8 @@ std::chrono::steady_clock::time_point gPaListed;
 constexpr std::chrono::seconds kRelistEvery{3};
 
 bool paReady() {
-    if (!gPaTried) {
+    // (a start that failed, the sound system not up yet say, is tried again every few seconds, not given up for good)
+    if (!gPaTried || (!gPaUp && std::chrono::steady_clock::now() - gPaListed >= kRelistEvery)) {
         gPaTried = true;
         gPaUp = Pa_Initialize() == paNoError;
         gPaListed = std::chrono::steady_clock::now();
