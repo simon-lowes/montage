@@ -528,16 +528,20 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
     // It crashed or did not answer: bypassed this time, named, and started again for the next render (a few times).
     const std::string how = hostFailed(*link->host, d, bypassKey(e, d), r, timeout);
     if (asked) {
-        // A host that ended while its picture was to come as a handle: no handle is asked for from now on, and this
-        // picture is rendered again in a new host, through shared memory (once: nothing is asked of that one).
-        const std::string why = "its plug-in host ended while the picture was shared as a handle (" + d.label + " " + how + ")";
+        // A host that ended while its picture was to come as a handle: no handle is asked for from now on. One that
+        // crashed has this picture rendered again in a new host, through shared memory (once: nothing is asked of
+        // that one), as the handle may be what it died of; one that hung is not, as the plug-in would most likely
+        // hang there too, holding the frame a second timeout and spending a second restart.
+        const bool hung = r == Result::Timeout;
+        const std::string why = "its plug-in host " + std::string(hung ? "hung" : "ended") + " while the picture was shared as a handle (" + d.label +
+                                " " + how + ")";
         {
             std::lock_guard lock(gPicturesM);
             gHandlesOff = why;
         }
         if (logsPictures()) std::fprintf(stderr, "montage gpu: %s: pictures come through shared memory from now on\n", why.c_str());
         link.reset();
-        return renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
+        if (!hung) return renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
     }
     if (error) *error = d.label + " " + how;
     return false;
