@@ -321,6 +321,7 @@ struct JxsDecoder::State {
     svt_jpeg_xs_decoder_api_t api{};
     svt_jpeg_xs_image_config_t config{};
     bool open = false;
+    int proxy = 0, openProxy = 0;  // (asked for, and the one the decoder was set up with)
     JxsHeader header;
     std::vector<uint8_t> headerBytes;
     std::vector<uint8_t> planes[3];
@@ -335,6 +336,9 @@ void JxsDecoder::close() {
     s_->headerBytes.clear();
 }
 
+void JxsDecoder::setProxy(int level) { s_->proxy = std::clamp(level, 0, 2); }
+int JxsDecoder::proxy() const { return s_->proxy; }
+
 bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::string* error, JxsSampling sampling444) {
     State& st = *s_;
     quietSvt();
@@ -343,7 +347,8 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
     // (a header may name 65,535 x 65,535: checked before the library or any plane is set up for it)
     if (!jxsPictureFits(h, error)) return false;
     // (the decoder is set up for one header: another one, even of another rate alone, starts it again)
-    const bool same = st.open && st.headerBytes.size() == h.headerBytes && std::equal(data, data + h.headerBytes, st.headerBytes.begin());
+    const bool same = st.open && st.openProxy == st.proxy && st.headerBytes.size() == h.headerBytes &&
+                      std::equal(data, data + h.headerBytes, st.headerBytes.begin());
     if (!same) {
         close();
         std::memset(&st.api, 0, sizeof st.api);
@@ -351,7 +356,8 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
         st.api.verbose = VERBOSE_NONE;
         st.api.threads_num = uint32_t(threadsFor(0));
         st.api.packetization_mode = 0;
-        st.api.proxy_mode = proxy_mode_full;
+        st.api.proxy_mode = st.proxy == 2 ? proxy_mode_quarter : st.proxy == 1 ? proxy_mode_half : proxy_mode_full;
+        st.openProxy = st.proxy;
         if (const SvtJxsErrorType_t e = svt_jpeg_xs_decoder_init(SVT_JPEGXS_API_VER_MAJOR, SVT_JPEGXS_API_VER_MINOR, &st.api, data, size, &st.config);
             e != SvtJxsErrorNone)
             return fail(error, "SVT-JPEG-XS cannot decode this codestream (" + svtError(e) + ")");
@@ -430,10 +436,14 @@ bool JxsEncoder::open(const JxsEncodeSettings&, std::string* error) { return fai
 bool JxsEncoder::encode(const JxsPicture&, std::vector<uint8_t>&, std::vector<uint32_t>*, std::string* error) {
     return fail(error, "This build of Montage has no JPEG XS (SVT-JPEG-XS)");
 }
-struct JxsDecoder::State {};
+struct JxsDecoder::State {
+    int proxy = 0;
+};
 JxsDecoder::JxsDecoder() : s_(std::make_unique<State>()) {}
 JxsDecoder::~JxsDecoder() = default;
 void JxsDecoder::close() {}
+void JxsDecoder::setProxy(int level) { s_->proxy = std::clamp(level, 0, 2); }
+int JxsDecoder::proxy() const { return s_->proxy; }
 bool JxsDecoder::decode(const uint8_t*, size_t, JxsPicture&, std::string* error, JxsSampling) {
     return fail(error, "This build of Montage has no JPEG XS (SVT-JPEG-XS)");
 }

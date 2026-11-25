@@ -326,6 +326,7 @@ struct Input {
     std::unique_ptr<st2110::Input> st2110;
     std::deque<std::shared_ptr<st2110::InputFrame>> early2110;
     st2110::VideoFormat st2110Video;
+    int st2110Proxy = 0;  // (ST 2110-22's pictures decoded smaller while the feed is only watched: jpegxs_proxy=)
     bool st2110Full = false;
     int st2110Channels = 0;
     // A WHIP endpoint's feed (media/WhipEndpoint.h): the endpoint, and what FFmpeg's RTP reader takes it through (the
@@ -449,6 +450,11 @@ bool openSt2110(Recorder::State* s, const CaptureSource& src, bool wantVideo, bo
         x.interfaceAddress[1] = option((kind + "interface2").c_str());
     }
     if (const std::string w = option("wait"); !w.empty()) o.waitMs = std::clamp(std::atoi(w.c_str()), 0, 2000);
+    // (jpegxs_proxy=half or quarter: ST 2110-22 decoded at that size while the feed is only watched, as a
+    // multiviewer's tile needs no more; a recording from the same reception has it at full size again)
+    if (const std::string p = option("jpegxs_proxy"); !p.empty())
+        in.st2110Proxy = p == "quarter" || p == "2" ? 2 : p == "half" || p == "1" ? 1 : 0;
+    o.jpegXsProxy = s->settings.path.empty() ? in.st2110Proxy : 0;
     in.st2110 = std::make_unique<st2110::Input>();
     if (!in.st2110->open(streams, o, error)) {
         in.st2110.reset();
@@ -1279,6 +1285,8 @@ void Recorder::run() {
         watchOnly = file.path.empty();
         jxsRecord = isJpegXs(file.codec) && !watchOnly;
         jxsCopy = false;
+        for (Input& in : inputs)
+            if (in.st2110) in.st2110->setJpegXsProxy(watchOnly ? in.st2110Proxy : 0);
         switched = true;
         seconds = 0, frameLimit = 0;
         ranged = false, firstLabel = -1;
@@ -2162,7 +2170,9 @@ void Recorder::run() {
         const st2110::InputFrame& f = *item.st2110;
         const int64_t pts = f.ptpNs / 100;
         // (a picture dropped while the encoder caught up: its sound still goes in)
-        AVFrame* pic = !soundOnly && in.videoStream >= 0 ? rasterFrame(f.picture, in.st2110Full) : nullptr;
+        // (a picture decoded at a proxy size, from while the feed was only watched, is not recorded)
+        const bool proxySized = f.picture.width != in.st2110Video.width;
+        AVFrame* pic = !soundOnly && in.videoStream >= 0 && !(proxySized && !watchOnly) ? rasterFrame(f.picture, in.st2110Full) : nullptr;
         // (an ST 2110-22 codestream, for a JPEG XS recording that keeps it)
         if (pic && jxsRecord && !cs.recodeJpegXs && !f.codestream.empty())
             if ((pic->opaque_ref = av_buffer_alloc(f.codestream.size()))) std::memcpy(pic->opaque_ref->data, f.codestream.data(), f.codestream.size());

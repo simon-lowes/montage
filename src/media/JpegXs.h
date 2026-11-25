@@ -108,6 +108,10 @@ public:
     // R′G′B′: the container or the SDP does).
     bool decode(const uint8_t* data, size_t size, JxsPicture& out, std::string* error = nullptr,
                 JxsSampling sampling444 = JxsSampling::Ycc444);
+    // Pictures decoded smaller, as JPEG XS can without decoding them whole: 0 at full size, 1 at half the width and
+    // height, 2 at a quarter (the picture's own width and height say what came). From the next codestream on.
+    void setProxy(int level);
+    int proxy() const;
     void close();
 
 private:

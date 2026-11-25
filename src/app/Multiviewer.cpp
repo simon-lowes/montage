@@ -355,6 +355,9 @@ bool Multiviewer::startSlot(Slot& s, bool record, QString* error) {
         if (error) *error = s.error;
         return false;
     }
+    // (ST 2110-22 decoded smaller for its tile, as JPEG XS can: half its size with up to four inputs, a quarter with
+    // more, unless the input's options say; its recordings have it at full size)
+    if (cs.video.device == "st2110" && !cs.video.options.count("jpegxs_proxy")) cs.video.options["jpegxs_proxy"] = inputs_.size() > 4 ? "quarter" : "half";
     cs.live = s.feed;
     cs.codec = codec_->currentData().toString().toStdString();
     cs.openTimeout = 10;

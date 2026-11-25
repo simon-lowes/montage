@@ -21313,7 +21313,7 @@ colorspaces:
 
         // Over the loopback interface (on two paths, each losing a packet in twenty the other has), in each mode: the
         // SDP as ST 2110-22 and RFC 9134 have it, and every frame the codestream sent and its picture as it decodes.
-        auto loopback = [&](st::VideoFormat v, int frames) -> std::string {
+        auto loopback = [&](st::VideoFormat v, int frames, int proxy = 0) -> std::string {
             int ports[6];
             {
                 st::Receiver probe[6];
@@ -21352,8 +21352,12 @@ colorspaces:
             if (got.bandwidthKbps * 1000 < frameBits * v.fps.toDouble() || got.bandwidthKbps * 1000 > frameBits * v.fps.toDouble() * 1.1)
                 return "b=AS " + std::to_string(got.bandwidthKbps);
             st::Input in;
-            if (!in.open(streams, {}, &e)) return e;
-            // What each picture codes to and decodes as, straight from the encoder.
+            st::InputOptions io;
+            io.jpegXsProxy = proxy;
+            if (!in.open(streams, io, &e)) return e;
+            // What each picture codes to and decodes as, straight from the encoder (at the proxy size asked for).
+            montage::JxsDecoder small;
+            small.setProxy(proxy);
             const JxsSampling js = v.sampling == st::Sampling::Ycc422 ? JxsSampling::Ycc422 : v.sampling == st::Sampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444;
             const montage::JxsPicture pics[2] = {jxsTestPicture(v.width, v.height, v.depth, js, 0), jxsTestPicture(v.width, v.height, v.depth, js, 9)};
             montage::JxsEncoder direct;
@@ -21379,7 +21383,9 @@ colorspaces:
             for (int k = 0; k < 2 && !v.interlaced; ++k) {
                 if (!direct.encode(pics[k], codes[k], nullptr, &e)) return e;
                 montage::JxsPicture p;
-                if (!dec.decode(codes[k].data(), codes[k].size(), p, &e, js)) return e;
+                if (!(proxy ? small : dec).decode(codes[k].data(), codes[k].size(), p, &e, js)) return e;
+                if (proxy && (std::abs(p.width - (v.width >> proxy)) > 1 || std::abs(p.height - (v.height >> proxy)) > 1))
+                    return "a proxy picture of " + std::to_string(p.width) + "x" + std::to_string(p.height);
                 expect[k] = st::rasterOf(p);
             }
             const st::Raster rasters[2] = {st::rasterOf(pics[0]), st::rasterOf(pics[1])};
@@ -21427,6 +21433,13 @@ colorspaces:
             v.packetMode = mode;
             const std::string e = loopback(v, 20);
             QVERIFY2(e.empty(), (std::string(mode ? "slice mode: " : "codestream mode: ") + e).c_str());
+        }
+        // Phase 17 #9 (CI only, as all of this test): decoded at half and a quarter of the size, as a
+        // multiviewer's tiles ask, each frame still keeps its codestream as it came.
+        for (int proxy : {1, 2}) {
+            v.packetMode = 0;
+            const std::string pe = loopback(v, 20, proxy);
+            QVERIFY2(pe.empty(), (std::string("proxy ") + std::to_string(proxy) + ": " + pe).c_str());
         }
         v.packetMode = 1, v.sampling = st::Sampling::Rgb, v.depth = 12, v.bpp = 6, v.fps = {50, 1};
         const std::string e = loopback(v, 20);

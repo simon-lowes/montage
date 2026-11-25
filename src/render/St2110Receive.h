@@ -125,6 +125,7 @@ struct InputOptions {
     std::string interfaceAddress[2];  // where to join multicast groups on each path ("" as routing chooses), for the
                                       // streams that name none of their own
     int waitMs = 200;                 // how long a frame waits for its sound and ancillary data before going without
+    int jpegXsProxy = 0;              // ST 2110-22: pictures decoded at full size (0), half (1) or a quarter (2) of it
 };
 
 struct InputStats {
@@ -154,6 +155,9 @@ public:
     // Each sound stream's format, in the order their channels come.
     std::vector<AudioFormat> audioStreams() const;
     InputStats stats() const;
+    // ST 2110-22: the size pictures are decoded at from the next codestream on (as InputOptions::jpegXsProxy). Each
+    // frame keeps its codestream as it came, whatever its picture's size.
+    void setJpegXsProxy(int level) { proxy_ = std::clamp(level, 0, 2); }
 
 private:
     struct Stream;
@@ -192,6 +196,7 @@ private:
     std::vector<std::unique_ptr<Stream>> streams_;
     std::vector<std::thread> threads_;
     std::atomic<bool> stop_{false};
+    std::atomic<int> proxy_{0};
     mutable std::mutex m_;
     std::condition_variable cv_;
     std::deque<Pending> pending_;

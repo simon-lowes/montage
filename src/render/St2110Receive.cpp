@@ -459,6 +459,7 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
         return false;
     };
     options_ = o;
+    proxy_ = std::clamp(o.jpegXsProxy, 0, 2);
     stop_ = false;
     int channels = 0;
     for (const SdpStream& s : streams) {
@@ -622,11 +623,15 @@ void Input::decodeCoded(Stream* st) {
         // (an interlaced stream: a codestream each field, half the frame's height, the first held until its second)
         const bool interlaced = video_.interlaced;
         const int height = interlaced ? video_.height / 2 : video_.height;
+        // (at a proxy size, a side halved or quartered: as the decoder rounds it, a pixel either way)
+        const int proxy = proxy_;
+        s.decoder->setProxy(proxy);
+        auto sized = [&](int got, int full) { return std::abs(got - (full >> proxy)) <= (proxy ? 1 : 0); };
         // (a codestream of another size or depth than the SDP's, or a field where a frame belongs, is not decoded at all)
         JxsHeader h;
         const bool ok = (c.field != 0) == interlaced && readJxsHeader(cs.data(), cs.size(), h) && h.width == video_.width && h.height == height &&
-                        h.depth == video_.depth && s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && pic.width == video_.width &&
-                        pic.height == height && pic.depth == video_.depth && pic.sampling == want;
+                        h.depth == video_.depth && s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && sized(pic.width, video_.width) &&
+                        sized(pic.height, height) && pic.depth == video_.depth && pic.sampling == want;
         if (interlaced && ok && c.field == 1) {
             s.firstField = rasterOf(pic);
             s.haveFirst = true;
@@ -637,7 +642,8 @@ void Input::decodeCoded(Stream* st) {
             continue;
         }
         std::lock_guard lock(m_);
-        if (!ok || (interlaced && (!s.haveFirst || s.firstTs != c.ts))) {
+        // (a second field decoded at another size than its first, the proxy changed between them, is a frame lost too)
+        if (!ok || (interlaced && (!s.haveFirst || s.firstTs != c.ts || s.firstField.width != pic.width || s.firstField.height != pic.height))) {
             // (a second field without its first is a frame lost: counted once, not again for its first that failed)
             s.haveFirst = false;
             const bool counted = interlaced && s.failedSeen && s.failedTs == c.ts;
@@ -648,7 +654,7 @@ void Input::decodeCoded(Stream* st) {
         Raster frame;
         int64_t lost = c.lost;
         if (interlaced) {
-            frame = Raster(video_.width, video_.height, s.firstField.sampling, s.firstField.depth);
+            frame = Raster(pic.width, s.firstField.height + pic.height, s.firstField.sampling, s.firstField.depth);
             weaveField(frame, s.firstField, 1);
             weaveField(frame, rasterOf(pic), 2);
             lost += s.firstLost;
