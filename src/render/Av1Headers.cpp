@@ -107,11 +107,23 @@ bool no(std::string* error, const char* text) {
 size_t configObus(const uint8_t* data, size_t size) { return size >= 4 && data[0] == 0x81 ? 4 : 0; }
 
 // A film grain's parameters as a sequence can carry them (no chroma points for a monochrome one, or for a 4:2:0 one
-// with no luma points, or beside chroma scaled from the luma).
+// with no luma points, or beside chroma scaled from the luma; in 4:2:0, a plane with no points beside one with them
+// given the other's points scaled to nothing, so that both have points, as decoders require).
 Av1FilmGrain grainFor(const Av1FilmGrain& in, const Av1Sequence& seq) {
     Av1FilmGrain g = in;
     if (seq.mono) g.chromaFromLuma = false;
     if (seq.mono || g.chromaFromLuma || (seq.subX && seq.subY && g.numY == 0)) g.numCb = g.numCr = 0;
+    if (seq.subX && seq.subY && (g.numCb > 0) != (g.numCr > 0)) {
+        if (g.numCr == 0) {
+            g.numCr = g.numCb;
+            for (int i = 0; i < g.numCr; ++i) g.crValue[i] = g.cbValue[i], g.crScaling[i] = 0;
+            std::fill(std::begin(g.arCr), std::end(g.arCr), int8_t(0));
+        } else {
+            g.numCb = g.numCr;
+            for (int i = 0; i < g.numCb; ++i) g.cbValue[i] = g.crValue[i], g.cbScaling[i] = 0;
+            std::fill(std::begin(g.arCb), std::end(g.arCb), int8_t(0));
+        }
+    }
     return g;
 }
 
@@ -303,7 +315,8 @@ bool Av1HeaderReader::readFrameHeader(const uint8_t* p, size_t n, const Obu& obu
     if ((!intra || h.refreshFlags != kAllFrames) && errorResilient && s.enableOrderHint)
         for (Slot& slot : slots_) {
             const int hint = int(b.f(s.orderHintBits));
-            if (hint != slot.orderHint) slot.orderHint = hint;
+            // (a slot whose order hint is not the one given holds no frame: a decoder that lost it carries on without it)
+            if (hint != slot.orderHint) slot = Slot{}, slot.orderHint = hint;
         }
 
     int frameWidth = 0, frameHeight = 0, upscaledWidth = 0, renderWidth = 0, renderHeight = 0;
@@ -619,6 +632,9 @@ bool Av1HeaderReader::readFrameHeader(const uint8_t* p, size_t n, const Obu& obu
             h.grainUpdate = h.frameType == kInterFrame ? b.flag() : true;
             if (!h.grainUpdate) {
                 h.grainRefSlot = int(b.f(3));
+                // (the parameters of a frame this one refers to: one of its own references)
+                if (std::find(std::begin(h.refSlot), std::end(h.refSlot), h.grainRefSlot) == std::end(h.refSlot))
+                    return no(error, "An AV1 frame's film grain is taken from a frame it does not refer to");
                 const uint16_t seed = g.seed;
                 g = slots_[h.grainRefSlot].grain;
                 g.apply = true, g.seed = seed;
@@ -634,6 +650,8 @@ bool Av1HeaderReader::readFrameHeader(const uint8_t* p, size_t n, const Obu& obu
                     g.numCr = int(b.f(4));
                     if (g.numCr > 10) return no(error, "An AV1 frame's film grain has too many chroma points");
                     for (int i = 0; i < g.numCr; ++i) g.crValue[i] = uint8_t(b.f(8)), g.crScaling[i] = uint8_t(b.f(8));
+                    if (s.subX && s.subY && (g.numCb > 0) != (g.numCr > 0))
+                        return no(error, "An AV1 frame's 4:2:0 film grain has points for one chroma plane and not the other");
                 }
                 g.scalingShift = int(b.f(2)) + 8;
                 g.arLag = int(b.f(2));
@@ -854,7 +872,7 @@ bool Av1GrainWriter::rewrite(const uint8_t* data, size_t size, int64_t frame, co
                     if (!h.showFrame && shownHint >= 0) at += r.relativeDistance(h.orderHint, shownHint);
                     given = grainFor(grain ? grain(at) : Av1FilmGrain{}, r.seq_);
                     std::string why;
-                    if (given.apply && !given.valid(&why)) return no(error, "The film grain parameters cannot be written");
+                    if (given.apply && !given.valid(&why, r.seq_.subX && r.seq_.subY)) return no(error, "The film grain parameters cannot be written");
                     const bool inter = h.frameType == kInterFrame;
                     int from = -1;
                     if (given.apply && inter)

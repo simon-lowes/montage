@@ -40,8 +40,9 @@ struct Av1FilmGrain {
     int lumaCoefficients() const { return 2 * arLag * (arLag + 1); }
     // Every parameter but the seed is the same.
     bool sameParameters(const Av1FilmGrain& o) const;
-    // Within what a frame header may carry (counts, shifts, each plane's points rising).
-    bool valid(std::string* why = nullptr) const;
+    // Within what a frame header may carry (counts, shifts, each plane's points rising; in 4:2:0, `subsampled`,
+    // points for both Cb and Cr or for neither, as decoders require).
+    bool valid(std::string* why = nullptr, bool subsampled = false) const;
 };
 
 // A picture's planes for the synthesis: samples of `bitDepth` bits in 16-bit words, `stride` in samples.

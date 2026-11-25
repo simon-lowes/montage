@@ -145,7 +145,7 @@ bool Av1FilmGrain::sameParameters(const Av1FilmGrain& o) const {
            a.overlap == b.overlap && a.clipRestricted == b.clipRestricted;
 }
 
-bool Av1FilmGrain::valid(std::string* why) const {
+bool Av1FilmGrain::valid(std::string* why, bool subsampled) const {
     auto no = [&](const char* text) {
         if (why) *why = text;
         return false;
@@ -165,6 +165,7 @@ bool Av1FilmGrain::valid(std::string* why) const {
     for (int i = 1; i < numCr; ++i)
         if (crValue[i] <= crValue[i - 1]) return no("the Cr scaling points must rise");
     if (chromaFromLuma && (numCb > 0 || numCr > 0)) return no("chroma scaled from the luma has no points of its own");
+    if (subsampled && (numCb > 0) != (numCr > 0)) return no("4:2:0 grain has points for both Cb and Cr or for neither");
     return true;
 }
 
@@ -534,7 +535,9 @@ Av1FilmGrain av1FilmGrainFrom(const GrainProfile& g, const ColorSpace& space, co
     out.apply = true;
     out.overlap = true;
     out.clipRestricted = !t.fullRange;
-    const bool anyCb = strongest[1] >= 0.05, anyCr = strongest[2] >= 0.05;
+    // (in 4:2:0 both chroma planes have points or neither does: a decoder refuses one without the other)
+    bool anyCb = strongest[1] >= 0.05, anyCr = strongest[2] >= 0.05;
+    if (t.subX && t.subY) anyCb = anyCr = anyCb || anyCr;
 
     // The autoregression: to three samples away where the grain is soft, none where it is white. Its coefficients
     // in the header's whole numbers, at the finest shift they fit. Of the lags and the shares of white grain mixed in

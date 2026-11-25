@@ -33808,6 +33808,154 @@ colorspaces:
         QVERIFY2(without.checked && without.frames == delivered.frames, without.summary().c_str());
         QVERIFY2(without.highest < delivered.highest, qPrintable(QString("%1 against %2").arg(without.highest).arg(delivered.highest)));
     }
+    void av1GrainOneChromaPlane() {
+        // Grain in one chroma plane only. In 4:2:0, AV1 film grain has points for both Cb and Cr or for neither, and
+        // dav1d refuses a frame that has one without the other. The check says so (in 4:2:0 only); grain in the blue
+        // with none in Cr, fitted for 4:4:4, has Cb points alone, and fitted for 4:2:0 has both; given one plane's
+        // points alone, the writer gives the other the same points scaled to nothing, and dav1d decodes every frame
+        // with the grain on, finding what Montage's reading of the headers finds.
+        if (!avcodec_find_decoder_by_name("libdav1d")) QSKIP("This FFmpeg has no dav1d");
+        std::string why;
+        Av1FilmGrain cbOnly = av1TestGrain(0, 0), crOnly = av1TestGrain(0, 0);
+        cbOnly.numCr = 0, crOnly.numCb = 0;
+        QVERIFY2(cbOnly.valid(&why) && crOnly.valid(&why), why.c_str());
+        QVERIFY(!cbOnly.valid(&why, true) && !crOnly.valid(&why, true));
+        QVERIFY(why.find("both Cb and Cr") != std::string::npos);
+        QVERIFY(av1TestGrain(0, 0).valid(&why, true));
+
+        // The fit: grain in the blue channel, faint in the others and apart from them.
+        // (red's grain blue's, at the share that leaves Cr (red less luma) none: Cb's alone; next to none in the
+        // darkest band, where the blue's would be clipped at black and the red's not)
+        GrainModel gm;
+        gm.strength = 0.04, gm.correlation = 0, gm.width = 640;
+        GrainProfile blue = grainModelProfile(gm);
+        const double redShare = 0.0722 / (1 - 0.2126);
+        blue.response = 0;
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            blue.amplitude[2][b] *= b == 0 ? 0.002 : 2, blue.amplitude[0][b] = redShare * blue.amplitude[2][b], blue.amplitude[1][b] = 0;
+        blue.correlation[0] = 0, blue.correlation[1] = 1, blue.correlation[2] = 0;
+        Av1GrainTarget t444, t420;
+        t444.width = t420.width = 640, t444.subX = t444.subY = false;
+        const Av1FilmGrain f444 = av1FilmGrainFrom(blue, rec709Space(), t444), f420 = av1FilmGrainFrom(blue, rec709Space(), t420);
+        qInfo("4:4:4: %d Cb points (largest scaling %d), %d Cr (%d); 4:2:0: %d and %d", f444.numCb,
+              int(*std::max_element(f444.cbScaling, f444.cbScaling + 10)), f444.numCr, int(*std::max_element(f444.crScaling, f444.crScaling + 10)),
+              f420.numCb, f420.numCr);
+        QVERIFY(f444.apply && f444.numCb > 0 && f444.numCr == 0);
+        QVERIFY(f420.apply && f420.numCb > 0 && f420.numCr > 0);
+        QVERIFY2(f420.valid(&why, true), why.c_str());
+
+        // Written into 4:2:0 AV1 and decoded.
+        const char* encoder = avcodec_find_encoder_by_name("libaom-av1") ? "libaom-av1" : avcodec_find_encoder_by_name("libsvtav1") ? "libsvtav1" : nullptr;
+        if (!encoder) QSKIP("This FFmpeg has no AV1 encoder");
+        const std::vector<std::pair<std::string, std::string>> options =
+            std::string(encoder) == "libaom-av1" ? std::vector<std::pair<std::string, std::string>>{{"cpu-used", "8"}, {"crf", "40"}, {"b", "0"}}
+                                                 : std::vector<std::pair<std::string, std::string>>{{"preset", "12"}, {"crf", "45"}};
+        const int w = 128, h = 96, frames = 12;
+        av1streams::Stream s;
+        QVERIFY2(av1streams::encode(encoder, options, w, h, 8, frames, [&](int f, AVFrame* fr) {
+            for (int p = 0; p < 3; ++p)
+                for (int y = 0; y < (p ? h / 2 : h); ++y)
+                    for (int x = 0; x < (p ? w / 2 : w); ++x) fr->data[p][ptrdiff_t(y) * fr->linesize[p] + x] = uint8_t(p ? 128 : 40 + (x + f) % 160);
+        }, s, &why), why.c_str());
+        for (const bool crAlone : {false, true}) {
+            auto given = [&](int64_t f) {
+                Av1FilmGrain g = crAlone ? crOnly : cbOnly;
+                g.seed = av1GrainSeed(f, 7);
+                return g;
+            };
+            Av1GrainWriter writer;
+            av1streams::Stream out;
+            out.config = s.config;
+            QVERIFY2(out.config.empty() || writer.configure(out.config, &why), why.c_str());
+            for (size_t i = 0; i < s.packets.size(); ++i) {
+                std::vector<uint8_t> o;
+                QVERIFY2(writer.rewrite(s.packets[i].data(), s.packets[i].size(), int64_t(i), given, o, &why), why.c_str());
+                out.packets.push_back(std::move(o));
+            }
+            std::vector<av1streams::Picture> applied, beside;
+            QVERIFY(av1streams::decode(out, false, applied) && av1streams::decode(out, true, beside));
+            QCOMPARE(int(applied.size()), frames);
+            QCOMPARE(int(beside.size()), frames);
+            Av1HeaderReader reader;
+            QVERIFY2(out.config.empty() || reader.configure(out.config.data(), out.config.size(), &why), why.c_str());
+            std::vector<Av1FilmGrain> shown;
+            for (const auto& pk : out.packets) {
+                std::vector<Av1FrameHeader> hs;
+                QVERIFY2(reader.read(pk.data(), pk.size(), hs, &why), why.c_str());
+                for (const Av1FrameHeader& hd : hs)
+                    if (hd.shown()) shown.push_back(hd.grain);
+            }
+            QCOMPARE(int(shown.size()), frames);
+            const Av1FilmGrain& want = crAlone ? crOnly : cbOnly;
+            for (int i = 0; i < frames; ++i) {
+                const Av1FilmGrain& g = beside[size_t(i)].grain;
+                QVERIFY2(beside[size_t(i)].hasGrain && g.numCb == g.numCr && g.numCb == (crAlone ? want.numCr : want.numCb), qPrintable(QString("frame %1").arg(i)));
+                for (int k = 0; k < g.numCb; ++k) {
+                    QCOMPARE(int(crAlone ? g.cbScaling[k] : g.crScaling[k]), 0);
+                    QCOMPARE(int(crAlone ? g.crScaling[k] : g.cbScaling[k]), int(crAlone ? want.crScaling[k] : want.cbScaling[k]));
+                }
+                QVERIFY2(shown[size_t(i)].apply && shown[size_t(i)].sameParameters(g), qPrintable(QString("frame %1").arg(i)));
+            }
+        }
+    }
+
+    void av1GrainKeepsTheStreamTags() {
+        // An MP4 export with its grain carried as parameters has the streams, and each stream's tag, of the same export
+        // without it (the frame headers are written again and the other streams copied with their own tags), and the
+        // grain on every frame.
+        const char* encoder = avcodec_find_encoder_by_name("libsvtav1") ? "libsvtav1" : avcodec_find_encoder_by_name("libaom-av1") ? "libaom-av1" : nullptr;
+        if (!encoder) QSKIP("This FFmpeg has no AV1 encoder");
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 192, s.height = 108, s.fps = {25, 1};
+        s.videoTracks[0].clips.push_back(makeGeneratorClip(p, "color", 15));
+        ExportSettings es;
+        es.videoCodec = encoder;
+        es.audioCodec = "aac";
+        es.preset = std::string(encoder) == "libsvtav1" ? "12" : "8";
+        es.path = dir.filePath("plain.mp4").toStdString();
+        std::string err;
+        QVERIFY2(exportSequence(p, s, es, {}, nullptr, &err), err.c_str());
+        ExportSettings carried = es;
+        carried.filmGrain = grainProfileText(stockGrain(1));
+        carried.path = dir.filePath("carried.mp4").toStdString();
+        QVERIFY2(exportSequence(p, s, carried, {}, nullptr, &err), err.c_str());
+        auto streams = [](const std::string& file) {
+            std::vector<std::pair<int, uint32_t>> out;
+            AVFormatContext* f = nullptr;
+            if (avformat_open_input(&f, file.c_str(), nullptr, nullptr) < 0) return out;
+            for (unsigned i = 0; i < f->nb_streams; ++i) out.emplace_back(int(f->streams[i]->codecpar->codec_type), f->streams[i]->codecpar->codec_tag);
+            avformat_close_input(&f);
+            return out;
+        };
+        const auto plain = streams(es.path), withGrain = streams(carried.path);
+        QCOMPARE(int(plain.size()), 2);
+        QVERIFY(plain == withGrain);
+        QVERIFY(std::find(plain.begin(), plain.end(), std::make_pair(int(AVMEDIA_TYPE_AUDIO), uint32_t(MKTAG('m', 'p', '4', 'a')))) != plain.end());
+        // (and the grain is in it)
+        AVFormatContext* f = nullptr;
+        QVERIFY(avformat_open_input(&f, carried.path.c_str(), nullptr, nullptr) >= 0);
+        std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> held(f, [](AVFormatContext* x) { avformat_close_input(&x); });
+        QVERIFY(avformat_find_stream_info(f, nullptr) >= 0);
+        const int vs = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        QVERIFY(vs >= 0);
+        const AVCodecParameters* par = f->streams[vs]->codecpar;
+        Av1HeaderReader reader;
+        QVERIFY2(par->extradata_size <= 0 || reader.configure(par->extradata, size_t(par->extradata_size), &err), err.c_str());
+        AVPacket* pkt = av_packet_alloc();
+        int withParameters = 0;
+        while (av_read_frame(f, pkt) >= 0) {
+            std::vector<Av1FrameHeader> hs;
+            if (pkt->stream_index == vs && reader.read(pkt->data, size_t(pkt->size), hs, &err))
+                for (const Av1FrameHeader& h : hs)
+                    if (h.shown() && h.grain.apply) ++withParameters;
+            av_packet_unref(pkt);
+        }
+        av_packet_free(&pkt);
+        QCOMPARE(withParameters, 15);
+    }
+
     void av1GrainTableReadBySvtAv1() {
         // A film grain table as Montage writes it, two shots of parameters, given to SVT-AV1's own encoder
         // (SvtAv1EncApp --fgs-table, built in CI from v4.3.1): Montage's reading of the frame headers it writes finds on

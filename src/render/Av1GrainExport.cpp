@@ -210,7 +210,13 @@ bool carryAv1Grain(const std::string& path, const std::function<Av1FilmGrain(int
         const AVStream* is = in->streams[i];
         AVStream* os = avformat_new_stream(o, nullptr);
         if (!os || avcodec_parameters_copy(os->codecpar, is->codecpar) < 0) return fail("Out of memory");
-        os->codecpar->codec_tag = 0;
+        // (the stream's own tag kept where the container takes it for that codec, as FFmpeg's own copy keeps it: a
+        // timecode track's tmcd among them; else the container's own)
+        unsigned int tag = is->codecpar->codec_tag, theirs = 0;
+        if (tag && o->oformat->codec_tag && av_codec_get_id(o->oformat->codec_tag, tag) != is->codecpar->codec_id &&
+            av_codec_get_tag2(o->oformat->codec_tag, is->codecpar->codec_id, &theirs))
+            tag = 0;
+        os->codecpar->codec_tag = tag;
         os->time_base = is->time_base;
         os->disposition = is->disposition;
         os->avg_frame_rate = is->avg_frame_rate, os->r_frame_rate = is->r_frame_rate;
@@ -258,7 +264,8 @@ bool carryAv1Grain(const std::string& path, const std::function<Av1FilmGrain(int
     int64_t shown = 0;
     bool ok = true;
     std::vector<uint8_t> rewritten;
-    while (ok && av_read_frame(in, pkt) >= 0) {
+    int read = 0;
+    while (ok && (read = av_read_frame(in, pkt)) >= 0) {
         const AVStream* is = in->streams[pkt->stream_index];
         if (pkt->stream_index == vs) {
             // (each temporal unit shows one frame: the k-th in decoding order is the k-th shown)
@@ -287,6 +294,8 @@ bool carryAv1Grain(const std::string& path, const std::function<Av1FilmGrain(int
         }
         av_packet_unref(pkt);
     }
+    // (a read that failed before the end is not taken for the end: the file would lose what follows)
+    if (ok && read != AVERROR_EOF) ok = false, why = "Cannot read " + path + " to its end";
     if (ok && av_write_trailer(o) < 0) ok = false, why = "Cannot finish " + temp;
     outHeld.reset();
     inHeld.reset();
@@ -294,8 +303,19 @@ bool carryAv1Grain(const std::string& path, const std::function<Av1FilmGrain(int
         QFile::remove(QString::fromStdString(temp));
         return fail(why);
     }
-    QFile::remove(QString::fromStdString(path));
-    if (!QFile::rename(QString::fromStdString(temp), QString::fromStdString(path))) return fail("Cannot put " + temp + " in place of " + path);
+    // (the file as it was set aside until the new one is in its place, and put back if that fails)
+    const QString target = QString::fromStdString(path), made = QString::fromStdString(temp), was = target + QStringLiteral(".grain-was");
+    QFile::remove(was);
+    if (!QFile::rename(target, was)) {
+        QFile::remove(made);
+        return fail("Cannot put " + temp + " in place of " + path);
+    }
+    if (!QFile::rename(made, target)) {
+        QFile::rename(was, target);
+        QFile::remove(made);
+        return fail("Cannot put " + temp + " in place of " + path);
+    }
+    QFile::remove(was);
     if (report) {
         report->framesWithGrain = writer.framesWithGrain;
         report->framesByReference = writer.framesByReference;
