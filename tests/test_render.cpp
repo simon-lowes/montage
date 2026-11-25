@@ -22106,7 +22106,21 @@ colorspaces:
         registry.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), group, 5353);
         QCOMPARE(answers(250), 0);
         QCOMPARE(answers(1200), 1);
+        // Datagrams read and parsed on a thread of their own, not the Node's (this one): with this thread held for a
+        // second, a busy network's 200 queries for other services are read meanwhile, and none is handed to the Node;
+        // a query for the Node after them is still answered.
+        QVERIFY(announced.mdnsThread() && announced.mdnsThread() != announced.thread() && announced.mdnsThread()->isRunning());
+        QTest::qWait(1100);  // (the last answer's second over)
+        while (registry.hasPendingDatagrams()) registry.receiveDatagram();
+        const int before = announced.mdnsDatagrams();
+        for (int i = 0; i < 200; ++i) registry.writeDatagram(query(QStringLiteral("printer-%1._ipp._tcp.local").arg(i), 16), group, 5353);
+        QThread::msleep(1000);
+        const int read = announced.mdnsDatagrams() - before;
+        QVERIFY2(read >= 100, qPrintable(QString::number(read)));  // (multicast loopback may drop a few)
+        registry.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), group, 5353);
+        QCOMPARE(answers(500), 1);
         announced.stop();
+        QVERIFY(!announced.mdnsThread());
     }
 
     // Nightly 10 Nov: a multicast DNS name is held to 255 octets however its compression pointers make it (a chain of
