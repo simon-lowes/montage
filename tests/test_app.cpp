@@ -25278,12 +25278,25 @@ print("added " + ui["name"])
             return lines;
         };
         auto logEnd = [&] { return QFileInfo(log).size(); };
-        // The wl_output Montage has for an output, from its name event.
+        // The wl_output Montage has for an output, from its name event: wl_output's own (version 4, which Qt 6.12
+        // binds), or the name event of the xdg_output made for it (Qt 6.8 binds wl_output at version 3, without one).
         auto output = [&](const char* name) {
             const QByteArray said = QByteArray(".name(\"") + name + "\")";
+            static const QByteArray made = "get_xdg_output(new id ";
+            QHash<QByteArray, QByteArray> outputOf;  // (zxdg_output_v1@n: its wl_output@m)
             for (const QByteArray& line : ours(0)) {
-                const qsizetype at = line.indexOf(" ev wl_output@");
-                if (at >= 0 && line.contains(said)) return line.mid(at + 4, line.indexOf('.', at) - at - 4);
+                qsizetype at = line.indexOf(made);
+                if (at >= 0) {
+                    const qsizetype id = at + made.size(), comma = line.indexOf(", ", id), close = line.indexOf(')', comma);
+                    if (comma > id && close > comma) outputOf[line.mid(id, comma - id)] = line.mid(comma + 2, close - comma - 2);
+                    continue;
+                }
+                if (!line.contains(said)) continue;
+                if ((at = line.indexOf(" ev wl_output@")) >= 0) return line.mid(at + 4, line.indexOf('.', at) - at - 4);
+                if ((at = line.indexOf(" ev zxdg_output_v1@")) >= 0) {
+                    const QByteArray wl = outputOf.value(line.mid(at + 4, line.indexOf('.', at) - at - 4));
+                    if (!wl.isEmpty()) return wl;
+                }
             }
             return QByteArray();
         };
