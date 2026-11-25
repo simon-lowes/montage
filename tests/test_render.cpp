@@ -31354,14 +31354,28 @@ colorspaces:
         gpu::setTextureBudgetForTesting(0);
         QCOMPARE(twice.gpuFrames, once.gpuFrames + 1);
         QCOMPARE(twice.texturesMade, once.texturesMade);
-        // An adjustment layer with an effect only the CPU draws needs the canvas beneath it there: the frame falls back.
+        // An adjustment layer with an effect only the CPU draws (Paint, a clone stroke held on every frame) needs the
+        // canvas beneath it there: the frame falls back.
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
-        adj.effects.push_back(makeEffect(p, "texture_pop"));
+        Effect paint = makeEffect(p, "paint");
+        PaintStroke held;
+        held.hold = true, held.dx = 0.25, held.radius = 0.05;
+        held.points = {{0.3, 0.5}, {0.6, 0.5}};
+        paint.strings["strokes"] = paintStrokesToString({held});
+        adj.effects.push_back(paint);
+        o.gpu = false;
+        const Image unpainted = renderProgramFrame(p, s, 5, o);
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
         gpu::resetStats();
         QVERIFY(same(5) <= 1e-6);
         QCOMPARE(gpu::stats().cpuFrames, 1L);
-        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Local Contrast") == 0, gpu::stats().lastFallback.c_str());
+        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Paint (Clone and Heal)") == 0, gpu::stats().lastFallback.c_str());
+        // (the stroke changes the frame)
+        o.gpu = false;
+        const Image painted = renderProgramFrame(p, s, 5, o);
+        double moved = 0;
+        for (size_t i = 0; i < painted.px.size() && i < unpainted.px.size(); ++i) moved = std::max(moved, std::fabs(double(painted.px[i]) - unpainted.px[i]));
+        QVERIFY2(moved > 0.05, qPrintable(QString::number(moved)));
     }
 
     // The filters, transitions, adjustment layers and track mattes the GPU draws, each at three settings, against the
