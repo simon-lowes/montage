@@ -16,6 +16,7 @@
 #include <QPushButton>
 #include <QSaveFile>
 #include <QThread>
+#include <QThreadPool>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QtConcurrent>
@@ -33,6 +34,18 @@ const QString kOwner = QStringLiteral("app");
 const QString kConsolidate = QStringLiteral("consolidate");
 constexpr int kKept = 100;  // finished jobs kept in the store
 constexpr int kTries = 2;   // how often one cut short is taken up again
+
+// The threads tasks run on: a pool of their own, so a task paused (which waits on its thread) holds none of the
+// threads the rest of Montage shares (peaking, thumbnails, waveforms). Never deleted: a task's thread may outlive
+// this object, as suspend() lets it.
+QThreadPool* taskThreads() {
+    static QThreadPool* pool = [] {
+        auto* p = new QThreadPool;
+        p->setMaxThreadCount(64);
+        return p;
+    }();
+    return pool;
+}
 
 QJsonObject optionsJson(const ConsolidateOptions& o) {
     QJsonArray sequences;
@@ -332,6 +345,7 @@ int DialogJobs::resume() {
             t->kind = r.kind;
             t->title = r.title;
             t->input = r.data.value("input").toObject();
+            t->project = markOf(r.data);
             t->resumed = true;
             t->shared = std::make_shared<Shared>();
             t->shared->project = loaded;
@@ -469,6 +483,38 @@ QString DialogJobs::start(EditorState* state, const QString& kind, const QString
     return startOn(state ? state->project() : Project(), state, kind, title, input);
 }
 
+DialogJobs::ProjectMark DialogJobs::markOf(const EditorState* state) {
+    ProjectMark m;
+    if (!state) return m;
+    m.known = m.thisSession = true;
+    m.path = state->filePath();
+    m.generation = state->projectGeneration();
+    return m;
+}
+
+DialogJobs::ProjectMark DialogJobs::markOf(const QJsonObject& data) {
+    ProjectMark m;
+    m.known = data.contains(QStringLiteral("project"));
+    m.path = data.value(QStringLiteral("project")).toString();
+    return m;
+}
+
+QString DialogJobs::notTheProject(const ProjectMark& mark, const EditorState* state) const {
+    if (!mark.known) return {};
+    if (!state) return tr("no project is open");
+    if (mark.thisSession && state->projectGeneration() == mark.generation) return {};
+    const QString now = state->filePath();
+    if (!mark.path.isEmpty() && !now.isEmpty()) {
+        const QFileInfo a(mark.path), b(now);
+        if (a.exists() && b.exists() ? a.canonicalFilePath() == b.canonicalFilePath() : QDir::cleanPath(a.absoluteFilePath()) == QDir::cleanPath(b.absoluteFilePath()))
+            return {};
+    }
+    // (an untitled project, taken up after Montage stopped: an untitled one, as a recovered copy opens)
+    if (!mark.thisSession && mark.path.isEmpty() && now.isEmpty()) return {};
+    return mark.path.isEmpty() ? tr("another project is open (it was begun on an untitled one)")
+                               : tr("another project is open (it was begun on %1)").arg(QFileInfo(mark.path).fileName());
+}
+
 QString DialogJobs::startOn(const Project& project, EditorState* state, const QString& kind, const QString& title, const QJsonObject& input) {
     if (!hasKind(kind)) return {};
     auto t = std::make_unique<Task>();
@@ -476,6 +522,7 @@ QString DialogJobs::startOn(const Project& project, EditorState* state, const QS
     t->title = title;
     t->input = input;
     t->state = state;
+    t->project = markOf(state ? state : state_.data());
     t->shared = std::make_shared<Shared>();
     t->shared->project = std::make_shared<const Project>(project);
     t->shared->input = input;
@@ -492,10 +539,11 @@ QString DialogJobs::startOn(const Project& project, EditorState* state, const QS
             r.data["task"] = true;
             r.data["input"] = input;
             r.data["resumable"] = kept;
-            if (state) r.data["project"] = state->filePath();
+            if (t->project.known) r.data["project"] = t->project.path;
         });
     }
     const QString id = t->id;
+    marks_[id] = t->project;
     tasks_.push_back(std::move(t));
     startTask(*tasks_.back());
     emit tasksChanged();
@@ -509,7 +557,7 @@ void DialogJobs::startTask(Task& t) {
     const QString id = t.id;
     connect(&t.watcher, &QFutureWatcher<bool>::finished, this, [this, id] { taskFinished(id); });
     // (everything the thread touches is shared with it, so it may outlive this object's wait in suspend())
-    t.watcher.setFuture(QtConcurrent::run([sh = t.shared, run = kind.run] {
+    t.watcher.setFuture(QtConcurrent::run(taskThreads(), [sh = t.shared, run = kind.run] {
         TaskRun r;
         r.project = sh->project;
         r.input = sh->input;
@@ -581,6 +629,11 @@ QJsonObject DialogJobs::applyResult(Task& t, const QJsonObject& result, QString*
     TaskKind kind;
     if (!kindOf(t.kind, &kind) || !kind.apply) return {};
     EditorState* state = stateFor(t);
+    // Never to another project than the one it was begun on (one opened since, whose ids may be the same).
+    if (const QString other = notTheProject(t.project, state); !other.isEmpty()) {
+        if (note) *note = other;
+        return {};
+    }
     if (!t.watched) {
         // Nobody watched, so the project may have changed under it: what it was made for must still be where it was.
         QString moved = state ? movedNote(*t.shared->project, state->project(), t.input) : tr("no project is open");
@@ -605,7 +658,11 @@ void DialogJobs::taskFinished(const QString& id) {
     QString text, note;
     if (ok) {
         out.result = t->shared->result;
+        const QPointer<DialogJobs> alive(this);
         out.applied = applyResult(*t, out.result, &note);
+        // (a result looked over in a dialog of its own, as Auto Mix's is, runs an event loop: Montage may have quit
+        // meanwhile, taking this with it)
+        if (!alive || !(t = task(id))) return;
         text = out.applied.value("message").toString();
         if (!note.isEmpty()) {
             // Kept, not applied: offered from the jobs list.
@@ -767,9 +824,16 @@ bool DialogJobs::applyOffered(const QString& id, QString* said) {
     }
     TaskKind kind;
     if (!state_ || !kindOf(kindName, &kind) || !kind.apply) return false;
+    // (to the project it was begun on only: in this session, that one, else the file it was in)
+    const auto mark = marks_.find(id);
+    if (const QString other = notTheProject(mark != marks_.end() ? mark->second : markOf(r.data), state_); !other.isEmpty()) {
+        if (said) *said = tr("It was not applied: %1.").arg(other);
+        return false;
+    }
+    const QPointer<DialogJobs> alive(this);
     const QJsonObject applied = kind.apply(state_, input, result);
     if (said) *said = applied.value("message").toString();
-    if (applied.value("failed").toBool()) return false;
+    if (!alive || applied.value("failed").toBool()) return false;  // (Montage may have quit in a dialog the result is looked over in)
     if (folder_.isEmpty()) {
         offeredHere_.erase(id);
     } else {

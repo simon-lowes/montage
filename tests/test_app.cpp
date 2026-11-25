@@ -6925,6 +6925,60 @@ private slots:
         state()->newProject();
     }
 
+    void dialogTasksStayWithTheirProject() {
+        // A background task's result goes to the project it was begun on and to no other. Another project open when
+        // it ends (built the same way, so its sequence and clip ids are the same): the result is kept and offered,
+        // named with the project it was begun on, and applying it from the list is refused there. Its own project
+        // opened again: applied from the list.
+        DialogJobs* dialogs = win_->dialogJobs();
+        QVERIFY(dialogs);
+        auto build = [&]() -> Id {
+            state()->newProject();
+            const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+            if (ids.size() != 1) return Id(0);
+            const Id media = ids[0];
+            if (!state()->apply("Dialogue", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }))
+                return Id(0);
+            if (!state()->apply("Music", [media](Project& p, Sequence& s) {
+                    return edit::placeMedia(p, s, media, 0, 0, -1, V1, {TrackKind::Audio, 1}, false);
+                }))
+                return Id(0);
+            return trackAt(*state()->sequence(), {TrackKind::Audio, 1})->clips.front().id;
+        };
+        const Id music = build();
+        QVERIFY(music != Id(0));
+        const QString own = dir_.path() + "/task-own-project.montage";
+        QVERIFY(state()->save(own));
+        const auto gain = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), music);
+            return c && c->audio.params.count("gain_db") ? c->audio.params.at("gain_db") : Param(0.0);
+        };
+        QString offeredNote;
+        connect(dialogs, &DialogJobs::offered, this, [&](const QString&, const QString&, const QString& note) { offeredNote = note; });
+        auto done = qScopeGuard([&] {
+            disconnect(dialogs, &DialogJobs::offered, this, nullptr);
+            state()->newProject();
+        });
+        DuckOptions o;
+        const QString id = startInBackground(dialogs, [&] { AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get()); });
+        QVERIFY(!id.isEmpty());
+        QCOMPARE(build(), music);
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+        QVERIFY(!gain().animated());
+        QVERIFY2(offeredNote.contains("another project is open") && offeredNote.contains("task-own-project.montage"), qPrintable(offeredNote));
+        QCOMPARE(dialogs->offeredNote(id), offeredNote);
+        QString said;
+        QVERIFY(!dialogs->applyOffered(id, &said));
+        QVERIFY2(said.startsWith("It was not applied: another project is open"), qPrintable(said));
+        QVERIFY(!gain().animated());
+        QVERIFY(state()->open(own));
+        QVERIFY(!gain().animated());
+        QVERIFY2(dialogs->applyOffered(id, &said), qPrintable(said));
+        QVERIFY(gain().animated());
+        QCOMPARE(state()->undoText(), QString("Auto Duck"));
+    }
+
     void dialogTasksLookedOver() {
         // Auto Mix and the Conform Check are jobs in the store whose results are looked over in their dialogs. Left to
         // run, Auto Mix's plan is kept and offered, and looked over from there it mixes as a watched run does; the

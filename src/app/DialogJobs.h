@@ -175,9 +175,22 @@ private:
         QFutureWatcher<bool> watcher;
     };
     struct Shared;  // what a task's thread and this object both hold
+    // The project a task was begun on, so that its result goes to that one and no other: in this session, the editor's
+    // project of that generation (or one saved as the same file); taken up after Montage stopped, the file it was in
+    // (an untitled one only to an untitled one). Not known (begun with no editor): any.
+    struct ProjectMark {
+        bool known = false, thisSession = false;
+        QString path;
+        uint64_t generation = 0;
+    };
+    static ProjectMark markOf(const EditorState* state);
+    static ProjectMark markOf(const QJsonObject& data);  // a job record's
+    // Why the project open in `state` is not the one marked ("" when it is).
+    QString notTheProject(const ProjectMark& mark, const EditorState* state) const;
     struct Task {
         QString id, kind, title;
         QJsonObject input;
+        ProjectMark project;
         QPointer<EditorState> state;
         std::shared_ptr<Shared> shared;
         QFutureWatcher<bool> watcher;
@@ -207,6 +220,7 @@ private:
     std::deque<std::unique_ptr<Task>> tasks_;      // running and waiting, in order
     std::map<QString, TaskOutcome> outcomes_;      // of watched tasks that ended, until their watcher takes them
     std::map<QString, Offered> offeredHere_;       // results kept and not applied, where nothing is kept on disk
+    std::map<QString, ProjectMark> marks_;         // the projects of the tasks begun in this session, by id
     QPointer<EditorState> state_;
     int memoryIds_ = 0;
 };
