@@ -634,6 +634,12 @@ void Device::letGoIdle() {
     idleLetGo_ = true;
     while (!pool_.empty()) dropPooled(pool_.size() - 1);
     while (!splatSets_.empty()) dropSplatSet(splatSets_.size() - 1);
+    // So too the LUTs and the filters' shared tables (Aperture Glare's spectra), uploaded again from what the CPU holds
+    // when next used; the shader programs stay (building them again takes longer than the frame).
+    for (auto& [key, lut] : luts_) delete lut.tex;
+    luts_.clear();
+    for (auto& [key, table] : sharedTables_) delete table.tex;
+    sharedTables_.clear();
     // (an empty frame, after which the API frees what was let go: it holds a texture until a frame has ended past it)
     QRhiCommandBuffer* cb = nullptr;
     if (rhi_->beginOffscreenFrame(&cb) == QRhi::FrameOpSuccess) rhi_->endOffscreenFrame();
@@ -2284,7 +2290,7 @@ void Device::endFrame(bool drawn) {
     ++frameNo_;
     failed_ = false;
     lastDrawn_ = std::chrono::steady_clock::now();
-    idleLetGo_ = pool_.empty() && splatSets_.empty();
+    idleLetGo_ = pool_.empty() && splatSets_.empty() && luts_.empty() && sharedTables_.empty();
     const size_t peak = peakBytes;
     countHeld();
     peakBytes = peak;

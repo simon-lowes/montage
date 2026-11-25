@@ -3711,6 +3711,43 @@ colorspaces:
         const double want = 0.18 * std::pow(0.4 * 2 / 0.18, 1.5 * 0.8) * 0.5;
         QVERIFY2(std::fabs(img.px[0] - want) < 1e-4, qPrintable(QString("%1, not %2").arg(img.px[0]).arg(want)));
         QCOMPARE(ocioProcessorsBuilt(), before + 1);
+        // (nightly 25 Nov) A processor lent while the ones kept are let go (more than 64 transforms drawn) goes back to
+        // its own transform's, never to one made since in its place for another: 70 transforms, each scaling by its
+        // own amount, drawn over and over by four threads at once, each come out at their own scale.
+        const QString many = dir.filePath("many.ocio");
+        QFile m(many);
+        QVERIFY(m.open(QIODevice::WriteOnly));
+        QByteArray text = "ocio_profile_version: 2\nroles:\n  default: linear\n  scene_linear: linear\nfile_rules:\n"
+                          "  - !<Rule> {name: Default, colorspace: default}\ndisplays:\n  Monitor:\n    - !<View> {name: Raw, colorspace: linear}\n"
+                          "colorspaces:\n  - !<ColorSpace>\n    name: linear\n";
+        for (int k = 0; k < 70; ++k) {
+            const QByteArray s = QByteArray::number((k + 2) / 100.0);
+            text += "  - !<ColorSpace>\n    name: s" + QByteArray::number(k) + "\n    from_scene_reference: !<MatrixTransform> {matrix: [" + s + ", 0, 0, 0, 0, " +
+                    s + ", 0, 0, 0, 0, " + s + ", 0, 0, 0, 0, 1]}\n";
+        }
+        m.write(text);
+        m.close();
+        std::vector<Effect> scaled;
+        for (int k = 0; k < 70; ++k) {
+            Effect s = e;
+            s.strings["config"] = many.toStdString();
+            s.strings["dst"] = "s" + std::to_string(k);
+            scaled.push_back(s);
+        }
+        std::atomic<int> mixed{0};
+        threads.clear();
+        for (int k = 0; k < 4; ++k)
+            threads.emplace_back([&, k] {
+                for (int n = 0; n < 6 * 70; ++n) {
+                    const int which = (n * 7 + k * 13) % 70;
+                    const FrameTime t = FrameTime((n + k) % 10);
+                    Image img = solid(128, 64, 0.4f, 0.4f, 0.4f);
+                    const double want = 0.4 * std::exp2(e.p("exposure", t, 0)) * (which + 2) / 100.0;
+                    if (!applyOcio(scaled[size_t(which)], img, nullptr, t) || !(std::fabs(img.px[0] - want) < 1e-5 * want)) ++mixed;
+                }
+            });
+        for (std::thread& th : threads) th.join();
+        QCOMPARE(mixed.load(), 0);
     }
     void colorSpaceTransformEffect() {
         Project p = makeDefaultProject();
@@ -37267,14 +37304,18 @@ colorspaces:
         // (nightly 23 Nov) What the last frames kept for later ones is let go once no frame has been drawn for a while
         // (a fifth of a second here, 10 s outside tests); the next frame is drawn as before. (They were kept until
         // frames came again: over a gigabyte after Lens Blur (Depth) at 4K.)
+        // (nightly 25 Nov) So too the filters' shared tables: Aperture Glare's, drawn a frame before.
         gpu::setIdleReleaseForTesting(200);
+        QVERIFY(gpu::execute(glare, &out));
+        QVERIFY(gpu::stats().tableBytes > 0);
         QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));
         const Image blurred = out;
         QVERIFY2(gpu::stats().textureBytes >= 3 * smallBytes, qPrintable(QString::number(gpu::stats().textureBytes)));
         QElapsedTimer idle;
         idle.start();
-        while (gpu::stats().textureBytes >= smallBytes && idle.elapsed() < 20000) QTest::qWait(50);
+        while ((gpu::stats().textureBytes >= smallBytes || gpu::stats().tableBytes > 0) && idle.elapsed() < 20000) QTest::qWait(50);
         QVERIFY2(gpu::stats().textureBytes < smallBytes, qPrintable(QString::number(gpu::stats().textureBytes)));
+        QCOMPARE(gpu::stats().tableBytes, size_t(0));
         QVERIFY(idle.elapsed() >= 150);
         gpu::setIdleReleaseForTesting(0);
         QVERIFY(gpu::execute(frameOf(small, "gaussian_blur", {{"radius", 6}}), &out));

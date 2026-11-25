@@ -44766,6 +44766,55 @@ private slots:
             QCOMPARE(countOf(splatKeep(capture, f)), capture.count);
         }
         {
+            auto cloudOf = [](const std::vector<std::array<float, 3>>& at) {
+                SplatCloud cloud;
+                cloud.count = at.size();
+                for (const auto& p : at) cloud.positions.insert(cloud.positions.end(), p.begin(), p.end());
+                cloud.scales.assign(at.size() * 3, 0.01f), cloud.opacities.assign(at.size(), 1.0f);
+                cloud.rotations.assign(at.size() * 4, 0.0f), cloud.colors.assign(at.size() * 3, 0.0f);
+                return cloud;
+            };
+            // (nightly 25 Nov) Which splats are kept is what measuring every pair says, for clusters, lone splats and
+            // splats on whole multiples of the distance, at several distances and counts.
+            std::vector<std::array<float, 3>> at;
+            for (int k = 0; k < 10; ++k) {
+                const float cx = float(rnd() * 10 - 5), cy = float(rnd() * 10 - 5), cz = float(rnd() * 10 - 5);
+                for (int i = 0; i < 200; ++i) at.push_back({cx + float(rnd() * 0.8 - 0.4), cy + float(rnd() * 0.8 - 0.4), cz + float(rnd() * 0.8 - 0.4)});
+            }
+            for (int i = 0; i < 800; ++i) at.push_back({float(rnd() * 10 - 5), float(rnd() * 10 - 5), float(rnd() * 10 - 5)});
+            for (int i = 0; i < 200; ++i) at.push_back({float(int(rnd() * 8) - 4) * 0.5f, float(int(rnd() * 8) - 4) * 0.5f, float(int(rnd() * 8) - 4) * 0.5f});
+            const SplatCloud mixed = cloudOf(at);
+            for (const float dist : {0.25f, 0.5f, 1.0f, 1.7f})
+                for (const int need : {1, 3, 8, 64}) {
+                    std::vector<uint8_t> measured(at.size(), 0);
+                    for (size_t i = 0; i < at.size(); ++i) {
+                        int found = 0;
+                        for (size_t j = 0; j < at.size(); ++j) {
+                            const double dx = double(at[j][0]) - at[i][0], dy = double(at[j][1]) - at[i][1], dz = double(at[j][2]) - at[i][2];
+                            if (j != i && dx * dx + dy * dy + dz * dz <= double(dist) * double(dist)) ++found;
+                        }
+                        measured[i] = found >= need;
+                    }
+                    SplatFilter f;
+                    f.neighbourDistance = dist, f.neighbours = need;
+                    QVERIFY2(splatKeep(mixed, f) == measured, qPrintable(QString("distance %1, %2 neighbours").arg(dist).arg(need)));
+                }
+            // Two crowds a little more than the distance apart, in cells side by side, are each kept whole, as quickly as
+            // one crowd: a splat finds its neighbours among its own before measuring the other crowd's splats one by one.
+            at.clear();
+            for (int i = 0; i < 60000; ++i) at.push_back({0.001f + float(rnd() * 0.001), float(rnd() * 0.001), float(rnd() * 0.001)});
+            for (int i = 0; i < 60000; ++i) at.push_back({1.998f + float(rnd() * 0.001), float(rnd() * 0.001), float(rnd() * 0.001)});
+            SplatFilter f;
+            f.neighbourDistance = 1.0f, f.neighbours = 64;
+            QCOMPARE(countOf(splatKeep(cloudOf(at), f)), at.size());
+            // Splats far from the origin at a small distance are measured in cells of their own, not one shared cell:
+            // 20,000 in a line, each farther than the distance from the next, all go.
+            at.clear();
+            for (int i = 0; i < 20000; ++i) at.push_back({1000.0f + float(i) * 0.001f, 0, 0});
+            f.neighbourDistance = 0.0004f, f.neighbours = 1;
+            QCOMPARE(countOf(splatKeep(cloudOf(at), f)), size_t(0));
+        }
+        {
             SplatFilter f;
             f.minOpacity = 0.05f;
             QVERIFY(droppedAre(splatKeep(capture, f, &counts), 2));
@@ -45019,6 +45068,35 @@ private slots:
                 }
             }
             QVERIFY2(worst[0] < 1e-3 && worst[1] < 1e-4 && worst[2] < 1e-5, qPrintable(QString("%1 %2 %3").arg(worst[0]).arg(worst[1]).arg(worst[2])));
+        }
+        {
+            // Accessors with no buffer view are zeros: one of the cloud's own size (its opacities) is read as zeros, and
+            // a file whose accessors would unpack to 2^24 splats of nothing is refused before anything is made of it.
+            QJsonObject zeros = gltfJson;
+            QJsonArray accessors = zeros["accessors"].toArray();
+            const QJsonObject attrs = zeros["meshes"].toArray()[0].toObject()["primitives"].toArray()[0].toObject()["attributes"].toObject();
+            const int opacityAt = attrs["KHR_gaussian_splatting:OPACITY"].toInt();
+            QJsonObject opacity = accessors[opacityAt].toObject();
+            opacity.remove("bufferView"), opacity.remove("byteOffset"), opacity.remove("min"), opacity.remove("max");
+            accessors[opacityAt] = opacity;
+            zeros["accessors"] = accessors;
+            QVERIFY(writeJson("splat_zeros.gltf", zeros));
+            SplatCloud none;
+            QVERIFY2(loadSplats(path("splat_zeros.gltf"), none, &err), err.c_str());
+            QCOMPARE(none.count, ply.count);
+            QVERIFY(std::all_of(none.opacities.begin(), none.opacities.end(), [](float v) { return v == 0; }));
+            for (const QString& name : attrs.keys()) {
+                QJsonObject a = accessors[attrs[name].toInt()].toObject();
+                a.remove("bufferView"), a.remove("byteOffset"), a.remove("min"), a.remove("max");
+                a["count"] = 1 << 24;
+                accessors[attrs[name].toInt()] = a;
+            }
+            zeros["accessors"] = accessors;
+            QVERIFY(writeJson("splat_zeros.gltf", zeros));
+            QVERIFY(QFileInfo(QString::fromStdString(path("splat_zeros.gltf"))).size() < 64 * 1024);
+            err.clear();
+            QVERIFY(!loadSplats(path("splat_zeros.gltf"), none, &err));
+            QVERIFY2(err.find("larger than Montage can load") != std::string::npos, err.c_str());
         }
         {
             // A file in linear light: blended as it is, then brought to display values. One opaque splat of linear 0.2

@@ -13,6 +13,7 @@
 #include <QRegularExpression>
 #include <QUrl>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -977,58 +978,129 @@ std::vector<uint8_t> splatRangeSet(const std::string& ranges, size_t count) {
 namespace {
 
 // For each splat still kept, whether at least `need` others (kept or not: a speck is one whatever else is dropped)
-// have their centres within `dist`: the centres are put in a grid of cells `dist` across, and each splat looks through
-// its own cell and the 26 round it, stopping at the first `need` it finds.
+// have their centres within `dist`. The centres are put in a grid of cells a little under dist/√3 across, so that any
+// two in one cell are within `dist` of each other: a splat counts the others of its own cell without measuring, then
+// each cell near enough (nearest first) whole when all of it lies within `dist`, measuring splat by splat only in the
+// cells the distance's edge crosses, and stops at the first `need` it finds. A splat whose own cell holds more than
+// `need` so stops at once; only the others, at most 124 x `need` round any cell, measure a crowded cell next to them,
+// so the work grows with the number of splats and not with its square, however they lie.
 void dropLonely(const SplatCloud& c, float dist, int need, std::vector<uint8_t>& keep, size_t& dropped) {
     const size_t n = c.count;
     if (n == 0 || !(dist > 0) || need <= 0) return;
-    constexpr int64_t kEdge = int64_t(1) << 20;  // cells each way of the origin; what lies farther shares the last cell
-    auto cellOf = [&](float v) {
-        const double q = std::floor(double(v) / double(dist));
-        return int64_t(std::clamp(q, double(-kEdge), double(kEdge - 1))) + kEdge;
+    const double d2 = double(dist) * double(dist), side = double(dist) / 1.733;
+    const double margin = side * 1e-6;  // (more than a cell's index can be off by, rounded)
+    auto finite = [&](size_t i) {
+        const float* p = &c.positions[i * 3];
+        return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
     };
-    auto keyOf = [](int64_t x, int64_t y, int64_t z) { return uint64_t(x) << 42 | uint64_t(y) << 21 | uint64_t(z); };
-    std::vector<uint64_t> keys(n);
-    for (size_t i = 0; i < n; ++i) keys[i] = keyOf(cellOf(c.positions[i * 3]), cellOf(c.positions[i * 3 + 1]), cellOf(c.positions[i * 3 + 2]));
-    std::vector<uint32_t> order(n);
-    std::iota(order.begin(), order.end(), uint32_t(0));
-    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return keys[a] < keys[b] || (keys[a] == keys[b] && a < b); });
-    // An open-addressed table from a cell's key to where its splats start in `order`.
-    size_t buckets = 16;
-    while (buckets < n * 2) buckets <<= 1;
-    std::vector<uint32_t> table(buckets, UINT32_MAX);
-    auto slotOf = [&](uint64_t key) { return size_t((key * 0x9e3779b97f4a7c15ull) >> 20) & (buckets - 1); };
+    double lo[3] = {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
     for (size_t i = 0; i < n; ++i)
-        if (i == 0 || keys[order[i]] != keys[order[i - 1]]) {
-            size_t s = slotOf(keys[order[i]]);
-            while (table[s] != UINT32_MAX) s = (s + 1) & (buckets - 1);
-            table[s] = uint32_t(i);
+        if (finite(i))
+            for (int a = 0; a < 3; ++a) lo[a] = std::min(lo[a], double(c.positions[i * 3 + a]));
+    // Cells counted from the lowest centre; those past the last on an axis share it, and are measured splat by splat.
+    // A centre that is not a number (or infinite) is within no distance of anything, and is in no cell.
+    constexpr int32_t kLast = int32_t(1) << 30;
+    using Cell = std::array<int32_t, 3>;
+    std::vector<Cell> cells(n, Cell{-1, -1, -1});
+    std::vector<uint32_t> order;
+    order.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!finite(i)) continue;
+        for (int a = 0; a < 3; ++a) cells[i][a] = int32_t(std::min(std::floor((double(c.positions[i * 3 + a]) - lo[a]) / side), double(kLast)));
+        order.push_back(uint32_t(i));
+    }
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return cells[a] < cells[b] || (cells[a] == cells[b] && a < b); });
+    struct Run {
+        Cell at;
+        uint32_t start, count;
+    };
+    std::vector<Run> runs;
+    for (size_t k = 0; k < order.size(); ++k)
+        if (k == 0 || cells[order[k]] != cells[order[k - 1]]) runs.push_back({cells[order[k]], uint32_t(k), 1});
+        else ++runs.back().count;
+    // An open-addressed table from a cell to its run.
+    size_t buckets = 16;
+    while (buckets < runs.size() * 2) buckets <<= 1;
+    std::vector<uint32_t> table(buckets, UINT32_MAX);
+    auto slotOf = [&](const Cell& at) {
+        const uint64_t h = (uint64_t(uint32_t(at[0])) * 0x9e3779b97f4a7c15ull) ^ (uint64_t(uint32_t(at[1])) * 0xc2b2ae3d27d4eb4full) ^ (uint64_t(uint32_t(at[2])) * 0x165667b19e3779f9ull);
+        return size_t(h ^ (h >> 29)) & (buckets - 1);
+    };
+    for (size_t r = 0; r < runs.size(); ++r) {
+        size_t s = slotOf(runs[r].at);
+        while (table[s] != UINT32_MAX) s = (s + 1) & (buckets - 1);
+        table[s] = uint32_t(r);
+    }
+    auto runAt = [&](const Cell& at) -> const Run* {
+        for (size_t s = slotOf(at);; s = (s + 1) & (buckets - 1)) {
+            if (table[s] == UINT32_MAX) return nullptr;
+            if (runs[table[s]].at == at) return &runs[table[s]];
         }
-    const double d2 = double(dist) * double(dist);
+    };
+    // The cells two or fewer away each way (farther ones are more than `dist` off), the nearest first.
+    static const std::vector<std::array<int, 3>> kAround = [] {
+        std::vector<std::array<int, 3>> out;
+        for (int x = -2; x <= 2; ++x)
+            for (int y = -2; y <= 2; ++y)
+                for (int z = -2; z <= 2; ++z) out.push_back({x, y, z});
+        auto gap = [](const std::array<int, 3>& o) {
+            int g = 0;
+            for (int v : o) g += std::max(std::abs(v) - 1, 0) * std::max(std::abs(v) - 1, 0);
+            return g * 10 + std::abs(o[0]) + std::abs(o[1]) + std::abs(o[2]);
+        };
+        std::stable_sort(out.begin(), out.end(), [&](const auto& a, const auto& b) { return gap(a) < gap(b); });
+        return out;
+    }();
     std::vector<uint8_t> lonely(n, 0);
     constexpr size_t kChunk = 4096;
     parallelRows(int((n + kChunk - 1) / kChunk) * 16, [&](int r0, int r1) {
         for (int task = (r0 + 15) / 16; task < (r1 + 15) / 16; ++task)
             for (size_t i = size_t(task) * kChunk; i < std::min(n, (size_t(task) + 1) * kChunk); ++i) {
                 if (!keep[i]) continue;
+                if (cells[i][0] < 0) {
+                    lonely[i] = 1;
+                    continue;
+                }
                 const float* p = &c.positions[i * 3];
-                const int64_t cx = cellOf(p[0]), cy = cellOf(p[1]), cz = cellOf(p[2]);
+                double rel[3];
+                for (int a = 0; a < 3; ++a) rel[a] = double(p[a]) - lo[a];
+                const Cell& own = cells[i];
                 int found = 0;
-                for (int64_t x = std::max<int64_t>(0, cx - 1); x <= std::min(2 * kEdge - 1, cx + 1) && found < need; ++x)
-                    for (int64_t y = std::max<int64_t>(0, cy - 1); y <= std::min(2 * kEdge - 1, cy + 1) && found < need; ++y)
-                        for (int64_t z = std::max<int64_t>(0, cz - 1); z <= std::min(2 * kEdge - 1, cz + 1) && found < need; ++z) {
-                            const uint64_t key = keyOf(x, y, z);
-                            size_t s = slotOf(key);
-                            while (table[s] != UINT32_MAX && keys[order[table[s]]] != key) s = (s + 1) & (buckets - 1);
-                            if (table[s] == UINT32_MAX) continue;
-                            for (size_t k = table[s]; k < n && keys[order[k]] == key && found < need; ++k) {
-                                const uint32_t j = order[k];
-                                if (j == i) continue;
-                                const float* q = &c.positions[size_t(j) * 3];
-                                const double dx = double(q[0]) - p[0], dy = double(q[1]) - p[1], dz = double(q[2]) - p[2];
-                                if (dx * dx + dy * dy + dz * dz <= d2) ++found;
-                            }
+                for (const auto& o : kAround) {
+                    const Cell at{own[0] + o[0], own[1] + o[1], own[2] + o[2]};  // (kLast + 2 still fits)
+                    if (at[0] < 0 || at[1] < 0 || at[2] < 0 || at[0] > kLast || at[1] > kLast || at[2] > kLast) continue;
+                    const Run* run = runAt(at);
+                    if (!run) continue;
+                    const bool shared = at[0] == kLast || at[1] == kLast || at[2] == kLast;
+                    bool whole = false;
+                    if (!shared && o == std::array<int, 3>{0, 0, 0}) {
+                        found += int(std::min<uint32_t>(uint32_t(need), run->count - 1));
+                        continue;
+                    }
+                    if (!shared) {
+                        double nearest = 0, farthest = 0;
+                        for (int a = 0; a < 3; ++a) {
+                            const double from = double(at[a]) * side - margin, to = double(at[a] + 1) * side + margin;
+                            const double near = rel[a] < from ? from - rel[a] : rel[a] > to ? rel[a] - to : 0;
+                            const double far = std::max(std::abs(rel[a] - from), std::abs(rel[a] - to));
+                            nearest += near * near, farthest += far * far;
                         }
+                        if (nearest > d2 * (1 + 1e-9)) continue;
+                        whole = farthest <= d2 * (1 - 1e-9);
+                    }
+                    if (whole) {
+                        found += int(std::min<uint32_t>(uint32_t(need), run->count));
+                    } else {
+                        for (uint32_t k = run->start; k < run->start + run->count && found < need; ++k) {
+                            const uint32_t j = order[k];
+                            if (j == i) continue;
+                            const float* q = &c.positions[size_t(j) * 3];
+                            const double dx = double(q[0]) - p[0], dy = double(q[1]) - p[1], dz = double(q[2]) - p[2];
+                            if (dx * dx + dy * dy + dz * dz <= d2) ++found;
+                        }
+                    }
+                    if (found >= need) break;
+                }
                 lonely[i] = found < need;
             }
     });
