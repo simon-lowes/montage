@@ -619,9 +619,12 @@ struct RelayBridge::Impl {
     int releaseRound = 0;
     qint64 releaseBy = 0;
     std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    const int scale = RelayBridge::timeScale();  // (1 but in tests: the bridge's protocol clock runs this many times as fast)
     std::function<void(const std::string&)> allocateDone;
 
-    qint64 now() const { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began).count(); }
+    qint64 now() const {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began).count() * scale;
+    }
     void setState(const std::string& text) {
         std::lock_guard lock(m);
         stateText = text;
@@ -648,7 +651,7 @@ struct RelayBridge::Impl {
         ctx = new QObject;
         timer = new QTimer(ctx);
         QObject::connect(timer, &QTimer::timeout, ctx, [this] { tick(); });
-        timer->start(100);
+        timer->start(std::max(10, 100 / scale));
     }
 
     static QByteArray randomId() {
@@ -1390,6 +1393,12 @@ std::string RelayBridge::state() const {
 }
 
 int RelayBridge::threads() { return bridgeThread().running; }
+
+namespace {
+std::atomic<int> relayTimeScale{1};
+}
+void RelayBridge::setTimeScaleForTests(int scale) { relayTimeScale = std::clamp(scale, 1, 20); }
+int RelayBridge::timeScale() { return relayTimeScale; }
 uint64_t RelayBridge::threadsStarted() { return bridgeThread().started; }
 
 }  // namespace montage::output

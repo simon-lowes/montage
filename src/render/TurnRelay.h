@@ -103,6 +103,13 @@ public:
     static int threads();
     static uint64_t threadsStarted();
 
+    // For tests alone: bridges made after this keep their protocol's time `scale` times as fast (1 to 20): asking
+    // again, the six seconds an asking has, a refusal's wait, refreshing half way through the address's lifetime and
+    // its running out, and giving it back. Montage leaves it at 1; a test that waits out those times sets it, and puts
+    // it back to 1 when it is done.
+    static void setTimeScaleForTests(int scale);
+    static int timeScale();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> d_;

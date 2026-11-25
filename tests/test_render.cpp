@@ -26916,6 +26916,11 @@ colorspaces:
     void reviewRelayTransports() {
         using namespace montage::output;
         using namespace montage::reviewtest;
+        // (the bridges' protocol clock four times as fast, so its six-second askings and the rest are waited out in a
+        // quarter of the time: the bounds below are the same times over that scale)
+        RelayBridge::setTimeScaleForTests(4);
+        auto realTime = qScopeGuard([] { RelayBridge::setTimeScaleForTests(1); });
+        const int k = RelayBridge::timeScale();
         QFETCH(QString, transport);
         QFETCH(int, ipv6);
         if (ipv6 == 2 && !FakeRelay::hasIpv6()) {
@@ -27074,7 +27079,7 @@ colorspaces:
             const std::string said = allocate(changed);
             relay.corruptAnswers = false;
             QVERIFY2(QString::fromStdString(said).contains("did not answer") && QString::fromStdString(said).contains("not signed with this review's login"), said.c_str());
-            QVERIFY2(waited.elapsed() >= 4000 && waited.elapsed() < 12000, std::to_string(waited.elapsed()).c_str());
+            QVERIFY2(waited.elapsed() >= 4000 / k && waited.elapsed() < 12000 / k, std::to_string(waited.elapsed()).c_str());
             QCOMPARE(changed.lastError(), said);
             QVERIFY(changed.answersRefused() >= 1);
             if (stream) QCOMPARE(changed.answersRefused(), uint64_t(1));
@@ -27299,19 +27304,24 @@ colorspaces:
             QVERIFY2(relay.start(&why), why.c_str());
             QVERIFY(parseRelayAddress(relay.url(), at));
             at.pin = QSslCertificate(QByteArray::fromStdString(config.certificatePem), QSsl::Pem).digest(QCryptographicHash::Sha256).toHex().toStdString();
-            RelayBridge bridge(at, turnRestLogin(secret, QDateTime::currentSecsSinceEpoch() + 4));
+            // (the relay's clock is the wall's: at the bridges' scale the login's time is up two seconds on, still
+            // before the bridge asks at a quarter of ten seconds)
+            RelayBridge::setTimeScaleForTests(4);
+            auto realTime = qScopeGuard([] { RelayBridge::setTimeScaleForTests(1); });
+            const int k = RelayBridge::timeScale();
+            RelayBridge bridge(at, turnRestLogin(secret, QDateTime::currentSecsSinceEpoch() + 2));
             QElapsedTimer clock;
             clock.start();
             QCOMPARE(allocate(bridge, 4), std::string());
             QCOMPARE(relay.loginsExpired.load(), 0);
-            while (clock.elapsed() < 16000 && bridge.lastError().empty()) QThread::msleep(100);
-            QVERIFY2(clock.elapsed() >= 9000 && clock.elapsed() < 14000, std::to_string(clock.elapsed()).c_str());
+            while (clock.elapsed() < 16000 / k && bridge.lastError().empty()) QThread::msleep(20);
+            QVERIFY2(clock.elapsed() >= 9000 / k && clock.elapsed() < 14000 / k, std::to_string(clock.elapsed()).c_str());
             QVERIFY2(QString::fromStdString(bridge.lastError()).contains("did not take Montage's login (401)"), bridge.lastError().c_str());
             QVERIFY(relay.loginsExpired.load() >= 1);
             QCOMPARE(relay.refreshes.load(), 0);
             QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over TLS"));
-            while (clock.elapsed() < 26000 && bridge.state() != "Ended") QThread::msleep(100);
-            QVERIFY2(clock.elapsed() >= 19000 && clock.elapsed() < 24000, std::to_string(clock.elapsed()).c_str());
+            while (clock.elapsed() < 26000 / k && bridge.state() != "Ended") QThread::msleep(20);
+            QVERIFY2(clock.elapsed() >= 19000 / k && clock.elapsed() < 24000 / k, std::to_string(clock.elapsed()).c_str());
             const QString ended = QString::fromStdString(bridge.lastError());
             QVERIFY2(ended.contains("ran out") && ended.contains("the relay refused to keep it"), qPrintable(ended));
         }
@@ -27322,6 +27332,12 @@ colorspaces:
     void reviewRelayQuietRecoveredLapsedAndMangled() {
         using namespace montage::output;
         using montage::reviewtest::FakeRelay;
+        // (the bridges' protocol clock four times as fast, so its six-second askings and the rest are waited out in a
+        // quarter of the time: the bounds below are the same times over that scale)
+        RelayBridge::setTimeScaleForTests(4);
+        auto realTime = qScopeGuard([] { RelayBridge::setTimeScaleForTests(1); });
+        const int k = RelayBridge::timeScale();
+
         struct Said {
             std::mutex m;
             std::condition_variable cv;
@@ -27398,11 +27414,11 @@ colorspaces:
             clock.start();
             QCOMPARE(answer(ask(bridge), 15), std::string());
             relay.refuseRefresh = true;
-            while (clock.elapsed() < 16000 && bridge.lastError().empty()) QThread::msleep(50);
+            while (clock.elapsed() < 16000 / k && bridge.lastError().empty()) QThread::msleep(20);
             QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (508"), bridge.lastError().c_str());
             QVERIFY(!bridge.ended());
             relay.refuseRefresh = false;
-            while (clock.elapsed() < 24000 && !bridge.lastError().empty()) QThread::msleep(50);
+            while (clock.elapsed() < 24000 / k && !bridge.lastError().empty()) QThread::msleep(20);
             QVERIFY2(bridge.lastError().empty(), bridge.lastError().c_str());
             QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over UDP"));
             // Nightly 23 November: a viewer the relay refuses to let in (403) is the bridge's error while the refusal
@@ -27419,13 +27435,13 @@ colorspaces:
                 QVERIFY(alias != 0);
                 QElapsedTimer refused;
                 refused.start();
-                while (refused.elapsed() < 8000 && bridge.lastError().empty()) QThread::msleep(50);
+                while (refused.elapsed() < 8000 / k && bridge.lastError().empty()) QThread::msleep(20);
                 QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (403"), bridge.lastError().c_str());
                 relay.refusePermission = false;
                 refused.restart();
-                while (refused.elapsed() < 12000 && !bridge.lastError().empty()) QThread::msleep(50);
+                while (refused.elapsed() < 12000 / k && !bridge.lastError().empty()) QThread::msleep(20);
                 QVERIFY2(bridge.lastError().empty(), bridge.lastError().c_str());
-                QVERIFY2(refused.elapsed() < 7000, std::to_string(refused.elapsed()).c_str());
+                QVERIFY2(refused.elapsed() < 7000 / k, std::to_string(refused.elapsed()).c_str());
                 QByteArray heard;
                 for (int i = 0; i < 50 && heard.isEmpty(); ++i) {
                     end.writeDatagram("let in at last", QHostAddress::LocalHost, alias);
@@ -27446,21 +27462,21 @@ colorspaces:
                 const uint64_t refusedBefore = bridge.answersRefused();
                 QElapsedTimer unsignedFor;
                 unsignedFor.start();
-                while (unsignedFor.elapsed() < 18000 && bridge.lastError().empty()) QThread::msleep(20);
+                while (unsignedFor.elapsed() < 18000 / k && bridge.lastError().empty()) QThread::msleep(20);
                 relay.refuseRefresh = false;
                 relay.unsignedRefusals = false;
                 QVERIFY2(QString::fromStdString(bridge.lastError()).contains("not signed with this review's login"), bridge.lastError().c_str());
                 QVERIFY(bridge.answersRefused() > refusedBefore);
                 QVERIFY(!bridge.ended());
                 unsignedFor.restart();
-                while (unsignedFor.elapsed() < 8000 && !bridge.lastError().empty()) QThread::msleep(50);
+                while (unsignedFor.elapsed() < 8000 / k && !bridge.lastError().empty()) QThread::msleep(20);
                 QVERIFY2(bridge.lastError().empty(), bridge.lastError().c_str());
                 QVERIFY(!bridge.ended());
                 QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over UDP"));
             }
             const qint64 recovered = clock.elapsed();
             relay.forget = true;
-            while (clock.elapsed() < recovered + 16000 && !bridge.ended()) QThread::msleep(50);
+            while (clock.elapsed() < recovered + 16000 / k && !bridge.ended()) QThread::msleep(20);
             QVERIFY(bridge.ended());
             QVERIFY2(QString::fromStdString(bridge.lastError()).contains("refused (437"), bridge.lastError().c_str());
             QCOMPARE(relay.allocations.load(), 1);
