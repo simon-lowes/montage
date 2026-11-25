@@ -2442,13 +2442,30 @@ private slots:
         QVERIFY(events[1].value == (11 << 7 | 21));
         QVERIFY(!decoder.holding());
         // (the same with no pause after the lone half, which no order of messages can tell from pairs sent fine
-        // half first: the last half is held, and sent once a pair's time has passed, so the control ends where it is)
+        // half first: the halves are paired as they come, each fine half with the coarse half after it, and the last
+        // half is held, and sent once a pair's time has passed, so the control ends where it is)
         decoder.reset();
         events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 5, 0xB1, 6, 10, 0xB1, 38, 20, 0xB1, 6, 11, 0xB1, 38, 21});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].value == (10 << 7 | 5) && events[1].value == (11 << 7 | 20));
         QVERIFY(decoder.holding());
         events = rest();
         QCOMPARE(events.size(), size_t(1));
         QVERIFY(events[0].value == (11 << 7 | 21));
+        // Once a pair alone (a pause before and after it: here the parameter chosen, and the caller's flush) has shown
+        // that the coarse half comes first, the same run gives every value right: a fine half that comes with
+        // nothing held is a value whose coarse half did not change (nightly 25 Nov).
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 6, 9, 0xB1, 38, 100});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].value == 9 && events[0].resolution == 128 && events[1].value == (9 << 7 | 100));
+        QVERIFY(rest().empty());
+        events = decode({0xB1, 38, 5, 0xB1, 6, 10, 0xB1, 38, 20, 0xB1, 6, 11, 0xB1, 38, 21});
+        QCOMPARE(events.size(), size_t(3));
+        QCOMPARE(events[0].value, 9 << 7 | 5);
+        QCOMPARE(events[1].value, 10 << 7 | 20);
+        QCOMPARE(events[2].value, 11 << 7 | 21);
+        QVERIFY(!decoder.holding());
         // A controller that sends the fine half first, the parameter chosen once: two fine halves alone, each sent
         // with the coarse half it has; the pairs after them still come once each, whole (not the fine half with the
         // coarse half before it, the coarse halves lost), and a last fine half alone is sent too.
@@ -2502,6 +2519,22 @@ private slots:
             events = timed({{{0xB1, 6, 13}, 100000}, {{0xB1, 6, 14}, 120000}, {{0xB1, 38, 1}, 120500}});
             QCOMPARE(events.size(), size_t(2));
             QVERIFY(events[0].value == (13 << 7) && events[1].value == (14 << 7 | 1));
+            // Nightly 25 Nov: a controller that sends the coarse half first and leaves out a half that did not change,
+            // in a burst with half a millisecond between messages, after a pair alone (5, 126) has shown its order:
+            // (5, 127) (6, 0) (6, 1) (7, 0), sent as fine 127, coarse 6, fine 0, fine 1, coarse 7, fine 0, each once,
+            // not a coarse step off at each boundary.
+            decoder.reset();
+            events = timed({{{0xB1, 99, 3}, 0}, {{0xB1, 98, 4}, 100}, {{0xB1, 6, 5}, 200}, {{0xB1, 38, 126}, 300},
+                            {{0xB1, 38, 127}, 20000}, {{0xB1, 6, 6}, 20500}, {{0xB1, 38, 0}, 21000}, {{0xB1, 38, 1}, 21500},
+                            {{0xB1, 6, 7}, 22000}, {{0xB1, 38, 0}, 22500}});
+            QCOMPARE(events.size(), size_t(6));
+            QVERIFY(events[0].value == 5 && events[0].resolution == 128);
+            QCOMPARE(events[1].value, 5 << 7 | 126);
+            QCOMPARE(events[2].value, 5 << 7 | 127);
+            QCOMPARE(events[3].value, 6 << 7 | 0);
+            QCOMPARE(events[4].value, 6 << 7 | 1);
+            QCOMPARE(events[5].value, 7 << 7 | 0);
+            QVERIFY(!decoder.holding());
             decoder = saved;
         }
         // A coarse half alone, from a parameter that sends fine halves: its fine half is 0 (MIDI 1.0).

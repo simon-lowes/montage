@@ -89,12 +89,23 @@ private:
         int held = -1;
         bool heldFine = false;
         int64_t heldAt = -1;  // (when it arrived: -1 not known)
+        bool heldQuiet = false;  // (it came after a pause)
+        // A pause in data entry since its last half: a parameter chosen, a flush, or more than kPairUs between halves.
+        bool quiet = true;
+        int64_t lastAt = -1;  // when its last data entry half came (-1 not known)
+        // A pair that came after a pause, its order (1: coarse half first, 2: fine) taken as the parameter's when a
+        // pause follows it too (0: none).
+        int pending = 0;
         Channel();
     };
     void release(int ch, const std::function<void(const Event&)>& out);
+    void pause(int ch);  // a pause in the channel's data entry: a pair alone before it shows its parameter's order
     Channel ch_[16];
     std::set<std::tuple<int, bool, int>> fine_;  // (channel, rpn, parameter) seen sending data entry's fine half
     std::map<std::tuple<int, bool, int>, int> coarse_;  // each parameter's last coarse half (for fine-only updates)
+    // Each parameter's order, as the last pair alone (a pause before and after it) showed it: 1 the coarse half first,
+    // 2 the fine half first.
+    std::map<std::tuple<int, bool, int>, int> order_;
 };
 
 // How a control's values are read.

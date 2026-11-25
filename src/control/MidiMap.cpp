@@ -119,6 +119,7 @@ void Decoder::reset() {
     for (Channel& c : ch_) c = Channel();
     fine_.clear();
     coarse_.clear();
+    order_.clear();
 }
 
 bool Decoder::holding() const {
@@ -126,7 +127,17 @@ bool Decoder::holding() const {
 }
 
 void Decoder::flush(const std::function<void(const Event&)>& out) {
-    for (int ch = 0; ch < 16; ++ch) release(ch, out);
+    for (int ch = 0; ch < 16; ++ch) {
+        release(ch, out);
+        pause(ch);
+    }
+}
+
+void Decoder::pause(int ch) {
+    Channel& c = ch_[ch];
+    if (c.pending) order_[std::make_tuple(ch, c.rpn, (c.paramMsb << 7) | c.paramLsb)] = c.pending;
+    c.pending = 0;
+    c.quiet = true;
 }
 
 // The half a channel holds, as one that came alone: a fine half with the coarse half its parameter last had (none yet:
@@ -173,10 +184,10 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
     Channel& c = ch_[ch];
     const int n = d1, v = d2;
     switch (n) {
-        case 99: release(ch, out); c.paramMsb = v; c.rpn = false; return;
-        case 98: release(ch, out); c.paramLsb = v; c.rpn = false; return;
-        case 101: release(ch, out); c.paramMsb = v; c.rpn = true; return;
-        case 100: release(ch, out); c.paramLsb = v; c.rpn = true; return;
+        case 99: release(ch, out); pause(ch); c.paramMsb = v; c.rpn = false; return;
+        case 98: release(ch, out); pause(ch); c.paramLsb = v; c.rpn = false; return;
+        case 101: release(ch, out); pause(ch); c.paramMsb = v; c.rpn = true; return;
+        case 100: release(ch, out); pause(ch); c.paramLsb = v; c.rpn = true; return;
         default: break;
     }
     const bool chosen = !(c.paramMsb == 127 && c.paramLsb == 127);
@@ -185,25 +196,42 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
         const Key key{c.rpn ? Kind::Rpn : Kind::Nrpn, ch, param};
         const auto id = std::make_tuple(ch, c.rpn, param);
         if (n == 6 || n == 38) {
-            // A half is held for the other half to follow it, whichever a controller sends first (nothing is learnt
-            // about the order, which a run of halves alone cannot tell from a run of pairs): the value goes out
-            // whole when the other half arrives. The same half again means the one held came alone, and it goes out
-            // as that; so does one still held when the caller's time for a pair has passed (flush).
+            // A half is held for the other half to follow it, whichever a controller sends first: the value goes
+            // out whole when the other half arrives. The same half again means the one held came alone, and it goes
+            // out as that; so does one still held when the caller's time for a pair has passed (flush).
             const bool fineHalf = n == 38;
             // (the half held came alone when this one is too late to be its other half: nightly 23 Nov, a lone half
             // first otherwise paired each value with a half of the one before, for as long as the halves kept coming)
+            const bool late = atUs >= 0 && c.lastAt >= 0 && atUs - c.lastAt > kPairUs;
             if (c.held >= 0 && atUs >= 0 && c.heldAt >= 0 && atUs - c.heldAt > kPairUs) release(ch, out);
+            // The order a pair alone shows (a pause before it and after it, which a run of halves alone cannot give)
+            // is taken as the parameter's; a later pair alone can show it anew. Only one order is acted on: a
+            // parameter that sends its coarse half first (MIDI 1.0's order) has a fine half that comes with nothing
+            // held go out at once, with the coarse half it has, as the fine half of a value whose coarse half did
+            // not change (nightly 25 Nov: in a burst under kPairUs, it was otherwise paired with the next value's
+            // coarse half, a coarse step off at each boundary). A fine half held is still paired as before.
+            if (late) pause(ch);
+            const bool afterPause = c.quiet;
+            c.quiet = false;
+            c.lastAt = atUs;
             if (c.held >= 0 && c.heldFine != fineHalf) {
                 const int coarse = fineHalf ? c.held : v, fine = fineHalf ? v : c.held;
+                c.pending = c.heldQuiet ? (c.heldFine ? 2 : 1) : 0;
                 c.held = -1;
                 fine_.insert(id);
                 coarse_[id] = coarse;
                 out({key, (coarse << 7) | fine, 16384});
                 return;
             }
+            c.pending = 0;
             release(ch, out);
             if (fineHalf) {
                 fine_.insert(id);
+                if (const auto it = order_.find(id); it != order_.end() && it->second == 1)
+                    if (const auto had = coarse_.find(id); had != coarse_.end()) {
+                        out({key, (had->second << 7) | v, 16384});
+                        return;
+                    }
             } else {
                 coarse_[id] = v;
                 if (!fine_.count(id)) out({key, v, 128});  // a parameter that (so far) sends only the coarse half
@@ -211,9 +239,11 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
             c.held = v;
             c.heldFine = fineHalf;
             c.heldAt = atUs;
+            c.heldQuiet = afterPause;
         } else {
             // Data increment (96) and decrement (97): a step each, their value not read (RP-018).
             release(ch, out);
+            c.pending = 0;
             Event e{key, 0, fine_.count(id) ? 16384 : 128};
             e.steps = n == 96 ? 1 : -1;
             out(e);
