@@ -42365,8 +42365,10 @@ private slots:
                     }
                 }
             qInfo("%s: %d face px in the reference's shadow, %d lit, %d differ at its edge, %d further", what, shadowed, lit, wrong, far);
-            QVERIFY(shadowed > 100);
-            QVERIFY(lit > 100);
+            // (both sides of the shadow's edge there to compare: how many of each depends on the font the system
+            // finds for DejaVu Sans, a narrower I on Windows' than on Linux's: 96 lit pixels against 131)
+            QVERIFY(shadowed > 40);
+            QVERIFY(lit > 40);
             QCOMPARE(far, 0);
         };
 
