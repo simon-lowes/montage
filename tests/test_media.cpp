@@ -26289,6 +26289,90 @@ private slots:
         QVERIFY2(same >= copied, qPrintable(QStringLiteral("%1 of %2").arg(same).arg(copied)));
     }
 
+    void mpeg2MixedRateJoin() {
+        // Two MPEG-2 clips cut together: one at a variable rate (6 Mb/s, no more than 12 Mb/s into 9,781,248 bits,
+        // every vbv_delay 0xFFFF, open GOPs), then one at a constant 20 Mb/s into 14,548,992 bits (every vbv_delay
+        // set, closed GOPs). 60 frames each at 640x360 with grain, a GOP of 12 with two B-pictures.
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg to make the files with");
+        auto footage = [&](const std::string& file, const QStringList& rate) {
+            QProcess pr;
+            pr.start(ffmpeg, QStringList{"-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25,noise=alls=10:allf=t",
+                                         "-frames:v", "60", "-c:v", "mpeg2video", "-pix_fmt", "yuv420p", "-g", "12", "-bf", "2", "-field_order",
+                                         "progressive", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"} +
+                                 rate + QStringList{QString::fromStdString(file)});
+            return pr.waitForFinished(300000) && pr.exitCode() == 0;
+        };
+        const std::string vbrFile = path("mpeg2-mixed-vbr.mov"), cbrFile = path("mpeg2-mixed-cbr.mov");
+        QVERIFY(footage(vbrFile, {"-b:v", "6M", "-maxrate", "12M", "-bufsize", "9781248"}));
+        // (FFmpeg closes its GOPs only with its scene cuts off)
+        QVERIFY(footage(cbrFile, {"-b:v", "20M", "-minrate", "20M", "-maxrate", "20M", "-bufsize", "14548992", "-rc_init_occupancy", "14548992", "-flags",
+                                  "+cgop", "-sc_threshold", "1000000000"}));
+        const HrdReport vbrIn = checkHrd(vbrFile), cbrIn = checkHrd(cbrFile);
+        QVERIFY2(vbrIn.checked && !vbrIn.cbr && vbrIn.conforms(), vbrIn.summary().c_str());
+        QVERIFY2(cbrIn.checked && cbrIn.cbr && cbrIn.conforms(), cbrIn.summary().c_str());
+
+        // Each clip's frames 5 to 54, one after the other, exported as MPEG-2 at a constant 20 Mb/s (its buffer then
+        // the 14,548,992 bits a vbv_delay can wait for). Each clip's whole GOPs are copied (three or more: FFmpeg starts
+        // a GOP at a scene cut in the open ones).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360, s.fps = Rational{25, 1};
+        MediaItem a = probeOrFail(p, vbrFile), b = probeOrFail(p, cbrFile);
+        p.media.push_back(a);
+        p.media.push_back(b);
+        QVERIFY(edit::placeMedia(p, s, a.id, 0, 5, 55, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, b.id, 50, 5, 55, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings ex;
+        ex.videoCodec = "mpeg2video";
+        ex.audioCodec = "none";
+        ex.pixFmt = "yuv420p";
+        ex.gop = 12;
+        ex.videoBitrate = 20000000;
+        ex.path = path("mpeg2-mixed-out.mov");
+        std::string err;
+        int copied = -1;
+        HrdReport after;
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied, nullptr, nullptr, &after), err.c_str());
+        QVERIFY2(copied >= 72 && copied < 100, qPrintable(QString::number(copied)));
+        // It decodes whole, with no errors.
+        int errors = -1;
+        QCOMPARE(decodedPictures(ex.path, errors), 100);
+        QCOMPARE(errors, 0);
+        // One sequence_end_code, where the mode changes: every picture before it says 0xFFFF, every one after it states
+        // its vbv_delay.
+        int ends = 0, before = 0, beforeDelays = 0, afterPictures = 0, afterDelays = 0;
+        for (const CodedPacket& c : codedPackets(ex.path)) {
+            const uint8_t* d = reinterpret_cast<const uint8_t*>(c.data.constData());
+            const size_t n = size_t(c.data.size());
+            for (size_t i = 0; i + 4 <= n; ++i) {
+                if (d[i] || d[i + 1] || d[i + 2] != 1) continue;
+                if (d[i + 3] == 0xb7) ++ends;  // (the last four bytes of a packet, after the picture it ends on)
+                if (d[i + 3] != 0x00 || i + 8 > n) continue;
+                const uint32_t v = uint32_t(d[i + 4]) << 24 | uint32_t(d[i + 5]) << 16 | uint32_t(d[i + 6]) << 8 | d[i + 7];
+                const bool delay = ((v >> 3) & 0xffff) != 0xffff;
+                if (ends == 0) ++before, beforeDelays += delay;
+                else ++afterPictures, afterDelays += delay;
+            }
+        }
+        QVERIFY2(ends == 1, qPrintable(QStringLiteral("%1 sequence ends; %2 of %3 pictures before the first state a delay, %4 of %5 after")
+                                           .arg(ends).arg(beforeDelays).arg(before).arg(afterDelays).arg(afterPictures)));
+        QVERIFY2(before >= 50 && before <= 57, qPrintable(QString::number(before)));
+        QCOMPARE(beforeDelays, 0);
+        QCOMPARE(before + afterPictures, 100);
+        QCOMPARE(afterDelays, afterPictures);
+        // The buffer check runs each sequence on its own, each in its own mode, and both hold; the export's own check
+        // found the same.
+        const HrdReport r = checkHrd(ex.path);
+        QVERIFY2(r.checked && r.signalled && r.frames == 100, r.summary().c_str());
+        QVERIFY2(r.note.find("2 sequences") != std::string::npos && r.note.find("1 at a constant rate, 1 at a variable one") != std::string::npos,
+                 r.note.c_str());
+        QCOMPARE(r.bitRate, 12000000.0);
+        QCOMPARE(r.bufferBits, 9781248.0);
+        QVERIFY2(r.conforms(), (r.summary() + " " + (r.issues.empty() ? std::string() : r.issues.front().text)).c_str());
+        QVERIFY2(after.checked && after.conforms(), after.summary().c_str());
+    }
+
     void chromaSitingOverride() {
         // 4:2:2 footage that does not say where its chroma sits: luma flat, Cb a ramp of one code a chroma sample
         // across, Cr flat. FFV1 in Matroska, written here with no chroma location.

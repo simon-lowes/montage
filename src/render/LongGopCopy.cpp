@@ -908,6 +908,11 @@ struct LongGopCopier::Copy {
     bool chained = false;  // after the copy of the GOP before it in the source, so decoded on from it
     bool standalone = true;  // decodes after any picture (else, chained, only after the GOP it follows)
     int64_t bytes = 0;
+    // MPEG-2: the GOP's own mode (0: every vbv_delay set, a constant rate; 1: 0xFFFF, a variable one) and, variable,
+    // the maximum rate and buffer its sequence header states
+    int mpegMode = -1;
+    double mpegRate = 0, mpegBuffer = 0;
+    bool closed = false;  // a closed GOP (nothing in it refers to a picture before it)
 };
 
 // The most a frame of footage may take to be copied: a tenth over the export's own rate; at a quality (CRF), half as
@@ -1309,11 +1314,12 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     std::vector<std::vector<uint8_t>> hrdSets;  // the stream's parameter sets, for the buffer model
     // Which GOPs are copied: wholly inside a run, and decodable where they land.
     FrameTime lastCopyEnd = -2;  // the last copied frame so far
-    // MPEG-2: the first GOP copied says how the stream is joined: at a constant rate (it states its vbv_delay), or at a
-    // variable one (0xFFFF) with the maximum rate and buffer its sequence header states. GOPs that say otherwise are
-    // encoded, so one stream never states two.
-    int mpegMode = -1;  // 0: a constant rate; 1: a variable one
-    double mpegRate = 0, mpegBuffer = 0;
+    // MPEG-2: each GOP copied keeps its own mode: a constant rate (it states its vbv_delay), or a variable one (0xFFFF)
+    // with the maximum rate and buffer its sequence header states. Where the mode changes the sequence is ended (a
+    // sequence_end_code) and the GOP starts one of its own, so no sequence states two; such a GOP must be closed (its
+    // leading B-pictures would refer to a picture the new sequence does not have).
+    int lastMode = -1;
+    double lastRate = 0, lastBuffer = 0;
     for (size_t ri = 0; ri < lg->runs_.size(); ++ri) {
         const Run& r = lg->runs_[ri];
         const int64_t s1 = r.s0 + r.len;
@@ -1353,12 +1359,14 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
             }
             if (ok && codec == kMpeg2) {
                 const bool variable = g.asked < 0;
+                c.mpegMode = variable ? 1 : 0, c.mpegRate = g.rate, c.mpegBuffer = g.buffer, c.closed = g.idr;
+                const bool another = lastMode >= 0 && (c.mpegMode != lastMode || (variable && (g.rate != lastRate || g.buffer != lastBuffer)));
                 if (variable && (g.rate <= 0 || g.buffer < 16384 || g.need > g.buffer)) {
                     ok = false;  // (no maximum stated to keep, or pictures its own buffer could not hold)
-                } else if (mpegMode < 0) {
-                    mpegMode = variable ? 1 : 0, mpegRate = g.rate, mpegBuffer = g.buffer;
-                } else if ((variable ? 1 : 0) != mpegMode || (variable && (g.rate != mpegRate || g.buffer != mpegBuffer))) {
-                    ok = false;
+                } else if (another && !g.idr) {
+                    ok = false;  // (an open GOP cannot start a sequence)
+                } else {
+                    lastMode = c.mpegMode, lastRate = g.rate, lastBuffer = g.buffer;
                 }
             }
             if (!ok) {
@@ -1493,20 +1501,14 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         }
         lg->hrdOn_ = lg->hrd_.start(codec, hrdSets, lg->lengthSize_, fps, lg->depth_);
         lg->hrdSps_ = mode.sps;
-    } else if (codec == kMpeg2 && mpegMode == 1) {
-        // A variable rate: the footage's stated maximum and buffer kept by every part, every vbv_delay 0xFFFF, and each
-        // copy asking for the bits its pictures need there (as seconds at the rate, what a constant rate's delay is).
-        lg->hrdOn_ = lg->hrd_.start(codec, {}, 0, fps, lg->depth_, mpegRate, mpegBuffer, false);
-        if (lg->hrdOn_)
-            for (Run& r : lg->runs_)
-                for (Gop& g : r.gops)
-                    if (g.asked < 0) g.asked = g.need / mpegRate, g.margin = 0;
-    } else if (codec == kMpeg2 && m->rc_max_rate > 0 && m->rc_max_rate == m->rc_min_rate && m->rc_buffer_size >= 16384) {
-        // (only footage that states its delays: a variable-rate source's 0xFFFF would be made into a constant-rate claim)
-        bool stated = true;
-        for (const Copy& c : lg->copies_) stated = stated && lg->runs_[size_t(c.run)].gops[c.gop].asked >= 0;
-        const double buffer = std::floor(double(m->rc_buffer_size) / 16384) * 16384;
-        if (stated) lg->hrdOn_ = lg->hrd_.start(codec, {}, 0, fps, lg->depth_, double(m->rc_max_rate), buffer);
+    } else if (codec == kMpeg2) {
+        // A variable rate's GOPs each ask for the bits their pictures need there (as seconds at their rate, what a
+        // constant rate's delay is). The first copy's sequence is the one the stream starts in.
+        for (const Copy& c : lg->copies_) {
+            Gop& g = lg->runs_[size_t(c.run)].gops[c.gop];
+            if (c.mpegMode == 1 && g.asked < 0) g.asked = g.need / g.rate, g.margin = 0;
+        }
+        lg->startMpeg2Sequence(lg->copies_.front());
     }
     if (lg->hrdOn_) {
         lg->hrdRate_ = lg->hrd_.bitRate(), lg->hrdBuffer_ = lg->hrd_.bufferBits();
@@ -1514,6 +1516,28 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     lg->pkt_ = av_packet_alloc();
     if (!lg->pkt_) return none("out of memory");
     return lg;
+}
+
+// MPEG-2: the buffer model of the sequence copy `c` starts: at a variable rate, the footage's stated maximum and buffer,
+// kept by every part, every vbv_delay 0xFFFF; at a constant one, the export's own rate and buffer (only when the export
+// is at a constant rate itself: a variable one's encoded parts would otherwise be given delays they were not made to).
+bool LongGopCopier::startMpeg2Sequence(const Copy& c) {
+    const AVCodecContext* m = enc_.main;
+    const double fps = m->framerate.num > 0 ? av_q2d(m->framerate) : 25.0;
+    hrd_ = HrdSplicer();
+    hrdOn_ = false;
+    if (c.mpegMode == 1) {
+        hrdOn_ = hrd_.start(kMpeg2, {}, 0, fps, depth_, c.mpegRate, c.mpegBuffer, false);
+    } else if (m->rc_max_rate > 0 && m->rc_max_rate == m->rc_min_rate && m->rc_buffer_size >= 16384) {
+        hrdOn_ = hrd_.start(kMpeg2, {}, 0, fps, depth_, double(m->rc_max_rate), std::floor(double(m->rc_buffer_size) / 16384) * 16384);
+    }
+    seqMode_ = c.mpegMode, seqRate_ = c.mpegRate, seqBuffer_ = c.mpegBuffer;
+    hrdRate_ = hrdOn_ ? hrd_.bitRate() : 0, hrdBuffer_ = hrdOn_ ? hrd_.bufferBits() : 0;
+    return hrdOn_;
+}
+
+bool LongGopCopier::sameSequence(const Copy& c) const {
+    return c.mpegMode == seqMode_ && (c.mpegMode != 1 || (c.mpegRate == seqRate_ && c.mpegBuffer == seqBuffer_));
 }
 
 bool LongGopCopier::prepareStream(std::string* error) {
@@ -1570,6 +1594,23 @@ bool LongGopCopier::prepareStream(std::string* error) {
 // ---- Writing ----
 
 bool LongGopCopier::write(AVPacket* pkt, FrameTime display, bool ours, std::string* error) {
+    if (!seqEnd_.empty()) {
+        // (MPEG-2: the sequence before ended, its last picture already written: the end code goes in front of this one)
+        std::vector<uint8_t> joined = std::move(seqEnd_);
+        seqEnd_.clear();
+        joined.insert(joined.end(), pkt->data, pkt->data + pkt->size);
+        AVPacket* out = av_packet_alloc();
+        if (!out || av_new_packet(out, int(joined.size())) < 0) {
+            av_packet_free(&out);
+            return fail(error, "Out of memory");
+        }
+        std::memcpy(out->data, joined.data(), joined.size());
+        out->flags = pkt->flags;
+        out->pts = pkt->pts, out->dts = pkt->dts, out->duration = pkt->duration;
+        const bool ok = write(out, display, ours, error);
+        av_packet_free(&out);
+        return ok;
+    }
     if (!hrdOn_) return writeFinal(pkt, display, error);
     // Through the buffer model: each access unit held until the next is known (its filler, before a join, depends on
     // what the next asks for), its picture timing and buffering period rewritten for its place.
@@ -1900,12 +1941,30 @@ int LongGopCopier::copy(FrameTime rel, std::string* error) {
         const Copy& here = copies_[cursor_];
         const bool join = !(here.chained && lastCopiedHi_ + 1 == here.lo);
         bool declined = false;
+        if (codec_ == kMpeg2 && !sameSequence(here)) {
+            // A GOP of another mode: the sequence so far is ended after its last picture (sequence_end_code), and the
+            // copy starts one of its own, its sequence header and buffer model its own. Only a closed GOP can (one
+            // planned after a GOP of its own mode that was not copied after all is encoded instead).
+            declined = !here.closed;
+            if (!declined) {
+                static const uint8_t kEnd[4] = {0, 0, 1, 0xb7};
+                if (hrdOn_ && hrd_.holding()) {
+                    int64_t shown = 0;
+                    std::vector<uint8_t> last = hrd_.finish(&shown);
+                    last.insert(last.end(), kEnd, kEnd + 4);
+                    if (!writeHeld(std::move(last), FrameTime(shown), error)) return -1;
+                } else {
+                    seqEnd_.assign(kEnd, kEnd + 4);  // (before the copy's first picture: what came before is written)
+                }
+                startMpeg2Sequence(here);
+            }
+        }
         if (hrdOn_ && join && !hvc1_ && hrd_.holding()) {
             const Gop& g = runs_[size_t(here.run)].gops[here.gop];
             double margin = g.margin;
             for (size_t n = cursor_ + 1; n < copies_.size() && copies_[n].chained && copies_[n].lo == copies_[n - 1].hi + 1; ++n)
                 margin = std::min(margin, runs_[size_t(copies_[n].run)].gops[copies_[n].gop].margin);
-            declined = g.asked >= 0 && hrd_.nextDelay() < g.asked - 0.8 * std::clamp(margin, 0.0, g.asked);
+            declined = declined || (g.asked >= 0 && hrd_.nextDelay() < g.asked - 0.8 * std::clamp(margin, 0.0, g.asked));
         }
         std::vector<AVPacket*> gop;
         const int got = declined ? 0 : readGop(copies_[cursor_], gop, error);

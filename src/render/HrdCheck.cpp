@@ -470,6 +470,8 @@ struct Mpeg2Picture {
     size_t start = 0;  // byte where its data begins (its sequence and GOP headers, if any)
     size_t psc = 0;    // byte after its picture start code
     int64_t vbvDelay = -1;
+    double bitRate = 0, buffer = 0;  // what the sequence header before it states
+    bool endsSequence = false;       // a sequence_end_code follows it (the next picture starts a sequence of its own)
     int structure = 3;  // 1 top field, 2 bottom, 3 frame
     bool repeatFirstField = false, topFieldFirst = false;
 };
@@ -505,6 +507,7 @@ void mpeg2Pictures(const uint8_t* d, size_t n, Mpeg2Stream& st, std::vector<Mpeg
             const uint32_t v = uint32_t(d[i + 4]) << 24 | uint32_t(d[i + 5]) << 16 | uint32_t(d[i + 6]) << 8 | d[i + 7];
             const int64_t delay = (v >> 3) & 0xffff;
             p.vbvDelay = delay == 0xffff ? -1 : delay;
+            p.bitRate = st.bitRate, p.buffer = st.buffer;
             out.push_back(p);
             haveStart = false;
         } else if (code == 0xb5 && i + 9 <= n) {
@@ -531,6 +534,8 @@ void mpeg2Pictures(const uint8_t* d, size_t n, Mpeg2Stream& st, std::vector<Mpeg
                 r.u(5);
                 out.back().repeatFirstField = r.flag();
             }
+        } else if (code == 0xb7 && !out.empty()) {
+            out.back().endsSequence = true;
         } else if (code > 0x00 && code <= 0xaf) {
             i += 3;  // (a slice: skipped to its data)
         }
@@ -1237,6 +1242,9 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
     r.checked = true;
 }
 
+void checkMpeg2Sequence(const std::vector<Mpeg2Picture>& pics, const std::vector<int64_t>& shown, size_t pos, double R, double B,
+                        bool progressiveSequence, double frame, HrdReport& r);
+
 void checkMpeg2(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<bool>* cancel) {
     Mpeg2Stream st;
     std::vector<Mpeg2Picture> pics;
@@ -1262,9 +1270,6 @@ void checkMpeg2(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<boo
     r.signalled = true;
     r.bitRate = st.bitRate;
     r.bufferBits = st.buffer;
-    bool cbr = true;
-    for (const Mpeg2Picture& p : pics) cbr = cbr && p.vbvDelay >= 0;
-    r.cbr = cbr;
     const AVStream* s = fmt->streams[v];
     const AVRational rate = s->avg_frame_rate.num > 0 ? s->avg_frame_rate : s->r_frame_rate;
     const double frame = rate.num > 0 ? av_q2d(av_inv_q(rate)) : 0.04;
@@ -1275,15 +1280,54 @@ void checkMpeg2(AVFormatContext* fmt, int v, HrdReport& r, const std::atomic<boo
         std::stable_sort(order.begin(), order.end());
         for (size_t i = 0; i < order.size(); ++i) shown[order[i].second] = int64_t(i);
     }
+    // A sequence_end_code ends a sequence: the next starts afresh with its own sequence header, its own rate, buffer and
+    // mode (every vbv_delay set, or every one 0xFFFF), and its first picture waits as its vbv_delay says (or, at a
+    // variable rate, until the buffer is full). Each sequence is checked on its own.
+    std::vector<size_t> starts{0};
+    for (size_t k = 0; k + 1 < pics.size(); ++k)
+        if (pics[k].endsSequence) starts.push_back(k + 1);
+    if (starts.size() == 1) {
+        checkMpeg2Sequence(pics, shown, pos, st.bitRate, st.buffer, st.progressiveSequence, frame, r);
+        return;
+    }
+    int constant = 0;
+    for (size_t q = 0; q < starts.size(); ++q) {
+        const size_t a = starts[q], b = q + 1 < starts.size() ? starts[q + 1] : pics.size();
+        const size_t base = pics[a].start, end = b < pics.size() ? pics[b].start : pos;
+        std::vector<Mpeg2Picture> part(pics.begin() + std::ptrdiff_t(a), pics.begin() + std::ptrdiff_t(b));
+        for (Mpeg2Picture& p : part) p.start -= base, p.psc -= base;
+        const std::vector<int64_t> partShown(shown.begin() + std::ptrdiff_t(a), shown.begin() + std::ptrdiff_t(b));
+        const double R = part[0].bitRate > 0 ? part[0].bitRate : st.bitRate, B = part[0].buffer > 0 ? part[0].buffer : st.buffer;
+        HrdReport one;
+        checkMpeg2Sequence(part, partShown, end - base, R, B, st.progressiveSequence, frame, one);
+        if (q == 0) r.bitRate = R, r.bufferBits = B, r.initialDelay = one.initialDelay, r.cbr = one.cbr;
+        r.cbr = r.cbr && one.cbr;
+        constant += one.cbr ? 1 : 0;
+        r.lowest = std::min(r.lowest, one.lowest), r.highest = std::max(r.highest, one.highest);
+        for (const HrdIssue& i : one.issues) addIssue(r, i.frame + int64_t(a), i.shown, i.kind.c_str(), i.text);
+        r.issueCount += one.issueCount - int64_t(one.issues.size());
+    }
+    r.note = format("%.0f sequences, each checked on its own from its own sequence header: %.0f at a constant rate, %.0f at a variable one",
+                    double(starts.size()), double(constant), double(starts.size()) - constant);
+    r.frames = int64_t(pics.size());
+    r.checked = true;
+}
+
+// One MPEG-2 sequence's pictures (their bytes counted from the sequence's first, `pos` of them in all) through its VBV
+// at rate `R` into buffer `B`.
+void checkMpeg2Sequence(const std::vector<Mpeg2Picture>& pics, const std::vector<int64_t>& shown, size_t pos, double R, double B,
+                        bool progressiveSequence, double frame, HrdReport& r) {
+    bool cbr = true;
+    for (const Mpeg2Picture& p : pics) cbr = cbr && p.vbvDelay >= 0;
+    r.cbr = cbr;
     // Removal times one picture's display apart, in decoding order (a field picture half a frame; a repeated field half again).
     const size_t n = pics.size();
     std::vector<double> removal(n);
     auto lasts = [&](const Mpeg2Picture& p) {
         if (p.structure != 3) return frame / 2;
         if (!p.repeatFirstField) return frame;
-        return st.progressiveSequence ? frame * (p.topFieldFirst ? 3 : 2) : frame * 1.5;
+        return progressiveSequence ? frame * (p.topFieldFirst ? 3 : 2) : frame * 1.5;
     };
-    const double R = st.bitRate, B = st.buffer;
     std::vector<double> end(n);  // bits up to the end of each picture's data
     for (size_t k = 0; k < n; ++k) end[k] = k + 1 < n ? double(pics[k + 1].start) * 8 : double(pos) * 8;
     if (cbr) {
