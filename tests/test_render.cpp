@@ -31055,6 +31055,46 @@ colorspaces:
                 QVERIFY(!came && !err.empty());
             }
             plugins::clearHostFailures();
+            // Nightly 25 Nov: a host that hangs while its picture was to come as a handle (stopped where it asks for the
+            // frame before, and waited for as long as this test's export timeout): no handle is asked for from then on,
+            // but the frame is not rendered again in a new host, which would wait out a second timeout; it fails, and
+            // says the host did not answer.
+            {
+                ofx::remote::resetPictureStats();
+                const plugins::HostingSettings was = plugins::hosting();
+                plugins::HostingSettings quick = was;
+                quick.exportTimeoutMs = 2000;
+                plugins::setHosting(quick);
+                pid_t stopped = 0;
+                const ofx::FrameFetch stopping = [&](double, Image& out) {
+                    if (!stopped)
+                        for (const plugins::HostInfo& running : plugins::runningHosts())
+                            if (running.key.find("temporal") != std::string::npos && running.pid > 0 && ::kill(pid_t(running.pid), SIGSTOP) == 0)
+                                stopped = pid_t(running.pid);
+                    out = numbered(8);
+                    return true;
+                };
+                there = numbered(9);
+                err.clear();
+                const bool came = ofx::applyEffect(slow, 9, there, 1.0, stopping, &err);
+                if (stopped > 0) ::kill(stopped, SIGKILL);  // (ended already, as hung)
+                QVERIFY(stopped > 0);
+                QVERIFY2(!came && QString::fromStdString(err).contains("did not answer"), err.c_str());
+                const ofx::remote::PictureStats now = ofx::remote::pictureStats();
+                if (now.asked > 0) {
+                    QCOMPARE(now.handles, 0L);
+                    QCOMPARE(now.sharedMemory, 0L);  // (not rendered again)
+                    there = numbered(10);
+                    QVERIFY2(ofx::applyEffect(slow, 10, there, 1.0, [&](double, Image& out) { return out = numbered(9), true; }, &err), err.c_str());
+                    QCOMPARE(ofx::remote::pictureStats().asked, now.asked);
+                    QVERIFY2(QString::fromStdString(ofx::remote::pictureStats().last).contains("hung while the picture was shared as a handle"),
+                             ofx::remote::pictureStats().last.c_str());
+                } else {
+                    QVERIFY(!expected);
+                }
+                plugins::setHosting(was);
+                plugins::clearHostFailures();
+            }
 #endif
         }
     }
