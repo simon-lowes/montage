@@ -2,7 +2,8 @@
 # Runs the HDR viewer under Weston (scripts/build-weston.sh): headless, its GL renderer, one 1280x720 output, the kiosk
 # shell. Three times: with colour management on and the output driven as BT.2100 PQ (BT.2020, reference white 203
 # nits, a 1000-nit target), where test_app's hdrViewerOnWayland checks the surface's description in Weston's protocol
-# log, its 10-bit buffers, the surface's own pixels and the PQ codes in Weston's screenshot; with colour management on
+# log, its 10-bit buffers, the surface's own pixels and the PQ codes in Weston's screenshot, and liveHdrOnWayland the
+# PQ codes of a live BT.2100 PQ ST 2110 feed on the Source monitor in Weston's screenshot; with colour management on
 # and an SDR output, where a viewer that reads what the compositor prefers stays SDR and says the display is not HDR
 # (one described by Qt is shown, fitted by Weston); then with colour management off, where the viewer stays SDR and
 # says why. Every run first checks Weston's screenshot of the SDR viewer. A skipped test fails the check, and so does a
@@ -117,10 +118,13 @@ run() {  # name color-management(true: a PQ output|sdr: an SDR output|false: off
   fi
   echo "::group::$name"
   local status=0
+  # (with the PQ output, the live HDR feed on the Source monitor too: liveHdrOnWayland)
+  local fns="hdrViewerOnWayland"
+  [ "$cm" = true ] && fns="$fns liveHdrOnWayland"
   WAYLAND_DISPLAY="$socket" QT_QPA_PLATFORM=wayland QT_WAYLAND_DISABLE_WINDOWDECORATION=1 QTEST_FUNCTION_TIMEOUT=900000 \
     MONTAGE_TEST_WESTON_LOG="$dir/weston.log" MONTAGE_TEST_WESTON_CM="$cm" XDG_PICTURES_DIR="$dir/shots" \
     MONTAGE_TEST_WESTON_SCREENSHOOTER="$work/screenshooter" QT_LOGGING_RULES="qt.rhi.general=true" \
-    "$test_app" hdrViewerOnWayland -o "$dir/result.txt,txt" -o -,txt || status=1
+    "$test_app" $fns -o "$dir/result.txt,txt" -o -,txt || status=1
   echo "::endgroup::"
   if grep -q '^SKIP' "$dir/result.txt" 2> /dev/null; then
     grep '^SKIP' -A1 "$dir/result.txt"
@@ -144,7 +148,7 @@ run() {  # name color-management(true: a PQ output|sdr: an SDR output|false: off
   fi
   weston=""
   if [ "$status" != 0 ]; then
-    echo "hdrViewerOnWayland failed with colour management $cm; Weston's log:" >&2
+    echo "$fns failed with colour management $cm; Weston's log:" >&2
     grep -v ' -> \| client ' "$dir/weston.log" | tail -200 >&2 || true
     grep -E 'color|image_description|create_buffer|create_immed|\.create\(' "$dir/weston.log" | tail -60 >&2 || true
     echo "The last of Weston's protocol log:" >&2

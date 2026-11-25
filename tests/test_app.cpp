@@ -4418,6 +4418,152 @@ private slots:
         QCOMPARE(panelSizes(), sizesWere);
     }
 
+    // The same HDR feed live on the Source monitor under Weston with a BT.2100 PQ output (scripts/wayland-hdr-check.sh's
+    // "on" run, in CI): the window shown by the kiosk shell, the multiviewer that took the feed hidden, the monitor's
+    // HDR viewer on. Weston's screenshot of the monitor's picture is each grey's PQ code: the 203-nit grey within 2, the
+    // 1000-nit one within 4 (at the output's peak), as the HDR picture the monitor was given says.
+    void liveHdrOnWayland() {
+        const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
+        if (log.isEmpty() || qEnvironmentVariable("MONTAGE_TEST_WESTON_CM") != QLatin1String("true") ||
+            !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
+            QSKIP("Runs under Weston with a PQ output (scripts/wayland-hdr-check.sh)");
+#ifndef MONTAGE_HDR_VIEWER
+        QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
+#else
+        namespace st = st2110;
+        QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
+        state()->newProject();
+        int ports[3];
+        {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.ttl = 1;
+        const int W = 1280, H = 720;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        v.colorimetry = "BT2100", v.tcs = "PQ";
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        const double nits[2] = {203, 1000};
+        st::Raster raster(W, H, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < H; ++y) {
+            uint16_t* d = raster.row(y);
+            for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = uint16_t(std::lround(64 + 876 * fromLinear(Transfer::Pq, nits[x < W / 2 ? 0 : 1] / 203)));
+        }
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            const std::vector<float> sound(1920 * 2, 0.0f);
+            for (int t = 0; !stop && t < 25 * 300; ++t) {
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                if (!tx.send(raster, sound.data(), 1920, &tc, {}, &stop)) break;
+            }
+        });
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        MonitorPanel* source = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Source) source = m;
+        auto* playback = win_->findChild<PlaybackController*>("sourcePlayback");
+        QVERIFY(source && playback);
+        ViewerWidget* viewer = source->viewer();
+        Multiviewer* mv = win_->multiviewer();
+        const bool hdrWas = playback->hdrOutput(), viewerWas = viewer->hdrViewer();
+        auto finish = qScopeGuard([&] {
+            stop = true;
+            sending.join();
+            tx.close();
+            call({{"action", "live"}, {"watch", false}});
+            mv->clear();
+            mv->hide();
+            viewer->setHdrViewer(false);
+            source->setHdrViewer(viewerWas);
+            playback->setHdrOutput(hdrWas);
+            for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+                if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
+        });
+        QJsonObject r = call({{"action", "multiview"},
+                              {"inputs", QJsonArray{QJsonObject{{"label", "HDR cam"}, {"kind", "st2110"},
+                                                                {"url", QString::fromStdString(tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc())}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 5, 60000);
+        r = call({{"action", "live"}, {"input", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(source->liveShowing());
+        // (the kiosk shell shows the window last mapped: the multiviewer goes, and the main window is shown)
+        mv->hide();
+        win_->show();
+        win_->raise();
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowExposed(win_.get()));
+        playback->setHdrOutput(true);
+        source->setHdrViewer(true);
+        viewer->setHdrViewer(true);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer->hdrShowing(), qPrintable(viewer->hdrStatus()), 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->hdrPicture() && viewer->hdrPicture()->transfer == Transfer::Pq, 30000);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer->hdrSurface() && viewer->hdrSurface()->framesDrawn() > 0, qPrintable(viewer->hdrStatus()), 10000);
+        // What each grey is to be on the output: the monitor's HDR picture there, as the surface's signal.
+        const HdrPicturePtr pic = viewer->hdrPicture();
+        int expect[2];
+        for (int side = 0; side < 2; ++side) {
+            float px[4];
+            const size_t at = size_t(pic->height / 2) * size_t(pic->width) + size_t(pic->width / 4 + side * pic->width / 2);
+            qFloatFromFloat16(px, reinterpret_cast<const qfloat16*>(&pic->rgba[at * 4]), 4);
+            QVERIFY2(std::fabs(px[1] / (nits[side] / 203) - 1) < 0.04, qPrintable(QString::number(px[1])));
+            hdrSurfaceSignal(px, Transfer::Pq);
+            expect[side] = int(std::lround(px[1] * 255));
+        }
+        const QString shooter = qEnvironmentVariable("MONTAGE_TEST_WESTON_SCREENSHOOTER");
+        const QDir shots(qEnvironmentVariable("XDG_PICTURES_DIR"));
+        QVERIFY2(!shooter.isEmpty() && shots.exists(), "MONTAGE_TEST_WESTON_SCREENSHOOTER or XDG_PICTURES_DIR is not set");
+        QString said;
+        bool right = false;
+        for (int attempt = 0; attempt < 6 && !right; ++attempt) {  // (until the monitor has painted and Weston repainted)
+            QTest::qWait(500);
+            QVERIFY2(QProcess::execute(shooter, {}) == 0, "Weston's screenshooter failed");
+            const QStringList pngs = shots.entryList({QStringLiteral("wayland-screenshot-*.png")}, QDir::Files, QDir::Time);
+            QVERIFY2(!pngs.isEmpty(), "Weston's screenshooter wrote no picture");
+            const QImage shot = QImage(shots.filePath(pngs.first())).convertToFormat(QImage::Format_RGB32);
+            QVERIFY2(!shot.isNull(), "Weston's screenshot cannot be read");
+            QFile::remove(shots.filePath(QStringLiteral("live.png")));
+            QFile::rename(shots.filePath(pngs.first()), shots.filePath(QStringLiteral("live.png")));
+            const QRectF rect = viewer->imageRect().translated(QPointF(viewer->mapTo(viewer->window(), QPoint(0, 0))));
+            right = true;
+            QStringList got;
+            for (int side = 0; side < 2; ++side) {
+                const QPoint at(int(rect.left() + (side ? 0.75 : 0.25) * rect.width()), int(rect.center().y()));
+                if (!shot.rect().contains(at)) {
+                    right = false;
+                    got << QStringLiteral("%1,%2 is off the screenshot").arg(at.x()).arg(at.y());
+                    continue;
+                }
+                const QRgb px = shot.pixel(at);
+                const int within = side ? 4 : 2;
+                if (std::abs(qRed(px) - expect[side]) > within || std::abs(qGreen(px) - expect[side]) > within ||
+                    std::abs(qBlue(px) - expect[side]) > within)
+                    right = false;
+                got << QStringLiteral("%1 nits at %2,%3: %4 %5 %6, expected %7").arg(nits[side]).arg(at.x()).arg(at.y())
+                           .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect[side]);
+            }
+            said = got.join(QStringLiteral("; "));
+        }
+        qInfo().noquote() << "Weston's screenshot of the live feed:" << said;
+        QVERIFY2(right, qPrintable(said));
+#endif
+    }
+
     // Tangent panels through a stand-in Tangent Hub: introduced, the controls file written, turns, resets and value
     // requests answered on the graded clip's Color Correct (a run of turns one undo step), the node menu, the jog
     // wheel and a menu command.
