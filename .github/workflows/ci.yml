@@ -303,6 +303,10 @@ jobs:
       - name: Test
         env:
           MONTAGE_REQUIRE_FIREFOX: "1"  # (the runner's Firefox and geckodriver: the browser review test fails rather than skips without them)
+          # Qt's Linguist tools (Ubuntu's qt6-l10n-tools, installed by the set-up script) give the tests lupdate as
+          # MONTAGE_TEST_LUPDATE (tests/CMakeLists.txt): a tr() text missing from translations/*.ts fails
+          # everyTranslatableTextIsFound, which fails rather than skips here without lupdate.
+          MONTAGE_REQUIRE_LUPDATE: "1"
           MONTAGE_REQUIRE_IPV6: "1"     # (the relay tests' ::1 rows fail rather than skip without an IPv6 loopback)
         run: ctest --test-dir build --output-on-failure
       - name: The window read over AT-SPI, as a screen reader on Linux reads it

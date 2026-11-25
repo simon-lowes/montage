@@ -27116,6 +27116,8 @@ print("added " + ui["name"])
     void everyTranslatableTextIsFound() {
         // lupdate finds every tr() text in the interface, each under the name Montage asks for it by.
         const QByteArray lupdate = qgetenv("MONTAGE_TEST_LUPDATE");
+        // (CI's Linux job sets MONTAGE_REQUIRE_LUPDATE, so the check fails there rather than skips without lupdate)
+        if (lupdate.isEmpty() && qEnvironmentVariableIsSet("MONTAGE_REQUIRE_LUPDATE")) QFAIL("MONTAGE_TEST_LUPDATE (Qt's lupdate) is not set");
         if (lupdate.isEmpty()) QSKIP("MONTAGE_TEST_LUPDATE (Qt's lupdate) is not set");
         const QString src = QStringLiteral(MONTAGE_SOURCE_DIR "/src");
         const QString ts = dir_.filePath("found.ts");
@@ -27162,6 +27164,36 @@ print("added " + ui["name"])
         }
         QVERIFY(checked > 4000);
         QVERIFY2(missing.isEmpty(), qPrintable(missing.mid(0, 20).join('\n')));
+        // Each translation file holds every text lupdate finds, under its class: a text added without running
+        // lupdate (cmake --build build --target montage_lupdate) fails here.
+        auto messages = [](const QString& path) {
+            QSet<QString> out;
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) return out;
+            QXmlStreamReader r(&file);
+            QString context;
+            while (!r.atEnd()) {
+                r.readNext();
+                if (!r.isStartElement()) continue;
+                if (r.name() == QLatin1String("name")) context = r.readElementText();
+                else if (r.name() == QLatin1String("source")) out.insert(context + QChar(0) + r.readElementText());
+            }
+            return out;
+        };
+        const QSet<QString> wanted = messages(ts);
+        QVERIFY(wanted.size() > 4000);
+        const QDir translations(QStringLiteral(MONTAGE_SOURCE_DIR "/translations"));
+        const QStringList files = translations.entryList({QStringLiteral("montage_*.ts")}, QDir::Files);
+        QVERIFY(files.size() >= 7);
+        for (const QString& name : files) {
+            const QSet<QString> held = messages(translations.filePath(name));
+            QStringList absent;
+            for (const QString& m : wanted)
+                if (!held.contains(m)) absent << QString(m).replace(QChar(0), QLatin1String(": "));
+            absent.sort();
+            QVERIFY2(absent.isEmpty(), qPrintable(name + QStringLiteral(" lacks %1 texts, run montage_lupdate:\n").arg(absent.size()) +
+                                                  absent.mid(0, 20).join('\n')));
+        }
     }
 
     void remoteGradingBothWays() {

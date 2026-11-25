@@ -5989,10 +5989,6 @@
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Focus Distance (0: the card&apos;s middle)</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Frame Held (sequence frame)</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6646,6 +6642,34 @@
     </message>
     <message>
         <source>While Editing, Draw</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cast Shadows (in the 3D layers&apos; scene)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Focus Distance (0: the scene&apos;s middle depth)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Focus Distance 0 Focuses on the Scene</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Follow Speed Changes and Time Remapping</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shutter Phase (°)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stand in the 3D Layers&apos; Scene</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Samples (0: Auto)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -11895,6 +11919,49 @@ moved or muted, its keyframes are made again as part of that edit. A keyframe yo
     </message>
 </context>
 <context>
+    <name>montage::EncodeFolderJobs</name>
+    <message>
+        <source>Encoding %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Encode Folders</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each file that lands in one of these folders is encoded with its preset into its output folder once it has stopped growing, as a background job. Each file is encoded once, also after a restart.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Folder</source>
+        <translation type="unfinished">Ordner</translation>
+    </message>
+    <message>
+        <source>Preset</source>
+        <translation type="unfinished">Voreinstellung</translation>
+    </message>
+    <message>
+        <source>Output folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Folder…</source>
+        <translation type="unfinished">Ordner hinzufügen…</translation>
+    </message>
+    <message>
+        <source>Remove</source>
+        <translation type="unfinished">Entfernen</translation>
+    </message>
+    <message>
+        <source>Folder to Encode From</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Folder to Encode Into</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>montage::EqDisplay</name>
     <message>
         <source>Bell</source>
@@ -13196,10 +13263,6 @@ Do you want to replace it?</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>States a buffer model (HRD) in H.264 or H.265 video, as broadcast ingest checks it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set above. The export is checked against it when it is written.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source> kbit/s</source>
         <translation type="unfinished"></translation>
     </message>
@@ -13297,6 +13360,30 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>PNG depth:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>States a buffer model (HRD) in H.264 or H.265 video, or sets MPEG-2&apos;s (its VBV), as broadcast ingest checks it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set above. The export is checked against it when it is written.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>XDCAM HD422&apos;s own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>XDCAM HD422&apos;s buffer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, a VBV buffer MPEG-2 cannot state at this rate (16 to %1 kbit)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, a constant %1 kbit/s with its VBV stated (%2 kbit)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, no more than %1 kbit/s with its VBV stated (%2 kbit)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -16168,6 +16255,66 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>%1 Path</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stretch Keyframes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Exponential</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Logarithmic</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sine</source>
+        <translation type="unfinished">Sinus</translation>
+    </message>
+    <message>
+        <source>Circular</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Back (Overshoot)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Elastic</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Bounce</source>
+        <translation type="unfinished">Bounce</translation>
+    </message>
+    <message>
+        <source>%1 In</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 Out</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 In and Out</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Easing Curve</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In</source>
+        <translation type="unfinished">In</translation>
+    </message>
+    <message>
+        <source>Out</source>
+        <translation type="unfinished">Aus</translation>
+    </message>
+    <message>
+        <source>In and Out</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -22597,10 +22744,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished">FCPXML exportieren</translation>
     </message>
     <message>
-        <source>FCPXML (*.fcpxml)</source>
-        <translation type="unfinished">FCPXML (*.fcpxml)</translation>
-    </message>
-    <message>
         <source>Exported %1</source>
         <translation type="unfinished">%1 exportiert</translation>
     </message>
@@ -23928,6 +24071,14 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     </message>
     <message>
         <source>The events document as JSON instead of XML; a supplemental keeps the earlier package&apos;s form</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Encode Folders…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>FCPXML 1.15 (*.fcpxml);;FCPXML 1.10 (*.fcpxml)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -31140,6 +31291,15 @@ exports tell decoders to (with the downmix a decoder should prefer)</source>
         <source>Production:</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>The shutter new transforms, Motion Blurs and titles&apos; letters are blurred through, in degrees
+of a frame (180° is open for half of it)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shutter angle:</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::ShotSearchPanel</name>
@@ -31972,6 +32132,61 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
 </context>
 <context>
+    <name>montage::StillEditor</name>
+    <message>
+        <source>Only a still from a file can be edited in another application</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose the application for stills first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not make the folder %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not copy %1 to edit it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not start %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not keep the saved still as %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edit in Another Application</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not update the still: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Updated %1 from %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose Application for Stills</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edit in Another Application…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not edit the still: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose Application for Stills…</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>montage::StoryboardView</name>
     <message>
         <source>Arrange Storyboard</source>
@@ -32658,6 +32873,22 @@ Right-click: width, LFE, height and audio object.</source>
     </message>
     <message>
         <source>Colour Track&apos;s Clips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Easing Curve</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In</source>
+        <translation type="unfinished">In</translation>
+    </message>
+    <message>
+        <source>Out</source>
+        <translation type="unfinished">Aus</translation>
+    </message>
+    <message>
+        <source>In and Out</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
