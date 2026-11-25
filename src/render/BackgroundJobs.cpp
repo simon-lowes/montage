@@ -17,6 +17,15 @@
 
 #include "core/ProjectLock.h"
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#endif
+
 namespace montage::jobs {
 
 namespace {
@@ -130,8 +139,9 @@ bool save(Record r, const QString& folder) {
     r.updated = now;
     const QByteArray text = QJsonDocument(toJson(r)).toJson(QJsonDocument::Indented);
     // (tried again for up to two seconds when only putting it in place failed: on Windows a record cannot be replaced
-    // while another reader has it open, as a job list or a second Montage reading the store does for a moment. A write
-    // that fails, a full disk say, is not tried again: the GUI saves its running jobs every second.)
+    // while a reader that does not share its deletion has it open, as another program might. Montage's own readers
+    // share it (openRecord), so a job list or a second Montage reading the store holds no save up. A write that fails,
+    // a full disk say, is not tried again: the GUI saves its running jobs every second.)
     for (int attempt = 0; attempt < 400; ++attempt) {
         QSaveFile f(dir + QStringLiteral("/job.json"));
         if (!f.open(QIODevice::WriteOnly)) return false;
@@ -147,9 +157,31 @@ bool save(Record r, const QString& folder) {
     return false;
 }
 
+bool openRecord(QFile& f, const QString& path) {
+#ifdef Q_OS_WIN
+    const QString native = QDir::toNativeSeparators(path);
+    const HANDLE h = CreateFileW(reinterpret_cast<const wchar_t*>(native.utf16()), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const int fd = _open_osfhandle(intptr_t(h), _O_RDONLY | _O_BINARY);
+    if (fd < 0) {
+        CloseHandle(h);
+        return false;
+    }
+    if (!f.open(fd, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle)) {
+        _close(fd);
+        return false;
+    }
+    return true;
+#else
+    f.setFileName(path);
+    return f.open(QIODevice::ReadOnly);
+#endif
+}
+
 bool load(const QString& id, Record& r, const QString& folder) {
-    QFile f(jobFolder(id, folder) + QStringLiteral("/job.json"));
-    if (!f.open(QIODevice::ReadOnly)) return false;
+    QFile f;
+    if (!openRecord(f, jobFolder(id, folder) + QStringLiteral("/job.json"))) return false;
     const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
     if (!doc.isObject()) return false;
     r = fromJson(doc.object());
@@ -189,8 +221,8 @@ int prune(const QString& owner, int keep, const QString& folder) {
         const QFileInfo record(d.filePath() + QStringLiteral("/job.json"));
         if (record.exists() && record.lastModified().toUTC() > dayAgo) continue;
         if (record.exists()) {
-            QFile f(record.filePath());
-            if (!f.open(QIODevice::ReadOnly)) continue;
+            QFile f;
+            if (!openRecord(f, record.filePath())) continue;
             const QByteArray bytes = f.readAll();
             if (f.error() != QFileDevice::NoError || bytes.size() < f.size()) continue;
             if (QJsonDocument::fromJson(bytes).isObject()) continue;  // (a record: listed, and pruned below if done)

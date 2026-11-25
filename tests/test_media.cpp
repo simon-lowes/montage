@@ -22892,6 +22892,27 @@ if __name__ == '__main__':
 #ifndef Q_OS_WIN
         QVERIFY2(t.elapsed() < 500, qPrintable(QString::number(t.elapsed())));
 #endif
+        // A record open in a reader as the store reads it (a job list, a second Montage) is replaced at once, not
+        // waited for (on Windows it was tried again for up to two seconds): the reader reads on from the old one.
+        {
+            jobs::Record first;
+            first.id = "read";
+            first.owner = "test";
+            first.status = "running";
+            QVERIFY(jobs::save(first, store.path()));
+            QFile reader;
+            QVERIFY(jobs::openRecord(reader, store.filePath("read/job.json")));
+            const QByteArray start = reader.read(8);
+            first.status = "done";
+            t.restart();
+            QVERIFY(jobs::save(first, store.path()));
+            QVERIFY2(t.elapsed() < 200, qPrintable(QString::number(t.elapsed())));
+            QVERIFY(QJsonDocument::fromJson(start + reader.readAll()).object().value("status").toString() == "running");
+            reader.close();
+            jobs::Record back;
+            QVERIFY(jobs::load("read", back, store.path()) && back.status == "done");
+            QVERIFY(jobs::remove("read", store.path()));
+        }
         // Orphans: no record, a damaged one, both two days old, and a fresh one with no record yet; a finished job.
         const auto age = [&](const QString& path) { QVERIFY2(makeOlder(path, 48), qPrintable(path)); };
         QVERIFY(QDir().mkpath(store.filePath("empty")));
