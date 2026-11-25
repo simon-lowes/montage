@@ -67,6 +67,7 @@
 #include <QUdpSocket>
 #include <QTreeView>
 #include <QTreeWidget>
+#include <QScreen>
 #include <QJsonObject>
 #include <QJsonDocument>
 #include "core/ProjectLock.h"
@@ -25232,6 +25233,142 @@ print("added " + ui["name"])
             const QString hlgBars = bars(QStringLiteral("hlg.png"));
             QVERIFY2(hlgBars.isEmpty(), qPrintable(hlgBars));
         }
+#endif
+    }
+
+    void hdrViewerOnTwoOutputs() {
+        // Under a nested Weston with two outputs (scripts/wayland-hdr-check.sh's "two" run, in CI): Weston on its
+        // Wayland backend in an outer Weston, with its desktop shell and colour management, its output wayland0 SDR
+        // (1280x640) and wayland1 BT.2100 PQ (1024x720, reference white 203 nits, peak 1000). The viewer's window goes
+        // full screen on the SDR output, then on the PQ one, then on the SDR one again, as when a user moves it from
+        // one display to the other. Each time Weston's protocol log has Montage's surface entering that output, and the
+        // viewer is SDR and says why on the SDR output, and shows HDR, described anew as PQ, on the PQ one.
+        const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
+        if (log.isEmpty() || qEnvironmentVariable("MONTAGE_TEST_WESTON_CM") != QLatin1String("two") ||
+            !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
+            QSKIP("Runs under a nested Weston with two outputs (scripts/wayland-hdr-check.sh)");
+#ifndef MONTAGE_HDR_VIEWER
+        QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
+#else
+        QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
+        const bool throughQt = hdrViewerOnWaylandThroughQt();
+        QScreen* sdrScreen = nullptr;
+        QScreen* pqScreen = nullptr;
+        QStringList names;
+        for (QScreen* s : QGuiApplication::screens()) {
+            names << s->name();
+            if (s->name() == QLatin1String("wayland0")) sdrScreen = s;
+            if (s->name() == QLatin1String("wayland1")) pqScreen = s;
+        }
+        QVERIFY2(sdrScreen && pqScreen, qPrintable(names.join(QStringLiteral(", "))));
+        QCOMPARE(sdrScreen->size(), QSize(1280, 640));
+        QCOMPARE(pqScreen->size(), QSize(1024, 720));
+        // Montage's lines of the protocol log (the desktop shell's own client is in it too), from a byte offset on.
+        const QByteArray pid = QStringLiteral("(PID %1)").arg(QCoreApplication::applicationPid()).toLatin1();
+        auto ours = [&](qint64 from) {
+            QList<QByteArray> lines;
+            QFile f(log);
+            if (!f.open(QIODevice::ReadOnly) || !f.seek(from)) return lines;
+            for (const QByteArray& line : f.readAll().split('\n'))
+                if (line.contains(pid)) lines << line;
+            return lines;
+        };
+        auto logEnd = [&] { return QFileInfo(log).size(); };
+        // The wl_output Montage has for an output, from its name event.
+        auto output = [&](const char* name) {
+            const QByteArray said = QByteArray(".name(\"") + name + "\")";
+            for (const QByteArray& line : ours(0)) {
+                const qsizetype at = line.indexOf(" ev wl_output@");
+                if (at >= 0 && line.contains(said)) return line.mid(at + 4, line.indexOf('.', at) - at - 4);
+            }
+            return QByteArray();
+        };
+        auto said = [&](qint64 from, const QByteArray& what) {
+            for (const QByteArray& line : ours(from))
+                if (line.contains(what)) return true;
+            return false;
+        };
+        // `then` said after `first`.
+        auto saidAfter = [&](qint64 from, const QByteArray& first, const QByteArray& then) {
+            bool seen = false;
+            for (const QByteArray& line : ours(from)) {
+                if (seen && line.contains(then)) return true;
+                seen = seen || line.contains(first);
+            }
+            return false;
+        };
+        QByteArray sdrOutput, pqOutput;
+        QTRY_VERIFY(!(sdrOutput = output("wayland0")).isEmpty() && !(pqOutput = output("wayland1")).isEmpty());
+        qInfo().noquote() << "Montage's outputs:" << sdrOutput << "(SDR)," << pqOutput << "(PQ)";
+
+        win_->hide();
+        auto restore = qScopeGuard([this] { win_->show(); });
+        ViewerWidget viewer;
+        viewer.resize(640, 360);  // (its size when not full screen)
+        viewer.winId();
+        viewer.windowHandle()->setScreen(sdrScreen);
+        qint64 from = logEnd();
+        viewer.showFullScreen();
+        QVERIFY(QTest::qWaitForWindowExposed(&viewer));
+        QTRY_COMPARE_WITH_TIMEOUT(viewer.size(), sdrScreen->size(), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(said(from, ".enter(" + sdrOutput + ")"), "Montage's window did not enter the SDR output", 10000);
+        QImage sdr(viewer.size(), QImage::Format_RGBA8888);
+        sdr.fill(QColor(90, 90, 90));
+        viewer.setImage(sdr, 0);
+        // A PQ grey ramp from a sequence mastered at 800 nits on a BT.2020 display, as hdrViewerOnWayland's.
+        auto ramp = std::make_shared<HdrPicture>();
+        ramp->width = 64, ramp->height = 8;
+        ramp->contentPeak = 800.0 / 203;
+        ramp->maxCll = 800, ramp->maxFall = 200;
+        ramp->mastering = hdrMasteringPrimaries(*findColorSpace("rec2100pq"));
+        std::vector<float> texels(size_t(ramp->width) * size_t(ramp->height) * 4);
+        for (size_t i = 0; i < texels.size(); i += 4) {
+            const double nits[8] = {0, 5, 20, 50, 100, 203, 400, 800};
+            texels[i] = texels[i + 1] = texels[i + 2] = float(nits[(i / 4) % size_t(ramp->width) / 8] / 203);
+            texels[i + 3] = 1;
+        }
+        ramp->rgba.resize(texels.size());
+        qFloatToFloat16(reinterpret_cast<qfloat16*>(ramp->rgba.data()), texels.data(), qsizetype(texels.size()));
+        viewer.setHdrViewer(true);
+        viewer.setHdrPicture(ramp);
+        auto onSdr = [&] {
+            if (throughQt) {
+                // (Qt reads nothing back: its surface is PQ on an SDR output too, which Weston fits to the output)
+                QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
+                return;
+            }
+            QTRY_VERIFY2_WITH_TIMEOUT(!viewer.hdrStatus().isEmpty(), "still HDR on the SDR output", 10000);
+            QVERIFY(!viewer.hdrShowing());
+            QCOMPARE(viewer.hdrStatus(), QStringLiteral("This display does not show HDR"));
+            QCOMPARE(viewer.hdrHeadroom(), 1.0);
+        };
+        onSdr();
+        // Out of full screen (Weston's answer taken), then full screen on the other output, as Qt asks for it there.
+        auto moveTo = [&](QScreen* screen, const QByteArray& wlOutput, const char* what) {
+            const qint64 before = logEnd();
+            viewer.showNormal();
+            QTRY_VERIFY2_WITH_TIMEOUT(saidAfter(before, ".unset_fullscreen()", ".ack_configure("),
+                                      "Weston did not take the window out of full screen", 10000);
+            from = logEnd();
+            viewer.windowHandle()->setScreen(screen);
+            viewer.showFullScreen();
+            QTRY_COMPARE_WITH_TIMEOUT(viewer.size(), screen->size(), 10000);
+            QVERIFY2(said(from, ".set_fullscreen(" + wlOutput + ")"), what);
+            // (already there out of full screen, if Weston put it there: entered since it left full screen)
+            QTRY_VERIFY2_WITH_TIMEOUT(said(before, ".enter(" + wlOutput + ")"), what, 10000);
+        };
+        moveTo(pqScreen, pqOutput, "Montage's window did not enter the PQ output");
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->describedTransfer() == Transfer::Pq,
+                                  qPrintable(viewer.hdrStatus()), 10000);
+        QTRY_VERIFY2(said(from, ".set_image_description(wp_image_description_v1@"), "the surface was not described on the PQ output");
+        QTRY_VERIFY2(said(from, ".set_tf_named(11)"), "no PQ description on the PQ output");
+        if (!throughQt) {
+            QTRY_VERIFY2_WITH_TIMEOUT(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())), 10000);
+            QTRY_VERIFY2(said(from, ".set_mastering_luminance(50, 800)"), "the master's light is not in the PQ output's description");
+        }
+        moveTo(sdrScreen, sdrOutput, "Montage's window did not enter the SDR output again");
+        onSdr();
 #endif
     }
 

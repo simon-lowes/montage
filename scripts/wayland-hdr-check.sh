@@ -6,8 +6,11 @@
 # and an SDR output, where a viewer that reads what the compositor prefers stays SDR and says the display is not HDR
 # (one described by Qt is shown, fitted by Weston); then with colour management off, where the viewer stays SDR and
 # says why. Every run first checks Weston's screenshot of the SDR viewer. A skipped test fails the check, and so does a
-# Weston that died or did not stop cleanly. The same checks serve a build with Montage's binding of the protocol and
-# one where Qt describes the surface (-DMONTAGE_WAYLAND_BINDING=OFF, Qt 6.10.2 or later).
+# Weston that died or did not stop cleanly. Then a fourth time under a Weston with two outputs, one SDR and one PQ (its
+# Wayland backend, each output a window of an outer headless Weston; both with the desktop shell), where test_app's
+# hdrViewerOnTwoOutputs moves the viewer from one output to the other and reads its enter events in Weston's protocol
+# log. The same checks serve a build with Montage's binding of the protocol and one where Qt describes the surface
+# (-DMONTAGE_WAYLAND_BINDING=OFF, Qt 6.10.2 or later).
 #
 #   scripts/wayland-hdr-check.sh <weston prefix> <test_app> <work directory>
 set -euo pipefail
@@ -24,8 +27,40 @@ printf '#!/bin/sh\nLD_LIBRARY_PATH="%s/lib" exec "%s/bin/weston-screenshooter" "
 chmod +x "$work/screenshooter"
 
 weston=""
-cleanup() { [ -z "$weston" ] || kill "$weston" 2> /dev/null || true; }
+outer=""
+cleanup() {
+  [ -z "$weston" ] || kill "$weston" 2> /dev/null || true
+  [ -z "$outer" ] || kill "$outer" 2> /dev/null || true
+}
 trap cleanup EXIT
+
+# Waits for a Weston's socket: up to a minute, as the first Weston of a run loads Mesa and its LLVM from a cold disk,
+# which has taken 17 s on a busy runner.
+started() {  # pid socket log
+  local i
+  for i in $(seq 600); do
+    [ -S "$XDG_RUNTIME_DIR/$2" ] && return 0
+    kill -0 "$1" 2> /dev/null || break
+    sleep 0.1
+  done
+  echo "Weston did not start ($2):" >&2
+  tail -50 "$3" >&2 || true
+  return 1
+}
+# Stops a Weston that must have lived through the test, and must stop cleanly.
+stopped() {  # pid what
+  local ended=0
+  if kill -0 "$1" 2> /dev/null; then
+    kill "$1" 2> /dev/null || true
+    wait "$1" 2> /dev/null || ended=$?
+    [ "$ended" = 0 ] && return 0
+    echo "$2 did not stop cleanly (status $ended)" >&2
+  else
+    wait "$1" 2> /dev/null || ended=$?
+    echo "$2 died during the test (status $ended)" >&2
+  fi
+  return 1
+}
 
 failed=0
 run() {  # name color-management(true: a PQ output|sdr: an SDR output|false: off)
@@ -129,7 +164,74 @@ EOF
   fi
 }
 
+# Two outputs: the inner Weston's wayland0 SDR (sRGB, as Weston makes one by itself) and wayland1 PQ, as the "on" run's
+# output. They differ in size, so that a window moved full screen from one to the other is placed afresh, and so that
+# neither of the inner Weston's windows can cover the other in the outer one (a covered window is sent no frames, and
+# the inner Weston's output in it would stop).
+run_two() {
+  local dir="$work/two"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  local shell
+  shell=$(printf '[shell]\nlocking=false\nanimation=none\nclose-animation=none\nstartup-animation=none\nfocus-animation=none\npanel-position=none\nbackground-color=0xff202020')
+  printf '[core]\ncolor-management=false\n\n%s\n' "$shell" > "$dir/outer.ini"
+  {
+    printf '[core]\ncolor-management=true\n\n%s\n\n' "$shell"
+    printf '[output]\nname=wayland0\nmode=1280x640\n\n'
+    printf '[output]\nname=wayland1\nmode=1024x720\ncolor-profile=montage-hdr\n\n'
+    printf '[color-profile]\nname=montage-hdr\nprim_named=bt2020\ntf_named=st2084\nmin_lum=0.005\nmax_lum=10000\nref_lum=203\n'
+    printf 'target_min_lum=0.005\ntarget_max_lum=1000\n'
+  } > "$dir/weston.ini"
+  local status=0
+  # The outer Weston: headless, the CPU's renderer (it only shows the inner one's two windows), the desktop shell.
+  LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$weston_prefix/bin/weston" \
+    --backend=headless --fake-seat --renderer=pixman --width=2400 --height=800 --shell=desktop --socket=montage-hdr-outer \
+    --config="$dir/outer.ini" --log="$dir/outer.log" &
+  outer=$!
+  started "$outer" montage-hdr-outer "$dir/outer.log" || status=1
+  if [ "$status" = 0 ]; then
+    # The inner one, on its Wayland backend in the outer one: its GL renderer and colour management, as in the other
+    # runs.
+    LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      MESA_EXTENSION_OVERRIDE="-GL_EXT_shader_framebuffer_fetch_non_coherent" "$weston_prefix/bin/weston" \
+      --backend=wayland --display=montage-hdr-outer --output-count=2 --renderer=gl --shell=desktop --socket=montage-hdr-two \
+      --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto &
+    weston=$!
+    started "$weston" montage-hdr-two "$dir/weston.log" || status=1
+  fi
+  if [ "$status" = 0 ]; then
+    echo "::group::two"
+    WAYLAND_DISPLAY=montage-hdr-two QT_QPA_PLATFORM=wayland QT_WAYLAND_DISABLE_WINDOWDECORATION=1 QTEST_FUNCTION_TIMEOUT=900000 \
+      MONTAGE_TEST_WESTON_LOG="$dir/weston.log" MONTAGE_TEST_WESTON_CM=two QT_LOGGING_RULES="qt.rhi.general=true" \
+      "$test_app" hdrViewerOnTwoOutputs -o "$dir/result.txt,txt" -o -,txt || status=1
+    echo "::endgroup::"
+    if grep -q '^SKIP' "$dir/result.txt" 2> /dev/null; then
+      grep '^SKIP' -A1 "$dir/result.txt"
+      status=1
+    fi
+    sleep 1  # (the test's connection closed and taken in)
+  fi
+  if [ -n "$weston" ]; then
+    stopped "$weston" "The Weston with two outputs" || status=1
+    weston=""
+  fi
+  if [ -n "$outer" ]; then
+    stopped "$outer" "The outer Weston" || status=1
+    outer=""
+  fi
+  if [ "$status" != 0 ]; then
+    echo "hdrViewerOnTwoOutputs failed; the outer Weston's log:" >&2
+    tail -60 "$dir/outer.log" >&2 || true
+    echo "The inner Weston's log:" >&2
+    grep -v ' -> \| client ' "$dir/weston.log" | tail -150 >&2 || true
+    echo "The last of its protocol log:" >&2
+    grep -E 'enter[(]|leave[(]|fullscreen|configure[(]|image_description|wl_output@[0-9]+[.]name' "$dir/weston.log" | tail -60 >&2 || true
+    failed=1
+  fi
+}
+
 run on true
 run sdr sdr
 run off false
+run_two
 exit "$failed"

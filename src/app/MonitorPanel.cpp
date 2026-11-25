@@ -545,13 +545,15 @@ void ViewerWidget::updateHdr() {
             if (surface_ || hdrStatus_.isEmpty()) return;
             hdrStatus_.clear();
             updateHdr();
-            // Asked once more a moment later: a Wayland compositor may say what it prefers for the window on its new
-            // output only after the window has entered it.
-            QTimer::singleShot(500, this, [this] {
-                if (surface_ || hdrStatus_.isEmpty()) return;
-                hdrStatus_.clear();
-                updateHdr();
-            });
+            // Asked again a moment later, and later still: a Wayland compositor may say what it prefers for the window
+            // on its new output only after the window has entered it, and a window asked to go full screen on another
+            // display gets there only once it has drawn a frame of the new size.
+            for (int later : {500, 2000})
+                QTimer::singleShot(later, this, [this] {
+                    if (surface_ || hdrStatus_.isEmpty()) return;
+                    hdrStatus_.clear();
+                    updateHdr();
+                });
         });
     }
     if (want && !surface_ && hdrStatus_.isEmpty()) {

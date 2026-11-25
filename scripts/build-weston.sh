@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds Weston (MIT), the Wayland reference compositor, with its colour management (LittleCMS) and the headless
-# backend, and wayland-protocols (MIT) 1.46 for it and for Montage, from pinned tags checked against their commits. A
-# test tool only: CI runs the HDR viewer under it (scripts/wayland-hdr-check.sh); nothing of it goes into Montage or
-# its packages. Montage's own binding of the colour management protocol is generated from <prefix>/share/wayland-protocols
+# Builds Weston (MIT), the Wayland reference compositor, with its colour management (LittleCMS), its headless backend
+# and its Wayland backend (a Weston inside another, which gives the inner one two outputs), and wayland-protocols (MIT)
+# 1.46 for it and for Montage, from pinned tags checked against their commits. A test tool only: CI runs the HDR viewer
+# under it (scripts/wayland-hdr-check.sh); nothing of it goes into Montage or its packages. Montage's own binding of the colour management protocol is generated from <prefix>/share/wayland-protocols
 # (configure with -DMONTAGE_WAYLAND_PROTOCOLS_DIR=<prefix>/share/wayland-protocols).
 #
 #   scripts/build-weston.sh [prefix]     (default /opt/weston; set TMPDIR to put the sources and build elsewhere)
@@ -17,9 +17,10 @@ PROTOCOLS_COMMIT=6141e1154303dadd5c3e480bc4a16e26f1dcb2af
 WESTON_TAG=16.0.2
 WESTON_COMMIT=530ae6c769d2fd55ea5157542654810be81a3193
 PREFIX=${1:-/opt/weston}
-STAMP="wayland-protocols $PROTOCOLS_TAG, Weston $WESTON_TAG"
+STAMP="wayland-protocols $PROTOCOLS_TAG, Weston $WESTON_TAG (headless and Wayland backends, kiosk and desktop shells)"
 
 if [ "$(cat "$PREFIX/VERSION" 2>/dev/null || true)" = "$STAMP" ] && [ -x "$PREFIX/bin/weston" ] && [ -x "$PREFIX/bin/weston-screenshooter" ] \
+   && [ -x "$PREFIX/libexec/weston-desktop-shell" ] && [ -f "$PREFIX/lib/libweston-16/wayland-backend.so" ] \
    && [ -f "$PREFIX/share/wayland-protocols/staging/color-management/color-management-v1.xml" ]; then
   echo "$STAMP is already in $PREFIX"
   exit 0
@@ -48,15 +49,19 @@ build wayland-protocols "$tmp/wayland-protocols" "$tmp/build-protocols" -Dtests=
 export PKG_CONFIG_PATH="$PREFIX/share/pkgconfig:$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
 # Only what the check uses: the headless backend, the GL renderer, colour management, the kiosk shell (which gives
-# the one window the whole output) and the screenshooter.
+# the one window the whole output) and the screenshooter; and for two outputs, the Wayland backend (each output a
+# window of an outer Weston) and the desktop shell, under which a window goes full screen on the output it asks for
+# (and which shows the inner Weston's two windows side by side in the outer one). These need nothing the rest does not
+# (wayland-cursor, wayland-egl and cairo are there for the screenshooter and the GL renderer already).
 fetch https://gitlab.freedesktop.org/wayland/weston.git "$WESTON_TAG" "$WESTON_COMMIT" "$tmp/weston"
 build weston "$tmp/weston" "$tmp/build-weston" \
   -Dbackend-drm=false -Dbackend-headless=true -Dbackend-pipewire=false -Dbackend-rdp=false -Dbackend-vnc=false \
-  -Dbackend-wayland=false -Dbackend-x11=false -Dbackend-default=headless -Drenderer-gl=true -Drenderer-vulkan=false \
-  -Dxwayland=false -Dsystemd=false -Dshell-desktop=false -Dshell-ivi=false -Dshell-lua=false -Dshell-kiosk=true \
+  -Dbackend-wayland=true -Dbackend-x11=false -Dbackend-default=headless -Drenderer-gl=true -Drenderer-vulkan=false \
+  -Dxwayland=false -Dsystemd=false -Dshell-desktop=true -Dshell-ivi=false -Dshell-lua=false -Dshell-kiosk=true \
   -Dcolor-management-lcms=true -Dimage-jpeg=false -Dimage-webp=false -Dtests=false -Ddemo-clients=false \
   -Dsimple-clients=[] -Dtools=[]
-for f in bin/weston bin/weston-screenshooter share/wayland-protocols/staging/color-management/color-management-v1.xml; do
+for f in bin/weston bin/weston-screenshooter libexec/weston-desktop-shell lib/libweston-16/wayland-backend.so \
+         lib/weston/desktop-shell.so share/wayland-protocols/staging/color-management/color-management-v1.xml; do
   [ -e "$PREFIX/$f" ] || { echo "No $f in $PREFIX" >&2; exit 1; }
 done
 echo "$STAMP" > "$PREFIX/VERSION"
