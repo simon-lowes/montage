@@ -3595,6 +3595,10 @@ private slots:
         CaptureDialog* dlg = win_->captureDialog();
         auto stopped = qScopeGuard([&] {
             dlg->stop();
+            // (a check that failed midway leaves no recording going for the tests after it)
+            QElapsedTimer ending;
+            ending.start();
+            while (dlg->isRecording() && ending.elapsed() < 30000) QTest::qWait(50);
             dlg->setLive({});
             dlg->hide();
         });

@@ -1528,7 +1528,10 @@ struct LivePackager::State {
         if (!chapters.empty()) {
             for (const ChapterAsked& c : chapters) {
                 bool late = false;
-                chapterList.push_back({seconds(frameOf(c.at, c.picture, &late)), c.title});
+                // (one at a time already packaged, as a marker placed on the recording behind it, keeps its time:
+                // the list is written whole each time)
+                const int64_t frame = c.at >= 0 ? std::max<int64_t>(0, std::llround(c.at * rate) - firstPicture) : frameOf(c.at, c.picture, &late);
+                chapterList.push_back({seconds(frame), c.title});
             }
             std::stable_sort(chapterList.begin(), chapterList.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
             if (chapterList.size() > 1000) chapterList.erase(chapterList.begin(), chapterList.begin() + ptrdiff_t(chapterList.size() - 1000));
