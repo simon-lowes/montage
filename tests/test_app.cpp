@@ -25159,24 +25159,30 @@ print("added " + ui["name"])
         // The same light from a sequence in HLG: the surface described with HLG's transfer (named transfer 13) where
         // Weston lists it, and with PQ, the picture converted, where it does not (Weston 16.0.2's colour manager lists
         // no HLG), when Weston's screenshot is the ramp's PQ code within 2 again. (Qt's description is PQ for both.)
-        // Shown on a surface of its own, as when the viewer is turned on for an HLG sequence: Weston 16.0.2 drops a
-        // shown surface's colour transformation when its description changes (an HLG sequence's peak is 1000 nits,
-        // the ramp's 800) and makes it again only when it next rebuilds its list of views, so until then it leaves
-        // the surface out of every repaint ("skipped repaint: shader config failure" in its log).
+        // On the surface showing the ramp, as when another sequence comes up in the viewer: its description changes
+        // (an HLG sequence's peak is 1000 nits, the ramp's 800). Weston 16.0.2 drops a shown surface's colour
+        // transformation when its description changes and makes it again only when it next rebuilds its list of
+        // views, leaving the surface out of every repaint until then ("skipped repaint: shader config failure" in
+        // its log), so the surface is taken off the screen and mapped again with its next frame (WaylandColor::remap).
         const bool westonHlg = logged(QStringLiteral(".supported_tf_named(13)"));
         const Transfer hlgDescribed = westonHlg && !throughQt ? Transfer::Hlg : Transfer::Pq;
         qInfo().noquote() << "Weston" << (westonHlg ? "lists" : "does not list") << "HLG's transfer";
         auto hlg = std::make_shared<HdrPicture>(*ramp);
         hlg->transfer = Transfer::Hlg;
         hlg->contentPeak = hdrContentPeak(*findColorSpace("rec2100hlg"), 1000);
-        const QPointer<HdrSurface> shown = viewer.hdrSurface();
-        viewer.setHdrViewer(false);
-        QTRY_VERIFY(shown.isNull() && !viewer.hdrSurface());  // (gone with its wl_surface)
-        viewer.setHdrViewer(true);
+        const int beforeHlg = drawn();
         viewer.setHdrPicture(hlg);
-        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
-        QTRY_VERIFY2_WITH_TIMEOUT(drawn() > 0, qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame drawn") : viewer.hdrStatus()), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(drawn() > beforeHlg, qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame drawn") : viewer.hdrStatus()),
+                                  10000);
         QTRY_VERIFY2_WITH_TIMEOUT(described() == hlgDescribed, qPrintable(viewer.hdrStatus()), 10000);
+        QCOMPARE(viewer.hdrSurface(), surface);  // (the same surface, still showing)
+        if (!throughQt) {
+            // Described anew (Montage's binding): taken off the screen with what was set (a commit with no buffer)
+            // and mapped again by the next frame, after which the surface is on its output again.
+            QTRY_VERIFY2(logged(QStringLiteral(".set_mastering_luminance(50, 1000)")), "the new description is not in Weston's protocol log");
+            QTRY_VERIFY2(logged(QStringLiteral(".attach(nil, 0, 0)")), "no commit without a buffer in Weston's protocol log");
+            QTRY_VERIFY2_WITH_TIMEOUT(surface->waylandEntered(), "the surface's next frame was not reported", 10000);
+        }
         QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));
         if (hlgDescribed == Transfer::Hlg) {
             QTRY_VERIFY2(logged(QStringLiteral(".set_tf_named(13)")), "no HLG description in Weston's protocol log");

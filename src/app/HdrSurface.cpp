@@ -802,10 +802,18 @@ void HdrSurface::describeSurface() {
     d.transfer = picture_ && picture_->transfer == Transfer::Hlg && wayland_->supportsHlg() ? Transfer::Hlg : Transfer::Pq;
     if (picture_) d.light = hdrSurfaceLight(*picture_, headroom_);
     else if (const WaylandColor::Description* now = wayland_->described()) d = *now;  // (nothing to show yet: as it is)
-    if (const WaylandColor::Description* now = wayland_->described(); now && *now == d) return;
+    const WaylandColor::Description* now = wayland_->described();
+    if (now && *now == d) return;
+    const bool shownAlready = now != nullptr;  // (described before on this wl_surface, and shown so)
     std::string why;
-    if (!wayland_->describe(d, &why))
+    if (!wayland_->describe(d, &why)) {
         stopHdr(tr("The compositor did not take the HDR picture's description (%1)").arg(QString::fromStdString(why)));
+        return;
+    }
+    // A shown surface described anew is taken off the screen and mapped again by the frame drawn next (Weston
+    // shows it again only so: WaylandColor::remap), at most a frame showing what is beneath. The description changes
+    // only with the picture's transfer or light (another sequence, another display), never from frame to frame.
+    if (shownAlready) wayland_->remap();
 #endif
 }
 
