@@ -12349,7 +12349,11 @@ private slots:
         {
             const QString cwdWas = QDir::currentPath();
             auto back = qScopeGuard([&] { QDir::setCurrent(cwdWas); });
+#ifdef Q_OS_WIN
+            QVERIFY(QDir::setCurrent(folder));  // (Windows takes no ":" in a name, so no "ab:" folder can be made there)
+#else
             QVERIFY(QDir::setCurrent(folder) && QDir().mkpath(folder + "/ab:"));
+#endif
             QVERIFY(mcpPathReaches("ab:/../Montage-DKDMs/new.csv", dkdms, McpNameRules::Exact, false));
             QVERIFY(mcpPathReaches("file:ab:/../Montage-DKDMs/new.csv", dkdms, McpNameRules::Exact, false));
             QVERIFY(mcpPathReaches("ab:/..", dkdms, McpNameRules::Exact, true));
