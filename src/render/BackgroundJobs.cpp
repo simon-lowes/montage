@@ -12,6 +12,9 @@
 #include <QFileInfo>
 #include <algorithm>
 #include <condition_variable>
+#include <cstddef>
+#include <cstring>
+#include <vector>
 #include <mutex>
 #include <thread>
 
@@ -37,6 +40,62 @@ QString folderOr(const QString& folder) { return folder.isEmpty() ? storeFolder(
 // for it: a job is held elsewhere only while its process lives and its file is fresh.
 constexpr int kBeatSeconds = 5, kStaleSeconds = 30;
 QString aliveFile(const QString& folder, const QString& token) { return folder + QStringLiteral("/alive/") + token; }
+
+#ifdef Q_OS_WIN
+// Written whole beside `path`, flushed to disk, and renamed over it with POSIX semantics (Windows 10 1709 and later,
+// on NTFS): the old file goes out of the folder at once even while a reader that shares its deletion has it open (that
+// reader reads on from it), where a plain replace fails until the reader lets go. False when this cannot be done here
+// (an older Windows, a file system without it), the caller then trying the usual way; `wrote` false when the write
+// itself failed.
+bool replaceSharing(const QString& path, const QByteArray& text, bool& wrote) {
+    wrote = true;
+    const QString whole = QDir::toNativeSeparators(QDir::cleanPath(QFileInfo(path).absoluteFilePath()));
+    // (one temporary file a thread: two saves of the record at once do not write into each other's)
+    const QString temp = whole + QStringLiteral(".%1-%2.tmp").arg(QCoreApplication::applicationPid()).arg(qulonglong(GetCurrentThreadId()));
+    const HANDLE h = CreateFileW(reinterpret_cast<const wchar_t*>(temp.utf16()), GENERIC_WRITE | DELETE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    auto dropTemp = [&] {
+        // (deleted on close: nothing is left beside the record)
+        FILE_DISPOSITION_INFO gone{TRUE};
+        SetFileInformationByHandle(h, FileDispositionInfo, &gone, sizeof gone);
+        CloseHandle(h);
+    };
+    DWORD put = 0;
+    if (!WriteFile(h, text.constData(), DWORD(text.size()), &put, nullptr) || put != DWORD(text.size()) || !FlushFileBuffers(h)) {
+        wrote = false;
+        dropTemp();
+        return false;
+    }
+    // FILE_RENAME_INFO as FileRenameInfoEx takes it (its flags in place of ReplaceIfExists), declared here because
+    // older MinGW headers have neither the class nor the flags.
+    struct RenameEx {
+        DWORD flags;
+        HANDLE root;
+        DWORD length;
+        WCHAR name[1];
+    };
+    constexpr DWORD kReplaceIfExists = 0x1, kPosixSemantics = 0x2;
+    constexpr auto kFileRenameInfoEx = FILE_INFO_BY_HANDLE_CLASS(22);
+    // (the long form of the name, as the rename takes it: \\?\C:\..., or \\?\UNC\server\share\... for a share)
+    const QString target = whole.startsWith(QStringLiteral("\\\\?\\")) ? whole
+                           : whole.startsWith(QStringLiteral("\\\\"))  ? QStringLiteral("\\\\?\\UNC\\") + whole.mid(2)
+                                                                       : QStringLiteral("\\\\?\\") + whole;
+    const size_t bytes = size_t(target.size()) * sizeof(WCHAR);
+    std::vector<char> buffer(offsetof(RenameEx, name) + bytes + sizeof(WCHAR), 0);
+    auto* info = reinterpret_cast<RenameEx*>(buffer.data());
+    info->flags = kReplaceIfExists | kPosixSemantics;
+    info->root = nullptr;
+    info->length = DWORD(bytes);
+    std::memcpy(info->name, target.utf16(), bytes);
+    if (!SetFileInformationByHandle(h, kFileRenameInfoEx, info, DWORD(buffer.size()))) {
+        dropTemp();
+        return false;
+    }
+    CloseHandle(h);
+    return true;
+}
+#endif
 
 class Heartbeat {
 public:
@@ -138,10 +197,16 @@ bool save(Record r, const QString& folder) {
     if (r.created.isEmpty()) r.created = now;
     r.updated = now;
     const QByteArray text = QJsonDocument(toJson(r)).toJson(QJsonDocument::Indented);
+#ifdef Q_OS_WIN
+    // (Montage's own readers share the record's deletion (openRecord): renamed over with POSIX semantics, a job list or
+    // a second Montage reading the store holds no save up. A plain replace would fail while one has it open.)
+    bool wrote = true;
+    if (replaceSharing(dir + QStringLiteral("/job.json"), text, wrote)) return true;
+    if (!wrote) return false;
+#endif
     // (tried again for up to two seconds when only putting it in place failed: on Windows a record cannot be replaced
-    // while a reader that does not share its deletion has it open, as another program might. Montage's own readers
-    // share it (openRecord), so a job list or a second Montage reading the store holds no save up. A write that fails,
-    // a full disk say, is not tried again: the GUI saves its running jobs every second.)
+    // that way while a reader has it open, as another program might, or one of Montage's where the rename above cannot
+    // be done. A write that fails, a full disk say, is not tried again: the GUI saves its running jobs every second.)
     for (int attempt = 0; attempt < 400; ++attempt) {
         QSaveFile f(dir + QStringLiteral("/job.json"));
         if (!f.open(QIODevice::WriteOnly)) return false;
