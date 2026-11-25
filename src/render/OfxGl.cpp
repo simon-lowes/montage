@@ -430,7 +430,8 @@ struct Bound {
 
 }  // namespace
 
-bool flip(unsigned from, unsigned to, int width, int height) {
+namespace {
+bool blit(unsigned from, unsigned to, int width, int height, bool reversed) {
     Worker& w = worker();
     QOpenGLExtraFunctions* f = w.f;
     if (!f || !w.blits || !from || !to || width <= 0 || height <= 0) return false;
@@ -443,12 +444,16 @@ bool flip(unsigned from, unsigned to, int width, int height) {
         if (complete) {
             const bool scissor = f->glIsEnabled(GL_SCISSOR_TEST);
             f->glDisable(GL_SCISSOR_TEST);
-            f->glBlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            f->glBlitFramebuffer(0, 0, width, height, 0, reversed ? height : 0, width, reversed ? 0 : height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
             if (scissor) f->glEnable(GL_SCISSOR_TEST);
         }
     }
     return complete && f->glGetError() == GL_NO_ERROR;
 }
+}  // namespace
+
+bool flip(unsigned from, unsigned to, int width, int height) { return blit(from, to, width, height, true); }
+bool copy(unsigned from, unsigned to, int width, int height) { return blit(from, to, width, height, false); }
 
 void readTexture(unsigned texture, int width, int height, bool topFirst, Image& out) {
     Worker& w = worker();

@@ -30458,6 +30458,191 @@ colorspaces:
         QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
     }
 
+    // Plug-ins in hosts given the compositor's textures: a clip effect's and a transition's picture, which comes back
+    // as a handle, copied on the GPU into the compositor's texture (not read back into memory and made a texture
+    // again), and the GPU compositor draws a frame with such an effect itself. Where handles are not taken (turned off,
+    // or a side cannot share, as on llvmpipe here) the plug-in is not given textures, says why, and a picture asked of
+    // it all the same is written into the texture. Either way within 1/1023 of the picture made in Montage's process.
+    // With MONTAGE_EXPECT_HANDLES=1 (CI's guest), a picture not copied in place fails the test.
+    void openFxHandlesIntoTheCompositorsTextures() {
+        QTemporaryDir dir;
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath((dir.path() + "/ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, dissolve;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.dissolve/1", dissolve));
+        const bool expected = qEnvironmentVariable("MONTAGE_EXPECT_HANDLES") == "1";
+        std::string why, err;
+        if (!ofx::initializeGpu(&why)) QSKIP(why.c_str());
+        struct Asking {
+            const QByteArray before = qgetenv("MONTAGE_GPU_HANDLES");
+            const bool set = qEnvironmentVariableIsSet("MONTAGE_GPU_HANDLES");
+            const bool gpu = ofx::gpuRendering();
+            const plugins::HostingSettings hosting = plugins::hosting();
+            ~Asking() {
+                ofx::remote::releaseIdle();
+                for (int i = 0; i < 2000 && !plugins::runningHosts().empty(); ++i) QTest::qWait(10);
+                plugins::setHosting(hosting);
+                plugins::setHostExecutable({});
+                plugins::clearHostFailures();
+                if (set) qputenv("MONTAGE_GPU_HANDLES", before);
+                else qunsetenv("MONTAGE_GPU_HANDLES");
+                ofx::setGpuRendering(gpu);
+                ofx::remote::resetPictureStats();
+            }
+        } asking;
+        plugins::setHostExecutable(MONTAGE_PLUGIN_HOST);
+        auto host = [&](plugins::Isolation how) {
+            ofx::remote::releaseIdle();
+            plugins::HostingSettings s = asking.hosting;
+            s.isolation = how;
+            plugins::setHosting(s);
+            plugins::clearHostFailures();
+        };
+        qunsetenv("MONTAGE_GPU_HANDLES");
+        ofx::setGpuRendering(true);
+        // The compositor's stand-in: an OpenGL 3.3 core context made sharing with the plug-ins' (current on this thread).
+        QSurfaceFormat format;
+        format.setVersion(3, 3);
+        format.setProfile(QSurfaceFormat::CoreProfile);
+        QOffscreenSurface surface;
+        surface.setFormat(format);
+        surface.create();
+        QOpenGLContext other;
+        other.setFormat(format);
+        other.setShareContext(ofx::gl::context());
+        QVERIFY2(surface.isValid() && other.create() && other.makeCurrent(&surface), "no second OpenGL context");
+        QVERIFY2(ofx::gl::sharesWith(&other), "the two OpenGL contexts do not share their textures");
+        QOpenGLExtraFunctions* f = other.extraFunctions();
+        const int W = 96, H = 54;
+        std::vector<GLuint> textures;
+        auto texture = [&](const Image* img) {
+            GLuint t = 0;
+            f->glGenTextures(1, &t);
+            f->glBindTexture(GL_TEXTURE_2D, t);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            f->glTexImage2D(GL_TEXTURE_2D, 0, 0x8814 /* GL_RGBA32F */, W, H, 0, GL_RGBA, GL_FLOAT, img ? img->px.data() : nullptr);
+            f->glBindTexture(GL_TEXTURE_2D, 0);
+            f->glFinish();
+            textures.push_back(t);
+            return ofx::GlPicture{t, W, H};
+        };
+        auto pixels = [&](const ofx::GlPicture& t) {
+            Image out(W, H);
+            GLuint fbo = 0;
+            f->glGenFramebuffers(1, &fbo);
+            f->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            f->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.texture, 0);
+            f->glReadPixels(0, 0, W, H, GL_RGBA, GL_FLOAT, out.px.data());
+            f->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            f->glDeleteFramebuffers(1, &fbo);
+            return out;
+        };
+        auto worst = [](const Image& a, const Image& b) {
+            float d = a.px.size() == b.px.size() ? 0.0f : 1e9f;
+            for (size_t k = 0; k < a.px.size() && k < b.px.size(); ++k) d = std::max(d, std::fabs(a.px[k] - b.px[k]));
+            return d;
+        };
+        Project p = makeDefaultProject();
+        Image picture(W, H), second(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* px = picture.at(x, y);
+                px[0] = float(y) / H, px[1] = 0.5f, px[2] = 1 - float(x) / W, px[3] = 1;
+                px = second.at(x, y);
+                px[0] = 0.9f - 0.8f * float(y) / H, px[1] = float(x) / W, px[2] = 0.3f, px[3] = 1;
+            }
+        // (the effect leaves the lower half alone, so a picture copied upside down would show)
+        Effect e = ofx::makeEffect(p, invert);
+        e.params["param.amount"] = Param(0.7);
+        e.params["param.mode"] = Param(2.0);
+        Effect tr = ofx::makeEffect(p, dissolve);
+        Image cpu = picture, mixed;
+        host(plugins::Isolation::InProcess);
+        QVERIFY2(ofx::applyEffect(e, 0, cpu, 1.0, {}, &err), err.c_str());
+        QVERIFY2(ofx::applyTransition(tr, 3, 0.25, picture, second, mixed, 1.0, &err), err.c_str());
+        host(plugins::Isolation::PerPlugin);
+        ofx::remote::resetPictureStats();
+        const ofx::GlPicture in = texture(&picture), to = texture(&second), out = texture(nullptr), mix = texture(nullptr);
+        // Given textures where handles are asked for; told why not where they are not.
+        std::string cannot;
+        const bool handles = ofx::remote::asksForHandles(&cannot);
+        if (expected) QVERIFY2(handles, cannot.c_str());
+        QCOMPARE(ofx::rendersTextures(e, &why), handles);
+        if (!handles) QVERIFY2(why.find("renders in a plug-in host, and its pictures come through shared memory") != std::string::npos, why.c_str());
+        QCOMPARE(ofx::rendersTextures(tr, nullptr, true), handles);
+        QVERIFY(!ofx::rendersTextures(tr) && !ofx::rendersTextures(e, nullptr, true));  // (each as what it is)
+        // The effect: its source read back for the host, its picture copied into `out` where it came as a handle.
+        auto rendered = [&](const char* what, const std::function<bool()>& render, const ofx::GlPicture& into, const Image& want, int sides) {
+            const ofx::remote::PictureStats before = ofx::remote::pictureStats();
+            const int readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
+            if (!render()) return QString("%1: %2").arg(what, QString::fromStdString(err));
+            const ofx::remote::PictureStats now = ofx::remote::pictureStats();
+            const long copied = now.inPlace - before.inPlace, asHandle = now.handles - before.handles;
+            const QString text = QString("%1: %2 read back, %3 into the texture, %4 copied in place, %5 as a handle (%6); off by %7")
+                                     .arg(what).arg(ofx::gpuReadBacks() - readBacks).arg(ofx::gpuTextureRenders() - direct).arg(copied).arg(asHandle)
+                                     .arg(QString::fromStdString(now.last)).arg(worst(pixels(into), want));
+            if (worst(pixels(into), want) > 1.0f / 1023 || ofx::gpuReadBacks() - readBacks != sides) return text;
+            if (copied != asHandle || ofx::gpuTextureRenders() - direct != copied || (expected && copied != 1)) return text;
+            if (now.handles + now.sharedMemory != before.handles + before.sharedMemory + 1) return text;
+            return QString();
+        };
+        QString wrong = rendered("the effect", [&] { return ofx::applyEffectTexture(e, 0, in, out, 1.0, {}, &err); }, out, cpu, 1);
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        wrong = rendered("the transition", [&] { return ofx::applyTransitionTexture(tr, 3, 0.25, in, to, mix, 1.0, &err); }, mix, mixed, 2);
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        // Turned off: not given textures, and asked all the same, the picture is written into the texture.
+        qputenv("MONTAGE_GPU_HANDLES", "0");
+        QVERIFY(!ofx::rendersTextures(e, &why));
+        QVERIFY2(why.find("turned off") != std::string::npos, why.c_str());
+        const ofx::GlPicture plain = texture(nullptr);
+        const long copiedBefore = ofx::remote::pictureStats().inPlace;
+        QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
+        QCOMPARE(ofx::remote::pictureStats().inPlace, copiedBefore);
+        QVERIFY(worst(pixels(plain), cpu) <= 1.0f / 1023);
+        qunsetenv("MONTAGE_GPU_HANDLES");
+        // Textures of two sizes are refused.
+        QVERIFY(!ofx::applyEffectTexture(e, 0, in, ofx::GlPicture{out.texture, W, H - 2}, 1.0, {}, &err));
+        f->glDeleteTextures(GLsizei(textures.size()), textures.data());
+        other.doneCurrent();
+        // A frame with the hosted effect, drawn by the GPU compositor where its OpenGL shares with the plug-ins': the
+        // effect a texture step, nothing made on the CPU.
+        if (!handles || !gpu::initialize(&why) || !gpu::sharesOpenGl()) {
+            qInfo("No frame on the GPU: %s", handles ? (gpu::available() ? "the compositor does not share OpenGL" : why.c_str()) : cannot.c_str());
+            return;
+        }
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        QImage q(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.21f), float(y) / 90, 0.4f, 1.0f));
+        QVERIFY(q.save(dir.filePath("wide.png")));
+        MediaItem m;
+        QVERIFY(probeMedia(dir.filePath("wide.png").toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        const auto placed = edit::placeMedia(p, s, m.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(placed.ok);
+        edit::clipById(s, placed.created[0])->effects.push_back(e);
+        RenderOptions o;
+        o.gpu = false;
+        const Image cpuFrame = renderProgramFrame(p, s, 5, o);
+        const gpu::Stats before = gpu::stats();
+        const long copied = ofx::remote::pictureStats().inPlace;
+        o.gpu = true;
+        const Image gpuFrame = renderProgramFrame(p, s, 5, o);
+        const gpu::Stats after = gpu::stats();
+        QVERIFY2(after.gpuFrames == before.gpuFrames + 1, after.lastFallback.c_str());
+        QCOMPARE(after.textureSteps - before.textureSteps, 1L);
+        QCOMPARE(after.cpuLayers - before.cpuLayers, 0L);
+        if (expected) QCOMPARE(ofx::remote::pictureStats().inPlace, copied + 1);
+        QVERIFY2(worst(cpuFrame, gpuFrame) <= 1.0f / 1023, qPrintable(QString::number(worst(cpuFrame, gpuFrame))));
+    }
+
     // Pictures from plug-in hosts as handles. Asked with no setting of hosts started for GPU rendering, an
     // effect's picture, a transition's and a generator's each come as a handle where both sides share, and through
     // shared memory with the reason where they do not; either way within 1/1023 of the picture made in Montage's

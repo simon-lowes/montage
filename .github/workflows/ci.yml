@@ -356,7 +356,7 @@ jobs:
           MONTAGE_GPU_LOG: "1"
         run: |
           # Every GPU test must run on both: a skip (no device, no shader compiler) fails the step.
-          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuDepthAndObjectMasks gpuYcbcrPlanes gpuHardwareFrames gpuHardwareFramesImportedOnce gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl ofxSharedTextures gpuOfxTextures gpuTextureBudget gpuMasksAndStepsFromThePicture openFxHandlesForEveryKindAndAfterAHostEnds"
+          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuDepthAndObjectMasks gpuYcbcrPlanes gpuHardwareFrames gpuHardwareFramesImportedOnce gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl ofxSharedTextures gpuOfxTextures gpuTextureBudget gpuMasksAndStepsFromThePicture openFxHandlesForEveryKindAndAfterAHostEnds openFxHandlesIntoTheCompositorsTextures"
           for backend in opengl vulkan; do
             echo "::group::$backend"
             MONTAGE_GPU=$backend xvfb-run -a build/tests/test_render $tests -o "$RUNNER_TEMP/$backend.txt,txt" -o -,txt || failed=1
@@ -369,8 +369,8 @@ jobs:
           exit "${failed:-0}"
       # Plug-in pictures shared from the GPU's memory between a plug-in host and Montage, run to the end: in a guest
       # whose kernel has udmabuf (QEMU and the kernel from Ubuntu's packages; KVM where the runner allows it), on
-      # llvmpipe through EGL under Xvfb. There a picture that does not come as a handle fails the test
-      # (MONTAGE_EXPECT_HANDLES).
+      # llvmpipe through EGL under Xvfb. There a picture that does not come as a handle, or one not copied into the
+      # compositor's texture in place, fails the test (MONTAGE_EXPECT_HANDLES).
       - name: QEMU and a kernel with udmabuf (Ubuntu's packages)
         timeout-minutes: 10
         run: |
@@ -383,7 +383,7 @@ jobs:
           # (no MONTAGE_GPU_HANDLES: handles are asked for unless turned off)
           scripts/kvm-guest.sh "$RUNNER_TEMP/guest" env QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=xcb_egl \
             MONTAGE_EXPECT_HANDLES=1 MONTAGE_GPU_LOG=1 QTEST_FUNCTION_TIMEOUT=900000 \
-            xvfb-run -a build/tests/test_render openFxHandlesForEveryKindAndAfterAHostEnds
+            xvfb-run -a build/tests/test_render openFxHandlesForEveryKindAndAfterAHostEnds openFxHandlesIntoTheCompositorsTextures
 
   # HDR viewing on Linux: the viewer under Weston (headless, GL on llvmpipe, Wayland's colour management) built from
   # source, as Ubuntu 24.04's Weston and wayland-protocols are too old for color-management-v1; Qt 6.8 for its RHI.
