@@ -27690,7 +27690,24 @@ colorspaces:
         const QString pair = tab.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
                                     "return p ? r.get(p.localCandidateId).candidateType + ' ' + r.get(p.remoteCandidateId).candidateType + ' ' + r.get(p.localCandidateId).relayProtocol : ''; })")
                                  .toString();
-        QCOMPARE(pair, QStringLiteral("relay relay %1").arg(transport));
+        // Whether Chrome's checks from its relay carry a tiebreaker of 0: Chrome on Linux and Windows sends 0 from a relay
+        // it reaches over TCP or TLS, Chrome on macOS a real one. The fake relay sees each check it carries; coturn's
+        // rows (on Linux, after the fake rows) take what the fake row of their transport saw (unknown when run alone).
+        static std::map<QString, bool> zeroSeen;
+        int zero = -1;
+        if (fake) {
+            QVERIFY2(fake->controllingChecks > 0, said().constData());
+            zero = fake->zeroTiebreakers > 0 ? 1 : 0;
+            zeroSeen[transport] = zero == 1;
+        } else if (zeroSeen.count(transport)) {
+            zero = zeroSeen[transport] ? 1 : 0;
+        }
+        qInfo("Chrome's tiebreaker of 0 over %s: %s", qPrintable(transport), zero < 0 ? "not known" : zero ? "yes" : "no");
+        // Only through the relay, both ends are at the relay. Beside Montage's own addresses, a check with a tiebreaker
+        // of 0 reaches Montage's end only through the bridge, which repairs it; a real one may reach Montage's own
+        // addresses through Chrome's relay too, and that pair, with Montage's end a host, is the one ICE ranks first.
+        if (!beside || zero == 1) QCOMPARE(pair, QStringLiteral("relay relay %1").arg(transport));
+        else QVERIFY2(pair == QStringLiteral("relay relay %1").arg(transport) || pair == QStringLiteral("relay host %1").arg(transport), qPrintable(pair));
         // Montage's way through the relay, as the panel is told it: one bridge, carrying over that transport, with
         // nothing refused, on the one thread.
         ReviewStats st = rig.review->stats();
@@ -27699,11 +27716,13 @@ colorspaces:
         QCOMPARE(st.bridges[0].lastRefusal, std::string());
         QCOMPARE(st.bridges[0].answersRefused, uint64_t(0));
         QCOMPARE(st.bridgeThreads, 1);
-        // Chrome's checks from a relay it reaches over TCP or TLS were repaired on their way to Montage's end (the
-        // only way there, or the one beside its own addresses that it chose).
+        // Chrome's checks with a tiebreaker of 0 were repaired on their way to Montage's end (the only way there, or the
+        // one beside its own addresses that it chose), and checks with a real one were left as they were.
         QCOMPARE(st.bridges[0].beside, beside);
         qInfo("%llu of Chrome's checks repaired", (unsigned long long)st.bridges[0].checksRepaired);
-        if (transport != "udp") QVERIFY2(st.bridges[0].checksRepaired > 0, said().constData());
+        if (zero == 1) QVERIFY2(st.bridges[0].checksRepaired > 0, said().constData());
+        if (zero == 0) QVERIFY2(st.bridges[0].checksRepaired == 0, said().constData());
+        if (fake) QVERIFY2(st.bridges[0].checksRepaired <= fake->zeroTiebreakers, said().constData());
         if (firefox) {
             auto until = [&](const QString& expression, int seconds) {
                 QElapsedTimer t;
@@ -27748,12 +27767,14 @@ colorspaces:
         if (fake) {
             // What the test's relay carried while Chrome played two seconds more: Montage's pictures came to it as
             // Send indications (Chrome uses channels), over the stream when the transport is one and over UDP when
-            // it is not, and as many as the bridge says it sent.
-            const quint64 before = fake->sendIndications;
+            // it is not, and as many as the bridge says it sent. (Beside, when Chrome chose Montage's own address,
+            // they came to Chrome's address at the relay from there, and the bridge carried none of them.)
+            const bool viaHost = pair == QStringLiteral("relay host %1").arg(transport);
+            const quint64 before = viaHost ? fake->fromPeers.load() : fake->sendIndications.load();
             const quint64 presented = quint64(tab.js("__montage.presented").toDouble());
             QThread::msleep(2000);
             QVERIFY(quint64(tab.js("__montage.presented").toDouble()) > presented + 20);
-            const quint64 carried = fake->sendIndications - before;
+            const quint64 carried = (viaHost ? fake->fromPeers.load() : fake->sendIndications.load()) - before;
             QVERIFY2(carried > 40, std::to_string(carried).c_str());
             // (those from the bridges' own addresses at the relay, the ones the browsers chose to send to: Chrome's own, from
             // each address it has at the relay and for as long as it checks pairs it did not choose, are not the
@@ -27772,7 +27793,7 @@ colorspaces:
             qInfo("Through the relay: %llu Send indications from the bridges' addresses there, %llu sent by them, %llu from all",
                   (unsigned long long)fromBridge, (unsigned long long)sent, (unsigned long long)fake->sendIndications.load());
             // (a few still on their way, or sent before the relay let the viewer in)
-            QVERIFY2(fromBridge <= sent && fromBridge + 64 >= sent, (std::to_string(fromBridge) + " of " + std::to_string(sent)).c_str());
+            if (!viaHost) QVERIFY2(fromBridge <= sent && fromBridge + 64 >= sent, (std::to_string(fromBridge) + " of " + std::to_string(sent)).c_str());
             QCOMPARE(fake->bytesOverUdp.load() > 0, transport == "udp");
             QCOMPARE(fake->bytesOverStream.load() > 0, transport != "udp");
             QVERIFY(fake->channelData.load() > 0);

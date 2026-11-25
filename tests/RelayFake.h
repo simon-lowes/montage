@@ -70,6 +70,9 @@ public:
     std::atomic<int> loginsRefused{0}, loginsExpired{0}, familiesRefused{0};
     std::atomic<quint64> sendIndications{0}, channelData{0}, toPeers{0}, fromPeers{0};
     std::atomic<quint64> bytesOverUdp{0}, bytesOverStream{0};
+    // The connectivity checks it carried that say they are from the controlling end (ICE-CONTROLLING), and those of
+    // them whose tiebreaker is 0 (what some browsers send from a relay they reach over TCP or TLS).
+    std::atomic<quint64> controllingChecks{0}, zeroTiebreakers{0};
 
     // The Send indications passed on from the client whose relayed port is this one (a client's checks on pairs
     // that were not chosen are its own, not the chosen one's).
@@ -399,6 +402,17 @@ private:
         for (const auto& [type, value] : list) attribute(a, type, value);
     }
 
+    // A packet carried to a peer, counted when it is a check from the controlling end (and when its tiebreaker is 0).
+    void countCheck(const QByteArray& data) {
+        if (data.size() < 20 || get16(data, 0) != 0x0001 || data.mid(4, 4) != QByteArray::fromHex("2112a442")) return;
+        for (qsizetype at = 20; at + 4 <= data.size(); at += 4 + ((get16(data, at + 2) + 3) & ~3)) {
+            if (get16(data, at) != 0x802A || get16(data, at + 2) != 8 || at + 12 > data.size()) continue;
+            ++controllingChecks;
+            if (data.mid(at + 4, 8) == QByteArray(8, '\0')) ++zeroTiebreakers;
+            return;
+        }
+    }
+
     // One message from a client: a Send indication or a channel's data carried on, or a request answered.
     void heard(Client& c, const QByteArray& d, QUdpSocket* udp) {
         if (silent) return;
@@ -408,6 +422,7 @@ private:
             if (c.back && c.channels.contains(number) && 4 + size <= d.size()) {
                 ++channelData;
                 ++toPeers;
+                countCheck(d.mid(4, size));
                 c.back->writeDatagram(d.mid(4, size), real(c.channels[number].first), c.channels[number].second);
             }
             return;
@@ -454,6 +469,7 @@ private:
                     ++sendsByPort_[c.back->localPort()];
                 }
                 ++toPeers;
+                countCheck(data);
                 c.back->writeDatagram(data, real(peer), peerPort);
             }
             return;
