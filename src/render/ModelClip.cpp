@@ -2,7 +2,9 @@
 
 #include <QBuffer>
 #include <QCryptographicHash>
+#include <QFile>
 #include <QImage>
+#include <QTemporaryDir>
 #include <algorithm>
 #include <cmath>
 #include <list>
@@ -873,16 +875,41 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             // Where it stands at each of the solve's frames it plays over (its matrix's rows its axes and middle), its
             // plane then in its own space, as large as the card is at the first of them: the axes are as much longer
             // or shorter as its Width is at each frame.
+            // Its pictures: the first held here and, once one differs, each that differs as a file of its own in a
+            // folder of the mesh's (one picture in memory at a time, however long the clip). A frame whose picture
+            // cannot be made keeps the one before.
             SolvedSceneMesh m;
             const std::shared_ptr<const CameraSolve> solve = parsedSolve(footage);
             const FrameTime from = std::max(c.start, footage.start), to = std::min(c.end(), footage.end());
             const double firstUnit = layer3dPlace(*e, from - c.start, seq.width, seq.height).unit;
+            std::string last;
+            double lastAt = 0;
+            std::shared_ptr<QTemporaryDir> spool;
+            bool spooled = true;
+            auto keep = [&](double at, const std::string& pic) {
+                if (!spooled) return;
+                if (!spool) {
+                    spool = std::make_shared<QTemporaryDir>();
+                    if (!spool->isValid()) return void(spooled = false);
+                }
+                QFile f(spool->filePath(QString::number(m.pictures.size()) + ".png"));
+                if (!f.open(QIODevice::WriteOnly) || f.write(pic.data(), qint64(pic.size())) != qint64(pic.size()) || !f.flush())
+                    return void(spooled = false);
+                m.pictures.push_back({at, f.fileName().toStdString()});
+            };
             for (FrameTime t = from; solve && t < to; ++t) {
                 const int frame = cameraSolveFrame(seq, footage, *solve, t - footage.start);
                 if (frame < 0 || (!m.motion.empty() && m.motion.back().first >= frame)) continue;
                 const Layer3DPlace at = layer3dPlace(*e, t - c.start, seq.width, seq.height);
-                if (std::string pic = cardPicturePng(p, seq, ti, c, t); m.pictures.empty() || pic != m.pictures.back().second)
-                    m.pictures.push_back({double(frame), std::move(pic)});
+                if (std::string pic = cardPicturePng(p, seq, ti, c, t); !pic.empty() && pic != last) {
+                    if (last.empty()) {
+                        m.picture = pic, lastAt = frame;  // (the first: held, as most cards have no other)
+                    } else {
+                        if (m.pictures.empty()) keep(lastAt, m.picture);
+                        keep(double(frame), pic);
+                    }
+                    last = std::move(pic);
+                }
                 const double k = firstUnit > 0 ? at.unit / firstUnit : 1;
                 m.motion.push_back({double(frame), {at.axisU[0] * k, at.axisU[1] * k, at.axisU[2] * k, 0, at.axisV[0] * k, at.axisV[1] * k, at.axisV[2] * k, 0,
                                                     at.normal[0] * k, at.normal[1] * k, at.normal[2] * k, 0, at.origin[0], at.origin[1], at.origin[2], 1}});
@@ -894,12 +921,12 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             }
             std::shared_ptr<const Model> plane;
             const PosedTriangles tr = layer3dTriangles(place, plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));
-            if (!m.pictures.empty()) {
-                m.picture = m.pictures.front().second;
-                if (m.pictures.size() == 1 || m.picture.empty()) m.pictures.clear();
-            } else {
-                m.picture = cardPicturePng(p, seq, ti, c, from < to ? from : c.start);
+            if (!spooled) {
+                m.pictures.clear();  // (no room for them: the first throughout)
+            } else if (!m.pictures.empty()) {
+                m.picture.clear(), m.spool = spool;
             }
+            if (m.picture.empty() && m.pictures.empty()) m.picture = cardPicturePng(p, seq, ti, c, from < to ? from : c.start);
             m.card = true;
             m.name = c.name;
             m.color = {1, 1, 1, 1};

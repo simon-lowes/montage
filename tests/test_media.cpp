@@ -41993,17 +41993,24 @@ private slots:
                 card.generator = makeEffect(p, "color");
                 card.generator.params["color.g"] = 0.0, card.generator.params["color.b"] = 0.0;
                 card.generator.params["color.r"].keys = {{0, 0.0}, {9, 0.9}};
+                // (each held as a file of its own, not in memory: nightly 25 Nov)
                 const std::vector<SolvedSceneMesh> c = solvedSceneModels(p, changing, 0, changing.videoTracks[0].clips[0]);
-                QVERIFY(c.size() == 1 && c[0].pictures.size() == 10);
-                for (int i = 0; i < 10; ++i) QCOMPARE(c[0].pictures[size_t(i)].first, double(i));
-                QVERIFY(c[0].picture == c[0].pictures[0].second);
+                QVERIFY(c.size() == 1 && c[0].pictures.size() == 10 && c[0].picture.empty() && c[0].spool);
+                std::vector<std::string> made;
+                for (int i = 0; i < 10; ++i) {
+                    QCOMPARE(c[0].pictures[size_t(i)].first, double(i));
+                    QFile f(QString::fromStdString(c[0].pictures[size_t(i)].second));
+                    QVERIFY(f.open(QIODevice::ReadOnly));
+                    made.push_back(f.readAll().toStdString());
+                    QVERIFY(made.back().size() > 8 && made.back().compare(1, 3, "PNG") == 0);
+                }
                 for (int i : {0, 4, 9}) {
                     Sequence still = changing;
                     Clip& k = still.videoTracks[1].clips[0];
                     k.generator.params["color.r"] = Param(card.generator.p("color.r", i));
                     const std::vector<SolvedSceneMesh> one = solvedSceneModels(p, still, 0, still.videoTracks[0].clips[0]);
                     QVERIFY(one.size() == 1 && one[0].pictures.empty() && !one[0].picture.empty());
-                    QVERIFY2(one[0].picture == c[0].pictures[size_t(i)].second, qPrintable(QString("frame %1").arg(i)));
+                    QVERIFY2(one[0].picture == made[size_t(i)], qPrintable(QString("frame %1").arg(i)));
                 }
                 for (const char* name : {"changing.usda", "changing.usdz"}) {
                     const std::string file = path(name);
@@ -42020,12 +42027,26 @@ private slots:
                         QCOMPARE(samples[size_t(i)].first, double(i));
                         std::string bytes;
                         QVERIFY(stage.readAsset(samples[size_t(i)].second.text(0), bytes));
-                        QVERIFY2(bytes == c[0].pictures[size_t(i)].second, qPrintable(QString("%1 at %2").arg(name).arg(i)));
+                        QVERIFY2(bytes == made[size_t(i)], qPrintable(QString("%1 at %2").arg(name).arg(i)));
                         names.insert(samples[size_t(i)].second.text(0));
                     }
                     QCOMPARE(int(names.size()), 10);
                     std::string bytes;
-                    QVERIFY(stage.readAsset(tex->attribute("inputs:file")->value.text(0), bytes) && bytes == c[0].pictures[0].second);
+                    QVERIFY(stage.readAsset(tex->attribute("inputs:file")->value.text(0), bytes) && bytes == made[0]);
+                }
+                // Their folder goes with the mesh's last copy.
+                const QString folder = QFileInfo(QString::fromStdString(c[0].pictures[0].second)).absolutePath();
+                {
+                    std::vector<SolvedSceneMesh> gone = c;
+                    QVERIFY(QFileInfo::exists(folder));
+                }
+                QVERIFY(QFileInfo::exists(folder));
+                {
+                    std::vector<SolvedSceneMesh> held = solvedSceneModels(p, changing, 0, changing.videoTracks[0].clips[0]);
+                    const QString theirs = QFileInfo(QString::fromStdString(held[0].pictures[0].second)).absolutePath();
+                    QVERIFY(theirs != folder && QFileInfo::exists(theirs));
+                    held.clear();
+                    QVERIFY(!QFileInfo::exists(theirs));
                 }
             }
         }
