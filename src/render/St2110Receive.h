@@ -166,6 +166,8 @@ private:
     };
     void receive(Stream* s, int path);
     void take(Stream& s, const std::vector<uint8_t>& packet);
+    void decodeCoded(Stream* s);
+    static constexpr size_t kCodedHeld = 8;  // ST 2110-22 codestreams waiting to be decoded (four interlaced frames)
     bool ready(const Pending& p, std::chrono::steady_clock::time_point now);
     void build(Pending& p, InputFrame& out);
 

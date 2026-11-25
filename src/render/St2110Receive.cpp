@@ -428,6 +428,18 @@ struct Input::Stream {
     int64_t firstLost = 0;
     bool failedSeen = false;  // (the interlaced frame last counted incomplete, by its timestamp)
     uint32_t failedTs = 0;
+    // (ST 2110-22's codestreams waiting for the decode thread, the stream's lock held; the fields above are that
+    // thread's alone)
+    struct Coded {
+        std::vector<uint8_t> codestream;
+        uint32_t ts = 0;
+        int field = 0;
+        int64_t lost = 0;
+        int concealed = 0;
+        std::chrono::steady_clock::time_point came;
+    };
+    std::deque<Coded> coded;
+    std::condition_variable codedCv;
     std::chrono::steady_clock::time_point last[2];  // when each path last brought a packet
     // Ancillary data and metadata: the latest RTP timestamp this stream brought (the input's lock held).
     bool dataSeen = false;
@@ -512,14 +524,20 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
     bool video = false;
     for (const auto& s : streams_) video = video || s->kind == 0;
     if (!video) return fail("The SDP has no video stream (ST 2110-20 or -22)");
-    for (const auto& s : streams_)
+    for (const auto& s : streams_) {
         for (int p = 0; p < (s->sdp.redundant() ? 2 : 1); ++p) threads_.emplace_back([this, st = s.get(), p] { receive(st, p); });
+        if (s->jxsv) threads_.emplace_back([this, st = s.get()] { decodeCoded(st); });
+    }
     return true;
 }
 
 void Input::close() {
     stop_ = true;
     cv_.notify_all();
+    for (const auto& s : streams_) {
+        std::lock_guard lock(s->m);
+        s->codedCv.notify_all();
+    }
     for (std::thread& t : threads_) t.join();
     threads_.clear();
     streams_.clear();
@@ -584,45 +602,51 @@ void Input::receive(Stream* s, int path) {
     }
 }
 
-void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
-    RtpPacket p;
-    if (!parseRtp(packet.data(), packet.size(), p)) return;  // (the merger took RTP of the stream's payload type alone)
-    if (s.kind == 0 && s.jxsv) {
-        // ST 2110-22: the codestream rebuilt, decoded to the stream's sampling and depth.
-        if (!s.jxsv->add(p)) return;
+// ST 2110-22's decoding, on a thread of the stream's own: each codestream decoded to the stream's sampling and depth,
+// an interlaced frame's two fields woven into one.
+void Input::decodeCoded(Stream* st) {
+    Stream& s = *st;
+    for (;;) {
+        Stream::Coded c;
+        {
+            std::unique_lock lock(s.m);
+            s.codedCv.wait(lock, [&] { return stop_ || !s.coded.empty(); });
+            if (stop_) return;
+            c = std::move(s.coded.front());
+            s.coded.pop_front();
+        }
         JxsPicture pic;
         const JxsSampling s444 = s.sdp.video.sampling == Sampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444;
-        const std::vector<uint8_t>& cs = s.jxsv->codestream();
+        const std::vector<uint8_t>& cs = c.codestream;
         const JxsSampling want = video_.sampling == Sampling::Ycc422 ? JxsSampling::Ycc422 : s444;
         // (an interlaced stream: a codestream each field, half the frame's height, the first held until its second)
         const bool interlaced = video_.interlaced;
-        const int field = s.jxsv->field();
         const int height = interlaced ? video_.height / 2 : video_.height;
         // (a codestream of another size or depth than the SDP's, or a field where a frame belongs, is not decoded at all)
         JxsHeader h;
-        const bool ok = (field != 0) == interlaced && readJxsHeader(cs.data(), cs.size(), h) && h.width == video_.width && h.height == height &&
+        const bool ok = (c.field != 0) == interlaced && readJxsHeader(cs.data(), cs.size(), h) && h.width == video_.width && h.height == height &&
                         h.depth == video_.depth && s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && pic.width == video_.width &&
                         pic.height == height && pic.depth == video_.depth && pic.sampling == want;
-        if (interlaced && ok && field == 1) {
+        if (interlaced && ok && c.field == 1) {
             s.firstField = rasterOf(pic);
             s.haveFirst = true;
-            s.firstTs = s.jxsv->timestamp();
-            s.firstLost = s.jxsv->lostInFrame();
+            s.firstTs = c.ts;
+            s.firstLost = c.lost;
             std::lock_guard lock(m_);
-            stats_.concealedSlices += s.jxsv->concealedSlices();
-            return;
+            stats_.concealedSlices += c.concealed;
+            continue;
         }
         std::lock_guard lock(m_);
-        if (!ok || (interlaced && (!s.haveFirst || s.firstTs != s.jxsv->timestamp()))) {
+        if (!ok || (interlaced && (!s.haveFirst || s.firstTs != c.ts))) {
             // (a second field without its first is a frame lost: counted once, not again for its first that failed)
             s.haveFirst = false;
-            const bool counted = interlaced && s.failedSeen && s.failedTs == s.jxsv->timestamp();
+            const bool counted = interlaced && s.failedSeen && s.failedTs == c.ts;
             if (!counted) ++stats_.incomplete;
-            s.failedSeen = interlaced, s.failedTs = s.jxsv->timestamp();
-            return;
+            s.failedSeen = interlaced, s.failedTs = c.ts;
+            continue;
         }
         Raster frame;
-        int64_t lost = s.jxsv->lostInFrame();
+        int64_t lost = c.lost;
         if (interlaced) {
             frame = Raster(video_.width, video_.height, s.firstField.sampling, s.firstField.depth);
             weaveField(frame, s.firstField, 1);
@@ -634,10 +658,29 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         }
         while (pending_.size() >= pendingLimit_) pending_.pop_front(), ++stats_.dropped;
         // (an interlaced frame's codestreams are its fields': none kept as the frame's)
-        pending_.push_back({std::move(frame), s.jxsv->timestamp(), lost, std::chrono::steady_clock::now(), interlaced ? std::vector<uint8_t>() : cs});
+        pending_.push_back({std::move(frame), c.ts, lost, c.came, interlaced ? std::vector<uint8_t>() : std::move(c.codestream)});
         if (lost) ++stats_.incomplete;
-        stats_.concealedSlices += s.jxsv->concealedSlices();
+        stats_.concealedSlices += c.concealed;
         cv_.notify_all();
+    }
+}
+
+void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
+    RtpPacket p;
+    if (!parseRtp(packet.data(), packet.size(), p)) return;  // (the merger took RTP of the stream's payload type alone)
+    if (s.kind == 0 && s.jxsv) {
+        // ST 2110-22: the codestream rebuilt, and handed to the stream's decode thread (decoding here held up the
+        // packets behind it). A decoder that falls behind loses the oldest frames waiting, not the newest.
+        if (!s.jxsv->add(p)) return;
+        while (s.coded.size() >= kCodedHeld) {
+            const uint32_t ts = s.coded.front().ts;
+            while (!s.coded.empty() && s.coded.front().ts == ts) s.coded.pop_front();
+            std::lock_guard lock(m_);
+            ++stats_.dropped;
+        }
+        s.coded.push_back({s.jxsv->codestream(), s.jxsv->timestamp(), s.jxsv->field(), s.jxsv->lostInFrame(), s.jxsv->concealedSlices(),
+                           std::chrono::steady_clock::now()});
+        s.codedCv.notify_one();
     } else if (s.kind == 0) {
         if (!s.assembler->add(p)) return;
         std::lock_guard lock(m_);
