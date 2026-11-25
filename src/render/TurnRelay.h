@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace montage::output {
 
@@ -82,6 +83,11 @@ public:
     std::string lastError() const;
     // Answers from the relay that were not used because they were not signed with the login's key.
     uint64_t answersRefused() const;
+    // Viewers' checks given a tiebreaker of 1 in place of 0 (setLocal).
+    uint64_t checksRepaired() const;
+    // The ports this computer's end of the bridge uses: Montage's end's (once said), the bridge's own to the relay,
+    // and those that stand for viewers' addresses (what a capture of the traffic is checked against).
+    std::vector<uint16_t> ports() const;
     // Whether the bridge carries nothing any more: the relay let its address go (the address's time ran out, or a
     // Refresh was answered 437), or the connection to the relay ended. A bridge does not ask for another address:
     // it would be a different one, and the viewer was told this one, so the viewer is let go and connects again.
@@ -106,6 +112,17 @@ private:
 // moved to the loopback port `alias` gives for it (as a host candidate), and the others (names, TCP, and those
 // `alias` gives 0 for) are left out.
 std::string offerThroughRelay(const std::string& sdp, const std::function<uint16_t(const std::string& ip, uint16_t port)>& alias);
+
+// The same for a review that is not only through the relay, where a bridge is a second way to Montage's end beside
+// its own addresses (for a viewer that reaches the relay over TCP or TLS, whose checks it repairs): each of the offer's
+// UDP relay candidates is kept, and a loopback host candidate for it added, at a relay candidate's priority; the rest
+// is left as it is.
+std::string offerAlsoThroughRelay(const std::string& sdp, const std::function<uint16_t(const std::string& ip, uint16_t port)>& alias);
+// How many UDP relay candidates with an IPv4 or IPv6 address a viewer's offer has.
+int relayCandidates(const std::string& sdp);
+// Montage's answer with a bridge beside its own addresses: every candidate kept, and the address at the relay added as
+// a relay candidate after the first UDP host candidate, whose port `localPort` is given (0 when there is none).
+std::string answerAlsoThroughRelay(const std::string& sdp, const std::string& relayedIp, uint16_t relayedPort, uint16_t* localPort);
 
 // The family of relayed address a viewer's offer needs: 6 when its UDP candidates' addresses are all IPv6, else 4.
 int offerFamily(const std::string& sdp);

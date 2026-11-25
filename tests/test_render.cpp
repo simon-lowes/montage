@@ -127,6 +127,8 @@
 #include "render/HeadlessBrowser.h"
 #include "render/OGraf.h"
 #include "RelayFake.h"
+#include "CcFeed.h"
+#include "PacketCapture.h"
 #include "ReviewBrowsers.h"
 #ifdef MONTAGE_TEST_TURN
 #include <juice/juice.h>
@@ -26537,7 +26539,10 @@ colorspaces:
         using namespace montage::reviewtest;
         QFETCH(QString, transport);
         QFETCH(int, ipv6);
-        if (ipv6 == 2 && !FakeRelay::hasIpv6()) QSKIP("This computer has no IPv6 loopback address");
+        if (ipv6 == 2 && !FakeRelay::hasIpv6()) {
+            if (qEnvironmentVariableIsSet("MONTAGE_REQUIRE_IPV6")) QFAIL("MONTAGE_REQUIRE_IPV6 is set, and this computer has no IPv6 loopback address");
+            QSKIP("This computer has no IPv6 loopback address");
+        }
         const bool stream = transport != "udp";
         FakeRelay::Config config;
         config.v6 = ipv6 == 2;
@@ -27151,18 +27156,104 @@ colorspaces:
     // test's own relay, which counts what it carries: every picture Montage sends goes to it over that transport,
     // as Send indications in the one connection. The "coturn" rows run coturn listening that one way only (Linux,
     // MONTAGE_TEST_TURNSERVER).
+    // Phase 17: the "beside" rows are a review that is not only through the relay, with Chrome on the relay alone (as
+    // behind a firewall that passes only TCP, or TLS on its port): Montage's end, on its own addresses too, is reached
+    // through a bridge beside them, which repairs Chrome's checks (their tiebreaker of 0), and they are counted. With
+    // tcpdump (MONTAGE_TEST_TCPDUMP), the loopback is captured while a review only through the relay plays, and no
+    // packet from Montage's end or its bridge goes anywhere but the relay (or between the two).
+    void packetCaptureFilesRead() {
+        // The tests' pcap reader (tests/PacketCapture.h, what the relay test's capture is checked with) finds the UDP
+        // and TCP packets of files over Ethernet, Linux's cooked captures (both forms) and BSD's loopback, in either
+        // byte order, with their families, ports and whether both ends are the loopback; other packets and links are
+        // passed over, and a file that is not pcap is said to be so.
+        auto le32 = [](QByteArray& d, uint32_t v) { for (int i = 0; i < 4; ++i) d.append(char((v >> (8 * i)) & 0xff)); };
+        auto be32 = [](QByteArray& d, uint32_t v) { for (int i = 3; i >= 0; --i) d.append(char((v >> (8 * i)) & 0xff)); };
+        auto be16 = [](QByteArray& d, uint16_t v) { d.append(char(v >> 8)); d.append(char(v & 0xff)); };
+        // (an IPv4 or IPv6 header, then the transport's ports and four bytes more)
+        auto ip = [&](int family, int protocol, bool loopback, uint16_t from, uint16_t to) {
+            QByteArray d;
+            if (family == 4) {
+                d.append(char(0x45)), d.append('\0'), be16(d, 28), be16(d, 0), be16(d, 0), d.append(char(64)), d.append(char(protocol)), be16(d, 0);
+                be32(d, loopback ? 0x7f000001u : 0xc0a80002u), be32(d, 0x7f000001u);
+            } else {
+                d.append(char(0x60)), d.append(QByteArray(3, '\0')), be16(d, 8), d.append(char(protocol)), d.append(char(64));
+                for (int k = 0; k < 2; ++k) {
+                    QByteArray a(16, '\0');
+                    a[15] = (loopback || k == 1) ? '\1' : '\2';
+                    if (!loopback && k == 0) a[0] = char(0x20);
+                    d.append(a);
+                }
+            }
+            be16(d, from), be16(d, to), d.append(QByteArray(4, '\0'));
+            return d;
+        };
+        auto file = [&](bool little, uint32_t link, const std::vector<QByteArray>& frames) {
+            QByteArray d;
+            auto u32 = [&](uint32_t v) { little ? le32(d, v) : be32(d, v); };
+            auto u16 = [&](uint16_t v) { little ? (d.append(char(v & 0xff)), d.append(char(v >> 8))) : (be16(d, v), d); };
+            u32(0xa1b2c3d4u), u16(2), u16(4), u32(0), u32(0), u32(65535), u32(link);
+            for (const QByteArray& f : frames) u32(0), u32(0), u32(uint32_t(f.size())), u32(uint32_t(f.size())), d.append(f);
+            return d;
+        };
+        QTemporaryDir dir;
+        auto read = [&](const QByteArray& bytes, std::string* why = nullptr) {
+            const QString path = dir.filePath("t.pcap");
+            QFile f(path);
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return std::vector<montage::testcapture::Packet>();
+            f.write(bytes);
+            f.close();
+            return montage::testcapture::readPcap(path, why);
+        };
+        auto ethernet = [&](const QByteArray& payload, uint16_t type) {
+            QByteArray d(12, '\0');
+            be16(d, type);
+            return d + payload;
+        };
+        const QByteArray udp4 = ip(4, 17, true, 5000, 3478), tcp6 = ip(6, 6, false, 40000, 5349), icmp4 = ip(4, 1, true, 0, 0);
+        for (const bool little : {true, false}) {
+            const auto e = read(file(little, 1, {ethernet(udp4, 0x0800), ethernet(tcp6, 0x86DD), ethernet(icmp4, 0x0800), ethernet(udp4, 0x0806)}));
+            QCOMPARE(int(e.size()), 2);
+            QVERIFY(e[0].protocol == 17 && e[0].family == 4 && e[0].from == 5000 && e[0].to == 3478 && e[0].loopback);
+            QVERIFY(e[1].protocol == 6 && e[1].family == 6 && e[1].from == 40000 && e[1].to == 5349 && !e[1].loopback);
+        }
+        QByteArray sll(14, '\0');
+        be16(sll, 0x0800);
+        QByteArray sll2;
+        be16(sll2, 0x86DD), sll2.append(QByteArray(18, '\0'));
+        QByteArray bsd;
+        le32(bsd, 2);
+        const auto cooked = read(file(true, 113, {sll + udp4}));
+        QVERIFY(cooked.size() == 1 && cooked[0].to == 3478);
+        const auto cooked2 = read(file(true, 276, {sll2 + tcp6}));
+        QVERIFY(cooked2.size() == 1 && cooked2[0].family == 6 && cooked2[0].to == 5349);
+        const auto loop = read(file(true, 0, {bsd + udp4, bsd + tcp6}));
+        QVERIFY(loop.size() == 2 && loop[0].loopback && loop[1].protocol == 6);
+        // (a packet cut short of its ports, and a record running past the file's end, are left out)
+        QVERIFY(read(file(true, 1, {ethernet(udp4.left(22), 0x0800)})).empty());
+        QByteArray cut = file(true, 1, {ethernet(udp4, 0x0800)});
+        cut.chop(5);
+        QVERIFY(read(cut).empty());
+        std::string why;
+        QVERIFY(read("not a capture at all, but long enough", &why).empty());
+        QCOMPARE(QString::fromStdString(why), QStringLiteral("not a pcap file"));
+    }
+
     void browserReviewRelayTransports_data() {
         QTest::addColumn<bool>("coturn");
         QTest::addColumn<QString>("transport");
         QTest::addColumn<bool>("ipv6");
-        QTest::newRow("fake udp") << false << "udp" << false;
-        QTest::newRow("fake tcp") << false << "tcp" << false;
-        QTest::newRow("fake tls") << false << "tls" << false;
-        QTest::newRow("fake ::1") << false << "udp" << true;
-        QTest::newRow("fake tls on ::1") << false << "tls" << true;
-        QTest::newRow("coturn tcp") << true << "tcp" << false;
-        QTest::newRow("coturn tls") << true << "tls" << false;
-        QTest::newRow("coturn ::1") << true << "udp" << true;
+        QTest::addColumn<bool>("beside");
+        QTest::newRow("fake udp") << false << "udp" << false << false;
+        QTest::newRow("fake tcp") << false << "tcp" << false << false;
+        QTest::newRow("fake tls") << false << "tls" << false << false;
+        QTest::newRow("fake ::1") << false << "udp" << true << false;
+        QTest::newRow("fake tls on ::1") << false << "tls" << true << false;
+        QTest::newRow("coturn tcp") << true << "tcp" << false << false;
+        QTest::newRow("coturn tls") << true << "tls" << false << false;
+        QTest::newRow("coturn ::1") << true << "udp" << true << false;
+        QTest::newRow("beside fake tcp") << false << "tcp" << false << true;
+        QTest::newRow("beside fake tls") << false << "tls" << false << true;
+        QTest::newRow("beside coturn tls") << true << "tls" << false << true;
     }
     void browserReviewRelayTransports() {
         using namespace montage::output;
@@ -27170,10 +27261,14 @@ colorspaces:
         QFETCH(bool, coturn);
         QFETCH(QString, transport);
         QFETCH(bool, ipv6);
+        QFETCH(bool, beside);
         std::string why;
         if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
         if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
-        if (ipv6 && !FakeRelay::hasIpv6()) QSKIP("This computer has no IPv6 loopback address");
+        if (ipv6 && !FakeRelay::hasIpv6()) {
+            if (qEnvironmentVariableIsSet("MONTAGE_REQUIRE_IPV6")) QFAIL("MONTAGE_REQUIRE_IPV6 is set, and this computer has no IPv6 loopback address");
+            QSKIP("This computer has no IPv6 loopback address");
+        }
         const std::string secret = "a shared secret made up for this test";
         const QString host = ipv6 ? QStringLiteral("::1") : QStringLiteral("127.0.0.1");
         const QHostAddress loopback(ipv6 ? QHostAddress::LocalHostIPv6 : QHostAddress::LocalHost);
@@ -27281,7 +27376,7 @@ colorspaces:
             QVERIFY2(fake->start(&why), why.c_str());
             turnPort = fake->port();
         }
-        const bool firefox = transport != "tls" && !GeckoBrowser::firefox().empty() && !GeckoBrowser::geckodriver().empty();
+        const bool firefox = !beside && transport != "tls" && !GeckoBrowser::firefox().empty() && !GeckoBrowser::geckodriver().empty();
         bool firefoxPlays = firefox;
         ChromeTab tab;
         QVERIFY2(tab.start(&why, {"--allow-loopback-in-peer-connection"}), why.c_str());
@@ -27293,10 +27388,14 @@ colorspaces:
                                       .toStdString();
         rig.settings.turnSecret = secret;
         rig.settings.turnExpirySeconds = 600;
-        rig.settings.relayOnly = true;
+        rig.settings.relayOnly = !beside;
         if (transport == "tls")
             rig.settings.turnPin = QSslCertificate(QByteArray::fromStdString(certificatePem), QSsl::Pem).digest(QCryptographicHash::Sha256).toHex(':').toStdString();
         QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        // (the loopback captured while a review only through the relay plays, where tcpdump may capture)
+        montage::testcapture::LoopbackCapture capture;
+        const bool capturing = !beside && !montage::testcapture::LoopbackCapture::exe().isEmpty();
+        if (capturing) QVERIFY2(capture.start(dir.path() + "/review.pcap", &why), why.c_str());
         rig.picture = [](FrameTime) {
             auto img = std::make_shared<Image>(320, 180);
             for (int y = 0; y < 180; ++y)
@@ -27331,6 +27430,12 @@ colorspaces:
             return (text + " " + QString::fromUtf8(serverLog())).toUtf8();
         };
         QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        // (beside: the page offers every way, and Chrome is held to the relay as a firewall would hold it)
+        if (beside)
+            QCOMPARE(tab.js("(() => { const P = window.RTCPeerConnection; window.RTCPeerConnection = function (c) { return new P(Object.assign({}, c, { iceTransportPolicy: 'relay' })); };"
+                            " window.RTCPeerConnection.prototype = P.prototype; return 'held'; })()")
+                         .toString(),
+                     QStringLiteral("held"));
         const QString joined = tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString();
         QVERIFY2(joined == QStringLiteral("joined"), (joined.toUtf8() + " " + said()).constData());
         QVERIFY2(tab.until("__montage.stage === 'connected' && __montage.presented > 10", 30), said().constData());
@@ -27347,6 +27452,11 @@ colorspaces:
         QCOMPARE(st.bridges[0].lastRefusal, std::string());
         QCOMPARE(st.bridges[0].answersRefused, uint64_t(0));
         QCOMPARE(st.bridgeThreads, 1);
+        // Chrome's checks from a relay it reaches over TCP or TLS were repaired on their way to Montage's end (the
+        // only way there, or the one beside its own addresses that it chose).
+        QCOMPARE(st.bridges[0].beside, beside);
+        qInfo("%llu of Chrome's checks repaired", (unsigned long long)st.bridges[0].checksRepaired);
+        if (transport != "udp") QVERIFY2(st.bridges[0].checksRepaired > 0, said().constData());
         if (firefox) {
             auto until = [&](const QString& expression, int seconds) {
                 QElapsedTimer t;
@@ -27420,6 +27530,29 @@ colorspaces:
             QCOMPARE(fake->bytesOverStream.load() > 0, transport != "udp");
             QVERIFY(fake->channelData.load() > 0);
             QCOMPARE(fake->loginsRefused.load(), 0);
+        }
+        if (capturing) {
+            // What the capture shows: every packet from Montage's end of a viewer's connection, or from its bridge,
+            // went to the relay or between the two, and the bridges sent the relay some over the transport said.
+            QThread::msleep(500);
+            capture.stop();
+            st = rig.review->stats();
+            std::set<uint16_t> ours;
+            for (const auto& b : st.bridges) ours.insert(b.ports.begin(), b.ports.end());
+            QVERIFY(ours.size() >= 3);
+            const std::vector<montage::testcapture::Packet> packets = montage::testcapture::readPcap(dir.path() + "/review.pcap", &why);
+            QVERIFY2(!packets.empty(), (why + " " + capture.said().toStdString()).c_str());
+            int toRelay = 0, elsewhere = 0;
+            for (const auto& k : packets) {
+                // (a browser's own connection to the review's page, from a TCP port that happens to share a number
+                // with one of Montage's UDP ports, is not Montage's)
+                if (!k.loopback || !ours.count(k.from) || k.to == uint16_t(rig.port())) continue;
+                if (k.to == uint16_t(turnPort)) toRelay += k.protocol == (transport == "udp" ? 17 : 6);
+                else if (!ours.count(k.to)) ++elsewhere;
+            }
+            qInfo("Captured: %zu packets, %d from Montage to the relay over %s, %d from Montage elsewhere", packets.size(), toRelay, qPrintable(transport), elsewhere);
+            QVERIFY(toRelay > 40);
+            QCOMPARE(elsewhere, 0);
         }
     }
 

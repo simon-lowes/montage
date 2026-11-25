@@ -295,9 +295,15 @@ jobs:
           (sudo apt-get install -y --no-install-recommends coturn > /dev/null && (sudo systemctl stop coturn > /dev/null 2>&1 || true) && command -v turnserver > /dev/null) \
             && echo "MONTAGE_TEST_TURNSERVER=$(command -v turnserver)" >> "$GITHUB_ENV" \
             || echo "::warning::Could not install coturn; the browser review test through it will be skipped"
+      - name: tcpdump, to capture a review through the relay (the distribution's package, let capture without root)
+        run: |
+          sudo apt-get install -y --no-install-recommends tcpdump libcap2-bin > /dev/null
+          sudo setcap cap_net_raw,cap_net_admin=eip "$(command -v tcpdump)"
+          echo "MONTAGE_TEST_TCPDUMP=$(command -v tcpdump)" >> "$GITHUB_ENV"
       - name: Test
         env:
           MONTAGE_REQUIRE_FIREFOX: "1"  # (the runner's Firefox and geckodriver: the browser review test fails rather than skips without them)
+          MONTAGE_REQUIRE_IPV6: "1"     # (the relay tests' ::1 rows fail rather than skip without an IPv6 loopback)
         run: ctest --test-dir build --output-on-failure
       - name: The window read over AT-SPI, as a screen reader on Linux reads it
         run: |

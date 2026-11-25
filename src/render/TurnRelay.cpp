@@ -275,26 +275,27 @@ void renameMappedAddress(QByteArray& d, const Address& from, quint16 fromPort, c
 // of 0 is given a tiebreaker of 1, and signed again with Montage's end's ICE password (which the check is signed with)
 // and its fingerprint worked out again. Chrome sends 0 from a relay it reaches over TCP or TLS, and Montage's ICE takes
 // 0 for no ICE-CONTROLLING at all and refuses the check (400) as naming neither role. Anything else is left as it is.
-void giveTiebreaker(QByteArray& d, const QByteArray& password) {
-    if (d.size() < 20 || get16(d, 0) != 0x0001 || get32(d, 4) != kCookie || 20 + qsizetype(get16(d, 2)) != d.size()) return;
+// Whether the check was given one.
+bool giveTiebreaker(QByteArray& d, const QByteArray& password) {
+    if (d.size() < 20 || get16(d, 0) != 0x0001 || get32(d, 4) != kCookie || 20 + qsizetype(get16(d, 2)) != d.size()) return false;
     qsizetype controlling = -1, integrity = -1, fingerprint = -1;
     for (qsizetype at = 20; at + 4 <= d.size();) {
         const quint16 type = get16(d, at);
         const qsizetype size = get16(d, at + 2);
-        if (at + 4 + size > d.size()) return;
+        if (at + 4 + size > d.size()) return false;
         if (integrity < 0) {
             if (type == 0x802A && size == 8) controlling = at + 4;
             if (type == kMessageIntegrity && size == 20) integrity = at;
         } else if (type == 0x8028 && size == 4 && at + 8 == d.size()) {
             fingerprint = at;
         } else {
-            return;  // (anything else after the signature: not a check as browsers make them)
+            return false;  // (anything else after the signature: not a check as browsers make them)
         }
         at += 4 + ((size + 3) & ~qsizetype(3));
     }
-    if (controlling < 0 || integrity < 0) return;
+    if (controlling < 0 || integrity < 0) return false;
     for (int k = 0; k < 8; ++k)
-        if (d[controlling + k] != '\0') return;
+        if (d[controlling + k] != '\0') return false;
     d[controlling + 7] = '\1';
     QByteArray covered = d.left(integrity);
     const quint16 upTo = qToBigEndian(quint16(integrity - 20 + 24));
@@ -305,6 +306,7 @@ void giveTiebreaker(QByteArray& d, const QByteArray& password) {
         const quint32 crc = qToBigEndian(crc32(d.left(fingerprint)) ^ 0x5354554Eu);
         memcpy(d.data() + fingerprint + 4, &crc, 4);
     }
+    return true;
 }
 
 // One line's candidate, when it is one: "a=candidate:<foundation> <component> <transport> <priority> <address> <port> typ ...".
@@ -463,6 +465,35 @@ std::string offerThroughRelay(const std::string& sdp, const std::function<uint16
     });
 }
 
+std::string offerAlsoThroughRelay(const std::string& sdp, const std::function<uint16_t(const std::string& ip, uint16_t port)>& alias) {
+    const QString end = sdp.find("\r\n") != std::string::npos ? QStringLiteral("\r\n") : QStringLiteral("\n");
+    return mapLines(sdp, [&](const QString& line) {
+        Candidate c;
+        Address a;
+        if (!readCandidate(line, c) || c.transport.compare(QLatin1String("udp"), Qt::CaseInsensitive) != 0 || !readAddress(c.address, a) ||
+            !line.contains(QLatin1String(" typ relay")))
+            return line;
+        const uint16_t port = alias(c.address.toStdString(), c.port);
+        if (!port) return line;
+        // (a relay candidate's priority, so the viewer's own ways are tried first)
+        const uint priority = c.priority.toUInt() & 0x00FFFFFFu;
+        return line + end + QStringLiteral("a=candidate:%1m %2 UDP %3 127.0.0.1 %4 typ host").arg(c.foundation, c.component).arg(priority).arg(port);
+    });
+}
+
+int relayCandidates(const std::string& sdp) {
+    int n = 0;
+    mapLines(sdp, [&](const QString& line) {
+        Candidate c;
+        Address a;
+        if (readCandidate(line, c) && c.transport.compare(QLatin1String("udp"), Qt::CaseInsensitive) == 0 && readAddress(c.address, a) &&
+            line.contains(QLatin1String(" typ relay")))
+            ++n;
+        return QString();
+    });
+    return n;
+}
+
 int offerFamily(const std::string& sdp) {
     int v4 = 0, v6 = 0;
     mapLines(sdp, [&](const QString& line) {
@@ -503,6 +534,31 @@ std::string answerThroughRelay(const std::string& sdp, const std::string& relaye
     });
 }
 
+std::string answerAlsoThroughRelay(const std::string& sdp, const std::string& relayedIp, uint16_t relayedPort, uint16_t* localPort) {
+    if (localPort) *localPort = 0;
+    bool given = false;
+    const QString end = sdp.find("\r\n") != std::string::npos ? QStringLiteral("\r\n") : QStringLiteral("\n");
+    return mapLines(sdp, [&](const QString& line) {
+        Candidate c;
+        Address a;
+        if (given || !readCandidate(line, c) || c.transport.compare(QLatin1String("udp"), Qt::CaseInsensitive) != 0 || !readAddress(c.address, a) ||
+            !line.contains(QLatin1String(" typ host")))
+            return line;
+        given = true;
+        if (localPort) *localPort = c.port;
+        const uint component = c.component.toUInt();
+        const uint priority = (65535u << 8) | (256u - std::clamp(component, 1u, 256u));
+        return line + end +
+               QStringLiteral("a=candidate:%1m %2 UDP %3 %4 %5 typ relay raddr %6 rport %7")
+                   .arg(c.foundation, c.component)
+                   .arg(priority)
+                   .arg(QString::fromStdString(relayedIp))
+                   .arg(relayedPort)
+                   .arg(c.address)
+                   .arg(c.port);
+    });
+}
+
 // A bridge's sockets and timer live on the bridges' thread, and everything below `// (on the thread)` runs there.
 struct RelayBridge::Impl {
     RelayAddress relay;
@@ -515,9 +571,10 @@ struct RelayBridge::Impl {
     std::string error;      // (under m)
     std::string stateText = "Not begun";  // (under m)
     bool released = false;  // (under m) the address has been given back, or there was none
+    std::vector<uint16_t> ports;  // (under m) the bridge's own to the relay, and those standing for viewers
     std::atomic<quint16> relayedPort{0}, localPort{0};
     std::atomic<bool> localSaid{false};
-    std::atomic<quint64> toRelay{0}, fromRelay{0}, refused{0};
+    std::atomic<quint64> toRelay{0}, fromRelay{0}, refused{0}, repaired{0};
 
     // (on the thread)
     struct Request {
@@ -936,6 +993,10 @@ struct RelayBridge::Impl {
         if (connected || ended) return;
         connected = true;
         connectBy = 0;
+        if (outer && outer->localPort()) {
+            std::lock_guard lock(m);
+            ports.push_back(outer->localPort());
+        }
         askForAddress();
     }
     void askForAddress() {
@@ -1035,6 +1096,10 @@ struct RelayBridge::Impl {
             return nullptr;
         }
         QObject::connect(s, &QUdpSocket::readyRead, ctx, [this, s, address, peerPort] { readAlias(s, address, peerPort); });
+        {
+            std::lock_guard lock(m);
+            ports.push_back(s->localPort());
+        }
         Alias& a = aliases[k];
         a = {s, address, peerPort};
         permit(address, peerPort, false);
@@ -1133,7 +1198,7 @@ struct RelayBridge::Impl {
                     a->socket->writeDatagram(*data, QHostAddress(QHostAddress::LocalHost), to);
                 } else {
                     QByteArray check = *data;
-                    giveTiebreaker(check, icePassword);
+                    if (giveTiebreaker(check, icePassword)) ++repaired;
                     a->socket->writeDatagram(check, QHostAddress(QHostAddress::LocalHost), to);
                 }
             }
@@ -1301,6 +1366,13 @@ void RelayBridge::setLocal(uint16_t port, const std::string& icePassword) {
 uint64_t RelayBridge::toRelay() const { return d_->toRelay; }
 uint64_t RelayBridge::fromRelay() const { return d_->fromRelay; }
 uint64_t RelayBridge::answersRefused() const { return d_->refused; }
+uint64_t RelayBridge::checksRepaired() const { return d_->repaired; }
+std::vector<uint16_t> RelayBridge::ports() const {
+    std::lock_guard lock(d_->m);
+    std::vector<uint16_t> out = d_->ports;
+    if (d_->localPort) out.insert(out.begin(), d_->localPort);
+    return out;
+}
 std::string RelayBridge::lastError() const {
     std::lock_guard lock(d_->m);
     return d_->error;
