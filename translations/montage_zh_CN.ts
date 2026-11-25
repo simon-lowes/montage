@@ -11440,6 +11440,18 @@ moved or muted, its keyframes are made again as part of that edit. A keyframe yo
 <context>
     <name>montage::DialogJobs</name>
     <message>
+        <source>another project is open (it was begun on an untitled one)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>another project is open (it was begun on %1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>It was not applied: %1.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>Montage stopped while this ran</source>
         <translation type="unfinished"></translation>
     </message>
@@ -13305,10 +13317,6 @@ Do you want to replace it?</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>States a buffer model (HRD) in H.264 or H.265 video, or sets MPEG-2&apos;s (its VBV), as broadcast ingest checks it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set above. The export is checked against it when it is written.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>XDCAM HD422&apos;s own</source>
         <translation type="unfinished"></translation>
     </message>
@@ -13326,6 +13334,34 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>, no more than %1 kbit/s with its VBV stated (%2 kbit)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>States a buffer model (HRD) in H.264 or H.265 video, AV1&apos;s decoder model, or sets MPEG-2&apos;s (its VBV), as broadcast ingest checks it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set above. The export is checked against it when it is written.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The grain carried: each shot&apos;s own, measured, or a profile saved by name for every shot</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each shot&apos;s own, measured</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 (this project)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 (library)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, a constant %1 kbit/s with its decoder model stated</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, no more than %1 kbit/s with its decoder model stated</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
