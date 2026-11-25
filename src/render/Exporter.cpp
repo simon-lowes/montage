@@ -3936,8 +3936,8 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
         if (!stillRendition(seq, "", sro, sdrSpace, sdrPeak, error)) return false;
         if (sdrSpace->hdr()) sro.displaySpace = rec709Space().id, sdrSpace = &rec709Space();
         Image sdr = renderProgramFrame(p, seq, t, sro);
-        // A gain map's base says Rec.709 or Display P3: a trim to other primaries goes into Rec.709.
-        if (sdrSpace->primaries != Primaries::Bt709 && sdrSpace->primaries != Primaries::P3D65) {
+        // A gain map's base says Rec.709, Display P3 or Adobe RGB: a trim to other primaries goes into Rec.709.
+        if (sdrSpace->primaries != Primaries::Bt709 && sdrSpace->primaries != Primaries::P3D65 && !gainMapBaseIsAdobeRgb(*sdrSpace)) {
             convertColor(sdr, *sdrSpace, rec709Space(), sdrPeak);
             sdrSpace = &rec709Space();
         }

@@ -3304,6 +3304,78 @@ private slots:
         for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(toLinear(Transfer::Pq, (i == 0 ? 0.5 : i == 1 ? 0.58 : 0.75)) * 2.03 - pq[i]) < 1e-4 * pq[i]);
     }
 
+    void adobeRgbGainMapStills() {
+        // A gain map over an Adobe RGB picture: its base written in Adobe RGB (its primaries, gamma 2.2 and its ICC
+        // profile) rather than clipped to Display P3, so that Adobe RGB's green, outside P3, comes back as it was in the
+        // HDR rendition (twice SDR white here), in a JPEG and in a HEIF; the grey beside it too.
+        const ColorSpace& adobe = *findColorSpace("adobergb");
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        QVERIFY(gainMapBaseIsAdobeRgb(adobe) && !gainMapBaseIsAdobeRgb(*findColorSpace("p3d65")));
+        const int W = 64, H = 32;
+        Image sdr(W, H), hdr(W, H);
+        double toBt2020[9], toAdobe[9];
+        primariesMatrix(Primaries::AdobeRgb, Primaries::Bt2020, toBt2020);
+        primariesMatrix(Primaries::Bt2020, Primaries::AdobeRgb, toAdobe);
+        const double grey = toLinear(Transfer::Gamma22, 0.5);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const bool green = x < W / 2;
+                float* s = sdr.at(x, y);
+                s[0] = s[2] = green ? 0.0f : 0.5f;
+                s[1] = green ? 1.0f : 0.5f;
+                s[3] = 1;
+                const double lin[3] = {green ? 0.0 : 2 * grey, green ? 2.0 : 2 * grey, green ? 0.0 : 2 * grey};  // (SDR white 1.0)
+                float* h = hdr.at(x, y);
+                for (int c = 0; c < 3; ++c) {
+                    const double v = toBt2020[c * 3] * lin[0] + toBt2020[c * 3 + 1] * lin[1] + toBt2020[c * 3 + 2] * lin[2];
+                    h[c] = float(nitsToCode(pq, std::max(0.0, v) * 203));
+                }
+                h[3] = 1;
+            }
+        // A pixel of a decoded HDR rendition (PQ BT.2020) as linear Adobe RGB, SDR white 1.0.
+        auto inAdobe = [&](const GainMapPicture& pic, int x, int y, double out[3]) {
+            double lin[3];
+            for (int c = 0; c < 3; ++c) lin[c] = codeToNits(pq, pic.rgba[(size_t(y) * size_t(pic.width) + size_t(x)) * 4 + size_t(c)] / 65535.0) / 203;
+            for (int c = 0; c < 3; ++c) out[c] = toAdobe[c * 3] * lin[0] + toAdobe[c * 3 + 1] * lin[1] + toAdobe[c * 3 + 2] * lin[2];
+        };
+        auto check = [&](const GainMapPicture& pic, const char* what) -> QString {
+            if (pic.width != W || pic.height != H) return QString("%1: %2x%3").arg(what).arg(pic.width).arg(pic.height);
+            double g[3], n[3];
+            inAdobe(pic, W / 4, H / 2, g);
+            inAdobe(pic, W * 3 / 4, H / 2, n);
+            const QString got = QString("%1: green %2 %3 %4, grey %5 %6 %7").arg(what).arg(g[0]).arg(g[1]).arg(g[2]).arg(n[0]).arg(n[1]).arg(n[2]);
+            const bool ok = std::fabs(g[1] - 2) < 0.1 && std::fabs(g[0]) < 0.05 && std::fabs(g[2]) < 0.05 &&
+                            std::fabs(n[0] - 2 * grey) < 0.03 && std::fabs(n[1] - 2 * grey) < 0.03 && std::fabs(n[2] - 2 * grey) < 0.03;
+            return ok ? QString() : got;
+        };
+        QTemporaryDir dir;
+        std::string err;
+        // JPEG: the base says Adobe RGB (its ICC profile), its green as written.
+        const std::string jpg = dir.filePath("adobe.jpg").toStdString();
+        QVERIFY2(writeGainMapJpeg(sdr, adobe, hdr, pq, 95, jpg, &err), err.c_str());
+        const QImage base(QString::fromStdString(jpg));
+        QCOMPARE(base.colorSpace().primaries(), QColorSpace::Primaries::AdobeRgb);
+        const QColor bg = base.pixelColor(W / 4, H / 2);
+        QVERIFY2(bg.red() <= 4 && bg.green() >= 250 && bg.blue() <= 4, qPrintable(bg.name()));
+        auto pic = decodeGainMapJpeg(jpg, &err);
+        QVERIFY2(pic, err.c_str());
+        QString why = check(*pic, "JPEG");
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // HEIF: its base's ICC profile Adobe RGB's, the map's tone-mapped item read back the same.
+        const std::string heic = dir.filePath("adobe.heic").toStdString();
+        QVERIFY2(writeGainMapHeif(sdr, adobe, hdr, pq, 95, 406, 220, heic, &err), err.c_str());
+        HeifStillInfo hi;
+        QVERIFY(readHeifStill(heic, hi) && hi.gainMap && hi.adobeRgb);
+        const QColor hb = decodeHeifPicture(heic).pixelColor(W / 4, H / 2);
+        QVERIFY2(hb.red() <= 6 && hb.green() >= 248 && hb.blue() <= 6, qPrintable(hb.name()));
+        pic = decodeGainMapHeif(heic, &err);
+        QVERIFY2(pic, err.c_str());
+        why = check(*pic, "HEIF");
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // A picture in another wide gamut is still refused (a gain map's base says Rec.709, Display P3 or Adobe RGB).
+        QVERIFY(!writeGainMapJpeg(sdr, *findColorSpace("rec2020"), hdr, pq, 95, dir.filePath("bt2020.jpg").toStdString(), &err));
+    }
+
     void cameraColourSpaces() {
         // Canon Log 2: Canon's published curve (code 0.092864125 is black; 18% grey near 0.39), a round trip at seven
         // exposures, and code values below black reaching negative light.
