@@ -27897,6 +27897,259 @@ colorspaces:
         QVERIFY2(worst <= 0.040 + 1 / fps, std::to_string(worst).c_str());
     }
 
+    // Phase 17: FFmpeg's own WHIP sender (its whip muxer, which needs FFmpeg 8 or later built with a TLS library for
+    // its DTLS) sends six seconds of a test pattern and a 1 kHz tone, in H.264 and Opus, to Capture's endpoint, and
+    // Montage records them: the recording ends when the sender does, its pictures decode (the pattern's colours) and
+    // number the time sent within a second, and its tone is found. The ffmpeg run is MONTAGE_TEST_WHIP_FFMPEG's, or
+    // the one on the PATH (the Package jobs' own build, which must have the muxer: MONTAGE_REQUIRE_WHIP_MUXER).
+    void captureFromWhipMuxer() {
+        std::string why;
+        if (!whip::available(&why)) QSKIP(why.c_str());
+        QString ffmpeg = QString::fromLocal8Bit(qgetenv("MONTAGE_TEST_WHIP_FFMPEG"));
+        if (ffmpeg.isEmpty()) ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+        const auto asked = [&](const QStringList& args) {
+            QProcess p;
+            p.setProcessChannelMode(QProcess::MergedChannels);
+            p.start(ffmpeg, args);
+            return p.waitForFinished(30000) ? p.readAll() : QByteArray();
+        };
+        const QByteArray muxer = ffmpeg.isEmpty() ? QByteArray() : asked({"-hide_banner", "-h", "muxer=whip"});
+        const QByteArray encoders = ffmpeg.isEmpty() ? QByteArray() : asked({"-hide_banner", "-encoders"});
+        if (!muxer.contains("Muxer whip") || !encoders.contains("libx264") || !encoders.contains("libopus")) {
+            const std::string missing = ffmpeg.isEmpty() ? "No ffmpeg (MONTAGE_TEST_WHIP_FFMPEG, or ffmpeg on the PATH)"
+                                                         : ffmpeg.toStdString() + " has no whip muxer (FFmpeg 8 or later, with a TLS library), or no libx264 and libopus";
+            if (qEnvironmentVariableIsSet("MONTAGE_REQUIRE_WHIP_MUXER")) QFAIL(("MONTAGE_REQUIRE_WHIP_MUXER is set: " + missing).c_str());
+            QSKIP(missing.c_str());
+        }
+        QTemporaryDir dir;
+        // (a port free for TCP and UDP both: the endpoint's requests and its media share the number)
+        int port = 0;
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QTcpServer t;
+            QUdpSocket u;
+            if (t.listen(QHostAddress::LocalHost, 0) && u.bind(QHostAddress::LocalHost, t.serverPort())) port = t.serverPort();
+        }
+        QVERIFY(port > 0);
+        const std::string token = "another-token-made-up-for-this-test";
+        CaptureSettings cs;
+        cs.video.url = "whip://127.0.0.1:" + std::to_string(port) + "/whip";
+        cs.video.options = {{"token", token}, {"wait", "60"}};
+        cs.path = (dir.path() + "/whip.mov").toStdString();
+        cs.codec = "prores_proxy";
+        std::mutex m;
+        int pictures = 0, coloured = 0, fpsNum = 0, fpsDen = 1;
+        std::vector<float> sound;  // the first channel, whole
+        cs.onPicture = [&](const AVFrame* f, int num, int den) {
+            // (the pattern's colours: a picture of the test source has chroma well away from grey)
+            const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(f->format));
+            if (!d || d->nb_components < 3 || (d->flags & AV_PIX_FMT_FLAG_RGB)) return;
+            const bool deep = d->comp[1].depth > 8;
+            const int h = AV_CEIL_RSHIFT(f->height, d->log2_chroma_h), w = AV_CEIL_RSHIFT(f->width, d->log2_chroma_w);
+            double far = 0;
+            int n = 0;
+            for (int y = 0; y < h; y += 4)
+                for (int x = 0; x < w; x += 4) {
+                    const double u = deep ? reinterpret_cast<const uint16_t*>(f->data[1] + y * f->linesize[1])[x] / double((1 << d->comp[1].depth) - 1)
+                                          : f->data[1][y * f->linesize[1] + x] / 255.0;
+                    far += std::fabs(u - 0.5);
+                    ++n;
+                }
+            std::lock_guard lock(m);
+            ++pictures;
+            coloured += n > 0 && far / n > 0.05;
+            fpsNum = num, fpsDen = den;
+        };
+        cs.onSound = [&](const AVFrame* f) {
+            const int ch = f->ch_layout.nb_channels;
+            if (ch <= 0 || f->pts < 0) return;
+            std::lock_guard lock(m);
+            if (sound.size() < size_t(f->pts) + size_t(f->nb_samples)) sound.resize(size_t(f->pts) + size_t(f->nb_samples), 0);
+            for (int i = 0; i < f->nb_samples; ++i)
+                sound[size_t(f->pts) + i] = f->format == AV_SAMPLE_FMT_S32 ? float(reinterpret_cast<const int32_t*>(f->data[0])[i * ch]) / 2147483648.0f
+                                                                           : reinterpret_cast<const float*>(f->data[0])[i * ch];
+        };
+        Recorder rec;
+        std::atomic<bool> finished{false}, fine{false};
+        std::string finishedWhy;
+        rec.onFinished = [&](bool ok, const std::string& message) {
+            fine = ok;
+            finishedWhy = message;
+            finished = true;
+        };
+        QVERIFY2(rec.start(cs, &why), why.c_str());
+        auto stopRecording = qScopeGuard([&] { rec.stop(); });
+        // (the endpoint listens once the recording has opened it)
+        QElapsedTimer listening;
+        listening.start();
+        bool up = false;
+        while (!up && listening.elapsed() < 10000) {
+            QTcpSocket c;
+            c.connectToHost(QHostAddress::LocalHost, quint16(port));
+            up = c.waitForConnected(200);
+            if (!up) QThread::msleep(50);
+        }
+        QVERIFY(up);
+        // Six seconds, sent as they are made, then the sender ends (and DELETEs the session).
+        QProcess sender;
+        sender.setProcessChannelMode(QProcess::MergedChannels);
+        sender.start(ffmpeg, {"-hide_banner", "-nostdin", "-re", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30", "-re", "-f", "lavfi", "-i",
+                              "sine=frequency=1000:sample_rate=48000", "-t", "6", "-c:v", "libx264", "-profile:v", "baseline", "-bf", "0", "-g", "30",
+                              "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-c:a", "libopus", "-ac", "2", "-ar", "48000", "-f", "whip", "-authorization",
+                              QString::fromStdString(token), QStringLiteral("http://127.0.0.1:%1/whip").arg(port)});
+        QVERIFY2(sender.waitForStarted(10000), qPrintable(sender.errorString()));
+        QElapsedTimer sending;
+        sending.start();
+        QVERIFY2(sender.waitForFinished(60000), sender.readAll().right(2000).constData());
+        const QByteArray said = sender.readAll();
+        QVERIFY2(sender.exitStatus() == QProcess::NormalExit && sender.exitCode() == 0, said.right(2000).constData());
+        QVERIFY2(rec.wait(20), said.right(1500).constData());
+        QVERIFY2(finished && fine, (finishedWhy + "; " + said.right(1500).toStdString()).c_str());
+        stopRecording.dismiss();
+        const CaptureStatus st = rec.status();
+        QVERIFY2(st.error.empty(), st.error.c_str());
+        QCOMPARE(st.width, 320);
+        QCOMPARE(st.height, 180);
+        MediaItem item;
+        QVERIFY2(probeMedia(cs.path, item, &why), why.c_str());
+        QVERIFY(item.hasVideo && item.hasAudio);
+
+        std::lock_guard lock(m);
+        QVERIFY(fpsNum > 0);
+        const double fps = double(fpsNum) / fpsDen;
+        const double recorded = pictures / fps;
+        qInfo("FFmpeg's WHIP sender: %d pictures at %.3f a second (%.2f s; %d in colour), %.2f s of sound, the sender's run %.2f s", pictures, fps, recorded, coloured,
+              double(sound.size()) / 48000, sending.elapsed() / 1000.0);
+        QVERIFY2(std::fabs(recorded - 6.0) < 1.0, std::to_string(recorded).c_str());
+        QVERIFY2(coloured > pictures * 3 / 4, (std::to_string(coloured) + " of " + std::to_string(pictures)).c_str());
+        // The tone: 1 kHz, by its crossings over 80 ms a second in, and loud.
+        QVERIFY2(sound.size() > 48000 * 2, std::to_string(sound.size()).c_str());
+        int crossings = 0;
+        float peak = 0;
+        for (size_t i = 48001; i < 48000 + 3840; ++i) {
+            if ((sound[i - 1] < 0) != (sound[i] < 0)) ++crossings;
+            peak = std::max(peak, std::fabs(sound[i]));
+        }
+        QVERIFY2(crossings > 150 && crossings < 170, std::to_string(crossings).c_str());
+        QVERIFY2(peak > 0.05f, std::to_string(peak).c_str());
+    }
+
+    // Phase 17: the guest's page on a phone. Headless Chrome emulates a phone's screen, 390 by 844 (and touch), with
+    // two cameras of its own: the page is laid out within the screen's width, nothing clipped, before and while it
+    // sends; once it sends the camera it offers to switch cameras, and switching keeps the same connection and
+    // session (the sender given the other camera's picture), so Montage's recording goes on with pictures from it,
+    // and ends whole when the page stops.
+    void whipGuestPageOnAPhone() {
+        using namespace montage::reviewtest;
+        std::string why;
+        if (!whip::available(&why)) QSKIP(why.c_str());
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        QTemporaryDir dir;
+        int port = 0;
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QTcpServer t;
+            QUdpSocket u;
+            if (t.listen(QHostAddress::LocalHost, 0) && u.bind(QHostAddress::LocalHost, t.serverPort())) port = t.serverPort();
+        }
+        QVERIFY(port > 0);
+        const std::string token = "a-phone-token-made-up-for-this-test";
+        CaptureSettings cs;
+        cs.video.url = "whip://127.0.0.1:" + std::to_string(port) + "/whip";
+        cs.video.options = {{"token", token}, {"wait", "60"}};
+        cs.path = (dir.path() + "/phone.mov").toStdString();
+        cs.codec = "prores_proxy";
+        std::atomic<int> pictures{0};
+        cs.onPicture = [&](const AVFrame*, int, int) { ++pictures; };
+        Recorder rec;
+        std::atomic<bool> finished{false}, fine{false};
+        std::string finishedWhy;
+        rec.onFinished = [&](bool ok, const std::string& message) {
+            fine = ok;
+            finishedWhy = message;
+            finished = true;
+        };
+        QVERIFY2(rec.start(cs, &why), why.c_str());
+        auto stopRecording = qScopeGuard([&] { rec.stop(); });
+        QElapsedTimer listening;
+        listening.start();
+        bool up = false;
+        while (!up && listening.elapsed() < 10000) {
+            QTcpSocket c;
+            c.connectToHost(QHostAddress::LocalHost, quint16(port));
+            up = c.waitForConnected(200);
+            if (!up) QThread::msleep(50);
+        }
+        QVERIFY(up);
+
+        ChromeTab tab;
+        // (three fake cameras, of which the page is shown the first and third: Chrome's second fake camera gives depth
+        // pictures, which it does not send over WebRTC, and no phone offers such a camera to a page)
+        QVERIFY2(tab.start(&why, {"--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream=device-count=3"}), why.c_str());
+        QVERIFY2(tab.call("Emulation.setDeviceMetricsOverride", {{"width", 390}, {"height", 844}, {"deviceScaleFactor", 3}, {"mobile", true}}, &why), why.c_str());
+        QVERIFY2(tab.call("Emulation.setTouchEmulationEnabled", {{"enabled", true}, {"maxTouchPoints", 5}}, &why), why.c_str());
+        tab.js(QStringLiteral("location.href = 'http://127.0.0.1:%1/whip#%2'; true").arg(port).arg(QString::fromStdString(token)));
+        QVERIFY2(tab.until("document.readyState === 'complete' && !!window.__montageWhip", 20), tab.log().right(1500).constData());
+        tab.js("(() => { const all = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);"
+               " navigator.mediaDevices.enumerateDevices = async () => (await all()).filter(d => d.label !== 'fake_device_1'); return true; })()");
+        // (the screen's width, then whatever reaches past it or clips its own text: none)
+        const QString layout = QStringLiteral(
+            "(() => { const w = window.innerWidth, bad = [];"
+            " if (document.documentElement.scrollWidth > w) bad.push('the page is ' + document.documentElement.scrollWidth + ' wide');"
+            " for (const e of document.querySelectorAll('h1, label, input, button, p, video')) {"
+            "   if (e.hidden || getComputedStyle(e).display === 'none') continue;"
+            "   const r = e.getBoundingClientRect();"
+            "   if (r.width === 0) continue;"
+            "   if (r.left < -0.5 || r.right > w + 0.5) bad.push((e.id || e.tagName) + ' at ' + Math.round(r.left) + ' to ' + Math.round(r.right));"
+            "   if (e.tagName === 'BUTTON' && (e.scrollWidth > e.clientWidth + 1 || e.scrollHeight > e.clientHeight + 1)) bad.push(e.id + ' clips its text');"
+            "   if (e.tagName === 'BUTTON' && r.height < 40) bad.push(e.id + ' is ' + Math.round(r.height) + ' high');"
+            " }"
+            " return w + ':' + bad.join(', '); })()");
+        QCOMPARE(tab.js(layout).toString(), QStringLiteral("390:"));
+        QCOMPARE(tab.js("document.getElementById('switch').hidden").toBool(), true);
+        tab.js("__montageWhip.send(false); true");
+        QVERIFY2(tab.until("__montageWhip.stage === 'sending'", 30), (tab.js("__montageWhip.stage + ': ' + document.getElementById('state').textContent").toString().toStdString() + tab.log().right(1500).toStdString()).c_str());
+        QVERIFY2(tab.until("!document.getElementById('switch').hidden", 10), "no camera switch offered with two cameras");
+        QCOMPARE(tab.js(layout).toString(), QStringLiteral("390:"));
+        // (the sender's camera, its pictures sent, and the session)
+        const QString camera = QStringLiteral("__montageWhip.pc.getSenders().find(s => s.track && s.track.kind === 'video').track.getSettings().deviceId");
+        const QString framesSent = QStringLiteral("__montageWhip.pc.getStats().then(r => { let n = 0; r.forEach(s => { if (s.type === 'outbound-rtp' && s.kind === 'video') n = s.framesSent || 0; }); return n; })");
+        QElapsedTimer t;
+        t.start();
+        while (pictures < 30 && t.elapsed() < 15000) QThread::msleep(50);
+        QVERIFY2(pictures >= 30, std::to_string(pictures).c_str());
+        const QString before = tab.js(camera).toString();
+        const QString session = tab.js("__montageWhip.session").toString();
+        QVERIFY(!before.isEmpty() && !session.isEmpty());
+        QCOMPARE(tab.js("__montageWhip.switchCamera()").toBool(), true);
+        const QString after = tab.js(camera).toString();
+        QVERIFY2(!after.isEmpty() && after != before, qPrintable(before + " then " + after));
+        // The same connection and session, still sending, and pictures from the other camera reach the recording.
+        const int atSwitch = pictures;
+        const int sentAtSwitch = tab.js(framesSent).toInt();
+        QThread::msleep(3000);
+        QCOMPARE(tab.js("__montageWhip.session").toString(), session);
+        QCOMPARE(tab.js("__montageWhip.pc.connectionState").toString(), QStringLiteral("connected"));
+        QCOMPARE(tab.js("__montageWhip.stage").toString(), QStringLiteral("sending"));
+        QVERIFY(rec.recording());
+        const int sentSince = tab.js(framesSent).toInt() - sentAtSwitch;
+        // (for a failure's message: the camera's track as the sender has it now)
+        const QString track = tab.js("(() => { const t = __montageWhip.pc.getSenders().find(s => s.track && s.track.kind === 'video').track;"
+                                     " return t.label + ' ' + t.readyState + (t.muted ? ' muted ' : ' ') + JSON.stringify(t.getSettings()); })()")
+                                  .toString();
+        qInfo("Phone page: %d pictures recorded before the switch, %d after it (%d sent; %s)", atSwitch, pictures - atSwitch, sentSince, qPrintable(track));
+        QVERIFY2(sentSince > 30, qPrintable(QString::number(sentSince) + " " + track));
+        QVERIFY2(pictures - atSwitch > 30, std::to_string(pictures - atSwitch).c_str());
+        QCOMPARE(tab.js(layout).toString(), QStringLiteral("390:"));
+        tab.js("(async () => { await __montageWhip.stop(); return true; })()");
+        QVERIFY(rec.wait(20));
+        QVERIFY2(finished && fine, finishedWhy.c_str());
+        stopRecording.dismiss();
+        const CaptureStatus st = rec.status();
+        QVERIFY2(st.error.empty(), st.error.c_str());
+        MediaItem item;
+        QVERIFY2(probeMedia(cs.path, item, &why), why.c_str());
+        QVERIFY(item.hasVideo && item.hasAudio);
+    }
+
     void ndiOutput() {
         using namespace montage::output;
         // A stand-in NDI Runtime where the SDK says to look.

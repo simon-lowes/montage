@@ -96,22 +96,27 @@ const char* guestPage() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Send to Montage</title>
 <style>
-body { font: 16px system-ui, sans-serif; margin: 2rem auto; max-width: 40rem; padding: 0 1rem; color: #1b1b1b; background: #fafafa; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { font: 16px system-ui, sans-serif; margin: 2rem auto; max-width: 40rem; padding: 0 1rem; color: #1b1b1b; background: #fafafa; overflow-wrap: anywhere; }
 h1 { font-size: 1.4rem; }
 label { display: block; margin: 1rem 0; }
 input { font: inherit; padding: 0.3rem; width: 100%; box-sizing: border-box; }
-button { font: inherit; padding: 0.5rem 0.9rem; margin: 0 0.5rem 0.5rem 0; }
-video { width: 100%; background: #000; margin-top: 1rem; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+button { font: inherit; padding: 0.5rem 0.9rem; min-height: 2.75rem; max-width: 100%; }
+button[hidden] { display: none; }
+video { display: block; width: 100%; max-height: 60vh; object-fit: contain; background: #000; margin-top: 1rem; }
 #state { min-height: 1.5rem; }
+@media (max-width: 30rem) { body { margin-top: 1rem; } .actions button { flex: 1 1 100%; } }
 @media (prefers-color-scheme: dark) { body { color: #eee; background: #1b1b1b; } }
 </style>
 </head>
 <body>
 <h1>Send to Montage</h1>
 <label>Token <input id="token" type="password" autocomplete="off"></label>
-<p>
+<p class="actions">
 <button id="camera" type="button">Send camera and microphone</button>
 <button id="screen" type="button">Send screen</button>
+<button id="switch" type="button" hidden>Switch camera</button>
 <button id="stop" type="button" disabled>Stop</button>
 </p>
 <p id="state" role="status" aria-live="polite"></p>
@@ -122,7 +127,9 @@ video { width: 100%; background: #000; margin-top: 1rem; }
   const whip = window.__montageWhip = {stage: 'idle', pc: null, session: null, stream: null};
   if (location.hash.length > 1) $('token').value = decodeURIComponent(location.hash.slice(1));
   const say = (stage, text) => { whip.stage = stage; $('state').textContent = text; };
-  const sending = on => { $('camera').disabled = $('screen').disabled = on; $('stop').disabled = !on; };
+  const sending = on => { $('camera').disabled = $('screen').disabled = on; $('stop').disabled = !on; if (!on) $('switch').hidden = true; };
+  // (the cameras this browser has, once it has let the page open one: front and back on a phone)
+  const cameras = async () => (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput' && d.deviceId);
   const headers = extra => Object.assign($('token').value ? {Authorization: 'Bearer ' + $('token').value} : {}, extra || {});
   whip.stop = async (text) => {
     const session = whip.session;
@@ -168,13 +175,56 @@ video { width: 100%; background: #000; margin-top: 1rem; }
         if (pc.connectionState === 'connected') say('sending', 'Sending');
         if (pc.connectionState === 'failed') whip.stop('The connection to Montage was lost');
       });
-      for (const t of whip.stream.getTracks()) t.addEventListener('ended', () => { if (pc === whip.pc) whip.stop(); });
+      for (const t of whip.stream.getTracks()) t.addEventListener('ended', () => { if (pc === whip.pc && whip.stream && whip.stream.getTracks().includes(t)) whip.stop(); });
+      if (!screen && !made) $('switch').hidden = (await cameras()).length < 2;
     } catch (e) {
       whip.stop('Montage could not be reached: ' + e.message);
     }
   };
+  // The next camera in place of this one, in the same connection: its sender is given the new camera's picture,
+  // so Montage's feed goes on (no new offer, and no new session).
+  whip.switchCamera = async () => {
+    const pc = whip.pc, stream = whip.stream;
+    const sender = pc && pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (!sender) return false;
+    const list = await cameras();
+    if (list.length < 2) return false;
+    const old = sender.track;
+    const at = list.findIndex(d => d.deviceId === old.getSettings().deviceId);
+    const next = list[(at + 1) % list.length];
+    $('switch').disabled = true;
+    // (a phone opens one camera at a time: this one is let go first, and opened again if the other will not open)
+    const open = id => navigator.mediaDevices.getUserMedia({video: {deviceId: {exact: id}, width: {ideal: 1280}, height: {ideal: 720}}});
+    const was = old.getSettings().deviceId;
+    stream.removeTrack(old);
+    old.stop();
+    let track = null, failed = null;
+    try {
+      track = (await open(next.deviceId)).getVideoTracks()[0];
+    } catch (e) {
+      failed = e;
+      try { track = (await open(was)).getVideoTracks()[0]; } catch (e2) {}
+    }
+    try {
+      if (!track || pc !== whip.pc) {
+        if (track) track.stop();
+        if (pc === whip.pc) whip.stop('The camera could not be opened again');
+        return false;
+      }
+      await sender.replaceTrack(track);
+      stream.addTrack(track);
+      track.addEventListener('ended', () => { if (pc === whip.pc && whip.stream && whip.stream.getTracks().includes(track)) whip.stop(); });
+      $('preview').srcObject = stream;
+      if (failed) say(whip.stage, 'The other camera could not be opened: ' + failed.message);
+      else say(whip.stage, next.label ? 'Sending (' + next.label + ')' : 'Sending');
+      return !failed;
+    } finally {
+      $('switch').disabled = false;
+    }
+  };
   $('camera').addEventListener('click', () => whip.send(false));
   $('screen').addEventListener('click', () => whip.send(true));
+  $('switch').addEventListener('click', () => whip.switchCamera());
   $('stop').addEventListener('click', () => whip.stop());
   if (!navigator.mediaDevices) say('failed', 'This browser gives this page no camera: open it over https');
 })();

@@ -84,7 +84,9 @@ one with its exact version, licence and source.
 - [FFmpeg](https://ffmpeg.org), built by `scripts/build-ffmpeg.sh` with `--enable-gpl` (and never `--enable-nonfree`),
   which makes this build GPL-2.0-or-later; with [x264](https://www.videolan.org/developers/x264.html) (GPL-2.0-or-later),
   [x265](https://www.x265.org) (GPL-2.0-or-later), libvpx (BSD-3-Clause), SVT-AV1 (BSD-3-Clause-Clear), dav1d
-  (BSD-2-Clause), Opus (BSD-3-Clause), OpenJPEG (BSD-2-Clause), SRT (MPL-2.0), librist (BSD-2-Clause) and
+  (BSD-2-Clause), Opus (BSD-3-Clause), OpenJPEG (BSD-2-Clause), SRT (MPL-2.0), librist (BSD-2-Clause),
+  [GnuTLS](https://gnutls.org) (LGPL-2.1-or-later, with Nettle and GMP under LGPL-3.0-or-later or GPL-2.0-or-later;
+  FFmpeg's HTTPS and the DTLS of its WHIP sender) and
   [OpenAPV](https://github.com/AcademySoftwareFoundation/openapv) 0.2.1.3 (BSD-3-Clause, Copyright (c) 2022 Samsung
   Electronics Co., Ltd.; linked into libavcodec for APV encoding, its `LICENSE` copied into the packages' `ffmpeg`
   licences folder).
