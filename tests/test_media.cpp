@@ -41993,6 +41993,216 @@ private slots:
         }
     }
 
+    void titlesInTheSceneShadowEachOther() {
+        // In the 3D layers' scene, a letter's shadow on the next letter and a 3D model's shadow on a letter fall where a
+        // ray-traced reference puts them: a pixel of a letter's face (seen square on and facing the light) is in shadow
+        // where the ray from its point towards the light meets one of the casters' triangles (the title's from
+        // title3dMesh, the model's from modelClipScene, as the scene has them). Every face pixel the render shadows and
+        // the reference does not (or the other way) is within 1 px of one the reference shadows and one it lights.
+        const int W = 320, H = 180;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        RenderOptions o;
+        using V = std::array<double, 3>;
+        using Tri = std::array<V, 3>;
+        auto trianglesOf = [](const PosedTriangles& T) {
+            std::vector<Tri> out;
+            for (size_t i = 0; i + 2 < T.indices.size(); i += 3) {
+                Tri t;
+                for (size_t k = 0; k < 3; ++k)
+                    for (size_t j = 0; j < 3; ++j) t[k][j] = T.positions[T.indices[i + k] * 3 + j];
+                out.push_back(t);
+            }
+            return out;
+        };
+        // How far along d from o0 the ray meets t, or -1.
+        auto meet = [](const Tri& t, const V& o0, const V& d) {
+            const V e1{t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]}, e2{t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]};
+            const V pv{d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+            const double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+            if (std::fabs(det) < 1e-12) return -1.0;
+            const V tv{o0[0] - t[0][0], o0[1] - t[0][1], o0[2] - t[0][2]};
+            const double u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) / det;
+            if (u < 0 || u > 1) return -1.0;
+            const V qv{tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+            const double w = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) / det;
+            if (w < 0 || u + w > 1) return -1.0;
+            const double along = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) / det;
+            return along > 1e-6 ? along : -1.0;
+        };
+        auto blocked = [&](const std::vector<Tri>& T, const V& o0, const V& d) {
+            for (const Tri& t : T)
+                if (meet(t, o0, d) > 0) return true;
+            return false;
+        };
+        ModelCamera front;  // (the camera a 3D layer's card and a 3D title of their own see the scene through)
+        {
+            Clip probe;
+            probe.id = p.newId();
+            probe.duration = 10;
+            probe.generator = makeEffect(p, "color");
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 0.0;
+            probe.effects.push_back(e);
+            std::string err;
+            QVERIFY2(effectCamera(p, s, probe, probe.effects[0], 0, 1, front, &err), err.c_str());
+        }
+        // A 3D title (100 px, 20 px deep, square on, green), lit by a light from `angle`, `height` up.
+        auto title = [&](const char* text, double angle, double height) {
+            Clip c = makeGeneratorClip(p, "title3d", 10);
+            Effect& g = c.generator;
+            g.strings["text"] = text;
+            g.strings["font"] = "DejaVu Sans";
+            g.params["size"] = Param(100.0), g.params["depth"] = Param(20.0);
+            g.params["rot_x"] = Param(0.0), g.params["rot_y"] = Param(0.0);
+            g.params["light_angle"] = Param(angle), g.params["light_height"] = Param(height);
+            g.params["color.r"] = Param(0.2), g.params["color.g"] = Param(0.9), g.params["color.b"] = Param(0.3);
+            g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.9), g.params["side_color.b"] = Param(0.3);
+            g.params["in_scene"] = Param(1.0), g.params["shadows"] = Param(1.0);
+            return c;
+        };
+        // The render with the casters' shadows (`shaded`) and without, against the reference, over the pixels whose
+        // camera ray meets first a face of the title's letter `letter` (-1: any).
+        auto compare = [&](const char* what, const Image& shaded, const Image& unshaded, const Title3DMesh& mesh, int letter,
+                           const std::vector<Tri>& casters, const std::vector<Tri>& others, const V& toLight) {
+            const std::vector<Tri> T = trianglesOf(mesh.triangles);
+            std::vector<int> ref(size_t(W) * size_t(H), -1);  // -1 not looked at, 1 shadowed, 0 lit
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const V d = front.ray(x + 0.5, y + 0.5);
+                    double best = 1e30;
+                    size_t which = T.size();
+                    for (size_t i = 0; i < T.size(); ++i)
+                        if (const double a = meet(T[i], front.C, d); a > 0 && a < best) best = a, which = i;
+                    if (which == T.size()) continue;
+                    bool hidden = false;  // (something else in front)
+                    for (const Tri& t : others)
+                        if (const double a = meet(t, front.C, d); a > 0 && a < best) hidden = true;
+                    if (hidden) continue;
+                    const Tri& t = T[which];
+                    const V e1{t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]}, e2{t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]};
+                    V n{e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                    const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                    if (!(len > 0) || std::fabs(n[2]) / len < 0.999) continue;  // (a face, square on)
+                    if (letter >= 0 && (which >= mesh.letterOf.size() || mesh.letterOf[which] != letter)) continue;
+                    const V P{front.C[0] + d[0] * best + toLight[0] * 0.01, front.C[1] + d[1] * best + toLight[1] * 0.01,
+                              front.C[2] + d[2] * best + toLight[2] * 0.01};
+                    ref[size_t(y) * W + size_t(x)] = blocked(casters, P, toLight) ? 1 : 0;
+                }
+            auto near = [&](int x, int y, int want) {
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int X = x + dx, Y = y + dy;
+                        if (X >= 0 && Y >= 0 && X < W && Y < H && ref[size_t(Y) * W + size_t(X)] == want) return true;
+                    }
+                return false;
+            };
+            int shadowed = 0, lit = 0, wrong = 0, far = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const int r = ref[size_t(y) * W + size_t(x)];
+                    if (r < 0 || near(x, y, -1)) continue;  // (not a face pixel, or at a face's edge)
+                    const bool ours = unshaded.at(x, y)[1] - shaded.at(x, y)[1] > 0.05f;
+                    shadowed += r == 1, lit += r == 0;
+                    if (ours != (r == 1)) {
+                        ++wrong;
+                        if (!(near(x, y, 0) && near(x, y, 1))) ++far;
+                    }
+                }
+            qInfo("%s: %d face px in the reference's shadow, %d lit, %d differ at its edge, %d further", what, shadowed, lit, wrong, far);
+            QVERIFY(shadowed > 100);
+            QVERIFY(lit > 100);
+            QCOMPARE(far, 0);
+        };
+
+        // ---- "II", its first letter brought 60 px towards the camera, lit from the left: its shadow on the second
+        // letter's face. (A card far behind stands with it in the scene.)
+        {
+            Clip back;
+            back.id = p.newId();
+            back.duration = 10;
+            back.generator = makeEffect(p, "color");
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 0.0;
+            e.params["pos_z"] = -3000.0;
+            back.effects.push_back(e);
+            Clip ii = title("II", -35, 10);
+            const int k = addTextAnimator(ii.generator);
+            const std::string pre = "ta" + std::to_string(k) + ".";
+            ii.generator.params[pre + "end"] = Param(50.0);
+            ii.generator.params[pre + "z"] = Param(60.0);
+            s.videoTracks[0].clips = {back};
+            s.videoTracks[1].clips = {ii};
+            QVERIFY(title3dInScene(s, s.videoTracks[1].clips[0], 3));
+            const Image shaded = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips[0].generator.params["shadows"] = Param(0.0);
+            const Image unshaded = renderSequenceFrame(p, s, 3, o);
+            Title3DMesh mesh;
+            QVERIFY(title3dMesh(ii.generator, 3, W, H, 10, 25, mesh));
+            // (the first letter nearer the camera than the second)
+            double z0 = -1e30, z1 = -1e30;
+            for (size_t i = 0; i < mesh.letterOf.size(); ++i)
+                for (size_t c = 0; c < 3; ++c) {
+                    const double z = mesh.triangles.positions[mesh.triangles.indices[i * 3 + c] * 3 + 2];
+                    (mesh.letterOf[i] == 0 ? z0 : z1) = std::max(mesh.letterOf[i] == 0 ? z0 : z1, z);
+                }
+            QVERIFY2(z0 > z1 + 50, qPrintable(QString("%1 %2").arg(z0).arg(z1)));
+            const ModelLight light = settingsLight(ii.generator, 3, {0, 0, 0}, 1);
+            const V toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+            QVERIFY(toLight[2] > 0.2);
+            compare("a letter's shadow on the next", shaded, unshaded, mesh, 1, trianglesOf(mesh.triangles), {}, toLight);
+            for (Track& t : s.videoTracks) t.clips.clear();
+        }
+
+        // ---- A box (a 3D model, seen through its own camera) up and to the left of an "I", between it and the light,
+        // out of the letter's way as the camera sees it: its shadow on the letter's face.
+        {
+            Clip one = title("I", -60, 15);
+            const ModelLight light = settingsLight(one.generator, 3, {0, 0, 0}, 1);
+            const V toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+            QVERIFY(toLight[2] > 0.2);
+            Clip box = makeGeneratorClip(p, "model3d", 10);
+            Effect& b = box.generator;
+            b.params["shape"] = Param(2.0);
+            b.params["size"] = Param(40.0);
+            b.params["rot_x"] = Param(0.0), b.params["rot_y"] = Param(0.0), b.params["rot_z"] = Param(0.0);
+            b.params["ground"] = Param(0.0);
+            b.params["shadows"] = Param(1.0);
+            // (its middle 150 px from the frame's middle, where the letter is, towards the light)
+            const V want{toLight[0] * 150, toLight[1] * 150, toLight[2] * 150};
+            std::vector<Tri> boxTris;
+            for (int pass = 0; pass < 4; ++pass) {
+                ModelScene scene;
+                ModelCamera mc;
+                std::shared_ptr<const Model> model;
+                std::string err;
+                QVERIFY2(modelClipScene(p, s, box, 3, W, H, 1, {}, scene, mc, model, &err), err.c_str());
+                std::array<double, 3> lo, hi;
+                QVERIFY(modelBounds(scene.triangles, lo, hi));
+                const char* axis[3] = {"pos_x", "pos_y", "pos_z"};
+                double off = 0;
+                for (size_t k = 0; k < 3; ++k) off = std::max(off, std::fabs(want[k] - (lo[k] + hi[k]) / 2));
+                boxTris = trianglesOf(scene.triangles);
+                if (off < 0.5) break;
+                QVERIFY2(pass < 3, qPrintable(QString::number(off)));
+                for (size_t k = 0; k < 3; ++k) b.params[axis[k]] = Param(b.p(axis[k], 3) + want[k] - (lo[k] + hi[k]) / 2);
+            }
+            s.videoTracks[0].clips = {box};
+            s.videoTracks[1].clips = {one};
+            QCOMPARE(shadowWorldOf(s, box, box.generator, 3), std::string("front"));
+            QVERIFY(title3dInScene(s, s.videoTracks[1].clips[0], 3));
+            const Image shaded = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[0].clips[0].generator.params["shadows"] = Param(0.0);
+            const Image unshaded = renderSequenceFrame(p, s, 3, o);
+            Title3DMesh mesh;
+            QVERIFY(title3dMesh(one.generator, 3, W, H, 10, 25, mesh));
+            compare("a model's shadow on a letter", shaded, unshaded, mesh, -1, boxTris, boxTris, toLight);
+            for (Track& t : s.videoTracks) t.clips.clear();
+        }
+    }
+
     void shapeLayersAsVectorGraphics() {
         // A Shape layer's contents: groups of shapes, paints and the operators that change the paths above them.
         const int W = 400, H = 300;
