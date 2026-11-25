@@ -25308,6 +25308,7 @@ print("added " + ui["name"])
         viewer.winId();
         viewer.windowHandle()->setScreen(sdrScreen);
         qint64 from = logEnd();
+        const qint64 shown = from;
         viewer.showFullScreen();
         QVERIFY(QTest::qWaitForWindowExposed(&viewer));
         QTRY_COMPARE_WITH_TIMEOUT(viewer.size(), sdrScreen->size(), 10000);
@@ -25357,12 +25358,42 @@ print("added " + ui["name"])
             // (already there out of full screen, if Weston put it there: entered since it left full screen)
             QTRY_VERIFY2_WITH_TIMEOUT(said(before, ".enter(" + wlOutput + ")"), what, 10000);
         };
+        // The wl_surface whose colour management surface was last given an image description (since `since`).
+        auto describedSurface = [&](qint64 since) {
+            QHash<QByteArray, QByteArray> surfaceOf;  // (wp_color_management_surface_v1@n: its wl_surface@m)
+            QByteArray found;
+            for (const QByteArray& line : ours(since)) {
+                static const QByteArray made = "get_surface(new id ";
+                qsizetype at = line.indexOf(made + "wp_color_management_surface_v1@");
+                if (at >= 0) {
+                    const qsizetype id = at + made.size(), comma = line.indexOf(", ", id), close = line.indexOf(')', comma);
+                    if (comma > id && close > comma) surfaceOf[line.mid(id, comma - id)] = line.mid(comma + 2, close - comma - 2);
+                    continue;
+                }
+                at = line.indexOf(".set_image_description(wp_image_description_v1@");
+                if (at >= 0) {
+                    const qsizetype object = line.lastIndexOf(' ', at) + 1;
+                    found = surfaceOf.value(line.mid(object, at - object));
+                }
+            }
+            return found;
+        };
+        const qint64 moving = logEnd();
         moveTo(pqScreen, pqOutput, "Montage's window did not enter the PQ output");
         QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
         QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->describedTransfer() == Transfer::Pq,
                                   qPrintable(viewer.hdrStatus()), 10000);
-        QTRY_VERIFY2(said(from, ".set_image_description(wp_image_description_v1@"), "the surface was not described on the PQ output");
-        QTRY_VERIFY2(said(from, ".set_tf_named(11)"), "no PQ description on the PQ output");
+        // Montage's binding describes the surface anew for the output it enters (its headroom and mastering). Qt
+        // describes it from the window's colour space once, when it makes it (PQ on the SDR output too, which Weston
+        // fits to that output), and not again when it enters another: there the description to look for is that one,
+        // on the surface that entered the PQ output.
+        const qint64 describedFrom = throughQt ? shown : from;
+        QTRY_VERIFY2(said(describedFrom, ".set_image_description(wp_image_description_v1@"), "the surface was not described on the PQ output");
+        QTRY_VERIFY2(said(describedFrom, ".set_tf_named(11)"), "no PQ description on the PQ output");
+        const QByteArray hdrSurface = describedSurface(shown);
+        QVERIFY2(!hdrSurface.isEmpty(), "no wl_surface for the colour management surface described");
+        QTRY_VERIFY2_WITH_TIMEOUT(said(moving, hdrSurface + ".enter(" + pqOutput + ")"),
+                                  qPrintable(QStringLiteral("the described surface (%1) did not enter the PQ output").arg(QString::fromLatin1(hdrSurface))), 10000);
         if (!throughQt) {
             QTRY_VERIFY2_WITH_TIMEOUT(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())), 10000);
             QTRY_VERIFY2(said(from, ".set_mastering_luminance(50, 800)"), "the master's light is not in the PQ output's description");
