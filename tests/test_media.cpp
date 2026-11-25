@@ -41702,6 +41702,54 @@ private slots:
             QVERIFY(again.active()->videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
             QVERIFY(again.active()->videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
         }
+        // ---- The same project with a model too, a box through the scene's camera in front of the second card (as such
+        // a build wrote one: its own parameters, no lens of its own). Opened, the camera's lens stays off, and the second
+        // card and the model are drawn as with no lens anywhere (the camera's lens turned off by hand, the first card's
+        // too): the first card's own depth of field blurs neither.
+        {
+            QFile fixture(QString(MONTAGE_TEST_DATA_DIR) + "/projects/card-lens-before-10-nov.montage");
+            QVERIFY(fixture.open(QIODevice::ReadOnly));
+            QJsonObject doc = QJsonDocument::fromJson(fixture.readAll()).object();
+            QJsonArray sequences = doc.value("sequences").toArray();
+            QJsonObject seq = sequences[0].toObject();
+            QJsonArray video = seq.value("video").toArray();
+            const QJsonObject model{{"duration", 10}, {"id", 900}, {"media", 0}, {"name", ""}, {"sourceIn", 0}, {"speed", 1}, {"start", 0},
+                                    {"generator", QJsonObject{{"id", 901}, {"type", "model3d"},
+                                                              {"params", QJsonObject{{"camera", 3}, {"shape", 2}, {"size", 60}, {"pos_x", 130},
+                                                                                     {"pos_y", 0}, {"pos_z", -300}, {"ground", 0}}}}}};
+            video.append(QJsonObject{{"id", 902}, {"name", "V4"}, {"surround", QJsonValue()}, {"clips", QJsonArray{model}}});
+            seq["video"] = video;
+            sequences[0] = seq;
+            doc["sequences"] = sequences;
+            doc["nextId"] = 903;
+            Project opened;
+            std::string err;
+            QVERIFY2(projectFromJson(QJsonDocument(doc).toJson().toStdString(), opened, &err), err.c_str());
+            Sequence& os = *opened.active();
+            QVERIFY(os.videoTracks.size() >= 4);
+            QCOMPARE(os.videoTracks[3].clips[0].generator.type, std::string("model3d"));
+            QVERIFY(os.videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+            QVERIFY(os.videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
+            QVERIFY(os.videoTracks[3].clips[0].generator.p("dof", 0, 0) <= 0.5);
+            Project none = opened;
+            none.active()->videoTracks[0].clips[0].effects[0].params["depth_of_field"] = 0.0;
+            none.active()->videoTracks[1].clips[0].generator.params["dof"] = 0.0;
+            const Image a = renderSequenceFrame(opened, os, 0, o), b = renderSequenceFrame(none, *none.active(), 0, o);
+            // (the model drawn: the right half differs from the frame without its track)
+            Project without = opened;
+            without.active()->videoTracks[3].muted = true;
+            const Image c = renderSequenceFrame(without, *without.active(), 0, o);
+            double same = 0, drawn = 0;
+            for (int y = 0; y < a.height; ++y)
+                for (int x = a.width * 5 / 8; x < a.width; ++x)
+                    for (int k = 0; k < 4; ++k) {
+                        same += std::fabs(double(a.at(x, y)[k]) - b.at(x, y)[k]);
+                        drawn += std::fabs(double(a.at(x, y)[k]) - c.at(x, y)[k]);
+                    }
+            qInfo("with a model: %.2f drawn by it, %.4f from the frame with no lens anywhere", drawn, same);
+            QVERIFY(drawn > 20);
+            QCOMPARE(same, 0.0);
+        }
 
         // ---- A moving card in a solved scene's USD and USDZ exports: its picture byte for byte and its transform at
         // each frame (to 1e-6), read back by Montage and by tinyusdz.
