@@ -1510,6 +1510,11 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         for (const auto& f : p.watchFolders) folders.append(qs(f));
         root["watchFolders"] = folders;
     }
+    if (!p.grainProfiles.empty()) {
+        QJsonObject profiles;
+        for (const auto& [name, text] : p.grainProfiles) profiles.insert(qs(name), qs(text));
+        root["grainProfiles"] = profiles;
+    }
     if (!p.script.text.empty()) {
         QJsonArray lines;
         for (const auto& line : p.script.readings) {
@@ -1698,6 +1703,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         if (!w.toString().trimmed().isEmpty()) p.soundCaptions.push_back(ss(w));
     for (const auto& f : root.value("watchFolders").toArray())
         if (!f.toString().isEmpty()) p.watchFolders.push_back(ss(f));
+    {
+        const QJsonObject profiles = root.value("grainProfiles").toObject();
+        for (auto it = profiles.begin(); it != profiles.end(); ++it)
+            if (!it.key().trimmed().isEmpty() && !it.value().toString().isEmpty()) p.grainProfiles[it.key().toStdString()] = ss(it.value());
+    }
     for (const auto& w : root.value("fillerWords").toArray())
         if (!w.toString().trimmed().isEmpty()) p.fillerWords.push_back(ss(w));
     if (const QJsonObject so = root.value("script").toObject(); !so.isEmpty()) {

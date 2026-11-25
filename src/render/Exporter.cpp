@@ -3452,8 +3452,7 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // (grain carried as parameters: the cleaned sequence exported through here, then its frame headers written again)
     if (exportCarriesGrain(s)) {
         if (smartRendered) *smartRendered = 0;
-        if (hrd) *hrd = HrdReport{};
-        return exportCarryingGrain(p, seq, s, progress, cancel, error, encoderUsed, light, keptUnsigned);
+        return exportCarryingGrain(p, seq, s, progress, cancel, error, encoderUsed, light, keptUnsigned, nullptr, hrd);
     }
     // (the outermost call checks: two passes export again through here)
     static thread_local int depth = 0;

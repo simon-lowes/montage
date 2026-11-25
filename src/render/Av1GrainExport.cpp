@@ -3,16 +3,25 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <memory>
 
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSaveFile>
+#include <QStandardPaths>
 
 #include "core/Effects.h"
+#include "core/Provenance.h"
+#include "media/ContentCredentials.h"
 #include "render/Av1Headers.h"
 #include "render/ColorSpace.h"
+#include "render/HrdCheck.h"
+#include "render/RateConversion.h"
 #include "render/StreamingPackage.h"
 
 extern "C" {
@@ -52,6 +61,73 @@ bool checkFilmGrainSetting(const std::string& v, std::string* error) {
 }
 
 bool exportCarriesGrain(const ExportSettings& s) { return !s.filmGrain.empty() && s.filmGrain != "off"; }
+
+bool checkGrainProfileName(const std::string& name, std::string* error) {
+    const QString n = QString::fromStdString(name);
+    std::string why;
+    if (n.trimmed().isEmpty()) why = "A grain profile needs a name";
+    else if (n.size() > 100 || n.contains(QLatin1Char('\n')) || n.contains(QLatin1Char('\r'))) why = "A grain profile's name is one line of up to 100 characters";
+    else if (name == "measure" || name == "off") why = "A grain profile cannot be named \"" + name + "\"";
+    if (!why.empty() && error) *error = why;
+    return why.empty();
+}
+
+namespace {
+
+QString grainLibraryPath() {
+    const QString env = qEnvironmentVariable("MONTAGE_GRAIN_LIBRARY");
+    return !env.isEmpty() ? env : QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/Grain Profiles.json");
+}
+
+}  // namespace
+
+std::map<std::string, std::string> userGrainProfiles() {
+    std::map<std::string, std::string> out;
+    QFile f(grainLibraryPath());
+    if (!f.open(QIODevice::ReadOnly)) return out;
+    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object().value(QStringLiteral("profiles")).toObject();
+    for (auto it = o.begin(); it != o.end(); ++it) {
+        GrainProfile g;
+        const std::string text = it.value().toString().toStdString();
+        if (checkGrainProfileName(it.key().toStdString()) && parseGrainProfile(text, g) && g.valid()) out[it.key().toStdString()] = text;
+    }
+    return out;
+}
+
+bool saveUserGrainProfile(const std::string& name, const GrainProfile& g, std::string* error) {
+    if (!checkGrainProfileName(name, error)) return false;
+    if (!g.valid()) {
+        if (error) *error = "The grain profile is not a whole one";
+        return false;
+    }
+    std::map<std::string, std::string> all = userGrainProfiles();
+    all[name] = grainProfileText(g);
+    QJsonObject profiles;
+    for (const auto& [n, text] : all) profiles.insert(QString::fromStdString(n), QString::fromStdString(text));
+    const QString path = grainLibraryPath();
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QSaveFile f(path);
+    if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(QJsonObject{{QStringLiteral("profiles"), profiles}}).toJson()) < 0 || !f.commit()) {
+        if (error) *error = "Cannot write the grain profile library " + path.toStdString();
+        return false;
+    }
+    return true;
+}
+
+bool resolveFilmGrainSetting(const Project& p, std::string& setting, std::string* error) {
+    if (checkFilmGrainSetting(setting)) return true;
+    if (auto it = p.grainProfiles.find(setting); it != p.grainProfiles.end()) {
+        setting = it->second;
+        return true;
+    }
+    const std::map<std::string, std::string> library = userGrainProfiles();
+    if (auto it = library.find(setting); it != library.end()) {
+        setting = it->second;
+        return true;
+    }
+    if (error) *error = "No grain profile is named \"" + setting + "\" (in the project or the library); film grain is \"measure\", \"off\", a profile's name or its text";
+    return false;
+}
 
 std::vector<Av1GrainShot> av1GrainShots(const Project& p, const Sequence& seq, FrameTime in, FrameTime out, const std::string& filmGrain,
                                         const std::atomic<bool>* cancel, const std::function<void(double)>& progress) {
@@ -230,17 +306,26 @@ bool carryAv1Grain(const std::string& path, const std::function<Av1FilmGrain(int
 
 bool exportCarryingGrain(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                          const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, LightLevels* light, bool* keptUnsigned,
-                         Av1GrainReport* report) {
+                         Av1GrainReport* report, HrdReport* hrd) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
     };
+    if (keptUnsigned) *keptUnsigned = false;
+    if (hrd) *hrd = HrdReport{};
     std::string why;
     if (!checkFilmGrainSetting(s.filmGrain, &why)) return fail(why);
     if (!isAv1Encoder(s.videoCodec)) return fail("Grain is carried as parameters in AV1 only");
-    if (!s.rateChange.empty()) return fail("Grain cannot be carried as parameters in an export that changes the frame rate");
-    if (!s.credentialCertificate.empty())
-        return fail("Grain cannot be carried as parameters in an export signed with Content Credentials: the parameters are written after the file is made");
+    // (a rate change's delivered frames, each the programme frame it shows first; checked before rendering)
+    RateConversion rate;
+    if (!planRateConversion(seq, s, rate, &why)) return fail(why);
+    const bool signing = !s.credentialCertificate.empty();
+    if (signing) {  // (refused before rendering rather than after)
+        if (!contentCredentialsAvailable()) why = "This build of Montage cannot sign with Content Credentials";
+        else if (!exportCarriesCredentials(s)) why = "Content Credentials cannot go in this kind of file";
+        else if (!checkCredentialSigner({s.credentialCertificate, s.credentialKey, {}}, &why)) why = "Cannot sign with Content Credentials: " + why;
+        if (!why.empty()) return fail(why);
+    }
     const FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
     if (seq.duration() > 0) out = std::min(out, seq.duration());
@@ -275,10 +360,13 @@ bool exportCarryingGrain(const Project& p, const Sequence& seq, const ExportSett
                 c.effects.push_back(e);
             }
     }
+    // (unsigned and unchecked: the file is signed and checked once its parameters are in it)
     ExportSettings plain = s;
     plain.filmGrain.clear();
+    plain.credentialCertificate.clear(), plain.credentialKey.clear();
+    plain.hrdCheck = false;
     if (!exportSequence(clean, cleanSeq, plain, [&](double f, FrameTime) { report01(0.1 + 0.85 * f); }, cancel, error, encoderUsed, nullptr, light,
-                        keptUnsigned))
+                        nullptr))
         return false;
 
     // The parameters, fitted to the coded pictures as they are.
@@ -307,16 +395,39 @@ bool exportCarryingGrain(const Project& p, const Sequence& seq, const ExportSett
     fitAv1GrainShots(shots, workingColorSpace(seq), asked ? *asked : sequenceColorSpace(seq), target);
     Av1GrainReport written;
     const FrameTime total = out - in;
+    const int64_t delivered = rate.active() ? deliveredFrames(rate, total) : total;
     auto grainAt = [&](int64_t frame) {
         Av1FilmGrain g;
-        if (frame < 0 || frame >= total) return g;
-        auto it = std::upper_bound(shots.begin(), shots.end(), FrameTime(frame), [](FrameTime f, const Av1GrainShot& sh) { return f < sh.end; });
+        if (frame < 0 || frame >= delivered) return g;
+        // (the shot is the programme frame's; the seed the delivered frame's own, so no two frames share one)
+        const int64_t shown = rate.active() ? deliveredPicture(rate, frame, total).a : frame;
+        auto it = std::upper_bound(shots.begin(), shots.end(), FrameTime(shown), [](FrameTime f, const Av1GrainShot& sh) { return f < sh.end; });
         if (it == shots.end() || !it->grain.apply) return g;
         g = it->grain;
         g.seed = av1GrainSeed(frame);
         return g;
     };
-    if (!carryAv1Grain(s.path, grainAt, error, &written)) return false;
+    if (!carryAv1Grain(s.path, grainAt, error, &written)) {
+        std::remove(s.path.c_str());
+        return false;
+    }
+    if (signing) {
+        const Provenance made = sequenceProvenance(p, seq, s.in, s.out);
+        CredentialOptions o;
+        o.allowAiTraining = s.credentialAllowAiTraining;
+        o.sources = made.sources;
+        if (!signContentCredentials(s.path, made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
+            // (kept, unsigned, as any export whose signing fails: it can be signed again later)
+            if (keptUnsigned) *keptUnsigned = true;
+            return fail("Could not sign it with Content Credentials (" + why + "); the export is kept, unsigned, at " + s.path);
+        }
+    }
+    if (exportNeedsHrdCheck(s, 0)) {  // (as exportSequence checks a file it makes)
+        const HrdReport r = checkHrd(s.path, cancel);
+        if (r.checked && r.signalled && !r.conforms())
+            qWarning("The export %s does not keep its buffer model: %s", s.path.c_str(), r.summary().c_str());
+        if (hrd) *hrd = r;
+    }
     report01(1);
     if (report) {
         *report = written;

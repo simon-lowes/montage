@@ -84,6 +84,7 @@ private:
     QSpinBox* height_ = nullptr;
     QSpinBox* quality_ = nullptr;
     QCheckBox* filmGrain_ = nullptr;  // AV1: each shot's grain carried as film grain parameters (render/Av1GrainExport.h)
+    QComboBox* filmGrainProfile_ = nullptr;  // which grain: each shot's measured, or a profile saved by name
     // A stated HRD (H.264, H.265): none, a constant or a variable rate, with the buffer's rate and size (render/HrdCheck.h).
     QComboBox* hrd_ = nullptr;
     QSpinBox* hrdRate_ = nullptr;    // kbit/s

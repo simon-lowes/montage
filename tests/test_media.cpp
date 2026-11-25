@@ -76,6 +76,7 @@
 #include "core/ProjectMerge.h"
 #include "render/GrainMatch.h"
 #include "render/Av1Headers.h"
+#include "render/Av1GrainExport.h"
 #include "render/Expressions.h"
 #include "render/Particles.h"
 #include "core/Surround.h"
@@ -6547,6 +6548,117 @@ private slots:
         QCOMPARE(shown, 20);
         QCOMPARE(withGrain, 20);
         QCOMPARE(int(seeds.size()), 20);
+    }
+
+    void namedGrainProfiles() {
+        // A profile Measure Grain saves under a name over MCP (montage_grain save_as) is kept in the project and in the
+        // user's library (a file of the test's own here); montage_render's film_grain then takes the name and makes the
+        // same grain parameters, frame for frame, as the profile's text did. With the project's copy gone the library's
+        // serves; a name nothing has is refused. A project saved before profiles had names opens with none.
+        if (!avcodec_find_encoder_by_name("libsvtav1")) QSKIP("This build of FFmpeg has no SVT-AV1");
+        const QByteArray library = QByteArray::fromStdString(path("grain-library.json"));
+        qputenv("MONTAGE_GRAIN_LIBRARY", library);
+        auto putBack = qScopeGuard([] { qunsetenv("MONTAGE_GRAIN_LIBRARY"); });
+        QVERIFY(userGrainProfiles().empty());
+        std::string err;
+        QVERIFY(!checkGrainProfileName("measure", &err) && !checkGrainProfileName(" ", &err) && !checkGrainProfileName("a\nb", &err));
+        QVERIFY(checkGrainProfileName("Day 2 plate", &err));
+        // Grainy footage (fresh grain on every frame, kept by ProRes 422 HQ).
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 192, gs.height = 108, gs.fps = {25, 1};
+        Clip c = makeGeneratorClip(gen, "color", 20);
+        c.generator.params["color.r"] = Param(0.45), c.generator.params["color.g"] = Param(0.5), c.generator.params["color.b"] = Param(0.4);
+        Effect grain = makeEffect(gen, "film_grain");
+        grain.params["amount"] = Param(0.3);
+        c.effects.push_back(grain);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
+        st.path = path("named-grain-plate.mov");
+        st.audioCodec = "none";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 192, s.height = 108, s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id plate = s.videoTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("named-grain.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call("montage_grain", {{"project", project}, {"action", "measure"}, {"clip", double(plate)}, {"save_as", "Day 2 plate"}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Saved as \"Day 2 plate\""), qPrintable(text(r)));
+        const QString profile = r.value("structuredContent").toObject().value("profile").toString();
+        QVERIFY2(profile.startsWith("grain1"), qPrintable(profile));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.grainProfiles.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(back.grainProfiles["Day 2 plate"]), profile);
+        QCOMPARE(QString::fromStdString(userGrainProfiles()["Day 2 plate"]), profile);
+        // A name that would not do is refused, and nothing saved.
+        r = call("montage_grain", {{"project", project}, {"action", "measure"}, {"clip", double(plate)}, {"save_as", "off"}});
+        QVERIFY2(r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(userGrainProfiles().size(), size_t(1));
+
+        // Rendered by name and by text: the same grain parameters on every frame.
+        auto grainOf = [&](const QString& file) {
+            std::vector<Av1FilmGrain> out;
+            AVFormatContext* f = nullptr;
+            if (avformat_open_input(&f, file.toUtf8().constData(), nullptr, nullptr) < 0) return out;
+            std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> held(f, [](AVFormatContext* x) { avformat_close_input(&x); });
+            avformat_find_stream_info(f, nullptr);
+            const int v = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            if (v < 0) return out;
+            Av1HeaderReader reader;
+            const AVCodecParameters* par = f->streams[v]->codecpar;
+            if (par->extradata_size > 0 && !reader.configure(par->extradata, size_t(par->extradata_size), &err)) return out;
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(f, pkt) >= 0) {
+                std::vector<Av1FrameHeader> frames;
+                if (pkt->stream_index == v && reader.read(pkt->data, size_t(pkt->size), frames, &err))
+                    for (const Av1FrameHeader& h : frames)
+                        if (h.shown()) out.push_back(h.grain);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            return out;
+        };
+        const QString byName = QString::fromStdString(path("named-grain-name.mkv")), byText = QString::fromStdString(path("named-grain-text.mkv"));
+        r = call("montage_render", {{"project", project}, {"output", byName}, {"preset", "AV1 (SVT-AV1)"}, {"film_grain", "Day 2 plate"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_render", {{"project", project}, {"output", byText}, {"preset", "AV1 (SVT-AV1)"}, {"film_grain", profile}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const std::vector<Av1FilmGrain> named = grainOf(byName), given = grainOf(byText);
+        QCOMPARE(int(named.size()), 20);
+        QCOMPARE(named.size(), given.size());
+        for (size_t i = 0; i < named.size(); ++i)
+            QVERIFY2(named[i].apply && named[i].sameParameters(given[i]) && named[i].seed == given[i].seed, qPrintable(QString("frame %1").arg(i)));
+        // With the project's copy gone, the library's; a name nothing has is refused.
+        back.grainProfiles.clear();
+        QVERIFY(saveProject(back, project.toStdString()));
+        const QString fromLibrary = QString::fromStdString(path("named-grain-library.mkv"));
+        r = call("montage_render", {{"project", project}, {"output", fromLibrary}, {"preset", "AV1 (SVT-AV1)"}, {"film_grain", "Day 2 plate"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const std::vector<Av1FilmGrain> library2 = grainOf(fromLibrary);
+        QVERIFY(!library2.empty() && library2[0].sameParameters(given[0]));
+        r = call("montage_render", {{"project", project}, {"output", fromLibrary}, {"preset", "AV1 (SVT-AV1)"}, {"film_grain", "Day 3 plate"}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("No grain profile is named \"Day 3 plate\""), qPrintable(text(r)));
+
+        // A project saved before profiles were named opens with none, and is saved without any.
+        Project old;
+        QVERIFY(loadProject(MONTAGE_TEST_DATA_DIR "/projects/five-band-eq.montage", old));
+        QVERIFY(old.grainProfiles.empty());
+        QVERIFY(!QString::fromStdString(projectToJson(old)).contains("grainProfiles"));
     }
 
     void dereverbSpeech() {

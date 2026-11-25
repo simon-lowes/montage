@@ -28,8 +28,10 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <set>
 
 #include "EditorState.h"
+#include "render/Av1GrainExport.h"
 #include "RenderQueue.h"
 #include "core/AudioDescription.h"
 #include "core/Surround.h"
@@ -438,7 +440,27 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
                               "then written beside it as AV1 film grain parameters, which the player's decoder puts back: the bits go "
                               "to the picture instead of the grain"));
     filmGrain_->setChecked(appSettings().value("export/filmGrain", false).toBool());
-    form->addRow(QString(), filmGrain_);
+    // Which grain: each shot's own, measured, or a profile Measure Grain saved by name (the project's, then the library's).
+    filmGrainProfile_ = new QComboBox(form_);
+    filmGrainProfile_->setObjectName(QStringLiteral("exportFilmGrainProfile"));
+    filmGrainProfile_->setToolTip(tr("The grain carried: each shot's own, measured, or a profile saved by name for every shot"));
+    filmGrainProfile_->addItem(tr("Each shot's own, measured"), QStringLiteral("measure"));
+    {
+        std::set<std::string> listed;
+        for (const auto& [name, text] : state_->project().grainProfiles)
+            if (listed.insert(name).second) filmGrainProfile_->addItem(tr("%1 (this project)").arg(QString::fromStdString(name)), QString::fromStdString(name));
+        for (const auto& [name, text] : userGrainProfiles())
+            if (listed.insert(name).second) filmGrainProfile_->addItem(tr("%1 (library)").arg(QString::fromStdString(name)), QString::fromStdString(name));
+    }
+    {
+        const int was = filmGrainProfile_->findData(appSettings().value("export/filmGrainProfile").toString());
+        if (was > 0) filmGrainProfile_->setCurrentIndex(was);
+    }
+    auto* grainRow = new QHBoxLayout;
+    grainRow->addWidget(filmGrain_);
+    grainRow->addWidget(filmGrainProfile_, 1);
+    form->addRow(QString(), grainRow);
+    connect(filmGrain_, &QCheckBox::toggled, this, [this] { updateControls(); });
     adaptiveHdr_ = new QCheckBox(tr("Adaptive HDR metadata (ST 2094-50, any display's headroom)"), form_);
     adaptiveHdr_->setObjectName(QStringLiteral("exportAdaptiveHdr"));
     adaptiveHdr_->setToolTip(tr("Each scene's reference white, headroom and the gain curve to its SDR rendition (the sequence's SDR trim, "
@@ -951,8 +973,9 @@ void ExportDialog::updateControls() {
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
     color_->setEnabled(video);
-    filmGrain_->setEnabled(video && (p->settings.videoCodec == "libsvtav1" || p->settings.videoCodec == "libaom-av1" || p->settings.videoCodec == "librav1e") &&
-                           (!rate_ || rate_->currentData().toString().isEmpty()) && !(credentials_ && credentials_->isChecked()));
+    // (with a rate change or Content Credentials too: the parameters go in after the one and before the other)
+    filmGrain_->setEnabled(video && (p->settings.videoCodec == "libsvtav1" || p->settings.videoCodec == "libaom-av1" || p->settings.videoCodec == "librav1e"));
+    filmGrainProfile_->setEnabled(filmGrain_->isEnabled() && filmGrain_->isChecked());
     {
         // HDR10+ is HDR10's: PQ output only.
         const Sequence* sq = state_ ? state_->sequence() : nullptr;
@@ -1279,8 +1302,11 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/allCaptions", allCaptions_->isChecked());
     s.cea608 = cea608_->isEnabled() && cea608_->isChecked();
     settings.setValue("export/cea608", cea608_->isChecked());
-    s.filmGrain = filmGrain_->isEnabled() && filmGrain_->isChecked() ? "measure" : "";
+    s.filmGrain = filmGrain_->isEnabled() && filmGrain_->isChecked() ? filmGrainProfile_->currentData().toString().toStdString() : "";
+    // (a name: the profile's text, so the job renders the grain chosen whatever is saved later)
+    if (!s.filmGrain.empty() && !resolveFilmGrainSetting(state_->project(), s.filmGrain)) s.filmGrain = "measure";
     settings.setValue("export/filmGrain", filmGrain_->isChecked());
+    settings.setValue("export/filmGrainProfile", filmGrainProfile_->currentData().toString());
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
     s.adaptiveHdr = adaptiveHdr_->isEnabled() && adaptiveHdr_->isChecked();

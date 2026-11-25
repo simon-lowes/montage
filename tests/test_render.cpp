@@ -83,6 +83,8 @@
 #include "render/ProRes.h"
 #include "media/ProResEncoder.h"
 #include "render/RateConversion.h"
+#include "media/ContentCredentials.h"
+#include "render/HrdCheck.h"
 #include "render/Iab.h"
 #include "render/ImageSubtitles.h"
 #include "media/TextReader.h"
@@ -33684,6 +33686,127 @@ colorspaces:
               "as picture (CRF %d, VMAF %.2f against the grainy master): %.0f %% smaller",
               encoder, target, (long long)atVmafCarried, crfCarried, vmafCarried, (long long)atVmafCoded, crfCoded, vmafCoded, saving * 100);
         QVERIFY2(saving >= 0.30, qPrintable(QString("%1 bytes against %2").arg(atVmafCarried).arg(atVmafCoded)));
+    }
+    void av1GrainSignedAndRetimed() {
+        // Grain carried as parameters in an export that changes the rate (24 frames a second to 25, sped up) and is
+        // signed with Content Credentials, from libaom with AV1's decoder model stated. Two shots of grain of their own
+        // strength. Every frame delivered carries its shot's grain with a seed of its own, the parameters change at the
+        // cut, the file's credentials read back as valid, and the buffer check reads the file as delivered: the one the
+        // export made is the delivered file's, and the same file with its parameters taken out checks differently.
+        if (!avcodec_find_encoder_by_name("libaom-av1")) QSKIP("This FFmpeg has no libaom");
+        const ColorSpace& space = rec709Space();
+        QTemporaryDir dir;
+        const int W = 256, H = 128, kFrames = 12;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {24, 1};
+        for (int shot = 0; shot < 2; ++shot) {
+            GrainModel gm;
+            gm.strength = shot == 0 ? 0.03 : 0.07, gm.response = 0.5, gm.correlation = 0.6, gm.fineSize = 1.2, gm.clusters = 0.2, gm.clusterSize = 3.5, gm.width = W;
+            const GrainProfile made = grainModelProfile(gm);
+            const QString file = dir.filePath(QString("shot%1.y4m").arg(shot));
+            QVERIFY(writeY4m(file, W, H, kFrames, [&](int f, auto& y, auto& cb, auto& cr) {
+                Image img(W, H);
+                for (int r = 0; r < H; ++r)
+                    for (int c = 0; c < W; ++c) {
+                        float* q = img.at(c, r);
+                        q[0] = q[1] = q[2] = float(0.2 + 0.6 * c / W), q[3] = 1;
+                    }
+                GrainSettings gs;
+                gs.seed = uint32_t(5 + shot);
+                addGrain(img, space, made, gs, f);
+                for (int r = 0; r < H; ++r)
+                    for (int c = 0; c < W; ++c) y[size_t(r) * W + c] = uint8_t(std::clamp(std::lround(16 + 219 * img.at(c, r)[1]), 0L, 255L));
+                std::fill(cb.begin(), cb.end(), 128);
+                std::fill(cr.begin(), cr.end(), 128);
+            }, 24));
+            MediaItem m;
+            QVERIFY(probeMedia(file.toStdString(), m));
+            m.id = p.newId();
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, shot * kFrames, 0, -1, {TrackKind::Video, 0}, {}, false).ok);
+        }
+        const std::string certs = MONTAGE_TEST_DATA_DIR "/c2pa/chain.pem", key = MONTAGE_TEST_DATA_DIR "/c2pa/signer.key";
+        const bool signing = contentCredentialsAvailable();
+        ExportSettings es;
+        es.videoCodec = "libaom-av1";
+        es.audioCodec = "none";
+        es.preset = "8";
+        es.hrd = "vbr";
+        es.vbvMaxrate = 1500000;
+        es.rateChange = "speed";
+        es.rate = Rational{25, 1};
+        if (signing) es.credentialCertificate = certs, es.credentialKey = key;
+        es.path = dir.filePath("grain25.mp4").toStdString();
+        es.filmGrain = "measure";
+        std::string err;
+        HrdReport made;
+        bool unsigned_ = true;
+        QVERIFY2(exportSequence(p, s, es, {}, nullptr, &err, nullptr, nullptr, nullptr, &unsigned_, &made), err.c_str());
+        QVERIFY(!unsigned_);
+        MediaItem out;
+        QVERIFY(probeMedia(es.path, out));
+        QCOMPARE(out.fps, (Rational{25, 1}));
+
+        // Every frame delivered has its shot's grain, a seed of its own, and the parameters change at the cut.
+        auto shownGrain = [&](const std::string& file) {
+            std::vector<Av1FilmGrain> shown;
+            av1streams::Stream st;
+            AVFormatContext* f = nullptr;
+            if (avformat_open_input(&f, file.c_str(), nullptr, nullptr) < 0 || avformat_find_stream_info(f, nullptr) < 0) return shown;
+            const int v = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVCodecParameters* par = f->streams[v]->codecpar;
+            st.config.assign(par->extradata, par->extradata + par->extradata_size);
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(f, pkt) >= 0) {
+                if (pkt->stream_index == v) st.packets.emplace_back(pkt->data, pkt->data + pkt->size);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&f);
+            Av1HeaderReader reader;
+            if (!reader.configure(st.config.data(), st.config.size(), &err)) return shown;
+            for (const auto& pk : st.packets) {
+                std::vector<Av1FrameHeader> hs;
+                if (!reader.read(pk.data(), pk.size(), hs, &err)) return std::vector<Av1FilmGrain>{};
+                for (const Av1FrameHeader& hd : hs)
+                    if (hd.shown()) shown.push_back(hd.grain);
+            }
+            return shown;
+        };
+        const std::vector<Av1FilmGrain> shown = shownGrain(es.path);
+        QCOMPARE(int(shown.size()), 2 * kFrames);
+        for (int i = 0; i < 2 * kFrames; ++i) {
+            QVERIFY2(shown[size_t(i)].apply, qPrintable(QString("frame %1").arg(i)));
+            if (i > 0) QVERIFY(shown[size_t(i)].seed != shown[size_t(i) - 1].seed);
+            QVERIFY(shown[size_t(i)].sameParameters(shown[i < kFrames ? 0 : size_t(kFrames)]));
+        }
+        QVERIFY(!shown[0].sameParameters(shown[size_t(kFrames)]));
+
+        // Signed after the parameters were written: the credentials are intact.
+        if (signing) {
+            CredentialSummary c;
+            QVERIFY2(readContentCredentials(es.path, c, &err), err.c_str());
+            QVERIFY(c.present);
+            QCOMPARE(c.state, std::string("Valid"));
+        } else {
+            qInfo("Built without the C2PA library: the export was not signed");
+        }
+
+        // The buffer check the export ran is the delivered file's (parameters and all).
+        const HrdReport delivered = checkHrd(es.path);
+        QVERIFY2(delivered.checked && delivered.signalled && delivered.model == "decoder model", (delivered.summary() + " " + delivered.note).c_str());
+        QVERIFY2(delivered.conforms(), delivered.summary().c_str());
+        QVERIFY2(made.checked && made.highest == delivered.highest && made.lowest == delivered.lowest && made.frames == delivered.frames,
+                 (made.summary() + " / " + delivered.summary()).c_str());
+        // The same file without its parameters is smaller and fills the buffer less: what the check read had them.
+        const std::string bare = dir.filePath("bare.mp4").toStdString();
+        QVERIFY(QFile::copy(QString::fromStdString(es.path), QString::fromStdString(bare)));
+        QFile::setPermissions(QString::fromStdString(bare), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        QVERIFY2(carryAv1Grain(bare, [](int64_t) { return Av1FilmGrain{}; }, &err), err.c_str());
+        const HrdReport without = checkHrd(bare);
+        QVERIFY2(without.checked && without.frames == delivered.frames, without.summary().c_str());
+        QVERIFY2(without.highest < delivered.highest, qPrintable(QString("%1 against %2").arg(without.highest).arg(delivered.highest)));
     }
     void av1GrainTableReadBySvtAv1() {
         // A film grain table as Montage writes it, two shots of parameters, given to SVT-AV1's own encoder

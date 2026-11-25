@@ -6434,13 +6434,17 @@ void McpServer::Impl::addTools() {
         "(`model`: strength at mid grey as a fraction of the light, response the power of the light it follows, 0.5 "
         "sensor-like to 1 negative-like, correlation between the channels, yellow_blue 0..1 of the colour on film's "
         "yellow-blue axis, fine_size and cluster_size in pixels of a frame `width` wide (1920 unless given), clusters their share of the power, "
-        "kurtosis, temporal); apply with `model` (any of those, the rest the defaults) uses the model in scene-linear light.",
+        "kurtosis, temporal); apply with `model` (any of those, the rest the defaults) uses the model in scene-linear light. "
+        "measure with save_as keeps the profile under that name in the project and, unless library is false, in the user's "
+        "library too; apply's profile and montage_export's film_grain then take the name.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["measure","apply"]},
             "clip":{"type":"number","description":"measure: the clip whose grain to measure"},
             "region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},
                       "description":"In pixels of the footage (default: the whole frame)"},
             "apply_to":{"type":"array","items":{"type":"number"},"description":"Clips to put the grain on"},
-            "profile":{"type":"string","description":"apply: a profile measure returned"},
+            "profile":{"type":"string","description":"apply: a profile measure returned, or a saved profile's name"},
+            "save_as":{"type":"string","description":"measure: a name to keep the profile under"},
+            "library":{"type":"boolean","default":true,"description":"save_as: in the user's library as well as the project"},
             "gauge":{"type":"string","enum":["65mm","35mm","16mm","super8"]},
             "mode":{"type":"string","enum":["add","replace"],"default":"add"},
             "amount":{"type":"number","default":100,"description":"Percent of the measured strength"},
@@ -6484,6 +6488,17 @@ void McpServer::Impl::addTools() {
                        QString::fromStdString(grainProfileText(profile));
                 result["profile"] = QString::fromStdString(grainProfileText(profile));
                 result["model"] = modelJson(fitGrainModel(profile));
+                if (a.contains("save_as")) {
+                    // Kept by name: in the project (saved below) and the user's library.
+                    const std::string name = a.value("save_as").toString().toStdString();
+                    if (std::string why; !checkGrainProfileName(name, &why)) return fail(QString::fromStdString(why));
+                    if (a.value("library").toBool(true))
+                        if (std::string why; !saveUserGrainProfile(name, profile, &why)) return fail(QString::fromStdString(why));
+                    l.project.grainProfiles[name] = grainProfileText(profile);
+                    save(l);
+                    result["saved_as"] = QString::fromStdString(name);
+                    text += QStringLiteral("\nSaved as \"%1\".").arg(QString::fromStdString(name));
+                }
             } else if (action == "apply") {
                 if (a.contains("model")) {
                     const QJsonObject mo = a.value("model").toObject();
@@ -6502,7 +6517,9 @@ void McpServer::Impl::addTools() {
                     model.width = int(std::lround(width));
                     useModel = true;
                 } else if (a.contains("profile")) {
-                    if (!parseGrainProfile(a.value("profile").toString().toStdString(), profile)) return fail(QStringLiteral("That is not a grain profile"));
+                    std::string given = a.value("profile").toString().toStdString();
+                    if (!parseGrainProfile(given, profile) && !(resolveFilmGrainSetting(l.project, given) && parseGrainProfile(given, profile)))
+                        return fail(QStringLiteral("That is not a grain profile, or the name of one saved"));
                 } else {
                     const QString g = a.value("gauge").toString(QStringLiteral("35mm"));
                     const QStringList names{QStringLiteral("65mm"), QStringLiteral("35mm"), QStringLiteral("16mm"), QStringLiteral("super8")};
@@ -13768,7 +13785,7 @@ void McpServer::Impl::addTools() {
             "color_space":{"type":"string","description":"Deliver in this display space (rec709, srgb, rec2100pq, rec2100hlg...) instead of the sequence's; an HDR sequence delivered in SDR is tone mapped"},
             "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"An HDR sequence delivered in SDR: \"\" Montage's roll-off, or ITU-R BT.2446 Method A or C (a sequence graded scene-referred goes through its output transform instead)"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
-            "film_grain":{"type":"string","description":"AV1 exports: carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned: that grain for every shot; \"off\" (the default): none"},
+            "film_grain":{"type":"string","description":"AV1 exports: carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned, or the name it was saved under (the project's, else the user's library's): that grain for every shot; \"off\" (the default): none"},
             "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
@@ -14074,7 +14091,7 @@ void McpServer::Impl::addTools() {
             st.cea708 = a.value("cea708").toBool(true);
             st.hdr10Plus = a.value("hdr10plus").toBool();
             st.filmGrain = str(a, "film_grain", "").toStdString();
-            if (std::string e; !checkFilmGrainSetting(st.filmGrain, &e)) throw ArgError{QString::fromStdString(e)};
+            if (std::string e; !resolveFilmGrainSetting(l.project, st.filmGrain, &e)) throw ArgError{QString::fromStdString(e)};
             st.adaptiveHdr = a.value("adaptive_hdr").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))

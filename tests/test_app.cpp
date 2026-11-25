@@ -289,6 +289,7 @@
 #include "core/Automation.h"
 #include "core/History.h"
 #include "render/GrainMatch.h"
+#include "render/Av1GrainExport.h"
 #include "render/LutExport.h"
 #include "render/Processing.h"
 #include "media/Segmenter.h"
@@ -24630,9 +24631,21 @@ print("added " + ui["name"])
     }
 
     void av1GrainExportSetting() {
-        // The export dialog offers Carry grain as parameters for AV1 presets only, not with a frame rate change, and
-        // the export it sets up measures each shot's grain; the choice is kept for the next export.
+        // The export dialog offers Carry grain as parameters for AV1 presets only (with a frame rate change too), and
+        // the export it sets up measures each shot's grain, or carries a profile saved by name (the project's, then
+        // the user's library's) as that profile's text; the choices are kept for the next export.
         loadDemo();
+        const QByteArray library = (dir_.path() + "/grain-library.json").toUtf8();
+        qputenv("MONTAGE_GRAIN_LIBRARY", library);
+        auto putBack = qScopeGuard([this] {
+            qunsetenv("MONTAGE_GRAIN_LIBRARY");
+            appSettings().remove("export/filmGrainProfile");
+            state()->mutableProject().grainProfiles.clear();
+        });
+        const std::string day2 = grainProfileText(stockGrain(1)), oldStock = grainProfileText(stockGrain(2));
+        state()->mutableProject().grainProfiles["Day 2 plate"] = day2;
+        std::string why;
+        QVERIFY2(saveUserGrainProfile("Old stock", stockGrain(2), &why), why.c_str());
         // (the dialog keeps the preset last used: put back as it was)
         const QVariant lastPreset = appSettings().value("export/preset");
         RenderQueue* queue = win_->renderQueue();
@@ -24648,18 +24661,26 @@ print("added " + ui["name"])
             ed.setQueue(queue);
             auto* preset = ed.findChild<QComboBox*>("exportPreset");
             auto* grain = ed.findChild<QCheckBox*>("exportFilmGrain");
-            QVERIFY(preset && grain);
+            auto* which = ed.findChild<QComboBox*>("exportFilmGrainProfile");
+            QVERIFY(preset && grain && which);
+            QCOMPARE(which->count(), 3);
+            QCOMPARE(which->itemData(0).toString(), QStringLiteral("measure"));
+            QCOMPARE(which->itemText(1), QStringLiteral("Day 2 plate (this project)"));
+            QCOMPARE(which->itemText(2), QStringLiteral("Old stock (library)"));
             preset->setCurrentIndex(mp4);
-            QVERIFY(!grain->isEnabled());
+            QVERIFY(!grain->isEnabled() && !which->isEnabled());
             preset->setCurrentIndex(av1);
             QVERIFY(grain->isEnabled());
             if (auto* rate = ed.findChild<QComboBox*>("exportRate"); rate && rate->count() > 1) {
                 rate->setCurrentIndex(1);
-                QVERIFY(!grain->isEnabled());
-                rate->setCurrentIndex(0);
                 QVERIFY(grain->isEnabled());
+                rate->setCurrentIndex(0);
             }
+            grain->setChecked(false);
+            QVERIFY(!which->isEnabled());
             grain->setChecked(true);
+            QVERIFY(which->isEnabled());
+            which->setCurrentIndex(0);
             ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/grain.mp4");
             ed.findChild<QPushButton*>("addToQueue")->click();
             QCOMPARE(queue->jobs().size(), jobs + 1);
@@ -24668,9 +24689,23 @@ print("added " + ui["name"])
             QCOMPARE(job.settings.videoCodec, std::string("libsvtav1"));
             queue->remove(job.id);
         }
+        // A profile by name: the job carries its text (the project's, then the library's).
+        for (int i : {1, 2}) {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(av1);
+            ed.findChild<QCheckBox*>("exportFilmGrain")->setChecked(true);
+            ed.findChild<QComboBox*>("exportFilmGrainProfile")->setCurrentIndex(i);
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/grain-named.mp4");
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(queue->jobs().size(), jobs + 1);
+            QCOMPARE(queue->jobs().back().settings.filmGrain, i == 1 ? day2 : oldStock);
+            queue->remove(queue->jobs().back().id);
+        }
         {
             ExportDialog again(state(), win_.get());
             QVERIFY(again.findChild<QCheckBox*>("exportFilmGrain")->isChecked());
+            QCOMPARE(again.findChild<QComboBox*>("exportFilmGrainProfile")->currentText(), QStringLiteral("Old stock (library)"));
         }
         appSettings().remove("export/filmGrain");
         if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
