@@ -1794,7 +1794,10 @@ void Recorder::run() {
             ++s->st.dropped;
             return true;
         }
-        // The picture in the file's format (at its size, should the feed's change).
+        // The picture in the file's format (at its size, should the feed's change). Watched only, nothing is encoded,
+        // so a picture keeps its own size: an ST 2110-22 feed decoded smaller for a tile comes at its whole size again
+        // once a viewer shows it whole.
+        if (watchOnly) width = f->width, height = f->height;
         const int key[5] = {f->width, f->height, f->format, f->colorspace, f->color_range};
         if (!sws || !std::equal(key, key + 5, swsKey)) {
             sws = sws_getCachedContext(sws, f->width, f->height, AVPixelFormat(f->format), width, height, codec->pix, SWS_BICUBIC, nullptr, nullptr, nullptr);
