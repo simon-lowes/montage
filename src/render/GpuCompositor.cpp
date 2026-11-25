@@ -414,6 +414,7 @@ private:
     QRhiShaderResourceBindings* layout_ = nullptr;
     QRhiGraphicsPipeline *colorPs_ = nullptr, *compositePs_ = nullptr, *outputPs_ = nullptr, *output8Ps_ = nullptr;
     QRhiGraphicsPipeline *filterPs_ = nullptr, *mixPs_ = nullptr;
+    QRhiGraphicsPipeline* effectsPs_ = nullptr;  // (gpueffects.frag: the filter modes 73 to 79)
     bool splats_ = false;  // (brokenMutex_)
     std::string noSplats_;  // (why not; brokenMutex_)
     QRhiBuffer* splatDummy_ = nullptr;
@@ -825,8 +826,9 @@ bool Device::create() {
     outputPs_ = pipeline(kOutputFragQsb, sizeof kOutputFragQsb, rpFloat_);
     output8Ps_ = pipeline(kOutputFragQsb, sizeof kOutputFragQsb, rp8_);
     filterPs_ = pipeline(kFilterFragQsb, sizeof kFilterFragQsb, rpFloat_);
+    effectsPs_ = pipeline(kEffectsFragQsb, sizeof kEffectsFragQsb, rpFloat_);
     mixPs_ = pipeline(kMixFragQsb, sizeof kMixFragQsb, rpFloat_);
-    if (!colorPs_ || !compositePs_ || !outputPs_ || !output8Ps_ || !filterPs_ || !mixPs_) {
+    if (!colorPs_ || !compositePs_ || !outputPs_ || !output8Ps_ || !filterPs_ || !effectsPs_ || !mixPs_) {
         problem_ = "the graphics device cannot build the compositor's shaders";
         return false;
     }
@@ -917,8 +919,8 @@ void Device::destroy() {
         std::lock_guard lock(brokenMutex_);
         splats_ = false;
     }
-    delete colorPs_, delete compositePs_, delete outputPs_, delete output8Ps_, delete filterPs_, delete mixPs_;
-    colorPs_ = compositePs_ = outputPs_ = output8Ps_ = filterPs_ = mixPs_ = nullptr;
+    delete colorPs_, delete compositePs_, delete outputPs_, delete output8Ps_, delete filterPs_, delete effectsPs_, delete mixPs_;
+    colorPs_ = compositePs_ = outputPs_ = output8Ps_ = filterPs_ = effectsPs_ = mixPs_ = nullptr;
     rpFloat_ = rp8_ = nullptr;  // (the targets' own)
     delete layout_, layout_ = nullptr;
     delete dummy2d_, delete dummy3d_, delete dummy16_, delete dummyR_, delete rpFloatTex_, delete rp8Tex_;
@@ -1624,7 +1626,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 std::vector<std::pair<int, QRhiTexture*>> bound = {{1, at}, {4, cur}};
                 if (QRhiTexture* t = slotAt(fp.extra)) bound.push_back({2, t});
                 if (QRhiTexture* t = table ? table : kept ? kept : slotAt(fp.tableSlot)) bound.push_back({5, t});
-                pass(filterPs_, made, u, bound, uniforms(u, p));
+                pass(fp.mode >= 73 && fp.mode <= 79 ? effectsPs_ : filterPs_, made, u, bound, uniforms(u, p));
                 u = rhi_->nextResourceUpdateBatch();
                 if (table) release(table);
                 ++filterPasses;

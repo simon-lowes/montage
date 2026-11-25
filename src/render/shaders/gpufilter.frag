@@ -58,18 +58,7 @@
 // smear along the flow.
 // 56 a Shape layer's paints (render/ShapeRaster): each pixel's tile's commands, each path's coverage from its backdrop and
 // lines, its paint laid down over what is below, groups through their opacity; p[1].x the tiles across.
-// 73 Magnify (render/VideoFx's magnify: p[1] the centre, radius and magnification, p[2] feather, border, opacity and
-// whether square, p[3] the border's colour); Drop Shadow (render/Processing's dropShadow): 74 the shadow, the layer's
-// coverage p[1].xy pixels away, times p[1].z, in p[2]'s colour (then blurred by 1's boxes), 75 the layer (orig) over
-// it; 76 Broadcast Safe (render/QualityCheck's broadcastSafe: p[1] strict, knee, stripes where out of range).
-// 77 Lens Correction (render/VideoFx's lensCorrection by its LensPlan: p[1] kind, the transfer function, the lens's
-// centre; p[2] calibration units per pixel across and down, the plan's step and whether red and blue have their own
-// places; the table's row 1 red's, green's and blue's factors and the vignetting's gain by distance): kind 0 the
-// vignetting undone in light, 1 each pixel from where the lens put it (within the picture, its edge reached).
-// The bevels (render/BevelFx, their surface made on the CPU from the picture as the step runs, a pixel's ring round
-// the frame, in the table's x, its rows read as one run): 78 Edge Bevel (p[1] strength and the light's way across and
-// down, p[2] its colour), 79 Layer Bevel (p[1] whether it reaches past the layer, the highlight's and the shadow's
-// opacity and the highlight's blend mode; p[2] the shadow's, p[3] the light's direction, p[4] and p[5] the colours).
+// 73 to 79 are gpueffects.frag's (the compositor draws those modes with it).
 // 72 Gaussian splats blended (render/SplatRender): a linear cloud's colour (p[1].x set) brought to display values under
 // its coverage, and the whole the layer's opacity (p[1].y) of that.
 // Lens Blur (Depth) (render/LensBlur's lensBlur, its plan worked out on the CPU from the depth; the state, S, twice the
@@ -462,18 +451,6 @@ vec3 glareLight(int gx, int gy, int f, float threshold) {
 }
 
 // Lens Blur's weight of a pixel's layers (bin0 in x, the nearer one's share in y) for layer k.
-// A bevel's surface's slope at the frame's pixel xy (half the differences either side), from the table.
-vec2 bevelSlope(ivec2 size, ivec2 xy) {
-    const int pw = size.x + 2, i = (xy.y + 1) * pw + xy.x + 1;
-    return vec2(tableTexel(i + 1).x - tableTexel(i - 1).x, tableTexel(i + pw).x - tableTexel(i - pw).x) * 0.5;
-}
-float bevelBlend(int mode, float base, float over) {
-    if (mode == 1) return 1.0 - (1.0 - base) * (1.0 - over);
-    if (mode == 2) return base + over;
-    if (mode == 3) return base * over;
-    if (mode == 4) return base < 0.5 ? 2.0 * base * over : 1.0 - 2.0 * (1.0 - base) * (1.0 - over);
-    return over;
-}
 float lbWeight(vec4 b, int k) { return int(b.x) == k ? 1.0 - b.y : int(b.x) + 1 == k ? b.y : 0.0; }
 
 void main() {
@@ -481,131 +458,6 @@ void main() {
     const ivec2 size = textureSize(srcTex, 0);
     const int mode = int(p[0].x);
     const vec4 px = texelFetch(srcTex, xy, 0);
-    if (mode == 73) {
-        // Magnify: the lens (everything seen from the centre, larger) with a soft or anti-aliased edge, and its ring
-        const float dx = float(xy.x) + 0.5 - p[1].x, dy = float(xy.y) + 0.5 - p[1].y, radius = p[1].z, feather = p[2].x, border = p[2].y;
-        const float d = p[2].w > 0.5 ? max(abs(dx), abs(dy)) : sqrt(dx * dx + dy * dy);
-        const float cover = feather > 0.0 ? clamp((radius - d) / feather, 0.0, 1.0) : clamp(radius - d + 0.5, 0.0, 1.0);
-        vec4 c = px;
-        if (cover > 0.0) c += (sampleEdge(size, p[1].x + dx / p[1].w, p[1].y + dy / p[1].w, 0) - c) * (cover * p[2].z);
-        if (border > 0.0) {
-            const float ring = clamp(min(d - radius + 0.5, radius + border - d + 0.5), 0.0, 1.0);
-            if (ring > 0.0) {
-                const float a = ring * p[2].z;
-                c.rgb += (p[3].rgb - c.rgb) * a;
-                c.a += (1.0 - c.a) * a;
-            }
-        }
-        fragColor = c;
-        return;
-    }
-    if (mode == 74) {
-        const ivec2 from = xy - ivec2(p[1].xy);
-        if (from.x < 0 || from.y < 0 || from.x >= size.x || from.y >= size.y) {
-            fragColor = vec4(0.0);
-            return;
-        }
-        const float a = texelFetch(srcTex, from, 0).a * p[1].z;
-        fragColor = vec4(p[2].rgb * a, a);
-        return;
-    }
-    if (mode == 75) {
-        const vec4 o = texelFetch(orig, xy, 0);
-        fragColor = o.a <= 0.0 ? px : o + px * (1.0 - o.a);
-        return;
-    }
-    if (mode == 76) {
-        fragColor = px;
-        const float a = px.a;
-        if (a <= 0.0) return;
-        const bool strict = p[1].x > 0.5;
-        const float rgbLo = strict ? 0.0 : -0.05, rgbHi = strict ? 1.0 : 1.05, yLo = strict ? 0.0 : -0.01, yHi = strict ? 1.0 : 1.03;
-        const float knee = p[1].y;
-        const float inv = a < 1.0 ? 1.0 / a : 1.0;
-        vec3 c = px.rgb * inv;
-        const float luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-        const bool outside = luma < yLo || luma > yHi || any(lessThan(c, vec3(rgbLo))) || any(greaterThan(c, vec3(rgbHi)));
-        if (outside && p[1].z > 0.5) {
-            const bool stripe = ((xy.x + xy.y) / 4) % 2 == 0;
-            fragColor = vec4(stripe ? a : 0.0, 0.0, stripe ? a : 0.0, a);
-            return;
-        }
-        float l2 = luma;
-        if (knee <= 0.0) l2 = clamp(luma, yLo, yHi);
-        else if (luma > yHi - knee) l2 = yHi - knee + knee * (1.0 - exp(-(luma - (yHi - knee)) / knee));
-        else if (luma < yLo + knee) l2 = yLo + knee - knee * (1.0 - exp(-((yLo + knee) - luma) / knee));
-        c += l2 - luma;
-        float sat = 1.0;
-        for (int k = 0; k < 3; ++k) {
-            if (c[k] > rgbHi && c[k] > l2) sat = min(sat, (rgbHi - l2) / (c[k] - l2));
-            if (c[k] < rgbLo && c[k] < l2) sat = min(sat, (l2 - rgbLo) / (l2 - c[k]));
-        }
-        sat = clamp(sat, 0.0, 1.0);
-        fragColor = vec4(clamp(vec3(l2) + (c - vec3(l2)) * sat, vec3(rgbLo), vec3(rgbHi)) * a, a);
-        return;
-    }
-    if (mode == 77) {
-        const float x = float(xy.x) + 0.5, y = float(xy.y) + 0.5, dx = (x - p[1].z) * p[2].x, dy = (y - p[1].w) * p[2].y;
-        const vec4 f = tableAt(1, min(sqrt(dx * dx + dy * dy) / p[2].z, 4096.0), 4096);
-        if (int(p[1].x) == 0) {
-            fragColor = px;
-            if (px.a <= 0.0) return;
-            const int tf = int(p[1].y);
-            for (int k = 0; k < 3; ++k) fragColor[k] = tableEncode(tf, tableDecode(tf, px[k] / px.a) * f.w) * px.a;
-            return;
-        }
-        const vec2 W = vec2(size);
-        const vec2 g = vec2(p[1].z, p[1].w) + (vec2(x, y) - vec2(p[1].z, p[1].w)) * f.g;
-        if (!(g.x >= 0.0 && g.y >= 0.0 && g.x <= W.x && g.y <= W.y)) fragColor = vec4(0.0);
-        else fragColor = sampleEdge(size, clamp(g.x, 0.5, W.x - 0.5), clamp(g.y, 0.5, W.y - 0.5), 0);
-        if (p[2].w > 0.5) {
-            for (int k = 0; k < 3; k += 2) {
-                const vec2 at = vec2(p[1].z, p[1].w) + (vec2(x, y) - vec2(p[1].z, p[1].w)) * f[k];
-                vec4 c = vec4(0.0);
-                if (at.x >= 0.0 && at.y >= 0.0 && at.x <= W.x && at.y <= W.y)
-                    c = sampleEdge(size, clamp(at.x, 0.5, W.x - 0.5), clamp(at.y, 0.5, W.y - 0.5), 0);
-                fragColor[k] = c.a > 0.0 && fragColor.a > 0.0 ? c[k] / c.a * fragColor.a : c[k];
-            }
-        }
-        return;
-    }
-    if (mode == 78) {
-        fragColor = px;
-        if (px.a <= 0.0) return;
-        const vec2 g = bevelSlope(size, xy);
-        if (g.x == 0.0 && g.y == 0.0) return;
-        const float s = clamp((-g.x * p[1].y - g.y * p[1].z) / sqrt(g.x * g.x + g.y * g.y + 1.0) * 1.4142135623730951, -1.0, 1.0);
-        if (s > 0.0) fragColor.rgb += p[2].rgb * (s * p[1].x * px.a);
-        else if (s < 0.0) fragColor.rgb *= 1.0 - min(1.0, -s * p[1].x);
-        return;
-    }
-    if (mode == 79) {
-        fragColor = px;
-        const bool outside = p[1].x > 0.5;
-        const float a = clamp(px.a, 0.0, 1.0);
-        if (a <= 0.0 && !outside) return;
-        const vec2 g = bevelSlope(size, xy);
-        if (g.x == 0.0 && g.y == 0.0) return;
-        const vec3 l = p[3].xyz;
-        const float lit = (-g.x * l.x - g.y * l.y + l.z) / sqrt(g.x * g.x + g.y * g.y + 1.0) - l.z;
-        const float s = lit > 0.0 ? min(1.0, lit / (1.0 - l.z)) : max(-1.0, lit / l.z);
-        if (s == 0.0) return;
-        const float amount = s > 0.0 ? s * p[1].y : -s * p[1].z;
-        const vec3 tint = s > 0.0 ? p[4].rgb : p[5].rgb;
-        const int blend = int(s > 0.0 ? p[1].w : p[2].x);
-        vec3 o;
-        for (int c = 0; c < 3; ++c) {
-            const float base = a > 0.0 ? px[c] / a : 0.0;
-            o[c] = (base + (bevelBlend(blend, base, tint[c]) - base) * amount) * a;
-        }
-        if (outside && a < 1.0) {
-            const float under = amount * (1.0 - a);
-            o += tint * under;
-            fragColor.a = a + under;
-        }
-        fragColor.rgb = o;
-        return;
-    }
     if (mode == 72) {
         vec4 c = px;
         if (p[1].x > 0.5 && c.a > 0.0) {

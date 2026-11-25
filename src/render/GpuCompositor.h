@@ -134,10 +134,11 @@ struct ColorOp {
 };
 
 // A splat clip's capture, worked out for blending on the CPU (render/SplatRender's splatsForBlending, whose arithmetic
-// it is): sorted by depth on the GPU, by a stable radix sort in compute passes (equal depths in the cloud's order), and
-// blended front to back there, each splat a quad drawn over the pixels it reaches; or with `points`, each pixel the
-// nearest centre's colour. Its buffers are counted against the texture budget: a capture they would take past it is
-// drawn in batches of splats, nearest first, each batch sorted and blended under what is drawn already.
+// it is): an entry for each 16-pixel tile a splat reaches, sorted by depth on the GPU by a stable radix sort in compute
+// passes (equal depths in the cloud's order) and then by tile, each tile's pixels blended front to back through its
+// entries in a compute pass as the CPU blends them; or with `points`, each pixel the nearest centre's colour. Its
+// buffers are counted against the texture budget: a capture they would take past it is drawn in batches of splats,
+// nearest first, the blend carried from batch to batch.
 struct SplatLayer {
     int width = 0, height = 0;
     std::vector<float> records;  // 12 floats a splat, as splatsForBlending makes them
