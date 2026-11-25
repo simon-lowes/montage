@@ -727,22 +727,36 @@ bool cameraMotionFromString(const std::string& s, CameraMotion& m) {
     return true;
 }
 
+namespace {
+std::atomic<long> gCameraMotionFrames{0};
+}  // namespace
+
+long cameraMotionFramesMeasured() { return gCameraMotionFrames.load(); }
+
 CameraMotion analyzeCameraMotion(const std::string& path, double from, double to, const TrackProgress& progress,
-                                 const std::atomic<bool>* cancel, std::string* error) {
+                                 const std::atomic<bool>* cancel, std::string* error, const CameraMotion* resume,
+                                 const std::function<void(const CameraMotion&)>& keep) {
     CameraMotion m;
     FrameSource src;
     if (!src.open(path, error)) return m;
     m.fps = src.fps;
     m.start = from;
     const int frames = std::max(1, int(std::floor((to - from) * src.fps + 1e-6)));
+    // (taken on from an earlier run's last frame where it measured the same stretch: its frames are read by the same
+    // times, so the steps come out as one run's would)
+    int first = 1;
+    if (resume && resume->start == from && resume->fps == src.fps && !resume->steps.empty() && int(resume->steps.size()) <= frames) {
+        m.steps = resume->steps;
+        first = int(m.steps.size());
+    }
     GrayImage cur, next;
-    if (!src.frame(from, cur)) {
+    if (!src.frame(from + (first - 1) / src.fps, cur)) {
         if (error) *error = "Cannot read the clip's frames";
         return m;
     }
     const double W = src.w;
-    m.steps.push_back({});
-    for (int i = 1; i < frames; ++i) {
+    if (m.steps.empty()) m.steps.push_back({});
+    for (int i = first; i < frames; ++i) {
         if (cancel && cancel->load()) {
             m.steps.clear();
             if (error) *error = "Cancelled";
@@ -771,6 +785,8 @@ CameraMotion analyzeCameraMotion(const std::string& path, double from, double to
             std::swap(cur, next);
         }
         m.steps.push_back(step);
+        gCameraMotionFrames.fetch_add(1);
+        if (keep && i % 50 == 0) keep(m);
         if (progress) progress(double(i) / frames);
     }
     return m;

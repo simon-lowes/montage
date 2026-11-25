@@ -3999,7 +3999,12 @@ bool runInspectorAnalysis(TaskRun& t) {
     if (what == "stabilize") {
         const bool steadies = ef->type == "stabilize";
         std::string motion, gyro, gyroNote;
-        ok = analyzeClipStabilization(p, *sq, *cl, motion, progress, cancel, err, steadies ? &gyro : nullptr, steadies ? &gyroNote : nullptr);
+        // (the frames measured so far kept as a part every 50 frames, so that a run cut short is taken up from there)
+        QJsonValue kept;
+        const std::string before = t.part(QStringLiteral("motion"), &kept) ? kept.toString().toStdString() : std::string();
+        ok = analyzeClipStabilization(p, *sq, *cl, motion, progress, cancel, err, steadies ? &gyro : nullptr, steadies ? &gyroNote : nullptr,
+                                      before.empty() ? nullptr : &before,
+                                      [&t](const std::string& so) { t.keepPart(QStringLiteral("motion"), QString::fromStdString(so)); });
         if (ok) {
             // Motion data found switches Stabilize to Camera Gyro (once: a method picked afterwards stays).
             after.strings["motion"] = motion;

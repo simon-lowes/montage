@@ -33864,6 +33864,41 @@ private slots:
         QVERIFY2(half > repaired && half < skewed, qPrintable(QString("%1 %2 %3").arg(skewed).arg(half).arg(repaired)));
     }
 
+    // The camera's motion measured up to a point is kept (every 50 frames) and taken up from there: a run stopped at
+    // two thirds and taken up from what it kept measures only the frames after it, and comes out as one whole run's.
+    void cameraMotionTakenUp() {
+        const std::string video = path("shaky-long.mp4");
+        const int frames = 120;
+        writeShakyVideo(video, frames);
+        std::string err;
+        long before = cameraMotionFramesMeasured();
+        const CameraMotion whole = analyzeCameraMotion(video, 0, frames / 25.0, {}, nullptr, &err);
+        QCOMPARE(int(whole.steps.size()), frames);
+        QCOMPARE(cameraMotionFramesMeasured() - before, long(frames - 1));
+        std::atomic<bool> cancel{false};
+        CameraMotion kept;
+        int keptTimes = 0;
+        const CameraMotion stopped = analyzeCameraMotion(
+            video, 0, frames / 25.0, [&](double f) { cancel = cancel || f >= 2.0 / 3; }, &cancel, &err, nullptr,
+            [&](const CameraMotion& so) { kept = so, ++keptTimes; });
+        QVERIFY(stopped.steps.empty());
+        QCOMPARE(keptTimes, 1);
+        QCOMPARE(int(kept.steps.size()), 51);  // (frames 0 to 50)
+        // (kept as the Inspector's task keeps it: as text)
+        CameraMotion fromText;
+        QVERIFY(cameraMotionFromString(cameraMotionToString(kept), fromText));
+        before = cameraMotionFramesMeasured();
+        const CameraMotion takenUp = analyzeCameraMotion(video, 0, frames / 25.0, {}, nullptr, &err, &fromText);
+        QCOMPARE(cameraMotionFramesMeasured() - before, long(frames - 51));
+        QCOMPARE(int(takenUp.steps.size()), frames);
+        QCOMPARE(cameraMotionToString(takenUp), cameraMotionToString(whole));
+        // What another stretch measured is not taken up.
+        before = cameraMotionFramesMeasured();
+        const CameraMotion other = analyzeCameraMotion(video, 0.2, frames / 25.0, {}, nullptr, &err, &fromText);
+        QCOMPARE(cameraMotionFramesMeasured() - before, long(other.steps.size() - 1));
+        QVERIFY(other.start == 0.2);
+    }
+
     void trackingAndStabilization() {
         const std::string video = path("shaky.mp4");
         const int frames = 40;

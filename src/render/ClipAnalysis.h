@@ -23,9 +23,11 @@ namespace montage {
 // when the media has some (media/MotionData.h), lined up with that motion, as
 // strings["gyro"] keeps it; empty, with why in `gyroNote`, when it has none or
 // it does not match.
+// `resume` and `keep` as analyzeCameraMotion's: the motion so far, in that string form.
 bool analyzeClipStabilization(const Project& p, const Sequence& s, const Clip& c, std::string& motion,
                               const TrackProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
-                              std::string* error = nullptr, std::string* gyro = nullptr, std::string* gyroNote = nullptr);
+                              std::string* error = nullptr, std::string* gyro = nullptr, std::string* gyroNote = nullptr,
+                              const std::string* resume = nullptr, const std::function<void(const std::string&)>& keep = {});
 
 // Follows the mask of effect `e` from clip-local frame `fromLocal` to the
 // clip's end (forward) or start, as (clip-local frame, region) keys.

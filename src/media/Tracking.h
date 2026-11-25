@@ -108,8 +108,13 @@ struct CameraMotion {
 std::string cameraMotionToString(const CameraMotion& m);
 bool cameraMotionFromString(const std::string& s, CameraMotion& m);
 
+// `resume`: the motion an earlier run over the same stretch measured before it was cut short (its start and rate the
+// same), taken on from its last frame; `keep` is given the motion measured so far every 50 frames, to be kept for that.
 CameraMotion analyzeCameraMotion(const std::string& path, double from, double to, const TrackProgress& progress = {},
-                                 const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
+                                 const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr, const CameraMotion* resume = nullptr,
+                                 const std::function<void(const CameraMotion&)>& keep = {});
+// Frames analyzeCameraMotion has measured in this process (each step between two frames), for tests.
+long cameraMotionFramesMeasured();
 
 // The per-frame correction that moves the shaky path onto its smoothed
 // version (Gaussian, `smoothSeconds` wide; 0 locks the camera), as transforms
