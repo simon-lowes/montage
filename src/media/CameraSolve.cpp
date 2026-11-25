@@ -1294,8 +1294,9 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
     // The models and cards, each with its material (numbered among its kind).
     auto meshName = [&](size_t m) {
         size_t n = 0;
-        for (size_t i = 0; i <= m; ++i) n += models[i].card == models[m].card;
-        return (models[m].card ? "Card_" : "Model_") + std::to_string(n);
+        auto kind = [&](size_t i) { return models[i].card ? 1 : models[i].title ? 2 : 0; };
+        for (size_t i = 0; i <= m; ++i) n += kind(i) == kind(m);
+        return (kind(m) == 1 ? "Card_" : kind(m) == 2 ? "Title_" : "Model_") + std::to_string(n);
     };
     // A package (.usdz) or a layer with its pictures beside it, named after it.
     const QFileInfo info(QString::fromStdString(path));
@@ -1351,6 +1352,13 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
                     o << (i ? ", " : "") << "(" << formatNumber(mesh.uvs[i], true) << ", " << formatNumber(1 - double(mesh.uvs[i + 1]), true) << ")";
                 o << "] (\n                interpolation = \"vertex\"\n            )\n";
             }
+            const bool colored = !mesh.colors.empty() && mesh.colors.size() == mesh.positions.size();
+            if (colored) {
+                o << "            color3f[] primvars:displayColor = [";
+                for (size_t i = 0; i + 2 < mesh.colors.size(); i += 3)
+                    o << (i ? ", " : "") << f3(mesh.colors[i], mesh.colors[i + 1], mesh.colors[i + 2], true);
+                o << "] (\n                interpolation = \"vertex\"\n            )\n";
+            }
             o << "            uniform token subdivisionScheme = \"none\"\n";
             o << "            rel material:binding = </Solve/Looks/" << name << ">\n        }\n";
         }
@@ -1362,9 +1370,13 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
               << "/Surface.outputs:surface>\n\n            def Shader \"Surface\"\n            {\n"
               << "                uniform token info:id = \"UsdPreviewSurface\"\n";
             const std::string look = "</Solve/Looks/" + name;
+            const bool colored = !mesh.colors.empty() && mesh.colors.size() == mesh.positions.size();
             if (!mesh.picture.empty()) {
                 o << "                color3f inputs:diffuseColor.connect = " << look << "/Picture.outputs:rgb>\n"
                   << "                float inputs:opacity.connect = " << look << "/Picture.outputs:a>\n";
+            } else if (colored) {
+                o << "                color3f inputs:diffuseColor.connect = " << look << "/Colours.outputs:result>\n"
+                  << "                float inputs:opacity = " << formatNumber(mesh.color[3], true) << "\n";
             } else {
                 o << "                color3f inputs:diffuseColor = " << f3(mesh.color[0], mesh.color[1], mesh.color[2], true) << "\n"
                   << "                float inputs:opacity = " << formatNumber(mesh.color[3], true) << "\n";
@@ -1390,6 +1402,13 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
                   << "                uniform token info:id = \"UsdPrimvarReader_float2\"\n"
                   << "                string inputs:varname = \"st\"\n"
                   << "                float2 outputs:result\n            }\n";
+            } else if (colored) {
+                // (its display colour, corner by corner; its plain colour where that is not read)
+                o << "\n            def Shader \"Colours\"\n            {\n"
+                  << "                uniform token info:id = \"UsdPrimvarReader_float3\"\n"
+                  << "                string inputs:varname = \"displayColor\"\n"
+                  << "                float3 inputs:fallback = " << f3(mesh.color[0], mesh.color[1], mesh.color[2], true) << "\n"
+                  << "                float3 outputs:result\n            }\n";
             }
             o << "        }\n";
         }

@@ -11,6 +11,7 @@
 #include "core/Model.h"
 #include "media/Image.h"
 #include "media/Model3D.h"
+#include "render/ModelRender.h"
 
 #include <memory>
 
@@ -40,7 +41,11 @@ struct Title3DMesh {
     PosedTriangles triangles;
     std::shared_ptr<const Model> model;  // its material
     std::vector<int> letterOf;           // each triangle's letter solid (in the title's order)
+    std::vector<char> onFace;            // each triangle: 1 on its letter's front face
     double opacity = 1;
+    // The title's own camera in that space (its lens, at the picture's middle; scale 1: sequence pixels), through which
+    // it is drawn alone.
+    ModelCamera camera;
 };
 bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, FrameTime duration, double fps, Title3DMesh& out);
 

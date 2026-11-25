@@ -14,6 +14,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
 #include "render/Layer3D.h"
+#include "render/Title3D.h"
 #include "render/Processing.h"
 #include "render/Compositor.h"
 
@@ -906,6 +907,108 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             m.doubleSided = true;
             m.positions = tr.positions, m.normals = tr.normals, m.uvs = tr.uvs;
             m.indices = tr.indices;
+            out.push_back(std::move(m));
+        }
+    // The 3D titles over that footage (seen through their own cameras), each as it stands at its clip's first frame,
+    // placed in the solved scene by its own camera: the middle of its letters' faces where the picture shows it
+    // (through the clip's transform) at the median depth of the solve's points in front of the solved camera there,
+    // and the whole title scaled, turned about the view and moved with it in proportion. Through the solved camera at
+    // that frame, what lies as deep as that middle (a face square on) is where its own camera shows it, and the rest
+    // as near as one lens can show what another did (exactly, through the same lens with no transform).
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
+        for (const Clip& c : seq.videoTracks[ti].clips) {
+            if (!c.enabled || !c.isGenerator() || c.generator.type != "title3d" || !c.generator.s("camera_file").empty()) continue;
+            if (cameraTrackOf(seq, ti, c.generator, 0, c.start) != int(track) || clipOn(seq.videoTracks[track], c.start) != &footage) continue;
+            const std::shared_ptr<const CameraSolve> solve = parsedSolve(footage);
+            Title3DMesh mesh;
+            ModelCamera sc;
+            double groundY = 0;
+            bool onGround = false;
+            if (!solve || !title3dMesh(c.generator, 0, seq.width, seq.height, c.duration, seq.fpsValue(), mesh) ||
+                !clipCamera(p, seq, c, c.generator, c.start, 1, int(ti), 1, sc, groundY, onGround, nullptr))
+                continue;
+            const ModelCamera& tc = mesh.camera;
+            auto inCamera = [](const ModelCamera& cam, double x, double y, double z) {
+                const double d[3] = {x - cam.C[0], y - cam.C[1], z - cam.C[2]};
+                return std::array<double, 3>{cam.R[0] * d[0] + cam.R[1] * d[1] + cam.R[2] * d[2], cam.R[3] * d[0] + cam.R[4] * d[1] + cam.R[5] * d[2],
+                                             cam.R[6] * d[0] + cam.R[7] * d[1] + cam.R[8] * d[2]};
+            };
+            // (the middle of its faces' box: of the whole title's where it has no faces)
+            const PosedTriangles& tr = mesh.triangles;
+            std::array<double, 3> lo{1e300, 1e300, 1e300}, hi{-1e300, -1e300, -1e300};
+            const bool faces = std::find(mesh.onFace.begin(), mesh.onFace.end(), 1) != mesh.onFace.end();
+            for (size_t i = 0; i < tr.indices.size(); ++i)
+                if (!faces || (i / 3 < mesh.onFace.size() && mesh.onFace[i / 3]))
+                    for (size_t a = 0; a < 3; ++a)
+                        lo[a] = std::min(lo[a], double(tr.positions[tr.indices[i] * 3 + a])), hi[a] = std::max(hi[a], double(tr.positions[tr.indices[i] * 3 + a]));
+            if (!(lo[0] <= hi[0])) continue;
+            const std::array<double, 3> qm = inCamera(tc, (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2);
+            if (!(qm[2] > 0)) continue;
+            const double u = tc.screen[0] * qm[0] / qm[2] + tc.screen[1] * qm[1] / qm[2] + tc.screen[2];
+            const double v = tc.screen[3] * qm[0] / qm[2] + tc.screen[4] * qm[1] / qm[2] + tc.screen[5];
+            // Where the clip's transform puts that point, and how it scales and turns the picture there.
+            const double W = seq.width, H = seq.height;
+            double U, V, Ux, Uy, Vx, Vy;
+            if (!clipFrameToSequence(p, seq, c, c.start, u / W, v / H, U, V) || !clipFrameToSequence(p, seq, c, c.start, (u + 1) / W, v / H, Ux, Uy) ||
+                !clipFrameToSequence(p, seq, c, c.start, u / W, (v + 1) / H, Vx, Vy))
+                continue;
+            const double ax = Ux - U, ay = Uy - V, bx = Vx - U, by = Vy - V;
+            const double grow = std::sqrt(std::fabs(ax * by - ay * bx)), turn = std::atan2(ay, ax);
+            const double cr = std::cos(turn), sr = std::sin(turn);
+            // That point seen through the solved camera, at the median depth of the solve's points in front of it.
+            const std::array<double, 6>& S = sc.screen;
+            const double det = S[0] * S[4] - S[1] * S[3];
+            if (!(std::fabs(det) > 0) || !(grow > 0)) continue;
+            const double xs = ((U - S[2]) * S[4] - (V - S[5]) * S[1]) / det, ys = ((V - S[5]) * S[0] - (U - S[2]) * S[3]) / det;
+            std::vector<double> depths;
+            for (const auto& pt : solve->points)
+                if (const double z = inCamera(sc, pt.X.x, pt.X.y, pt.X.z)[2]; z > 0) depths.push_back(z);
+            double D = 1;
+            if (!depths.empty()) {
+                std::sort(depths.begin(), depths.end());
+                const size_t n = depths.size();
+                D = n % 2 ? depths[n / 2] : (depths[n / 2 - 1] + depths[n / 2]) / 2;
+            }
+            // (scene units a unit of the title's space: a unit at its middle's depth spans as many pixels as one of the
+            // solved scene's does at D)
+            const double ft = std::sqrt(std::fabs(tc.screen[0] * tc.screen[4] - tc.screen[1] * tc.screen[3]));
+            const double k = grow * ft * D / (qm[2] * std::sqrt(std::fabs(det)));
+            auto toScene = [&](const std::array<double, 3>& q, bool direction) {
+                const double dx = direction ? q[0] : q[0] - qm[0], dy = direction ? q[1] : q[1] - qm[1], dz = direction ? q[2] : q[2] - qm[2];
+                const double s = direction ? 1 : k;
+                const std::array<double, 3> qs{(direction ? 0 : D * xs) + s * (dx * cr - dy * sr), (direction ? 0 : D * ys) + s * (dx * sr + dy * cr),
+                                               (direction ? 0 : D) + s * dz};
+                std::array<double, 3> X{sc.R[0] * qs[0] + sc.R[3] * qs[1] + sc.R[6] * qs[2], sc.R[1] * qs[0] + sc.R[4] * qs[1] + sc.R[7] * qs[2],
+                                        sc.R[2] * qs[0] + sc.R[5] * qs[1] + sc.R[8] * qs[2]};
+                if (!direction)
+                    for (int a = 0; a < 3; ++a) X[size_t(a)] += sc.C[size_t(a)];
+                return X;
+            };
+            SolvedSceneMesh m;
+            m.title = true;
+            m.name = c.name.empty() ? c.generator.s("text") : c.name;
+            m.doubleSided = true;
+            if (mesh.model && !mesh.model->materials.empty()) m.roughness = mesh.model->materials[0].roughness, m.metallic = mesh.model->materials[0].metallic;
+            double sum[3] = {0, 0, 0};
+            for (size_t i = 0; i < tr.indices.size(); ++i) {
+                const size_t vi = tr.indices[i];
+                const std::array<double, 3> X = toScene(inCamera(tc, tr.positions[vi * 3], tr.positions[vi * 3 + 1], tr.positions[vi * 3 + 2]), false);
+                const std::array<double, 3> nc{tc.R[0] * tr.normals[vi * 3] + tc.R[1] * tr.normals[vi * 3 + 1] + tc.R[2] * tr.normals[vi * 3 + 2],
+                                               tc.R[3] * tr.normals[vi * 3] + tc.R[4] * tr.normals[vi * 3 + 1] + tc.R[5] * tr.normals[vi * 3 + 2],
+                                               tc.R[6] * tr.normals[vi * 3] + tc.R[7] * tr.normals[vi * 3 + 1] + tc.R[8] * tr.normals[vi * 3 + 2]};
+                const std::array<double, 3> N = toScene(nc, true);
+                m.indices.push_back(uint32_t(m.positions.size() / 3));
+                for (int a = 0; a < 3; ++a) {
+                    m.positions.push_back(float(X[size_t(a)]));
+                    m.normals.push_back(float(N[size_t(a)]));
+                    const float col = vi * 4 + size_t(a) < tr.colors.size() ? tr.colors[vi * 4 + size_t(a)] : 1.0f;
+                    m.colors.push_back(col);
+                    sum[a] += col;
+                }
+            }
+            if (m.indices.empty()) continue;
+            const double n = double(m.indices.size());
+            m.color = {float(sum[0] / n), float(sum[1] / n), float(sum[2] / n), float(std::clamp(mesh.opacity, 0.0, 1.0))};
             out.push_back(std::move(m));
         }
     return out;

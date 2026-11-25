@@ -80,7 +80,8 @@ std::shared_ptr<const ModelTexture> pictureTexture(const Image& layer, const Seq
 ModelLight settingsLight(const Effect& g, FrameTime lt, const std::array<double, 3>& mid, double size, float* ambient = nullptr);
 
 // The models placed in the scene solved on `footage` (on video track `track`): each model clip seen through that
-// solve, as it stands at its first frame, one mesh a material, then each 3D layer's card seen through it (for
+// solve, as it stands at its first frame, one mesh a material, then each 3D layer's card seen through it, then each
+// 3D title over it placed in the scene by its own camera (its letters in one mesh, coloured corner by corner; for
 // writeSolveUsda).
 std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence& seq, size_t track, const Clip& footage);
 

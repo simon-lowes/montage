@@ -42287,6 +42287,187 @@ private slots:
         }
     }
 
+    void titles3DInASolvedScenesUsd() {
+        // A 3D title over footage with a solved camera, written to the solved scene's USD as a mesh, placed by its own
+        // camera: the middle of its faces at the median depth of the solve's points in front of the solved camera at
+        // its first frame, the title in proportion (every distance between its corners the same multiple of the one in
+        // its own space), and, through a solved camera with its own lens, every corner where its own camera shows it
+        // (within 1e-3 px); square on, through its clip's transform and another lens, its faces' corners. Its colours
+        // corner by corner are its display colour, which its material reads; Montage's USD reader reads its
+        // triangles back.
+        const int W = 320, H = 180;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        Clip title = makeGeneratorClip(p, "title3d", 10);
+        title.name = "Hello";
+        title.generator.strings["text"] = "Hi";
+        title.generator.strings["font"] = "DejaVu Sans";
+        title.generator.params["size"] = Param(80.0), title.generator.params["depth"] = Param(24.0);
+        title.generator.params["rot_x"] = Param(10.0), title.generator.params["rot_y"] = Param(25.0);
+        title.generator.params["color.r"] = Param(0.9), title.generator.params["color.g"] = Param(0.4), title.generator.params["color.b"] = Param(0.1);
+        Title3DMesh own;
+        QVERIFY(title3dMesh(title.generator, 0, W, H, 10, 25, own));
+        const double lens = own.camera.screen[0];
+        QVERIFY(lens > 100 && own.camera.screen[1] == 0 && own.camera.screen[3] == 0 && own.camera.screen[4] == lens);
+        // The solve: a camera moving across a scene of 25 points, through a lens `focal` long.
+        auto solveWith = [&](double focal) {
+            CameraSolve solve;
+            solve.width = W, solve.height = H, solve.focal = focal, solve.fps = 25, solve.oriented = true;
+            for (int i = 0; i < 10; ++i) {
+                const ModelCamera c = lookAt({-1 + 0.08 * i, 1.6, 6}, {0, 0.5, 0}, 1, 1, 1);
+                SolvedCamera sc;
+                sc.valid = true;
+                std::copy(c.R.begin(), c.R.end(), sc.R.begin());
+                sc.C = {c.C[0], c.C[1], c.C[2]};
+                solve.cameras.push_back(sc);
+            }
+            for (int i = 0; i < 5; ++i)
+                for (int j = 0; j < 5; ++j) {
+                    SolvedPoint pt;
+                    pt.X = {-2 + i, 0.1 * j, -3 + 1.5 * j};
+                    solve.points.push_back(pt);
+                }
+            return solve;
+        };
+        auto placed = [&](const CameraSolve& solve, const Clip& t, SolvedSceneMesh& out) {
+            Clip plate;
+            plate.id = p.newId();
+            plate.duration = 10;
+            plate.generator = makeEffect(p, "gradient");
+            Effect track = makeEffect(p, "camera_track");
+            track.strings["solve"] = cameraSolveToString(solve);
+            plate.effects = {track};
+            s.videoTracks[0].clips = {plate};
+            s.videoTracks[1].clips = {t};
+            const std::vector<SolvedSceneMesh> meshes = solvedSceneModels(p, s, 0, s.videoTracks[0].clips[0]);
+            if (meshes.size() != 1 || !meshes[0].title) return false;
+            out = meshes[0];
+            return true;
+        };
+        // Where a point is in the picture through camera `cam`.
+        auto picture = [](const ModelCamera& cam, const std::array<double, 3>& X, double& u, double& v, double& z) {
+            const double d[3] = {X[0] - cam.C[0], X[1] - cam.C[1], X[2] - cam.C[2]};
+            const double q[3] = {cam.R[0] * d[0] + cam.R[1] * d[1] + cam.R[2] * d[2], cam.R[3] * d[0] + cam.R[4] * d[1] + cam.R[5] * d[2],
+                                 cam.R[6] * d[0] + cam.R[7] * d[1] + cam.R[8] * d[2]};
+            z = q[2];
+            u = cam.screen[0] * q[0] / q[2] + cam.screen[1] * q[1] / q[2] + cam.screen[2];
+            v = cam.screen[3] * q[0] / q[2] + cam.screen[4] * q[1] / q[2] + cam.screen[5];
+        };
+        auto solvedCamera = [&](const CameraSolve& solve) {
+            ModelCamera c;
+            std::copy(solve.cameras[0].R.begin(), solve.cameras[0].R.end(), c.R.begin());
+            c.C = {solve.cameras[0].C.x, solve.cameras[0].C.y, solve.cameras[0].C.z};
+            c.screen = {solve.focal, 0, W / 2.0, 0, solve.focal, H / 2.0};
+            return c;
+        };
+        auto at = [](const std::vector<float>& v, size_t i) { return std::array<double, 3>{v[i * 3], v[i * 3 + 1], v[i * 3 + 2]}; };
+        auto ownAt = [&](size_t i) { return at(own.triangles.positions, own.triangles.indices[i]); };
+
+        // ---- Through a solved camera with the title's own lens: every corner where its own camera shows it.
+        const CameraSolve solve = solveWith(lens);
+        SolvedSceneMesh m;
+        QVERIFY(placed(solve, title, m));
+        QCOMPARE(m.indices.size(), own.triangles.indices.size());
+        QCOMPARE(m.positions.size(), m.indices.size() * 3);
+        QCOMPARE(m.colors.size(), m.positions.size());
+        QCOMPARE(m.name, std::string("Hello"));
+        const ModelCamera sc = solvedCamera(solve);
+        double worst = 0, lo = 1e300, hi = 0;
+        for (size_t i = 0; i < m.indices.size(); ++i) {
+            double u0, v0, z0, u1, v1, z1;
+            picture(own.camera, ownAt(i), u0, v0, z0);
+            picture(sc, at(m.positions, m.indices[i]), u1, v1, z1);
+            QVERIFY(z1 > 0);
+            worst = std::max(worst, std::hypot(u1 - u0, v1 - v0));
+            // (in proportion: distances to the first corner)
+            const std::array<double, 3> a = ownAt(0), b = ownAt(i), A = at(m.positions, m.indices[0]), B = at(m.positions, m.indices[i]);
+            const double d0 = std::hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]), d1 = std::hypot(B[0] - A[0], B[1] - A[1], B[2] - A[2]);
+            if (d0 > 1) lo = std::min(lo, d1 / d0), hi = std::max(hi, d1 / d0);
+            for (size_t k = 0; k < 3; ++k) QCOMPARE(m.colors[i * 3 + k], own.triangles.colors[own.triangles.indices[i] * 4 + k]);
+        }
+        qInfo("a 3D title in a solved scene: its corners %.2g px from where its own camera shows them, %.6g to %.6g scene units a pixel of its own",
+              worst, lo, hi);
+        QVERIFY(worst < 1e-3);
+        QVERIFY(hi - lo < 1e-6 * hi);
+        // The middle of its faces at the points' median depth in front of the solved camera: as far in front of it as
+        // that middle is in front of its own camera, times the scale it was placed at.
+        {
+            std::vector<double> depths;
+            for (const SolvedPoint& pt : solve.points) {
+                double u, v, z;
+                picture(sc, {pt.X.x, pt.X.y, pt.X.z}, u, v, z);
+                if (z > 0) depths.push_back(z);
+            }
+            std::sort(depths.begin(), depths.end());
+            const size_t n = depths.size();
+            QVERIFY(n > 2);
+            const double median = n % 2 ? depths[n / 2] : (depths[n / 2 - 1] + depths[n / 2]) / 2;
+            std::array<double, 3> ownLo{1e300, 1e300, 1e300}, ownHi{-1e300, -1e300, -1e300};
+            for (size_t i = 0; i < m.indices.size(); ++i)
+                if (own.onFace.at(i / 3))
+                    for (size_t a = 0; a < 3; ++a) ownLo[a] = std::min(ownLo[a], ownAt(i)[a]), ownHi[a] = std::max(ownHi[a], ownAt(i)[a]);
+            double u, v, ownDepth;
+            picture(own.camera, {(ownLo[0] + ownHi[0]) / 2, (ownLo[1] + ownHi[1]) / 2, (ownLo[2] + ownHi[2]) / 2}, u, v, ownDepth);
+            qInfo("its middle %.6g in front of the solved camera, the points' median %.6g", ownDepth * lo, median);
+            QVERIFY(std::fabs(ownDepth * lo - median) < 1e-5 * median);
+        }
+        // Written to USD: the mesh with its display colour, read by its material, and its triangles read back.
+        {
+            const std::string file = (dir.path() + "/titled.usda").toStdString();
+            std::string err;
+            QVERIFY2(writeSolveUsda(solve, file, {m}, &err), err.c_str());
+            usd::Stage stage;
+            QVERIFY2(usd::openStage(file, stage, &err), err.c_str());
+            const auto* prim = stage.prim("/Solve/Models/Title_1");
+            QVERIFY(prim && prim->attribute("primvars:displayColor") && prim->attribute("points"));
+            QCOMPARE(prim->attribute("primvars:displayColor")->value.numbers.size(), m.colors.size());
+            QCOMPARE(prim->attribute("points")->value.numbers.size(), m.positions.size());
+            const auto* reader = stage.prim("/Solve/Looks/Title_1/Colours");
+            QVERIFY(reader && reader->attribute("inputs:varname") && reader->attribute("inputs:varname")->value.text(0) == "displayColor");
+            Model model;
+            QVERIFY2(loadModel(file, model, &err), err.c_str());
+            const PosedTriangles back = posedTriangles(model, poseModel(model, -1, 0));
+            QCOMPARE(back.indices.size(), m.indices.size());
+        }
+
+        // ---- The title square on, through its clip's transform (scaled to half and moved 40 px right, 20 up) and a
+        // solved camera with a lens half as long: every corner of its faces where the picture shows it (the sides,
+        // further back, as near as the other lens shows them).
+        {
+            Clip moved = title;
+            moved.generator.params["rot_x"] = Param(0.0), moved.generator.params["rot_y"] = Param(0.0);
+            moved.motion.params["scale"] = Param(50.0);
+            moved.motion.params["pos_x"] = Param(40.0), moved.motion.params["pos_y"] = Param(-20.0);
+            Title3DMesh square;
+            QVERIFY(title3dMesh(moved.generator, 0, W, H, 10, 25, square));
+            const CameraSolve half = solveWith(lens / 2);
+            SolvedSceneMesh mm;
+            QVERIFY(placed(half, moved, mm));
+            QCOMPARE(mm.indices.size(), square.triangles.indices.size());
+            const ModelCamera hc = solvedCamera(half);
+            double faces = 0, sides = 0;
+            int onFaces = 0;
+            for (size_t i = 0; i < mm.indices.size(); ++i) {
+                double u0, v0, z0, u1, v1, z1, x, y;
+                picture(square.camera, at(square.triangles.positions, square.triangles.indices[i]), u0, v0, z0);
+                QVERIFY(clipFrameToSequence(p, s, s.videoTracks[1].clips[0], 0, u0 / W, v0 / H, x, y));
+                picture(hc, at(mm.positions, mm.indices[i]), u1, v1, z1);
+                double& worstHere = square.onFace.at(i / 3) ? faces : sides;
+                worstHere = std::max(worstHere, std::hypot(u1 - x, v1 - y));
+                onFaces += square.onFace[i / 3];
+            }
+            qInfo("through its transform and half the lens: its faces' corners %.2g px off, its sides' %.2g", faces, sides);
+            QVERIFY(onFaces > 30);
+            QVERIFY(faces < 1e-3);
+            QVERIFY(sides < 5);
+        }
+        for (Track& t : s.videoTracks) t.clips.clear();
+    }
+
     void shapeLayersAsVectorGraphics() {
         // A Shape layer's contents: groups of shapes, paints and the operators that change the paths above them.
         const int W = 400, H = 300;

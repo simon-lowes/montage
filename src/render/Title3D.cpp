@@ -889,6 +889,10 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
     // The title's camera space (raster pixels) to the scene's: a unit a sequence pixel, the frame at z = 0.
     const double unit = 1.0 / b.super;
     auto toWorld = [&](V3 q) { return V3{q.x * unit, q.y * unit, (q.z + b.cam.f) * unit}; };
+    out.camera.R = {1, 0, 0, 0, -1, 0, 0, 0, -1};
+    out.camera.C = {0, 0, b.cam.f * unit};
+    out.camera.screen = {b.cam.f * unit, 0, b.cam.cx * unit, 0, b.cam.f * unit, b.cam.cy * unit};
+    out.camera.nearZ = b.cam.nearest * unit;
     PosedTriangles& tr = out.triangles;
     auto vertex = [&](V3 p, V3 n, const float* col) {
         tr.positions.insert(tr.positions.end(), {float(p.x), float(p.y), float(p.z)});
@@ -912,10 +916,11 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
         const Solid& so = b.solids[si];
         const M3 Rs = b.R * so.rot;
         auto place = [&](V3 p) { return toWorld(b.R * (so.place(p) * b.k) + b.T); };
-        auto triangle = [&](uint32_t a, uint32_t bb, uint32_t c) {
+        auto triangle = [&](uint32_t a, uint32_t bb, uint32_t c, bool face = false) {
             tr.indices.insert(tr.indices.end(), {a, bb, c});
             tr.materials.push_back(0);
             out.letterOf.push_back(int(si));
+            out.onFace.push_back(face ? 1 : 0);
         };
         const std::vector<std::array<V3, 3>> faces = faceTriangles(so.contours);
         for (int side = 0; side < (so.depth > 0 ? 2 : 1); ++side) {
@@ -929,7 +934,7 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
                     colourAt(paint, f[size_t(v)], col);
                     idx[v] = vertex(place({f[size_t(v)].x, f[size_t(v)].y, z}), n, col);
                 }
-                if (side == 0) triangle(idx[0], idx[1], idx[2]);
+                if (side == 0) triangle(idx[0], idx[1], idx[2], true);
                 else triangle(idx[0], idx[2], idx[1]);
             }
         }
