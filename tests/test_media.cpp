@@ -44907,6 +44907,35 @@ private slots:
             QVERIFY2(worst[0] < 1e-3 && worst[1] < 1e-4 && worst[2] < 1e-5, qPrintable(QString("%1 %2 %3").arg(worst[0]).arg(worst[1]).arg(worst[2])));
         }
         {
+            // Accessors with no buffer view are zeros: one of the cloud's own size (its opacities) is read as zeros, and
+            // a file whose accessors would unpack to 2^24 splats of nothing is refused before anything is made of it.
+            QJsonObject zeros = gltfJson;
+            QJsonArray accessors = zeros["accessors"].toArray();
+            const QJsonObject attrs = zeros["meshes"].toArray()[0].toObject()["primitives"].toArray()[0].toObject()["attributes"].toObject();
+            const int opacityAt = attrs["KHR_gaussian_splatting:OPACITY"].toInt();
+            QJsonObject opacity = accessors[opacityAt].toObject();
+            opacity.remove("bufferView"), opacity.remove("byteOffset"), opacity.remove("min"), opacity.remove("max");
+            accessors[opacityAt] = opacity;
+            zeros["accessors"] = accessors;
+            QVERIFY(writeJson("splat_zeros.gltf", zeros));
+            SplatCloud none;
+            QVERIFY2(loadSplats(path("splat_zeros.gltf"), none, &err), err.c_str());
+            QCOMPARE(none.count, ply.count);
+            QVERIFY(std::all_of(none.opacities.begin(), none.opacities.end(), [](float v) { return v == 0; }));
+            for (const QString& name : attrs.keys()) {
+                QJsonObject a = accessors[attrs[name].toInt()].toObject();
+                a.remove("bufferView"), a.remove("byteOffset"), a.remove("min"), a.remove("max");
+                a["count"] = 1 << 24;
+                accessors[attrs[name].toInt()] = a;
+            }
+            zeros["accessors"] = accessors;
+            QVERIFY(writeJson("splat_zeros.gltf", zeros));
+            QVERIFY(QFileInfo(QString::fromStdString(path("splat_zeros.gltf"))).size() < 64 * 1024);
+            err.clear();
+            QVERIFY(!loadSplats(path("splat_zeros.gltf"), none, &err));
+            QVERIFY2(err.find("larger than Montage can load") != std::string::npos, err.c_str());
+        }
+        {
             // A file in linear light: blended as it is, then brought to display values. One opaque splat of linear 0.2
             // shows as sRGB 0.2's code value under its coverage.
             SplatCloud one;
