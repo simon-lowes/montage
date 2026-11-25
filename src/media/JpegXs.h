@@ -1,7 +1,8 @@
 // Montage — JPEG XS (ISO/IEC 21122), coded and decoded through SVT-JPEG-XS (BSD-2-Clause-Patent), used directly as
 // libjxl and dav2d are (the FFmpeg Montage builds with has no JPEG XS):
 //  - pictures: 4:2:2 and 4:4:4 Y′CbCr and R′G′B′, 8 to 12 bits, at a chosen number of bits per pixel (a constant
-//    number of bytes a picture), slices of 16 lines, each slice's bytes known (RFC 9134's slice packetisation);
+//    number of bytes a picture), slices of 16 lines, each slice's bytes known (RFC 9134's slice packetisation), or
+//    lossless (each picture as many bytes as it takes); any of them with an alpha component at full size;
 //  - files: raw codestreams (.jxs: one picture, or a sequence of them one after the other) and MXF (SMPTE ST 2124,
 //    frame-wrapped in OP1a through bmx, with the JPEG XS Picture SubDescriptor and PCM sound beside it), read and
 //    written;
@@ -34,14 +35,18 @@ struct JxsHeader {
     int depth = 0;               // the first component's bits (Bc)
     int sx[4] = {}, sy[4] = {};  // each component's sampling factors
     int cpih = 0;                // colour transform (1: the reversible one, so R′G′B′ coded)
+    int fq = -1;                 // fractional bits (Fq; 0: coded losslessly; -1: not read)
     int decompV = 0;             // vertical decompositions (Nly): a precinct is 2^decompV lines
     std::vector<uint8_t> componentTable;  // the CDT marker segment as it is (ST 2124's JPEGXSComponentTable)
     size_t headerBytes = 0;      // bytes before the first slice (SOC to the first SLH)
     int sliceLines() const { return hsl << decompV; }
+    bool lossless() const { return fq == 0; }
+    bool alpha() const { return components == 4; }  // (a fourth component: alpha, at the first's size)
 };
 // False when `data` does not start with a JPEG XS codestream's header.
 bool readJxsHeader(const uint8_t* data, size_t size, JxsHeader& out);
-// Whether a codestream with this header is one decoded here: three components, each side at most 16,384 samples and
+// Whether a codestream with this header is one decoded here: three components (or four, the last alpha; not a Bayer
+// pattern's), each side at most 16,384 samples and
 // 64 million pixels in all (past 10K: a header asking for more is refused before anything is set aside for it).
 bool jxsPictureFits(const JxsHeader& h, std::string* why = nullptr);
 // ISO/IEC 21122-2's names: "Main 422.10", and the level and sublevel ("2k-1", "Sublev3bpp"); "" when not one of them.
@@ -56,14 +61,16 @@ size_t jxsCodestreamSize(const uint8_t* data, size_t size);
 enum class JxsSampling { Ycc422, Ycc444, Rgb };
 std::string jxsSamplingName(JxsSampling s);  // as RFC 9134's SDP names it ("YCbCr-4:2:2", "YCbCr-4:4:4", "RGB")
 // Planar samples: Y, Cb, Cr (or R, G, B), each its code (8 to 12 bits) in 16 bits, rows in turn; chroma half as wide
-// in 4:2:2.
+// in 4:2:2. With `alpha`, a fourth plane of alpha at the picture's full size (straight, at the same depth).
 struct JxsPicture {
     int width = 0, height = 0, depth = 10;
     JxsSampling sampling = JxsSampling::Ycc422;
-    std::vector<uint16_t> planes[3];
+    bool alpha = false;
+    std::vector<uint16_t> planes[4];
     JxsPicture() = default;
-    JxsPicture(int w, int h, int d, JxsSampling s);
-    int planeWidth(int c) const { return c && sampling == JxsSampling::Ycc422 ? (width + 1) / 2 : width; }
+    JxsPicture(int w, int h, int d, JxsSampling s, bool withAlpha = false);
+    int planeCount() const { return alpha ? 4 : 3; }
+    int planeWidth(int c) const { return c && c < 3 && sampling == JxsSampling::Ycc422 ? (width + 1) / 2 : width; }
     bool operator==(const JxsPicture& o) const;
 };
 
@@ -74,6 +81,8 @@ struct JxsEncodeSettings {
     int bppNum = 3, bppDen = 1;                // bits per pixel (as a fraction): bytes a picture = width x height x bpp / 8
     int sliceHeight = 16;                      // lines a slice
     bool slices = false;                       // say where each slice ends (RFC 9134's slice packetisation)
+    bool alpha = false;                        // a fourth component, alpha (R′G′B′ with it is coded without the colour transform)
+    bool lossless = false;                     // each picture exactly as it was (bpp unused; not with `slices`)
     int threads = 0;                           // 0: as SVT chooses
 };
 // Codes pictures at a constant number of bytes each.
@@ -85,7 +94,7 @@ public:
     JxsEncoder& operator=(const JxsEncoder&) = delete;
     bool open(const JxsEncodeSettings& s, std::string* error = nullptr);
     const JxsEncodeSettings& settings() const;
-    uint32_t bytesPerPicture() const;
+    uint32_t bytesPerPicture() const;  // (lossless: the most a picture can take)
     // One picture (at the settings' size, sampling and depth) as a codestream; with `slices`, `units` gets the bytes of
     // each part RFC 9134's slice packetisation sends apart: the header, then each slice (the last with the EOC marker).
     bool encode(const JxsPicture& picture, std::vector<uint8_t>& out, std::vector<uint32_t>* units = nullptr,
@@ -130,6 +139,8 @@ struct JxsFileInfo {
     JxsContainer container = JxsContainer::None;
     JxsHeader header;            // the first picture's
     JxsSampling sampling = JxsSampling::Ycc422;
+    bool alpha = false;          // its pictures have alpha (header.alpha())
+    int alphaDepth = 0;          // MXF: the descriptor's alpha bits (CDCI's AlphaSampleDepth, RGBA's 'A'); 0 none stated
     int fpsNum = 25, fpsDen = 1; // MXF's edit rate (a raw codestream: 25, or one picture alone a still)
     int64_t frames = 0;
     // Colour (CICP code points): MXF's descriptor, else Rec.709 Y′CbCr in narrow range (R′G′B′ full range).
@@ -152,8 +163,8 @@ struct JxsFileInfo {
 };
 bool readJxsFileInfo(const std::string& file, JxsFileInfo& out, std::string* error = nullptr);
 
-// Pictures of a JPEG XS file: frame `n` as FFmpeg would hand it out (planar Y′CbCr or GBR at 8, 10 or 12 bits,
-// colour tagged), or its codestream as it is.
+// Pictures of a JPEG XS file: frame `n` as FFmpeg would hand it out (planar Y′CbCr or GBR at 8, 10 or 12 bits, with
+// alpha YUVA or GBRA, colour tagged), or its codestream as it is.
 class JxsReader {
 public:
     JxsReader();
@@ -192,7 +203,8 @@ public:
     JxsWriter& operator=(const JxsWriter&) = delete;
     bool open(const std::string& path, const JxsWriteSettings& settings, std::string* error = nullptr);
     bool write(const JxsPicture& picture, std::string* error = nullptr);
-    // A frame as FFmpeg holds it (planar Y′CbCr 4:2:2 or 4:4:4, or GBR, at the settings' depth; other formats converted).
+    // A frame as FFmpeg holds it (planar Y′CbCr 4:2:2 or 4:4:4, or GBR, at the settings' depth, with alpha YUVA or GBRA
+    // when the settings have it; other formats converted).
     bool write(const AVFrame* frame, std::string* error = nullptr);
     // A codestream already coded (written as it is).
     bool writeCodestream(const uint8_t* data, size_t size, std::string* error = nullptr);

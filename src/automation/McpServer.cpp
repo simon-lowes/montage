@@ -13855,6 +13855,8 @@ void McpServer::Impl::addTools() {
             "jpeg_xs_bpp":{"type":"number","minimum":0.5,"maximum":24,"default":5,"description":"JPEG XS: bits a pixel, a constant number of bytes each picture (3 to 8 for most mezzanine work)"},
             "jpeg_xs_sampling":{"type":"string","enum":["422","444","rgb"],"default":"422","description":"JPEG XS: 4:2:2 or 4:4:4 Y'CbCr, or R'G'B' (the preset's when it is a JPEG XS preset)"},
             "jpeg_xs_depth":{"type":"integer","enum":[8,10,12],"default":10,"description":"JPEG XS: bits a sample"},
+            "jpeg_xs_lossless":{"type":"boolean","default":false,"description":"JPEG XS: each picture coded losslessly, as many bytes as it takes (jpeg_xs_bpp unused)"},
+            "jpeg_xs_alpha":{"type":"boolean","default":false,"description":"JPEG XS: the sequence's alpha kept as a fourth component, at full size"},
             "av2_speed":{"type":"integer","minimum":0,"maximum":6,"default":6,"description":"AV2: AVM's speed preset, 0 slowest (smallest) to 6 fastest"},
             "av2_quality":{"type":"integer","minimum":0,"maximum":63,"default":32,"description":"AV2 without a bitrate: the quantiser, 0 (best) to 63"},
             "av2_10bit":{"type":"boolean","default":false,"description":"AV2: 10 bits (always for HDR)"},
@@ -14028,6 +14030,11 @@ void McpServer::Impl::addTools() {
                 st.monoAudioTracks = 0;
                 if (st.audioCodec != "none") st.audioCodec = "pcm_s24le";
                 st.format.clear();
+            }
+            if (a.contains("jpeg_xs_lossless") || a.contains("jpeg_xs_alpha")) {
+                if (st.videoCodec != "jpegxs") throw ArgError{"\"jpeg_xs_lossless\" and \"jpeg_xs_alpha\" are for JPEG XS (\"video_codec\": \"jpeg_xs\")"};
+                if (a.contains("jpeg_xs_lossless")) st.jpegXsLossless = a.value("jpeg_xs_lossless").toBool();
+                if (a.contains("jpeg_xs_alpha")) st.alpha = a.value("jpeg_xs_alpha").toBool();
             }
             if (a.contains("jpeg_xs_bpp") || a.contains("jpeg_xs_sampling") || a.contains("jpeg_xs_depth")) {
                 if (st.videoCodec != "jpegxs") throw ArgError{"\"jpeg_xs_bpp\", \"jpeg_xs_sampling\" and \"jpeg_xs_depth\" are for JPEG XS (\"video_codec\": \"jpeg_xs\")"};

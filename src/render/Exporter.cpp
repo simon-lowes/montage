@@ -1104,15 +1104,24 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     AVPixelFormat jxsFormat = AV_PIX_FMT_YUV422P10LE;
     if (jxsOut) {
         if (!jpegXsAvailable()) return fail("This build of Montage writes no JPEG XS (SVT-JPEG-XS)");
+        // (each format without alpha, and its counterpart with alpha: yuv422p10le and yuva422p10le)
+        const AVPixelFormat ok[] = {AV_PIX_FMT_YUV422P,    AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV422P12LE, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV444P10LE,
+                                    AV_PIX_FMT_YUV444P12LE, AV_PIX_FMT_GBRP,       AV_PIX_FMT_GBRP10LE,    AV_PIX_FMT_GBRP12LE};
+        const AVPixelFormat withAlpha[] = {AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA422P10LE, AV_PIX_FMT_YUVA422P12LE,
+                                           AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUVA444P10LE, AV_PIX_FMT_YUVA444P12LE,
+                                           AV_PIX_FMT_GBRAP,    AV_PIX_FMT_GBRAP10LE,    AV_PIX_FMT_GBRAP12LE};
         if (!s.pixFmt.empty()) {
             jxsFormat = av_get_pix_fmt(s.pixFmt.c_str());
-            const AVPixelFormat ok[] = {AV_PIX_FMT_YUV422P,    AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV422P12LE, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV444P10LE,
-                                        AV_PIX_FMT_YUV444P12LE, AV_PIX_FMT_GBRP,       AV_PIX_FMT_GBRP10LE,    AV_PIX_FMT_GBRP12LE};
-            if (std::find(std::begin(ok), std::end(ok), jxsFormat) == std::end(ok))
-                return fail("JPEG XS is written as 4:2:2 or 4:4:4 Y'CbCr, or R'G'B', at 8, 10 or 12 bits (yuv422p10le, yuv444p12le, gbrp12le...)");
+            if (const auto at = std::find(std::begin(withAlpha), std::end(withAlpha), jxsFormat); at != std::end(withAlpha)) {
+                if (!s.alpha) return fail("A JPEG XS format with alpha is written with alpha kept: ask for alpha, or choose the format without it");
+                jxsFormat = ok[at - std::begin(withAlpha)];
+            } else if (std::find(std::begin(ok), std::end(ok), jxsFormat) == std::end(ok)) {
+                return fail("JPEG XS is written as 4:2:2 or 4:4:4 Y'CbCr, or R'G'B', at 8, 10 or 12 bits, with alpha or without (yuv422p10le, yuva444p12le, gbrp12le...)");
+            }
         }
+        if (s.alpha) jxsFormat = withAlpha[std::find(std::begin(ok), std::end(ok), jxsFormat) - std::begin(ok)];
         if (s.jpegXsBpp < 0 || s.jpegXsBpp > 24) return fail("A JPEG XS rate is up to 24 bits a pixel");
-        if (s.alpha || interlacedOut) return fail("JPEG XS is written without alpha or fields");
+        if (interlacedOut) return fail("JPEG XS is written without fields");
         if (s.cea608 || s.embedCaptions) return fail("JPEG XS is written without embedded captions: burn them in, or deliver them beside the file");
         if (s.adaptiveHdr) return fail("JPEG XS is written without adaptive HDR metadata");
         if (s.twoPass || s.pass != 0) return fail("JPEG XS is written in one pass");
@@ -1982,6 +1991,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         xs.encode.height = H;
         xs.encode.depth = d->comp[0].depth;
         xs.encode.sampling = (d->flags & AV_PIX_FMT_FLAG_RGB) ? JxsSampling::Rgb : d->log2_chroma_w ? JxsSampling::Ycc422 : JxsSampling::Ycc444;
+        xs.encode.alpha = (d->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        xs.encode.lossless = s.jpegXsLossless;
         const double bpp = s.jpegXsBpp > 0 ? s.jpegXsBpp : 5.0;
         xs.encode.bppNum = int(std::lround(bpp * 1000));
         xs.encode.bppDen = 1000;

@@ -21815,13 +21815,167 @@ colorspaces:
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err, &used), err.c_str());
         QCOMPARE(QFileInfo(QString::fromStdString(st.path)).size(), qint64(24) * w * h * 3 / 8);
         QVERIFY(probeMedia(st.path, m, &err) && m.videoCodec == "jpegxs" && !m.hasAudio);
-        // Refused: sound in a raw codestream, alpha, an unknown format.
+        // Refused: sound in a raw codestream, a format with alpha when alpha is not asked for, an unknown format.
         st.audioCodec = "pcm_s24le";
         QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err) && QString::fromStdString(err).contains("no sound"));
-        st.audioCodec = "none", st.alpha = true;
-        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
-        st.alpha = false, st.pixFmt = "yuv420p";
+        st.audioCodec = "none", st.pixFmt = "yuva444p12le";
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err) && QString::fromStdString(err).contains("alpha"));
+        st.pixFmt = "yuv420p";
         QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err) && QString::fromStdString(err).contains("4:2:2 or 4:4:4"));
+        // Phase 17 #9 (CI only, as all of this test): with alpha, losslessly, to MXF. The second clip at half opacity
+        // comes out with its alpha at half, and each picture is as long as it codes to.
+        s.videoTracks[0].clips[1].motion.params["opacity"] = 50.0;
+        st.path = (dir.path() + "/alpha.mxf").toStdString();
+        st.pixFmt = "yuv444p12le", st.alpha = true, st.jpegXsLossless = true;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err, &used), err.c_str());
+        montage::JxsReader ra;
+        QVERIFY2(ra.open(st.path, &err), err.c_str());
+        QVERIFY(ra.info().alpha && ra.info().header.lossless() && ra.info().sampling == JxsSampling::Ycc444 && ra.info().header.depth == 12);
+#ifdef MONTAGE_WITH_BMX
+        QCOMPARE(ra.info().alphaDepth, 12);
+#endif
+        montage::JxsPicture first, later;
+        QVERIFY(ra.picture(5, first) && ra.picture(18, later));
+        QVERIFY(first.alpha && later.alpha);
+        const size_t mid = size_t(h / 2) * size_t(w) + size_t(w / 2);
+        QCOMPARE(int(first.planes[3][mid]), 4095);
+        QVERIFY2(std::abs(int(later.planes[3][mid]) - 2048) <= 4, qPrintable(QString::number(later.planes[3][mid])));
+    }
+
+    // Phase 17 #9 (CI only: SVT-JPEG-XS is built in CI, not here). Lossless JPEG XS at 10 and 12 bits, and alpha as a
+    // fourth component: lossless pictures come back exactly, in Y'CbCr and R'G'B', with alpha or without, stated as
+    // lossless in the picture header (Fq 0, the lossless profile); alpha coded at a rate comes back close; files keep
+    // alpha, say how deep it is (MXF), and hand it out as FFmpeg's YUVA and GBRA formats.
+    void jpegXsLosslessAndAlpha() {
+        using montage::JxsSampling;
+        if (!montage::jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        const int w = 320, h = 192;
+        std::string why;
+        auto withAlpha = [&](montage::JxsPicture p, int frame) {
+            p.alpha = true;
+            p.planes[3].assign(size_t(w) * size_t(h), 0);
+            const int top = (1 << p.depth) - 1;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)  // (a soft-edged disc, moving, on a ramp)
+                    p.planes[3][size_t(y) * size_t(w) + size_t(x)] =
+                        uint16_t(std::clamp(std::hypot(x - 100 - frame * 4, y - 90) < 60 ? top : x * top / w, 0, top));
+            return p;
+        };
+        struct Case {
+            JxsSampling sampling;
+            int depth;
+            bool alpha;
+        };
+        for (const Case& c : {Case{JxsSampling::Ycc422, 10, false}, Case{JxsSampling::Ycc444, 12, false}, Case{JxsSampling::Rgb, 10, false},
+                              Case{JxsSampling::Rgb, 12, false}, Case{JxsSampling::Ycc422, 10, true}, Case{JxsSampling::Ycc444, 12, true},
+                              Case{JxsSampling::Rgb, 12, true}}) {
+            const std::string name = montage::jxsSamplingName(c.sampling) + " " + std::to_string(c.depth) + (c.alpha ? " alpha" : "");
+            montage::JxsEncodeSettings es;
+            es.width = w, es.height = h, es.depth = c.depth, es.sampling = c.sampling, es.alpha = c.alpha, es.lossless = true;
+            montage::JxsEncoder enc;
+            QVERIFY2(enc.open(es, &why), (name + ": " + why).c_str());
+            montage::JxsDecoder dec;
+            for (int f = 0; f < 2; ++f) {
+                montage::JxsPicture pic = jxsTestPicture(w, h, c.depth, c.sampling, f * 7);
+                if (c.alpha) pic = withAlpha(pic, f);
+                std::vector<uint8_t> cs;
+                QVERIFY2(enc.encode(pic, cs, nullptr, &why), (name + ": " + why).c_str());
+                QVERIFY2(cs.size() <= enc.bytesPerPicture(), name.c_str());
+                montage::JxsHeader hd;
+                QVERIFY(montage::readJxsHeader(cs.data(), cs.size(), hd));
+                QVERIFY2(hd.lossless() && hd.alpha() == c.alpha && hd.components == (c.alpha ? 4 : 3), (name + ": Fq " + std::to_string(hd.fq)).c_str());
+                QCOMPARE(montage::jxsProfileName(hd.ppih), std::string("MLS.12"));
+                montage::JxsPicture back;
+                QVERIFY2(dec.decode(cs.data(), cs.size(), back, &why, c.sampling == JxsSampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444),
+                         (name + ": " + why).c_str());
+                QVERIFY2(back == pic, (name + ": not the same picture").c_str());
+            }
+        }
+        // Lossless is not sent a slice at a time.
+        {
+            montage::JxsEncodeSettings es;
+            es.width = w, es.height = h, es.lossless = true, es.slices = true;
+            montage::JxsEncoder enc;
+            QVERIFY(!enc.open(es, &why) && QString::fromStdString(why).contains("slice"));
+        }
+        // Alpha at a rate: the lossy header says so (Fq above 0), and alpha comes back close.
+        {
+            montage::JxsEncodeSettings es;
+            es.width = w, es.height = h, es.depth = 10, es.sampling = JxsSampling::Ycc422, es.alpha = true, es.bppNum = 8;
+            montage::JxsEncoder enc;
+            QVERIFY2(enc.open(es, &why), why.c_str());
+            const montage::JxsPicture pic = withAlpha(jxsTestPicture(w, h, 10, JxsSampling::Ycc422, 3), 3);
+            std::vector<uint8_t> cs;
+            QVERIFY2(enc.encode(pic, cs, nullptr, &why), why.c_str());
+            QCOMPARE(cs.size(), size_t(enc.bytesPerPicture()));
+            montage::JxsHeader hd;
+            QVERIFY(montage::readJxsHeader(cs.data(), cs.size(), hd) && !hd.lossless() && hd.fq > 0 && hd.alpha());
+            montage::JxsDecoder dec;
+            montage::JxsPicture back;
+            QVERIFY2(dec.decode(cs.data(), cs.size(), back, &why), why.c_str());
+            QVERIFY(back.alpha && back.sampling == JxsSampling::Ycc422 && back.planes[3].size() == size_t(w) * size_t(h));
+            double sum = 0;
+            for (size_t i = 0; i < pic.planes[3].size(); ++i) sum += std::pow(double(pic.planes[3][i]) - double(back.planes[3][i]), 2);
+            const double psnr = 10 * std::log10(1023.0 * 1023.0 / std::max(sum / double(pic.planes[3].size()), 1e-9));
+            QVERIFY2(psnr > 35, qPrintable(QString::number(psnr)));
+        }
+        // Files: a raw lossless codestream run with alpha (each picture its own length), and MXF with alpha in a CDCI
+        // and an RGBA descriptor.
+        QTemporaryDir dir;
+        struct FileCase {
+            const char* file;
+            JxsSampling sampling;
+            int depth;
+            AVPixelFormat format;
+        };
+        for (const FileCase& fc : {FileCase{"alpha.jxs", JxsSampling::Ycc422, 10, AV_PIX_FMT_YUVA422P10LE},
+                                   FileCase{"alpha422.mxf", JxsSampling::Ycc422, 10, AV_PIX_FMT_YUVA422P10LE},
+                                   FileCase{"rgba.mxf", JxsSampling::Rgb, 12, AV_PIX_FMT_GBRAP12LE}}) {
+            const std::string path = dir.filePath(fc.file).toStdString();
+            const bool mxf = montage::jxsContainerForPath(path) == montage::JxsContainer::Mxf;
+#ifndef MONTAGE_WITH_BMX
+            if (mxf) continue;
+#endif
+            montage::JxsWriteSettings ws;
+            ws.container = mxf ? montage::JxsContainer::Mxf : montage::JxsContainer::Codestream;
+            ws.encode.width = w, ws.encode.height = h, ws.encode.depth = fc.depth, ws.encode.sampling = fc.sampling;
+            ws.encode.alpha = true, ws.encode.lossless = true;
+            if (fc.sampling == JxsSampling::Rgb) ws.matrix = 0, ws.fullRange = true;
+            std::vector<montage::JxsPicture> written;
+            {
+                montage::JxsWriter wr;
+                QVERIFY2(wr.open(path, ws, &why), (std::string(fc.file) + ": " + why).c_str());
+                for (int f = 0; f < 3; ++f) {
+                    written.push_back(withAlpha(jxsTestPicture(w, h, fc.depth, fc.sampling, f * 5), f * 9));
+                    QVERIFY2(wr.write(written.back(), &why), (std::string(fc.file) + ": " + why).c_str());
+                }
+                QVERIFY2(wr.finish(&why), why.c_str());
+            }
+            montage::JxsReader rd;
+            QVERIFY2(rd.open(path, &why), (std::string(fc.file) + ": " + why).c_str());
+            QCOMPARE(rd.info().frames, int64_t(3));
+            QVERIFY2(rd.info().alpha && rd.info().sampling == fc.sampling && rd.info().header.lossless(), fc.file);
+            if (mxf) QCOMPARE(rd.info().alphaDepth, fc.depth);
+            AVFrame* av = av_frame_alloc();
+            auto freeFrame = qScopeGuard([&] { av_frame_free(&av); });
+            for (int f = 0; f < 3; ++f) {
+                montage::JxsPicture back;
+                QVERIFY2(rd.picture(f, back, &why), why.c_str());
+                QVERIFY2(back == written[size_t(f)], (std::string(fc.file) + ": picture " + std::to_string(f)).c_str());
+                QVERIFY2(rd.frame(f, av, &why), why.c_str());
+                QVERIFY2(av->format == fc.format, fc.file);
+                QCOMPARE(reinterpret_cast<const uint16_t*>(av->data[3] + av->linesize[3] * 90)[100], back.planes[3][size_t(90) * size_t(w) + 100]);
+                QCOMPARE(reinterpret_cast<const uint16_t*>(av->data[3] + av->linesize[3] * 5)[300], back.planes[3][size_t(5) * size_t(w) + 300]);
+            }
+        }
+        // R'G'B' with alpha goes to MXF only: a raw codestream of four components would be read as Y'CbCr.
+        {
+            montage::JxsWriteSettings ws;
+            ws.container = montage::JxsContainer::Codestream;
+            ws.encode.width = w, ws.encode.height = h, ws.encode.sampling = JxsSampling::Rgb, ws.encode.alpha = true;
+            montage::JxsWriter wr;
+            QVERIFY(!wr.open(dir.filePath("rgba.jxs").toStdString(), ws, &why) && QString::fromStdString(why).contains("MXF"));
+        }
     }
 
     // NMOS receivers: a controller hands each one a sender's SDP (two paths, ST 2022-7) through IS-05, the parameters
