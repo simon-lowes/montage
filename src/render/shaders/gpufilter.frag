@@ -58,7 +58,7 @@
 // smear along the flow.
 // 56 a Shape layer's paints (render/ShapeRaster): each pixel's tile's commands, each path's coverage from its backdrop and
 // lines, its paint laid down over what is below, groups through their opacity; p[1].x the tiles across.
-// 73 to 79 are gpueffects.frag's (the compositor draws those modes with it).
+// 73 and above are gpueffects.frag's (the compositor draws those modes with it).
 // 72 Gaussian splats blended (render/SplatRender): a linear cloud's colour (p[1].x set) brought to display values under
 // its coverage, and the whole the layer's opacity (p[1].y) of that.
 // Lens Blur (Depth) (render/LensBlur's lensBlur, its plan worked out on the CPU from the depth; the state, S, twice the

@@ -416,7 +416,7 @@ private:
     QRhiShaderResourceBindings* layout_ = nullptr;
     QRhiGraphicsPipeline *colorPs_ = nullptr, *compositePs_ = nullptr, *outputPs_ = nullptr, *output8Ps_ = nullptr;
     QRhiGraphicsPipeline *filterPs_ = nullptr, *mixPs_ = nullptr;
-    QRhiGraphicsPipeline* effectsPs_ = nullptr;  // (gpueffects.frag: the filter modes 73 to 79)
+    QRhiGraphicsPipeline* effectsPs_ = nullptr;  // (gpueffects.frag: the filter modes from 73)
     bool splats_ = false;  // (brokenMutex_)
     std::string noSplats_;  // (why not; brokenMutex_)
     QRhiBuffer* splatDummy_ = nullptr;
@@ -1628,7 +1628,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 std::vector<std::pair<int, QRhiTexture*>> bound = {{1, at}, {4, cur}};
                 if (QRhiTexture* t = slotAt(fp.extra)) bound.push_back({2, t});
                 if (QRhiTexture* t = table ? table : kept ? kept : slotAt(fp.tableSlot)) bound.push_back({5, t});
-                pass(fp.mode >= 73 && fp.mode <= 79 ? effectsPs_ : filterPs_, made, u, bound, uniforms(u, p));
+                pass(fp.mode >= 73 ? effectsPs_ : filterPs_, made, u, bound, uniforms(u, p));
                 u = rhi_->nextResourceUpdateBatch();
                 if (table) release(table);
                 ++filterPasses;

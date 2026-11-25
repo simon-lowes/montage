@@ -3585,7 +3585,8 @@ bool isGpuFilter(const std::string& type) {
                                                   "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
                                                   "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare", "radial_blur",
                                                   "aperture_glare", "painterly", "depth_blur", "lens_distortion", "magnify",
-                                                  "drop_shadow", "broadcast_safe", "lens_correction", "edge_bevel", "layer_bevel"};
+                                                  "drop_shadow", "broadcast_safe", "lens_correction", "edge_bevel", "layer_bevel",
+                                                  "texture_pop", "film_look"};
     return filters.count(type) > 0;
 }
 
@@ -4166,6 +4167,76 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                     return true;
                 };
             }
+        } else if (ty == "film_look") {
+            // render/FilmLook's filmLook by its plan for the frame (gpueffects.frag's modes 81 to 85): the frame moved,
+            // softened, its highlights' halation and bloom, then the flicker, lift, vignette and grain on each pixel
+            if (width > 0 && height > 0) {
+                const FilmLookPlan plan = filmLookPlan(width, height, filmLookSettings(e, t), t);
+                const double cx = width / 2.0, cy = height / 2.0;
+                enum { kStart = 1, kHalo = 2, kMoved = 3 };
+                add(81, {float(plan.wx), float(plan.wy), float(plan.aberration), plan.moved ? 1.0f : 0.0f, float(cx), float(cy), float(std::hypot(cx, cy))});
+                if (plan.softRadius > 0) {
+                    f.passes.back().save = kMoved;
+                    blur(plan.softRadius, true, true, all);
+                    add(82, {plan.softMix});
+                    f.passes.back().extra = kMoved;
+                }
+                if (plan.halation > 0 || plan.bloom > 0) {
+                    f.passes.back().save = kStart;  // (the picture both are found in)
+                    if (plan.halation > 0) {
+                        add(83, {0.6f, 0});
+                        if (plan.haloRadius >= 0.5) blur(plan.haloRadius, true, true, all);
+                        f.passes.back().save = kHalo;
+                    }
+                    if (plan.bloom > 0) {
+                        add(83, {0.75f, 1});
+                        f.passes.back().extra = kStart;
+                        if (plan.bloomRadius >= 0.5) blur(plan.bloomRadius, true, true, all);
+                    }
+                    add(84, {plan.halation > 0 ? 1.0f : 0.0f, plan.bloom > 0 ? 1.0f : 0.0f, float(plan.halation * 1.6), float(plan.bloom * 0.8),
+                             float(plan.halation), float(plan.bloom)});
+                    f.passes.back().extra = kStart;
+                    if (plan.halation > 0) f.passes.back().tableSlot = kHalo;
+                }
+                add(85, {plan.flicker, plan.lift, float(plan.vignette), float(std::hypot(cx, cy)), float(cx), float(cy), plan.grain,
+                         float(plan.grainSize), float(plan.gridW), float(plan.gridH)});
+                if (plan.grain > 0) {
+                    gpu::ColorOp::FilterPass& fp = f.passes.back();
+                    fp.tableWidth = plan.gridW;
+                    fp.table.assign(size_t(plan.gridW) * size_t(plan.gridH) * 4, 0.0f);
+                    for (size_t i = 0; i < size_t(plan.gridW) * size_t(plan.gridH); ++i)
+                        for (int c = 0; c < 3; ++c) fp.table[i * 4 + size_t(c)] = plan.noise[i * 3 + size_t(c)];
+                }
+            }
+        } else if (ty == "texture_pop") {
+            // Local Contrast (render/ColorSlice's textureDetail): its plan, each pixel's brightness and the change to it,
+            // made on the CPU from the picture read back as the step runs, then the gain in light on the GPU (gpueffects.frag's
+            // mode 80)
+            const ColorSpace& working = currentWorkingSpace();
+            const int tf = gpuTransfer(working);
+            if (tf < 0) return false;  // (a curve the shader does not know)
+            // (its table a row a 4,097 pixels: a picture too big for it stays on the CPU)
+            if (const int most = gpu::maxTextureSize();
+                most > 0 && size_t(std::max(0, width)) * size_t(std::max(0, height)) / (TransferTables::kDecode + 1) + 2 > size_t(most))
+                return false;
+            if (width > 0 && height > 0) {
+                add(80, {float(tf)});
+                const ExpressionContext where = currentExpressionContext();
+                f.prepare = [effect = e, t, pixelScale, where, space = working](const Image& picture, gpu::ColorOp& step) {
+                    ExpressionScope expressions(where.project, where.sequence, where.clip, where.cancel);
+                    if (step.passes.size() != 1) return false;
+                    std::vector<float> Y, delta;
+                    const size_t n = size_t(picture.width) * size_t(picture.height);
+                    if (!textureDetailPlan(effect, t, space, picture, pixelScale, Y, delta)) Y.assign(n, 0.0f), delta.assign(n, 0.0f);
+                    if (Y.size() != n || delta.size() != n) return false;
+                    // (row 0 the transfer tables, then each pixel's brightness and change, in rows of the same width)
+                    gpu::ColorOp::FilterPass& fp = step.passes[0];
+                    const size_t w = TransferTables::kDecode + 1, rows = 1 + (n + w - 1) / w;
+                    transferTableRows(fp, space, int(rows));
+                    for (size_t i = 0; i < n; ++i) fp.table[(w + i) * 4] = Y[i], fp.table[(w + i) * 4 + 1] = delta[i];
+                    return true;
+                };
+            }
         } else if (ty == "lens_correction") {
             // vfx::lensCorrection by its radial plan (gpufilter.frag's mode 77): the vignetting undone in light, then each
             // pixel from where the lens put it, red and blue from their own places
@@ -4672,9 +4743,12 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         out.push_back(std::move(op));
         return true;
     } else if (e.type == "ofx") {
-        // An OpenFX plug-in that renders with OpenGL draws from the compositor's own texture into the next one, where
-        // the compositor's OpenGL context shares them with the plug-ins' (render/Ofx.h's applyEffectTexture): nothing
-        // is read back. Not through a mask, nor with further inputs connected (those are pictures made on the CPU).
+        // An OpenFX plug-in given textures (render/Ofx.h's rendersTextures and applyEffectTexture) draws into the
+        // compositor's next texture, where the compositor's OpenGL context shares them with the plug-ins': one that
+        // renders with OpenGL in this process from the compositor's own texture, nothing read back; one in a plug-in
+        // host asked for handles has its picture copied in on the GPU from the DMA-BUF it comes back as (or written in
+        // from shared memory), its input still read back for the host. Not through a mask, nor with further inputs
+        // connected (those are pictures made on the CPU).
         if (op.masked || ofx::usesOwnMask(e) || !gpu::sharesOpenGl() || !ofx::rendersTextures(e)) return false;
         if (std::any_of(e.strings.begin(), e.strings.end(), [](const auto& kv) { return kv.first.rfind("input.", 0) == 0 && !kv.second.empty(); }))
             return false;

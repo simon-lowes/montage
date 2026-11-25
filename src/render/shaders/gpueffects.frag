@@ -1,5 +1,5 @@
 #version 440
-// The filter passes of the effects that came to the GPU last, in a shader of their own beside gpufilter.frag (whose
+// The filter passes of the effects that came to the GPU last (modes 73 to 85), in a shader of their own beside gpufilter.frag (whose
 // bindings and parameters they share, as render/Processing makes their passes; the helpers below are gpufilter.frag's):
 // 73 Magnify (render/VideoFx's magnify: p[1] the centre, radius and magnification, p[2] feather, border, opacity and
 // whether square, p[3] the border's colour); Drop Shadow (render/Processing's dropShadow): 74 the shadow, the layer's
@@ -13,6 +13,15 @@
 // the frame, in the table's x, its rows read as one run): 78 Edge Bevel (p[1] strength and the light's way across and
 // down, p[2] its colour), 79 Layer Bevel (p[1] whether it reaches past the layer, the highlight's and the shadow's
 // opacity and the highlight's blend mode; p[2] the shadow's, p[3] the light's direction, p[4] and p[5] the colours).
+// 80 Local Contrast (render/ColorSlice's textureDetail, its plan made on the CPU from the picture as the step runs:
+// p[1].x the transfer function; the table's row 0 the transfer tables, then each pixel's ACEScct brightness and its
+// change in x and y, the rows read as one run).
+// Film Look (render/FilmLook's filmLook by its FilmLookPlan for the frame): 81 the weave and aberration (p[1] the
+// move, the aberration and whether there is any, p[2] the centre and half diagonal), 82 the softness (the picture kept,
+// extra, towards its blur by p[1].x), 83 the highlights past p[1].x (of extra where p[1].y), 84 the halation (the
+// table's slot) and bloom (srcTex) over the picture kept (p[1] which, and their gains, p[2] their amounts), 85 the
+// flicker, lift and vignette (p[1], p[2].xy the centre) and the grain (p[2].zw its amount and cell size, p[3].xy the
+// grid, the table its noise).
 layout(location = 0) out vec4 fragColor;
 layout(std140, binding = 0) uniform Params { vec4 p[16]; };
 layout(binding = 1) uniform sampler2D srcTex;  // RGBA32F, premultiplied: what the pass before made
@@ -105,6 +114,21 @@ vec4 sampleEdge(ivec2 size, float x, float y, int edge) {
     const vec4 p01 = texelEdge(size, x0, y0 + 1, edge), p11 = texelEdge(size, x0 + 1, y0 + 1, edge);
     const vec4 top = p00 + (p10 - p00) * fx, bottom = p01 + (p11 - p01) * fx;
     return top + (bottom - top) * fy;
+}
+float acesCctToLinear(float c) {
+    return c <= 10.5402377416545 * 0.0078125 + 0.0729055341958355 ? (c - 0.0729055341958355) / 10.5402377416545 : exp2(c * 17.52 - 9.72);
+}
+float lumaOf(vec4 c) { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
+// Film Look's sample: bilinear, the position clamped to the picture, as render/FilmLook's sampleAt.
+vec4 filmSample(ivec2 size, float x, float y) {
+    x = clamp(x, 0.0, float(size.x - 1));
+    y = clamp(y, 0.0, float(size.y - 1));
+    const int x0 = int(x), y0 = int(y), x1 = min(x0 + 1, size.x - 1), y1 = min(y0 + 1, size.y - 1);
+    const float fx = x - float(x0), fy = y - float(y0);
+    const vec4 p00 = texelFetch(srcTex, ivec2(x0, y0), 0), p10 = texelFetch(srcTex, ivec2(x1, y0), 0);
+    const vec4 p01 = texelFetch(srcTex, ivec2(x0, y1), 0), p11 = texelFetch(srcTex, ivec2(x1, y1), 0);
+    const vec4 a = p00 + (p10 - p00) * fx, b = p01 + (p11 - p01) * fx;
+    return a + (b - a) * fy;
 }
 vec4 tableTexel(int i) {
     const int w = textureSize(table, 0).x;
@@ -251,6 +275,86 @@ void main() {
             fragColor.a = a + under;
         }
         fragColor.rgb = o;
+        return;
+    }
+    if (mode == 80) {
+        // Local Contrast: each pixel's brightness and its change from the table (after row 0), a gain in light on every
+        // channel alike
+        const int tf = int(p[1].x), w = textureSize(table, 0).x;
+        const vec2 yd = tableTexel(w + xy.y * size.x + xy.x).xy;
+        vec4 c = px;
+        if (c.a > 0.0 && yd.y != 0.0) {
+            const float before = acesCctToLinear(yd.x), after = acesCctToLinear(yd.x + yd.y);
+            if (before > 1e-7) {
+                const float g = clamp(max(0.0, after) / before, 1.0 / 16.0, 16.0);
+                for (int k = 0; k < 3; ++k) c[k] = tableEncode(tf, tableDecode(tf, c[k] / c.a) * g) * c.a;
+            }
+        }
+        fragColor = c;
+        return;
+    }
+    if (mode == 81) {
+        // Film Look: the gate's weave and the aberration (red and blue apart from the centre)
+        if (p[1].w < 0.5) {
+            fragColor = px;
+            return;
+        }
+        const float x = float(xy.x), y = float(xy.y), sx = x - p[1].x, sy = y - p[1].y, ab = p[1].z;
+        const float rx = (x - p[2].x) / p[2].z, ry = (y - p[2].y) / p[2].z;
+        const vec4 at = filmSample(size, sx, sy);
+        fragColor = vec4(filmSample(size, sx + rx * ab, sy + ry * ab).r, at.g, filmSample(size, sx - rx * ab, sy - ry * ab).b, at.a);
+        return;
+    }
+    if (mode == 82) {
+        // Film Look's softness: the picture kept (extra) towards its blur by p[1].x
+        const vec4 was = texelFetch(extra, xy, 0);
+        fragColor = was + (px - was) * p[1].x;
+        return;
+    }
+    if (mode == 83) {
+        // Film Look's highlights: what is brighter than p[1].x, softly (from the picture kept where p[1].y is set)
+        const vec4 c = p[1].y > 0.5 ? texelFetch(extra, xy, 0) : px;
+        const float l = c.a > 0.0 ? lumaOf(c) / c.a : 0.0, k = clamp((l - p[1].x) / max(1e-3, 1.0 - p[1].x), 0.0, 1.0);
+        fragColor = c * (k * k);
+        return;
+    }
+    if (mode == 84) {
+        // Film Look's halation (its blurred highlights the table) and bloom (srcTex) added to the picture kept
+        vec4 c = texelFetch(extra, xy, 0);
+        const bool halo = p[1].x > 0.5, bloom = p[1].y > 0.5;
+        const vec4 h = halo ? texelFetch(table, xy, 0) : vec4(0.0);
+        const float hl = lumaOf(h);
+        const vec3 tint = vec3(1.0, 0.28, 0.06);
+        for (int k = 0; k < 3; ++k) {
+            if (halo) c[k] += p[1].z * tint[k] * hl;
+            if (bloom) c[k] += p[1].w * px[k];
+        }
+        const float more = max(halo ? p[2].x * h.a : 0.0, bloom ? p[2].y * px.a : 0.0);
+        c.a = min(1.0, c.a + more);
+        fragColor = c;
+        return;
+    }
+    if (mode == 85) {
+        // Film Look's flicker, lifted blacks and vignette, then its grain from the table's grid of noise
+        vec4 c = px;
+        const float a = c.a;
+        if (a > 0.0) {
+            const float r = length(vec2(float(xy.x) + 0.5 - p[2].x, float(xy.y) + 0.5 - p[2].y)) / p[1].w;
+            const float q = clamp((r - 0.35) / 0.65, 0.0, 1.0), v = 1.0 - p[1].z * 0.65 * q * q, lift = p[1].y;
+            for (int k = 0; k < 3; ++k) c[k] = (lift * a + c[k] * (1.0 - lift)) * p[1].x * v;
+            if (p[2].z > 0.0) {
+                const int gw = int(p[3].x), gh = int(p[3].y);
+                const float gx = float(xy.x) / p[2].w, gy = float(xy.y) / p[2].w;
+                const int ix = min(gw - 2, int(gx)), iy = min(gh - 2, int(gy));
+                const float fx = gx - float(ix), fy = gy - float(iy);
+                const float l = clamp(lumaOf(c) / a, 0.0, 1.0), g = p[2].z * (0.35 + 2.6 * l * (1.0 - l)) * a;
+                const vec4 n00 = texelFetch(table, ivec2(ix, iy), 0), n10 = texelFetch(table, ivec2(ix + 1, iy), 0);
+                const vec4 n01 = texelFetch(table, ivec2(ix, iy + 1), 0), n11 = texelFetch(table, ivec2(ix + 1, iy + 1), 0);
+                const vec4 top = n00 + (n10 - n00) * fx, bottom = n01 + (n11 - n01) * fx;
+                for (int k = 0; k < 3; ++k) c[k] = max(0.0, c[k] + (top[k] + (bottom[k] - top[k]) * fy) * g);
+            }
+        }
+        fragColor = c;
         return;
     }
     fragColor = px;

@@ -31196,6 +31196,12 @@ colorspaces:
             {"layer_bevel", {{}, {{"style", 1}, {"size", 9}, {"soften", 3}, {"highlight_mode", 4}}, {{"style", 3}, {"depth", 300}, {"shadow_mode", 0}}}},
             {"layer_bevel", {{{"style", 2}, {"angle", 30}, {"altitude", 60}}, {{"style", 2}, {"highlight_mode", 2}, {"shadow_mode", 1}, {"soften", 1}},
                              {{"style", 1}, {"highlight_opacity", 0}, {"shadow.r", 0.5}}}},
+            // (Local Contrast's plan made on the CPU from the picture read back, its gain in light on the GPU)
+            {"texture_pop", {{{"texture_pop", 60}, {"midtone_detail", 0}}, {{"midtone_detail", 80}, {"texture_pop", 0}, {"scale", 2}},
+                             {{"midtone_detail", -40}, {"texture_pop", 100}, {"noise_floor", 0}}}},
+            // (Film Look by its plan for the frame: the weave, softness, halation, bloom, vignette and grain in passes)
+            {"film_look", {{}, {{"gauge", 3}, {"aberration", 60}, {"flicker", 50}, {"fade", 40}, {"halation", 80}},
+                           {{"halation", 0}, {"bloom", 60}, {"grain", 0}, {"softness", 0}, {"weave", 0}, {"gauge", 0}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {
@@ -31207,7 +31213,8 @@ colorspaces:
                 compare(7 + FrameTime(k), QString("%1 #%2").arg(type).arg(k + 1));
                 QVERIFY2(gpu::stats().filterPasses > passes, type);
                 if (std::string(type) == "light_rays" || std::string(type) == "radial_blur" ||
-                    std::string(type) == "aperture_glare" || std::string(type) == "painterly") {  // (the rays, blur, glare or paint are there)
+                    std::string(type) == "aperture_glare" || std::string(type) == "painterly" ||
+                    std::string(type) == "texture_pop" || std::string(type) == "film_look") {  // (the rays, blur, glare, paint, contrast or look are there)
                     RenderOptions o;
                     o.gpu = true;
                     const Image lit = renderProgramFrame(p, s, 7 + FrameTime(k), o);
@@ -36789,7 +36796,7 @@ colorspaces:
             // (deep pictures and layers in 3D)
             "make_deep", "deep_holdout", "deep_grade", "deep_slice", "flatten_deep", "layer_3d",
             // (with no GPU form yet)
-            "texture_pop", "film_look", "patch_fill", "paint", "film_negative", "fade_restore"};
+            "patch_fill", "paint", "film_negative", "fade_restore"};
         // (through a mask: on the CPU, not run on the camera's picture as they are without one)
         const std::set<std::string> cpuOnlyMasked = {"aces_gamut_compress", "ocio"};
         std::vector<std::string> fellBack, unlisted, nowGpu;

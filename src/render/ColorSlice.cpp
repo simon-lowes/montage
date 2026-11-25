@@ -263,11 +263,12 @@ void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& im
     });
 }
 
-void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image& img, double pixelScale) {
+bool textureDetailPlan(const Effect& e, FrameTime t, const ColorSpace& space, const Image& img, double pixelScale, std::vector<float>& Y,
+                       std::vector<float>& delta) {
     const float mid = float(e.p("midtone_detail", t)) / 100, pop = float(e.p("texture_pop", t)) / 100;
     const double scale = std::max(0.05, e.p("scale", t, 1) * pixelScale);
     const float floor = float(e.p("noise_floor", t, 10)) / 100 * 0.35f * kStop;
-    if ((mid == 0 && pop == 0) || img.width <= 0 || img.height <= 0) return;
+    if ((mid == 0 && pop == 0) || img.width <= 0 || img.height <= 0) return false;
     const int W = img.width, H = img.height;
     const size_t N = size_t(W) * size_t(H);
     const TransferTables tables(space.transfer);
@@ -276,7 +277,8 @@ void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image&
     lumaWeights(space, lw);
     // Brightness in the log encoding, and alpha where any pixel is not opaque (so a matte's transparent surround is not
     // taken for black next to it).
-    std::vector<float> Y(N), alpha(N);
+    Y.assign(N, 0.0f);
+    std::vector<float> alpha(N);
     std::atomic<bool> opaque = true;
     parallelRows(H, [&](int y0, int y1) {
         bool rowsOpaque = true;
@@ -298,7 +300,7 @@ void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image&
     auto rows = [&](const std::function<void(size_t, size_t)>& fn) {
         parallelRows(H, [&](int y0, int y1) { fn(size_t(y0) * W, size_t(y1) * W); });
     };
-    std::vector<float> delta(N, 0.0f);
+    delta.assign(N, 0.0f);
     if (mid != 0) {
         // Mid-tone detail: brightness less an edge-preserving (self-guided) smoothing of it, so an edge of a couple of
         // stops or more keeps most of itself and gets no halo.
@@ -339,6 +341,14 @@ void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image&
             }
         });
     }
+    return true;
+}
+
+void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image& img, double pixelScale) {
+    std::vector<float> Y, delta;
+    if (!textureDetailPlan(e, t, space, img, pixelScale, Y, delta)) return;
+    const int W = img.width, H = img.height;
+    const TransferTables tables(space.transfer);
     // The change in brightness as a gain on every channel alike, so colours keep their balance.
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {

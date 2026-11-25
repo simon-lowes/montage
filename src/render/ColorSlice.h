@@ -44,5 +44,9 @@ struct ColorSliceSetup {
 ColorSliceSetup colorSliceSetup(const Effect& e, FrameTime t);
 void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& img);
 void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image& img, double pixelScale);
+// Local Contrast's plan for a picture (as textureDetail works it out): each pixel's brightness in ACEScct (Y) and the
+// change to it (delta), a gain on every channel alike in light; false where it changes nothing.
+bool textureDetailPlan(const Effect& e, FrameTime t, const ColorSpace& space, const Image& img, double pixelScale, std::vector<float>& Y,
+                       std::vector<float>& delta);
 
 }  // namespace montage
