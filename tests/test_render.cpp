@@ -17697,6 +17697,15 @@ colorspaces:
             QVERIFY(km.horizontalAdvance(QStringLiteral("AV")) < km.horizontalAdvance(QStringLiteral("A")) + km.horizontalAdvance(QStringLiteral("V")) - 0.1);
         }
         check(QString(QStringLiteral("AV")).repeated(3000).toStdString(), 0, nullptr, nullptr);
+        // Nightly 25 Nov: as many letters in 60 lines of 1,000, each short enough to be measured from its start but
+        // not all of them together (60 x 500,000 characters measured a frame): as quick, the letters where they were.
+        {
+            std::string lines;
+            for (int i = 0; i < 60; ++i) lines += std::string(1000, 'i') + (i < 59 ? "\n" : "");
+            check(lines, 0, &stillMs, &fadingMs);
+            qInfo("60 lines of 1,000 plain letters: %lld ms still, %lld ms fading in", static_cast<long long>(stillMs), static_cast<long long>(fadingMs));
+            QVERIFY2(fadingMs < stillMs * 3 + 3000, qPrintable(QString("%1 ms still, %2 ms fading in").arg(stillMs).arg(fadingMs)));
+        }
     }
 
     void textOnMasksAndShapePaths() {
