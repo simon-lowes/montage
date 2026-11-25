@@ -6031,6 +6031,17 @@ private slots:
             QVERIFY2(projectFromJson(projectToJson(fg.p), again, &err), err.c_str());
             QCOMPARE(trackAt(*again.findSequence(outerId), V1)->clips[1].duration, FrameTime(40));
         }
+        // An Out past the sequence's end: the compound ends where the sequence did (nightly 25 Nov: it ran on past it).
+        {
+            Fixture fe;
+            QVERIFY(placeMedia(fe.p, fe.s(), fe.media, 0, 0, 30, V1, A1, false).ok);
+            const Id eId = fe.s().id;
+            QVERIFY(nestRange(fe.p, fe.s(), 10, 100, allTracks(fe.s()), "Past").ok);
+            const Sequence& outer = *fe.p.findSequence(eId);
+            QCOMPARE(outer.duration(), FrameTime(30));
+            QCOMPARE(trackAt(outer, V1)->clips.back().duration, FrameTime(20));
+            QVERIFY(!nestRange(fe.p, *fe.p.findSequence(eId), 40, 100, allTracks(*fe.p.findSequence(eId)), "After").ok);
+        }
         Fixture fh;
         fh.put(V1, 20, 30);
         const Id hId = fh.s().id;
