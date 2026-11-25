@@ -6811,6 +6811,15 @@ colorspaces:
                  qPrintable(show(view(pq, w4000, w4000, w4000, 8, 4000))));
         QCOMPARE(hdrContentPeak(pq, 1000), 1000.0 / 203);
         QCOMPARE(hdrContentPeak(rec709Space(), 1000), 1.0);
+        // A feed's peak from its HDR metadata: its MaxCLL where that is lower than the mastering peak or alone, else the
+        // peak; 1000 nits where it states neither; within SDR white and PQ's 10 000 nits.
+        QCOMPARE(hdrStatedPeakNits(4000, 0), 4000.0);
+        QCOMPARE(hdrStatedPeakNits(4000, 1500), 1500.0);
+        QCOMPARE(hdrStatedPeakNits(1000, 2500), 1000.0);
+        QCOMPARE(hdrStatedPeakNits(0, 600), 600.0);
+        QCOMPARE(hdrStatedPeakNits(0, 0), 1000.0);
+        QCOMPARE(hdrStatedPeakNits(50000, 0), 10000.0);
+        QCOMPARE(hdrStatedPeakNits(0, 80), 203.0);
         // On an SDR display (headroom 1) the HDR picture stays within white.
         QVERIFY(view(pq, w1000, w1000, w1000, 1)[1] <= 1.0f);
         // Wide gamut kept: Rec. 2020's green is outside Rec. 709, so red and blue go negative.
@@ -20009,6 +20018,66 @@ colorspaces:
         QVERIFY(st::parseHdrMetadata(meta, hm) && hm.display && hm.lightLevel);
         QVERIFY(std::abs(hm.primaries[0][0] - 0.680) < 1e-9 && std::abs(hm.primaries[2][1] - 0.060) < 1e-9 && std::abs(hm.white[0] - 0.3127) < 1e-9);
         QVERIFY(std::abs(hm.maxLuminance - 1000) < 1e-9 && std::abs(hm.minLuminance - 0.0001) < 1e-9 && hm.maxCll == 1000 && hm.maxFall == 400);
+        // Montage's own ST 2110-41 item carries that packet's bytes, read back the same.
+        const st::FastMetadata hdrWords = st::hdrItem(hdr);
+        QVERIFY(hdrWords.type == st::kHdrItemType && hdrWords.words.size() == 9 && hdrWords.words[0] == 0x001A8918u);
+        st::HdrMetadata hw;
+        QVERIFY(st::parseHdrItem(hdrWords, hw) && hw.display && hw.lightLevel && hw.maxCll == 1000 && hw.maxFall == 400);
+        QVERIFY(std::abs(hw.maxLuminance - 1000) < 1e-9 && std::abs(hw.primaries[1][0] - 0.265) < 1e-9 && std::abs(hw.white[1] - 0.3290) < 1e-9);
+        QVERIFY(!st::parseHdrItem(st::frameItem(1, {}), hw));
+        // The reference output's ST 2110 backend sends that item with each frame of a PQ signal whose HDR metadata is
+        // stated (and names it in its stream's DIT, beside its frame item); for a signal that states none, only the frame
+        // item.
+        {
+            const st::SenderOptions saved = st::outputOptions();
+            st::Receiver meta;
+            QVERIFY(meta.open({"127.0.0.1", 0}));
+            st::SenderOptions oo;
+            oo.metadata = {"127.0.0.1", meta.port()};
+            oo.sendVideo = oo.sendAnc = false, oo.sendMetadata = true, oo.ttl = 1;
+            st::setOutputOptions(oo);
+            const std::shared_ptr<Backend> backend = makeSt2110Backend();
+            const Mode mode{"720p25", 1280, 720, {25, 1}};
+            const size_t stride = size_t((1280 + 47) / 48) * 128;
+            const std::vector<uint8_t> black(stride * 720, 0);
+            for (const bool stated : {true, false}) {
+                Signal sig;
+                sig.colorSpace = "rec2100pq", sig.bt2020 = true, sig.eotf = Eotf::Pq, sig.hdrMetadata = stated;
+                sig.masteringPeak = 4000, sig.maxCll = 2500, sig.maxFall = 300;
+                std::string why;
+                QVERIFY2(backend->open(backend->devices()[0], mode, sig, 0, 48000, &why), why.c_str());
+                st::VideoFormat sentVideo;
+                st::AudioFormat sentAudio;
+                st::SenderOptions sentOptions;
+                QVERIFY(st::openStreams(*backend, sentVideo, sentAudio, sentOptions));
+                const bool named = std::count(sentOptions.metadataTypes.begin(), sentOptions.metadataTypes.end(), st::kHdrItemType) == 1;
+                QCOMPARE(named, stated);
+                QVERIFY(std::count(sentOptions.metadataTypes.begin(), sentOptions.metadataTypes.end(), st::kFrameItemType) == 1);
+                std::vector<uint8_t> drained;
+                while (meta.receive(drained, 0)) {
+                }
+                VideoFrame vf1;
+                vf1.width = 1280, vf1.height = 720, vf1.stride = stride, vf1.data = black.data(), vf1.frame = 7;
+                QVERIFY(backend->send(vf1, montage::output::Audio{}));
+                std::vector<uint8_t> packet;
+                QVERIFY(meta.receive(packet, 2000));
+                st::RtpPacket mp;
+                std::vector<st::FastMetadata> items;
+                QVERIFY(st::parseRtp(packet.data(), packet.size(), mp) && st::unpackFastMetadata(mp.payload, mp.size, items));
+                int64_t frameNumber = -1;
+                st::HdrMetadata got;
+                bool frameSeen = false, hdrSeen = false;
+                for (const st::FastMetadata& m : items) {
+                    frameSeen = frameSeen || st::parseFrameItem(m, frameNumber);
+                    hdrSeen = hdrSeen || st::parseHdrItem(m, got);
+                }
+                QVERIFY(frameSeen && frameNumber == 7);
+                QCOMPARE(hdrSeen, stated);
+                if (stated) QVERIFY(std::abs(got.maxLuminance - 4000) < 1e-9 && got.maxCll == 2500 && got.maxFall == 300);
+                backend->close();
+            }
+            st::setOutputOptions(saved);
+        }
         std::vector<CcTriplet> ccBack;
         QVERIFY(back[1].did == 0x61 && back[1].sdid == 0x01 && parseCdp(back[1].data.data(), back[1].data.size(), ccBack));
         QVERIFY(ccBack == cc);

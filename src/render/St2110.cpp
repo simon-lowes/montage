@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -1113,6 +1114,24 @@ bool parseHdrMetadata(const AncPacket& p, HdrMetadata& out) {
     return out.display || out.lightLevel;
 }
 
+FastMetadata hdrItem(const output::Signal& s) {
+    const AncPacket a = hdrMetadataPacket(s);
+    FastMetadata m;
+    m.type = kHdrItemType;
+    m.words.assign((a.data.size() + 3) / 4, 0);
+    for (size_t i = 0; i < a.data.size(); ++i) m.words[i / 4] |= uint32_t(a.data[i]) << (24 - 8 * (i % 4));
+    return m;
+}
+
+bool parseHdrItem(const FastMetadata& m, HdrMetadata& out) {
+    if (m.type != kHdrItemType || m.words.empty()) return false;
+    AncPacket a;
+    a.did = 0x41, a.sdid = 0x0C;
+    for (const uint32_t w : m.words)
+        for (int k = 3; k >= 0; --k) a.data.push_back(uint8_t(w >> (8 * k)));
+    return parseHdrMetadata(a, out);
+}
+
 AncPacket captionPacket(const std::vector<uint8_t>& cdp) {
     AncPacket a;
     a.did = 0x61;
@@ -1776,16 +1795,19 @@ public:
             if (a.channels > 6) a.packetUs = 125;
         }
         o.sendAudio = o.sendAudio && audioChannels > 0;
-        // (ST 2110-41: each frame's number and time code, the item named in the SDP)
-        if (o.sendMetadata && std::find(o.metadataTypes.begin(), o.metadataTypes.end(), st2110::kFrameItemType) == o.metadataTypes.end())
-            o.metadataTypes.push_back(st2110::kFrameItemType);
+        // (ST 2110-41: each frame's number and time code, and a PQ signal's stated HDR metadata, the items named in the SDP)
+        const bool hdrStated = signal.hdrMetadata && signal.eotf == Eotf::Pq;
+        for (const uint32_t type : {st2110::kFrameItemType, st2110::kHdrItemType})
+            if (o.sendMetadata && (type != st2110::kHdrItemType || hdrStated) &&
+                std::find(o.metadataTypes.begin(), o.metadataTypes.end(), type) == o.metadataTypes.end())
+                o.metadataTypes.push_back(type);
         std::lock_guard lock(m_);
         stop_ = false;
         cdpSequence_ = 0;
         fps_ = mode.fps;
         if (!sender_.open(o, v, a, error)) return false;
-        sender_.setFrameAnc(signal.hdrMetadata && signal.eotf == Eotf::Pq ? std::vector<st2110::AncPacket>{st2110::hdrMetadataPacket(signal)}
-                                                                          : std::vector<st2110::AncPacket>{});
+        sender_.setFrameAnc(hdrStated ? std::vector<st2110::AncPacket>{st2110::hdrMetadataPacket(signal)} : std::vector<st2110::AncPacket>{});
+        hdrItem_ = hdrStated ? std::optional<st2110::FastMetadata>(st2110::hdrItem(signal)) : std::nullopt;
         return true;
     }
     bool send(const VideoFrame& f, const Audio& a) override {
@@ -1797,7 +1819,11 @@ public:
         }
         const float* audio = a.channels > 0 ? a.samples : nullptr;
         const int audioFrames = a.channels > 0 ? a.frames : 0;
-        if (sender_.options().sendMetadata) sender_.setNextMetadata({st2110::frameItem(f.frame, f.timecode)});
+        if (sender_.options().sendMetadata) {
+            std::vector<st2110::FastMetadata> items{st2110::frameItem(f.frame, f.timecode)};
+            if (hdrItem_) items.push_back(*hdrItem_);
+            sender_.setNextMetadata(std::move(items));
+        }
         if (f.format == PixelFormat::V210 || f.format == PixelFormat::Uyvy8)
             return sender_.send(f.data, f.stride, f.format, audio, audioFrames, &f.timecode, anc, &stop_);
         // The 16-bit formats' samples cut to the stream's depth.
@@ -1858,6 +1884,7 @@ private:
     std::atomic<bool> stop_{false};
     uint16_t cdpSequence_ = 0;
     Rational fps_{25, 1};
+    std::optional<st2110::FastMetadata> hdrItem_;
 };
 
 }  // namespace

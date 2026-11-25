@@ -34,6 +34,11 @@ using HdrPicturePtr = std::shared_ptr<const HdrPicture>;
 // 1000 nits for HLG (its reference display), SDR white for SDR spaces.
 double hdrContentPeak(const ColorSpace& space, double hdrPeakNits);
 
+// The peak a PQ picture is shown to from what its HDR metadata states (0 where it states nothing): its MaxCLL where
+// that is lower than the mastering display's peak or stated alone, else that peak; 1000 nits where neither is. Within
+// PQ's range, and no lower than SDR white.
+double hdrStatedPeakNits(double masteringMaxNits, double maxCll);
+
 // One pixel's code values in `space` to the light shown on a display with this much headroom (1 = an SDR display:
 // HDR then rolls off from 75 % of white, as the SDR preview does). Scene-referred spaces give their SDR view.
 void hdrViewPixel(float rgb[3], const ColorSpace& space, double hdrPeakNits, double headroom);

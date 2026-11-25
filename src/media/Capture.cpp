@@ -32,6 +32,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/timecode.h>
@@ -329,6 +330,9 @@ struct Input {
     int st2110Proxy = 0;  // (ST 2110-22's pictures decoded smaller while the feed is only watched: jpegxs_proxy=)
     bool st2110Full = false;
     int st2110Channels = 0;
+    // (a PQ feed's HDR metadata as it last stated it: kept for its pictures until it states it again)
+    st2110::HdrMetadata st2110Hdr;
+    bool st2110HdrStated = false;
     // A WHIP endpoint's feed (media/WhipEndpoint.h): the endpoint, and what FFmpeg's RTP reader takes it through (the
     // endpoint's description first, then its packets, by custom I/O). The endpoint outlives the reader.
     std::unique_ptr<whip::Endpoint> whip;
@@ -754,6 +758,25 @@ const char* hdrOf(const AVFrame* f) {
     return f->color_trc == AVCOL_TRC_SMPTE2084 ? "pq" : f->color_trc == AVCOL_TRC_ARIB_STD_B67 ? "hlg" : "";
 }
 
+// HDR metadata as FFmpeg's frames carry it (its decoders' side data): the mastering display (primaries R, G, B and
+// white in 0.00002 steps, luminance in 0.0001 nits) and the content light levels.
+void hdrSideData(AVFrame* f, const st2110::HdrMetadata& m) {
+    if (m.display)
+        if (AVMasteringDisplayMetadata* d = av_mastering_display_metadata_create_side_data(f)) {
+            for (int c = 0; c < 3; ++c)
+                for (int k = 0; k < 2; ++k) d->display_primaries[c][k] = av_make_q(int(std::lround(m.primaries[c][k] * 50000)), 50000);
+            for (int k = 0; k < 2; ++k) d->white_point[k] = av_make_q(int(std::lround(m.white[k] * 50000)), 50000);
+            d->max_luminance = av_make_q(int(std::lround(std::min(m.maxLuminance, 200000.0) * 10000)), 10000);
+            d->min_luminance = av_make_q(int(std::lround(std::min(m.minLuminance, 200000.0) * 10000)), 10000);
+            d->has_primaries = d->has_luminance = 1;
+        }
+    if (m.lightLevel)
+        if (AVContentLightMetadata* l = av_content_light_metadata_create_side_data(f)) {
+            l->MaxCLL = unsigned(std::max(0, m.maxCll));
+            l->MaxFALL = unsigned(std::max(0, m.maxFall));
+        }
+}
+
 // The scaler from a picture to R'G'B' at w by h (8-bit BGRA, or 16-bit RGBA for an HDR picture's code values), kept
 // and made again when what it was made for changes.
 SwsContext* rgbScaler(SwsContext* sws, int* kept, const AVFrame* f, int w, int h, bool deep) {
@@ -910,6 +933,15 @@ LiveFeed::Full LiveFeed::full(int maxWidth, int maxHeight, int64_t after) const 
         if (fullSws_ && *hdr) {
             ok = lightOf(fullSws_, f, w, h, out.light);
             out.space = hdrSpace(hdr).id;
+            if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
+                const auto* d = reinterpret_cast<const AVMasteringDisplayMetadata*>(sd->data);
+                if (d->has_luminance && d->max_luminance.den > 0 && d->min_luminance.den > 0)
+                    out.masteringMaxNits = std::max(0.0, av_q2d(d->max_luminance)), out.masteringMinNits = std::max(0.0, av_q2d(d->min_luminance));
+            }
+            if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
+                const auto* l = reinterpret_cast<const AVContentLightMetadata*>(sd->data);
+                out.maxCll = l->MaxCLL, out.maxFall = l->MaxFALL;
+            }
         } else if (fullSws_) {
             out.picture = QImage(w, h, QImage::Format_RGB32);
             uint8_t* dst[1] = {out.picture.bits()};
@@ -1794,6 +1826,10 @@ void Recorder::run() {
             }
             ccCarried.clear();
         }
+        // (its HDR metadata, which a live view takes its peak from)
+        for (const AVFrameSideDataType t : {AV_FRAME_DATA_MASTERING_DISPLAY_METADATA, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL})
+            if (const AVFrameSideData* from = av_frame_get_side_data(f, t))
+                if (AVFrameSideData* d = av_frame_new_side_data(pic, t, from->size)) std::memcpy(d->data, from->data, from->size);
         if (interlaced) {
 #ifdef AV_FRAME_FLAG_INTERLACED
             pic->flags |= AV_FRAME_FLAG_INTERLACED | (topFirst ? AV_FRAME_FLAG_TOP_FIELD_FIRST : 0);
@@ -2185,6 +2221,15 @@ void Recorder::run() {
             pic->color_trc = v.tcs == "PQ" ? AVCOL_TRC_SMPTE2084 : v.tcs == "HLG" ? AVCOL_TRC_ARIB_STD_B67 : wide ? AVCOL_TRC_BT2020_10 : AVCOL_TRC_BT709;
             if (v.interlaced) pic->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
             if (f.lostPackets) pic->flags |= AV_FRAME_FLAG_CORRUPT;
+            // (a PQ feed's HDR metadata: ST 2108-1 in its ancillary data, else Montage's own ST 2110-41 item, as side
+            // data FFmpeg's decoders give an HEVC feed's, for a live view's peak)
+            if (v.tcs == "PQ") {
+                for (const st2110::AncPacket& a : f.anc)
+                    if (st2110::parseHdrMetadata(a, in.st2110Hdr)) in.st2110HdrStated = true;
+                for (const st2110::FastMetadata& m : f.metadata)
+                    if (st2110::parseHdrItem(m, in.st2110Hdr)) in.st2110HdrStated = true;
+                if (in.st2110HdrStated) hdrSideData(pic, in.st2110Hdr);
+            }
             // (its time code, as the feed's own: SMPTE 12-M side data, as FFmpeg gives it)
             if (f.hasTimecode)
                 if (AVFrameSideData* sd = av_frame_new_side_data(pic, AV_FRAME_DATA_S12M_TIMECODE, sizeof(uint32_t) * 4)) {

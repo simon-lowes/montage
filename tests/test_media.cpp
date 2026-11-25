@@ -157,6 +157,7 @@
 #include "render/VfxPull.h"
 #include "render/VfxShots.h"
 #include "render/Amf.h"
+#include "render/HdrView.h"
 #include "render/AafExport.h"
 #include "core/Interpretation.h"
 #include "render/Adm.h"
@@ -2375,7 +2376,7 @@ private slots:
     // uncompressed at 1280 by 720): the feed says it is PQ, its picture is kept at its own size for a viewer that
     // shows it whole (its R'G'B' code values, a grey at SDR white's 203 nits and one at 1000), scaled down only when
     // asked smaller, and the small picture a tile shows is that light as an SDR display shows it (as convertColor
-    // rolls HDR off), not the code values read as SDR.
+    // rolls HDR off), not the code values read as SDR. The light its ST 2108-1 packets state comes with that picture.
     void captureWatchedHdrAtFullSize() {
         namespace st = st2110;
         int ports[3];
@@ -2398,6 +2399,10 @@ private slots:
         st::Sender tx;
         std::string err;
         QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        output::Signal stated;
+        stated.eotf = output::Eotf::Pq, stated.hdrMetadata = true, stated.masteringPeak = 2000, stated.masteringMin = 0.005;
+        stated.maxCll = 1500, stated.maxFall = 400;
+        tx.setFrameAnc({st::hdrMetadataPacket(stated)});
         // The left half a grey at 203 nits, the right at 1000 (PQ's code values, narrow range, 10 bits).
         const int codes[2] = {int(std::lround(64 + 876 * fromLinear(Transfer::Pq, 1.0))), int(std::lround(64 + 876 * fromLinear(Transfer::Pq, 1000.0 / 203)))};
         const float sent[2] = {float(codes[0] - 64) / 876, float(codes[1] - 64) / 876};
@@ -2438,6 +2443,10 @@ private slots:
         QVERIFY(whole.pictures >= 5 && whole.picture.isNull() && whole.width == W && whole.height == H);
         QCOMPARE(whole.space, std::string("rec2100pq"));
         QVERIFY(whole.light.width == W && whole.light.height == H);
+        QVERIFY2(std::fabs(whole.masteringMaxNits - 2000) < 1e-6 && std::fabs(whole.masteringMinNits - 0.005) < 1e-6,
+                 qPrintable(QStringLiteral("%1 %2").arg(whole.masteringMaxNits).arg(whole.masteringMinNits)));
+        QVERIFY(whole.maxCll == 1500 && whole.maxFall == 400 && fitted.masteringMaxNits == 2000);
+        QCOMPARE(hdrStatedPeakNits(whole.masteringMaxNits, whole.maxCll), 1500.0);
         for (int side = 0; side < 2; ++side) {
             const float* p = whole.light.at(W / 4 + side * W / 2, H / 2);
             QVERIFY2(std::fabs(p[0] - sent[side]) < 0.006f && std::fabs(p[1] - sent[side]) < 0.006f && std::fabs(p[2] - sent[side]) < 0.006f && p[3] == 1,
@@ -2459,6 +2468,71 @@ private slots:
             // (and not the code value itself, as an SDR conversion would show it)
             if (side == 0) QVERIFY2(std::abs(want - int(std::lround(sent[0] * 255))) > 20, qPrintable(QString::number(want)));
         }
+    }
+
+    // A PQ feed whose HDR metadata comes only in its ST 2110-41 stream, as Montage's own item: the mastering peak and
+    // light levels it states come with its picture, as they last came (the item is sent with every fifth frame here).
+    void captureHdrMetadataInFastMetadata() {
+        namespace st = st2110;
+        int ports[4];
+        {
+            st::Receiver probe[4];
+            for (int i = 0; i < 4; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.metadata = {"127.0.0.1", ports[3]};
+        o.ttl = 1, o.sendMetadata = true, o.metadataTypes = {st::kHdrItemType};
+        const int W = 640, H = 360;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        v.colorimetry = "BT2100", v.tcs = "PQ";
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        output::Signal stated;
+        stated.eotf = output::Eotf::Pq, stated.hdrMetadata = true, stated.masteringP3 = false, stated.masteringPeak = 4000;
+        stated.maxCll = 0, stated.maxFall = 0;
+        const st::FastMetadata item = st::hdrItem(stated);
+        st::Raster raster(W, H, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < H; ++y) {
+            uint16_t* d = raster.row(y);
+            for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = 600;
+        }
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            const std::vector<float> sound(size_t(1920) * 2, 0.0f);
+            for (int t = 0; !stop && t < 25 * 60; ++t) {
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                if (t % 5 == 0) tx.setNextMetadata({item});
+                if (!tx.send(raster, sound.data(), 1920, &tc, {}, &stop)) break;
+            }
+        });
+        CaptureSettings cs;
+        cs.video.device = "st2110";
+        cs.video.url = tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc() + tx.sdpMetadata();
+        cs.live = std::make_shared<LiveFeed>(320, 180);
+        Recorder r;
+        QVERIFY2(r.start(cs, &err), err.c_str());
+        QElapsedTimer t;
+        t.start();
+        // (pictures after the fifth: one at least without the item, its light the last item's)
+        while (cs.live->look().pictures < 12 && t.elapsed() < 60000 && r.recording()) QThread::msleep(20);
+        const LiveFeed::Full whole = cs.live->full(4096, 4096);
+        r.stop();
+        stop = true;
+        sending.join();
+        tx.close();
+        QVERIFY2(whole.pictures >= 12, r.status().error.c_str());
+        QCOMPARE(whole.space, std::string("rec2100pq"));
+        QVERIFY2(std::fabs(whole.masteringMaxNits - 4000) < 1e-6 && std::fabs(whole.masteringMinNits - 0.0001) < 1e-6,
+                 qPrintable(QStringLiteral("%1 %2").arg(whole.masteringMaxNits).arg(whole.masteringMinNits)));
+        // (light levels stated as 0: not known, so the peak is the display's)
+        QVERIFY(whole.maxCll == 0 && whole.maxFall == 0);
+        QCOMPARE(hdrStatedPeakNits(whole.masteringMaxNits, whole.maxCll), 4000.0);
     }
 
     // ST 2110-31 recorded: AES3 subframes carrying a payload that is not PCM (an ST 337 burst's preambles and counted

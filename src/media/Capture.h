@@ -143,13 +143,17 @@ public:
     // by `maxHeight`), converted on the calling thread (any but the recording's, which is not held up by it): an SDR
     // feed's as `picture`; an HDR feed's as `light`, its R'G'B' code values (0 to 1, alpha 1) in `space`
     // ("rec2100pq" or "rec2100hlg"), for render/HdrView.h and convertColor. Nothing (pictures 0) before the first
-    // picture, or when the latest is still picture number `after` (Now::pictures, as an earlier call gave it).
+    // picture, or when the latest is still picture number `after` (Now::pictures, as an earlier call gave it). An HDR
+    // feed's light as its HDR metadata states it, in nits (0 where it is not stated): the mastering display's peak
+    // and minimum, and the content light levels (an ST 2110 feed's ST 2108-1 packets or Montage's ST 2110-41 item,
+    // an HEVC feed's SEI messages).
     struct Full {
         int64_t pictures = 0;
         QImage picture;
         Image light;
         std::string space;
         int width = 0, height = 0;  // the feed's own size
+        double masteringMaxNits = 0, masteringMinNits = 0, maxCll = 0, maxFall = 0;
     };
     Full full(int maxWidth, int maxHeight, int64_t after = 0) const;
     // The timecode of picture `frame` (its number in the recording): the first's counted on at the feed's rate.

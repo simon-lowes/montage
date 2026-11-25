@@ -47,6 +47,12 @@ double hdrContentPeak(const ColorSpace& space, double hdrPeakNits) {
     return 1;
 }
 
+double hdrStatedPeakNits(double masteringMaxNits, double maxCll) {
+    const bool display = std::isfinite(masteringMaxNits) && masteringMaxNits > 0, light = std::isfinite(maxCll) && maxCll > 0;
+    const double peak = display && light ? std::min(masteringMaxNits, maxCll) : display ? masteringMaxNits : light ? maxCll : 1000;
+    return std::clamp(peak, kSdrWhiteNits, 10000.0);
+}
+
 void hdrViewPixel(float rgb[3], const ColorSpace& space, double hdrPeakNits, double headroom) {
     headroom = std::max(headroom, 1.0);
     double l[3];

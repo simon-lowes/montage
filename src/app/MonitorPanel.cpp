@@ -1375,7 +1375,7 @@ void MonitorPanel::liveTick() {
 // The feed's newest picture at its own size, scaled down only where the monitor has fewer pixels than it (never below
 // 1280 by 720), made ready off this thread (one at a time: pictures that come meanwhile are passed over). An HDR
 // feed's is HDR light for the HDR viewer while that shows HDR (through the display's calibration, as a sequence's),
-// with its SDR view for everything else.
+// with its SDR view for everything else, a PQ feed's brightest as its HDR metadata states it.
 void MonitorPanel::showLivePicture() {
     liveConverting_ = true;
     const qreal dpr = viewer_->devicePixelRatioF();
@@ -1395,10 +1395,13 @@ void MonitorPanel::showLivePicture() {
                 auto pic = std::make_shared<HdrPicture>();
                 pic->width = full.light.width;
                 pic->height = full.light.height;
-                pic->contentPeak = hdrContentPeak(*space, 1000);
+                // (a PQ feed's peak as its HDR metadata states it, else 1000 nits)
+                const double peak = hdrStatedPeakNits(full.masteringMaxNits, full.maxCll);
+                pic->contentPeak = hdrContentPeak(*space, peak);
                 pic->transfer = space->transfer;
                 pic->mastering = hdrMasteringPrimaries(*space);
-                hdrViewImage(full.light, *space, 1000, pic->contentPeak, pic->rgba);  // (rolled off as drawn)
+                pic->maxCll = full.maxCll, pic->maxFall = full.maxFall;
+                hdrViewImage(full.light, *space, peak, pic->contentPeak, pic->rgba);  // (rolled off as drawn)
                 if (calibration) calibrateHdrPicture(pic->rgba, pic->width, pic->height, *calibration, white);
                 hdr = std::move(pic);
             }
