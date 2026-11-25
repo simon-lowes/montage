@@ -202,16 +202,23 @@ void notePicture(const PluginDesc& d, bool handle, const std::string& why) {
     gPictures.last = std::move(line);
 }
 
+// Whether the user turned handles off (MONTAGE_GPU_HANDLES=0), the first reason given when they did.
+bool handlesTurnedOff(std::string& why) {
+    // (asked for unless turned off: CI's guest showed the path working on 24 November 2026, where both sides share)
+    const char* v = std::getenv("MONTAGE_GPU_HANDLES");
+    const std::string asked = v ? v : "";
+    if (asked != "0" && asked != "off") return false;
+    why = "handles are turned off (MONTAGE_GPU_HANDLES=0)";
+    return true;
+}
+
 // Whether hosts are asked for handles (the host aside); why not, otherwise.
 bool asksForHandlesNow(std::string& why) {
     auto no = [&](const std::string& reason) {
         why = reason;
         return false;
     };
-    // (asked for unless turned off: CI's guest showed the path working on 24 November 2026, where both sides share)
-    const char* v = std::getenv("MONTAGE_GPU_HANDLES");
-    const std::string asked = v ? v : "";
-    if (asked == "0" || asked == "off") return no("handles are turned off (MONTAGE_GPU_HANDLES=0)");
+    if (handlesTurnedOff(why)) return false;
     {
         std::lock_guard lock(gPicturesM);
         if (!gHandlesOff.empty()) return no(gHandlesOff);
@@ -224,6 +231,7 @@ bool asksForHandlesNow(std::string& why) {
 
 // Whether the host is asked for a handle; why not, otherwise.
 bool asksForHandle(const Host& host, std::string& why) {
+    if (handlesTurnedOff(why)) return false;
     if (!host.gpu) {
         why = "its plug-in host renders without OpenGL";
         return false;
