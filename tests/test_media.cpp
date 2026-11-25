@@ -29688,6 +29688,40 @@ private slots:
         QVERIFY(r.value("isError").toBool());
     }
 
+    void autoDuckKeptUnderManyStretches() {
+        // Nightly 25 Nov: a duck kept up to date under 200 stretches of dialogue (some 800 keys) is found again after
+        // its clip is trimmed at the head, every key moved by the same frames, in moments: the search for that
+        // shift no longer goes as the square of the keys, which took minutes inside each edit. A key set by hand
+        // meanwhile is kept, and only that one.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        Clip c;
+        c.id = p.newId();
+        c.start = 0;
+        c.duration = 25 * 1000;
+        Spans spans;
+        for (int i = 0; i < 200; ++i) spans.emplace_back(2.0 + 5 * i, 4.0 + 5 * i);
+        const DuckOptions o;
+        QVERIFY(duckClipKept(c, s, spans, o, {}));
+        QVERIFY(c.duck);
+        const size_t keys = c.audio.params["gain_db"].keys.size();
+        QVERIFY2(keys >= 600, qPrintable(QString::number(keys)));
+        // Trimmed at the head by 7 frames: the keys move with the picture; then one set by hand, at a level no duck key has.
+        c.start += 7, c.sourceIn += 7, c.duration -= 7;
+        Param& gain = c.audio.params["gain_db"];
+        for (Keyframe& k : gain.keys) k.t -= 7;
+        std::erase_if(gain.keys, [](const Keyframe& k) { return k.t < 0; });
+        const FrameTime hand = FrameTime(std::llround(500.5 * 25)) - c.start;
+        gain.addKey(hand, -5.5);
+        QElapsedTimer took;
+        took.start();
+        duckClipKept(c, s, spans, o, {});
+        QVERIFY2(took.elapsed() < 5000, qPrintable(QString::number(took.elapsed())));
+        QCOMPARE(c.duck->kept, 1);
+        QCOMPARE(c.audio.params["gain_db"].at(hand), -5.5);
+    }
+
     void renderFarmJobs() {
         // ---- An export's settings as JSON and back, every kind of field.
         ExportSettings s;

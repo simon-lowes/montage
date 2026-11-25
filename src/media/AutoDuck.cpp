@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <unordered_map>
+#include <vector>
 
 #include "Decoder.h"
 #include "core/AudioDescription.h"
@@ -25,6 +29,11 @@ struct Heard {
 };
 std::mutex gHeardLock;
 std::map<std::string, std::shared_ptr<const Heard>> gHeard;
+// (the files heard, oldest first, and their energies' size together: kept to 64 MB, about 23 hours of sound, the
+// files heard longest ago forgotten first, so a long session does not hold every file it ever ducked)
+std::deque<std::string> gHeardOrder;
+size_t gHeardSize = 0;
+constexpr size_t kHeardMost = size_t(64) << 20;
 
 std::shared_ptr<const Heard> heard(const std::string& key) {
     std::lock_guard l(gHeardLock);
@@ -41,7 +50,19 @@ std::shared_ptr<const Heard> hear(const std::string& key, const AudioBuffer& buf
         h->energy[size_t(k / kBlock)] += float(v * v);
     }
     std::lock_guard l(gHeardLock);
+    if (const auto it = gHeard.find(key); it != gHeard.end()) {
+        gHeardSize -= it->second->energy.size() * sizeof(float);
+        gHeardOrder.erase(std::find(gHeardOrder.begin(), gHeardOrder.end(), key));
+    }
     gHeard[key] = h;
+    gHeardOrder.push_back(key);
+    gHeardSize += h->energy.size() * sizeof(float);
+    while (gHeardSize > kHeardMost && gHeardOrder.size() > 1) {
+        const auto old = gHeard.find(gHeardOrder.front());
+        gHeardSize -= old->second->energy.size() * sizeof(float);
+        gHeard.erase(old);
+        gHeardOrder.pop_front();
+    }
     return h;
 }
 
@@ -66,6 +87,8 @@ Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>&
 void forgetHeardSound() {
     std::lock_guard l(gHeardLock);
     gHeard.clear();
+    gHeardOrder.clear();
+    gHeardSize = 0;
 }
 
 Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>& tracks, const DuckOptions& o, std::string* error,
@@ -275,12 +298,31 @@ bool duckClipKept(Clip& c, const Sequence& s, const Spans& spans, const DuckOpti
         auto matches = [&](FrameTime shift) { return int(std::count_if(gain.keys.begin(), gain.keys.end(), [&](const Keyframe& k) { return own(k, shift); })); };
         FrameTime shift = 0;
         int best = matches(0);
-        if (best < int(std::min(link.keys.size(), gain.keys.size())))
+        const int most = int(std::min(link.keys.size(), gain.keys.size()));
+        if (best < most) {
+            // (each pair of one of its keys and one of the clip's at the same level votes for the shift between them,
+            // and a shift's votes are its matches, as a key's time is its own: counted once, not by matching every
+            // shift again, which went as the square of the keys and froze the window under hundreds of them, as
+            // this runs inside each edit; the pairs then gone through in the same order, so ties go as before)
+            std::vector<std::pair<double, FrameTime>> byLevel;
+            byLevel.reserve(link.keys.size());
+            for (const auto& w : link.keys) byLevel.emplace_back(w.second, w.first);
+            std::sort(byLevel.begin(), byLevel.end());
+            auto sameLevel = [&](double v) {
+                return std::make_pair(std::lower_bound(byLevel.begin(), byLevel.end(), std::make_pair(v - 1e-9, std::numeric_limits<FrameTime>::min())),
+                                      std::upper_bound(byLevel.begin(), byLevel.end(), std::make_pair(v + 1e-9, std::numeric_limits<FrameTime>::max())));
+            };
+            std::unordered_map<FrameTime, int> votes;
             for (const Keyframe& k : gain.keys)
+                for (auto [from, to] = sameLevel(k.v); from != to; ++from) ++votes[k.t - from->second];
+            for (const Keyframe& k : gain.keys) {
                 for (const auto& w : link.keys) {
                     if (std::fabs(w.second - k.v) > 1e-9 || k.t - w.first == shift) continue;
-                    if (const int n = matches(k.t - w.first); n > best) best = n, shift = k.t - w.first;
+                    if (const int n = votes[k.t - w.first]; n > best) best = n, shift = k.t - w.first;
                 }
+                if (best >= most) break;
+            }
+        }
         for (const Keyframe& k : gain.keys)
             if (!own(k, shift)) byHand.push_back(k);
     } else {
