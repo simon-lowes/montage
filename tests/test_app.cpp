@@ -3614,18 +3614,59 @@ private slots:
         QTest::qWait(600);
         chapter->trigger();
         auto liveNow = [&] { return call({{"action", "status"}}).value("structuredContent").toObject().value("live").toObject(); };
+        auto readFile = [](const QString& f) {
+            QFile file(f);
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+        };
         QTRY_COMPARE_WITH_TIMEOUT(liveNow().value("cues").toInt(), 2, 5000);
         QTRY_COMPARE_WITH_TIMEOUT(liveNow().value("chapters").toInt(), 2, 5000);
+        // Phase 17: a marker placed on a clip of the growing recording is a chapter too, in chapters.vtt within a
+        // segment (2 seconds), at its place in the recording; the project changing again makes it no second one.
+        Id growing = 0;
+        QTRY_VERIFY_WITH_TIMEOUT((growing = Id(call({{"action", "status"}}).value("structuredContent").toObject().value("media").toDouble())) != 0, 5000);
+        QVERIFY(state()->apply("Growing clip", [growing](Project& p, Sequence& s) {
+            edit::Result placed = edit::placeMedia(p, s, growing, 0, 0, 4, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            // (on the recording's first clip, its picture's or else its sound's)
+            bool marked = false;
+            for (auto* tracks : {&s.videoTracks, &s.audioTracks})
+                for (Track& t : *tracks)
+                    for (Clip& c : t.clips)
+                        if (!marked && c.mediaId == growing) {
+                            c.markers.push_back(Marker{FrameTime(std::llround(3 * s.fps.toDouble())), 0, "From the clip", "", 0, false});
+                            marked = true;
+                        }
+            return placed;
+        }));
+        QElapsedTimer markedAt;
+        markedAt.start();
+        QString listed;
+        while (markedAt.elapsed() < 2500 && !(listed = readFile(folder + "/chapters.vtt")).contains("From the clip")) QTest::qWait(50);
+        if (!listed.contains("From the clip")) {
+            // (for a failure's message: the recording's clips and their markers as the project has them)
+            QString clips;
+            for (const Sequence& q : state()->project().sequences)
+                for (const auto* tracks : {&q.videoTracks, &q.audioTracks})
+                    for (const Track& t : *tracks)
+                        for (const Clip& c : t.clips)
+                            if (c.mediaId == growing)
+                                clips += QStringLiteral(" clip %1 (%2 markers%3)").arg(c.id).arg(c.markers.size()).arg(c.markers.empty() ? QString() : QStringLiteral(", the first at %1").arg(c.markers.front().t));
+            listed += "\nclips of media " + QString::number(growing) + ":" + clips + "; live chapters " + QString::number(liveNow().value("chapters").toInt());
+        }
+        QVERIFY2(listed.contains("00:00:03.000 --> ") && listed.contains("From the clip"), qPrintable(listed));
+        qInfo("The clip's marker was in chapters.vtt %lld ms after it was placed", (long long)markedAt.elapsed());
+        QCOMPARE(liveNow().value("chapters").toInt(), 3);
+        QVERIFY(state()->apply("Name", [](Project&, Sequence& s) {
+            s.name += " (live)";
+            return edit::Result{};
+        }));
+        QTest::qWait(300);
+        QCOMPARE(liveNow().value("chapters").toInt(), 3);
         QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 30000);
         QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live package ended"), 20000);
         QVERIFY2(dlg->statusText().contains("2 ad cue") && dlg->statusText().contains("2 sound stream"), qPrintable(dlg->statusText()));
         const QJsonObject live = liveNow();
         QCOMPARE(live.value("sound_renditions").toInt(), 2);
         QVERIFY(!live.value("captioned").toBool());
-        auto readFile = [](const QString& f) {
-            QFile file(f);
-            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
-        };
         const QString master = readFile(folder + "/master.m3u8");
         QCOMPARE(int(master.count("TYPE=AUDIO")), 2);
         QVERIFY(!master.contains("TYPE=SUBTITLES"));
@@ -3633,7 +3674,7 @@ private slots:
         const QString list = readFile(folder + "/" + video);
         QVERIFY2(list.contains("ID=\"cue-1\"") && list.contains("ID=\"cue-2\"") && list.contains("PLANNED-DURATION=1.500"), qPrintable(list));
         const QString chapters = readFile(folder + "/chapters.vtt");
-        QVERIFY2(chapters.contains("Second half") && chapters.contains("Chapter 2"), qPrintable(chapters));
+        QVERIFY2(chapters.contains("Second half") && chapters.contains("Chapter 2") && chapters.contains("From the clip"), qPrintable(chapters));
     }
 
     // ST 2110 streams recorded by an agent (montage_capture), their SDPs given as text: in the Captures bin with the

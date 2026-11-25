@@ -1,6 +1,7 @@
 #include "Capture.h"
 
 #include "audio/Ltc.h"
+#include "core/Cea708.h"
 
 #include <algorithm>
 #include <cctype>
@@ -285,6 +286,11 @@ double captureClockNow() { return std::chrono::duration<double>(std::chrono::ste
 }  // namespace
 
 double captureClock() { return captureClockNow(); }
+
+std::string captionSidecar(const std::string& recording) {
+    const size_t slash = recording.find_last_of("/\\"), dot = recording.find_last_of('.');
+    return (dot != std::string::npos && (slash == std::string::npos || dot > slash) ? recording.substr(0, dot) : recording) + ".mcc";
+}
 
 namespace {
 
@@ -1088,6 +1094,11 @@ void Recorder::run() {
     // ST 2110-41 fast metadata kept beside the recording, a line a frame (a dropped picture's items go with the next).
     std::vector<st2110::FastMetadata> metaCarried;
     std::unique_ptr<QFile> metaFile;
+    // The feed's caption data kept beside the recording as it came, every service and channel (captionSidecar).
+    std::unique_ptr<QFile> mccFile;
+    // The feed's other sound streams in the file too (allSound): each a track of its own, in its language.
+    std::vector<AVCodecContext*> xencs;
+    std::vector<AVStream*> xsts;
     // The feed's other sound streams (allSound): each converted and placed as the recorded one is.
     struct ExtraPlace {
         SwrContext* swr = nullptr;
@@ -1128,6 +1139,18 @@ void Recorder::run() {
         if (f && enc == venc) {
             if (cs.onPicture) cs.onPicture(f, fps.num, fps.den);
             if (cs.live) cs.live->picture(f);
+            if (const AVFrameSideData* cc = av_frame_get_side_data(f, AV_FRAME_DATA_A53_CC); cc && cc->size >= 3 && !watchOnly && f->pts >= 0) {
+                if (!mccFile) {
+                    mccFile = std::make_unique<QFile>(QString::fromStdString(captionSidecar(file.path)));
+                    if (mccFile->open(QIODevice::WriteOnly | QIODevice::Truncate)) mccFile->write(QByteArray::fromStdString(mccHeader(Rational{fps.num, fps.den})));
+                    else mccFile->setFileName(QString());
+                }
+                if (mccFile->isOpen()) {
+                    std::vector<CcTriplet> list(cc->size / 3);
+                    for (size_t i = 0; i < list.size(); ++i) list[i] = {cc->data[i * 3], cc->data[i * 3 + 1], cc->data[i * 3 + 2]};
+                    mccFile->write(QByteArray::fromStdString(mccFrame(list, Rational{fps.num, fps.den}, f->pts)));
+                }
+            }
         } else if (f && enc == aenc) {
             if (cs.onSound) cs.onSound(f);
             if (cs.live) cs.live->sound(f);
@@ -1203,6 +1226,8 @@ void Recorder::run() {
             // (a QuickTime file already holds all but the last fragment)
             if (venc) write(venc, vst, nullptr);
             if (aenc) write(aenc, ast, nullptr);
+            for (size_t k = 0; k < xencs.size(); ++k)
+                if (xencs[k]) write(xencs[k], xsts[k], nullptr);
             const int err = av_write_trailer(oc);
             if (err < 0 && fatal.empty()) fatal = "Cannot finish " + file.path + ": " + avError(err);
             // (JPEG XS: its MXF finished with what was recorded, as a QuickTime file keeps its fragments)
@@ -1217,6 +1242,11 @@ void Recorder::run() {
         if (fileMade && !headerWritten) QFile::remove(QString::fromStdString(file.path));
         if (metaFile) metaFile->close();
         metaFile.reset();
+        if (mccFile) mccFile->close();
+        mccFile.reset();
+        for (AVCodecContext*& x : xencs) avcodec_free_context(&x);
+        xencs.clear();
+        xsts.clear();
         vst = ast = nullptr;
         avcodec_free_context(&venc);
         avcodec_free_context(&aenc);
@@ -1497,6 +1527,38 @@ void Recorder::run() {
                 ast->time_base = aenc->time_base;
             }
         }
+        // The feed's other sound streams (allSound), each a track of the file in its language (QuickTime and MXF, not
+        // JPEG XS's writer), and the recorded one's language as the feed states it.
+        if (aenc && ast && !jxsRecord && cs.allSound && &ain == &inputs[0]) {
+            if (ain.fmt && ain.audioStream >= 0)
+                if (const AVDictionaryEntry* l = av_dict_get(ain.fmt->streams[ain.audioStream]->metadata, "language", nullptr, 0))
+                    av_dict_set(&ast->metadata, "language", l->value, 0);
+            const AVCodec* pcm = avcodec_find_encoder(AV_CODEC_ID_PCM_S24LE);
+            for (const Input::Extra& e : inputs[0].extras) {
+                AVCodecContext* x = avcodec_alloc_context3(pcm);
+                AVStream* xs = nullptr;
+                if (x) {
+                    x->sample_fmt = AV_SAMPLE_FMT_S32;
+                    x->sample_rate = 48000;
+                    const int n = std::min(8, std::max(1, e.dec ? e.dec->ch_layout.nb_channels : 2));
+                    if (e.dec && e.dec->ch_layout.nb_channels == n && e.dec->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC)
+                        av_channel_layout_copy(&x->ch_layout, &e.dec->ch_layout);
+                    else
+                        av_channel_layout_default(&x->ch_layout, n);
+                    x->time_base = {1, 48000};
+                    if (oc->oformat->flags & AVFMT_GLOBALHEADER) x->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+                    if (avcodec_open2(x, pcm, nullptr) < 0 || !(xs = avformat_new_stream(oc, nullptr))) avcodec_free_context(&x);
+                }
+                if (xs && x) {
+                    avcodec_parameters_from_context(xs->codecpar, x);
+                    xs->time_base = x->time_base;
+                    if (!e.language.empty()) av_dict_set(&xs->metadata, "language", e.language.c_str(), 0);
+                    if (!e.title.empty()) av_dict_set(&xs->metadata, "title", e.title.c_str(), 0);
+                }
+                xencs.push_back(x);
+                xsts.push_back(xs);
+            }
+        }
         // The sound streams named (the recorded one first), before the first picture is given.
         if (cs.onSoundTracks && aenc) {
             std::vector<CaptureSettings::SoundTrack> tracks(1);
@@ -1574,6 +1636,7 @@ void Recorder::run() {
         }
         // (fast metadata an earlier recording here kept: not this one's)
         if (!watchOnly) QFile::remove(QString::fromStdString(st2110::fastMetadataSidecar(file.path)));
+        if (!watchOnly) QFile::remove(QString::fromStdString(captionSidecar(file.path)));
         headerWritten = true;
         if (cs.live) cs.live->begin(tc, fps.num, fps.den);
         std::lock_guard lock(s->m);
@@ -1864,7 +1927,7 @@ void Recorder::run() {
     // against the pictures', as putSound places the recorded one (silence where it is missing, trimmed where it runs
     // early; jitter under a tenth of a second left be), then given to onTrackSound.
     auto putExtra = [&](size_t k, AVFrame* f) -> bool {
-        if (!headerWritten || !cs.onTrackSound || k >= extraPlaces.size()) return true;
+        if (!headerWritten || (!cs.onTrackSound && (k >= xencs.size() || !xencs[k])) || k >= extraPlaces.size()) return true;
         ExtraPlace& x = extraPlaces[k];
         const int64_t endSample = std::min(soundEnd, frameLimit > 0 ? int64_t(std::llround(double(frameLimit) / av_q2d(fps) * 48000)) : INT64_MAX);
         if (x.next >= endSample || f->sample_rate <= 0) return true;
@@ -1891,10 +1954,31 @@ void Recorder::run() {
         }
         av_channel_layout_uninit(&layout);
         if (!x.swr) return true;
+        bool wrote = true;
         auto give = [&](AVFrame* g) {
             g->pts = x.next;
             x.next += g->nb_samples;
-            cs.onTrackSound(int(k + 1), g);
+            if (cs.onTrackSound) cs.onTrackSound(int(k + 1), g);
+            // (into its own track of the file: 24-bit, interleaved)
+            AVCodecContext* enc = k < xencs.size() ? xencs[k] : nullptr;
+            if (!enc || watchOnly || g->ch_layout.nb_channels != enc->ch_layout.nb_channels) return;
+            AVFrame* pcm = av_frame_alloc();
+            pcm->format = AV_SAMPLE_FMT_S32;
+            pcm->sample_rate = 48000;
+            av_channel_layout_copy(&pcm->ch_layout, &enc->ch_layout);
+            pcm->nb_samples = g->nb_samples;
+            if (av_frame_get_buffer(pcm, 0) >= 0) {
+                const int n = g->ch_layout.nb_channels;
+                auto* d = reinterpret_cast<int32_t*>(pcm->data[0]);
+                for (int c = 0; c < n; ++c) {
+                    const float* src = reinterpret_cast<const float*>(g->extended_data[c]);
+                    for (int i = 0; i < g->nb_samples; ++i)
+                        d[size_t(i) * size_t(n) + size_t(c)] = int32_t(std::lround(std::clamp(double(src[i]), -1.0, 1.0 - 1.0 / 8388608) * 8388608.0)) * 256;
+                }
+                pcm->pts = g->pts;
+                wrote = write(enc, xsts[k], pcm) && wrote;
+            }
+            av_frame_free(&pcm);
         };
         auto frameOf = [&](int n) {
             AVFrame* g = av_frame_alloc();
@@ -1947,7 +2031,7 @@ void Recorder::run() {
         g->nb_samples = int(std::min<int64_t>(g->nb_samples, endSample - x.next));
         give(g);
         av_frame_free(&g);
-        return true;
+        return wrote;
     };
     // A cue message from the feed, given once the recording has begun (its clock known).
     auto putCue = [&](const AVPacket* p, AVRational tb) {

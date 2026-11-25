@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,10 +44,15 @@ struct LiveSettings {
     // Each sound stream's language, by track (LivePackager::soundTracks; track 0 the main sound's): "" or past the
     // list the feed's own (else audioLanguage for track 0, else und). RFC 5646 or ISO 639-2 codes.
     std::vector<std::string> languages;
-    // The feed's captions (CEA-608 channel 1, or CTA-708 service 1 where it has pop-on captions): "auto" listed when
-    // its first segment carries caption data, "always" listed from the start, "none".
+    // The feed's captions: each CTA-708 caption service and CEA-608 channel a rendition of its own (core/Cea708.h,
+    // captionStreamsFromCc), roll-up and paint-on captions shown a line at a time as they build. "auto": each listed
+    // at the end of the first segment it carries captions in; "always": one listed from the start (taken by the first
+    // service or channel the feed turns out to have) and the others as they come; "none".
     std::string captions = "auto";
-    std::string captionLanguage = "en", captionName;  // ("": the language's)
+    std::string captionLanguage = "en", captionName;  // the first's (and service 1's and channel 1's) language; its name
+    // Each service's or channel's language by its id ("SERVICE2", "CC3": CcCaptionStream::id); one not named is
+    // captionLanguage's if it is the first (or service 1 or channel 1), else und.
+    std::map<std::string, std::string> captionLanguages;
     // Cues placed while recording (LivePackager::cue): splice_insert or time_signal with segmentation descriptors (a
     // placement opportunity's start and end).
     std::string cueCommand = "splice_insert";
@@ -65,7 +71,8 @@ struct LiveCue {
     double duration = 0;     // the break's length (seconds; 0 not known)
     bool returning = false, other = false;
     bool autoReturn = true;  // a break with a length ends by itself (else at its return)
-    bool cancel = false;     // the feed's cancel of event `eventId`: a break of it not yet begun is taken off
+    bool cancel = false;     // the feed's cancel of event `eventId`: a break of it not yet begun is taken off (and
+                             // ended for DASH players already sent its event: a new event, to its splice)
     uint32_t eventId = 0;    // the feed's splice_event_id (or segmentation_event_id), matching a return to its out
                              // and a repeat of a message to the cue it repeats
     std::vector<uint8_t> scte35;  // the feed's splice_info_section, as it came ("" for a cue placed here: made)
@@ -92,6 +99,11 @@ struct LiveStatus {
     std::vector<std::string> renditions;
     int soundRenditions = 0;
     bool captioned = false;             // a caption rendition is listed
+    std::vector<std::string> captionStreams;  // the caption services and channels listed, by id ("" not yet seen)
+    // Media playlists written (each sound and picture rendition's, once a part or segment), and the parts made (every
+    // rendition's).
+    int64_t playlistWrites = 0, parts = 0;
+    std::vector<std::string> lateRenditions;  // sound renditions that joined after the others were announced
     int64_t captionSegments = 0, captionCues = 0;  // its segments written, and the cues in them
     std::vector<LiveCueStatus> cues;
     int chapters = 0;
@@ -130,7 +142,8 @@ public:
     // A picture's CEA-608 and CTA-708 caption data (AV_FRAME_DATA_A53_CC) are its captions.
     void picture(const AVFrame* frame, int fpsNum, int fpsDen);
     // The feed's sound streams, before their sound (track 0 the main sound; CaptureSettings::onSoundTracks). Without
-    // it there is one, track 0. A track whose sound begins a segment after the pictures is left out.
+    // it there is one, track 0. A track whose sound begins after the others are announced joins at the next segment's
+    // start (the playlists list it once its first part or segment is made; LiveStatus::lateRenditions).
     void soundTracks(const std::vector<LiveSoundTrack>& tracks);
     void sound(const AVFrame* frame, int track = 0);
     // An ad cue, from any thread: placed on its picture, made a keyframe (a cue for a picture already encoded goes on
@@ -141,8 +154,9 @@ public:
     void cue(const LiveCue& cue);
     // A SCTE 35 message from the feed (CaptureSettings::onCue): splice_insert and time_signal become cues at their
     // splice time on the feed's clock (immediate ones when they came); a message repeated (as encoders send each a few
-    // times before its splice) is the cue it repeats, a cancel takes off a break not yet begun; splice_null and those
-    // it cannot read are passed over.
+    // times before its splice) is the cue it repeats, a cancel takes off a break not yet begun (its DATERANGE dropped,
+    // and DASH players already sent its event sent another, with the id its return would have had, lasting from the
+    // cancel to the splice: the event ended); splice_null and those it cannot read are passed over.
     void cueFromFeed(const std::vector<uint8_t>& section, double feedZero, double at);
     // A chapter from here (at < 0: the next picture recorded; else seconds into the recording) to the next: the
     // package's chapters.vtt (named in the multivariant playlist).

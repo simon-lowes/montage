@@ -61,6 +61,7 @@ QString clock(double seconds) {
 CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(parent), state_(state) {
     setWindowTitle(tr("Capture"));
     setObjectName(QStringLiteral("captureDialog"));
+    connect(state_, &EditorState::projectChanged, this, &CaptureDialog::markersToChapters);
     QSettings settings = appSettings();
     auto* layout = new QVBoxLayout(this);
     auto* intro = new QLabel(tr("Records a live feed (a network stream or a camera, capture card or sound card on this computer) "
@@ -469,11 +470,31 @@ bool CaptureDialog::startLive(CaptureSettings& cs) {
     // (the feed's own ad cues, an MPEG transport stream's)
     cs.onCue = [p](const std::vector<uint8_t>& section, double zero, double at) { p->cueFromFeed(section, zero, at); };
     liveChapters_ = 0;
+    liveMarkers_.clear();
     packager_ = std::move(packager);
     QSettings settings = appSettings();
     settings.setValue(QStringLiteral("capture/liveFolder"), o.folder);
     if (o.serve) settings.setValue(QStringLiteral("capture/livePort"), o.port);
     return true;
+}
+
+void CaptureDialog::markersToChapters() {
+    if (!packager_ || !recording_ || !imported_ || !packager_->status().running) return;
+    for (const Sequence& seq : state_->project().sequences) {
+        const double fps = seq.fps.valid() ? seq.fps.toDouble() : 25;
+        for (const auto* tracks : {&seq.videoTracks, &seq.audioTracks})
+            for (const Track& t : *tracks)
+                for (const Clip& c : t.clips) {
+                    if (c.mediaId != imported_) continue;
+                    for (const Marker& m : c.markers) {
+                        if (m.shotChange || m.adBreak || !liveMarkers_.insert({c.id, m.t, m.name}).second) continue;
+                        ++liveChapters_;
+                        // (its place in the recording: the clip's source frames, as its in-point, at the sequence's rate)
+                        const std::string title = m.name.empty() ? tr("Chapter %1").arg(liveChapters_).toStdString() : m.name;
+                        packager_->chapter(title, std::max(0.0, (double(m.t) + m.sub) / fps));
+                    }
+                }
+    }
 }
 
 void CaptureDialog::endLive() {

@@ -1276,6 +1276,58 @@ montage::JxsPicture jxsFromPlanarBytes(const QByteArray& b, int w, int h, int de
     return p;
 }
 
+// A live channel handed straight to a packager, as a recording hands it on: 320 by 180 pictures at 25 a second
+// carrying CcFeed.h's four caption languages, the feed's two sound streams named (eng and fra), a 500 Hz tone on the
+// first from the first picture and an 800 Hz one on the second from `lateFrame` on.
+class LiveChannelFeed {
+public:
+    std::vector<montage::Caption> popOn;
+    std::vector<montage::testcc::Line> service2, channel3;
+    int64_t frames = 250, lateFrame = 50;
+    std::vector<std::vector<montage::CcTriplet>> cc;
+    LiveChannelFeed() {
+        pic_ = av_frame_alloc();
+        pic_->format = AV_PIX_FMT_YUV420P, pic_->width = 320, pic_->height = 180;
+        av_frame_get_buffer(pic_, 0);
+        snd_ = av_frame_alloc();
+        snd_->format = AV_SAMPLE_FMT_FLTP, snd_->sample_rate = 48000, snd_->nb_samples = 1920;
+        av_channel_layout_default(&snd_->ch_layout, 2);
+        av_frame_get_buffer(snd_, 0);
+    }
+    ~LiveChannelFeed() {
+        av_frame_free(&pic_);
+        av_frame_free(&snd_);
+    }
+    void prepare() { cc = montage::testcc::fourLanguages(popOn, service2, channel3, {25, 1}, frames); }
+    void start(montage::LivePackager& p) const { p.soundTracks({{"eng", "", 2}, {"fra", "Commentaire", 2}}); }
+    void push(montage::LivePackager& p, int64_t f) {
+        av_frame_make_writable(pic_);
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) pic_->data[0][y * pic_->linesize[0] + x] = uint8_t(std::abs(x - int(f * 4 % 320)) < 8 ? 235 : 90);
+        for (int c = 1; c < 3; ++c)
+            for (int y = 0; y < 90; ++y) std::memset(pic_->data[c] + y * pic_->linesize[c], 128, 160);
+        pic_->pts = f;
+        av_frame_remove_side_data(pic_, AV_FRAME_DATA_A53_CC);
+        if (size_t(f) < cc.size() && !cc[size_t(f)].empty())
+            if (AVFrameSideData* sd = av_frame_new_side_data(pic_, AV_FRAME_DATA_A53_CC, cc[size_t(f)].size() * 3))
+                for (size_t k = 0; k < cc[size_t(f)].size(); ++k) std::memcpy(sd->data + k * 3, cc[size_t(f)][k].data(), 3);
+        p.picture(pic_, 25, 1);
+        for (int track = 0; track < 2; ++track) {
+            if (track == 1 && f < lateFrame) continue;
+            av_frame_make_writable(snd_);
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < 1920; ++i)
+                    reinterpret_cast<float*>(snd_->data[c])[i] = 0.3f * float(std::sin(2 * M_PI * (track ? 800 : 500) * double(f * 1920 + i) / 48000));
+            snd_->pts = f * 1920;
+            p.sound(snd_, track);
+        }
+    }
+
+private:
+    AVFrame* pic_ = nullptr;
+    AVFrame* snd_ = nullptr;
+};
+
 }  // namespace
 
 class TestRender : public QObject {
@@ -34622,6 +34674,34 @@ colorspaces:
         }
         const QString master = readFile(folder + "/master.m3u8");
         QVERIFY(master.contains("LANGUAGE=\"en\"") && master.contains("LANGUAGE=\"fr\"") && master.contains("TYPE=SUBTITLES"));
+        // Phase 17: the recording holds both sound streams, each with its language, and every caption the feed carried
+        // beside it (the caption data as it came, in an MCC file: CC1's captions read back from it).
+        {
+            QVERIFY(recorder.wait(20));
+            AVFormatContext* fc = nullptr;
+            QVERIFY(avformat_open_input(&fc, cs.path.c_str(), nullptr, nullptr) >= 0);
+            QVERIFY(avformat_find_stream_info(fc, nullptr) >= 0);
+            QStringList languages;
+            for (unsigned i = 0; i < fc->nb_streams; ++i)
+                if (fc->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    const AVDictionaryEntry* e = av_dict_get(fc->streams[i]->metadata, "language", nullptr, 0);
+                    languages << (e ? QString::fromUtf8(e->value) : QStringLiteral("?"));
+                }
+            avformat_close_input(&fc);
+            QCOMPARE(languages.join(','), QStringLiteral("eng,fra"));
+            const std::string sidecar = captionSidecar(cs.path);
+            QCOMPARE(QFileInfo(QString::fromStdString(sidecar)).fileName(), QStringLiteral("live.mcc"));
+            QFile mccFile(QString::fromStdString(sidecar));
+            QVERIFY(mccFile.open(QIODevice::ReadOnly));
+            std::vector<std::pair<double, CcTriplet>> kept;
+            QVERIFY(mccCcData(mccFile.readAll().toStdString(), {25, 1}, kept));
+            const std::vector<CcCaptionStream> streams = captionStreamsFromCc(kept, {25, 1});
+            QVERIFY(!streams.empty() && streams.front().id == "CC1");
+            int found = 0;
+            for (const Caption& c : streams.front().captions) found += c.text.rfind("Caption ", 0) == 0;
+            // (a caption every two seconds of the twenty or so recorded)
+            QVERIFY2(found >= 5, std::to_string(found).c_str());
+        }
 #endif
     }
 
@@ -34755,6 +34835,353 @@ colorspaces:
         if (ls.audioCodec == "ac3")
             QVERIFY2(x.contains("schemeIdUri=\"tag:dolby.com,2014:dash:audio_channel_configuration:2011\" value=\"A000\"") && !x.contains("mpegB:cicp"), x.constData());
         origin.stop();
+    }
+
+    void livePackageEveryLanguageAndLateTrack() {
+        // What a channel carries, packaged live with low latency and two rungs: four caption languages (708 services 1
+        // and 2, 608 channels 1 and 3) each a rendition, roll-up lines shown as they are typed with the line above
+        // them; a sound stream that starts two segments after the pictures joins at the third; each part writes each
+        // media playlist once; and a break the feed cancels after its event message went out is ended for DASH players
+        // by an event of its own.
+        QTemporaryDir dir;
+        LiveSettings ls;
+        ls.folder = dir.filePath("live").toStdString();
+        ls.rungs = {{320, 180, 300000, "libx264"}, {160, 90, 120000, "libx264"}};
+        ls.segmentSeconds = 1;
+        ls.window = 10;
+        ls.lowLatency = true;
+        ls.partSeconds = 0.2;
+        ls.audioCodec = "aac";
+        ls.preset = "ultrafast";
+        ls.captionLanguages = {{"SERVICE2", "es"}, {"CC3", "fr"}};
+        LiveChannelFeed feed;
+        feed.popOn = {{30, 70, "Pop one", {}}, {110, 150, "Pop two", {}}, {190, 230, "Pop three", {}}};
+        feed.service2 = {{40, "Dos uno"}, {90, "Dos dos"}, {140, "Dos tres"}};
+        feed.channel3 = {{45, "Trois un"}, {100, "Trois deux"}, {150, "Trois trois"}};
+        feed.frames = 300;
+        feed.lateFrame = 50;  // (two segments in)
+        feed.prepare();
+        std::string err;
+        LivePackager packager;
+        QVERIFY2(packager.start(ls, &err), err.c_str());
+        feed.start(packager);
+        // (the feed's break at 6 s, announced at 3 s and cancelled at 3.6 s)
+        scte35::Cue out;
+        out.eventId = 77, out.outOfNetwork = true, out.ptsTime = 6 * 90000, out.breakDuration = 2 * 90000;
+        scte35::Cue cancel;
+        cancel.eventId = 77, cancel.eventCancel = true;
+        const std::vector<uint8_t> cancelBytes = scte35::encode(cancel);
+        int64_t writes0 = -1, parts0 = 0, writes1 = 0, parts1 = 0;
+        for (int64_t f = 0; f < feed.frames; ++f) {
+            if (f == 75) packager.cueFromFeed(scte35::encode(out), 0, 3.0);
+            if (f == 90) packager.cueFromFeed(cancelBytes, 0, 3.6);
+            feed.push(packager, f);
+            // (kept up with: nothing dropped)
+            QElapsedTimer t;
+            t.start();
+            while (packager.status().behind > 0.4 && t.elapsed() < 10000) QThread::msleep(2);
+            if (f == 125 || f == 250) {
+                QElapsedTimer settle;
+                settle.start();
+                while (packager.status().behind > 0 && settle.elapsed() < 10000) QThread::msleep(2);
+                QThread::msleep(100);
+                const LiveStatus st = packager.status();
+                (f == 125 ? writes0 : writes1) = st.playlistWrites;
+                (f == 125 ? parts0 : parts1) = st.parts;
+            }
+        }
+        packager.finish();
+        const LiveStatus st = packager.status();
+        QVERIFY2(st.error.empty(), st.error.c_str());
+        QCOMPARE(st.dropped, int64_t(0));
+        auto readFile = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()) : QString();
+        };
+        const QString folder = QString::fromStdString(ls.folder);
+
+        // Four caption languages, each a rendition in its language, in HLS and in DASH.
+        QStringList streams;
+        for (const std::string& id : st.captionStreams) streams << QString::fromStdString(id);
+        QCOMPARE(streams.join(','), QString("SERVICE1,SERVICE2,CC1,CC3"));
+        const QString master = readFile(folder + "/master.m3u8"), mpd = readFile(folder + "/manifest.mpd");
+        QCOMPARE(int(master.count("TYPE=SUBTITLES")), 4);
+        for (const char* lang : {"LANGUAGE=\"es\"", "LANGUAGE=\"fr\""}) QVERIFY2(master.contains(lang), qPrintable(master));
+        QCOMPARE(int(master.count("LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO")), 2);
+        QCOMPARE(int(mpd.count("contentType=\"text\"")), 4);
+        QVERIFY(mpd.contains("lang=\"es\"") && mpd.contains("lang=\"fr\""));
+        // Roll-up on channel 3, as shown: each line from when it is typed, under the one before; none early.
+        auto cuesOf = [&](const QString& rendition) {
+            std::vector<Caption> cues;
+            for (int k = 1; k <= 12; ++k) {
+                std::vector<Caption> got;
+                parseSubtitles(readFile(folder + "/" + rendition + QStringLiteral("/seg%1.vtt").arg(k, 5, 10, QChar('0'))).toStdString(), {25, 1}, got);
+                cues.insert(cues.end(), got.begin(), got.end());
+            }
+            return cues;
+        };
+        const std::vector<Caption> french = cuesOf("s4_fr");
+        QVERIFY(!french.empty());
+        bool sawTwo = false;
+        for (const Caption& c : french) {
+            if (c.text.find("Trois deux") != std::string::npos) {
+                QVERIFY2(c.start >= 100, qPrintable(QString::number(c.start)));
+                if (c.text == "Trois un\nTrois deux") sawTwo = true;
+            }
+            if (c.text.find("Trois trois") != std::string::npos) QVERIFY(c.start >= 150 && c.text == "Trois deux\nTrois trois");
+        }
+        QVERIFY(sawTwo);
+        const std::vector<Caption> spanish = cuesOf("s2_es");
+        QVERIFY(std::any_of(spanish.begin(), spanish.end(), [](const Caption& c) { return c.text == "Dos uno\nDos dos" && c.start >= 90; }));
+        QVERIFY(std::none_of(spanish.begin(), spanish.end(), [](const Caption& c) { return c.text.find("Dos dos") != std::string::npos && c.start < 90; }));
+        const std::vector<Caption> english = cuesOf("s1_en");
+        QVERIFY(std::any_of(english.begin(), english.end(), [](const Caption& c) { return c.text == "Pop two"; }));
+
+        // The late sound stream: listed in both, its playlist from the third segment.
+        QCOMPARE(st.soundRenditions, 2);
+        QCOMPARE(int(st.lateRenditions.size()), 1);
+        const QString late = QString::fromStdString(st.lateRenditions.front());
+        QVERIFY2(late.startsWith("a2_"), qPrintable(late));
+        QCOMPARE(int(master.count("TYPE=AUDIO")), 2);
+        QVERIFY(master.contains("NAME=\"Commentaire\"") && mpd.contains(late));
+        const QString lateList = readFile(folder + "/" + late + "/playlist.m3u8");
+        QVERIFY2(lateList.contains("#EXT-X-MEDIA-SEQUENCE:3\n") && !lateList.contains("seg00002.m4s") && lateList.contains("seg00003.m4s"), qPrintable(lateList));
+        QVERIFY(!QFile::exists(folder + "/" + late + "/seg00002.m4s"));
+        // (its first sound at the third segment's start, 2 s: its fragment's decode time that of the main sound's
+        // third segment, in the same time scale)
+        {
+            auto decodeTime = [&](const QString& file) -> int64_t {
+                QFile f(file);
+                if (!f.open(QIODevice::ReadOnly)) return -1;
+                const QByteArray d = f.readAll();
+                const qsizetype at = d.indexOf("tfdt");
+                if (at < 4 || at + 8 > d.size()) return -1;
+                const auto byte = [&](qsizetype i) { return int64_t(uint8_t(d[i])); };
+                int64_t v = 0;
+                const int n = byte(at + 4) == 1 ? 8 : 4;
+                if (at + 8 + n > d.size()) return -1;
+                for (int i = 0; i < n; ++i) v = v << 8 | byte(at + 8 + i);
+                return v;
+            };
+            QString main;
+            for (const std::string& r : st.renditions)
+                if (r.rfind("a", 0) == 0 && QString::fromStdString(r) != late && main.isEmpty()) main = QString::fromStdString(r);
+            QVERIFY(!main.isEmpty());
+            const int64_t lateAt = decodeTime(folder + "/" + late + "/seg00003.m4s"), mainAt = decodeTime(folder + "/" + main + "/seg00003.m4s");
+            QVERIFY2(lateAt > 0 && lateAt == mainAt, qPrintable(QString("%1 %2").arg(lateAt).arg(mainAt)));
+        }
+
+        // Each part writes each media playlist once (two rungs and two sound renditions: four a part, not sixteen; five
+        // seconds of 0.2 s parts are dozens of the renditions' parts).
+        QVERIFY2(writes0 >= 0 && parts1 > parts0 + 40, qPrintable(QString("%1 %2 %3").arg(writes0).arg(parts0).arg(parts1)));
+        qInfo("%lld parts made, %lld media playlists written", (long long)(parts1 - parts0), (long long)(writes1 - writes0));
+        // (a segment's end, where a rendition's last part and its segment are listed, may write one more)
+        const int64_t writes = writes1 - writes0, made = parts1 - parts0;
+        QVERIFY2(writes >= made - 4 && writes <= made + made / 4 + 4, qPrintable(QString("%1 %2").arg(writes).arg(made)));
+
+        // The cancelled break: not listed, nor in the cues; its out and then its cancel sent to DASH players, the
+        // cancel an event of the return's id, from the cancel to where the splice was to be.
+        QVERIFY(std::none_of(st.cues.begin(), st.cues.end(), [](const LiveCueStatus& c) { return c.fromFeed; }));
+        const QString video = QString::fromStdString(st.renditions.front());
+        QVERIFY(!readFile(folder + "/" + video + "/playlist.m3u8").contains("DATERANGE"));
+        struct Event {
+            uint32_t id = 0, duration = 0, scale = 0;
+            uint64_t time = 0;
+            QByteArray message;
+        };
+        std::vector<Event> events;
+        for (int k = 1; k <= 12; ++k) {
+            QFile g(folder + "/" + video + QStringLiteral("/seg%1.m4s").arg(k, 5, 10, QChar('0')));
+            if (!g.open(QIODevice::ReadOnly)) continue;
+            const QByteArray b = g.readAll();
+            for (qsizetype at = b.indexOf("emsg"); at >= 4; at = b.indexOf("emsg", at + 4)) {
+                const auto* d = reinterpret_cast<const uint8_t*>(b.constData());
+                auto u32 = [&](qsizetype i) { return uint32_t(d[i]) << 24 | uint32_t(d[i + 1]) << 16 | uint32_t(d[i + 2]) << 8 | d[i + 3]; };
+                const qsizetype box = at - 4, size = qsizetype(u32(box));
+                if (d[at + 4] != 1 || box + size > b.size()) continue;
+                Event e;
+                e.scale = u32(at + 8);
+                e.time = uint64_t(u32(at + 12)) << 32 | u32(at + 16);
+                e.duration = u32(at + 20), e.id = u32(at + 24);
+                qsizetype i = at + 28;
+                i = b.indexOf('\0', i) + 1;  // (scheme)
+                i = b.indexOf('\0', i) + 1;  // (value)
+                e.message = b.mid(i, box + size - i);
+                events.push_back(e);
+            }
+        }
+        const auto outEvent = std::find_if(events.begin(), events.end(), [&](const Event& e) { return e.message == QByteArray(reinterpret_cast<const char*>(scte35::encode(out).data()), qsizetype(scte35::encode(out).size())); });
+        const auto cancelEvent = std::find_if(events.begin(), events.end(), [&](const Event& e) { return e.message == QByteArray(reinterpret_cast<const char*>(cancelBytes.data()), qsizetype(cancelBytes.size())); });
+        QVERIFY(outEvent != events.end() && cancelEvent != events.end());
+        QCOMPARE(cancelEvent->id, outEvent->id + 1);
+        QVERIFY(outEvent->id % 2 == 0);
+        const double cancelAt = double(cancelEvent->time) / cancelEvent->scale, spliceAt = double(outEvent->time) / outEvent->scale;
+        QVERIFY2(std::fabs(spliceAt - 6.0) < 0.05 && cancelAt >= 3.55 && cancelAt < 3.8, qPrintable(QString("%1 %2").arg(spliceAt).arg(cancelAt)));
+        QVERIFY(std::fabs(cancelAt + double(cancelEvent->duration) / cancelEvent->scale - spliceAt) < 0.05);
+    }
+
+    void livePackageLanguagesPlay() {
+        // The four caption languages of a live channel in the players: dash.js and hls.js in headless Chromium list
+        // all four, dash.js raises the cancel of a break whose event it was already sent, and hls.js shows channel 3's
+        // roll-up lines as they were typed (each under the one before).
+#ifndef MONTAGE_TEST_STREAMING_PLAYERS
+        QSKIP("hls.js and dash.js were not fetched when the build was configured");
+#else
+        const std::string exe = ografBrowser();
+        if (exe.empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        if (!avcodec_find_encoder_by_name("libx264")) QSKIP("No libx264");
+        QTemporaryDir dir;
+        const QString folder = dir.filePath("live");
+        QVERIFY(QDir().mkpath(folder));
+        const QDir players(QStringLiteral(MONTAGE_TEST_STREAMING_PLAYERS));
+        for (const char* f : {"hls.min.js", "dash.all.min.js"}) QVERIFY(QFile::copy(players.filePath(f), folder + "/" + f));
+        {
+            QFile page(folder + "/harness.html");
+            QVERIFY(page.open(QIODevice::WriteOnly));
+            page.write("<!doctype html><html><body><video width=\"320\" height=\"180\" muted playsinline></video></body></html>");
+        }
+        bool sandbox = true;
+#ifndef _WIN32
+        sandbox = geteuid() != 0;
+#endif
+        HeadlessBrowser::Options options;
+        options.offline = false;
+        options.extraArgs = {"--autoplay-policy=no-user-gesture-required", "--no-proxy-server"};
+        HeadlessBrowser b;
+        std::string err;
+        QVERIFY2(b.start(exe, 640, 360, sandbox, &err, options), err.c_str());
+        auto js = [&](const QString& expression) {
+            QJsonObject r;
+            std::string e;
+            if (!b.call("Runtime.evaluate", {{"expression", expression}, {"awaitPromise", true}, {"returnByValue", true}}, &r, &e, true, 30000)) {
+                qWarning("%s", e.c_str());
+                return QJsonValue();
+            }
+            return r.value("result").toObject().value("value");
+        };
+        auto until = [&](const QString& expression, int seconds) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < seconds * 1000) {
+                if (js(expression).toBool()) return true;
+                QThread::msleep(100);
+            }
+            return false;
+        };
+        QJsonObject nav;
+        QVERIFY2(b.call("Page.navigate", {{"url", "about:blank"}}, &nav, &err), err.c_str());
+        if (!js("MediaSource.isTypeSupported('video/mp4; codecs=\"avc1.640015,mp4a.40.2\"')").toBool()) QSKIP("This browser plays no H.264 and AAC");
+        LiveSettings ls;
+        ls.folder = folder.toStdString();
+        ls.rungs = {{320, 180, 300000, "libx264"}};
+        ls.segmentSeconds = 1;
+        ls.window = 10;
+        ls.lowLatency = true;
+        ls.partSeconds = 0.2;
+        ls.audioCodec = "aac";
+        ls.preset = "ultrafast";
+        ls.captionLanguages = {{"SERVICE2", "es"}, {"CC3", "fr"}};
+        LiveChannelFeed feed;
+        feed.frames = 25 * 30;
+        feed.lateFrame = 0;
+        for (int k = 0; k < 14; ++k) {
+            feed.popOn.push_back({FrameTime(25 + k * 50), FrameTime(60 + k * 50), "Pop " + std::to_string(k + 1), {}});
+            feed.service2.push_back({30 + k * 50, "Dos " + std::to_string(k + 1)});
+            feed.channel3.push_back({35 + k * 50, "Trois " + std::to_string(k + 1)});
+        }
+        feed.prepare();
+        LivePackager packager;
+        QVERIFY2(packager.start(ls, &err), err.c_str());
+        feed.start(packager);
+        LiveOrigin origin;
+        QVERIFY2(origin.start(ls.folder, 0, [&](const std::string& rel) { return packager.growing(rel); }, &err), err.c_str());
+        // (the break at 14 s, announced at 9 s and cancelled at 10 s)
+        scte35::Cue out;
+        out.eventId = 91, out.outOfNetwork = true, out.ptsTime = 14 * 90000, out.breakDuration = 2 * 90000;
+        scte35::Cue cancel;
+        cancel.eventId = 91, cancel.eventCancel = true;
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int64_t f = 0; f < feed.frames && !stop; ++f) {
+                if (f == 225) packager.cueFromFeed(scte35::encode(out), 0, 9.0);
+                if (f == 250) packager.cueFromFeed(scte35::encode(cancel), 0, 10.0);
+                feed.push(packager, f);
+                std::this_thread::sleep_until(t0 + std::chrono::milliseconds(40 * (f + 1)));
+            }
+        });
+        auto joined = qScopeGuard([&] {
+            stop = true;
+            sending.join();
+            packager.finish();
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(packager.status().captionStreams.size() == 4 || !packager.status().error.empty(), 15000);
+        QCOMPARE(QString::fromStdString(packager.status().error), QString());
+        const QString base = QStringLiteral("http://127.0.0.1:%1/").arg(origin.port());
+
+        // dash.js: four text tracks; the cancel of a break whose event it had, as an event of the return's id.
+        QVERIFY2(b.call("Page.navigate", {{"url", base + "harness.html"}}, &nav, &err), err.c_str());
+        QVERIFY(until("document.readyState === 'complete'", 20));
+        QVERIFY(js(R"js((async () => {
+            await new Promise((ok, bad) => { const s = document.createElement('script'); s.src = 'dash.all.min.js'; s.onload = ok; s.onerror = bad; document.head.appendChild(s); });
+            window.r = {error: '', texts: [], events: []};
+            const v = document.querySelector('video');
+            const p = dashjs.MediaPlayer().create();
+            p.updateSettings({debug: {logLevel: 0}});
+            p.on(dashjs.MediaPlayer.events.ERROR, e => r.error = JSON.stringify(e.error && (e.error.message || e.error.code) || e));
+            p.on('urn:scte:scte35:2013:bin', e => r.events.push([e.event.id, e.event.calculatedPresentationTime, e.event.duration]), null, {mode: 'eventModeOnReceive'});
+            p.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => { r.texts = p.getTracksFor('text').map(t => t.lang); });
+            p.initialize(v, 'manifest.mpd', true);
+            return true; })())js").toBool());
+        QVERIFY2(until("r.error !== '' || r.texts.length > 0", 30), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        QCOMPARE(js("r.texts.length").toInt(), 4);
+        QVERIFY2(until("r.events.some(e => e[0] % 2 === 1)", 40), qPrintable(js("JSON.stringify(r)").toString()));
+        const QJsonArray ended = js("r.events.find(e => e[0] % 2 === 1)").toArray();
+        qInfo("dash.js: the break's cancel at %.3f s for %.3f s", ended.at(1).toDouble(), ended.at(2).toDouble());
+        QVERIFY2(std::fabs(ended.at(1).toDouble() - 10.0) < 0.1 && std::fabs(ended.at(1).toDouble() + ended.at(2).toDouble() - 14.0) < 0.1,
+                 qPrintable(js("JSON.stringify(r.events)").toString()));
+        QVERIFY(js(QString("r.events.some(e => e[0] === %1)").arg(ended.at(0).toInt() - 1)).toBool());  // (its out, before)
+        QCOMPARE(js("r.error").toString(), QString());
+        js("p.reset()");
+        // hls.js: four subtitle tracks; channel 3 (French) chosen, its lines shown as they were typed.
+        QVERIFY2(b.call("Page.navigate", {{"url", base + "harness.html"}}, &nav, &err), err.c_str());
+        QVERIFY(until("document.readyState === 'complete'", 20));
+        QVERIFY(js(R"js((async () => {
+            await new Promise((ok, bad) => { const s = document.createElement('script'); s.src = 'hls.min.js'; s.onload = ok; s.onerror = bad; document.head.appendChild(s); });
+            window.r = {error: '', subs: [], cues: {}};
+            const v = document.querySelector('video');
+            const h = new Hls({lowLatencyMode: true, renderTextTracksNatively: true});
+            window.h = h;
+            h.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) r.error = d.type + ' ' + d.details; });
+            h.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (e, d) => {
+                r.subs = d.subtitleTracks.map(t => t.lang + ':' + t.name);
+                h.subtitleTrack = d.subtitleTracks.findIndex(t => t.lang === 'fr');
+                h.subtitleDisplay = true;
+            });
+            h.loadSource('master.m3u8');
+            h.attachMedia(v);
+            v.play().catch(e => r.error = String(e));
+            return true; })())js").toBool());
+        QVERIFY2(until("r.error !== '' || r.subs.length === 4", 30), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        qInfo("hls.js lists %s", qPrintable(js("JSON.stringify(r.subs)").toString()));
+        // (a line typed a second or more after where playback is)
+        QVERIFY2(until("r.error !== '' || document.querySelector('video').currentTime > 0.5", 30), qPrintable(js("JSON.stringify(r)").toString()));
+        const double now = js("document.querySelector('video').currentTime").toDouble();
+        int line = 1;
+        while ((35 + line * 50) / 25.0 < now + 1) ++line;
+        QVERIFY2(line < 14, qPrintable(QString::number(now)));
+        const QString rolled = QString("(() => { for (const t of document.querySelector('video').textTracks) if (t.kind !== 'metadata') for (const c of (t.cues || [])) "
+                                       "if (c.text === 'Trois %1\\nTrois %2') return c.startTime; return -1; })()").arg(line).arg(line + 1);
+        QVERIFY2(until(rolled + " >= 0", 40), qPrintable(js("JSON.stringify(r)").toString()));
+        const double shown = js(rolled).toDouble(), typed = (35 + line * 50) / 25.0;
+        qInfo("hls.js shows line %d under line %d from %.3f s (typed from %.3f s)", line + 1, line, shown, typed);
+        QVERIFY2(shown >= typed && shown < typed + 0.6, qPrintable(QString::number(shown)));
+        QCOMPARE(js("r.error").toString(), QString());
+        js("h.destroy()");
+
+#endif
     }
 
     void streamingSegmentsAndLadder() {

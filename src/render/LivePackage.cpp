@@ -307,6 +307,13 @@ public:
         return true;
     }
     bool chunkOpen() const { return oc_ && oc_->pb; }
+    // Its samples keep their own decode times (a track joining late), rather than starting from 0: called before the
+    // first sample.
+    void keepTimes() {
+        if (!oc_) return;
+        oc_->avoid_negative_ts = AVFMT_AVOID_NEG_TS_MAKE_NON_NEGATIVE;
+        av_opt_set(oc_->priv_data, "movflags", "+frag_discont", 0);
+    }
     // A packet (its times in `from`) into the chunk being made.
     bool write(AVPacket* pkt, AVRational from, std::string* why) {
         if (!oc_->pb) {
@@ -398,6 +405,9 @@ struct Rendition {
     std::string language, label;    // sound and captions
     std::vector<uint8_t> emsg;      // event messages for its next chunk (pictures)
     uint32_t textSequence = 0;      // captions: the IMSC fragments' numbers
+    std::string ccId;               // captions: the feed's caption service or channel it carries ("" not chosen yet)
+    bool due = false;               // its playlist to be written in the next pass
+    int64_t joinSample = -1;        // sound joining late: its first sample (a segment's start)
     bool ended = false;             // its playlist ended (kept so when the others' are written after)
     // Pictures.
     StreamingRung rung;
@@ -483,10 +493,13 @@ struct LivePackager::State {
     std::vector<LiveSoundTrack> trackList;  // (the packager thread's copy, taken as it opens)
 
     // Captions: the feed's cc_data entries and when each came (seconds of the presentation), the last half minute
-    // and more, decoded again at each segment's end; the caption rendition once listed.
+    // and more, decoded again at each segment's end; the caption renditions once listed, one for each caption service
+    // and channel of the feed.
     std::deque<std::pair<double, CcTriplet>> cc;
     bool ccSeen = false;
-    std::unique_ptr<Rendition> captions;
+    std::vector<std::unique_ptr<Rendition>> captions;
+    std::set<std::string> ccIds;  // (the services and channels seen, by CcCaptionStream::id)
+    bool announceDue = false;     // a rendition joined: the multivariant playlist and the MPD again once it has a part
 
     // Cues: asked for (any thread, under m; a cue for the next picture gets its picture as it is pushed), and placed.
     struct Asked {
@@ -503,6 +516,12 @@ struct LivePackager::State {
         bool fromFeed = false, late = false, keyframe = false, returned = false, signalled = false, inSignalled = false;
         bool returnSeen = false;  // the feed's return message came (its repeats passed over)
         int64_t placedAt = -1;    // the picture it was placed at
+        // Cancelled by the feed after its event message was sent: the cancel sent to DASH players as an event of the
+        // return's id from the cancel to where the splice was to be, which ends the break for them; nothing else of it
+        // is listed.
+        bool cancelled = false, cancelSignalled = false;
+        int64_t cancelFrame = -1;
+        std::vector<uint8_t> cancelMessage;
     };
     std::vector<Placed> placed;
     int nextCue = 1;
@@ -806,7 +825,7 @@ struct LivePackager::State {
         std::vector<std::pair<double, std::string>> tags;
         for (const Placed& p : placed) {
             const double at = seconds(p.frame), end = p.back >= 0 ? seconds(p.back) : at;
-            if (std::max(at, end) < from) continue;
+            if (p.cancelled || std::max(at, end) < from) continue;
             const std::string id = "#EXT-X-DATERANGE:ID=\"cue-" + std::to_string(p.id) + "\",START-DATE=\"" + dateOf(at) + "\"";
             if (p.cue.other) {
                 tags.push_back({at, id + ",SCTE35-CMD=" + scte35::toHex(p.out)});
@@ -928,15 +947,15 @@ struct LivePackager::State {
             m += "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=" + montage::quoted(a->label) + ",LANGUAGE=" + montage::quoted(a->language) + ",DEFAULT=" +
                  (a->track == 0 ? "YES" : "NO") + ",AUTOSELECT=YES,CHANNELS=\"" + std::to_string(a->channels) + "\",URI=\"" + a->name + "/playlist.m3u8\"\n";
         }
-        if (captions)
-            m += "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=" + montage::quoted(captions->label) + ",LANGUAGE=" + montage::quoted(captions->language) +
-                 ",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI=\"" + captions->name + "/playlist.m3u8\"\n";
+        for (const auto& c : captions)
+            m += "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=" + montage::quoted(c->label) + ",LANGUAGE=" + montage::quoted(c->language) +
+                 ",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI=\"" + c->name + "/playlist.m3u8\"\n";
         const std::string audioCodecs = audio.empty() ? "" : "," + audio.front()->codecs;
         for (const auto& v : video)
             m += "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(v->rung.bitrate * 3 / 2 + audioRate) + ",AVERAGE-BANDWIDTH=" +
                  std::to_string(v->rung.bitrate + audioRate) + ",CODECS=\"" + v->codecs + audioCodecs + "\",RESOLUTION=" + std::to_string(v->width) + "x" +
                  std::to_string(v->height) + ",FRAME-RATE=" + fmt("%.3f", av_q2d(fps)) + ",VIDEO-RANGE=SDR" + (audio.empty() ? "" : ",AUDIO=\"audio\"") +
-                 (captions ? ",SUBTITLES=\"subs\"" : "") + ",CLOSED-CAPTIONS=NONE\n" + v->name + "/playlist.m3u8\n";
+                 (captions.empty() ? "" : ",SUBTITLES=\"subs\"") + ",CLOSED-CAPTIONS=NONE\n" + v->name + "/playlist.m3u8\n";
         return writeAtomically(folder + "/master.m3u8", m) || fail("Cannot write " + folder + "/master.m3u8");
     }
 
@@ -996,13 +1015,13 @@ struct LivePackager::State {
                             std::to_string(a->channels == 8 ? 12 : a->channels) + "\"/>") +
                  "\n" + templ(*a) + "</Representation>\n</AdaptationSet>\n";
         }
-        if (captions) {
+        for (const auto& c : captions) {
             // (IMSC 1 text in fragmented MP4, a TTML document a segment, made at each segment's end)
-            x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"text\" mimeType=\"application/mp4\" lang=\"" + xmlEscape(captions->language) +
-                 "\" segmentAlignment=\"true\">\n<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"caption\"/>\n<Label>" + xmlEscape(captions->label) +
-                 "</Label>\n<Representation id=\"" + captions->name + "\" bandwidth=\"2000\" codecs=\"stpp.ttml.im1t\">\n<SegmentTemplate timescale=\"1000\" duration=\"" +
-                 std::to_string(std::llround(segSeconds * 1000)) + "\" startNumber=\"1\" initialization=\"" + captions->name + "/init.mp4\" media=\"" +
-                 captions->name + "/seg$Number%05d$.m4s\"/>\n</Representation>\n</AdaptationSet>\n";
+            x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"text\" mimeType=\"application/mp4\" lang=\"" + xmlEscape(c->language) +
+                 "\" segmentAlignment=\"true\">\n<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"caption\"/>\n<Label>" + xmlEscape(c->label) +
+                 "</Label>\n<Representation id=\"" + c->name + "\" bandwidth=\"2000\" codecs=\"stpp.ttml.im1t\">\n<SegmentTemplate timescale=\"1000\" duration=\"" +
+                 std::to_string(std::llround(segSeconds * 1000)) + "\" startNumber=\"1\" initialization=\"" + c->name + "/init.mp4\" media=\"" +
+                 c->name + "/seg$Number%05d$.m4s\"/>\n</Representation>\n</AdaptationSet>\n";
         }
         x += "</Period>\n<UTCTiming schemeIdUri=\"urn:mpeg:dash:utc:direct:2014\" value=\"" + isoDate(wallMs()) + "\"/>\n</MPD>\n";
         return writeAtomically(folder + "/manifest.mpd", x) || fail("Cannot write " + folder + "/manifest.mpd");
@@ -1012,16 +1031,32 @@ struct LivePackager::State {
 
     bool writePlaylist(Rendition& r, bool ended = false) {
         r.ended = r.ended || ended;
+        r.due = false;
         if (!set.hls || (!firstSegment && !r.ended)) return true;
         fixEpoch();
+        if (!r.text) {
+            std::lock_guard lock(m);
+            ++st.playlistWrites;
+        }
         return writeAtomically(folder + "/" + r.name + "/playlist.m3u8", mediaPlaylist(r, r.ended)) || fail("Cannot write " + r.name + "'s playlist");
     }
-    // Every rendition's playlist (with parts, each states where the others have got to).
-    bool writePlaylists() {
+    // The playlists that changed, written in one pass (after each picture or stretch of sound is taken, so renditions
+    // whose parts end together are written once each, stating where the others have got to); the multivariant
+    // playlist and the MPD again once a rendition that joined late has its first part or segment.
+    bool flushPlaylists() {
         for (auto& o : video)
-            if (!writePlaylist(*o)) return false;
+            if (o->due && !writePlaylist(*o)) return false;
         for (auto& o : audio)
-            if (!writePlaylist(*o)) return false;
+            if (o->due && !writePlaylist(*o)) return false;
+        if (announceDue) {
+            bool ready = true;
+            for (const auto& a : audio)
+                if (a->joinSample >= 0 && (a->segments.empty() || (a->segments.front().parts.empty() && !a->segments.front().complete))) ready = false;
+            if (ready) {
+                announceDue = false;
+                return announce();
+            }
+        }
         return true;
     }
 
@@ -1048,19 +1083,32 @@ struct LivePackager::State {
         if (parts) {
             s.parts.push_back({seconds, r.video ? r.firstChunkOfSegment : true});
             r.firstChunkOfSegment = false;
-            return writePlaylists();
+            r.due = true;
+            std::lock_guard lock(m);
+            ++st.parts;
         }
         return true;
     }
 
     // ---- Captions ----
 
-    bool openCaptions() {
+    // A caption rendition: for the feed's service or channel `id` ("" the first the feed turns out to have).
+    bool openCaptions(const std::string& id) {
         auto r = std::make_unique<Rendition>();
         r->video = false, r->text = true;
-        r->language = set.captionLanguage.empty() ? "und" : set.captionLanguage;
-        r->label = !set.captionName.empty() ? set.captionName : "Captions";
-        r->name = "s1_" + pathName(r->language);
+        r->ccId = id;
+        const auto named = set.captionLanguages.find(id);
+        const bool main = captions.empty();
+        r->language = named != set.captionLanguages.end() && !named->second.empty() ? named->second
+                      : main || id == "SERVICE1" || id == "CC1"                      ? (set.captionLanguage.empty() ? "und" : set.captionLanguage)
+                                                                                     : "und";
+        // (its name in the players' menus, unique: the first's as set, the others' with the service or channel)
+        const std::string base = !set.captionName.empty() ? set.captionName : "Captions";
+        const std::string what = id.rfind("SERVICE", 0) == 0 ? "Service " + id.substr(7) : id;
+        r->label = main ? base : base + " (" + what + ")";
+        for (int n = 2; std::any_of(captions.begin(), captions.end(), [&](const std::unique_ptr<Rendition>& c) { return c->label == r->label; }); ++n)
+            r->label = base + " (" + what + ") " + std::to_string(n);
+        r->name = "s" + std::to_string(captions.size() + 1) + "_" + pathName(r->language);
         std::string why;
         const std::string dir = renditionDir(r->name, &why);
         if (dir.empty()) return fail(why);
@@ -1068,61 +1116,117 @@ struct LivePackager::State {
             const std::vector<uint8_t> init = stppInit(r->language);
             if (!writeAtomically(dir + "/init.mp4", init.data(), init.size())) return fail("Cannot write " + dir + "/init.mp4");
         }
-        captions = std::move(r);
+        captions.push_back(std::move(r));
         std::lock_guard lock(m);
         st.captioned = true;
+        st.captionStreams.push_back(id);
         return true;
     }
 
-    // The captions of a segment of the pictures (its number, first frame and length): what the feed's caption data
-    // shows over it, decoded again with what came since (a caption still up runs to the segment's end and goes on in
-    // the next), as a WebVTT segment for HLS and an IMSC 1 fragment for DASH.
-    bool writeCaptions(const Segment& vs, bool last) {
-        if (!captions) return true;
-        Rendition& r = *captions;
+    // The feed's caption services and channels as they stand (the last half minute and more of its caption data),
+    // each built as it is shown (roll-up and paint-on a line at a time).
+    std::vector<CcCaptionStream> captionStreams() const {
+        if (cc.empty()) return {};
+        const std::vector<std::pair<double, CcTriplet>> list(cc.begin(), cc.end());
+        return captionStreamsFromCc(list, Rational{fps.num, fps.den}, true);
+    }
+
+    // Renditions for services and channels that have turned up, the first one listed with no service yet taking the
+    // first of them. True when one was opened.
+    bool captionsFor(const std::vector<CcCaptionStream>& streams, bool* opened) {
+        *opened = false;
+        for (const CcCaptionStream& c : streams) {
+            if (ccIds.count(c.id)) continue;
+            ccIds.insert(c.id);
+            Rendition* waiting = nullptr;
+            for (auto& r : captions)
+                if (r->ccId.empty()) waiting = r.get();
+            if (waiting) {
+                waiting->ccId = c.id;
+                std::lock_guard lock(m);
+                for (std::string& n : st.captionStreams)
+                    if (n.empty()) n = c.id;
+                continue;
+            }
+            if (captions.size() >= 16) break;
+            if (!openCaptions(c.id)) return false;
+            *opened = true;
+        }
+        return true;
+    }
+
+    // The captions of a segment of the pictures (its number, first frame and length): what each of the feed's caption
+    // services and channels shows over it, decoded again with what came since (a caption still up runs to the
+    // segment's end and goes on in the next), as a WebVTT segment for HLS and an IMSC 1 fragment for DASH; only
+    // `only` when given (a rendition just opened catching up).
+    bool writeCaptions(const Segment& vs, bool last, const std::vector<CcCaptionStream>* decoded = nullptr, Rendition* only = nullptr) {
+        if (captions.empty()) return true;
         const Rational rate{fps.num, fps.den};
         const int64_t from = (vs.number - 1) * segFrames, to = from + std::max<int64_t>(1, std::llround(vs.seconds * av_q2d(fps)));
-        std::vector<Caption> all, part;
-        if (!cc.empty()) {
-            const std::vector<std::pair<double, CcTriplet>> list(cc.begin(), cc.end());
-            if (!captionsFromCc(list, rate, all)) all.clear();
+        std::vector<CcCaptionStream> own;
+        if (!decoded) own = captionStreams(), decoded = &own;
+        int64_t cues = 0;
+        for (auto& rp : captions) {
+            Rendition& r = *rp;
+            if (only && only != &r) continue;
+            std::vector<Caption> part;
+            for (const CcCaptionStream& c : *decoded) {
+                if (c.id != r.ccId) continue;
+                for (Caption k : c.captions) {
+                    if (k.end <= from || k.start >= to) continue;
+                    k.start = std::max<FrameTime>(k.start, from), k.end = std::min<FrameTime>(k.end, to);
+                    part.push_back(std::move(k));
+                }
+            }
+            const std::string dir = folder + "/" + r.name + "/";
+            if (set.hls) {
+                // (cue times are the presentation's, as the pictures' are: from 0 in CMAF, from kTsOffset in MPEG-TS)
+                std::string vtt = captionsToVtt(part, rate);
+                const size_t nl = vtt.find('\n');
+                vtt.insert(nl == std::string::npos ? vtt.size() : nl + 1, "X-TIMESTAMP-MAP=MPEGTS:" + std::to_string(ts ? kTsOffset : 0) + ",LOCAL:00:00:00.000\n");
+                if (!writeAtomically(dir + segName(vs.number, "vtt"), vtt)) return fail("Cannot write " + dir + segName(vs.number, "vtt"));
+            }
+            if (set.dash) {
+                const int64_t startMs = std::llround(seconds(from) * 1000), endMs = std::llround(seconds(to) * 1000);
+                const std::vector<uint8_t> frag = stppSegment(++r.textSequence, uint64_t(startMs), uint32_t(std::max<int64_t>(1, endMs - startMs)),
+                                                              captionsToTtml(part, rate, r.language));
+                if (!writeAtomically(dir + segName(vs.number, "m4s"), frag.data(), frag.size())) return fail("Cannot write " + dir + segName(vs.number, "m4s"));
+            }
+            Segment s;
+            s.number = vs.number, s.start = vs.start, s.seconds = vs.seconds, s.complete = true;
+            r.segments.push_back(s);
+            while (int(r.segments.size()) > 2 * set.window + 2) {
+                QFile::remove(QString::fromStdString(dir + segName(r.segments.front().number, "vtt")));
+                QFile::remove(QString::fromStdString(dir + segName(r.segments.front().number, "m4s")));
+                r.segments.pop_front();
+            }
+            cues += int64_t(part.size());
+            if (!writePlaylist(r, last)) return false;
         }
-        for (Caption c : all) {
-            if (c.end <= from || c.start >= to) continue;
-            c.start = std::max<FrameTime>(c.start, from), c.end = std::min<FrameTime>(c.end, to);
-            part.push_back(std::move(c));
-        }
-        const std::string dir = folder + "/" + r.name + "/";
-        if (set.hls) {
-            // (cue times are the presentation's, as the pictures' are: from 0 in CMAF, from kTsOffset in MPEG-TS)
-            std::string vtt = captionsToVtt(part, rate);
-            const size_t nl = vtt.find('\n');
-            vtt.insert(nl == std::string::npos ? vtt.size() : nl + 1, "X-TIMESTAMP-MAP=MPEGTS:" + std::to_string(ts ? kTsOffset : 0) + ",LOCAL:00:00:00.000\n");
-            if (!writeAtomically(dir + segName(vs.number, "vtt"), vtt)) return fail("Cannot write " + dir + segName(vs.number, "vtt"));
-        }
-        if (set.dash) {
-            const int64_t startMs = std::llround(seconds(from) * 1000), endMs = std::llround(seconds(to) * 1000);
-            const std::vector<uint8_t> frag = stppSegment(++r.textSequence, uint64_t(startMs), uint32_t(std::max<int64_t>(1, endMs - startMs)),
-                                                          captionsToTtml(part, rate, r.language));
-            if (!writeAtomically(dir + segName(vs.number, "m4s"), frag.data(), frag.size())) return fail("Cannot write " + dir + segName(vs.number, "m4s"));
-        }
-        Segment s;
-        s.number = vs.number, s.start = vs.start, s.seconds = vs.seconds, s.complete = true;
-        r.segments.push_back(s);
-        while (int(r.segments.size()) > 2 * set.window + 2) {
-            QFile::remove(QString::fromStdString(dir + segName(r.segments.front().number, "vtt")));
-            QFile::remove(QString::fromStdString(dir + segName(r.segments.front().number, "m4s")));
-            r.segments.pop_front();
-        }
+        if (only) return true;
         // (what came before the next segment's last half minute is no longer needed)
         const double keep = seconds(to) - 30;
         while (!cc.empty() && cc.front().first < keep) cc.pop_front();
-        {
-            std::lock_guard lock(m);
-            ++st.captionSegments;
-            st.captionCues += int64_t(part.size());
-        }
-        return writePlaylist(r, last);
+        std::lock_guard lock(m);
+        ++st.captionSegments;
+        st.captionCues += cues;
+        return true;
+    }
+
+    // At a segment's end: renditions for caption services and channels that turned up in it (the segments made so far
+    // written for each, the renditions announced again), then every rendition's captions of it.
+    bool segmentCaptions(const Segment& vs, bool last) {
+        if (!mastered || set.captions == "none" || (captions.empty() && !ccSeen)) return writeCaptions(vs, last);
+        const std::vector<CcCaptionStream> decoded = captionStreams();
+        const size_t before = captions.size();
+        bool opened = false;
+        if (!captionsFor(decoded, &opened)) return false;
+        if (opened && !video.empty())
+            for (size_t k = before; k < captions.size(); ++k)
+                for (const Segment& g : video.front()->segments)
+                    if (g.complete && g.number < vs.number && !writeCaptions(g, false, &decoded, captions[k].get())) return false;
+        if (!writeCaptions(vs, last, &decoded)) return false;
+        return !opened || announce();
     }
 
     // ---- Chapters ----
@@ -1162,10 +1266,8 @@ struct LivePackager::State {
         if (!firstSegment && front) {
             // (the timeline stated from now: every rendition's playlist so far)
             firstSegment = true;
-            for (auto& o : video)
-                if (o.get() != &r && !writePlaylist(*o)) return false;
-            for (auto& o : audio)
-                if (!writePlaylist(*o)) return false;
+            for (auto& o : video) o->due = true;
+            for (auto& o : audio) o->due = true;
         }
         // The window: the playlists list `window` segments; a segment's files stay for its own length and the
         // playlist's after it leaves (RFC 8216 6.2.2: a player paused, behind a CDN or at the window's start may still
@@ -1179,7 +1281,7 @@ struct LivePackager::State {
             r.segments.pop_front();
         }
         if (front) {
-            if (!writeCaptions(s, last)) return false;
+            if (!segmentCaptions(s, last)) return false;
             if (!chapterList.empty() && !writeChapters()) return false;
             std::lock_guard lock(m);
             st.segments = r.current;
@@ -1200,7 +1302,9 @@ struct LivePackager::State {
             }
             if (mastered && !writeMpd(false, 0)) return false;
         }
-        return writePlaylist(r, last);
+        r.ended = r.ended || last;
+        r.due = true;
+        return true;
     }
 
     // Where a packet of a rendition goes: segment `k` (from 1), part `j`.
@@ -1270,6 +1374,19 @@ struct LivePackager::State {
     // yet, or (`again`) those still ahead of picture `index` (each segment's start repeats them for players that
     // join between the message and its splice; the same id, so a player raises each once).
     void signal(Placed& p, bool again = false, int64_t index = 0) {
+        if (p.cancelled) {
+            if (again ? !(p.cancelSignalled && p.frame > index) : p.cancelSignalled) return;
+            for (auto& v : video) {
+                if (!v->cmaf) continue;
+                const uint32_t scale = uint32_t(v->cmaf->timescale.den / std::max(1, v->cmaf->timescale.num));
+                const auto at = [&](int64_t frame) { return uint64_t(std::llround(seconds(frame) * scale)); };
+                const std::vector<uint8_t> e = emsgBox(scale, at(p.cancelFrame), uint32_t(at(p.frame) - at(p.cancelFrame)), uint32_t(p.id * 2 + 1),
+                                                       kScte35Scheme, "1", p.cancelMessage);
+                v->emsg.insert(v->emsg.end(), e.begin(), e.end());
+            }
+            p.cancelSignalled = true;
+            return;
+        }
         const bool out = again ? p.signalled && p.frame > index : !p.signalled;
         const bool in = p.back >= 0 && !p.in.empty() && (again ? p.inSignalled && p.back > index : !p.inSignalled);
         if (!out && !in) return;
@@ -1294,6 +1411,7 @@ struct LivePackager::State {
     void publishCues() {
         std::vector<LiveCueStatus> list;
         for (const Placed& p : placed) {
+            if (p.cancelled) continue;
             LiveCueStatus c;
             c.id = p.id, c.frame = p.frame, c.seconds = seconds(p.frame);
             c.duration = p.back >= 0 ? seconds(p.back - p.frame) : p.cue.duration;
@@ -1334,18 +1452,34 @@ struct LivePackager::State {
                 continue;
             }
             if (a.fromFeed && a.cue.cancel) {
-                // A cancel: the feed's break of that event not yet begun taken off (its message, if sent, stays sent).
-                const size_t was = placed.size();
-                placed.erase(std::remove_if(placed.begin(), placed.end(),
-                                            [&](const Placed& p) { return p.fromFeed && p.cue.eventId == a.cue.eventId && p.frame > index && !p.keyframe; }),
-                             placed.end());
-                changed = changed || placed.size() != was;
+                // A cancel: the feed's break of that event not yet begun taken off; one whose event message went out
+                // is ended for DASH players by the cancel (as an event of its own, signal).
+                for (auto it = placed.begin(); it != placed.end();) {
+                    Placed& p = *it;
+                    if (!p.fromFeed || p.cancelled || p.cue.eventId != a.cue.eventId || p.frame <= index || p.keyframe) {
+                        ++it;
+                        continue;
+                    }
+                    changed = true;
+                    if (!p.signalled) {
+                        it = placed.erase(it);
+                        continue;
+                    }
+                    p.cancelled = true;
+                    // (from when it came on the feed's clock, when the pictures here are behind it)
+                    p.cancelFrame = std::min(std::max(index, frame), p.frame - 1);
+                    p.cancelMessage = a.cue.scte35;
+                    p.back = -1;
+                    p.in.clear();
+                    signal(p);
+                    ++it;
+                }
                 continue;
             }
             // (a message the feed repeats ahead of its splice: the cue placed already)
             if (a.fromFeed && !a.cue.other &&
                 std::any_of(placed.begin(), placed.end(), [&](const Placed& p) {
-                    return p.fromFeed && !p.cue.other && !p.cue.returning && p.cue.eventId == a.cue.eventId &&
+                    return p.fromFeed && !p.cancelled && !p.cue.other && !p.cue.returning && p.cue.eventId == a.cue.eventId &&
                            (a.cue.returning ? p.returnSeen : !p.returned);
                 }))
                 continue;
@@ -1353,7 +1487,7 @@ struct LivePackager::State {
                 // The return of a break: the feed's by its event id, one placed here the latest still out.
                 Placed* out = nullptr;
                 for (auto it = placed.rbegin(); it != placed.rend() && !out; ++it)
-                    if (!it->cue.other && !it->cue.returning && !it->returned && it->fromFeed == a.fromFeed &&
+                    if (!it->cancelled && !it->cue.other && !it->cue.returning && !it->returned && it->fromFeed == a.fromFeed &&
                         (a.fromFeed ? it->cue.eventId == a.cue.eventId : it->back < 0))
                         out = &*it;
                 if (out) {
@@ -1418,7 +1552,7 @@ struct LivePackager::State {
             if (&r == video.front().get()) {
                 bool marked = false;
                 for (Placed& p : placed)
-                    if (p.frame == i && !p.keyframe && (r.pkt->flags & AV_PKT_FLAG_KEY)) p.keyframe = marked = true;
+                    if (!p.cancelled && p.frame == i && !p.keyframe && (r.pkt->flags & AV_PKT_FLAG_KEY)) p.keyframe = marked = true;
                 if (marked) publishCues();
             }
             if (!place(r, k, j)) return false;
@@ -1436,7 +1570,7 @@ struct LivePackager::State {
             if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return true;
             if (rc < 0) return fail("Encoding the sound failed: " + (r.extended && !r.extended->error.empty() ? r.extended->error : averr(rc)));
             // (the encoder's priming, before 0, is left out: the presentation starts with the pictures)
-            if (r.pkt->pts == AV_NOPTS_VALUE || r.pkt->pts < 0) {
+            if (r.pkt->pts == AV_NOPTS_VALUE || r.pkt->pts < 0 || r.pkt->pts < r.joinSample) {
                 av_packet_unref(r.pkt);
                 continue;
             }
@@ -1470,6 +1604,7 @@ struct LivePackager::State {
         // (a cue on a picture that was dropped goes on the first after it)
         bool moved = false;
         for (Placed& p : placed) {
+            if (p.cancelled) continue;
             if (p.frame > encodedIndex && p.frame < index) p.frame = index, moved = true;
             if (p.back > encodedIndex && p.back < index) p.back = std::max(index, p.frame + 1), moved = true;
         }
@@ -1479,7 +1614,8 @@ struct LivePackager::State {
         if (segment != before)
             for (Placed& p : placed)
                 if (p.placedAt != index) signal(p, true, index);
-        const bool cueHere = std::any_of(placed.begin(), placed.end(), [&](const Placed& p) { return p.frame == index || p.back == index; });
+        const bool cueHere =
+            std::any_of(placed.begin(), placed.end(), [&](const Placed& p) { return !p.cancelled && (p.frame == index || p.back == index); });
         const bool start = segment != before || cueHere;
         encodedSegment = segment;
         encodedEnd = seconds(index + 1);
@@ -1544,14 +1680,24 @@ struct LivePackager::State {
         Rendition* found = audioTrack(track);
         if (!found) {
             if (set.audioCodec.empty() || set.audioCodec == "none" || !opened) return true;
-            // (sound starting a segment or more after the pictures is left out: the renditions were announced; and a
-            // track the feed did not name)
-            if (mastered || track < 0 || track >= expectedTracks() || audio.size() >= 16) return true;
+            // (a track the feed did not name is left out)
+            if (track < 0 || track >= expectedTracks() || audio.size() >= 16) return true;
             if (!openAudio(f, track)) return false;
             found = audio.back().get();
             found->nextPts = (f->pts == AV_NOPTS_VALUE ? 0 : f->pts) * 48000 / std::max(1, f->sample_rate) -
                              firstPicture * 48000 * fps.den / std::max(1, fps.num);
             if (found->nextPts < 0) found->nextPts = 0;
+            if (mastered) {
+                // Sound starting after the renditions were announced: it joins at the next segment's start (what came
+                // before is left out), and is announced once it has a part or segment there.
+                const double at = double(found->nextPts) / 48000;
+                found->joinSample = std::llround(std::ceil(at / segSeconds - 1e-9) * segSeconds * 48000);
+                if (found->cmaf) found->cmaf->keepTimes();
+                announceDue = true;
+                std::stable_sort(audio.begin(), audio.end(), [](const auto& a, const auto& b) { return a->track < b->track; });
+                std::lock_guard lock(m);
+                st.lateRenditions.push_back(found->name);
+            }
         }
         Rendition& r = *found;
         if (!r.swr) {
@@ -1573,6 +1719,11 @@ struct LivePackager::State {
         const int got = swr_convert(r.swr, out->data, most, const_cast<const uint8_t**>(f->extended_data), f->nb_samples);
         if (got > 0) av_audio_fifo_write(r.fifo, reinterpret_cast<void**>(out->data), got);
         av_frame_free(&out);
+        if (r.joinSample > r.nextPts) {  // (joining late: nothing before its first segment's start)
+            const int drop = int(std::min<int64_t>(av_audio_fifo_size(r.fifo), r.joinSample - r.nextPts));
+            av_audio_fifo_drain(r.fifo, drop);
+            r.nextPts += drop;
+        }
         return encodeSoundFifo(r, false);
     }
 
@@ -1581,7 +1732,7 @@ struct LivePackager::State {
         std::vector<std::string> names;
         for (auto& v : video) names.push_back(v->name);
         for (auto& a : audio) names.push_back(a->name);
-        if (captions) names.push_back(captions->name);
+        for (auto& c : captions) names.push_back(c->name);
         const bool ok = writeMaster() && writeMpd(false, 0);
         std::lock_guard lock(m);
         st.renditions = names;
@@ -1605,6 +1756,7 @@ struct LivePackager::State {
             if (!takeAudio(*a) || !endSegment(*a, true)) return false;
         }
         if (!chapterList.empty() && !writeChapters()) return false;
+        if (!flushPlaylists()) return false;
         double duration = 0;
         for (auto& v : video)
             if (!v->segments.empty()) duration = std::max(duration, v->segments.back().start + v->segments.back().seconds);
@@ -1628,7 +1780,7 @@ struct LivePackager::State {
             writePlaylist(*v, true);
         }
         for (auto& a : audio) writePlaylist(*a, true);
-        if (captions) writePlaylist(*captions, true);
+        for (auto& c : captions) writePlaylist(*c, true);
         if (mastered) writeMpd(true, duration);
     }
 
@@ -1652,16 +1804,20 @@ struct LivePackager::State {
             if (ok && opened && !mastered && (int(audio.size()) >= expectedTracks() || noSound || (!video.empty() && video.front()->current >= 2))) {
                 mastered = true;
                 std::stable_sort(audio.begin(), audio.end(), [](const auto& a, const auto& b) { return a->track < b->track; });
-                if (set.captions == "always" || (set.captions == "auto" && ccSeen)) ok = openCaptions();
-                ok = ok && announce();
-            } else if (ok && mastered && !captions && set.captions == "auto" && ccSeen && !video.empty() && video.front()->segments.size() >= 2 &&
-                       video.front()->segments.front().complete) {
-                ok = openCaptions();
-                // (the segments made so far: their captions now)
-                for (const Segment& g : video.front()->segments)
-                    if (ok && g.complete) ok = writeCaptions(g, false);
+                // ("always": one listed from the start, for the first service or channel the feed turns out to have)
+                if (set.captions == "always") ok = openCaptions("");
+                if (ok && set.captions != "none" && ccSeen) {
+                    bool opened = false;
+                    const std::vector<CcCaptionStream> decoded = captionStreams();
+                    ok = captionsFor(decoded, &opened);
+                    // (the segments made so far: their captions now)
+                    if (ok && opened && !video.empty())
+                        for (const Segment& g : video.front()->segments)
+                            if (ok && g.complete) ok = writeCaptions(g, false, &decoded);
+                }
                 ok = ok && announce();
             }
+            if (ok && opened) ok = flushPlaylists();
             av_frame_free(&it.frame);
             if (failed && !closedAfterError) closeAfterError();
         }

@@ -82,8 +82,9 @@ struct CaptureSettings {
     // Every sound stream of the feed, not only the one recorded (a network stream's or file's: each language of a
     // broadcast, its commentary, its descriptions): the others given apart, track 1 on, placed against the pictures as
     // the recorded one is, at 48 kHz in planar float with their own channels (at most 8). `onSoundTracks` names them
-    // all (track 0 the recorded one) before the first picture is given. The file records track 0 only. (The feed's
-    // own sound streams: not with a sound device of its own.)
+    // all (track 0 the recorded one) before the first picture is given. A QuickTime or MXF file (not JPEG XS's)
+    // records each as a track of its own, in the language the feed states, after track 0. (The feed's own sound
+    // streams: not with a sound device of its own.)
     bool allSound = false;
     std::function<void(int track, const AVFrame* sound)> onTrackSound;
     struct SoundTrack {
@@ -172,6 +173,10 @@ private:
     mutable SwsContext* fullSws_ = nullptr;
     mutable int fullKey_[7] = {0, 0, -1, 0, 0, 0, 0};
 };
+
+// The feed's caption data kept beside a recording (".mcc" in place of its extension: MacCaption MCC, a line a frame
+// with every CTA-708 service and CEA-608 channel as it came), written once a picture brings any.
+std::string captionSidecar(const std::string& recording);
 
 // The clock CaptureSettings::label is asked by (seconds, steady).
 double captureClock();
