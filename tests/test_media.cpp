@@ -2980,8 +2980,12 @@ private slots:
             cs.recodeJpegXs = recode;
             cs.seconds = 2;
             Recorder rec;
+            // (the frames this test's sender skips, behind by more than a fifth of a second on a busy machine: the
+            // recording repeats a picture in each slot that came empty, as it should)
+            const int64_t skippedBefore = tx.slotsSkipped();
             QVERIFY2(rec.start(cs, &err), err.c_str());
             QVERIFY(rec.wait(20));
+            const int64_t skipped = tx.slotsSkipped() - skippedBefore;
             const CaptureStatus status = rec.status();
             QVERIFY2(status.error.empty(), status.error.c_str());
             QCOMPARE(status.frames, int64_t(50));
@@ -3004,7 +3008,11 @@ private slots:
                 if (previous < 0 || number == (previous + 1) % 32) ++inOrder;
                 previous = number;
             }
-            QVERIFY2(inOrder >= 47, qPrintable(QStringLiteral("%1 of 50 in order (recorder dropped %2, repeated %3)").arg(inOrder).arg(status.dropped).arg(status.repeated)));
+            // (a run of slots the sender skipped: a picture repeated in each, then the next picture sent; so at most two
+            // pictures out of order for each slot skipped)
+            QVERIFY2(inOrder >= 47 - 2 * skipped,
+                     qPrintable(QStringLiteral("%1 of 50 in order (recorder dropped %2, repeated %3; sender skipped %4 slots)")
+                                    .arg(inOrder).arg(status.dropped).arg(status.repeated).arg(skipped)));
         }
 #endif
     }
