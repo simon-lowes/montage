@@ -182,6 +182,14 @@ if(MONTAGE_WITH_BMX)
     GIT_TAG 346ba45dfd41f24f7582460caa56c9ef47dd9b4b  # v1.7, pinned by its commit (a tag can be moved)
     GIT_SUBMODULES "")
   FetchContent_MakeAvailable(bmx)
+  # bmx's JPEG XS parser takes codestreams of three components only, so it refuses one with alpha (four, which its
+  # component table already holds room for). Changed here before anything is compiled, once.
+  set(MONTAGE_BMX_JXS ${bmx_SOURCE_DIR}/src/essence_parser/JXSEssenceParser.cpp)
+  file(READ ${MONTAGE_BMX_JXS} MONTAGE_BMX_JXS_TEXT)
+  string(REPLACE "if (m_subDesc.JPEGXSNc != 3)" "if (m_subDesc.JPEGXSNc != 3 && m_subDesc.JPEGXSNc != 4)" MONTAGE_BMX_JXS_NEW "${MONTAGE_BMX_JXS_TEXT}")
+  if(NOT MONTAGE_BMX_JXS_NEW STREQUAL MONTAGE_BMX_JXS_TEXT)
+    file(WRITE ${MONTAGE_BMX_JXS} "${MONTAGE_BMX_JXS_NEW}")
+  endif()
   if(MINGW)
     # libMXF's Windows memory-mapped file guards its copies with MSVC's __try / __except, which GCC lacks.
     target_compile_options(MXF PRIVATE -include ${CMAKE_SOURCE_DIR}/third_party/bmx/mingw-seh.h)
