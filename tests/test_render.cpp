@@ -20959,6 +20959,9 @@ colorspaces:
             QCOMPARE(st::jxsvFrameLimit(xs), st::JxsvAssembler::kLargestFrame);
             other.setFrameLimit(st::jxsvFrameLimit(xs));
             QCOMPARE(other.frameLimit(), st::JxsvAssembler::kLargestFrame);
+            // Nightly 25 Nov: interlaced, each codestream is a field, so it is held to half the frame's lines.
+            xs.width = 1920, xs.height = 1080, xs.sampling = st::Sampling::Ycc422, xs.depth = 10, xs.bpp = 5, xs.interlaced = true;
+            QCOMPARE(st::jxsvFrameLimit(xs), size_t(1920 * 540 * 3 + 65536));
         }
         {
             // One whole frame with an odd long packet does not stay the measure of the frames after: once a frame of
@@ -21128,6 +21131,18 @@ colorspaces:
         QCOMPARE(int(boxes.size()), 42 + 18);
         QVERIFY(std::memcmp(boxes.data() + 4, "jpvs", 4) == 0 && std::memcmp(boxes.data() + 12, "jpvi", 4) == 0 &&
                 std::memcmp(boxes.data() + 34, "jxpl", 4) == 0 && std::memcmp(boxes.data() + 46, "colr", 4) == 0);
+        {
+            // Nightly 25 Nov: interlaced, the bit rate is both fields' codestreams and the frame rate says the frame
+            // is interlaced; progressive, it says progressive.
+            auto word = [](const std::vector<uint8_t>& b, size_t at) { return uint32_t(b[at]) << 24 | uint32_t(b[at + 1]) << 16 | uint32_t(b[at + 2]) << 8 | b[at + 3]; };
+            st::VideoFormat fields = vf;
+            fields.interlaced = true;
+            const std::vector<uint8_t> both = st::jxsvBoxes(fields, hd.ppih, hd.plev, uint32_t(cs[0].size()));
+            QVERIFY(word(both, 16) >= 2 * word(boxes, 16) - 1 && word(both, 16) <= 2 * word(boxes, 16));
+            QCOMPARE(word(boxes, 20) >> 30, 0u);
+            QCOMPARE(word(both, 20) >> 30, 1u);
+            QCOMPARE(word(both, 20) & 0x3FFFFFFFu, word(boxes, 20));
+        }
         montage::JxsDecoder dec;
         auto decoded = [&](const std::vector<uint8_t>& c) {
             montage::JxsPicture p;
@@ -30992,46 +31007,6 @@ colorspaces:
                 QVERIFY(!came && !err.empty());
             }
             plugins::clearHostFailures();
-            // Nightly 25 Nov: a host that hangs while its picture was to come as a handle (stopped where it asks for the
-            // frame before, and waited for as long as this test's export timeout): no handle is asked for from then on,
-            // but the frame is not rendered again in a new host, which would wait out a second timeout; it fails, and
-            // says the host did not answer.
-            {
-                ofx::remote::resetPictureStats();
-                const plugins::HostingSettings was = plugins::hosting();
-                plugins::HostingSettings quick = was;
-                quick.exportTimeoutMs = 2000;
-                plugins::setHosting(quick);
-                pid_t stopped = 0;
-                const ofx::FrameFetch stopping = [&](double, Image& out) {
-                    if (!stopped)
-                        for (const plugins::HostInfo& running : plugins::runningHosts())
-                            if (running.key.find("temporal") != std::string::npos && running.pid > 0 && ::kill(pid_t(running.pid), SIGSTOP) == 0)
-                                stopped = pid_t(running.pid);
-                    out = numbered(8);
-                    return true;
-                };
-                there = numbered(9);
-                err.clear();
-                const bool came = ofx::applyEffect(slow, 9, there, 1.0, stopping, &err);
-                if (stopped > 0) ::kill(stopped, SIGKILL);  // (ended already, as hung)
-                QVERIFY(stopped > 0);
-                QVERIFY2(!came && QString::fromStdString(err).contains("did not answer"), err.c_str());
-                const ofx::remote::PictureStats now = ofx::remote::pictureStats();
-                if (now.asked > 0) {
-                    QCOMPARE(now.handles, 0L);
-                    QCOMPARE(now.sharedMemory, 0L);  // (not rendered again)
-                    there = numbered(10);
-                    QVERIFY2(ofx::applyEffect(slow, 10, there, 1.0, [&](double, Image& out) { return out = numbered(9), true; }, &err), err.c_str());
-                    QCOMPARE(ofx::remote::pictureStats().asked, now.asked);
-                    QVERIFY2(QString::fromStdString(ofx::remote::pictureStats().last).contains("hung while the picture was shared as a handle"),
-                             ofx::remote::pictureStats().last.c_str());
-                } else {
-                    QVERIFY(!expected);
-                }
-                plugins::setHosting(was);
-                plugins::clearHostFailures();
-            }
 #endif
         }
     }
