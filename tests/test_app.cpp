@@ -25372,6 +25372,88 @@ print("added " + ui["name"])
 #endif
     }
 
+    void hdrViewerWhenWestonGoes() {
+        // Under Weston (scripts/wayland-hdr-check.sh's "gone" run, in CI), with Qt's reconnection to a compositor on
+        // (QT_WAYLAND_RECONNECT): the viewer shows HDR on a PQ output, its Weston is killed, and Qt connects to the
+        // Weston that took over (MONTAGE_TEST_WESTON_NEXT, colour management on and an SDR output). Montage stays up:
+        // the viewer says the compositor went away, is shown by the new Weston (its screenshot the SDR picture's
+        // grey) and stays SDR there, saying why (asked again on the new display, which is not HDR).
+        const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
+        const qint64 westonPid = qEnvironmentVariableIntValue("MONTAGE_TEST_WESTON_PID");
+        const QByteArray next = qgetenv("MONTAGE_TEST_WESTON_NEXT");
+        if (log.isEmpty() || westonPid <= 0 || next.isEmpty() || !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
+            QSKIP("Runs under Weston with a second one to take over (scripts/wayland-hdr-check.sh)");
+#ifndef MONTAGE_HDR_VIEWER
+        QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
+#else
+        QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
+        QVERIFY2(qEnvironmentVariableIsSet("QT_WAYLAND_RECONNECT"), "Qt's reconnection is not on");
+        const bool throughQt = hdrViewerOnWaylandThroughQt();
+        win_->hide();
+        auto restore = qScopeGuard([this] { win_->show(); });
+        ViewerWidget viewer;
+        viewer.showFullScreen();
+        QVERIFY(QTest::qWaitForWindowExposed(&viewer));
+        QImage sdr(viewer.size(), QImage::Format_RGBA8888);
+        sdr.fill(QColor(90, 90, 90));
+        viewer.setImage(sdr, 0);
+        auto ramp = std::make_shared<HdrPicture>();
+        ramp->width = 64, ramp->height = 8;
+        ramp->contentPeak = 800.0 / 203;
+        ramp->mastering = hdrMasteringPrimaries(*findColorSpace("rec2100pq"));
+        std::vector<float> texels(size_t(ramp->width) * size_t(ramp->height) * 4);
+        for (size_t i = 0; i < texels.size(); i += 4) {
+            texels[i] = texels[i + 1] = texels[i + 2] = float(double((i / 4) % size_t(ramp->width)) / 16);
+            texels[i + 3] = 1;
+        }
+        ramp->rgba.resize(texels.size());
+        qFloatToFloat16(reinterpret_cast<qfloat16*>(ramp->rgba.data()), texels.data(), qsizetype(texels.size()));
+        QStringList said;  // (what the viewer said, each time that changed)
+        connect(&viewer, &ViewerWidget::hdrChanged, &viewer, [&] { said << viewer.hdrStatus(); });
+        viewer.setHdrViewer(true);
+        viewer.setHdrPicture(ramp);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->framesDrawn() > 0, qPrintable(viewer.hdrStatus()), 10000);
+        // Killed as a crash would end it, the next Weston named for Qt's connection again. (Qt lets the old Weston's
+        // screen go as it connects again, and the new one's output is another.)
+        const QPointer<QScreen> was = viewer.windowHandle()->screen();
+        qputenv("WAYLAND_DISPLAY", next);
+        QCOMPARE(QProcess::execute(QStringLiteral("kill"), {QStringLiteral("-KILL"), QString::number(westonPid)}), 0);
+        QTRY_VERIFY2_WITH_TIMEOUT(was.isNull() && viewer.windowHandle() && viewer.windowHandle()->isExposed() &&
+                                      QGuiApplication::screens().size() == 1 && !QGuiApplication::screens().first()->name().isEmpty(),
+                                  "the viewer is not shown by the Weston that took over", 30000);
+        qInfo().noquote() << "The viewer said:" << said.join(QStringLiteral(" | "));
+        if (!throughQt) {
+            QTRY_VERIFY2_WITH_TIMEOUT(said.contains(QStringLiteral("The Wayland compositor went away")), qPrintable(said.join(QStringLiteral(" | "))), 10000);
+            QTest::qWait(2500);  // (the viewer asks again on the new display)
+            QVERIFY2(!viewer.hdrShowing() && !viewer.hdrStatus().isEmpty(), qPrintable(said.join(QStringLiteral(" | "))));
+            qInfo().noquote() << "On the new Weston's display the viewer says:" << viewer.hdrStatus();
+        }
+        // The new Weston's screenshot (its screenshooter finds it by WAYLAND_DISPLAY): the SDR grey, as Weston shows
+        // sRGB on an SDR output.
+        const QString shooter = qEnvironmentVariable("MONTAGE_TEST_WESTON_SCREENSHOOTER");
+        const QDir shots(qEnvironmentVariable("XDG_PICTURES_DIR"));
+        QVERIFY2(!shooter.isEmpty() && shots.exists(), "MONTAGE_TEST_WESTON_SCREENSHOOTER or XDG_PICTURES_DIR is not set");
+        QString grey;
+        bool right = false;
+        for (int attempt = 0; attempt < 6 && !right; ++attempt) {  // (until the viewer has painted and Weston repainted)
+            QTest::qWait(500);
+            QVERIFY2(QProcess::execute(shooter, {}) == 0, "Weston's screenshooter failed");
+            const QStringList pngs = shots.entryList({QStringLiteral("wayland-screenshot-*.png")}, QDir::Files, QDir::Time);
+            QVERIFY2(!pngs.isEmpty(), "Weston's screenshooter wrote no picture");
+            const QImage shot = QImage(shots.filePath(pngs.first())).convertToFormat(QImage::Format_RGB32);
+            QVERIFY2(!shot.isNull(), "Weston's screenshot cannot be read");
+            QFile::remove(shots.filePath(QStringLiteral("after.png")));
+            QFile::rename(shots.filePath(pngs.first()), shots.filePath(QStringLiteral("after.png")));
+            const QRgb px = shot.pixel(shot.width() / 2, shot.height() / 2);
+            grey = QStringLiteral("%1 %2 %3").arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px));
+            right = std::abs(qRed(px) - 90) <= 3 && std::abs(qGreen(px) - 90) <= 3 && std::abs(qBlue(px) - 90) <= 3;
+        }
+        qInfo().noquote() << "The new Weston shows the viewer's grey (sRGB 90) as" << grey;
+        if (!throughQt) QVERIFY2(right, qPrintable(grey));
+#endif
+    }
+
     void workspaces() {
         auto dock = [this](const char* name) { return win_->findChild<QDockWidget*>(name); };
         // On screen: shown and in front (Qt moves the panels behind a tab out of sight rather than hiding them).

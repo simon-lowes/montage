@@ -9,7 +9,9 @@
 # Weston that died or did not stop cleanly. Then a fourth time under a Weston with two outputs, one SDR and one PQ (its
 # Wayland backend, each output a window of an outer headless Weston; both with the desktop shell), where test_app's
 # hdrViewerOnTwoOutputs moves the viewer from one output to the other and reads its enter events in Weston's protocol
-# log. The same checks serve a build with Montage's binding of the protocol and one where Qt describes the surface
+# log. Last, with Qt's reconnection on, the PQ output's Weston is killed under hdrViewerWhenWestonGoes and a second
+# Weston (an SDR output) takes Qt's connection: Montage must stay up, the viewer SDR with the reason, shown by the second.
+# The same checks serve a build with Montage's binding of the protocol and one where Qt describes the surface
 # (-DMONTAGE_WAYLAND_BINDING=OFF, Qt 6.10.2 or later).
 #
 #   scripts/wayland-hdr-check.sh <weston prefix> <test_app> <work directory>
@@ -31,6 +33,12 @@ outer=""
 cleanup() {
   [ -z "$weston" ] || kill "$weston" 2> /dev/null || true
   [ -z "$outer" ] || kill "$outer" 2> /dev/null || true
+}
+# The "on" run's output: BT.2100 PQ (BT.2020, reference white 203 nits, a 1000-nit target).
+pq_ini() {  # file
+  printf '[core]\ncolor-management=true\n\n[output]\nname=headless\neotf-mode=st2084\ncolorimetry-mode=bt2020rgb\n' > "$1"
+  printf 'color-profile=montage-hdr\n\n[color-profile]\nname=montage-hdr\nprim_named=bt2020\ntf_named=st2084\n' >> "$1"
+  printf 'min_lum=0.005\nmax_lum=10000\nref_lum=203\ntarget_min_lum=0.005\ntarget_max_lum=1000\n' >> "$1"
 }
 trap cleanup EXIT
 
@@ -70,26 +78,7 @@ run() {  # name color-management(true: a PQ output|sdr: an SDR output|false: off
   if [ "$cm" = sdr ]; then
     printf '[core]\ncolor-management=true\n' > "$dir/weston.ini"
   elif [ "$cm" = true ]; then
-    cat > "$dir/weston.ini" << EOF
-[core]
-color-management=true
-
-[output]
-name=headless
-eotf-mode=st2084
-colorimetry-mode=bt2020rgb
-color-profile=montage-hdr
-
-[color-profile]
-name=montage-hdr
-prim_named=bt2020
-tf_named=st2084
-min_lum=0.005
-max_lum=10000
-ref_lum=203
-target_min_lum=0.005
-target_max_lum=1000
-EOF
+    pq_ini "$dir/weston.ini"
   else
     printf '[core]\ncolor-management=false\n' > "$dir/weston.ini"
   fi
@@ -230,8 +219,64 @@ run_two() {
   fi
 }
 
+# Weston killed: the first Weston (PQ, as the "on" run's) is killed by the test itself; the second (an SDR output, as
+# the "sdr" run's) runs from the start, so Qt finds it the moment it connects again (Qt 6 ends the program if no
+# compositor answers then).
+run_gone() {
+  local dir="$work/gone"
+  rm -rf "$dir"
+  mkdir -p "$dir/shots"
+  pq_ini "$dir/weston.ini"
+  printf '[core]\ncolor-management=true\n' > "$dir/next.ini"
+  local status=0 next="" name
+  for name in weston next; do
+    LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      MESA_EXTENSION_OVERRIDE="-GL_EXT_shader_framebuffer_fetch_non_coherent" "$weston_prefix/bin/weston" \
+      --backend=headless --fake-seat --renderer=gl --width=1280 --height=720 --shell=kiosk --socket="montage-hdr-gone-$name" \
+      --config="$dir/$name.ini" --debug --log="$dir/$name.log" --logger-scopes=log,proto &
+    if [ "$name" = weston ]; then weston=$!; else next=$!; outer=$next; fi
+    started "$!" "montage-hdr-gone-$name" "$dir/$name.log" || status=1
+  done
+  if [ "$status" = 0 ]; then
+    echo "::group::gone"
+    WAYLAND_DISPLAY=montage-hdr-gone-weston QT_WAYLAND_RECONNECT=1 QT_QPA_PLATFORM=wayland QT_WAYLAND_DISABLE_WINDOWDECORATION=1 \
+      QTEST_FUNCTION_TIMEOUT=900000 MONTAGE_TEST_WESTON_LOG="$dir/weston.log" MONTAGE_TEST_WESTON_PID="$weston" \
+      MONTAGE_TEST_WESTON_NEXT=montage-hdr-gone-next XDG_PICTURES_DIR="$dir/shots" MONTAGE_TEST_WESTON_SCREENSHOOTER="$work/screenshooter" \
+      QT_LOGGING_RULES="qt.rhi.general=true;qt.qpa.wayland=true" \
+      "$test_app" hdrViewerWhenWestonGoes -o "$dir/result.txt,txt" -o -,txt || status=1
+    echo "::endgroup::"
+    if grep -q '^SKIP' "$dir/result.txt" 2> /dev/null; then
+      grep '^SKIP' -A1 "$dir/result.txt"
+      status=1
+    fi
+    sleep 1
+  fi
+  # The first must have been killed by the test (and so not be running), the second must have lived through it.
+  if [ -n "$weston" ]; then
+    if kill -0 "$weston" 2> /dev/null; then
+      echo "The test did not kill the first Weston" >&2
+      kill "$weston" 2> /dev/null || true
+      status=1
+    fi
+    wait "$weston" 2> /dev/null || true
+    weston=""
+  fi
+  if [ -n "$next" ]; then
+    stopped "$next" "The Weston that took over" || status=1
+    outer=""
+  fi
+  if [ "$status" != 0 ]; then
+    echo "hdrViewerWhenWestonGoes failed; the second Weston's log:" >&2
+    grep -v ' -> \| client ' "$dir/next.log" | tail -100 >&2 || true
+    echo "The last of the first Weston's protocol log:" >&2
+    grep -v 'wl_registry@.*global(\|wl_shm@.*format(' "$dir/weston.log" | tail -30 >&2 || true
+    failed=1
+  fi
+}
+
 run on true
 run sdr sdr
 run off false
 run_two
+run_gone
 exit "$failed"

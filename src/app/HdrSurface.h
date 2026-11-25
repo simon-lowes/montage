@@ -102,8 +102,10 @@ private:
     // Wayland: the compositor's word about the surface taken in (its first frame up, another output, the output's
     // brightness), and HDR stopped or the picture drawn again where that changed what the display shows.
     void waylandEvents();
-    // Wayland: the connection the surface was made on has gone (Qt connected to a compositor again): HDR stops.
+    // Wayland: the connection the surface was made on has gone (Qt connected to a compositor again): HDR stops, and
+    // stays true from then on (nothing of the GPU's, made on the old connection, is used again).
     bool waylandGone();
+    bool waylandWentAway_ = false;
 
     QPointer<QWidget> target_;
     std::unique_ptr<HdrSurfaceGpu> gpu_;
