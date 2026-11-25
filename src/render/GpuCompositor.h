@@ -169,6 +169,9 @@ struct Layer {
     std::shared_ptr<const SplatLayer> splats;   // or a splat clip's capture, sorted and blended here at its size
     std::vector<ColorOp> ops;
     Placement place;
+    // Its transform's motion blur: the picture placed at each of these (times through the shutter) and the mean
+    // kept, as the CPU's finishClipLayer keeps it (empty: placed once, at `place`).
+    std::vector<Placement> through;
 };
 
 struct Item {
@@ -221,6 +224,7 @@ struct Stats {
     long filterPasses = 0, mixPasses = 0;  // passes of filters (gpufilter.frag) and of transitions and mattes (gpumix.frag)
     long shaderBuilds = 0;                 // shader steps built (ShaderStep, once a key), since resetStats
     long shapeLayers = 0;                  // Shape layers drawn on the GPU (Layer::shapes)
+    long blurredLayers = 0, blurPlacements = 0;  // layers drawn with their transform's motion blur, and their placements
     long textureSteps = 0;                 // texture steps run (TextureStep: plug-ins drawing into the compositor's textures)
     // Splat layers sorted and blended on the GPU (Layer::splats), their splats, and the batches they took (one a
     // layer within the budget); and why the last splat clip was drawn on the CPU instead (countSplatsOnCpu).

@@ -198,6 +198,7 @@ size_t frameShape(const Frame& frame, bool eightBit) {
         mix(l->shapes ? static_cast<long long>(l->shapes->table.size()) : 0);
         mix(l->splats ? l->splats->width : 0), mix(l->splats ? l->splats->height : 0);
         mix(l->splats ? static_cast<long long>(l->splats->depths.size()) : 0), mix(l->splats && l->splats->points);
+        mix(!l->through.empty());
         ops(l->ops);
     };
     mix(frame.width), mix(frame.height), mix(eightBit), mix(static_cast<long long>(frame.items.size()));
@@ -258,6 +259,7 @@ public:
     long texturesMade = 0;                 // (textures made, the last frame)
     long shaderBuilds = 0;                 // (shader steps built, the last frame)
     long shapeLayers = 0;                  // (Shape layers drawn, the last frame)
+    long blurredLayers = 0, blurPlacements = 0;  // (layers drawn through their transform's shutter, the last frame)
     long splatLayers = 0, splatsDrawn = 0, splatBatches = 0;  // (splat layers sorted and blended, the last frame)
     // Whether it sorts and blends splats (it has compute, and their shaders were built), and why not.
     bool takesSplats(std::string* why) const {
@@ -2292,6 +2294,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
     filterPasses = mixPasses = shaderBuilds = shapeLayers = textureSteps = texturesMade = pictureReadBacks = 0;
     splatLayers = splatsDrawn = splatBatches = 0;
+    blurredLayers = blurPlacements = 0;
     hwMapped = hwGpuCopies = hwImports = 0;
     hwFallback.clear();
     overBudget.clear();
@@ -2338,14 +2341,52 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     QRhiResourceUpdateBatch* u = rhi_->nextResourceUpdateBatch();
     QRhiTexture* canvas = nullptr;
     float p[64] = {};
-    auto place = [&](float* q, const Layer* l, QRhiTexture* tex) {
-        if (!l || !tex) return;  // (kind 0: nothing)
-        const Placement& g = l->place;
+    auto placeAt = [&](float* q, const Placement& g) {
         q[0] = g.full ? 1 : 2, q[1] = g.scale, q[2] = g.opacity, q[3] = g.axis ? 1 : 0;
         q[4] = g.cx, q[5] = g.cy, q[6] = g.cosr, q[7] = g.sinr;
         q[8] = g.sx, q[9] = g.sy, q[10] = g.au, q[11] = g.av;
         q[12] = g.u0, q[13] = g.u1, q[14] = g.v0, q[15] = g.v1;
         q[16] = g.kx, q[17] = g.ky, q[18] = g.px, q[19] = g.py;
+    };
+    auto place = [&](float* q, const Layer* l, QRhiTexture* tex) {
+        if (!l || !tex) return;  // (kind 0: nothing)
+        if (!l->through.empty()) {  // (its mean through the shutter, the canvas's size already: see layerOf)
+            q[0] = 1;
+            return;
+        }
+        placeAt(q, l->place);
+    };
+    // A layer's picture as the frame takes it: with its transform's motion blur, placed at each time through the
+    // shutter and the mean kept (a mean of k + 1 being the mean of k mixed with the next at 1 / (k + 1)), the canvas's
+    // size.
+    auto layerOf = [&](const Layer& l, QRhiTexture* cv = nullptr) -> QRhiTexture* {
+        QRhiTexture* tex = layer(l, u, cv);
+        if (!tex || l.through.empty()) return tex;
+        QRhiTexture* mean = nullptr;
+        for (size_t k = 0; k < l.through.size(); ++k) {
+            QRhiTexture* to = texture(T::RGBA32F, W, H, true);
+            if (!to) {
+                if (mean) release(mean);
+                mean = nullptr;
+                break;
+            }
+            float q[64] = {};
+            q[1] = 1;  // (replacing what is there)
+            q[3] = k == 0 ? -1.0f : 1.0f / float(k + 1);
+            if (k == 0) {
+                placeAt(q + 4, l.through[0]);
+            } else {
+                q[4] = 1;  // (the mean so far, the canvas's size)
+                placeAt(q + 24, l.through[k]);
+            }
+            pass(compositePs_, to, u, {{1, dummy2d_}, {2, k == 0 ? tex : mean}, {3, k == 0 ? dummy2d_ : tex}}, uniforms(u, q));
+            u = rhi_->nextResourceUpdateBatch();
+            if (mean) release(mean);
+            mean = to;
+        }
+        if (tex != cv) release(tex);
+        if (mean) ++blurredLayers, blurPlacements += long(l.through.size());
+        return mean;
     };
     // A layer placed alone on a transparent canvas (a transition's or a matte's, before they are mixed).
     auto placed = [&](const Layer* l, QRhiTexture* tex) -> QRhiTexture* {
@@ -2393,8 +2434,8 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     full.place.full = true;
     for (const Item& it : frame.items) {
         if (!it.b && it.a.canvas && !canvas) continue;  // (an adjustment layer over nothing shows nothing)
-        QRhiTexture* a = layer(it.a, u, canvas);
-        QRhiTexture* b = it.b ? layer(*it.b, u, canvas) : nullptr;
+        QRhiTexture* a = layerOf(it.a, canvas);
+        QRhiTexture* b = it.b ? layerOf(*it.b, canvas) : nullptr;
         if ((!a && !absent(it.a)) || (it.b && !b && !absent(*it.b))) {
             ok = false;
             break;
@@ -2425,7 +2466,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
             if (m && it.displace) {
                 QRhiTexture* map = self;
                 if (!it.displaceSelf) {
-                    QRhiTexture* mt = it.displaceMap ? layer(*it.displaceMap, u) : nullptr;
+                    QRhiTexture* mt = it.displaceMap ? layerOf(*it.displaceMap) : nullptr;
                     if (!mt && it.displaceMap && !absent(*it.displaceMap)) {
                         release(m);
                         ok = false;
@@ -2448,7 +2489,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
                 release(self);
             }
             if (m && it.matte) {
-                QRhiTexture* matte = layer(*it.matte, u);
+                QRhiTexture* matte = layerOf(*it.matte);
                 if (!matte && !absent(*it.matte)) {
                     ok = false;
                     break;
@@ -2642,13 +2683,14 @@ bool execute(const Frame& frame, Image* out, QImage* out8, std::string* why) {
     if (!gDevice || !gDevice->ready() || waitedFor(*gDevice)) return false;
     Device* d = gDevice.get();
     long filters = 0, mixes = 0, mapped = 0, copied = 0, imported = 0, builds = 0, shapes = 0, steps = 0, made = 0, readBacks = 0;
-    long splatLayers = 0, splats = 0, splatBatches = 0;
+    long splatLayers = 0, splats = 0, splatBatches = 0, blurred = 0, placements = 0;
     size_t held = 0, peak = 0, tables = 0;
     std::string hwFallback, overBudget;
     const bool ok = d->serve([&] {
         const bool drawn = d->draw(frame, out, out8);
         filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds, shapes = d->shapeLayers;
         splatLayers = d->splatLayers, splats = d->splatsDrawn, splatBatches = d->splatBatches;
+        blurred = d->blurredLayers, placements = d->blurPlacements;
         mapped = d->hwMapped, copied = d->hwGpuCopies, imported = d->hwImports, hwFallback = d->hwFallback, steps = d->textureSteps, readBacks = d->pictureReadBacks;
         made = d->texturesMade;
         held = d->heldBytes, peak = d->peakBytes, tables = d->tableBytes, overBudget = d->overBudget;
@@ -2668,6 +2710,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8, std::string* why) {
         gStats.mixPasses += mixes;
         gStats.shapeLayers += shapes;
         gStats.splatLayers += splatLayers, gStats.splatsDrawn += splats, gStats.splatBatches += splatBatches;
+        gStats.blurredLayers += blurred, gStats.blurPlacements += placements;
         gStats.textureSteps += steps;
         gStats.pictureReadBacks += readBacks;
     }

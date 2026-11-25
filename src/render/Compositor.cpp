@@ -3367,9 +3367,34 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         else if (cs.splats) *why = std::to_string(cs.splats->depths.size()) + " splats, sorted and blended there";
         else *why = "a picture made on the CPU before its effects";
     }
-    // A transform moving through its shutter is drawn at each time on the CPU.
-    if (!shutterGeometries(seq, c, cs.lt, cs.g, cs.mw, cs.mh, o.scale).empty()) return cpu("its transform's motion blur");
-    // Placed as transformLayer places it (worked out here in double).
+    // Placed as transformLayer places it (worked out here in double); false for a transparent placement.
+    auto placement = [&](const Geometry& g, gpu::Placement& pl) {
+        const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
+        if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) return false;
+        const double cosr = std::cos(g.rot), sinr = std::sin(g.rot);
+        pl.scale = float(o.scale);
+        pl.opacity = float(g.opacity);
+        pl.axis = std::fabs(sinr) < 1e-9 && cosr > 0 && g.sx > 0 && g.sy > 0;
+        pl.cx = float(SW / 2.0 + g.px), pl.cy = float(SH / 2.0 + g.py), pl.cosr = float(cosr), pl.sinr = float(sinr);
+        pl.sx = float(g.sx), pl.sy = float(g.sy), pl.au = float(g.mw / 2 + g.ax), pl.av = float(g.mh / 2 + g.ay);
+        pl.u0 = float(u0), pl.u1 = float(u1), pl.v0 = float(v0), pl.v1 = float(v1);
+        pl.kx = float(w / g.mw), pl.ky = float(h / g.mh);
+        pl.px = float(std::fabs(g.sx) * o.scale), pl.py = float(std::fabs(g.sy) * o.scale);
+        return true;
+    };
+    // A transform moving through its shutter: the picture placed at each time and the mean kept there (a time at
+    // which it is transparent placed at nothing: it adds nothing to the mean).
+    if (const std::vector<Geometry> through = shutterGeometries(seq, c, cs.lt, cs.g, cs.mw, cs.mh, o.scale); !through.empty()) {
+        if (out.canvas) return cpu("an adjustment layer's transform's motion blur");
+        out.through.clear();
+        for (const Geometry& gs : through) {
+            gpu::Placement pl;
+            if (!placement(gs, pl)) pl.opacity = 0, pl.u0 = pl.v0 = 1, pl.u1 = pl.v1 = 0;  // (covering nothing)
+            out.through.push_back(pl);
+        }
+        if (why) *why += ", its transform's motion blur through " + std::to_string(through.size()) + " times there";
+        return GpuLayerResult::Drawn;
+    }
     const Geometry& g = cs.g;
     gpu::Placement& pl = out.place;
     Image probe;  // (identityLayer reads the size alone)
@@ -3378,8 +3403,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         pl.full = w == W && h == H;
         return GpuLayerResult::Drawn;
     }
-    const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
-    if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) {  // (a transparent layer)
+    if (!placement(g, pl)) {  // (a transparent layer)
         out.canvas = false;
         out.frame.reset();
         out.shapes.reset();
@@ -3387,15 +3411,6 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         out.ops.clear();
         return GpuLayerResult::Drawn;
     }
-    const double cosr = std::cos(g.rot), sinr = std::sin(g.rot);
-    pl.scale = float(o.scale);
-    pl.opacity = float(g.opacity);
-    pl.axis = std::fabs(sinr) < 1e-9 && cosr > 0 && g.sx > 0 && g.sy > 0;
-    pl.cx = float(SW / 2.0 + g.px), pl.cy = float(SH / 2.0 + g.py), pl.cosr = float(cosr), pl.sinr = float(sinr);
-    pl.sx = float(g.sx), pl.sy = float(g.sy), pl.au = float(g.mw / 2 + g.ax), pl.av = float(g.mh / 2 + g.ay);
-    pl.u0 = float(u0), pl.u1 = float(u1), pl.v0 = float(v0), pl.v1 = float(v1);
-    pl.kx = float(w / g.mw), pl.ky = float(h / g.mh);
-    pl.px = float(std::fabs(g.sx) * o.scale), pl.py = float(std::fabs(g.sy) * o.scale);
     return GpuLayerResult::Drawn;
 }
 

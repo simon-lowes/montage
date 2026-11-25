@@ -30343,6 +30343,80 @@ colorspaces:
     // draws from and into them, with no read-back and no layer made on the CPU, whichever of the two contexts was made
     // first and after the device was lost. On another backend the layer is made on the CPU, as before. Either way the
     // frames match the CPU's within 1/1023.
+    void gpuTransformMotionBlur() {
+        // A layer's transform blurred through its shutter, drawn on the GPU (its picture placed at each time through
+        // the shutter and the mean kept) against the CPU's: a picture with transparency, scaled, cropped and faded,
+        // moving 60 px and turning 20 degrees a frame over a full-frame one, within 1/1023 everywhere, every time the
+        // CPU places it placed there too; with a 90 degree phase and eight samples of its own, likewise. Still, with
+        // its motion blur on, it is drawn as without it, placed once.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        auto addPicture = [&](const char* name, int w, int h, bool alpha) {
+            QImage q(w, h, QImage::Format_RGBA64);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(float(x) / w, float(y) / h, 0.5f + 0.4f * std::sin(x * 0.11f + y * 0.07f),
+                                                           alpha ? std::min(1.0f, 0.15f + 0.85f * float((x + 2 * y) % 97) / 96) : 1.0f));
+            const QString path = dir.filePath(name);
+            if (!q.save(path)) return Id{};
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id wide = addPicture("wide.png", 320, 180, false), small = addPicture("small.png", 211, 147, true);
+        QVERIFY(wide && small);
+        QVERIFY(edit::placeMedia(p, s, wide, 0, 0, 20, {TrackKind::Video, 0}, {}, false).ok);
+        auto r2 = edit::placeMedia(p, s, small, 0, 0, 20, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(r2.ok);
+        Clip* top = edit::clipById(s, r2.created[0]);
+        QVERIFY(top);
+        top->motion.params["scale"] = 60.0;
+        top->motion.params["crop_left"] = 7.0;
+        top->motion.params["opacity"] = 80.0;
+        top->motion.params["pos_x"].keys = {{0, -150.0}, {10, 450.0}};
+        top->motion.params["rotation"].keys = {{0, 0.0}, {10, 200.0}};
+        top->motion.params["motion_blur"] = 1.0;
+        auto compare = [&](FrameTime t, const QString& what, bool blurred) {
+            RenderOptions o;
+            o.gpu = false;
+            const uint64_t draws = transformLayerDraws();
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const long placedOnCpu = long(transformLayerDraws() - draws) - 1;  // (less the full-frame picture's)
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QCOMPARE(after.blurredLayers - before.blurredLayers, blurred ? 1L : 0L);
+            QCOMPARE(after.blurPlacements - before.blurPlacements, blurred ? placedOnCpu : 0L);
+            QVERIFY2(blurred ? placedOnCpu >= 8 : placedOnCpu == 1, qPrintable(QString::number(placedOnCpu)));
+            QCOMPARE(onGpu.width, cpu.width);
+            QCOMPARE(onGpu.height, cpu.height);
+            double worst = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c)
+                        if (const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]); d > worst) worst = d, wx = x, wy = y;
+            qInfo("%s: %ld placements, the GPU's at most %.6f from the CPU's (at %d,%d)", qPrintable(what), placedOnCpu, worst, wx, wy);
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(what));
+        };
+        compare(4, "moving", true);
+        top->motion.params["shutter_phase"] = 90.0;
+        top->motion.params["samples"] = 8.0;
+        compare(6, "a 90 degree phase, eight samples", true);
+        top->motion.params["pos_x"] = 30.0;
+        top->motion.params["rotation"] = 15.0;
+        compare(6, "still", false);
+    }
+
     void gpuOfxTextures() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
