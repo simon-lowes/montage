@@ -12963,6 +12963,17 @@ colorspaces:
             c.replace("urn:smpte:ul:060e2b34.0401010d.03020103.00000000", "urn:smpte:ul:060e2b34.0401010d.0e090103.00000000");
         }, nullptr);
         QVERIFY2(has(issues, "names channel 3 (chC) by a label of neither ST 2067-8 nor ST 377-42 (RDD 59-1 8)"), qPrintable(all(issues)));
+        // Nightly 25 Nov: a channel count no sound track file has, up to INT_MAX, is told once, at once, and its
+        // channels are not gone through one by one; one just over six still has each missing label told.
+        QVERIFY(cpl.contains("<r1:ChannelCount>6</r1:ChannelCount>"));
+        QElapsedTimer took;
+        took.start();
+        issues = checked([&](QByteArray& c) { c.replace("<r1:ChannelCount>6</r1:ChannelCount>", "<r1:ChannelCount>2147483647</r1:ChannelCount>"); }, nullptr);
+        QVERIFY2(has(issues, "says it has 2147483647 channels, more than any sound track file has"), qPrintable(all(issues)));
+        QVERIFY2(!has(issues, "not at all") && issues.size() < 10, qPrintable(all(issues)));
+        QVERIFY2(took.elapsed() < 30000, qPrintable(QString::number(took.elapsed())));
+        issues = checked([&](QByteArray& c) { c.replace("<r1:ChannelCount>6</r1:ChannelCount>", "<r1:ChannelCount>8</r1:ChannelCount>"); }, nullptr);
+        QVERIFY2(has(issues, "labels channel 7 not at all") && has(issues, "labels channel 8 not at all") && !has(issues, "more than any"), qPrintable(all(issues)));
         // Put back, the package passes again.
         issues = verifyImf(r.folder);
         QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
