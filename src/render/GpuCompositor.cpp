@@ -2033,6 +2033,9 @@ QRhiTexture* Device::splatLayer(const SplatLayer& s, QRhiResourceUpdateBatch*& u
     }
     const bool flip = rhi_->isYUpInNDC() != rhi_->isYUpInFramebuffer();
     for (size_t k = 0; k < batches; ++k) {
+        // (each batch's uploads go into the buffers the one before read: that one's work is waited for first, as a
+        // backend may copy an upload into a buffer when it is recorded, Metal's among them)
+        if (k > 0) rhi_->finish();
         const size_t part = s.points ? batches - 1 - k : k;
         const size_t from = starts[part], nb = starts[part + 1] - from;
         size_t E = 0;

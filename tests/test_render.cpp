@@ -36352,6 +36352,9 @@ colorspaces:
             const SplatCloud million = capture(1000000, 1);
             const ModelCamera cam = lookAt({0.4, 0.3, 4.5}, {0, 0, 0}, 500, 640, 360);
             gpu::setTextureLimitForTesting(size_t(64) << 20);
+            struct LimitBack {  // (the budget given back however the block ends, for the tests after it)
+                ~LimitBack() { gpu::setTextureLimitForTesting(0); }
+            } limitBack;
             gpu::resetStats();
             Image g;
             QVERIFY2(onGpu(million, cam, 640, 360, {}, g), qPrintable(QString::fromStdString(gpu::stats().lastFallback)));
