@@ -2355,6 +2355,17 @@ private slots:
         QCOMPARE(slot().velocityCurve, 0);
         QVERIFY(slot().velocityPoints.empty());
         for (int v = 1; v <= 127; ++v) QCOMPARE(sampler::curveVelocity(slot(), v), v);
+        // Double-clicked where there is no point: one is put down, in one step (nightly 25 Nov: it was made and taken
+        // away again, two steps for nothing). (Through the window, as a mouse does it: two presses and releases that
+        // Qt takes as a double click, so the view has press, release, press, double click and release.)
+        const size_t undoAt = state()->history().undoCount();
+        QWindow* window = view->window()->windowHandle();
+        QVERIFY(window);
+        QTest::mouseDClick(window, Qt::LeftButton, Qt::NoModifier, window->mapFromGlobal(view->mapToGlobal(view->pointFor(60, 30))));
+        QVERIFY(mapsAsDrawn({{1, 1}, {60, 30}, {127, 127}}));
+        QCOMPARE(state()->history().undoCount(), undoAt + 1);
+        state()->undo();
+        QCOMPARE(slot().velocityCurve, 0);
         win_->findChild<QDockWidget*>("sampler")->hide();
         QTRY_VERIFY(!panel->isActive());
     }
