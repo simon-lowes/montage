@@ -2829,6 +2829,112 @@ private slots:
         QVERIFY(!QFile::exists(QString::fromStdString(none.path)));
     }
 
+    // ST 2110-22 recorded to JPEG XS in MXF: its codestreams written as they came (the feed's bits a pixel, not the
+    // recording's setting), the pictures the ones sent; asked to code them again, at the recording's setting. CI only:
+    // it needs SVT-JPEG-XS and bmx.
+    void captureSt2110JpegXsKept() {
+        namespace st = st2110;
+        if (!jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS (runs in Linux CI)");
+#ifndef MONTAGE_WITH_BMX
+        QSKIP("Built without bmx, which writes JPEG XS in MXF");
+#else
+        int ports[3];
+        {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.ttl = 1;
+        const int W = 640, H = 360, spf = 1920;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1}, v.codec = "jxsv", v.bpp = 3;
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        // Each picture's frame number (mod 32) in five squares along the top, dark for 0 and light for 1.
+        auto picture = [&](int t) {
+            st::Raster r(W, H, st::Sampling::Ycc422, 10);
+            for (int y = 0; y < H; ++y) {
+                uint16_t* d = r.row(y);
+                for (int x = 0; x < W; ++x) {
+                    const bool square = y >= 8 && y < 56 && x >= 16 && x < 16 + 5 * 96 && (x - 16) % 96 < 64;
+                    d[2 * x] = 512, d[2 * x + 1] = uint16_t(square ? (((t % 32) >> ((x - 16) / 96)) & 1 ? 880 : 100) : 200 + x / 2);
+                }
+            }
+            return r;
+        };
+        std::string url;
+        for (const auto& [name, text] : {std::pair{"video", tx.sdpVideo()}, {"audio", tx.sdpAudio()}}) {
+            const std::string file = path(QStringLiteral("st2110-22-kept-%1.sdp").arg(QLatin1String(name)).toStdString().c_str());
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(text.c_str());
+            url += (url.empty() ? "" : ";") + file;
+        }
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            for (int t = 0; !stop && t < 25 * 30; ++t) {
+                std::vector<float> sound(size_t(spf) * 2, 0.0f);
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                if (!tx.send(picture(t), sound.data(), spf, &tc, {}, &stop)) break;
+            }
+        });
+        auto stopSending = qScopeGuard([&] {
+            stop = true;
+            sending.join();
+            tx.close();
+        });
+        // The bytes of a picture at each rate: what the sender codes at 3 bits a pixel, and the recording's own 5.
+        JxsEncodeSettings es;
+        es.width = W, es.height = H, es.depth = 10, es.sampling = JxsSampling::Ycc422, es.bppNum = 3000, es.bppDen = 1000;
+        JxsEncoder sent, own;
+        QVERIFY2(sent.open(es, &err), err.c_str());
+        es.bppNum = 5000;
+        QVERIFY2(own.open(es, &err), err.c_str());
+        QVERIFY(sent.bytesPerPicture() != own.bytesPerPicture());
+        for (const bool recode : {false, true}) {
+            CaptureSettings cs;
+            cs.video.device = "st2110";
+            cs.video.url = url;
+            cs.path = path(recode ? "capture-st2110-22-recoded.mxf" : "capture-st2110-22-kept.mxf");
+            cs.codec = "jpeg_xs";
+            cs.jpegXsBpp = 5;
+            cs.recodeJpegXs = recode;
+            cs.seconds = 2;
+            Recorder rec;
+            QVERIFY2(rec.start(cs, &err), err.c_str());
+            QVERIFY(rec.wait(20));
+            const CaptureStatus status = rec.status();
+            QVERIFY2(status.error.empty(), status.error.c_str());
+            QCOMPARE(status.frames, int64_t(50));
+            JxsReader r;
+            QVERIFY2(r.open(cs.path, &err), err.c_str());
+            QCOMPARE(r.info().frames, int64_t(50));
+            QCOMPARE(r.info().componentDepth, 10);
+            QCOMPARE(r.info().horizontalSubsampling, 2);
+            // Each codestream the size of the rate it was coded at, and each picture one that was sent, in order.
+            const uint32_t bytes = recode ? own.bytesPerPicture() : sent.bytesPerPicture();
+            int previous = -1, inOrder = 0;
+            for (int64_t n = 0; n < 50; ++n) {
+                std::vector<uint8_t> cs8;
+                QVERIFY2(r.codestream(n, cs8, &err), err.c_str());
+                QVERIFY2(cs8.size() == bytes, qPrintable(QStringLiteral("frame %1: %2 bytes, not %3").arg(n).arg(cs8.size()).arg(bytes)));
+                JxsPicture p;
+                QVERIFY2(r.picture(n, p, &err), err.c_str());
+                int number = 0;
+                for (int i = 0; i < 5; ++i) number |= (p.planes[0][size_t(32) * size_t(p.planeWidth(0)) + size_t(16 + 96 * i + 32)] > 512 ? 1 : 0) << i;
+                if (previous < 0 || number == (previous + 1) % 32) ++inOrder;
+                previous = number;
+            }
+            QVERIFY2(inOrder >= 47, qPrintable(QStringLiteral("%1 of 50 in order (recorder dropped %2, repeated %3)").arg(inOrder).arg(status.dropped).arg(status.repeated)));
+        }
+#endif
+    }
+
     // ST 2110-22 (JPEG XS, a packet of each slice its own) recorded with its -41 fast metadata stream: the items each
     // frame came with kept beside the recording at the frame it became, the picture there the one they were sent with.
     // (Uncompressed -20 video when built without SVT-JPEG-XS.)

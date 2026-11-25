@@ -57,6 +57,9 @@ struct CaptureSettings {
     std::string codec = "prores_hq";     // prores_proxy, prores_lt, prores, prores_hq, dnxhr_lb, dnxhr_sq, dnxhr_hq, dnxhr_hqx,
                                          // jpeg_xs (10-bit 4:2:2 in MXF, ST 2124, through SVT-JPEG-XS)
     double jpegXsBpp = 5;                // jpeg_xs: bits a pixel (a constant number of bytes each picture)
+    // jpeg_xs from a progressive ST 2110-22 feed: its codestreams are written as they came, at the feed's bits a pixel,
+    // depth and sampling (`jpegXsBpp` unused), unless this asks for them to be coded again.
+    bool recodeJpegXs = false;
     std::string timecode;                // the first frame's ("hh:mm:ss:ff"); "" the feed's own, else the time of day
     double seconds = 0;                  // stop after this long (0: when stopped)
     double openTimeout = 10;             // seconds to wait for the feed to start (and to send again, at least 5)

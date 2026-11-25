@@ -1072,6 +1072,7 @@ void Recorder::run() {
     bool watchOnly = file.path.empty();
     // JPEG XS: FFmpeg's raw pictures and PCM packets handed to its writer (the muxer FFmpeg's null one).
     bool jxsRecord = isJpegXs(file.codec) && !watchOnly;
+    bool jxsCopy = false;  // (an ST 2110-22 feed's codestreams written as they came, each carried as its picture's opaque_ref)
     std::unique_ptr<JxsWriter> jxs;
     AVFrame* jxsPicture = av_frame_alloc();
     std::vector<float> jxsSound;
@@ -1136,6 +1137,17 @@ void Recorder::run() {
     std::function<bool(AVFrame*, bool, AVRational)> placeSound;  // (putSound, for putPicture)
 
     auto write = [&](AVCodecContext* enc, AVStream* st, AVFrame* f) -> bool {
+        // (a picture that carries the feed's own codestream: written as it is, not coded again)
+        if (f && enc == venc && jxs && jxsCopy && f->opaque_ref && !watchOnly) {
+            if (cs.onPicture) cs.onPicture(f, fps.num, fps.den);
+            if (cs.live) cs.live->picture(f);
+            std::string why;
+            if (!jxs->writeCodestream(f->opaque_ref->data, f->opaque_ref->size, &why)) {
+                fatal = "Cannot write " + file.path + ": " + why;
+                return false;
+            }
+            return true;
+        }
         if (f && enc == venc) {
             if (cs.onPicture) cs.onPicture(f, fps.num, fps.den);
             if (cs.live) cs.live->picture(f);
@@ -1266,6 +1278,7 @@ void Recorder::run() {
         mov = endsWith(file.path, ".mov");
         watchOnly = file.path.empty();
         jxsRecord = isJpegXs(file.codec) && !watchOnly;
+        jxsCopy = false;
         switched = true;
         seconds = 0, frameLimit = 0;
         ranged = false, firstLabel = -1;
@@ -1617,6 +1630,16 @@ void Recorder::run() {
             xs.encode.sampling = JxsSampling::Ycc422;
             xs.encode.bppNum = int(std::lround(file.jpegXsBpp * 1000));
             xs.encode.bppDen = 1000;
+            // (an ST 2110-22 feed of the recording's size: its codestreams kept, the file described as they are, and
+            // the encoder, for a picture that comes without one, made to match them)
+            const st2110::VideoFormat& v = in.st2110Video;
+            jxsCopy = !cs.recodeJpegXs && in.st2110 && v.jpegXs() && !v.interlaced && v.width == width && v.height == height;
+            if (jxsCopy) {
+                xs.encode.depth = v.depth;
+                xs.encode.sampling = v.sampling == st2110::Sampling::Ycc422 ? JxsSampling::Ycc422 : v.sampling == st2110::Sampling::Ycc444 ? JxsSampling::Ycc444 : JxsSampling::Rgb;
+                xs.encode.bppNum = int(std::lround(v.bpp * 1000));
+                xs.fullRange = in.st2110Full;
+            }
             xs.fpsNum = fps.num;
             xs.fpsDen = fps.den;
             xs.primaries = int(venc->color_primaries != AVCOL_PRI_UNSPECIFIED ? venc->color_primaries : AVCOL_PRI_BT709);
@@ -1753,6 +1776,7 @@ void Recorder::run() {
             return false;
         }
         sws_scale(sws, f->data, f->linesize, 0, f->height, pic->data, pic->linesize);
+        if (jxsCopy && f->opaque_ref) pic->opaque_ref = av_buffer_ref(f->opaque_ref);
         // (its captions, with any a dropped picture had)
         if ((cc && cc->size > 0) || !ccCarried.empty()) {
             const size_t n = ccCarried.size() + (cc ? cc->size : 0);
@@ -2139,6 +2163,9 @@ void Recorder::run() {
         const int64_t pts = f.ptpNs / 100;
         // (a picture dropped while the encoder caught up: its sound still goes in)
         AVFrame* pic = !soundOnly && in.videoStream >= 0 ? rasterFrame(f.picture, in.st2110Full) : nullptr;
+        // (an ST 2110-22 codestream, for a JPEG XS recording that keeps it)
+        if (pic && jxsRecord && !cs.recodeJpegXs && !f.codestream.empty())
+            if ((pic->opaque_ref = av_buffer_alloc(f.codestream.size()))) std::memcpy(pic->opaque_ref->data, f.codestream.data(), f.codestream.size());
         if (pic) {
             const st2110::VideoFormat& v = in.st2110Video;
             pic->pts = pic->best_effort_timestamp = pts;
