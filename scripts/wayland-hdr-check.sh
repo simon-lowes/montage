@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the HDR viewer under Weston (scripts/build-weston.sh): headless, its GL renderer, one 1280x720 output, the kiosk
+# Runs the HDR viewer under Weston (scripts/build-weston.sh): headless, its GL renderer, one 1920x1080 output, the kiosk
 # shell. Three times: with colour management on and the output driven as BT.2100 PQ (BT.2020, reference white 203
 # nits, a 1000-nit target), where test_app's hdrViewerOnWayland checks the surface's description in Weston's protocol
 # log, its 10-bit buffers, the surface's own pixels and the PQ codes in Weston's screenshot, and liveHdrOnWayland the
@@ -89,6 +89,8 @@ run() {  # name color-management(true: a PQ output|sdr: an SDR output|false: off
   # only through its seat's focus: with none, the output keeps pointing at the freed window (desktop_surface_removed
   # in kiosk-shell.c) and Weston crashes when the next window is mapped, as the test's viewer is after the main window
   # is hidden. Desktops always have a seat.
+  # (1920x1080: the kiosk shell refuses a window larger than its output, and the main window with a live feed on the
+  # Source monitor is wider than 1280 in CI's fonts; liveHdrOnWayland shows it there)
   # The log also has what Weston's renderer draws each surface with (its buffer's format and its colour
   # transformation), for when its screenshot is not what the test expects.
   # Weston 16 blends in its fragment shaders where the GL driver can read the framebuffer back in a shader, and under
@@ -96,7 +98,7 @@ run() {  # name color-management(true: a PQ output|sdr: an SDR output|false: off
   # blends in a half-float buffer of its own, as its earlier releases always did.
   LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     MESA_EXTENSION_OVERRIDE="-GL_EXT_shader_framebuffer_fetch_non_coherent" "$weston_prefix/bin/weston" \
-    --backend=headless --fake-seat --renderer=gl --width=1280 --height=720 --shell=kiosk --socket="$socket" \
+    --backend=headless --fake-seat --renderer=gl --width=1920 --height=1080 --shell=kiosk --socket="$socket" \
     --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto,gl-renderer-paint-nodes,color-lcms-transformations &
   weston=$!
   # (Up to a minute: the first Weston of a run loads Mesa and its LLVM from a cold disk, which has taken 17 s on a

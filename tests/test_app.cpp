@@ -25451,12 +25451,23 @@ print("added " + ui["name"])
                 if (line.contains(what)) return true;
             return false;
         };
-        // `then` said after `first`.
-        auto saidAfter = [&](qint64 from, const QByteArray& first, const QByteArray& then) {
+        // The configure Weston sent after `first` acknowledged (its own serial: an ack of an earlier configure, sent
+        // after `first` but before Weston's answer to it, does not count, as Qt has not taken the answer then).
+        auto answered = [&](qint64 from, const QByteArray& first) {
             bool seen = false;
+            QByteArray ack;
             for (const QByteArray& line : ours(from)) {
-                if (seen && line.contains(then)) return true;
-                seen = seen || line.contains(first);
+                if (!ack.isEmpty() && line.contains(ack)) return true;
+                if (!seen) {
+                    seen = line.contains(first);
+                    continue;
+                }
+                const qsizetype at = line.indexOf(" ev xdg_surface@");
+                const qsizetype open = at < 0 ? -1 : line.indexOf(".configure(", at);
+                if (ack.isEmpty() && open > at && at >= 0) {
+                    const qsizetype close = line.indexOf(')', open);
+                    ack = ".ack_configure(" + line.mid(open + 11, close - open - 11) + ")";
+                }
             }
             return false;
         };
@@ -25511,8 +25522,8 @@ print("added " + ui["name"])
         auto moveTo = [&](QScreen* screen, const QByteArray& wlOutput, const char* what) {
             const qint64 before = logEnd();
             viewer.showNormal();
-            QTRY_VERIFY2_WITH_TIMEOUT(saidAfter(before, ".unset_fullscreen()", ".ack_configure("),
-                                      "Weston did not take the window out of full screen", 10000);
+            QTRY_VERIFY2_WITH_TIMEOUT(answered(before, ".unset_fullscreen()"), "Weston did not take the window out of full screen", 10000);
+            QTRY_COMPARE_WITH_TIMEOUT(viewer.size(), QSize(640, 360), 10000);
             from = logEnd();
             viewer.windowHandle()->setScreen(screen);
             viewer.showFullScreen();
