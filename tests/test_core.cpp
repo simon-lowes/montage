@@ -1950,6 +1950,18 @@ private slots:
                 }
             }
             QCOMPARE(b.activeVoices(), 0);
+#ifdef Q_OS_LINUX
+            // The disk reader's own handle on the cache file is closed in any program Montage starts too (nightly 25
+            // Nov: it was opened without that).
+            int held = 0;
+            const QDir fds(QStringLiteral("/proc/self/fd"));
+            for (const QString& name : fds.entryList(QDir::Files | QDir::System | QDir::NoDotAndDotDot)) {
+                if (QFile::symLinkTarget(fds.filePath(name)) != QString::fromStdString(cacheFile)) continue;
+                ++held;
+                QVERIFY2(::fcntl(name.toInt(), F_GETFD) & FD_CLOEXEC, qPrintable(name));
+            }
+            QVERIFY(held >= 2);
+#endif
         }
         {
             // At the device's pace (blocks of 256), the disk at 2 MB/s (five times what a voice needs): nothing late.
