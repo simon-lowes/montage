@@ -12271,6 +12271,52 @@ private slots:
         QFile f(kept);
         QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == "<dkdm/>");
         QVERIFY(!QFileInfo::exists(dkdms + "/new.csv"));
+        // Nightly 25 Nov: a "name:" before a path, which FFmpeg takes off and QFile takes as a folder ("ab:" in the
+        // current one), is looked at both ways: "ab:/../Montage-DKDMs/new.csv" from this run's folder is Montage's
+        // DKDMs to QFile (and /Montage-DKDMs/new.csv to FFmpeg). Refused through the server too.
+        {
+            const QString cwdWas = QDir::currentPath();
+            auto back = qScopeGuard([&] { QDir::setCurrent(cwdWas); });
+            QVERIFY(QDir::setCurrent(folder) && QDir().mkpath(folder + "/ab:"));
+            QVERIFY(mcpPathReaches("ab:/../Montage-DKDMs/new.csv", dkdms, McpNameRules::Exact, false));
+            QVERIFY(mcpPathReaches("file:ab:/../Montage-DKDMs/new.csv", dkdms, McpNameRules::Exact, false));
+            QVERIFY(mcpPathReaches("ab:/..", dkdms, McpNameRules::Exact, true));
+            QVERIFY(!mcpPathReaches("ab:/../Montage-DKDMs2/new.csv", dkdms, McpNameRules::Exact, false));
+            QVERIFY(!mcpPathReaches("/Montage-DKDMs/new.csv", dkdms, McpNameRules::Exact, false));
+            for (const QString& path : {QStringLiteral("ab:/../Montage-DKDMs/new.csv"), QStringLiteral("md5:ab:/../Montage-DKDMs/new.csv")}) {
+                const QJsonObject r = call({{"path", path}});
+                QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+            }
+            QVERIFY(!QFileInfo::exists(dkdms + "/new.csv"));
+        }
+        // And montage_repair_media's relative output, which is beside the damaged file (here this run's folder, not
+        // the current one): "Montage-DKDMs/fixed.wav" is refused, and nothing is written there; elsewhere it repairs.
+        {
+            const QString damaged = folder + "/damaged.wav";
+            QFile w(damaged);
+            QVERIFY(w.open(QIODevice::WriteOnly));
+            QByteArray head("RIFF\xff\xff\xff\xffWAVEfmt ", 16);
+            const auto le = [&head](quint32 v, int bytes) {
+                for (int i = 0; i < bytes; ++i) head.append(char((v >> (8 * i)) & 0xff));
+            };
+            le(16, 4), le(1, 2), le(1, 2), le(48000, 4), le(96000, 4), le(2, 2), le(16, 2);
+            head.append("data", 4), le(0xffffffffu, 4);
+            QVERIFY(w.write(head) == 44 && w.write(QByteArray(9600, '\x10')) == 9600);
+            w.close();
+            QCOMPARE(checkRecording(damaged).kind, RepairKind::Wav);
+            auto repair = [&](const QString& output) {
+                const QJsonObject args{{"file", damaged}, {"output", output}};
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_repair_media"}, {"arguments", args}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QVERIFY(QDir::current().absolutePath() != QDir(folder).absolutePath());
+            const QJsonObject r = repair("Montage-DKDMs/fixed.wav");
+            QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+            QVERIFY(!QFileInfo::exists(dkdms + "/fixed.wav"));
+            const QJsonObject done = repair("fixed.wav");
+            QVERIFY2(!done.value("isError").toBool() && QFileInfo::exists(folder + "/fixed.wav"), QJsonDocument(done).toJson().constData());
+        }
     }
 
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.

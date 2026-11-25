@@ -828,19 +828,26 @@ QString json(const QJsonObject& o) { return QString::fromUtf8(QJsonDocument(o).t
 
 // ---- Tools ------------------------------------------------------------------------------
 
+// What a path can name: as written, as QFile and Montage's own writers take it ("ab:/x" a folder "ab:" in the current
+// one), and with each "name:" before it taken off in turn, as FFmpeg, which writes most outputs, takes "file:" and its
+// other protocols' names, nested as "md5:file:/x" (and "file:ab:/x" as the file "ab:/x"). One letter is a Windows drive.
+static QStringList spellings(const QString& path) {
+    QStringList out{path};
+    static const QRegularExpression scheme(QStringLiteral("^[A-Za-z][A-Za-z0-9+.\\-]+:"));
+    QString bare = path;
+    for (QRegularExpressionMatch m = scheme.match(bare); m.hasMatch() && out.size() < 64; m = scheme.match(bare)) out << (bare = bare.mid(m.capturedLength()));
+    return out;
+}
+
 // A path as the file system takes it: symbolic links followed as far as it exists (`existing`, that part; `whole`,
-// all of it exists), the rest kept as written under it.
+// all of it exists), the rest kept as written under it. `bare`: with the names before it that FFmpeg takes off
+// (spellings' last), else as written.
 struct ResolvedPath {
     QString name, existing;
     bool whole = false;
 };
-static ResolvedPath resolvedPath(const QString& path) {
-    // (FFmpeg, which writes most outputs, takes "file:" and its other protocols' names before a path, nested as
-    // "md5:file:/x": each is taken off, so they name the file they reach. One letter is a Windows drive.)
-    QString bare = path;
-    static const QRegularExpression scheme(QStringLiteral("^[A-Za-z][A-Za-z0-9+.\\-]+:"));
-    for (QRegularExpressionMatch m = scheme.match(bare); m.hasMatch(); m = scheme.match(bare)) bare = bare.mid(m.capturedLength());
-    QString clean = QDir::cleanPath(absolute(bare));
+static ResolvedPath resolvedPath(const QString& path, bool bare = true) {
+    QString clean = QDir::cleanPath(absolute(bare ? spellings(path).constLast() : path));
     QString rest;
     QFileInfo at(clean);
     // (what does not exist yet, an output and perhaps its folders, is kept as written under the part that does)
@@ -952,8 +959,12 @@ static bool reachedByIdentity(const ResolvedPath& p, const ResolvedPath& o, bool
 }
 
 bool mcpPathReaches(const QString& path, const QString& own, McpNameRules rules, bool orHolding) {
-    const ResolvedPath p = resolvedPath(path), o = resolvedPath(own);
-    return reachedByName(mcpFoldedName(p.name, rules), mcpFoldedName(o.name, rules), orHolding) || reachedByIdentity(p, o, orHolding);
+    const ResolvedPath o = resolvedPath(own, false);
+    for (const QString& spelt : spellings(path)) {
+        const ResolvedPath p = resolvedPath(spelt, false);
+        if (reachedByName(mcpFoldedName(p.name, rules), mcpFoldedName(o.name, rules), orHolding) || reachedByIdentity(p, o, orHolding)) return true;
+    }
+    return false;
 }
 
 // A path as one name for the file it is: symbolic links followed as far as the path exists, and the name folded as
@@ -1029,25 +1040,30 @@ QString mcpOwnFileNamed(const QString& tool, const QJsonObject& arguments, const
     std::vector<Own> owns;
     for (const auto& [file, what] : own)
         if (!file.empty()) {
-            const ResolvedPath at = resolvedPath(QString::fromStdString(file));
+            const ResolvedPath at = resolvedPath(QString::fromStdString(file), false);
             owns.push_back({at, mcpFoldedName(at.name, rules), what});
         }
     // (the parts of paths that exist, each looked up once: most texts that are no path at all resolve to one folder)
     QHash<QString, int> reached;
+    // (each way the path can be taken, written or as FFmpeg takes it: "ab:/../x" is the folder "ab:"'s parent's x to
+    // the one, /x to the other)
     auto named = [&](const QString& path, bool orHolding) -> const char* {
-        const ResolvedPath p = resolvedPath(path);
-        const QString pn = mcpFoldedName(p.name, rules);
-        for (const Own& o : owns)
-            if (reachedByName(pn, o.name, orHolding)) return o.what;
-        const QString key = p.existing + QLatin1Char('\n') + QLatin1Char(p.whole ? '1' : '0') + QLatin1Char(orHolding ? 'h' : '-');
-        auto it = reached.find(key);
-        if (it == reached.end()) {
-            int found = -1;
-            for (size_t i = 0; i < owns.size() && found < 0; ++i)
-                if (reachedByIdentity(p, owns[i].at, orHolding)) found = int(i);
-            it = reached.insert(key, found);
+        for (const QString& spelt : spellings(path)) {
+            const ResolvedPath p = resolvedPath(spelt, false);
+            const QString pn = mcpFoldedName(p.name, rules);
+            for (const Own& o : owns)
+                if (reachedByName(pn, o.name, orHolding)) return o.what;
+            const QString key = p.existing + QLatin1Char('\n') + QLatin1Char(p.whole ? '1' : '0') + QLatin1Char(orHolding ? 'h' : '-');
+            auto it = reached.find(key);
+            if (it == reached.end()) {
+                int found = -1;
+                for (size_t i = 0; i < owns.size() && found < 0; ++i)
+                    if (reachedByIdentity(p, owns[i].at, orHolding)) found = int(i);
+                it = reached.insert(key, found);
+            }
+            if (*it >= 0) return owns[size_t(*it)].what;
         }
-        return *it >= 0 ? owns[size_t(*it)].what : nullptr;
+        return nullptr;
     };
     // What the call is known to write: there, or a folder that holds one of them.
     for (const QString& w : paths.writes)
@@ -2154,6 +2170,15 @@ void McpServer::Impl::addTools() {
             }
             if (sameFile(output, file) || (check.needsReference && sameFile(output, absolute(str(a, "reference")))))
                 throw ArgError{"\"output\" must be a new file, not the damaged file or the reference"};
+            // (a relative output is beside the damaged file, where the guard on Montage's own files, which takes it from
+            // the current folder, did not look: the output as it is to be written is looked at here)
+            {
+                const QJsonObject written{{"output", output}};
+                if (const QString why = mcpOwnFileNamed(QStringLiteral("montage_repair_media"), written,
+                                                        mcpCallPaths(QStringLiteral("montage_repair_media"), written, false));
+                    !why.isEmpty())
+                    throw ArgError{why};
+            }
             if (QFileInfo::exists(output) && !a.value("overwrite").toBool())
                 throw ArgError{"\"output\" exists: pass overwrite to replace it"};
             std::optional<Loaded> l;
