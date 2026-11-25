@@ -141,13 +141,24 @@ void Wake::post() noexcept {
     if (!d_->raised.exchange(true)) sem_post(&d_->sem);  // (async-signal-safe: no lock, no wait)
 }
 void Wake::wait(int ms) noexcept {
+    // (on the steady clock where the C library waits on it, glibc 2.30 and later: the wall clock set by hand or
+    // stepped by a time server neither ends the wait early nor holds it for as long as the clock went back)
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 30))
+    const clockid_t clock = CLOCK_MONOTONIC;
+#else
+    const clockid_t clock = CLOCK_REALTIME;
+#endif
     timespec until{};
-    clock_gettime(CLOCK_REALTIME, &until);
+    clock_gettime(clock, &until);
     until.tv_nsec += long(ms < 0 ? 0 : ms) * 1000000L;
     until.tv_sec += until.tv_nsec / 1000000000L;
     until.tv_nsec %= 1000000000L;
     int r;
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 30))
+    do r = sem_clockwait(&d_->sem, clock, &until);
+#else
     do r = sem_timedwait(&d_->sem, &until);
+#endif
     while (r != 0 && errno == EINTR);
     if (r == 0) d_->raised = false;
 }
