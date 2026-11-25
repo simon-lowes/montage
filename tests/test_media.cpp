@@ -42432,7 +42432,7 @@ private slots:
             for (int i = 0; i < 5; ++i)
                 for (int j = 0; j < 5; ++j) {
                     SolvedPoint pt;
-                    pt.X = {-2 + i, 0.1 * j, -3 + 1.5 * j};
+                    pt.X = {-2.0 + i, 0.1 * j, -3 + 1.5 * j};
                     solve.points.push_back(pt);
                 }
             return solve;
