@@ -912,7 +912,19 @@ void LiveFeed::picture(const AVFrame* f) {
     }
 }
 
+namespace {
+int64_t steadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
+bool LiveFeed::wholeWanted() const {
+    const int64_t asked = wholeAsked_.load();
+    return asked != 0 && steadyMs() - asked < 1000;
+}
+
 LiveFeed::Full LiveFeed::full(int maxWidth, int maxHeight, int64_t after) const {
+    wholeAsked_ = std::max<int64_t>(1, steadyMs());
     Full out;
     AVFrame* f = nullptr;
     {
@@ -2205,6 +2217,9 @@ void Recorder::run() {
         Input& in = inputs[item.input];
         const st2110::InputFrame& f = *item.st2110;
         const int64_t pts = f.ptpNs / 100;
+        // (a feed decoded smaller for a tile while it is only watched: at its own size again while a viewer shows it
+        // whole, as the Source monitor does a feed taken live; from the next codestream on)
+        if (watchOnly && in.st2110Proxy > 0 && in.st2110) in.st2110->setJpegXsProxy(cs.live && cs.live->wholeWanted() ? 0 : in.st2110Proxy);
         // (a picture dropped while the encoder caught up: its sound still goes in)
         // (a picture decoded at a proxy size, from while the feed was only watched, is not recorded)
         const bool proxySized = f.picture.width != in.st2110Video.width;

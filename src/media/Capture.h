@@ -156,6 +156,9 @@ public:
         double masteringMaxNits = 0, masteringMinNits = 0, maxCll = 0, maxFall = 0;
     };
     Full full(int maxWidth, int maxHeight, int64_t after = 0) const;
+    // A viewer asked for full() within the last second: a feed decoded smaller for a tile (ST 2110-22's
+    // jpegxs_proxy=) is decoded at its own size again while one does.
+    bool wholeWanted() const;
     // The timecode of picture `frame` (its number in the recording): the first's counted on at the feed's rate.
     std::string timecodeAt(int64_t frame) const;
     std::string firstTimecode() const;
@@ -175,6 +178,7 @@ private:
     SwsContext* sws_ = nullptr;
     int swsKey_[7] = {0, 0, -1, 0, 0, 0, 0};
     AVFrame* latest_ = nullptr;  // the latest picture as it came (a reference to its planes)
+    mutable std::atomic<int64_t> wholeAsked_{0};  // (when full() was last called: the steady clock's ms, 0 never)
     // (full()'s scaler, kept from call to call: one caller at a time)
     mutable std::mutex fullM_;
     mutable SwsContext* fullSws_ = nullptr;
