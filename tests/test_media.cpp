@@ -25967,6 +25967,50 @@ if ui["pressed"] == "add":
         QCOMPARE(beside.issueCount, alone.issueCount);
     }
 
+    void av1ExportStatesDecoderModel() {
+        // An AV1 export from libaom with the HRD row set states AV1's decoder model (its timing and decoder model info,
+        // each frame's removal time), and the buffer check finds it, and every frame kept to it; the export checked
+        // itself. Without the row set it states none.
+        if (!avcodec_find_encoder_by_name("libaom-av1")) QSKIP("This build of FFmpeg has no libaom");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        Clip moving = makeGeneratorClip(p, "particles", 40);
+        s.videoTracks[0].clips.push_back(moving);
+        ExportSettings ex;
+        ex.videoCodec = "libaom-av1";
+        ex.audioCodec = "none";
+        ex.preset = "8";
+        ex.hrd = "vbr";
+        ex.vbvMaxrate = 600000;
+        ex.path = path("aom-model.mp4");
+        std::string err;
+        HrdReport after;
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, nullptr, nullptr, nullptr, &after), err.c_str());
+        const HrdReport r = checkHrd(ex.path);
+        QVERIFY2(r.checked && r.signalled && r.codec == "AV1" && r.model == "decoder model", (r.summary() + " " + r.note).c_str());
+        // (every coded frame is removed from the buffer at its own time: the 40 shown and libaom's hidden ones)
+        QVERIFY2(r.frames >= 40 && r.frames < 60, qPrintable(QString::number(r.frames)));
+        QVERIFY2(r.conforms(), (r.summary() + " " + (r.issues.empty() ? std::string() : r.issues.front().text)).c_str());
+        QVERIFY2(after.checked && after.model == r.model && after.highest == r.highest && after.issueCount == 0, after.summary().c_str());
+        // (the rate asked for kept: the file's bits a second no more than it, give or take its start)
+        const double seconds = 40.0 / 25;
+        QVERIFY2(double(QFileInfo(QString::fromStdString(ex.path)).size()) * 8 / seconds < 1.15 * 600000,
+                 qPrintable(QString::number(QFileInfo(QString::fromStdString(ex.path)).size())));
+        ExportSettings none = ex;
+        none.hrd.clear();
+        none.path = path("aom-none.mp4");
+        QVERIFY2(exportSequence(p, s, none, nullptr, nullptr, &err), err.c_str());
+        const HrdReport n = checkHrd(none.path);
+        QVERIFY2(!n.checked && n.note.find("no decoder model") != std::string::npos, n.note.c_str());
+        // A decoder model with no rate to keep is refused.
+        ExportSettings noRate = ex;
+        noRate.vbvMaxrate = 0, noRate.videoBitrate = 0;
+        noRate.path = path("aom-no-rate.mp4");
+        QVERIFY(!exportSequence(p, s, noRate, nullptr, nullptr, &err));
+        QVERIFY2(err.find("decoder model needs a rate") != std::string::npos, err.c_str());
+    }
+
 private:
     // A file's video packets in decode order: their bytes, the frame each shows, and whether it is a key frame.
     struct CodedPacket {

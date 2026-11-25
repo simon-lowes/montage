@@ -65,7 +65,8 @@ struct ExportSettings {
     // it (render/HrdCheck.h): "cbr" (a constant rate, filler data where the pictures need fewer bits), "vbr" (no more
     // than the rate, at the quality or bit rate asked), or empty (none stated). The HRD's rate is vbvMaxrate (0: the
     // video bit rate), its buffer vbvBuffer bits (0: a second at the rate). MPEG-2 always states its VBV: these set
-    // it (0 buffer: XDCAM HD422's), and empty is XDCAM HD422's own (exportMpeg2Vbv).
+    // it (0 buffer: XDCAM HD422's), and empty is XDCAM HD422's own (exportMpeg2Vbv). AV1 from libaom: its decoder
+    // model stated, the rate kept to (the buffer the level's, AV1 stating no other).
     std::string hrd;
     int64_t vbvMaxrate = 0;
     int64_t vbvBuffer = 0;

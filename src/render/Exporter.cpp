@@ -1403,6 +1403,24 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             av_dict_set(&opts, "row-mt", "1", 0);
             av_dict_set(&opts, "deadline", s.preset.empty() ? "good" : s.preset.c_str(), 0);
             av_dict_set(&opts, "cpu-used", "4", 0);
+        } else if (c == "libaom-av1" && (s.hrd == "cbr" || s.hrd == "vbr")) {
+            // libaom with a stated HRD: AV1's decoder model in its sequence header (timing and decoder model info,
+            // each operating point's buffer delays) and in every frame header (its removal time), at the rate asked:
+            // exactly it at a constant rate, never more at a variable one. The buffer is the level's (AV1 states no
+            // other), which the rate is held under.
+            const int64_t rate = s.vbvMaxrate > 0 ? s.vbvMaxrate : s.videoBitrate;
+            if (rate <= 0) {
+                av_dict_free(&opts);
+                return fail("AV1's decoder model needs a rate: set the HRD rate or a video bit rate");
+            }
+            const bool cbr = s.hrd == "cbr";
+            o.vctx->rc_max_rate = rate;
+            o.vctx->rc_min_rate = cbr ? rate : 0;
+            o.vctx->bit_rate = cbr ? rate : std::min<int64_t>(s.videoBitrate > 0 ? s.videoBitrate : rate * 3 / 4, rate);
+            o.vctx->rc_buffer_size = int(std::min<int64_t>(s.vbvBuffer > 0 ? s.vbvBuffer : rate, INT_MAX));
+            av_dict_set(&opts, "aom-params", "timing-info=model", 0);
+            av_dict_set(&opts, "row-mt", "1", 0);
+            if (!s.preset.empty()) av_dict_set(&opts, "cpu-used", s.preset.c_str(), 0);
         } else if (c == "libsvtav1") {
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
             av_dict_set(&opts, "preset", s.preset.empty() ? "8" : s.preset.c_str(), 0);
@@ -3423,7 +3441,7 @@ bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSetti
 
 bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames) {
     const std::string& c = s.videoCodec;
-    if (!s.hrdCheck || (c != "libx264" && c != "libx265" && c != "mpeg2video")) return false;
+    if (!s.hrdCheck || (c != "libx264" && c != "libx265" && c != "mpeg2video" && c != "libaom-av1")) return false;
     if (s.profile == "avci100" || s.path.find('%') != std::string::npos) return false;  // (intra only; image sequences)
     return copiedFrames > 0 || s.hrd == "cbr" || s.hrd == "vbr";
 }

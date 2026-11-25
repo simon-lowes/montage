@@ -57,10 +57,11 @@ const QString kSettingsPreset = QStringLiteral("export/preset");
 bool hasVideo(const ExportSettings& s) { return !s.videoCodec.empty() && s.videoCodec != "none"; }
 bool hasAudio(const ExportSettings& s) { return !s.audioCodec.empty() && s.audioCodec != "none"; }
 
-// Whether an export's video can state an HRD: x264's and x265's (not AVC-Intra, whose class fixes its rate), and
-// MPEG-2's VBV (which it always states: the row sets it).
+// Whether an export's video can state an HRD: x264's and x265's (not AVC-Intra, whose class fixes its rate),
+// MPEG-2's VBV (which it always states: the row sets it), and libaom's AV1 decoder model.
 bool statesHrd(const ExportSettings& s) {
-    return ((s.videoCodec == "libx264" || s.videoCodec == "libx265") && s.profile != "avci100") || s.videoCodec == "mpeg2video";
+    return ((s.videoCodec == "libx264" || s.videoCodec == "libx265") && s.profile != "avci100") || s.videoCodec == "mpeg2video" ||
+           s.videoCodec == "libaom-av1";
 }
 
 bool usesCrf(const std::string& codec) {
@@ -220,8 +221,8 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     hrd_->addItem(tr("Not stated"), QString());
     hrd_->addItem(tr("Constant bit rate (CBR)"), QStringLiteral("cbr"));
     hrd_->addItem(tr("Variable bit rate (VBR)"), QStringLiteral("vbr"));
-    hrd_->setToolTip(tr("States a buffer model (HRD) in H.264 or H.265 video, or sets MPEG-2's (its VBV), as broadcast ingest checks "
-                        "it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this "
+    hrd_->setToolTip(tr("States a buffer model (HRD) in H.264 or H.265 video, AV1's decoder model, or sets MPEG-2's (its VBV), "
+                        "as broadcast ingest checks it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this "
                         "rate, at the quality set above. The export is checked against it when it is written."));
     hrdRate_ = new QSpinBox(form_);
     hrdRate_->setObjectName(QStringLiteral("exportHrdRate"));
@@ -1132,6 +1133,11 @@ void ExportDialog::updateSummary() {
             else
                 line += (vbv.cbr ? tr(", a constant %1 kbit/s with its VBV stated (%2 kbit)") : tr(", no more than %1 kbit/s with its VBV stated (%2 kbit)"))
                             .arg(rate, buffer);
+        } else if (!hrdMode.isEmpty() && s.videoCodec == "libaom-av1") {
+            // (AV1's decoder model states the level's buffer: the rate is the one asked)
+            line += (hrdMode == QLatin1String("cbr") ? tr(", a constant %1 kbit/s with its decoder model stated")
+                                                     : tr(", no more than %1 kbit/s with its decoder model stated"))
+                        .arg(hrdRate_->value());
         } else if (!hrdMode.isEmpty()) {
             const int buffer = hrdBuffer_->value() > 0 ? hrdBuffer_->value() : hrdRate_->value();
             line += (hrdMode == QLatin1String("cbr") ? tr(", a constant %1 kbit/s with its buffer model stated (%2 kbit)")
