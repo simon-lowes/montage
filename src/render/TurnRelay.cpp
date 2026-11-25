@@ -740,6 +740,7 @@ struct RelayBridge::Impl {
                 unprovenLost = true;
             }
             if (r.done) r.done(nullptr);
+            if (unprovenLost) unprovenStands = true;
             unprovenLost = false;
         }
         if (allocated && at >= expiresAt)
@@ -782,6 +783,7 @@ struct RelayBridge::Impl {
         }
     }
     bool unprovenLost = false;  // (while a request that only had unsigned answers is told it had none)
+    bool unprovenStands = false;  // (that request's error is the bridge's until a signed answer comes)
     bool releasing = false;     // release() was begun (it is begun once)
 
     void setError(const std::string& why) {
@@ -843,20 +845,25 @@ struct RelayBridge::Impl {
     // An answer to a request: the relay's realm and nonce are taken from a 401 or 438 and the request sent again
     // with the login (three times at most); anything else is the request's answer. Once Montage signs its
     // requests, an answer that is not signed with the same key (any but a 401 or 438, which carry the relay's
-    // challenge) is not used and is counted: the request goes on waiting (over UDP, sent again as before).
+    // challenge) is not used and is counted: the request goes on waiting (over UDP, sent again as before). A refusal
+    // counts as much as a success: an unsigned 437 or 403 from anyone on the way would end a bridge or a join.
     void answered(const Message& m, const QByteArray& raw) {
         auto it = requests.find(m.id);
         if (it == requests.end() || (m.type & ~0x0110) != it->second.method) return;
         const int answerCode = (m.type & 0x0110) == kError ? errorCode(m) : 0;
         const bool challenge = answerCode == 401 || answerCode == 438;
-        const bool signedAtAll = m.find(kMessageIntegrity) || m.find(kMessageIntegritySha256);
-        if (!key.isEmpty() && !challenge && ((m.type & 0x0110) == kSuccess || signedAtAll) && !signedRight(raw)) {
+        if (!key.isEmpty() && !challenge && !signedRight(raw)) {
             ++refused;
             ++it->second.unproven;
             return;
         }
         Request r = std::move(it->second);
         requests.erase(it);
+        // (the relay answers in a way Montage can check again: a request lost to unsigned answers no longer stands)
+        if (unprovenStands) {
+            unprovenStands = false;
+            standing();
+        }
         if ((m.type & 0x0110) == kError) {
             const int code = errorCode(m);
             const QByteArray* n = m.find(kNonce);

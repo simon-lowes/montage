@@ -60,6 +60,7 @@ public:
     std::atomic<bool> refuseRefresh{false};   // a Refresh that keeps the address is answered 508 (it keeps it all the same)
     std::atomic<bool> forget{false};          // the next Refresh finds the address gone: 437, as after a restart
     std::atomic<bool> refusePermission{false};  // a CreatePermission answered 403 (the peer is not let in)
+    std::atomic<bool> unsignedRefusals{false};  // a refusal sent unsigned, as one made up on the way would be
     // Each answer's attributes changed before it is signed (and each packet passed on from a peer), a different way
     // every time, from this seed: values with bytes changed, cut short or longer, attributes left out, said twice
     // or under another's name. What arrives is well formed and rightly signed, and says something else.
@@ -553,8 +554,10 @@ private:
         mangled(a);
         note(QStringLiteral("%1 asks %2%3%4").arg(c.fromPort).arg(type, 4, 16, QChar('0')).arg(peerGiven ? " for " + peer.toString() + ":" + QString::number(peerPort) : QString()).arg(refused ? " (refused)" : ""));
         QByteArray answer = message(type | (refused ? 0x0110 : 0x0100), id, a);
-        answer[2] = char((a.size() + 24) >> 8), answer[3] = char((a.size() + 24) & 0xff);
-        attribute(answer, 0x0008, QMessageAuthenticationCode::hash(answer, key, QCryptographicHash::Sha1));
+        if (!refused || !unsignedRefusals) {
+            answer[2] = char((a.size() + 24) >> 8), answer[3] = char((a.size() + 24) & 0xff);
+            attribute(answer, 0x0008, QMessageAuthenticationCode::hash(answer, key, QCryptographicHash::Sha1));
+        }
         // (a byte of the signed answer changed on its way, as a box in the middle might: the relayed port's, the
         // lifetime's or the error's, whichever attribute comes first)
         if (corruptAnswers && answer.size() > 28) answer[27] = char(answer[27] ^ 0x01);

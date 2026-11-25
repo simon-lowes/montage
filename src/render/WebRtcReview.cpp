@@ -1176,6 +1176,14 @@ struct BrowserReviewBackend::Impl {
         const QByteArray sdp = !bridge ? offered
                                        : QByteArray::fromStdString(beside ? offerAlsoThroughRelay(offered.toStdString(), alias)
                                                                           : offerThroughRelay(offered.toStdString(), alias));
+        // (only through the relay, none of the viewer's addresses may be of the family the relay gave Montage: a relay
+        // with no IPv6 address for Montage carries nothing to a browser that has only IPv6 ones there; said at once,
+        // not left to fail the checks half a minute on)
+        if (bridge && !beside && offerAddresses(sdp.toStdString()) == 0)
+            return respond(c, "502 Bad Gateway", {},
+                           offerFamily(offered.toStdString()) == 6
+                               ? "The review's relay gave Montage no IPv6 address, and this browser's addresses there are all IPv6, so it cannot watch through it"
+                               : "None of this browser's addresses at the review's relay can be reached through Montage's address there");
         std::shared_ptr<Viewer> v;
         std::string why;
         try {

@@ -246,6 +246,44 @@ void setTimingTrace(std::function<void(const std::string&)> trace) {
     tracing = bool(traceTo);
 }
 
+bool beginsKeyframe(const std::string& codec, const uint8_t* p, size_t n, bool parameterSetsGiven) {
+    if (n < 1) return false;
+    if (codec == "h264") {
+        // (a sequence parameter set, by itself or first among those put together in one packet: browsers send one
+        // before each keyframe)
+        const int type = p[0] & 0x1f;
+        if (type == 7 || (parameterSetsGiven && type == 5)) return true;
+        if (type == 24) {
+            for (size_t at = 1; at + 3 <= n;) {
+                const size_t size = (size_t(p[at]) << 8) | p[at + 1];
+                if ((p[at + 2] & 0x1f) == 7 || (parameterSetsGiven && (p[at + 2] & 0x1f) == 5)) return true;
+                at += 2 + size;
+            }
+        }
+        // (an IDR picture's first fragment)
+        if (type == 28 && parameterSetsGiven && n >= 2 && (p[1] & 0x80) && (p[1] & 0x1f) == 5) return true;
+        return false;
+    }
+    if (codec == "vp8") {
+        // (the payload descriptor, then the frame's first byte, whose lowest bit is 0 in a keyframe: only in the
+        // packet that starts the first partition)
+        size_t at = 1;
+        if (!(p[0] & 0x10) || (p[0] & 0x07)) return false;
+        if (p[0] & 0x80) {
+            if (n < 2) return false;
+            const uint8_t x = p[1];
+            at = 2;
+            if (x & 0x80) at += (at < n && (p[at] & 0x80)) ? 2 : 1;
+            if (x & 0x40) ++at;
+            if (x & 0x30) ++at;
+        }
+        return at < n && !(p[at] & 0x01);
+    }
+    if (codec == "vp9") return !(p[0] & 0x40) && (p[0] & 0x08);  // (not predicted from another picture, and its beginning)
+    if (codec == "av1") return (p[0] & 0x08) != 0;               // (a new coded video sequence)
+    return false;
+}
+
 #ifndef MONTAGE_WITH_WEBRTC
 
 struct Endpoint::Impl {};
@@ -273,7 +311,7 @@ using Clock = std::chrono::steady_clock;
 using output::PassphraseGate;
 
 constexpr qsizetype kMaxHeader = 16 * 1024, kMaxBody = 256 * 1024;
-constexpr int kMaxConnections = 32;
+constexpr int kMaxConnections = 32, kMaxFromOneAddress = 8;
 constexpr size_t kHeldBytes = size_t(16) << 20;     // pictures kept before the feed begins (from the last keyframe)
 constexpr size_t kQueuedBytes = size_t(64) << 20;   // packets waiting to be read: past this, pictures are dropped
 constexpr double kReportsWait = 3.0;                // seconds the sender's reports are waited for before arrival lines the sound up
@@ -402,43 +440,6 @@ bool parseRtp(const uint8_t* d, size_t n, Rtp& r) {
     return true;
 }
 
-// Whether a picture's packet begins a keyframe, as each codec's RTP payload says it.
-bool beginsKeyframe(const std::string& codec, const uint8_t* p, size_t n) {
-    if (n < 1) return false;
-    if (codec == "h264") {
-        // (a sequence parameter set, by itself or first among those put together in one packet: browsers send one
-        // before each keyframe)
-        const int type = p[0] & 0x1f;
-        if (type == 7) return true;
-        if (type == 24) {
-            for (size_t at = 1; at + 3 <= n;) {
-                const size_t size = (size_t(p[at]) << 8) | p[at + 1];
-                if ((p[at + 2] & 0x1f) == 7) return true;
-                at += 2 + size;
-            }
-        }
-        return false;
-    }
-    if (codec == "vp8") {
-        // (the payload descriptor, then the frame's first byte, whose lowest bit is 0 in a keyframe: only in the
-        // packet that starts the first partition)
-        size_t at = 1;
-        if (!(p[0] & 0x10) || (p[0] & 0x07)) return false;
-        if (p[0] & 0x80) {
-            if (n < 2) return false;
-            const uint8_t x = p[1];
-            at = 2;
-            if (x & 0x80) at += (at < n && (p[at] & 0x80)) ? 2 : 1;
-            if (x & 0x40) ++at;
-            if (x & 0x30) ++at;
-        }
-        return at < n && !(p[at] & 0x01);
-    }
-    if (codec == "vp9") return !(p[0] & 0x40) && (p[0] & 0x08);  // (not predicted from another picture, and its beginning)
-    if (codec == "av1") return (p[0] & 0x08) != 0;               // (a new coded video sequence)
-    return false;
-}
-
 struct Stream {
     bool present = false;
     int pt = 0, clock = 90000;
@@ -555,7 +556,9 @@ struct Feed {
     }
 
     void push(std::vector<uint8_t>&& d, bool isVideo) {
-        if (outBytes + d.size() > kQueuedBytes && isVideo) {
+        // (pictures past the queue's size; sound too past a sixteenth more, so a reader that stalls, or a sender's
+        // flood of sound, cannot grow it without end)
+        if (outBytes + d.size() > (isVideo ? kQueuedBytes : kQueuedBytes + kQueuedBytes / 16)) {
             ++dropped;
             return;
         }
@@ -716,12 +719,13 @@ struct Feed {
         ++packets;
         if (s.numbered) {
             const int16_t step = int16_t(r.seq - s.lastSeq);
-            if (step > 1) {
+            // (a jump of more than a few seconds' packets is the sender starting its numbers afresh, not a loss)
+            if (step > 1 && step <= 3000) {
                 lost += step - 1;
                 ask = isVideo;
                 if (isVideo && holding && !started) heldLost = true;
             }
-            if (step > 0) s.lastSeq = r.seq;
+            if (step > 0 || step < -3000) s.lastSeq = r.seq;
         } else {
             s.numbered = true;
             s.lastSeq = r.seq;
@@ -740,7 +744,7 @@ struct Feed {
             cv.notify_all();
         } else {
             if (isVideo) {
-                if (beginsKeyframe(s.codec, r.payload, r.size) && (s.held.empty() || s.held.back().ts != ts) && (!holding || heldLost)) {
+                if (beginsKeyframe(s.codec, r.payload, r.size, s.fmtp.find("sprop-parameter-sets=") != std::string::npos) && (s.held.empty() || s.held.back().ts != ts) && (!holding || heldLost)) {
                     // (the first keyframe; or a later one before the feed has begun, after a loss: the feed begins
                     // there instead. A later one with nothing lost is held with the rest: a sender sends keyframes
                     // of its own while the sender's reports are waited for, and the feed begins at its first)
@@ -795,8 +799,12 @@ struct Feed {
                         const double now = secondsNow(), sent = double(ntp >> 32) + double(ntp & 0xffffffffu) / 4294967296.0;
                         s.reported = true;
                         s.reportRtp = s.unwrap(ts);
-                        note(s.origins, now, sent - double(s.reportRtp) / s.clock, 0);
-                        note(gaps, now, now - sent, 0);
+                        // (reports within a tenth of a second of each other kept as their least, and only the last
+                        // kTimingKept seconds' kept, in a feed with pictures alone too: as many as a sender sends,
+                        // the lists stay short)
+                        note(s.origins, now, sent - double(s.reportRtp) / s.clock, 0.1);
+                        note(gaps, now, now - sent, 0.1);
+                        least(gaps, now, true);
                         trace("report %c came %.6f ntp %.6f rtp %lld", isVideo ? 'V' : 'A', now, sent, (long long)s.reportRtp);
                         for (Stream* st : {&video, &audio})
                             if (st->reported) {
@@ -922,7 +930,15 @@ struct Endpoint::Impl {
 
     void accept(HttpServer& server, qintptr fd) {
         auto* c = new QSslSocket(&server);
-        if (!c->setSocketDescriptor(fd) || server.findChildren<QSslSocket*>().size() > kMaxConnections) {
+        // (32 connections at most, and 8 from any one address, so one sender cannot hold every slot)
+        bool full = !c->setSocketDescriptor(fd) || server.findChildren<QSslSocket*>().size() > kMaxConnections;
+        if (!full) {
+            int same = 0;
+            for (QSslSocket* o : server.findChildren<QSslSocket*>())
+                if (o != c && o->peerAddress().isEqual(c->peerAddress(), QHostAddress::TolerantConversion)) ++same;
+            full = same >= kMaxFromOneAddress;
+        }
+        if (full) {
             if (c->socketDescriptor() == -1) {
 #ifdef Q_OS_WIN
                 ::closesocket(SOCKET(fd));
@@ -981,6 +997,28 @@ struct Endpoint::Impl {
         c->disconnectFromHost();
     }
 
+    // Whether a request may be from a page elsewhere: its Origin, when it has one, names the host it was sent to; and
+    // when Montage listens on the loopback alone, the host it was sent to is the loopback's (by address or as
+    // localhost), not a name some page made point there.
+    bool sameSite(const Request& r) const {
+        const QByteArray hostHeader = r.header("host").trimmed().toLower();
+        auto hostOf = [](const QByteArray& h) {
+            // ("name:port", "[v6]:port", or a bare name)
+            if (h.startsWith('[')) return h.mid(1, h.indexOf(']') - 1);
+            const qsizetype colon = h.lastIndexOf(':');
+            return colon > 0 && h.count(':') == 1 ? h.left(colon) : h;
+        };
+        const QByteArray name = hostOf(hostHeader);
+        if (host.isLoopback() && !name.isEmpty()) {
+            QHostAddress a;
+            if (name != "localhost" && !name.endsWith(".localhost") && !(a.setAddress(QString::fromLatin1(name)) && a.isLoopback())) return false;
+        }
+        const QByteArray origin = r.header("origin").trimmed().toLower();
+        if (origin.isEmpty() || origin == "null") return origin.isEmpty();
+        const qsizetype scheme = origin.indexOf("://");
+        return scheme > 0 && origin.mid(scheme + 3) == hostHeader;
+    }
+
     // The token as a bearer token, compared only when the gate lets it be tried (render/ReviewGate.h: an address
     // that guessed wrong too often is refused at once, and each address and network may try only so often).
     bool authorised(QSslSocket* c, const Request& r) {
@@ -1037,8 +1075,12 @@ struct Endpoint::Impl {
             if (r.method == "GET" && asked == "/") return respond(c, "303 See Other", {{"Location", path}}, {});
             return respond(c, "404 Not Found", {}, "Not found");
         }
+        // (a page elsewhere, or a name that is not this computer's when Montage listens on its loopback alone, as a
+        // page that rebinds its own name to 127.0.0.1 would use, is refused)
+        if (!sameSite(r)) return respond(c, "403 Forbidden", {}, "Not from this endpoint's own page or address");
         if (r.method == "OPTIONS") {
-            auto headers = iceLinks();
+            // (no ICE servers here: the relay's login goes only with an answer, to a sender that gave the token)
+            std::vector<std::pair<QByteArray, QByteArray>> headers;
             headers.emplace_back("Accept-Post", "application/sdp");
             headers.emplace_back("Allow", endpoint ? "GET, POST, OPTIONS" : "PATCH, DELETE, OPTIONS");
             return respond(c, "204 No Content", headers, {});
@@ -1064,6 +1106,11 @@ struct Endpoint::Impl {
                 endSession(s, true);
                 return respond(c, "200 OK", {}, {});
             }
+            // (RFC 9725's trickle: a fragment of that type, for this session's ICE (the ETag its answer gave) or "*")
+            if (!r.header("content-type").toLower().startsWith("application/trickle-ice-sdpfrag"))
+                return respond(c, "415 Unsupported Media Type", {}, "Candidates are application/trickle-ice-sdpfrag");
+            if (const QByteArray match = r.header("if-match").trimmed(); !match.isEmpty() && match != "*" && match != "\"" + QByteArray::fromStdString(s->id) + "\"")
+                return respond(c, "412 Precondition Failed", {}, "Not this session's ICE");
             // More of the sender's addresses (RFC 8840's fragment: candidates under each medium's mid).
             std::string mid;
             for (const QByteArray& raw : r.body.split('\n')) {

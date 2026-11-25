@@ -88,6 +88,12 @@ private:
 // The page a GET of the endpoint gives.
 const char* guestPage();
 
+// Whether a picture's RTP payload (`codec` as the offer names it: h264, vp8, vp9 or av1) begins a keyframe.
+// `parameterSetsGiven`: H.264 whose sequence and picture parameter sets the offer gave (sprop-parameter-sets), so an
+// IDR picture's first packet begins one even with none sent before it; otherwise one begins with its sequence
+// parameter set, as browsers send it before each keyframe.
+bool beginsKeyframe(const std::string& codec, const uint8_t* payload, size_t size, bool parameterSetsGiven = false);
+
 // Each event of a feed's timing as a line of text, for finding where a sender's sound and pictures stand against
 // each other (a test's, a diagnosis'): every RTP packet as it came ("packet V|A ts <unwrapped RTP time> bytes <n>
 // came <s>"), every sender report ("report V|A came <s> ntp <s> rtp <t>") and the timing taken from the reports

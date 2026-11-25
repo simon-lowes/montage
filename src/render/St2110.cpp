@@ -325,7 +325,9 @@ size_t jxsvFrameLimit(const VideoFormat& f) {
     const Pgroup pg = pgroup(f.sampling, f.depth);
     const double raw = pg.pixels > 0 ? 8.0 * pg.bytes / pg.pixels : 0;
     const double bits = std::max({24.0, std::isfinite(f.bpp) ? f.bpp : 0.0, raw});
-    return size_t(std::min(double(f.width) * f.height * bits / 8 + 65536, double(JxsvAssembler::kLargestFrame)));
+    // (interlaced, each codestream is a field's: half the frame's lines, so half its bytes)
+    const double lines = f.interlaced ? (f.height + 1) / 2 : f.height;
+    return size_t(std::min(double(f.width) * lines * bits / 8 + 65536, double(JxsvAssembler::kLargestFrame)));
 }
 
 bool videoFormatOk(const VideoFormat& f, std::string* why) {

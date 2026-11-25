@@ -426,6 +426,8 @@ struct Input::Stream {
     bool haveFirst = false;
     uint32_t firstTs = 0;
     int64_t firstLost = 0;
+    bool failedSeen = false;  // (the interlaced frame last counted incomplete, by its timestamp)
+    uint32_t failedTs = 0;
     std::chrono::steady_clock::time_point last[2];  // when each path last brought a packet
     // Ancillary data and metadata: the latest RTP timestamp this stream brought (the input's lock held).
     bool dataSeen = false;
@@ -612,9 +614,11 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         }
         std::lock_guard lock(m_);
         if (!ok || (interlaced && (!s.haveFirst || s.firstTs != s.jxsv->timestamp()))) {
-            // (a second field without its first is a frame lost)
+            // (a second field without its first is a frame lost: counted once, not again for its first that failed)
             s.haveFirst = false;
-            ++stats_.incomplete;
+            const bool counted = interlaced && s.failedSeen && s.failedTs == s.jxsv->timestamp();
+            if (!counted) ++stats_.incomplete;
+            s.failedSeen = interlaced, s.failedTs = s.jxsv->timestamp();
             return;
         }
         Raster frame;

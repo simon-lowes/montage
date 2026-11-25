@@ -2228,6 +2228,32 @@ struct LiveOrigin::State {
     }
     bool after(const Request& r, double seconds) const { return Clock::now() > r.came + std::chrono::milliseconds(int64_t(seconds * 1000)); }
 
+    // A playlist or manifest as it is now, read once each time it changes and its text shared by every request (one
+    // kept from a long event's start is a megabyte or more, and each player asks for it each part); false when it
+    // cannot be read.
+    struct Text {
+        qint64 size = -1, modified = -1, readAt = -1;
+        QByteArray text;
+    };
+    std::map<QString, Text> texts;
+    bool textOf(QFile& f, QByteArray& text) {
+        const QFileInfo fi(f);
+        const qint64 size = fi.size(), modified = fi.lastModified().toMSecsSinceEpoch();
+        Text& t = texts[fi.absoluteFilePath()];
+        // (read again too when it had changed just before it was read: a second change in the same tick of the
+        // file's clock would keep its size and time)
+        if (t.size != size || t.modified != modified || t.readAt - t.modified < 50) {
+            if (!f.open(QIODevice::ReadOnly)) return false;
+            t.readAt = QDateTime::currentMSecsSinceEpoch();
+            t.text = f.readAll();
+            f.close();
+            // (what was seen before the reading: a change while it is read is read again next time)
+            t.size = size, t.modified = modified;
+        }
+        text = t.text;
+        return true;
+    }
+
     // A blocking reload (_HLS_msn, _HLS_part): whether the playlist has what was asked for (else held, answered 503
     // after three target durations; 400 at once when it is further ahead than a player may ask).
     bool playlistCanAnswer(Request& r, QFile& f) {
@@ -2237,9 +2263,8 @@ struct LiveOrigin::State {
             if (after(r, r.holdFor)) answer(r, 503, "text/plain", "Not yet");
             return false;
         }
-        if (!f.open(QIODevice::ReadOnly)) return false;
-        const QByteArray text = f.readAll();
-        f.close();
+        QByteArray text;
+        if (!textOf(f, text)) return false;
         r.seenSize = size, r.seenModified = modified, r.seenAt = Clock::now();
         // (held for three target durations at most)
         r.holdFor = targetDuration(text) * 3;
@@ -2376,11 +2401,11 @@ struct LiveOrigin::State {
         if (r.skip && r.rel.endsWith(".m3u8")) {
             // (a delta update: the playlist as it is when it can be answered, its old segments skipped)
             if (r.msn >= 0 && !playlistCanAnswer(r, f)) return;
-            if (!f.open(QIODevice::ReadOnly)) {
+            QByteArray text;
+            if (!textOf(f, text)) {
                 if (after(r, waitSeconds)) answer(r, 404, "text/plain", "Not found");
                 return;
             }
-            const QByteArray text = f.readAll();
             return answer(r, 200, contentType(r.rel), QByteArray::fromStdString(playlistDeltaUpdate(text.toStdString())));
         }
         if (r.msn >= 0 && r.rel.endsWith(".m3u8") && !playlistCanAnswer(r, f)) return;
@@ -2390,11 +2415,13 @@ struct LiveOrigin::State {
             r.streaming = true;
             return attempt(r);
         }
-        if (!f.open(QIODevice::ReadOnly)) {
+        const bool listing = r.rel.endsWith(".mpd") || r.rel.endsWith(".m3u8");
+        QByteArray body;
+        if (listing ? !textOf(f, body) : !f.open(QIODevice::ReadOnly)) {
             if (after(r, waitSeconds)) answer(r, 404, "text/plain", "Not found");
             return;
         }
-        if (f.size() > kHeld && !r.rel.endsWith(".mpd") && !r.rel.endsWith(".m3u8")) {
+        if (!listing && f.size() > kHeld) {
             // (a file larger than a connection may hold: its headers now, its bytes as the client takes them)
             r.length = f.size();
             send(r, headers(200, contentType(r.rel), r.length, false));
@@ -2403,7 +2430,7 @@ struct LiveOrigin::State {
             f.close();
             return attempt(r);
         }
-        QByteArray body = f.readAll();
+        if (!listing) body = f.readAll();
         if (r.rel.endsWith(".mpd")) {
             // (the clock as it is when sent)
             const QByteArray scheme = "urn:mpeg:dash:utc:direct:2014\" value=\"";

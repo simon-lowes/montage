@@ -131,16 +131,17 @@ Raster rasterOf(const JxsPicture& p) {
 
 std::vector<uint8_t> jxsvBoxes(const VideoFormat& f, uint16_t ppih, uint16_t plev, uint32_t codestreamBytes) {
     std::vector<uint8_t> out;
-    // The video support box: its information box (the maximum bit rate in Mb/s, rounded up; the frame rate as
-    // progressive, a whole numerator over 1 or 1.001; the sampling, said only for 4:2:2 at its depth; no time code)
-    // and its profile and level box.
+    // The video support box: its information box (the maximum bit rate in Mb/s, rounded up, of both fields'
+    // codestreams when interlaced; the frame rate, a whole numerator over 1 or 1.001, with whether the frame is
+    // progressive or interlaced, its first field the top one; the sampling, said only for 4:2:2 at its depth; no
+    // time code) and its profile and level box.
     box(out, "jpvs", 22 + 12);
     box(out, "jpvi", 14);
     const double fps = f.fps.toDouble();
-    add32(out, uint32_t(std::ceil(double(codestreamBytes) * 8 * fps / 1e6)));
+    add32(out, uint32_t(std::ceil(double(codestreamBytes) * 8 * fps * (f.interlaced ? 2 : 1) / 1e6)));
     const bool ntsc = f.fps.den == 1001;
     const uint32_t numerator = ntsc ? uint32_t(f.fps.num / 1000) : uint32_t(std::lround(fps));
-    add32(out, (ntsc ? 2u : 1u) << 24 | (numerator & 0xFFFF));
+    add32(out, (f.interlaced ? 1u : 0u) << 30 | (ntsc ? 2u : 1u) << 24 | (numerator & 0xFFFF));
     add16(out, f.sampling == Sampling::Ycc422 ? 0x8000u | uint32_t(f.depth - 1) << 4 : 0u);
     add32(out, 0);
     box(out, "jxpl", 4);

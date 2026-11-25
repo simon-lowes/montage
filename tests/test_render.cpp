@@ -27206,6 +27206,28 @@ colorspaces:
                 }
                 QCOMPARE(heard, QByteArray("let in at last"));
             }
+            // Nightly 25 November: a refusal that is not signed with the login's key (as one made up by someone on
+            // the way would be) is not used. The bridge goes on asking to keep its address, says once an asking's six
+            // seconds are up that the answers were not signed, and that error is gone once the relay answers signed
+            // again, before the address runs out.
+            {
+                relay.refuseRefresh = true;
+                relay.unsignedRefusals = true;
+                const uint64_t refusedBefore = bridge.answersRefused();
+                QElapsedTimer unsignedFor;
+                unsignedFor.start();
+                while (unsignedFor.elapsed() < 18000 && bridge.lastError().empty()) QThread::msleep(20);
+                relay.refuseRefresh = false;
+                relay.unsignedRefusals = false;
+                QVERIFY2(QString::fromStdString(bridge.lastError()).contains("not signed with this review's login"), bridge.lastError().c_str());
+                QVERIFY(bridge.answersRefused() > refusedBefore);
+                QVERIFY(!bridge.ended());
+                unsignedFor.restart();
+                while (unsignedFor.elapsed() < 8000 && !bridge.lastError().empty()) QThread::msleep(50);
+                QVERIFY2(bridge.lastError().empty(), bridge.lastError().c_str());
+                QVERIFY(!bridge.ended());
+                QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over UDP"));
+            }
             const qint64 recovered = clock.elapsed();
             relay.forget = true;
             while (clock.elapsed() < recovered + 16000 && !bridge.ended()) QThread::msleep(50);
@@ -27709,6 +27731,30 @@ colorspaces:
     // and sends what the page makes (a canvas that flashes white every 1.2 seconds, and a 1 kHz tone that beeps with
     // each flash) to whip://127.0.0.1:port/whip, and Montage records it to ProRes. A wrong token is answered 401, a
     // second sender 409, and the page's DELETE ends the recording whole.
+    // Nightly 25 Nov: where a sender's pictures may begin. H.264 begins at a sequence parameter set sent with the
+    // pictures (by itself, or first in a packet of several), and, when the offer gave the parameter sets
+    // (sprop-parameter-sets), at an IDR picture too: by itself, in a packet of several, or its first fragment (not
+    // a later one). Pictures that are not IDR never begin it.
+    void whipKeyframes() {
+        using montage::whip::beginsKeyframe;
+        auto starts = [](std::initializer_list<uint8_t> bytes, bool given) {
+            const std::vector<uint8_t> b(bytes);
+            return beginsKeyframe("h264", b.data(), b.size(), given);
+        };
+        QVERIFY(starts({0x67, 0x42}, false) && starts({0x67, 0x42}, true));
+        QVERIFY(starts({0x78, 0x00, 0x02, 0x67, 0x42, 0x00, 0x02, 0x68, 0xce}, false));
+        QVERIFY(!starts({0x65, 0x88}, false));
+        QVERIFY(starts({0x65, 0x88}, true));
+        QVERIFY(!starts({0x78, 0x00, 0x02, 0x65, 0x88}, false));
+        QVERIFY(starts({0x78, 0x00, 0x02, 0x65, 0x88}, true));
+        QVERIFY(!starts({0x7c, 0x85, 0x88}, false));
+        QVERIFY(starts({0x7c, 0x85, 0x88}, true));
+        QVERIFY(!starts({0x7c, 0x05, 0x88}, true));  // (a later fragment)
+        QVERIFY(!starts({0x7c, 0x81, 0x9a}, true));  // (the first fragment of a picture that is not IDR)
+        QVERIFY(!starts({0x41, 0x9a}, true));
+        QVERIFY(!starts({0x78, 0x00}, true));        // (cut short)
+    }
+
     void captureFromWhip() {
         using namespace montage::reviewtest;
         std::string why;
@@ -27804,6 +27850,38 @@ colorspaces:
         QVERIFY(ask("POST", "/whip", "Bearer wrong", "v=0\r\n").startsWith("HTTP/1.1 401"));
         QVERIFY(ask("POST", "/whip", {}, "v=0\r\n").startsWith("HTTP/1.1 401"));
         QVERIFY(ask("DELETE", "/whip/nothing", "Bearer " + QByteArray::fromStdString(token), {}).startsWith("HTTP/1.1 404"));
+        // Nightly 25 Nov: requests made by hand. A request's headers as given (each line ending \r\n), and the
+        // answer's head.
+        auto exchange = [&](const QByteArray& method, const QByteArray& path, const QByteArray& headers, const QByteArray& body) -> QByteArray {
+            QTcpSocket c;
+            c.connectToHost(QHostAddress::LocalHost, quint16(port));
+            if (!c.waitForConnected(2000)) return {};
+            c.write(method + " " + path + " HTTP/1.1\r\n" + headers + "Content-Length: " + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+            QByteArray got;
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < 5000 && !got.contains("\r\n\r\n")) {
+                c.waitForReadyRead(100);
+                got += c.readAll();
+            }
+            return got.left(got.indexOf("\r\n\r\n"));
+        };
+        const QByteArray bearer = "Authorization: Bearer " + QByteArray::fromStdString(token) + "\r\n";
+        const QByteArray self = "Host: 127.0.0.1:" + QByteArray::number(port) + "\r\n";
+        {
+            // OPTIONS, which asks for no token, names no ICE servers: the relay's login is not given to anyone who
+            // can reach the port.
+            const QByteArray options = exchange("OPTIONS", "/whip", self, {});
+            QVERIFY2(options.startsWith("HTTP/1.1 204"), options.constData());
+            QVERIFY2(!options.toLower().contains("\r\nlink:"), options.constData());
+            // A page elsewhere, or a name that is not this computer's while the endpoint listens on its loopback
+            // alone (a page that rebinds its own name to 127.0.0.1), is refused before the token is looked at; the
+            // endpoint's own page and its loopback names are not.
+            QVERIFY(exchange("POST", "/whip", self + "Origin: http://elsewhere.example\r\nContent-Type: application/sdp\r\n" + bearer, "v=0\r\n").startsWith("HTTP/1.1 403"));
+            QVERIFY(exchange("POST", "/whip", "Host: rebound.example:" + QByteArray::number(port) + "\r\nContent-Type: application/sdp\r\n" + bearer, "v=0\r\n").startsWith("HTTP/1.1 403"));
+            QVERIFY(exchange("GET", "/whip", "Host: localhost:" + QByteArray::number(port) + "\r\n", {}).startsWith("HTTP/1.1 200"));
+            QVERIFY(exchange("OPTIONS", "/whip", self + "Origin: http://127.0.0.1:" + QByteArray::number(port) + "\r\n", {}).startsWith("HTTP/1.1 204"));
+        }
 
         ChromeTab tab;
         QVERIFY2(tab.start(&why), why.c_str());
@@ -27874,6 +27952,15 @@ colorspaces:
         QVERIFY2(tab.until("__test.firstSentAt > 0", 10), "no picture sent");
         // A second sender while the first is connected: 409.
         QVERIFY(ask("POST", "/whip", "Bearer " + QByteArray::fromStdString(token), "v=0\r\n").startsWith("HTTP/1.1 409"));
+        {
+            // Nightly 25 Nov: a PATCH to the session that is not a trickle fragment is refused (415), and one for
+            // another ICE than the session's ETag names is too (412).
+            const QByteArray session = QUrl(tab.js("__montageWhip.session").toString()).path().toUtf8();
+            QVERIFY2(session.startsWith("/whip/"), session.constData());
+            const QByteArray fragment = "a=ice-ufrag:none\r\n";
+            QVERIFY(exchange("PATCH", session, self + bearer + "Content-Type: application/sdp\r\n", fragment).startsWith("HTTP/1.1 415"));
+            QVERIFY(exchange("PATCH", session, self + bearer + "Content-Type: application/trickle-ice-sdpfrag\r\nIf-Match: \"not-this-one\"\r\n", fragment).startsWith("HTTP/1.1 412"));
+        }
         QThread::msleep(7000);
         QVERIFY(rec.recording());
         // DELETE (the page's stop) ends the recording, all of it written: once the pictures stop being made and the
@@ -28231,8 +28318,11 @@ colorspaces:
 
         ChromeTab tab;
         // (three fake cameras, of which the page is shown the first and third: Chrome's second fake camera gives depth
-        // pictures, which it does not send over WebRTC, and no phone offers such a camera to a page)
-        QVERIFY2(tab.start(&why, {"--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream=device-count=3"}), why.c_str());
+        // pictures, which it does not send over WebRTC, and no phone offers such a camera to a page. A page let open a
+        // camera is given this computer's own addresses, each its own socket, and on Windows none of those reaches
+        // the endpoint on 127.0.0.1: Chrome is let use its loopback too, as a phone would use its network)
+        QVERIFY2(tab.start(&why, {"--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream=device-count=3", "--allow-loopback-in-peer-connection"}),
+                 why.c_str());
         QVERIFY2(tab.call("Emulation.setDeviceMetricsOverride", {{"width", 390}, {"height", 844}, {"deviceScaleFactor", 3}, {"mobile", true}}, &why), why.c_str());
         QVERIFY2(tab.call("Emulation.setTouchEmulationEnabled", {{"enabled", true}, {"maxTouchPoints", 5}}, &why), why.c_str());
         tab.js(QStringLiteral("location.href = 'http://127.0.0.1:%1/whip#%2'; true").arg(port).arg(QString::fromStdString(token)));
@@ -30902,6 +30992,46 @@ colorspaces:
                 QVERIFY(!came && !err.empty());
             }
             plugins::clearHostFailures();
+            // Nightly 25 Nov: a host that hangs while its picture was to come as a handle (stopped where it asks for the
+            // frame before, and waited for as long as this test's export timeout): no handle is asked for from then on,
+            // but the frame is not rendered again in a new host, which would wait out a second timeout; it fails, and
+            // says the host did not answer.
+            {
+                ofx::remote::resetPictureStats();
+                const plugins::HostingSettings was = plugins::hosting();
+                plugins::HostingSettings quick = was;
+                quick.exportTimeoutMs = 2000;
+                plugins::setHosting(quick);
+                pid_t stopped = 0;
+                const ofx::FrameFetch stopping = [&](double, Image& out) {
+                    if (!stopped)
+                        for (const plugins::HostInfo& running : plugins::runningHosts())
+                            if (running.key.find("temporal") != std::string::npos && running.pid > 0 && ::kill(pid_t(running.pid), SIGSTOP) == 0)
+                                stopped = pid_t(running.pid);
+                    out = numbered(8);
+                    return true;
+                };
+                there = numbered(9);
+                err.clear();
+                const bool came = ofx::applyEffect(slow, 9, there, 1.0, stopping, &err);
+                if (stopped > 0) ::kill(stopped, SIGKILL);  // (ended already, as hung)
+                QVERIFY(stopped > 0);
+                QVERIFY2(!came && QString::fromStdString(err).contains("did not answer"), err.c_str());
+                const ofx::remote::PictureStats now = ofx::remote::pictureStats();
+                if (now.asked > 0) {
+                    QCOMPARE(now.handles, 0L);
+                    QCOMPARE(now.sharedMemory, 0L);  // (not rendered again)
+                    there = numbered(10);
+                    QVERIFY2(ofx::applyEffect(slow, 10, there, 1.0, [&](double, Image& out) { return out = numbered(9), true; }, &err), err.c_str());
+                    QCOMPARE(ofx::remote::pictureStats().asked, now.asked);
+                    QVERIFY2(QString::fromStdString(ofx::remote::pictureStats().last).contains("hung while the picture was shared as a handle"),
+                             ofx::remote::pictureStats().last.c_str());
+                } else {
+                    QVERIFY(!expected);
+                }
+                plugins::setHosting(was);
+                plugins::clearHostFailures();
+            }
 #endif
         }
     }
