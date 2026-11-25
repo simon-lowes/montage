@@ -12210,6 +12210,13 @@ private slots:
         QCOMPARE(mcpFoldedName(composed, McpNameRules::Windows), mcpFoldedName(decomposed, McpNameRules::Windows));
         QCOMPARE(mcpFoldedName(QStringLiteral("C:\\Users\\Ana\\DKDMs. \\new.xml::$DATA"), McpNameRules::Windows), QStringLiteral("c:/users/ana/dkdms/new.xml"));
         QCOMPARE(mcpFoldedName(QStringLiteral("C:/x/Roots.pem:$DATA"), McpNameRules::Windows), mcpFoldedName(QStringLiteral("c:/X/roots.pem"), McpNameRules::Windows));
+        // (the long and device forms of a name, and this machine's own share of a drive, as the names they stand for;
+        // another machine's share as itself)
+        for (const char* other : {"\\\\?\\C:\\Users\\Ana\\new.xml", "\\\\.\\C:\\Users\\Ana\\new.xml", "\\\\localhost\\C$\\Users\\Ana\\new.xml",
+                                  "//127.0.0.1/c$/Users/Ana/new.xml"})
+            QCOMPARE(mcpFoldedName(QString::fromLatin1(other), McpNameRules::Windows), QStringLiteral("c:/users/ana/new.xml"));
+        QCOMPARE(mcpFoldedName(QStringLiteral("\\\\?\\UNC\\Server\\Share\\x"), McpNameRules::Windows), QStringLiteral("//server/share/x"));
+        QCOMPARE(mcpFoldedName(QStringLiteral("\\\\elsewhere\\C$\\x"), McpNameRules::Windows), QStringLiteral("//elsewhere/c$/x"));
         QVERIFY(mcpFoldedName(QStringLiteral("/x/roots.pem:$DATA"), McpNameRules::Folded) != mcpFoldedName(QStringLiteral("/x/roots.pem"), McpNameRules::Folded));
         // Paths that do not exist yet, under this run's folder, are told apart by name alone.
         const QString folder = dir_.filePath("own-names");

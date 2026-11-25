@@ -884,6 +884,12 @@ QString mcpFoldedName(const QString& name, McpNameRules rules) {
         // (either slash; a component's stream name, "x.pem:$DATA" or "x.pem::$DATA", is the file itself, and so is
         // one with dots or spaces after it, which Windows drops; the drive's own colon stays)
         out.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        // (the long and device forms, \\?\C:\x, \\.\C:\x and \\?\UNC\server\share, and this machine's own share of
+        // a drive, \\localhost\C$\x: the names they stand for)
+        if (out.startsWith(QLatin1String("//?/unc/"))) out.remove(2, 6);
+        else if (out.startsWith(QLatin1String("//?/")) || out.startsWith(QLatin1String("//./"))) out.remove(0, 4);
+        static const QRegularExpression ownShare(QStringLiteral("^//(?:localhost|127\\.0\\.0\\.1|\\[::1\\])/([a-z])\\$(?=/|$)"));
+        out.replace(ownShare, QStringLiteral("\\1:"));
         QStringList parts = out.split(QLatin1Char('/'));
         for (int i = 0; i < parts.size(); ++i) {
             QString& c = parts[i];
