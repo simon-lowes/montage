@@ -2818,27 +2818,39 @@ private slots:
         }
         std::atomic<bool> stop{false};
         std::thread sending([&] {
-            for (int t = 0; !stop && t < 25 * 20; ++t) {
+            for (int t = 0; !stop && t < 25 * 60; ++t) {
                 std::vector<float> sound(size_t(spf) * 2, 0.0f);
                 for (int i = 0; i < spf; ++i) sound[size_t(i) * 2] = tone(int64_t(t) * spf + i);
                 const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
                 if (!tx.send(pictures[size_t(t % 25)], sound.data(), spf, &tc, {}, &stop)) break;
             }
         });
-        // Recorded for two seconds, with the streams' time code.
+        // Recorded for two seconds, with the streams' time code. (Should this test's own sender fall so far behind on a
+        // busy machine that it passes over frame slots while it is recorded, the streams themselves have gaps, and
+        // they are recorded again, up to three times.)
         CaptureSettings cs;
         cs.video.device = "st2110";
         cs.video.url = url;
-        cs.path = path("capture-st2110.mov");
         cs.seconds = 2;
-        Recorder rec;
-        QVERIFY2(rec.start(cs, &err), err.c_str());
-        const bool ended = rec.wait(20);
+        CaptureStatus status;
+        int64_t skipped = 0;
+        bool ended = false;
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            cs.path = path(QStringLiteral("capture-st2110-%1.mov").arg(attempt).toStdString().c_str());
+            const int64_t skippedBefore = tx.slotsSkipped();
+            Recorder rec;
+            ended = rec.start(cs, &err) && rec.wait(20);
+            status = rec.status();
+            if (!ended) break;
+            skipped = tx.slotsSkipped() - skippedBefore;
+            if (skipped == 0) break;
+            qWarning("captureFromSt2110: the sender passed over %lld frame slots while recording %d", (long long)skipped, attempt);
+        }
         stop = true;
         sending.join();
         tx.close();
-        QVERIFY(ended);
-        const CaptureStatus status = rec.status();
+        QVERIFY2(ended, err.c_str());
+        QVERIFY2(skipped == 0, qPrintable(QStringLiteral("the sender passed over %1 frame slots in each of three recordings").arg(skipped)));
         QVERIFY2(status.error.empty(), status.error.c_str());
         QCOMPARE(status.frames, int64_t(50));
         QVERIFY(status.width == W && status.height == H && status.fps == 25 && status.channels == 2);
