@@ -6281,7 +6281,7 @@ private slots:
             std::mutex m;
             std::condition_variable cv;
             bool open = false, offThread = true;
-            int calls = 0;
+            int calls = 0, passes = 0;  // (passes: pictures let through while it is shut)
         };
         auto gate = std::make_shared<Gate>();
         QThread* const ui = QThread::currentThread();
@@ -6289,7 +6289,8 @@ private slots:
             std::unique_lock lock(gate->m);
             ++gate->calls;
             if (QThread::currentThread() == ui) gate->offThread = false;
-            gate->cv.wait(lock, [&] { return gate->open; });
+            gate->cv.wait(lock, [&] { return gate->open || gate->passes > 0; });
+            if (!gate->open) --gate->passes;
         });
         auto setOpen = [gate](bool open) {
             {
@@ -6383,6 +6384,31 @@ private slots:
         QTRY_VERIFY(!v.peakingPending());
         v.repaint();
         QCOMPARE(v.paintedImage(), a);
+        // Off and on again while one is held: what it peaked lands after peaking came back, and is not drawn over
+        // the picture shown since, while that one is worked out.
+        v.setFocusPeaking(true);
+        setOpen(false);
+        v.setImage(chart(24), 6);
+        v.repaint();
+        QTRY_COMPARE(calls(), 6);
+        v.setFocusPeaking(false);
+        v.setImage(chart(56), 7);
+        const QImage c = v.image();
+        v.setFocusPeaking(true);
+        v.repaint();
+        QCOMPARE(v.paintedImage(), c);
+        shown.clear();
+        {
+            std::lock_guard lock(gate->m);
+            gate->passes = 1;
+        }
+        gate->cv.notify_all();
+        QTRY_VERIFY(shown.count() >= 1);
+        QTRY_COMPARE(calls(), 7);  // (the picture shown now, held)
+        v.repaint();
+        QCOMPARE(v.paintedImage(), c);
+        setOpen(true);
+        QTRY_COMPARE(v.paintedImage(), focusPeakingView(c, red, 1));
     }
 
     void gamutScopeAndChecks() {

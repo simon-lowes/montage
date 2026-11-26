@@ -177,6 +177,7 @@ private:
     mutable qint64 peakedKey_ = -1;
     mutable QString peakedState_;
     QFutureWatcher<QImage>* peakingWatch_ = nullptr;  // the picture being peaked off the interface thread
+    int peakingTurn_ = 0;                              // how often peaking was turned off (a result from before is not kept)
     QImage painted_;
     // The picture peaking is found in for what is shown now, the view it is painted over, and the key of what it peaks.
     QString peakingWanted(QImage& exposed, QSize& size) const;
