@@ -1559,6 +1559,13 @@ void Recorder::run() {
                 return false;
             }
             avcodec_parameters_from_context(vst->codecpar, venc);
+            // The feed's HDR metadata, as its first picture states it, in the file's header: QuickTime's mdcv and
+            // clli, MXF's mastering display (the muxers read it from the stream, not from the pictures).
+            for (const auto& [from, to] : {std::pair{AV_FRAME_DATA_MASTERING_DISPLAY_METADATA, AV_PKT_DATA_MASTERING_DISPLAY_METADATA},
+                                           std::pair{AV_FRAME_DATA_CONTENT_LIGHT_LEVEL, AV_PKT_DATA_CONTENT_LIGHT_LEVEL}})
+                if (const AVFrameSideData* sd = av_frame_get_side_data(f, from))
+                    if (AVPacketSideData* d = av_packet_side_data_new(&vst->codecpar->coded_side_data, &vst->codecpar->nb_coded_side_data, to, sd->size, 0))
+                        std::memcpy(d->data, sd->data, sd->size);
             vst->time_base = venc->time_base;
             vst->avg_frame_rate = fps;
             av_dict_set(&vst->metadata, "timecode", tc.c_str(), 0);

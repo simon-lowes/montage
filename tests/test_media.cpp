@@ -2535,6 +2535,95 @@ private slots:
         QCOMPARE(hdrStatedPeakNits(whole.masteringMaxNits, whole.maxCll), 4000.0);
     }
 
+    // Phase 18 #11: a PQ feed recorded (ST 2110-20 with its ST 2108-1 HDR metadata, to ProRes in QuickTime and in
+    // MXF): the file states the feed's mastering display (its primaries, white and luminance range) and its light
+    // levels (MaxCLL and MaxFALL), as a reader finds them in the file's header, beside its PQ transfer.
+    void captureHdrMetadataRecorded() {
+        namespace st = st2110;
+        for (const char* file : {"capture-hdr.mov", "capture-hdr.mxf"}) {
+            int ports[3];
+            {
+                st::Receiver probe[3];
+                for (int i = 0; i < 3; ++i) {
+                    QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                    ports[i] = probe[i].port();
+                }
+            }
+            st::SenderOptions o;
+            o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+            o.ttl = 1;
+            const int W = 320, H = 180;
+            st::VideoFormat v;
+            v.width = W, v.height = H, v.fps = {25, 1};
+            v.colorimetry = "BT2100", v.tcs = "PQ";
+            st::Sender tx;
+            std::string err;
+            QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+            output::Signal stated;
+            stated.eotf = output::Eotf::Pq, stated.hdrMetadata = true, stated.masteringP3 = true, stated.masteringPeak = 1000, stated.masteringMin = 0.0050;
+            stated.maxCll = 1200, stated.maxFall = 350;
+            tx.setFrameAnc({st::hdrMetadataPacket(stated)});
+            st::Raster raster(W, H, st::Sampling::Ycc422, 10);
+            for (int y = 0; y < H; ++y) {
+                uint16_t* d = raster.row(y);
+                for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = uint16_t(300 + x);
+            }
+            std::atomic<bool> stop{false};
+            std::thread sending([&] {
+                const std::vector<float> sound(size_t(1920) * 2, 0.0f);
+                for (int t = 0; !stop && t < 25 * 30; ++t) {
+                    const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                    if (!tx.send(raster, sound.data(), 1920, &tc, {}, &stop)) break;
+                }
+            });
+            CaptureSettings cs;
+            cs.video.device = "st2110";
+            cs.video.url = tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc();
+            cs.path = path(file);
+            cs.codec = "prores_proxy";
+            cs.seconds = 1;
+            Recorder rec;
+            QVERIFY2(rec.start(cs, &err), err.c_str());
+            const bool ended = rec.wait(20);
+            stop = true;
+            sending.join();
+            tx.close();
+            QVERIFY2(ended, file);
+            QVERIFY2(rec.status().error.empty(), rec.status().error.c_str());
+            // The file's header, as FFmpeg's demuxers read it.
+            AVFormatContext* f = nullptr;
+            QVERIFY(avformat_open_input(&f, cs.path.c_str(), nullptr, nullptr) >= 0);
+            std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> held(f, [](AVFormatContext* x) { avformat_close_input(&x); });
+            QVERIFY(avformat_find_stream_info(f, nullptr) >= 0);
+            const int vi = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            QVERIFY(vi >= 0);
+            const AVCodecParameters* par = f->streams[vi]->codecpar;
+            QVERIFY2(par->color_trc == AVCOL_TRC_SMPTE2084 && par->color_primaries == AVCOL_PRI_BT2020, file);
+            const AVPacketSideData* md = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+            QVERIFY2(md && md->size >= sizeof(AVMasteringDisplayMetadata), file);
+            const auto* m = reinterpret_cast<const AVMasteringDisplayMetadata*>(md->data);
+            QVERIFY2(m->has_luminance && m->has_primaries, file);
+            QVERIFY2(std::fabs(av_q2d(m->max_luminance) - 1000) < 0.01 && std::fabs(av_q2d(m->min_luminance) - 0.005) < 0.0002,
+                     qPrintable(QStringLiteral("%1: %2 to %3 nits").arg(file).arg(av_q2d(m->min_luminance)).arg(av_q2d(m->max_luminance))));
+            // (P3's primaries, red, green and blue, and D65's white)
+            const double want[4][2] = {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}, {0.3127, 0.3290}};
+            for (int c = 0; c < 4; ++c)
+                for (int k = 0; k < 2; ++k) {
+                    const double got = av_q2d(c < 3 ? m->display_primaries[c][k] : m->white_point[k]);
+                    QVERIFY2(std::fabs(got - want[c][k]) < 0.001, qPrintable(QStringLiteral("%1: %2 %3 is %4").arg(file).arg(c).arg(k).arg(got)));
+                }
+            const AVPacketSideData* cl = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+            if (QString(file).endsWith(".mxf") && !cl) {
+                // (FFmpeg's MXF muxer writes the mastering display only: MXF's descriptor has no light levels of its own)
+                qInfo("%s: no light levels (as MXF has none)", file);
+                continue;
+            }
+            QVERIFY2(cl && cl->size >= sizeof(AVContentLightMetadata), file);
+            const auto* l = reinterpret_cast<const AVContentLightMetadata*>(cl->data);
+            QVERIFY2(l->MaxCLL == 1200 && l->MaxFALL == 350, qPrintable(QStringLiteral("%1: %2 %3").arg(file).arg(l->MaxCLL).arg(l->MaxFALL)));
+        }
+    }
+
     // ST 2110-31 recorded: AES3 subframes carrying a payload that is not PCM (an ST 337 burst's preambles and counted
     // words) are in the file bit for bit, as the 24-bit sound they were sent as, beside the picture.
     void captureAes3BitExact() {
