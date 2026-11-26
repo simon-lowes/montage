@@ -1602,6 +1602,7 @@ public:
     int burstReads = 0, laterBurstReads = 0;
     bool recordWithoutRoll = false;
     int64_t heldUp = -1;  // a picture its output sends a frame and a half late (held up on its way)
+    int64_t moves = 0;     // how often the tape was moved, cued, rolled or stopped (its picture runs on between)
 
     double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * fps * std::chrono::duration<double>(now - at).count(); }
     void move(double frame, double sp) {
@@ -1610,6 +1611,7 @@ public:
         pos = frame;
         speed = sp;
         at = now;
+        ++moves;
     }
     bool servoLocked(Clock::time_point now = Clock::now()) const {
         return servoLockAfter >= 0 && speed == 1 && std::chrono::duration<double>(now - rolledAt).count() >= servoLockAfter;
@@ -1639,16 +1641,18 @@ public:
                 video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), o.data(), size_t(W) * 2);
                 pics.push_back(std::move(o));
             }
-            int64_t sent = -1;
+            int64_t sent = -1, sentRun = -1;
             while (!stop_) {
-                int64_t f;
+                int64_t f, run;
                 {
                     std::lock_guard lock(m);
                     f = speed == 1 ? int64_t(std::floor(frameNow() + 1e-9)) : -1;
+                    run = moves;
                 }
                 // (every frame played sent, as a deck's output never skips one: those this thread was held up past
-                // go at once, each with its own time)
-                for (int64_t g = sent >= 0 && f > sent && f - sent <= 5 ? sent + 1 : f; f >= 0 && f != sent && g <= f; ++g) {
+                // go at once, each with its own time, however long it was held up on a busy machine; a cue or a roll
+                // starts the picture afresh)
+                for (int64_t g = sent >= 0 && run == sentRun && f > sent ? sent + 1 : f; f >= 0 && f != sent && g <= f; ++g) {
                     bool hold = false;
                     {
                         std::lock_guard lock(m);
@@ -1662,7 +1666,7 @@ public:
                     if (stamp) v.metadata += "<montage_timecode value=\"" + formatTimecode(g, 25, false) + "\"/>";
                     tx->sendVideo(v);
                 }
-                if (f >= 0) sent = f;
+                if (f >= 0) sent = f, sentRun = run;
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         });
