@@ -42383,6 +42383,71 @@ private slots:
             QVERIFY(drawn > 20);
             QCOMPARE(same, 0.0);
         }
+        // ---- The same project with a second card that has a depth of field of its own too (as such a build wrote
+        // one: focused at half its distance, f/2 throughout). Opened, each card keeps its own, the camera's lens stays
+        // off, the second card is blurred by its own lens and the first card's half is as it was with the second
+        // sharp.
+        {
+            QFile fixture(QString(MONTAGE_TEST_DATA_DIR) + "/projects/card-lens-before-10-nov.montage");
+            QVERIFY(fixture.open(QIODevice::ReadOnly));
+            QJsonObject doc = QJsonDocument::fromJson(fixture.readAll()).object();
+            QJsonArray sequences = doc.value("sequences").toArray();
+            QJsonObject seq = sequences[0].toObject();
+            QJsonArray video = seq.value("video").toArray();
+            QJsonObject track = video[2].toObject();
+            QJsonArray clips = track.value("clips").toArray();
+            QJsonObject card = clips[0].toObject();
+            QJsonArray effects = card.value("effects").toArray();
+            QJsonObject lens3d = effects[0].toObject();
+            QCOMPARE(lens3d.value("type").toString(), QString("layer_3d"));
+            QJsonObject params = lens3d.value("params").toObject();
+            params["depth_of_field"] = 1;
+            params["focus_distance"] = params.value("pos_z").toDouble() / -2;
+            params["fstop"] = 2.0;
+            lens3d["params"] = params;
+            effects[0] = lens3d;
+            card["effects"] = effects;
+            clips[0] = card;
+            track["clips"] = clips;
+            video[2] = track;
+            seq["video"] = video;
+            sequences[0] = seq;
+            doc["sequences"] = sequences;
+            Project opened;
+            std::string err;
+            QVERIFY2(projectFromJson(QJsonDocument(doc).toJson().toStdString(), opened, &err), err.c_str());
+            Sequence& os = *opened.active();
+            QVERIFY(os.videoTracks.size() >= 3);
+            const Effect& first = os.videoTracks[0].clips[0].effects[0];
+            const Effect& second = os.videoTracks[2].clips[0].effects[0];
+            QVERIFY(first.p("depth_of_field", 0, 0) == 1.0 && second.p("depth_of_field", 0, 0) == 1.0);
+            QCOMPARE(first.params.at("fstop").keys.size(), size_t(2));
+            QVERIFY(second.p("fstop", 0, 0) == 2.0 && second.params.at("fstop").keys.empty());
+            QVERIFY(std::fabs(second.p("focus_distance", 0, 0) - 507.455168378114 / 2) < 1e-9);
+            QVERIFY(os.videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+            // Against the same with the second card's lens off: its half blurred, the first card's half the same.
+            Project secondSharp = opened;
+            secondSharp.active()->videoTracks[2].clips[0].effects[0].params["depth_of_field"] = 0.0;
+            auto differs = [&](FrameTime t, bool right) {
+                const Image a = renderSequenceFrame(opened, os, t, o), b = renderSequenceFrame(secondSharp, *secondSharp.active(), t, o);
+                double sum = 0;
+                for (int y = 0; y < a.height; ++y)
+                    for (int x = right ? a.width * 5 / 8 : 0; x < (right ? a.width : a.width * 3 / 8); ++x) sum += std::fabs(double(a.at(x, y)[3]) - b.at(x, y)[3]);
+                return sum;
+            };
+            const double secondBlur = differs(0, true), firstSame = differs(0, false);
+            }
+            qInfo("a second card's own lens kept: blur %.2f on its half, %.4f on the first card's", secondBlur, firstSame);
+            QVERIFY(secondBlur > 20);
+            QCOMPARE(firstSame, 0.0);
+            QVERIFY(std::fabs(differs(9, true) - secondBlur) <= 1e-6 * secondBlur);  // (f/2 throughout: the same at the last frame)
+            // Saved now and opened again, it is the same.
+            Project again;
+            QVERIFY2(projectFromJson(projectToJson(opened), again, &err), err.c_str());
+            QVERIFY(again.active()->videoTracks[2].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
+            QVERIFY(again.active()->videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
+            QVERIFY(again.active()->videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+        }
 
         // ---- A moving card in a solved scene's USD and USDZ exports: its picture byte for byte and its transform at
         // each frame (to 1e-6), read back by Montage and by tinyusdz.
