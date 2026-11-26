@@ -114,9 +114,10 @@ if(MONTAGE_BUILD_APP)
   montage_copy_runtime(test_app)
   montage_test_command(test_app command)
   add_test(NAME test_app COMMAND ${command})
-  # A function that hangs is stopped by Qt's watchdog after QTEST_FUNCTION_TIMEOUT, which names it in the log, well
-  # before ctest's own limit would stop the whole run without saying where (aHungFunctionIsNamed).
-  set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test;QTEST_FUNCTION_TIMEOUT=240000" TIMEOUT 900)  # (414 s on a macOS runner in November 2026)
+  # A function that hangs is stopped by Qt's watchdog after its default 300 s, which names it in the log before ctest's
+  # own limit would stop the whole run without saying where (aHungFunctionIsNamed). (The longest function took 62 s
+  # here in November 2026, a minute of wall-clock time by design; the longest that works the processor, 36 s.)
+  set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 900)  # (414 s on a macOS runner in November 2026)
   add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe montage-pluginhost montage-cli)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_CLI="$<TARGET_FILE:montage-cli>"
