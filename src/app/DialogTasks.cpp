@@ -4,11 +4,13 @@
 #include <QJsonObject>
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <mutex>
 
 #include <QApplication>
 #include <QDir>
 #include <QFileInfo>
+#include <QPointer>
 #include <QStorageInfo>
 #include <QTimer>
 
@@ -265,9 +267,15 @@ bool runMix(TaskRun& t) {
 QJsonObject applyMixPlan(EditorState* state, const QJsonObject&, const QJsonObject& result) {
     std::vector<ClipMix> plan = mixPlanFromJson(result.value("plan"));
     if (plan.empty()) return {{"changed", -1}, {"message", QCoreApplication::translate("montage::AutoMixDialog", "There is no audio to mix")}};
-    AutoMixDialog dlg(state, std::move(plan), QApplication::activeWindow());
-    if (dlg.exec() != QDialog::Accepted) return {{"changed", -1}, {"failed", true}};
-    const int n = AutoMixDialog::apply(state, dlg.plan(), dlg.options());
+    // (the dialog runs an event loop of its own: Montage may quit meanwhile, its window taking the dialog with it and
+    // its editor state going, so neither is held where they could be freed under it)
+    const QPointer<EditorState> alive(state);
+    const QPointer<AutoMixDialog> dlg = new AutoMixDialog(state, std::move(plan), QApplication::activeWindow());
+    const bool accepted = dlg->exec() == QDialog::Accepted;
+    if (!dlg || !alive) return {{"changed", -1}, {"failed", true}};
+    const std::unique_ptr<AutoMixDialog> done(dlg.data());
+    if (!accepted) return {{"changed", -1}, {"failed", true}};
+    const int n = AutoMixDialog::apply(state, done->plan(), done->options());
     return {{"changed", n}, {"message", QCoreApplication::translate("montage::AutoMixDialog", "Mixed %n clip(s)", "", n)}};
 }
 
@@ -396,6 +404,11 @@ VfxPullOptions vfxOptionsFrom(const QJsonObject& j) {
     o.mattes = j.value("mattes").toBool(o.mattes);
     o.stMaps = j.value("stMaps").toBool(o.stMaps);
     o.scripts = j.value("scripts").toBool(o.scripts);
+    o.scaleHandles = j.value("scaleHandles").toBool(o.scaleHandles);
+    o.plateMetadata = j.value("plateMetadata").toBool(o.plateMetadata);
+    o.clipNegative = j.value("clipNegative").toBool(o.clipNegative);
+    o.clipOver = j.value("clipOver").toBool(o.clipOver);
+    o.camera = j.value("camera").toBool(o.camera);
     return o;
 }
 
@@ -407,7 +420,8 @@ QJsonObject vfxShotJson(const VfxShot& v) {
                        {"layers", stringsJson(v.layers)}, {"undistortMap", q(v.undistortMap)}, {"redistortMap", q(v.redistortMap)},
                        {"overscanWidth", v.overscanWidth}, {"overscanHeight", v.overscanHeight}, {"deep", v.deep},
                        {"clip", QString::number(v.clip)}, {"plate", q(v.plate)}, {"colorSpace", q(v.colorSpace)}, {"width", v.width},
-                       {"height", v.height}, {"fps", QJsonArray{v.fps.num, v.fps.den}}, {"cutSource", v.cutSource}, {"script", q(v.script)}};
+                       {"height", v.height}, {"fps", QJsonArray{v.fps.num, v.fps.den}}, {"cutSource", v.cutSource}, {"script", q(v.script)},
+                       {"chan", q(v.chan)}};
 }
 
 VfxShot vfxShotFrom(const QJsonObject& j) {
@@ -429,6 +443,7 @@ VfxShot vfxShotFrom(const QJsonObject& j) {
     if (const QJsonArray fps = j.value("fps").toArray(); fps.size() == 2) v.fps = Rational{fps.at(0).toInt(), fps.at(1).toInt()};
     v.cutSource = j.value("cutSource").toDouble();
     v.script = s("script");
+    v.chan = s("chan");
     return v;
 }
 

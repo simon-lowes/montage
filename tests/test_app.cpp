@@ -7081,6 +7081,44 @@ private slots:
             state()->undo();
         }
         accept.stop();
+        // Looked over from a window that is closed and freed while the plan is shown (as Montage's own is when it
+        // quits): nothing is mixed, the dialog goes with its window, and nothing freed is touched after.
+        {
+            const Sequence before = *state()->sequence();
+            QString again = startInBackground(dialogs, [&] { QCOMPARE(AutoMixDialog::run(state(), win_.get()), -1); });
+            QVERIFY(!again.isEmpty());
+            dialogs->setPaused(again, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 120000);
+            QPointer<QWidget> other = new QWidget;
+            other->resize(200, 100);
+            other->show();
+            QApplication::setActiveWindow(other);
+            QTRY_COMPARE(QApplication::activeWindow(), other.data());
+            bool wentWithIt = false, otherParent = false;
+            QTimer close;
+            connect(&close, &QTimer::timeout, this, [&] {
+                for (QWidget* w : QApplication::topLevelWidgets())
+                    if (auto* d = qobject_cast<AutoMixDialog*>(w); d && d->isVisible()) {
+                        close.stop();
+                        if (d->parentWidget() != other) {
+                            otherParent = true;
+                            d->reject();
+                            return;
+                        }
+                        QPointer<AutoMixDialog> gone(d);
+                        delete other.data();
+                        wentWithIt = gone.isNull();
+                    }
+            });
+            close.start(20);
+            QVERIFY(!dialogs->applyOffered(again));
+            close.stop();
+            QVERIFY(!otherParent);
+            QVERIFY(wentWithIt);
+            QVERIFY(*state()->sequence() == before);
+            QApplication::setActiveWindow(win_.get());
+            dialogs->discardOffered(again);
+        }
         disconnect(dialogs, &DialogJobs::offered, this, nullptr);
 
         // The Conform Check: a shot and a reference movie that shows it 10 % larger.
