@@ -17,6 +17,7 @@
 #include "core/TranscriptCorrect.h"
 #include "Decoder.h"
 #include "Diarizer.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -35,7 +36,7 @@ const std::vector<WhisperModel>& whisperModels() {
 }
 
 std::string whisperModelsDirectory() {
-    if (const char* env = std::getenv("MONTAGE_WHISPER_MODELS"); env && *env) return env;
+    if (const QString chosen = prefs::text(QStringLiteral("models/speech")); !chosen.isEmpty()) return chosen.toStdString();
     QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     if (dir.isEmpty()) dir = QDir::homePath() + "/.montage";
     return (dir + "/whisper-models").toStdString();
@@ -49,9 +50,10 @@ std::string whisperModelPath(const std::string& nameOrPath) {
 }
 
 std::string whisperModelUrl(const std::string& name) {
-    // $MONTAGE_WHISPER_MODEL_URL replaces the download folder (a mirror, or file:// in tests).
+    // Preferences' "models/speechDownloads" ($MONTAGE_WHISPER_MODEL_URL) replaces the download folder (a mirror, or
+    // file:// in tests).
     std::string base = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
-    if (const char* env = std::getenv("MONTAGE_WHISPER_MODEL_URL"); env && *env) base = env;
+    if (const QString chosen = prefs::text(QStringLiteral("models/speechDownloads")); !chosen.isEmpty()) base = chosen.toStdString();
     if (!base.empty() && base.back() == '/') base.pop_back();
     return base + "/ggml-" + name + ".bin";
 }

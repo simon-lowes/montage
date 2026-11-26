@@ -13,6 +13,7 @@
 #include "render/BackgroundJobs.h"
 #include "render/GpuCompositor.h"
 #include "render/RenderFarm.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -33,7 +34,7 @@ const char* statusName(RenderQueue::Status s) {
 
 }  // namespace
 
-bool exportsOnGpu() { return appSettings().value("playback/gpuRendering", true).toBool() && gpu::available(); }
+bool exportsOnGpu() { return prefs::toggle(QStringLiteral("playback/gpuRendering")) && gpu::available(); }
 
 RenderQueue::RenderQueue(QObject* parent, const QString& folder) : QObject(parent), atOnce_(jobs::atOnce()), folder_(folder) {
     poll_.setInterval(200);

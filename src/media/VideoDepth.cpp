@@ -3,6 +3,7 @@
 // Bytedance Ltd. and/or its affiliates, licensed under the Apache License, Version 2.0 (LICENSES/Apache-2.0.txt);
 // modified: rewritten in C++ on ONNX Runtime for Montage.
 #include "VideoDepth.h"
+#include "core/Preferences.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -413,8 +414,7 @@ bool estimateVideoDepth(int count, const std::function<bool(int, Image&)>& frame
 //   noise and took over twice the room.) The folder is kept under a size: the analyses longest unchanged go first.
 
 std::string videoDepthCacheDirectory() {
-    const QByteArray env = qgetenv("MONTAGE_DEPTH_CACHE");
-    if (!env.isEmpty()) return QString::fromLocal8Bit(env).toStdString();
+    if (const QString chosen = prefs::text(QStringLiteral("media/depthCache")); !chosen.isEmpty()) return chosen.toStdString();
     return (QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/depth").toStdString();
 }
 
@@ -740,11 +740,10 @@ bool analyzeVideoDepth(const std::string& path, double start, double end, const 
         if (error) *error = "Cannot write " + file.toStdString();
         return false;
     }
-    // The folder kept under its size ($MONTAGE_DEPTH_CACHE_GB, 20 by default): the others longest unchanged removed.
+    // The folder kept under its size (Preferences' "media/depthCacheGb", or $MONTAGE_DEPTH_CACHE_GB; 20 by default): the
+    // others longest unchanged removed.
     {
-        bool given = false;
-        const double gb = qEnvironmentVariableIntValue("MONTAGE_DEPTH_CACHE_GB", &given);
-        const qint64 most = qint64((given && gb > 0 ? gb : 20) * 1024 * 1024 * 1024);
+        const qint64 most = qint64(prefs::whole(QStringLiteral("media/depthCacheGb"))) * 1024 * 1024 * 1024;
         QFileInfoList kept = QDir(QString::fromStdString(videoDepthCacheDirectory())).entryInfoList({"*.mdepth"}, QDir::Files, QDir::Time);
         qint64 total = 0;
         for (const QFileInfo& fi : kept) total += fi.size();

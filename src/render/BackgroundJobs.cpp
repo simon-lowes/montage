@@ -19,6 +19,7 @@
 #include <thread>
 
 #include "core/ProjectLock.h"
+#include "core/Preferences.h"
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -312,10 +313,9 @@ bool runningElsewhere(const Record& r, const QString& folder) {
 }
 
 int atOnce() {
-    const int n = QSettings(QSettings::defaultFormat(), QSettings::UserScope, QStringLiteral("Montage"), QStringLiteral("Montage")).value(QStringLiteral("jobs/at_once"), 2).toInt();
-    return std::clamp(n, 1, 16);
+    return std::clamp(prefs::whole(QStringLiteral("jobs/at_once")), 1, 16);
 }
 
-void setAtOnce(int n) { QSettings(QSettings::defaultFormat(), QSettings::UserScope, QStringLiteral("Montage"), QStringLiteral("Montage")).setValue(QStringLiteral("jobs/at_once"), std::clamp(n, 1, 16)); }
+void setAtOnce(int n) { prefs::set(QStringLiteral("jobs/at_once"), std::clamp(n, 1, 16)); }
 
 }  // namespace montage::jobs

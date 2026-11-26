@@ -15,6 +15,7 @@
 
 #include "Settings.h"
 #include "core/MediaLog.h"
+#include "core/Preferences.h"
 
 namespace montage::theme {
 
@@ -79,15 +80,13 @@ void setTextScale(double scale) { gTextScale = std::clamp(scale, 1.0, 2.0); }
 double textScale() { return gTextScale; }
 
 void loadSettings() {
-    QSettings settings = appSettings();
-    setHighContrast(settings.value(QStringLiteral("ui/highContrast"), false).toBool());
-    setTextScale(settings.value(QStringLiteral("ui/textScale"), 1.0).toDouble());
+    setHighContrast(prefs::toggle(QStringLiteral("ui/highContrast")));
+    setTextScale(prefs::number(QStringLiteral("ui/textScale")));
 }
 
 void saveSettings() {
-    QSettings settings = appSettings();
-    settings.setValue(QStringLiteral("ui/highContrast"), gHighContrast);
-    settings.setValue(QStringLiteral("ui/textScale"), gTextScale);
+    prefs::set(QStringLiteral("ui/highContrast"), gHighContrast);
+    prefs::set(QStringLiteral("ui/textScale"), gTextScale);
 }
 
 double contrastRatio(const QColor& a, const QColor& b) {

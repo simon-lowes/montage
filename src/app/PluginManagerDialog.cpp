@@ -24,6 +24,7 @@
 #include <set>
 
 #include "audio/PluginHost.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -46,23 +47,21 @@ void PluginManagerDialog::applySavedFolders() {
 }
 
 void PluginManagerDialog::applySavedHosting() {
-    QSettings s = appSettings();
     HostingSettings h;
-    if (const auto i = isolationFromName(s.value(QStringLiteral("plugins/hosting/isolation")).toString().toStdString())) h.isolation = *i;
-    h.missedBlocks = std::clamp(s.value(QStringLiteral("plugins/hosting/missedBlocks"), h.missedBlocks).toInt(), 1, 1000);
-    h.bypassWithSilence = s.value(QStringLiteral("plugins/hosting/bypassWithSilence"), h.bypassWithSilence).toBool();
-    h.exportTimeoutMs = std::max(1000, s.value(QStringLiteral("plugins/hosting/exportTimeoutMs"), h.exportTimeoutMs).toInt());
-    h.memoryLimitMb = std::max(0, s.value(QStringLiteral("plugins/hosting/memoryLimitMb"), h.memoryLimitMb).toInt());
-    h.autoRestarts = std::clamp(s.value(QStringLiteral("plugins/hosting/autoRestarts"), h.autoRestarts).toInt(), 0, 100);
+    if (const auto i = isolationFromName(prefs::text(QStringLiteral("plugins/hosting/isolation")).toStdString())) h.isolation = *i;
+    h.missedBlocks = std::clamp(prefs::whole(QStringLiteral("plugins/hosting/missedBlocks")), 1, 1000);
+    h.bypassWithSilence = prefs::toggle(QStringLiteral("plugins/hosting/bypassWithSilence"));
+    h.exportTimeoutMs = std::max(1000, prefs::whole(QStringLiteral("plugins/hosting/exportTimeoutMs")));
+    h.memoryLimitMb = std::max(0, prefs::whole(QStringLiteral("plugins/hosting/memoryLimitMb")));
+    h.autoRestarts = std::clamp(prefs::whole(QStringLiteral("plugins/hosting/autoRestarts")), 0, 100);
     setHosting(h);
     onHostingChanged([](const HostingSettings& n) {
-        QSettings out = appSettings();
-        out.setValue(QStringLiteral("plugins/hosting/isolation"), QString::fromLatin1(isolationName(n.isolation)));
-        out.setValue(QStringLiteral("plugins/hosting/missedBlocks"), n.missedBlocks);
-        out.setValue(QStringLiteral("plugins/hosting/bypassWithSilence"), n.bypassWithSilence);
-        out.setValue(QStringLiteral("plugins/hosting/exportTimeoutMs"), n.exportTimeoutMs);
-        out.setValue(QStringLiteral("plugins/hosting/memoryLimitMb"), n.memoryLimitMb);
-        out.setValue(QStringLiteral("plugins/hosting/autoRestarts"), n.autoRestarts);
+        prefs::set(QStringLiteral("plugins/hosting/isolation"), QString::fromLatin1(isolationName(n.isolation)));
+        prefs::set(QStringLiteral("plugins/hosting/missedBlocks"), n.missedBlocks);
+        prefs::set(QStringLiteral("plugins/hosting/bypassWithSilence"), n.bypassWithSilence);
+        prefs::set(QStringLiteral("plugins/hosting/exportTimeoutMs"), n.exportTimeoutMs);
+        prefs::set(QStringLiteral("plugins/hosting/memoryLimitMb"), n.memoryLimitMb);
+        prefs::set(QStringLiteral("plugins/hosting/autoRestarts"), n.autoRestarts);
     });
 }
 

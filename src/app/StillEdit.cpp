@@ -16,6 +16,7 @@
 #include "core/Interpretation.h"
 #include "media/ImageSequence.h"
 #include "media/Relink.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -45,9 +46,9 @@ StillEditor::StillEditor(EditorState* state) : QObject(state), state_(state) {
     connect(quiet_, &QTimer::timeout, this, [this] { takeSaved(); });
 }
 
-QString StillEditor::program() { return appSettings().value(QStringLiteral("editing/stillProgram")).toString(); }
+QString StillEditor::program() { return prefs::text(QStringLiteral("editing/stillProgram")); }
 
-void StillEditor::setProgram(const QString& path) { appSettings().setValue(QStringLiteral("editing/stillProgram"), path); }
+void StillEditor::setProgram(const QString& path) { prefs::set(QStringLiteral("editing/stillProgram"), path); }
 
 bool StillEditor::canEdit(Id media) const {
     const MediaItem* m = state_->project().findMedia(media);

@@ -23,6 +23,7 @@
 #include "render/HrdCheck.h"
 #include "render/RateConversion.h"
 #include "render/StreamingPackage.h"
+#include "core/Preferences.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -75,7 +76,7 @@ bool checkGrainProfileName(const std::string& name, std::string* error) {
 namespace {
 
 QString grainLibraryPath() {
-    const QString env = qEnvironmentVariable("MONTAGE_GRAIN_LIBRARY");
+    const QString env = prefs::text(QStringLiteral("libraries/grain"));
     return !env.isEmpty() ? env : QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/Grain Profiles.json");
 }
 

@@ -14,6 +14,7 @@
 #include "core/ProjectIO.h"
 #include "render/ColorSpace.h"
 #include "render/OfxGl.h"
+#include "core/Preferences.h"
 
 namespace montage::ofx::remote {
 
@@ -205,10 +206,9 @@ void notePicture(const PluginDesc& d, bool handle, const std::string& why) {
 // Whether the user turned handles off (MONTAGE_GPU_HANDLES=0), the first reason given when they did.
 bool handlesTurnedOff(std::string& why) {
     // (asked for unless turned off: CI's guest showed the path working on 24 November 2026, where both sides share)
-    const char* v = std::getenv("MONTAGE_GPU_HANDLES");
-    const std::string asked = v ? v : "";
-    if (asked != "0" && asked != "off") return false;
-    why = "handles are turned off (MONTAGE_GPU_HANDLES=0)";
+    if (prefs::toggle(QStringLiteral("playback/gpuHandles"))) return false;
+    const QString by = prefs::overriddenBy(QStringLiteral("playback/gpuHandles"));
+    why = by.isEmpty() ? "handles are turned off (Preferences, Playback)" : "handles are turned off (" + by.toStdString() + ")";
     return true;
 }
 

@@ -4,6 +4,7 @@
 #include "SoundSearch.h"
 #include "core/Ucs.h"
 #include "core/VisualIndex.h"
+#include "core/Preferences.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -250,7 +251,7 @@ SoundLibrary::~SoundLibrary() {
 }
 
 std::string SoundLibrary::defaultPath() {
-    const QString env = qEnvironmentVariable("MONTAGE_SOUND_LIBRARY");
+    const QString env = prefs::text(QStringLiteral("libraries/sounds"));
     if (!env.isEmpty()) return env.toStdString();
     return (QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/sound-library.sqlite")).toStdString();
 }

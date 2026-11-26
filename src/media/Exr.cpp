@@ -48,6 +48,7 @@
 #include "Image.h"
 #include "ImageSequence.h"
 #include "core/Interpretation.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -1240,19 +1241,19 @@ bool compositeDeepWithOpenExr(const std::vector<std::string>& files, int& width,
 
 namespace {
 std::mutex deepMutex;
-// 1 GB, or $MONTAGE_DEEP_CACHE_MB.
-size_t deepBudget = [] {
-    const char* mb = std::getenv("MONTAGE_DEEP_CACHE_MB");
-    const long long v = mb ? std::atoll(mb) : 0;
-    return v > 0 ? size_t(v) << 20 : size_t(1) << 30;
-}();
+// 1 GB, or Preferences' "media/deepCacheMb" ($MONTAGE_DEEP_CACHE_MB): read when the first deep image is held.
+size_t deepBudget = 0;
+size_t deepBudgetNow() {
+    if (deepBudget == 0) deepBudget = size_t(std::max(1, prefs::whole(QStringLiteral("media/deepCacheMb")))) << 20;
+    return deepBudget;
+}
 std::list<std::pair<std::string, std::shared_ptr<const DeepFrame>>> deepRecent;  // newest first
 
 void trimDeep() {
     size_t bytes = 0, kept = 0;
     for (auto it = deepRecent.begin(); it != deepRecent.end(); ++it, ++kept) {
         bytes += it->second->bytes();
-        if (kept >= 1 && bytes > deepBudget) {
+        if (kept >= 1 && bytes > deepBudgetNow()) {
             deepRecent.erase(it, deepRecent.end());
             break;
         }
@@ -1292,7 +1293,7 @@ void setDeepCacheBudget(size_t bytes) {
 
 size_t deepCacheBudget() {
     std::lock_guard<std::mutex> lock(deepMutex);
-    return deepBudget;
+    return deepBudgetNow();
 }
 
 size_t deepCacheBytes() {

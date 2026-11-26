@@ -29,6 +29,7 @@
 #include "core/Surround.h"
 #include "core/TrackGroups.h"
 #include "Theme.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -1691,7 +1692,7 @@ void MixerPanel::finishPass(FrameTime t, bool final) {
     const Id sequence = passSeq_;
     const std::optional<WriteTo> writeTo = writeTo_;
     writeTo_.reset();
-    const bool coalesce = appSettings().value(QStringLiteral("mixer/coalesceTrim"), false).toBool();
+    const bool coalesce = prefs::toggle(QStringLiteral("mixer/coalesceTrim"));
     clearPass();
     if (commit) {
         state_->edit(tr("Write Automation"), [&](Project& p, Sequence&) {
@@ -1983,16 +1984,16 @@ void MixerPanel::makeAutomationMenu(QWidget* parent) {
     add(menu, QStringLiteral("coalesceTrim"), tr("Coalesce Trim"), tr("Fold every trim into the volume automation"), [this] { coalesceTrim(); });
     QAction* after = add(menu, QStringLiteral("coalesceTrimAfterPass"), tr("Coalesce Trim After Each Pass"),
                          tr("Fold a pass's trims in as playback stops"), [](bool on) {
-                             appSettings().setValue(QStringLiteral("mixer/coalesceTrim"), on);
+                             prefs::set(QStringLiteral("mixer/coalesceTrim"), on);
                          });
     after->setCheckable(true);
-    after->setChecked(appSettings().value(QStringLiteral("mixer/coalesceTrim"), false).toBool());
+    after->setChecked(prefs::toggle(QStringLiteral("mixer/coalesceTrim")));
     QAction* prime = add(menu, QStringLiteral("latchPrime"), tr("Prime Latch While Stopped"),
                          tr("A Latch track's control moved while stopped writes from the first frame played"), [](bool on) {
-                             appSettings().setValue(QStringLiteral("mixer/latchPrime"), on);
+                             prefs::set(QStringLiteral("mixer/latchPrime"), on);
                          });
     prime->setCheckable(true);
-    prime->setChecked(appSettings().value(QStringLiteral("mixer/latchPrime"), false).toBool());
+    prime->setChecked(prefs::toggle(QStringLiteral("mixer/latchPrime")));
     automationMenu_->setMenu(menu);
 }
 
@@ -2001,7 +2002,7 @@ QAction* MixerPanel::automationAction(const QString& objectName) const {
 }
 
 bool MixerPanel::holdMove(Id owner, AutomationMode mode, const std::string& lane, double value) {
-    const bool primeLatch = untrimmed(mode) == AutomationMode::Latch && appSettings().value(QStringLiteral("mixer/latchPrime"), false).toBool();
+    const bool primeLatch = untrimmed(mode) == AutomationMode::Latch && prefs::toggle(QStringLiteral("mixer/latchPrime"));
     // (Preview holds controls whose lanes play: what it punches is heard.)
     if (!(previewing_ && automationReads(mode)) && !primeLatch) return false;
     const Sequence* seq = state_->sequence();

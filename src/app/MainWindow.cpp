@@ -155,6 +155,8 @@ extern "C" {
 #include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
+#include "PreferencesDialog.h"
+#include "core/Preferences.h"
 #include "CaptureDialog.h"
 #include "Multiviewer.h"
 #include "media/Capture.h"
@@ -316,7 +318,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     // The agent link comes back on if it was on when Montage last closed.
     connect(liveLink_, &LiveLink::applied, this, [this](const QString& label) { statusBar()->showMessage(label, 5000); });
-    if (appSettings().value(QStringLiteral("agentLink/enabled"), false).toBool()) setAgentLink(true);
+    if (prefs::toggle(QStringLiteral("agentLink/enabled"))) setAgentLink(true);
 
     syncTimer_.setSingleShot(true);
     syncTimer_.setInterval(0);
@@ -677,11 +679,11 @@ void MainWindow::buildPanels() {
         surface_->setCommand(QString::fromLatin1(name), [this, name] {
             if (QAction* a = findChild<QAction*>(QString::fromLatin1(name))) a->trigger();
         });
-    osc_->setFeedbackPort(quint16(appSettings().value(QStringLiteral("osc/feedbackPort"), 0).toInt()));
-    osc_->setToolsAllowed(appSettings().value(QStringLiteral("osc/tools"), false).toBool());
-    if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool()) {
+    osc_->setFeedbackPort(quint16(prefs::whole(QStringLiteral("osc/feedbackPort"))));
+    osc_->setToolsAllowed(prefs::toggle(QStringLiteral("osc/tools")));
+    if (prefs::toggle(QStringLiteral("osc/enabled"))) {
         QString err;
-        if (!osc_->start(quint16(appSettings().value(QStringLiteral("osc/port"), 9100).toInt()), appSettings().value(QStringLiteral("osc/network"), false).toBool(), &err))
+        if (!osc_->start(quint16(prefs::whole(QStringLiteral("osc/port"))), prefs::toggle(QStringLiteral("osc/network")), &err))
             QTimer::singleShot(0, this, [this, err] { state_->message(tr("OSC: %1").arg(err), 8000); });  // (once the window is up)
     }
     surface_->setProtocol(appSettings().value(QStringLiteral("controlSurface/protocol")).toString() == QLatin1String("hui")
@@ -1723,6 +1725,10 @@ void MainWindow::buildMenus() {
         add(editM, QT_TR_NOOP("MIDI &Map…"), QKeySequence(), [this] { midiLearn_->openDialog(this); })
             ->setObjectName(QStringLiteral("midiMap"));
     }
+    editM->addSeparator();
+    QAction* preferences = add(editM, QT_TR_NOOP("Pre&ferences…"), QKeySequence::Preferences, [this] { PreferencesDialog::open(this); });
+    preferences->setObjectName(QStringLiteral("preferences"));
+    preferences->setMenuRole(QAction::PreferencesRole);  // (the application menu's on macOS)
 
     // ---- Clip
     QMenu* clipM = menuIn(menuBar(), QT_TR_NOOP("&Clip"));
@@ -2286,10 +2292,10 @@ void MainWindow::buildMenus() {
     }
     {
         // Premiere's "insert and overwrite sequences as nests or individual clips".
-        state_->setSequencesAsClips(appSettings().value("editing/sequencesAsClips", false).toBool());
+        state_->setSequencesAsClips(prefs::toggle(QStringLiteral("editing/sequencesAsClips")));
         QAction* a = add(clipM, QT_TR_NOOP("Insert Sequences as Clips"), QKeySequence(), [this](bool on) {
             state_->setSequencesAsClips(on);
-            appSettings().setValue("editing/sequencesAsClips", on);
+            prefs::set(QStringLiteral("editing/sequencesAsClips"), on);
         });
         a->setObjectName(QStringLiteral("sequencesAsClips"));
         a->setCheckable(true);
@@ -2754,13 +2760,12 @@ void MainWindow::buildMenus() {
     // ---- Playback
     QMenu* play = menuIn(menuBar(), QT_TR_NOOP("&Playback"));
     {
-        // Hardware decoding (on by default; MONTAGE_HWACCEL=off overrides the saved choice).
-        const bool hw = qEnvironmentVariable("MONTAGE_HWACCEL") != "off" &&
-                        appSettings().value("playback/hardwareDecoding", true).toBool();
+        // Hardware decoding (on by default; MONTAGE_HWACCEL=off overrides the saved choice: Preferences, Playback).
+        const bool hw = prefs::toggle(QStringLiteral("playback/hardwareDecoding"));
         setHwDecodeMode(hw ? HwDecodeMode::Auto : HwDecodeMode::Off);
         QAction* a = add(play, QT_TR_NOOP("&Hardware Decoding"), QKeySequence(), [this](bool on) {
             setHwDecodeMode(on ? HwDecodeMode::Auto : HwDecodeMode::Off);
-            appSettings().setValue("playback/hardwareDecoding", on);
+            prefs::set(QStringLiteral("playback/hardwareDecoding"), on);
             MediaPool::instance().clear();  // reopen decoders with the new setting
             syncProgram();
             program_->seek(state_->playhead());
@@ -2778,10 +2783,10 @@ void MainWindow::buildMenus() {
         // launch that ended while the GPU was being set up or drawing its first frame (a driver crash takes Montage with
         // it) leaves it off the next time.
         std::string why;
-        bool wantGpu = appSettings().value("playback/gpuRendering", true).toBool();
+        bool wantGpu = prefs::toggle(QStringLiteral("playback/gpuRendering"));
         if (wantGpu && appSettings().value("playback/gpuStarting", false).toBool()) {
             wantGpu = false;
-            appSettings().setValue("playback/gpuRendering", false);
+            prefs::set(QStringLiteral("playback/gpuRendering"), false);
             appSettings().remove("playback/gpuStarting");
             why = tr("turned off because Montage closed while starting it last time; turn it on again in the Playback menu").toStdString();
             QTimer::singleShot(0, this, [this, why] {
@@ -2810,7 +2815,7 @@ void MainWindow::buildMenus() {
             }
             describe({});
             program_->setGpuRendering(on);
-            appSettings().setValue("playback/gpuRendering", on);
+            prefs::set(QStringLiteral("playback/gpuRendering"), on);
             statusBar()->showMessage(on ? tr("GPU rendering on (%1): layers, transforms and colour effects draw on the GPU")
                                               .arg(QString::fromStdString(gpu::deviceName()))
                                         : tr("GPU rendering off: frames render on the CPU"),
@@ -2856,14 +2861,14 @@ void MainWindow::buildMenus() {
         });
     // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
     hdrViewer_ = add(play, QT_TR_NOOP("HDR Viewer"), QKeySequence(), [this](bool on) {
-        appSettings().setValue("playback/hdrViewer", on);
+        prefs::set(QStringLiteral("playback/hdrViewer"), on);
         hdrMessageShown_ = false;
         applyHdrViewer();
     });
     hdrViewer_->setObjectName(QStringLiteral("hdrViewer"));
     hdrViewer_->setCheckable(true);
     hdrViewer_->setEnabled(hdrViewerBuilt());
-    hdrViewer_->setChecked(hdrViewerBuilt() && appSettings().value("playback/hdrViewer", true).toBool());
+    hdrViewer_->setChecked(hdrViewerBuilt() && prefs::toggle(QStringLiteral("playback/hdrViewer")));
     hdrViewer_->setToolTip(hdrViewerBuilt() ? tr("Show HDR sequences as HDR on an HDR display (macOS EDR, Windows with HDR switched on) "
                                                  "instead of tone mapped to SDR")
                                             : tr("This build has no HDR viewer (it needs Qt 6.7 or later)"));
@@ -3245,7 +3250,7 @@ void MainWindow::buildMenus() {
         // Provider libraries beside the program or in Montage's data folder are registered first.
         initInference();  // (the provider libraries, and the choice saved here, as the command line takes them too)
         InferenceMode saved = InferenceMode::Auto;
-        parseInferenceMode(appSettings().value(QStringLiteral("ai/inference"), "auto").toString().toStdString(), saved);
+        parseInferenceMode(prefs::text(QStringLiteral("ai/inference")).toStdString(), saved);
         QMenu* runOn = menuIn(toolsM, QT_TR_NOOP("AI Models Run On"));
         runOn->setObjectName(QStringLiteral("aiRunOn"));
         auto* modes = new QActionGroup(this);
@@ -3258,7 +3263,7 @@ void MainWindow::buildMenus() {
             const InferenceMode m = mode;
             QAction* a = runOn->addAction(label, this, [this, m] {
                 setInferenceMode(m);
-                appSettings().setValue(QStringLiteral("ai/inference"), QString::fromLatin1(inferenceModeName(m)));
+                prefs::set(QStringLiteral("ai/inference"), QString::fromLatin1(inferenceModeName(m)));
                 statusBar()->showMessage(tr("AI models opened from now on run %1").arg(m == InferenceMode::Cpu ? tr("on the processor")
                                                                                           : m == InferenceMode::Efficient ? tr("on an NPU when there is one")
                                                                                                                           : tr("on the GPU when there is one")),
@@ -5894,7 +5899,7 @@ bool MainWindow::setAgentLink(bool on) {
     const bool ok = on ? liveLink_->start(0, &err) : (liveLink_->stop(), true);
     if (!ok) statusBar()->showMessage(tr("The agent link could not start: %1").arg(err), 8000);
     const bool running = liveLink_->running();
-    appSettings().setValue(QStringLiteral("agentLink/enabled"), running);
+    prefs::set(QStringLiteral("agentLink/enabled"), running);
     if (agentLinkAction_) agentLinkAction_->setChecked(running);
     if (ok && on) statusBar()->showMessage(tr("AI agents can now edit this project (montage-cli mcp --live, or %1)").arg(liveLink_->url()), 8000);
     return ok;
@@ -9628,7 +9633,7 @@ QDialog* MainWindow::controlSurfaceDialog() {
     auto* oscPort = new QSpinBox(oscBox);
     oscPort->setObjectName(QStringLiteral("oscPort"));
     oscPort->setRange(1024, 65535);
-    oscPort->setValue(appSettings().value(QStringLiteral("osc/port"), 9100).toInt());
+    oscPort->setValue(prefs::whole(QStringLiteral("osc/port")));
     auto* oscFeedback = new QSpinBox(oscBox);
     oscFeedback->setObjectName(QStringLiteral("oscFeedbackPort"));
     oscFeedback->setRange(0, 65535);
@@ -9637,7 +9642,7 @@ QDialog* MainWindow::controlSurfaceDialog() {
     oscFeedback->setToolTip(tr("Playing, timecode, loop and tools' answers are sent to this port on the computer the messages come from"));
     auto* oscNetwork = new QCheckBox(tr("Accept messages from other computers"), oscBox);
     oscNetwork->setObjectName(QStringLiteral("oscNetwork"));
-    oscNetwork->setChecked(appSettings().value(QStringLiteral("osc/network"), false).toBool());
+    oscNetwork->setChecked(prefs::toggle(QStringLiteral("osc/network")));
     oscNetwork->setToolTip(tr("Otherwise only this computer can send. Anyone on the network could then play, edit with menu "
                               "commands and, if allowed, run agent tools"));
     auto* oscTools = new QCheckBox(tr("Allow agent tools (/montage/tool/...)"), oscBox);
@@ -9663,8 +9668,8 @@ QDialog* MainWindow::controlSurfaceDialog() {
     };
     showOsc();
     auto applyOsc = [this, oscOn, oscPort, oscNetwork, oscStatus, oscFeedback, showOsc] {
-        appSettings().setValue(QStringLiteral("osc/port"), oscPort->value());
-        appSettings().setValue(QStringLiteral("osc/network"), oscNetwork->isChecked());
+        prefs::set(QStringLiteral("osc/port"), oscPort->value());
+        prefs::set(QStringLiteral("osc/network"), oscNetwork->isChecked());
         QString err;
         if (oscOn->isChecked() && oscFeedback->value() == oscPort->value()) err = tr("The feedback port must differ from the port listened on.");
         if (!oscOn->isChecked()) osc_->stop();
@@ -9675,7 +9680,7 @@ QDialog* MainWindow::controlSurfaceDialog() {
             oscOn->setChecked(false);
             osc_->stop();
         }
-        appSettings().setValue(QStringLiteral("osc/enabled"), oscOn->isChecked());
+        prefs::set(QStringLiteral("osc/enabled"), oscOn->isChecked());
         showOsc();
         if (!err.isEmpty()) oscStatus->setText(err);
     };
@@ -9689,12 +9694,12 @@ QDialog* MainWindow::controlSurfaceDialog() {
     connect(oscFeedback, &QSpinBox::valueChanged, dlg, [this, oscPort, oscStatus, showOsc](int port) {
         if (port != 0 && port == oscPort->value()) return oscStatus->setText(tr("The feedback port must differ from the port listened on."));
         osc_->setFeedbackPort(quint16(port));
-        appSettings().setValue(QStringLiteral("osc/feedbackPort"), port);
+        prefs::set(QStringLiteral("osc/feedbackPort"), port);
         showOsc();
     });
     connect(oscTools, &QCheckBox::toggled, dlg, [this](bool on) {
         osc_->setToolsAllowed(on);
-        appSettings().setValue(QStringLiteral("osc/tools"), on);
+        prefs::set(QStringLiteral("osc/tools"), on);
     });
     connect(oscAddresses, &QPushButton::clicked, dlg, [this, dlg] {
         // Every address, to copy into Companion's buttons.

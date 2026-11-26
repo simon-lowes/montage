@@ -79,6 +79,7 @@ add_library(montage_engine STATIC
   core/Production.h core/Production.cpp
   core/GraphicsTemplate.h core/GraphicsTemplate.cpp
   core/MidiMaps.h core/MidiMaps.cpp
+  core/Preferences.h core/Preferences.cpp
   core/Storyboard.h core/Storyboard.cpp
   automation/ScriptHost.h automation/ScriptHost.cpp
   automation/PythonHost.h automation/PythonHost.cpp

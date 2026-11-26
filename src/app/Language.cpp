@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "Settings.h"
+#include "core/Preferences.h"
 
 namespace montage::language {
 
@@ -62,12 +63,11 @@ QString displayName(const QString& code) {
     return n;
 }
 
-QString chosen() { return appSettings().value(QLatin1String(kKey)).toString(); }
+QString chosen() { return prefs::text(QLatin1String(kKey)); }
 
 void choose(const QString& code) {
-    QSettings s = appSettings();
-    if (code.isEmpty()) s.remove(QLatin1String(kKey));
-    else s.setValue(QLatin1String(kKey), code);
+    if (code.isEmpty()) prefs::restore(QLatin1String(kKey));
+    else prefs::set(QLatin1String(kKey), code);
 }
 
 QString resolve(const QString& choice) {

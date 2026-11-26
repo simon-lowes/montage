@@ -46,6 +46,7 @@
 #include "SoundOut.h"
 #include "audio/AudioRepair.h"
 #include "media/SoundSearch.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -233,7 +234,7 @@ SoundLibraryPanel::SoundLibraryPanel(EditorState* state, std::shared_ptr<SoundLi
     copy_ = new QCheckBox(tr("Copy into project folder"), this);
     copy_->setObjectName("soundLibraryCopy");
     copy_->setToolTip(tr("Sounds placed from the library are copied into a \"Sound Effects\" folder beside the project first"));
-    copy_->setChecked(appSettings().value(QStringLiteral("soundLibrary/copyToProject"), false).toBool());
+    copy_->setChecked(prefs::toggle(QStringLiteral("soundLibrary/copyToProject")));
     bottom->addWidget(playButton);
     bottom->addWidget(new QLabel(tr("Pitch"), this));
     bottom->addWidget(pitch_);
@@ -287,10 +288,7 @@ SoundLibraryPanel::SoundLibraryPanel(EditorState* state, std::shared_ptr<SoundLi
         drag->exec(Qt::CopyAction);
     };
     connect(playButton, &QPushButton::clicked, this, [this] { playing() ? stop() : play(); });
-    connect(copy_, &QCheckBox::toggled, this, [](bool on) {
-        QSettings settings = appSettings();
-        settings.setValue(QStringLiteral("soundLibrary/copyToProject"), on);
-    });
+    connect(copy_, &QCheckBox::toggled, this, [](bool on) { prefs::set(QStringLiteral("soundLibrary/copyToProject"), on); });
     connect(rescanSoon_, &QTimer::timeout, this, [this] { rescan(); });
     connect(watcher_, &QFileSystemWatcher::directoryChanged, this, [this] { rescanSoon_->start(); });
     auto* menu = new QMenu(folders_);

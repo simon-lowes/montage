@@ -21,6 +21,7 @@
 #include "Omt.h"
 #include "OmtNet.h"
 #include "audio/DynLib.h"
+#include "core/Preferences.h"
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -76,7 +77,7 @@ bool parseUrl(const std::string& url, std::string& host, int& port) {
 // The discovery server
 
 std::string discoveryServer() {
-    if (const char* e = std::getenv("MONTAGE_OMT_DISCOVERY_SERVER"); e && *e) return e;
+    if (const QString chosen = prefs::text(QStringLiteral("network/omtDiscovery")); !chosen.isEmpty()) return chosen.toStdString();
     // libomtnet's settings: ~/.OMT/settings.xml (OMT_STORAGE_PATH's when set), <Settings><DiscoveryServer>.
     QString dir;
     if (const char* e = std::getenv("OMT_STORAGE_PATH"); e && *e) dir = QString::fromLocal8Bit(e);

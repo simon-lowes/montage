@@ -27,11 +27,12 @@
 #include "Theme.h"
 #include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
 QString scriptsDirectory() {
-    const QString env = qEnvironmentVariable("MONTAGE_SCRIPTS_DIR");
+    const QString env = prefs::text(QStringLiteral("libraries/scripts"));
     return !env.isEmpty() ? env : QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/Scripts");
 }
 

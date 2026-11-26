@@ -10,6 +10,7 @@
 #include "Processing.h"
 #include "ShapeRaster.h"
 #include "media/HwAccel.h"
+#include "core/Preferences.h"
 
 namespace montage::gpu {
 
@@ -711,7 +712,7 @@ bool Device::create() {
             params.format = glFormat_;
             // Its textures shared with the OpenFX plug-ins' context (render/OfxGl.h): made sharing with that one where
             // it exists already (on its own, as before, where the two cannot share), and offered to it otherwise.
-            const bool share = qgetenv("MONTAGE_GPU_SHARE").toLower() != "off";
+            const bool share = prefs::toggle(QStringLiteral("playback/gpuShare"));
             params.shareContext = share ? ofx::gl::context() : nullptr;
             rhi_ = QRhi::create(QRhi::OpenGLES2, &params, flags);
             if (!rhi_ && params.shareContext) {
@@ -851,18 +852,18 @@ bool Device::create() {
         splats_ = noSplats.empty();
         noSplats_ = noSplats;
     }
-    // The texture budget: MONTAGE_GPU_MEMORY megabytes, or half the card's memory where the device tells it (the rest
-    // is the decoders', the display's and other programs'), never under 256 MB.
+    // The texture budget: the Texture budget setting's megabytes (MONTAGE_GPU_MEMORY's when set), or half the card's
+    // memory where the device tells it (the rest is the decoders', the display's and other programs'), never under 256 MB.
     {
-        bool set = false;
-        const int megabytes = qEnvironmentVariableIntValue("MONTAGE_GPU_MEMORY", &set);
+        const int megabytes = prefs::whole(QStringLiteral("playback/gpuMemoryMb"));
+        const bool set = megabytes > 0;
         const size_t card = set && megabytes > 0 ? 0 : cardMemory();
         ownBudget_ = set && megabytes > 0 ? size_t(megabytes) << 20 : card > 0 ? std::max(size_t(256) << 20, card / 2) : 0;
         if (logFallbacks()) {
             if (ownBudget_ == 0) std::fprintf(stderr, "montage gpu: no texture budget (the device does not say how much memory it has)\n");
             else if (card > 0)
                 std::fprintf(stderr, "montage gpu: texture budget %zu MB (half the device's %zu MB)\n", size_t(ownBudget_ >> 20), card >> 20);
-            else std::fprintf(stderr, "montage gpu: texture budget %zu MB (MONTAGE_GPU_MEMORY)\n", size_t(ownBudget_ >> 20));
+            else std::fprintf(stderr, "montage gpu: texture budget %zu MB (set)\n", size_t(ownBudget_ >> 20));
         }
     }
     // Hardware frames: the decoders of the devices whose frames map into this one keep them in the device's memory.

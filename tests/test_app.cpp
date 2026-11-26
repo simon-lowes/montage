@@ -296,11 +296,14 @@
 #include "HdrSurface.h"
 #include "MonitorPanel.h"
 #include "StillEdit.h"
+#include "PreferencesDialog.h"
+#include "core/Preferences.h"
 #include "PlaybackController.h"
 #include "Recovery.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
 #include "render/BackgroundJobs.h"
+#include "media/ModelFiles.h"
 #include "render/RenderFarm.h"
 #include "DialogJobs.h"
 #include "DialogTasks.h"
@@ -27667,6 +27670,414 @@ print("added " + ui["name"])
             QLocale::setDefault(QLocale::c());
             QCOMPARE(other, c);
         }
+    }
+
+    // The settings keys `code` reads or writes outside core/Preferences (each a whole key, or a group as "group/*").
+    static QStringList settingsKeysIn(const QString& code) {
+        static const QString key = QStringLiteral("(?:(?:QStringLiteral|QLatin1String|QString)\\s*\\(\\s*)?(?:\"([^\"]*)\"|(k[A-Z]\\w*))");
+        static const QRegularExpression constant(QStringLiteral("\\b(k[A-Z]\\w*)\\s*(?:=|\\(|\\{)\\s*(?:(?:QStringLiteral|QLatin1String|QString)\\s*\\(\\s*)?\"([^\"]+)\""));
+        static const QRegularExpression declared(QStringLiteral("\\bQSettings\\s*&?\\s+(\\w+)\\s*[=;({]"));
+        const QString calls = QStringLiteral("\\s*\\.\\s*(value|setValue|contains|remove|beginGroup)\\s*\\(\\s*") + key + QStringLiteral("(\\s*\\)?\\s*\\+)?");
+        QHash<QString, QString> constants;
+        for (auto m = constant.globalMatch(code); m.hasNext();) {
+            const auto c = m.next();
+            constants.insert(c.captured(1), c.captured(2));
+        }
+        QStringList names;
+        for (auto m = declared.globalMatch(code); m.hasNext();) names << QRegularExpression::escape(m.next().captured(1));
+        QList<QRegularExpression> uses{QRegularExpression(
+            QStringLiteral("(?:\\bappSettings\\s*\\(\\s*\\)|\\bsettings\\s*\\(\\s*\\)|\\bQSettings\\s*\\([^;{}]*?\\))") + calls)};
+        if (!names.isEmpty()) uses << QRegularExpression(QStringLiteral("\\b(?:%1)").arg(names.join(QLatin1Char('|'))) + calls);
+        static const QRegularExpression plain(QStringLiteral("^[A-Za-z][\\w./-]*$"));
+        QStringList keys;
+        for (const QRegularExpression& use : uses)
+            for (auto m = use.globalMatch(code); m.hasNext();) {
+                const auto u = m.next();
+                QString k = u.captured(2).isNull() ? constants.value(u.captured(3)) : u.captured(2);
+                if (!plain.match(k).hasMatch()) continue;  // (made as the program runs: a group's own keys)
+                if (!u.captured(4).isEmpty() || u.captured(1) == QLatin1String("beginGroup"))
+                    k = (k.endsWith(QLatin1Char('/')) ? k.chopped(1) : k) + QStringLiteral("/*");
+                keys << k;
+            }
+        return keys;
+    }
+
+    void everySettingsKeyIsDeclared() {
+        // Every settings key the application reads or writes is a setting, on one of the Preferences window's pages,
+        // read through the registry; or a remembered choice the registry declares. A setting's key read straight from
+        // QSettings fails, as does a key that is neither.
+        QStringList pages;
+        for (const prefs::Setting& s : prefs::all()) {
+            QVERIFY2(prefs::pages().contains(QString::fromLatin1(s.page)), qPrintable(s.key));
+            QVERIFY2(s.label && s.description, qPrintable(s.key));
+            QVERIFY2(!prefs::isRemembered(s.key), qPrintable(s.key));
+            QCOMPARE(prefs::find(s.key), &s);
+            QCOMPARE(prefs::get(s.key).isValid(), true);
+            if (!pages.contains(QString::fromLatin1(s.page))) pages << QString::fromLatin1(s.page);
+        }
+        QCOMPARE(pages, prefs::pages());  // (every page has settings, in the window's order)
+        auto problems = [](const QString& file, const QString& code) {
+            QStringList out;
+            for (const QString& k : settingsKeysIn(code)) {
+                if (k.endsWith(QLatin1String("/*"))) {
+                    for (const prefs::Setting& s : prefs::all())
+                        if (s.key.startsWith(k.chopped(1))) out << QStringLiteral("%1: %2 holds the setting %3").arg(file, k, s.key);
+                    if (!prefs::remembered().contains(k) && !prefs::isRemembered(k.chopped(2)))
+                        out << QStringLiteral("%1: %2 is not declared").arg(file, k);
+                } else if (prefs::find(k)) {
+                    out << QStringLiteral("%1: the setting %2 is read around the registry").arg(file, k);
+                } else if (!prefs::isRemembered(k)) {
+                    out << QStringLiteral("%1: %2 is not declared").arg(file, k);
+                }
+            }
+            return out;
+        };
+        // The check itself: a setting read straight from QSettings, and a key nobody declared, are both found.
+        const QStringList planted = problems(QStringLiteral("planted"), QStringLiteral(
+            "const int mb = appSettings().value(QStringLiteral(\"playback/gpuMemoryMb\"), 0).toInt();\n"
+            "QSettings s = appSettings();\ns.setValue(\"nobody/declared\", 1);\n"));
+        QCOMPARE(planted.size(), 2);
+        QVERIFY(planted[0].contains("around the registry") && planted[1].contains("nobody/declared"));
+        QStringList found;
+        int files = 0, keys = 0;
+        QDirIterator it(QStringLiteral(MONTAGE_SOURCE_DIR "/src"), {QStringLiteral("*.cpp"), QStringLiteral("*.h")}, QDir::Files,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QString path = it.next();
+            if (path.endsWith(QLatin1String("core/Preferences.cpp"))) continue;
+            QFile f(path);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString code = QString::fromUtf8(f.readAll());
+            if (!code.contains(QLatin1String("QSettings")) && !code.contains(QLatin1String("appSettings"))) continue;
+            ++files;
+            keys += int(settingsKeysIn(code).size());
+            found << problems(QDir(QStringLiteral(MONTAGE_SOURCE_DIR)).relativeFilePath(path), code);
+        }
+        QVERIFY2(files > 40 && keys > 300, qPrintable(QStringLiteral("%1 files, %2 keys").arg(files).arg(keys)));
+        QVERIFY2(found.isEmpty(), qPrintable(found.join('\n')));
+    }
+
+    void preferencesSetInTheWindowAreUsed() {
+        // Edit › Preferences… opens the window; a value set there is the one the code reads, and Restore gives the
+        // default back.
+        QAction* open = win_->findChild<QAction*>(QStringLiteral("preferences"));
+        QVERIFY(open);
+        QCOMPARE(open->menuRole(), QAction::PreferencesRole);
+        open->trigger();
+        auto* d = win_->findChild<PreferencesDialog*>();
+        QVERIFY(d && d->isVisible());
+        auto close = qScopeGuard([d] { d->close(); });
+        auto* jobs = d->findChild<QSpinBox*>(QStringLiteral("edit:jobs/at_once"));
+        QVERIFY(jobs && jobs->isEnabled());
+        QCOMPARE(jobs::atOnce(), 2);
+        QCOMPARE(d->findChild<QLabel*>(QStringLiteral("default:jobs/at_once"))->text(), QStringLiteral("Default: 2"));
+        jobs->setValue(5);
+        QCOMPARE(jobs::atOnce(), 5);
+        QVERIFY(prefs::isSet(QStringLiteral("jobs/at_once")));
+        // A folder: where downloaded models go.
+        const std::string ownModels = modelsDirectory();
+        auto* folder = d->findChild<QLineEdit*>(QStringLiteral("text:models/folder"));
+        QVERIFY(folder);
+        folder->setText(dir_.filePath(QStringLiteral("models here")));
+        emit folder->editingFinished();
+        QCOMPARE(QString::fromStdString(modelsDirectory()), dir_.filePath(QStringLiteral("models here")));
+        // A choice and a toggle.
+        auto* psd = d->findChild<QComboBox*>(QStringLiteral("edit:import/psd"));
+        QVERIFY(psd && psd->count() == 3);
+        psd->setCurrentIndex(psd->findData(QStringLiteral("layers")));
+        emit psd->activated(psd->currentIndex());
+        QCOMPARE(prefs::text(QStringLiteral("import/psd")), QStringLiteral("layers"));
+        auto* coalesce = d->findChild<QCheckBox*>(QStringLiteral("edit:mixer/coalesceTrim"));
+        QVERIFY(coalesce && !coalesce->isChecked());
+        coalesce->setChecked(true);
+        QVERIFY(prefs::toggle(QStringLiteral("mixer/coalesceTrim")));
+        // Restore: the default is used again, and the row shows it.
+        for (const char* key : {"jobs/at_once", "models/folder", "import/psd", "mixer/coalesceTrim"}) {
+            auto* restore = d->findChild<QToolButton*>(QStringLiteral("restore:") + key);
+            QVERIFY2(restore && restore->isEnabled(), key);
+            restore->click();
+            QVERIFY2(!prefs::isSet(QString::fromLatin1(key)) && !restore->isEnabled(), key);
+        }
+        QCOMPARE(jobs::atOnce(), 2);
+        QCOMPARE(jobs->value(), 2);
+        QCOMPARE(modelsDirectory(), ownModels);
+        QVERIFY(folder->text().isEmpty());
+        QCOMPARE(prefs::text(QStringLiteral("import/psd")), QStringLiteral("merged"));
+        QVERIFY(!prefs::toggle(QStringLiteral("mixer/coalesceTrim")) && !coalesce->isChecked());
+        // Opened again, it is the same window.
+        open->trigger();
+        QCOMPARE(win_->findChildren<PreferencesDialog*>().size(), 1);
+    }
+
+    void preferencesSavedToAFileAndReadBack() {
+        // Settings saved to a file and read back on a fresh profile come back the same; a key that is no setting, and
+        // a value a setting cannot take, are passed over.
+        const QList<std::pair<QString, QVariant>> values{
+            {QStringLiteral("jobs/at_once"), 7}, {QStringLiteral("ui/textScale"), 1.25}, {QStringLiteral("import/psd"), QStringLiteral("sequence")},
+            {QStringLiteral("mixer/latchPrime"), true}, {QStringLiteral("osc/port"), 9300},
+            {QStringLiteral("programs/browser"), QStringLiteral("/opt/browser/run")}};
+        for (const auto& [k, v] : values) QVERIFY2(prefs::set(k, v), qPrintable(k));
+        auto putBack = qScopeGuard([&values] {
+            for (const auto& [k, v] : values) prefs::restore(k);
+        });
+        QMap<QString, QVariant> before;
+        for (const prefs::Setting& s : prefs::all()) before.insert(s.key, prefs::get(s.key));
+        const QString file = dir_.filePath(QStringLiteral("my-settings.json"));
+        QString why;
+        QVERIFY2(prefs::saveTo(file, &why), qPrintable(why));
+        {
+            QFile f(file);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QJsonObject doc = QJsonDocument::fromJson(f.readAll()).object();
+            QCOMPARE(doc.value("montage-settings").toInt(), 1);
+            QCOMPARE(doc.value("settings").toObject().value("osc/port").toInt(), 9300);
+            QCOMPARE(doc.value("settings").toObject().value("import/psd").toString(), QStringLiteral("sequence"));
+        }
+        // A fresh profile: nothing set, every setting its default.
+        const QString fresh = dir_.filePath(QStringLiteral("fresh-profile"));
+        auto profile = [](const QString& where) {
+            for (auto format : {QSettings::NativeFormat, QSettings::IniFormat}) QSettings::setPath(format, QSettings::UserScope, where);
+        };
+        profile(fresh);
+        auto back = qScopeGuard([&] { profile(dir_.filePath(QStringLiteral("settings"))); });
+        for (const prefs::Setting& s : prefs::all()) QVERIFY2(!prefs::isSet(s.key), qPrintable(s.key));
+        QCOMPARE(prefs::whole(QStringLiteral("jobs/at_once")), 2);
+        QStringList passed;
+        QVERIFY2(prefs::loadFrom(file, &passed, &why), qPrintable(why));
+        QVERIFY2(passed.isEmpty(), qPrintable(passed.join(' ')));
+        for (const prefs::Setting& s : prefs::all())
+            QVERIFY2(prefs::get(s.key) == before.value(s.key), qPrintable(QStringLiteral("%1: %2, was %3").arg(s.key, prefs::get(s.key).toString(), before.value(s.key).toString())));
+        // Passed over, the rest read.
+        const QString odd = dir_.filePath(QStringLiteral("odd-settings.json"));
+        {
+            QFile f(odd);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(R"({"montage-settings": 1, "settings": {"no/such": 1, "import/psd": "flattened", "osc/tools": true}})");
+        }
+        QVERIFY(prefs::loadFrom(odd, &passed, &why));
+        passed.sort();
+        QCOMPARE(passed, QStringList({"import/psd", "no/such"}));
+        QVERIFY(prefs::toggle(QStringLiteral("osc/tools")));
+        QCOMPARE(prefs::text(QStringLiteral("import/psd")), QStringLiteral("sequence"));
+        // Not a settings file.
+        QVERIFY(!prefs::loadFrom(dir_.filePath(QStringLiteral("my-settings-missing.json")), &passed, &why) && why.contains("could not be read"));
+        QDir(fresh).removeRecursively();
+    }
+
+    void facilitySettingsLockASetting() {
+        // A facility's file gives defaults and can lock a setting: the locked one cannot be changed, in the window or
+        // by a file read in, and the window says why.
+        const QString file = dir_.filePath(QStringLiteral("facility.json"));
+        {
+            QFile f(file);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(R"({"montage-settings": 1, "settings": {"jobs/at_once": 3, "osc/port": 9200}, "locked": ["jobs/at_once"]})");
+        }
+        qputenv("MONTAGE_FACILITY_SETTINGS", file.toUtf8());
+        prefs::reloadFacility();
+        auto back = qScopeGuard([] {
+            qunsetenv("MONTAGE_FACILITY_SETTINGS");
+            prefs::reloadFacility();
+            prefs::restore(QStringLiteral("osc/port"));
+        });
+        QCOMPARE(prefs::facilityFile(), file);
+        QVERIFY2(prefs::facilityProblem().isEmpty(), qPrintable(prefs::facilityProblem()));
+        QCOMPARE(jobs::atOnce(), 3);
+        QCOMPARE(prefs::whole(QStringLiteral("osc/port")), 9200);  // (the facility's default)
+        QCOMPARE(prefs::defaultFor(QStringLiteral("osc/port")).toInt(), 9200);
+        QString why;
+        QVERIFY(!prefs::set(QStringLiteral("jobs/at_once"), 6, &why));
+        QVERIFY2(why.contains(file), qPrintable(why));
+        jobs::setAtOnce(6);
+        QCOMPARE(jobs::atOnce(), 3);
+        QVERIFY(prefs::set(QStringLiteral("osc/port"), 9400));  // (a default, not locked: the user's own wins)
+        QCOMPARE(prefs::whole(QStringLiteral("osc/port")), 9400);
+        PreferencesDialog* d = PreferencesDialog::open(win_.get());
+        auto close = qScopeGuard([d] { d->close(); });
+        auto* jobs = d->findChild<QSpinBox*>(QStringLiteral("edit:jobs/at_once"));
+        QVERIFY(jobs && !jobs->isEnabled());
+        QCOMPARE(jobs->value(), 3);
+        auto* note = d->findChild<QLabel*>(QStringLiteral("note:jobs/at_once"));
+        QVERIFY(note && !note->isHidden());
+        QVERIFY2(note->text().contains(QStringLiteral("Locked by the facility's settings file")) && note->text().contains(file), qPrintable(note->text()));
+        QVERIFY(!d->findChild<QToolButton*>(QStringLiteral("restore:jobs/at_once"))->isEnabled());
+        QCOMPARE(d->findChild<QLabel*>(QStringLiteral("default:osc/port"))->text(), QStringLiteral("Default: 9200"));
+        QVERIFY(d->findChild<QSpinBox*>(QStringLiteral("edit:osc/port"))->isEnabled());
+        QVERIFY(d->findChild<QLabel*>(QStringLiteral("note:osc/port"))->isHidden());
+        // A file read in passes over the locked setting.
+        const QString mine = dir_.filePath(QStringLiteral("mine.json"));
+        {
+            QFile f(mine);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(R"({"montage-settings": 1, "settings": {"jobs/at_once": 8}})");
+        }
+        QStringList passed;
+        QVERIFY(d->loadFrom(mine, &passed));
+        QCOMPARE(passed, QStringList{"jobs/at_once"});
+        QCOMPARE(jobs::atOnce(), 3);
+        // A facility file that is not one is named as a problem in the window, and locks nothing.
+        {
+            QFile f(file);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write("{\"settings\": 1}");
+        }
+        d->refresh();
+        QVERIFY(prefs::facilityProblem().contains(QStringLiteral("not a Montage settings file")));
+        QVERIFY(!d->findChild<QLabel*>(QStringLiteral("preferencesProblem"))->isHidden());
+        QVERIFY(jobs->isEnabled() && jobs::atOnce() == 2);
+    }
+
+    void preferencesShowWhatTheEnvironmentOverrides() {
+        // With MONTAGE_GPU_MEMORY set, the texture budget is that, and the window shows it overridden and by what.
+        qputenv("MONTAGE_GPU_MEMORY", "512");
+        auto back = qScopeGuard([] { qunsetenv("MONTAGE_GPU_MEMORY"); });
+        QCOMPARE(prefs::whole(QStringLiteral("playback/gpuMemoryMb")), 512);
+        QCOMPARE(prefs::overriddenBy(QStringLiteral("playback/gpuMemoryMb")), QStringLiteral("MONTAGE_GPU_MEMORY=512"));
+        PreferencesDialog* d = PreferencesDialog::open(win_.get());
+        auto close = qScopeGuard([d] { d->close(); });
+        d->showPage(QStringLiteral("Playback"));
+        auto* budget = d->findChild<QSpinBox*>(QStringLiteral("edit:playback/gpuMemoryMb"));
+        QVERIFY(budget && !budget->isEnabled() && budget->value() == 512 && budget->isVisible());
+        auto* note = d->findChild<QLabel*>(QStringLiteral("note:playback/gpuMemoryMb"));
+        QVERIFY(note && note->isVisible());
+        QVERIFY2(note->text().contains(QStringLiteral("Overridden by MONTAGE_GPU_MEMORY=512")), qPrintable(note->text()));
+        // Unset, the window's own value is used again.
+        qunsetenv("MONTAGE_GPU_MEMORY");
+        d->refresh();
+        QVERIFY(budget->isEnabled() && budget->value() == 0 && note->isHidden());
+        QVERIFY(prefs::overriddenBy(QStringLiteral("playback/gpuMemoryMb")).isEmpty());
+        // A toggle's variable: off, no and 0 turn it off.
+        qputenv("MONTAGE_GPU_HANDLES", "0");
+        QVERIFY(!prefs::toggle(QStringLiteral("playback/gpuHandles")));
+        qunsetenv("MONTAGE_GPU_HANDLES");
+        QVERIFY(prefs::toggle(QStringLiteral("playback/gpuHandles")));
+    }
+
+    void preferencesSearchFindsTexture() {
+        // The search finds "texture" on the Playback page: only that page and its row are shown.
+        PreferencesDialog* d = PreferencesDialog::open(win_.get());
+        auto close = qScopeGuard([d] {
+            d->search(QString());
+            d->close();
+        });
+        d->showPage(QStringLiteral("General"));
+        auto* search = d->findChild<QLineEdit*>(QStringLiteral("preferencesSearch"));
+        QVERIFY(search);
+        QTest::keyClicks(search, QStringLiteral("texture"));
+        QCOMPARE(d->currentPage(), QStringLiteral("Playback"));
+        QVERIFY(d->findChild<QLabel*>(QStringLiteral("name:playback/gpuMemoryMb"))->isVisible());
+        QVERIFY(!d->findChild<QLabel*>(QStringLiteral("name:playback/hdrViewer"))->isVisible());
+        auto* pages = d->findChild<QListWidget*>(QStringLiteral("preferencesPages"));
+        QStringList shown;
+        for (int i = 0; i < pages->count(); ++i)
+            if (!pages->item(i)->isHidden()) shown << pages->item(i)->data(Qt::UserRole).toString();
+        QCOMPARE(shown, QStringList{"Playback"});
+        // Words from a description find it too; nothing found says so.
+        search->setText(QStringLiteral("half the card"));
+        QVERIFY(d->findChild<QLabel*>(QStringLiteral("name:playback/gpuMemoryMb"))->isVisible());
+        search->setText(QStringLiteral("no such words anywhere"));
+        QVERIFY(d->findChild<QLabel*>(QStringLiteral("preferencesNothing"))->isVisible());
+        search->clear();
+        QVERIFY(d->findChild<QLabel*>(QStringLiteral("name:playback/hdrViewer"))->isVisible());
+    }
+
+    void preferencesChooseTheImageEditor() {
+        // The program for Edit in Another Application set in Preferences is the one the clip's menu opens the still in.
+        state()->newProject();
+        const QString png = dir_.path() + "/preferred-editor.png";
+        QImage red(64, 36, QImage::Format_RGB32);
+        red.fill(qRgb(220, 0, 0));
+        QVERIFY(red.save(png));
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 64, s.height = 36;
+            return edit::placeMedia(p, s, ids[0], 0, 0, 30, V1, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        PreferencesDialog* d = PreferencesDialog::open(win_.get());
+        auto* program = d->findChild<QLineEdit*>(QStringLiteral("text:editing/stillProgram"));
+        QVERIFY(program);
+        program->setText(QStringLiteral("/opt/Chosen Editor/edit"));
+        emit program->editingFinished();
+        d->close();
+        QStringList launched;
+        StillEditor::setLauncherForTesting([&](const QString& prog, const QString& file) {
+            launched << prog << file;
+            return true;
+        });
+        auto back = qScopeGuard([&] {
+            StillEditor::setLauncherForTesting({});
+            prefs::restore(QStringLiteral("editing/stillProgram"));
+            state()->newProject();
+        });
+        state()->setSelection({clip}, false);
+        bool offered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            for (QAction* a : menu->findChildren<QAction*>())
+                if (a->objectName() == "editStillElsewhere") {
+                    offered = true;
+                    a->trigger();
+                }
+            menu->close();
+        });
+        const QPoint on = pointFor(1, V1);
+        QContextMenuEvent menuEvent(QContextMenuEvent::Mouse, on, viewport()->mapToGlobal(on));
+        QApplication::sendEvent(viewport(), &menuEvent);
+        QVERIFY(offered);
+        QCOMPARE(launched.size(), 2);
+        QCOMPARE(launched[0], QStringLiteral("/opt/Chosen Editor/edit"));
+        QCOMPARE(StillEditor::program(), QStringLiteral("/opt/Chosen Editor/edit"));
+    }
+
+    // Each visible label and button in `top` that is narrower than its text needs (a label that wraps: shorter than
+    // its lines need), with where it is.
+    static QStringList cutShort(QWidget* top) {
+        QStringList out;
+        for (QWidget* c : top->findChildren<QWidget*>()) {
+            if (!c->isVisible()) continue;
+            auto* l = qobject_cast<QLabel*>(c);
+            auto* b = qobject_cast<QAbstractButton*>(c);
+            if (!l && !b) continue;
+            const QString text = l ? l->text() : b->text();
+            if (text.isEmpty() || (l && (!l->pixmap().isNull() || l->textFormat() == Qt::RichText))) continue;
+            const bool cut = l && l->wordWrap() ? c->height() < c->heightForWidth(c->width()) : c->width() < c->sizeHint().width();
+            if (cut)
+                out << QStringLiteral("%1 %2 %3x%4: %5").arg(c->metaObject()->className(), c->objectName()).arg(c->width()).arg(c->height()).arg(text.left(60));
+        }
+        return out;
+    }
+
+    // `w`'s picture saved for a person to look at: in $MONTAGE_TEST_SCREENSHOTS when set, else in this run's folder.
+    QString screenshot(QWidget* w, const QString& name) {
+        const QString folder = qEnvironmentVariableIsSet("MONTAGE_TEST_SCREENSHOTS") ? qEnvironmentVariable("MONTAGE_TEST_SCREENSHOTS") : dir_.path();
+        QDir().mkpath(folder);
+        const QString path = QDir(folder).filePath(name + QStringLiteral(".png"));
+        w->grab().save(path);
+        return path;
+    }
+
+    void preferencesInArabic() {
+        // In Arabic the window lays out right to left at 1280 by 800, and on no page is a text cut short. Each page is
+        // saved as a picture to be looked at.
+        QCOMPARE(language::install("ar"), QString("ar"));
+        auto back = qScopeGuard([] { language::uninstall(); });
+        PreferencesDialog d(win_.get());
+        d.resize(1280, 800);
+        d.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&d));
+        QVERIFY(d.isRightToLeft());
+        QStringList cut;
+        for (const QString& page : prefs::pages()) {
+            d.showPage(page);
+            QCoreApplication::processEvents();
+            QCOMPARE(d.currentPage(), page);
+            for (const QString& c : cutShort(&d)) cut << page + QStringLiteral(": ") + c;
+            qInfo().noquote() << "Preferences in Arabic:" << screenshot(&d, QStringLiteral("preferences-ar-") + page.toLower());
+        }
+        QVERIFY2(cut.isEmpty(), qPrintable(cut.join('\n')));
     }
 
     void aHungFunctionIsNamed() {
