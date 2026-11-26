@@ -38,7 +38,8 @@ uint64_t title3dSolidsDrawn();
 // a track's picture, its colour there), with uvs across the title's box as its own drawing maps a picture, in one
 // material, and one more for each track's picture it shows (given `pictures`), that picture as its texture
 // (premultiplied and display-referred, as the title is drawn with it). Each corner also has the title's own light:
-// how its own drawing lights it. False when nothing of it shows, or for a title seen through a camera in a file.
+// how its own drawing lights it. Seen through a camera in a file, its triangles and that camera are in the file's
+// scene (its units). False when nothing of it shows, or for a title to be seen through a camera its file lacks.
 struct Title3DMesh {
     PosedTriangles triangles;
     std::shared_ptr<const Model> model;  // its materials

@@ -43263,6 +43263,148 @@ private slots:
         QVERIFY(makeEffect(again, "title3d").p("own_light", 0) > 0.5);  // (on for a new title)
     }
 
+    void titleInTheSceneThroughAFileCamera() {
+        // A 3D title seen through the camera in a USD scene (8 units down +z, a 50 mm lens on a 16:9 film back) stands
+        // in that file's scene with a card seen through the same file's camera: its letters are where the file's camera
+        // sees them, in front of the card 1 unit behind them, and their shadow on the lit card falls where a ray-traced
+        // reference puts it (every pixel the render shadows and the reference does not, or the other way, within 1 px
+        // of one the reference shadows and one it lights). Through a camera the file lacks, or with the card through
+        // its own camera, the title is not in the scene.
+        const int W = 320, H = 180;
+        const std::string file = MONTAGE_TEST_DATA_DIR "/models/camera.usda";
+        const double f = 50 * H / 20.25;  // (the lens in pixels across the picture's height)
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        RenderOptions o;
+        Clip card;
+        card.id = p.newId();
+        card.duration = 10;
+        card.generator = makeEffect(p, "color");
+        card.generator.params["color.r"] = 1.0, card.generator.params["color.g"] = 1.0, card.generator.params["color.b"] = 1.0;
+        {
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 2.0;
+            e.strings["camera_file"] = file;
+            e.params["width"] = 6.0;
+            e.params["pos_z"] = -1.0;
+            e.params["lit"] = 1.0, e.params["shadows"] = 1.0, e.params["ambient"] = 30.0;
+            e.params["light_angle"] = -20.0, e.params["light_height"] = 20.0;
+            card.effects.push_back(e);
+        }
+        Clip title = makeGeneratorClip(p, "title3d", 10);
+        {
+            Effect& g = title.generator;
+            g.strings["text"] = "I";
+            g.strings["font"] = "DejaVu Sans";
+            g.strings["camera_file"] = file;
+            g.params["units"] = Param(f / 8);
+            g.params["size"] = Param(100.0), g.params["depth"] = Param(20.0);
+            g.params["rot_x"] = Param(0.0), g.params["rot_y"] = Param(0.0);
+            g.params["light_angle"] = Param(-20.0), g.params["light_height"] = Param(20.0);
+            g.params["color.r"] = Param(0.2), g.params["color.g"] = Param(0.9), g.params["color.b"] = Param(0.3);
+            g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.9), g.params["side_color.b"] = Param(0.3);
+            g.params["in_scene"] = Param(1.0);
+            g.params["shadows"] = Param(1.0);
+        }
+        s.videoTracks[0].clips = {card};
+        s.videoTracks[1].clips = {title};
+        QVERIFY(title3dInScene(s, s.videoTracks[1].clips[0], 3));
+        // Its triangles and camera are the file's scene's: the camera the card is seen through, the letters in front of
+        // the card.
+        ModelCamera cam;
+        std::string err;
+        QVERIFY2(effectCamera(p, s, card, card.effects[0], 3, 1, cam, &err), err.c_str());
+        Title3DMesh mesh;
+        QVERIFY(title3dMesh(title.generator, 3, W, H, 10, 25, mesh));
+        for (int k = 0; k < 9; ++k) QVERIFY2(std::fabs(mesh.camera.R[size_t(k)] - cam.R[size_t(k)]) < 1e-9, qPrintable(QString::number(k)));
+        for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(mesh.camera.C[size_t(k)] - cam.C[size_t(k)]) < 1e-9);
+        for (int k = 0; k < 6; ++k)
+            QVERIFY2(std::fabs(mesh.camera.screen[size_t(k)] - cam.screen[size_t(k)]) < 1e-6,
+                     qPrintable(QString("%1: %2 %3").arg(k).arg(mesh.camera.screen[size_t(k)]).arg(cam.screen[size_t(k)])));
+        std::array<double, 3> lo, hi;
+        QVERIFY(modelBounds(mesh.triangles, lo, hi));
+        const double planeZ = -1;
+        QVERIFY2(lo[2] > planeZ + 0.1 && hi[2] < 1, qPrintable(QString("%1 %2").arg(lo[2]).arg(hi[2])));
+        const Image shaded = renderSequenceFrame(p, s, 3, o);
+        // (the letter's face, not the card behind it, in the middle)
+        const float* mid = shaded.at(W / 2, H / 2);
+        QVERIFY2(mid[1] > mid[0] + 0.2f, qPrintable(QString("%1 %2 %3").arg(mid[0]).arg(mid[1]).arg(mid[2])));
+        s.videoTracks[1].clips[0].generator.params["shadows"] = Param(0.0);
+        const Image unshaded = renderSequenceFrame(p, s, 3, o);
+        const PosedTriangles& T = mesh.triangles;
+        auto hits = [&](const std::array<double, 3>& o0, const std::array<double, 3>& d) {
+            for (size_t i = 0; i + 2 < T.indices.size(); i += 3) {
+                std::array<double, 3> v[3];
+                for (int k = 0; k < 3; ++k)
+                    for (int j = 0; j < 3; ++j) v[k][size_t(j)] = T.positions[T.indices[i + size_t(k)] * 3 + size_t(j)];
+                const std::array<double, 3> e1{v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]}, e2{v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]};
+                const std::array<double, 3> pv{d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+                const double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+                if (std::fabs(det) < 1e-12) continue;
+                const std::array<double, 3> tv{o0[0] - v[0][0], o0[1] - v[0][1], o0[2] - v[0][2]};
+                const double u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) / det;
+                if (u < 0 || u > 1) continue;
+                const std::array<double, 3> qv{tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+                const double w = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) / det;
+                if (w < 0 || u + w > 1) continue;
+                if ((e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) / det > 1e-9) return true;
+            }
+            return false;
+        };
+        const ModelLight light = settingsLight(card.effects[0], 3, {0, 0, planeZ}, 6);
+        const std::array<double, 3> toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+        // Each pixel: -1 the title itself (or off the card, or at its edge), 1 shadowed, 0 lit, by the reference.
+        std::vector<int> ref(size_t(W) * size_t(H), 0);
+        const double unit = 6.0 / W, halfW = 3.0 - 3 * unit, halfH = 6.0 * H / W / 2 - 3 * unit;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const std::array<double, 3> d = cam.ray(x + 0.5, y + 0.5);
+                int& r = ref[size_t(y) * W + size_t(x)];
+                if (hits(cam.C, d) || !(d[2] < 0)) {
+                    r = -1;
+                    continue;
+                }
+                const double k = (planeZ - cam.C[2]) / d[2];
+                const std::array<double, 3> P{cam.C[0] + d[0] * k, cam.C[1] + d[1] * k, planeZ};
+                if (std::fabs(P[0]) > halfW || std::fabs(P[1]) > halfH) {
+                    r = -1;
+                    continue;
+                }
+                r = hits(P, toLight) ? 1 : 0;
+            }
+        int shadowed = 0, wrong = 0, far = 0;
+        auto near = [&](int x, int y, int want) {
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int X = x + dx, Y = y + dy;
+                    if (X >= 0 && Y >= 0 && X < W && Y < H && ref[size_t(Y) * W + size_t(X)] == want) return true;
+                }
+            return false;
+        };
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const int r = ref[size_t(y) * W + size_t(x)];
+                if (r < 0 || near(x, y, -1)) continue;
+                const bool ours = unshaded.at(x, y)[0] - shaded.at(x, y)[0] > 0.05f;
+                shadowed += r == 1;
+                if (ours != (r == 1)) {
+                    ++wrong;
+                    if (!(near(x, y, 0) && near(x, y, 1))) ++far;
+                }
+            }
+        qInfo("a letter's shadow on a card in a file's scene: %d px in the reference's shadow, %d differ at its edge, %d further", shadowed, wrong, far);
+        QVERIFY(shadowed > 300);
+        QCOMPARE(far, 0);
+        // Not in the scene: through a camera the file lacks (its own camera then), or with the card through its own.
+        s.videoTracks[1].clips[0].generator.params["camera_index"] = Param(2.0);
+        QVERIFY(!title3dInScene(s, s.videoTracks[1].clips[0], 3));
+        s.videoTracks[1].clips[0].generator.params["camera_index"] = Param(1.0);
+        s.videoTracks[0].clips[0].effects[0].params["camera"] = 0.0;
+        QVERIFY(!title3dInScene(s, s.videoTracks[1].clips[0], 3));
+    }
+
     void titlesInTheSceneShadowEachOther() {
         // In the 3D layers' scene, a letter's shadow on the next letter and a 3D model's shadow on a letter fall where a
         // ray-traced reference puts them: a pixel of a letter's face (seen square on and facing the title's own light)

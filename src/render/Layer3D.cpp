@@ -154,6 +154,12 @@ const Effect* firstLayer3D(const Clip& k) {
     return nullptr;
 }
 
+// The scene of shadows a 3D title stands in: the front one, or the file's whose camera it is seen through.
+std::string title3dWorld(const Clip& c) {
+    const std::string file = c.generator.s("camera_file");
+    return file.empty() ? "front" : "file:" + file;
+}
+
 SceneShadows makeSceneShadows(const Project& p, const Sequence& seq, FrameTime t, const std::string& world,
                               const std::function<Image(const Clip&)>& cardLayer, const std::function<Image(int)>& trackLayer,
                               const Clip* self) {
@@ -171,7 +177,7 @@ SceneShadows makeSceneShadows(const Project& p, const Sequence& seq, FrameTime t
         m.id = k.id, m.track = ti;
         if (k.isGenerator() && k.generator.type == "title3d") {
             // A 3D title standing in the scene: its letters' triangles.
-            if (world != "front" || !title3dInScene(seq, k, t)) return;
+            if (title3dWorld(k) != world || !title3dInScene(seq, k, t)) return;
             Title3DMesh mesh;
             if (!title3dMesh(k.generator, double(kt), seq.width, seq.height, k.duration, seq.fpsValue(), mesh)) return;
             std::array<double, 3> lo, hi;
@@ -321,15 +327,22 @@ SceneShadows sceneShadows(const Project& p, const Sequence& seq, FrameTime t, co
 }
 
 bool title3dInScene(const Sequence& seq, const Clip& c, FrameTime t) {
-    if (!c.isGenerator() || c.generator.type != "title3d" || !c.generator.s("camera_file").empty()) return false;
+    if (!c.isGenerator() || c.generator.type != "title3d") return false;
     if (c.generator.p("in_scene", t - c.start, 0) <= 0.5) return false;
+    // (through a file's camera: one the file has)
+    const std::string world = title3dWorld(c), file = c.generator.s("camera_file");
+    if (!file.empty()) {
+        const std::shared_ptr<const Model> model = cachedModel(file);
+        const long index = std::lround(c.generator.p("camera_index", t - c.start, 1)) - 1;
+        if (!model || index < 0 || size_t(index) >= model->cameras.size()) return false;
+    }
     for (const Track& track : seq.videoTracks) {
         if (track.muted) continue;
         for (const Clip& k : track.clips) {
             if (!k.enabled || t < k.start || t >= k.end() || k.id == c.id) continue;
             if (k.isGenerator() && k.generator.type == "model3d") {
-                if (shadowWorldOf(seq, k, k.generator, t) == "front") return true;
-            } else if (const Effect* l = firstLayer3D(k); l && shadowWorldOf(seq, k, *l, t) == "front") {
+                if (shadowWorldOf(seq, k, k.generator, t) == world) return true;
+            } else if (const Effect* l = firstLayer3D(k); l && shadowWorldOf(seq, k, *l, t) == world) {
                 return true;
             }
         }
@@ -344,10 +357,16 @@ Image renderTitle3DInScene(const Project& p, const Sequence& seq, const Clip& c,
     Title3DMesh mesh;
     ModelCamera cam;
     const bool own = g.p("own_light", lt, 0) > 0.5;
+    const std::string world = title3dWorld(c);
     if (!title3dMesh(g, double(lt), seq.width, seq.height, c.duration, seq.fpsValue(), mesh, own ? pictures : nullptr) ||
-        !effectCamera(p, seq, c, g, t, scale, cam)) {
+        (world == "front" && !effectCamera(p, seq, c, g, t, scale, cam))) {
         if (depth) depth->assign(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
         return Image(std::max(1, w), std::max(1, h));
+    }
+    if (world != "front") {
+        // (through the file's camera, as the title's own drawing sees through it)
+        cam = mesh.camera;
+        for (double& v : cam.screen) v *= scale;
     }
     ModelScene scene;
     scene.triangles = std::move(mesh.triangles);
@@ -375,7 +394,7 @@ Image renderTitle3DInScene(const Project& p, const Sequence& seq, const Clip& c,
         scene.ambient = {ambient, ambient, ambient};
     }
     scene.castsShadows = g.p("shadows", lt, 0) > 0.5;
-    const SceneShadows sh = sceneShadows(p, seq, t, "front", {}, {}, &c);
+    const SceneShadows sh = sceneShadows(p, seq, t, world, {}, {}, &c);
     if (sh.world) scene.shadowWorld = sh.world;
     return renderModel(scene, cam, w, h, depth);
 }

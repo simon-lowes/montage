@@ -80,8 +80,9 @@ SceneShadows sceneShadows(const Project& p, const Sequence& seq, FrameTime t, co
                           const std::function<Image(int track)>& trackLayer = {}, const Clip* self = nullptr);
 
 // Whether 3D title clip c stands in the 3D layers' scene at sequence frame t: its In the 3D Scene setting on (off in
-// projects saved before it), seen through no file's camera, and a card or a model seen through its own camera or the
-// scene's Camera clip on screen with it. There its letters are drawn as a model is, through the scene's camera, lit
+// projects saved before it), and a card or a model seen through its own camera or the scene's Camera clip on screen
+// with it; or, seen through a camera in a file (one the file has), one seen through that file's cameras. There its
+// letters are drawn as a model is, through the scene's camera (or the file's camera it is seen through), lit
 // as its own drawing lights it (Lit as Drawn Alone; off in projects saved before it, where its light is read as a 3D
 // layer's), its faces showing the tracks' pictures they are filled with, merged by depth with the cards and models,
 // and casting and taking shadows with them in the scene's one shadow map a light.

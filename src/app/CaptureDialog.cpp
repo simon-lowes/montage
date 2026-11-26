@@ -25,6 +25,7 @@
 #include <QVBoxLayout>
 
 #include "EditorState.h"
+#include "FittedScroll.h"
 #include "ReferenceOutputPanel.h"
 #include "Settings.h"
 #include "audio/AudioDevice.h"
@@ -63,7 +64,11 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     setObjectName(QStringLiteral("captureDialog"));
     connect(state_, &EditorState::projectChanged, this, &CaptureDialog::markersToChapters);
     QSettings settings = appSettings();
-    auto* layout = new QVBoxLayout(this);
+    // (the rows scroll on a screen too short for them; the buttons stay below)
+    auto* outer = new QVBoxLayout(this);
+    auto* rows = new QWidget(this);
+    auto* layout = new QVBoxLayout(rows);
+    layout->setContentsMargins(0, 0, 0, 0);
     auto* intro = new QLabel(tr("Records a live feed (a network stream or a camera, capture card or sound card on this computer) "
                                 "with its timecode. A QuickTime recording is in the Captures bin a second after it starts and "
                                 "grows there as it records, so it can be cut in straight away."),
@@ -343,7 +348,10 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     record_->setObjectName(QStringLiteral("captureRecord"));
     connect(record_, &QPushButton::clicked, this, [this] { isRecording() ? stop() : (void)record(); });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::hide);  // (recording goes on with it hidden)
-    layout->addWidget(buttons);
+    auto* scroll = new FittedScroll(rows, this);
+    scroll->setObjectName(QStringLiteral("captureRows"));
+    outer->addWidget(scroll, 1);
+    outer->addWidget(buttons);
 
     tick_ = new QTimer(this);
     tick_->setInterval(250);

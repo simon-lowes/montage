@@ -272,6 +272,12 @@ struct Built {
     double opacity = 0;
     Camera cam;
     Lighting light;
+    // Seen through a camera in a file: the camera's axes (rows: right, up, back), where it is in the file's scene and
+    // the raster pixels a scene unit.
+    bool inFile = false;
+    M3 fileView;
+    V3 fileAt;
+    double fileUnit = 1;
     M3 R;
     V3 T;
     double k = 1;
@@ -568,6 +574,7 @@ bool buildTitle3D(const Effect& g, double t, int w, int h, double scale, FrameTi
                     for (int j = 0; j < 3; ++j) view.m[i][j] = axes[size_t(i)][size_t(j)];
                 R = view * R;
                 T = view * V3{g.pAt("pos_x", t) * px - at[0] * u, -g.pAt("pos_y", t) * px - at[1] * u, -depth / 2 - away * H - at[2] * u};
+                b.inFile = true, b.fileView = view, b.fileAt = {at[0], at[1], at[2]}, b.fileUnit = u;
             }
         }
     b.R = R, b.T = T;
@@ -888,15 +895,29 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
     out = Title3DMesh{};
     const int w = std::max(1, int(std::lround(seqWidth))), h = std::max(1, int(std::lround(seqHeight)));
     Built b;
-    if (!buildTitle3D(g, t, w, h, 1.0, duration, fps, pictures, b) || !g.s("camera_file").empty()) return false;
-    // The title's camera space (raster pixels) to the scene's: a unit a sequence pixel, the frame at z = 0.
+    if (!buildTitle3D(g, t, w, h, 1.0, duration, fps, pictures, b) || (!g.s("camera_file").empty() && !b.inFile)) return false;
+    // The title's camera space (raster pixels) to the scene's: a unit a sequence pixel, the frame at z = 0; or, seen
+    // through a file's camera, the file's scene (its units).
     const double unit = 1.0 / b.super;
-    auto toWorld = [&](V3 q) { return V3{q.x * unit, q.y * unit, (q.z + b.cam.f) * unit}; };
-    out.camera.R = {1, 0, 0, 0, -1, 0, 0, 0, -1};
-    out.camera.C = {0, 0, b.cam.f * unit};
+    const M3 back = transposed(b.fileView);  // (camera to file: its axes)
+    auto toWorld = [&](V3 q) {
+        if (b.inFile) return back * q * (1 / b.fileUnit) + b.fileAt;
+        return V3{q.x * unit, q.y * unit, (q.z + b.cam.f) * unit};
+    };
+    auto dirToWorld = [&](V3 n) { return b.inFile ? back * n : n; };
+    if (b.inFile) {
+        const M3& v = b.fileView;  // (the camera's rows: right, down and ahead)
+        out.camera.R = {v.m[0][0], v.m[0][1], v.m[0][2], -v.m[1][0], -v.m[1][1], -v.m[1][2], -v.m[2][0], -v.m[2][1], -v.m[2][2]};
+        out.camera.C = {b.fileAt.x, b.fileAt.y, b.fileAt.z};
+        out.camera.nearZ = b.cam.nearest / b.fileUnit;
+    } else {
+        out.camera.R = {1, 0, 0, 0, -1, 0, 0, 0, -1};
+        out.camera.C = {0, 0, b.cam.f * unit};
+        out.camera.nearZ = b.cam.nearest * unit;
+    }
     out.camera.screen = {b.cam.f * unit, 0, b.cam.cx * unit, 0, b.cam.f * unit, b.cam.cy * unit};
-    out.camera.nearZ = b.cam.nearest * unit;
-    out.toLight = {b.light.light.x, b.light.light.y, b.light.light.z};  // (the camera's axes are the scene's)
+    const V3 toLight = dirToWorld(b.light.light);
+    out.toLight = {toLight.x, toLight.y, toLight.z};
     out.ambient = float(b.light.ambient);
     PosedTriangles& tr = out.triangles;
     // (a face or side filled with a track's picture: a material of its own with that picture, display-referred, as
@@ -930,6 +951,7 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
     };
     double uvAt[2] = {0, 0};
     auto vertex = [&](V3 p, V3 n, const float* col) {
+        n = dirToWorld(n);
         tr.positions.insert(tr.positions.end(), {float(p.x), float(p.y), float(p.z)});
         tr.normals.insert(tr.normals.end(), {float(n.x), float(n.y), float(n.z)});
         tr.uvs.insert(tr.uvs.end(), {float(uvAt[0]), float(uvAt[1])});
