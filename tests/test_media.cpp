@@ -43079,12 +43079,12 @@ private slots:
 
     void titles3DInASolvedScenesUsd() {
         // A 3D title over footage with a solved camera, written to the solved scene's USD as a mesh, placed by its own
-        // camera: the middle of its faces at the median depth of the solve's points in front of the solved camera at
-        // its first frame, the title in proportion (every distance between its corners the same multiple of the one in
-        // its own space), and, through a solved camera with its own lens, every corner where its own camera shows it
-        // (within 1e-3 px); square on, through its clip's transform and another lens, its faces' corners. Its colours
-        // corner by corner are its display colour, which its material reads; Montage's USD reader reads its
-        // triangles back.
+        // camera at each of the solve's frames: the middle of its faces at the median depth of the solve's points in
+        // front of the solved camera, the title in proportion (every distance between its corners the same multiple of
+        // the one in its own space), and every corner, of its faces and its sides, where its own camera and its clip's
+        // transform show it (within 1e-3 px), through the same lens and through another, mirrored or not, turning or
+        // with a letter rolling. Its front faces point toward the camera. Its colours corner by corner are its display
+        // colour, which its material reads; Montage's USD reader and tinyusdz read it back.
         const int W = 320, H = 180;
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -43147,17 +43147,48 @@ private slots:
             u = cam.screen[0] * q[0] / q[2] + cam.screen[1] * q[1] / q[2] + cam.screen[2];
             v = cam.screen[3] * q[0] / q[2] + cam.screen[4] * q[1] / q[2] + cam.screen[5];
         };
-        auto solvedCamera = [&](const CameraSolve& solve) {
+        auto solvedCameraAt = [&](const CameraSolve& solve, size_t f) {
             ModelCamera c;
-            std::copy(solve.cameras[0].R.begin(), solve.cameras[0].R.end(), c.R.begin());
-            c.C = {solve.cameras[0].C.x, solve.cameras[0].C.y, solve.cameras[0].C.z};
+            std::copy(solve.cameras[f].R.begin(), solve.cameras[f].R.end(), c.R.begin());
+            c.C = {solve.cameras[f].C.x, solve.cameras[f].C.y, solve.cameras[f].C.z};
             c.screen = {solve.focal, 0, W / 2.0, 0, solve.focal, H / 2.0};
             return c;
         };
         auto at = [](const std::vector<float>& v, size_t i) { return std::array<double, 3>{v[i * 3], v[i * 3 + 1], v[i * 3 + 2]}; };
         auto ownAt = [&](size_t i) { return at(own.triangles.positions, own.triangles.indices[i]); };
+        // Corner v of the exported mesh in the scene at its sample f: its points there (or throughout) through its
+        // transform there (row vectors).
+        auto sceneAt = [&](const SolvedSceneMesh& mesh, size_t f, size_t v) {
+            const std::array<double, 3> q = at(mesh.pointSamples.empty() ? mesh.positions : mesh.pointSamples.at(f).second, v);
+            const std::array<double, 16>& M = mesh.motion.at(f).second;
+            return std::array<double, 3>{q[0] * M[0] + q[1] * M[4] + q[2] * M[8] + M[12], q[0] * M[1] + q[1] * M[5] + q[2] * M[9] + M[13],
+                                         q[0] * M[2] + q[1] * M[6] + q[2] * M[10] + M[14]};
+        };
+        // How far the exported corners are, at every sample, from where the title's own camera and its clip's
+        // transform show them at that frame through the solved camera there (faces and sides apart).
+        auto offAtEveryFrame = [&](const CameraSolve& solve, const SolvedSceneMesh& mesh, const Clip& t, double& faces, double& sides) {
+            faces = sides = 0;
+            if (mesh.motion.size() != 10) return false;
+            for (size_t f = 0; f < 10; ++f) {
+                if (mesh.motion[f].first != double(f)) return false;
+                Title3DMesh here;
+                if (!title3dMesh(t.generator, double(f), W, H, 10, 25, here) || here.triangles.indices.size() != mesh.indices.size()) return false;
+                const ModelCamera cam = solvedCameraAt(solve, f);
+                for (size_t i = 0; i < mesh.indices.size(); ++i) {
+                    double u0, v0, z0, u1, v1, z1, x, y;
+                    picture(here.camera, at(here.triangles.positions, here.triangles.indices[i]), u0, v0, z0);
+                    if (!clipFrameToSequence(p, s, s.videoTracks[1].clips[0], FrameTime(f), u0 / W, v0 / H, x, y)) return false;
+                    picture(cam, sceneAt(mesh, f, i), u1, v1, z1);
+                    if (!(z1 > 0)) return false;
+                    double& worst = here.onFace.at(i / 3) ? faces : sides;
+                    worst = std::max(worst, std::hypot(u1 - x, v1 - y));
+                }
+            }
+            return true;
+        };
 
-        // ---- Through a solved camera with the title's own lens: every corner where its own camera shows it.
+        // ---- Through a solved camera with the title's own lens: every corner where its own camera shows it, at every
+        // frame of the moving camera, the title's place its transform's time samples alone.
         const CameraSolve solve = solveWith(lens);
         SolvedSceneMesh m;
         QVERIFY(placed(solve, title, m));
@@ -43165,26 +43196,46 @@ private slots:
         QCOMPARE(m.positions.size(), m.indices.size() * 3);
         QCOMPARE(m.colors.size(), m.positions.size());
         QCOMPARE(m.name, std::string("Hello"));
-        const ModelCamera sc = solvedCamera(solve);
+        QCOMPARE(m.motion.size(), size_t(10));
+        QVERIFY(m.pointSamples.empty() && m.normalSamples.empty());
         double worst = 0, lo = 1e300, hi = 0;
         for (size_t i = 0; i < m.indices.size(); ++i) {
-            double u0, v0, z0, u1, v1, z1;
-            picture(own.camera, ownAt(i), u0, v0, z0);
-            picture(sc, at(m.positions, m.indices[i]), u1, v1, z1);
-            QVERIFY(z1 > 0);
-            worst = std::max(worst, std::hypot(u1 - u0, v1 - v0));
+            QCOMPARE(m.indices[i], uint32_t(i));
             // (in proportion: distances to the first corner)
-            const std::array<double, 3> a = ownAt(0), b = ownAt(i), A = at(m.positions, m.indices[0]), B = at(m.positions, m.indices[i]);
+            const std::array<double, 3> a = ownAt(0), b = ownAt(i), A = sceneAt(m, 0, 0), B = sceneAt(m, 0, i);
             const double d0 = std::hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]), d1 = std::hypot(B[0] - A[0], B[1] - A[1], B[2] - A[2]);
             if (d0 > 1) lo = std::min(lo, d1 / d0), hi = std::max(hi, d1 / d0);
             for (size_t k = 0; k < 3; ++k) QCOMPARE(m.colors[i * 3 + k], own.triangles.colors[own.triangles.indices[i] * 4 + k]);
+        }
+        {
+            double faces, sides;
+            QVERIFY(offAtEveryFrame(solve, m, title, faces, sides));
+            worst = std::max(faces, sides);
         }
         qInfo("a 3D title in a solved scene: its corners %.2g px from where its own camera shows them, %.6g to %.6g scene units a pixel of its own",
               worst, lo, hi);
         QVERIFY(worst < 1e-3);
         QVERIFY(hi - lo < 1e-6 * hi);
+        // Its front faces point toward the solved camera, by the turn of their corners.
+        auto facesToward = [&](const SolvedSceneMesh& mesh, const Title3DMesh& alone, const ModelCamera& cam, size_t f) {
+            int toward = 0, away = 0;
+            for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+                if (!alone.onFace.at(t / 3)) continue;
+                const std::array<double, 3> A = sceneAt(mesh, f, mesh.indices[t]), B = sceneAt(mesh, f, mesh.indices[t + 1]), C = sceneAt(mesh, f, mesh.indices[t + 2]);
+                const double e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]}, e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+                const double n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                const double d = n[0] * (cam.C[0] - A[0]) + n[1] * (cam.C[1] - A[1]) + n[2] * (cam.C[2] - A[2]);
+                (d > 0 ? toward : away) += 1;
+            }
+            return std::pair<int, int>{toward, away};
+        };
+        {
+            const auto [toward, away] = facesToward(m, own, solvedCameraAt(solve, 0), 0);
+            QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1 toward, %2 away").arg(toward).arg(away)));
+        }
         // The middle of its faces at the points' median depth in front of the solved camera: as far in front of it as
         // that middle is in front of its own camera, times the scale it was placed at.
+        const ModelCamera sc = solvedCameraAt(solve, 0);
         {
             std::vector<double> depths;
             for (const SolvedPoint& pt : solve.points) {
@@ -43205,7 +43256,8 @@ private slots:
             qInfo("its middle %.6g in front of the solved camera, the points' median %.6g", ownDepth * lo, median);
             QVERIFY(std::fabs(ownDepth * lo - median) < 1e-5 * median);
         }
-        // Written to USD: the mesh with its display colour, read by its material, and its triangles read back.
+        // Written to USD: the mesh with its display colour, read by its material, its transform's time samples, and
+        // its triangles read back.
         {
             const std::string file = (dir.path() + "/titled.usda").toStdString();
             std::string err;
@@ -43216,6 +43268,8 @@ private slots:
             QVERIFY(prim && prim->attribute("primvars:displayColor") && prim->attribute("points"));
             QCOMPARE(prim->attribute("primvars:displayColor")->value.numbers.size(), m.colors.size());
             QCOMPARE(prim->attribute("points")->value.numbers.size(), m.positions.size());
+            QVERIFY(!prim->attribute("points")->animated());
+            QVERIFY(prim->attribute("xformOp:transform") && prim->attribute("xformOp:transform")->samples.size() == 10);
             const auto* reader = stage.prim("/Solve/Looks/Title_1/Colours");
             QVERIFY(reader && reader->attribute("inputs:varname") && reader->attribute("inputs:varname")->value.text(0) == "displayColor");
             Model model;
@@ -43225,35 +43279,154 @@ private slots:
         }
 
         // ---- The title square on, through its clip's transform (scaled to half and moved 40 px right, 20 up) and a
-        // solved camera with a lens half as long: every corner of its faces where the picture shows it (the sides,
-        // further back, as near as the other lens shows them).
+        // solved camera with a lens half as long: every corner, of its faces and its sides, where the picture shows it.
+        Clip moved = title;
+        moved.generator.params["rot_x"] = Param(0.0), moved.generator.params["rot_y"] = Param(0.0);
+        moved.motion.params["scale"] = Param(50.0);
+        moved.motion.params["pos_x"] = Param(40.0), moved.motion.params["pos_y"] = Param(-20.0);
+        const CameraSolve half = solveWith(lens / 2);
         {
-            Clip moved = title;
-            moved.generator.params["rot_x"] = Param(0.0), moved.generator.params["rot_y"] = Param(0.0);
-            moved.motion.params["scale"] = Param(50.0);
-            moved.motion.params["pos_x"] = Param(40.0), moved.motion.params["pos_y"] = Param(-20.0);
             Title3DMesh square;
             QVERIFY(title3dMesh(moved.generator, 0, W, H, 10, 25, square));
-            const CameraSolve half = solveWith(lens / 2);
             SolvedSceneMesh mm;
             QVERIFY(placed(half, moved, mm));
             QCOMPARE(mm.indices.size(), square.triangles.indices.size());
-            const ModelCamera hc = solvedCamera(half);
+            QCOMPARE(mm.pointSamples.size(), mm.normalSamples.size());
+            QVERIFY(mm.pointSamples.empty() || mm.pointSamples.size() == 10);
             double faces = 0, sides = 0;
-            int onFaces = 0;
-            for (size_t i = 0; i < mm.indices.size(); ++i) {
-                double u0, v0, z0, u1, v1, z1, x, y;
-                picture(square.camera, at(square.triangles.positions, square.triangles.indices[i]), u0, v0, z0);
-                QVERIFY(clipFrameToSequence(p, s, s.videoTracks[1].clips[0], 0, u0 / W, v0 / H, x, y));
-                picture(hc, at(mm.positions, mm.indices[i]), u1, v1, z1);
-                double& worstHere = square.onFace.at(i / 3) ? faces : sides;
-                worstHere = std::max(worstHere, std::hypot(u1 - x, v1 - y));
-                onFaces += square.onFace[i / 3];
-            }
+            QVERIFY(offAtEveryFrame(half, mm, moved, faces, sides));
             qInfo("through its transform and half the lens: its faces' corners %.2g px off, its sides' %.2g", faces, sides);
-            QVERIFY(onFaces > 30);
             QVERIFY(faces < 1e-3);
-            QVERIFY(sides < 5);
+            QVERIFY(sides < 1e-3);
+        }
+
+        // ---- Mirrored (flipped across), through half the lens and the 50 % scale: its corners where the picture shows
+        // them and its faces still toward the camera, its triangles turned round.
+        {
+            Clip mirrored = moved;
+            mirrored.generator.params["rot_y"] = Param(20.0);
+            mirrored.motion.params["flip_h"] = Param(1.0);
+            Title3DMesh alone;
+            QVERIFY(title3dMesh(mirrored.generator, 0, W, H, 10, 25, alone));
+            SolvedSceneMesh mm;
+            QVERIFY(placed(half, mirrored, mm));
+            double faces = 0, sides = 0;
+            QVERIFY(offAtEveryFrame(half, mm, mirrored, faces, sides));
+            qInfo("mirrored: its faces' corners %.2g px off, its sides' %.2g", faces, sides);
+            QVERIFY(faces < 1e-3 && sides < 1e-3);
+            QCOMPARE(mm.indices[1], uint32_t(2));
+            const auto [toward, away] = facesToward(mm, alone, solvedCameraAt(half, 0), 0);
+            QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1 toward, %2 away").arg(toward).arg(away)));
+            // (its normals follow: each front face's normal toward the camera too)
+            int normalsToward = 0;
+            for (size_t i = 0; i < mm.indices.size(); ++i)
+                if (alone.onFace.at(i / 3)) {
+                    const std::array<double, 3> N = at(mm.pointSamples.empty() ? mm.normals : mm.normalSamples[0].second, i);
+                    const std::array<double, 16>& M = mm.motion[0].second;
+                    const double n[3] = {N[0] * M[0] + N[1] * M[4] + N[2] * M[8], N[0] * M[1] + N[1] * M[5] + N[2] * M[9], N[0] * M[2] + N[1] * M[6] + N[2] * M[10]};
+                    const std::array<double, 3> X = sceneAt(mm, 0, i);
+                    const ModelCamera cam = solvedCameraAt(half, 0);
+                    normalsToward += n[0] * (cam.C[0] - X[0]) + n[1] * (cam.C[1] - X[1]) + n[2] * (cam.C[2] - X[2]) > 0;
+                }
+            QCOMPARE(normalsToward, toward * 3);
+        }
+
+        // ---- A title turning a quarter over its ten frames, through the title's own lens: its transform's time
+        // samples carry it (its points the same at every frame), every corner at each frame within 1e-3 px of where its
+        // camera puts it, as Montage's USD reader and tinyusdz read it back.
+        {
+            Clip turning = title;
+            Param turn;
+            turn.addKey(0, 0.0);
+            turn.addKey(9, 90.0);
+            turning.generator.params["rot_y"] = turn;
+            SolvedSceneMesh mt;
+            QVERIFY(placed(solve, turning, mt));
+            QVERIFY(mt.pointSamples.empty());
+            double faces = 0, sides = 0;
+            QVERIFY(offAtEveryFrame(solve, mt, turning, faces, sides));
+            qInfo("turning: its corners %.2g px off at worst over its ten frames", std::max(faces, sides));
+            QVERIFY(faces < 1e-3 && sides < 1e-3);
+            // (and a letter of it rolling: its points written at every frame, still exact)
+            Clip rolling = title;
+            rolling.generator.strings["text"] = "HiH";
+            const int k = addTextAnimator(rolling.generator);
+            const std::string pre = "ta" + std::to_string(k) + ".";
+            rolling.generator.params[pre + "start"] = Param(34.0), rolling.generator.params[pre + "end"] = Param(66.0);
+            // (rolled at every frame, so its letter is a solid of its own throughout: a frame whose triangles differ
+            // from the first's is held from the one before)
+            Param roll;
+            roll.addKey(0, 10.0);
+            roll.addKey(9, 100.0);
+            rolling.generator.params[pre + "rotation"] = roll;
+            SolvedSceneMesh mr;
+            QVERIFY(placed(solve, rolling, mr));
+            QCOMPARE(mr.pointSamples.size(), size_t(10));
+            QVERIFY(offAtEveryFrame(solve, mr, rolling, faces, sides));
+            qInfo("a letter rolling: its corners %.2g px off at worst", std::max(faces, sides));
+            QVERIFY(faces < 1e-3 && sides < 1e-3);
+            // Read back from USD at each frame.
+            const QByteArray tinyusdz = qgetenv("MONTAGE_TEST_TINYUSDZ");
+            if (tinyusdz.isEmpty()) qInfo("MONTAGE_TEST_TINYUSDZ is not set: tinyusdz's read-back is left out");
+            for (const SolvedSceneMesh* mesh : {&mt, &mr}) {
+                const Clip& t = mesh == &mt ? turning : rolling;
+                const std::string file = (dir.path() + (mesh == &mt ? "/turning.usda" : "/rolling.usda")).toStdString();
+                std::string err;
+                QVERIFY2(writeSolveUsda(solve, file, {*mesh}, &err), err.c_str());
+                // Where the picture shows each corner at frame f, and the nearest of them to a point read back.
+                auto nearest = [&](size_t f, const std::array<double, 3>& X) {
+                    Title3DMesh here;
+                    if (!title3dMesh(t.generator, double(f), W, H, 10, 25, here)) return 1e300;
+                    const ModelCamera cam = solvedCameraAt(solve, f);
+                    double u1, v1, z1, best = 1e300;
+                    picture(cam, X, u1, v1, z1);
+                    if (!(z1 > 0)) return 1e300;
+                    for (size_t i = 0; i < here.triangles.indices.size(); ++i) {
+                        double u0, v0, z0;
+                        picture(here.camera, at(here.triangles.positions, here.triangles.indices[i]), u0, v0, z0);
+                        best = std::min(best, std::hypot(u1 - u0, v1 - v0));
+                    }
+                    return best;
+                };
+                usd::Stage stage;
+                QVERIFY2(usd::openStage(file, stage, &err), err.c_str());
+                const auto* prim = stage.prim("/Solve/Models/Title_1");
+                QVERIFY(prim && prim->attribute("points") && prim->attribute("xformOp:transform"));
+                QCOMPARE(prim->attribute("points")->animated(), mesh == &mr);
+                double off = 0;
+                for (size_t f = 0; f < 10; f += 3) {
+                    const usd::Value M = prim->attribute("xformOp:transform")->at(double(f)), P = prim->attribute("points")->at(double(f));
+                    QCOMPARE(P.numbers.size(), mesh->positions.size());
+                    for (size_t i = 0; i + 2 < P.numbers.size(); i += 3) {
+                        const double q[3] = {P.numbers[i], P.numbers[i + 1], P.numbers[i + 2]};
+                        std::array<double, 3> X;
+                        for (size_t c = 0; c < 3; ++c) X[c] = q[0] * M.number(c) + q[1] * M.number(4 + c) + q[2] * M.number(8 + c) + M.number(12 + c);
+                        off = std::max(off, nearest(f, X));
+                    }
+                }
+                qInfo("%s read back by Montage: %.2g px off", file.c_str(), off);
+                QVERIFY(off < 1e-3);
+                if (tinyusdz.isEmpty()) continue;
+                QProcess run;
+                run.start(QString::fromLocal8Bit(tinyusdz), {QString::fromStdString(file), dir.path(), "0", "3", "6", "9"});
+                QVERIFY(run.waitForFinished(120000));
+                const QString said = QString::fromLocal8Bit(run.readAllStandardOutput());
+                QVERIFY2(run.exitCode() == 0, qPrintable(said + QString::fromLocal8Bit(run.readAllStandardError())));
+                int frames = 0;
+                off = 0;
+                for (const QString& line : said.split('\n', Qt::SkipEmptyParts)) {
+                    const QStringList w = line.split(' ', Qt::SkipEmptyParts);
+                    if (w.size() < 4 || w[0] != "points" || w[1] != "Title_1") continue;
+                    const size_t f = size_t(w[2].toInt()), n = size_t(w[3].toInt());
+                    QVERIFY(n > 30 && size_t(w.size()) == 4 + n * 3);
+                    for (size_t i = 0; i < n; ++i)
+                        off = std::max(off, nearest(f, {w[int(4 + i * 3)].toDouble(), w[int(5 + i * 3)].toDouble(), w[int(6 + i * 3)].toDouble()}));
+                    ++frames;
+                }
+                qInfo("%s read back by tinyusdz: %.2g px off", file.c_str(), off);
+                QCOMPARE(frames, 4);
+                QVERIFY(off < 1e-3);
+            }
         }
         for (Track& t : s.videoTracks) t.clips.clear();
     }

@@ -13,6 +13,7 @@
 
 #include "media/CameraSolve.h"
 #include "core/Expression.h"
+#include "core/LinearSolve.h"
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
 #include "render/Layer3D.h"
@@ -936,106 +937,246 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             m.indices = tr.indices;
             out.push_back(std::move(m));
         }
-    // The 3D titles over that footage (seen through their own cameras), each as it stands at its clip's first frame,
-    // placed in the solved scene by its own camera: the middle of its letters' faces where the picture shows it
-    // (through the clip's transform) at the median depth of the solve's points in front of the solved camera there,
-    // and the whole title scaled, turned about the view and moved with it in proportion. Through the solved camera at
-    // that frame, what lies as deep as that middle (a face square on) is where its own camera shows it, and the rest
-    // as near as one lens can show what another did (exactly, through the same lens with no transform).
+    // The 3D titles over that footage (seen through their own cameras), at each of the solve's frames they play over.
+    // Each corner is placed on the solved camera's ray through where the picture shows it (the title's own camera,
+    // then its clip's transform), at the median depth of the solve's points in front of the solved camera there, as
+    // much nearer or further than the middle of its letters' faces as it is in the title's own space, times the scale
+    // the title is placed at; so through any lens and any transform every corner is where the picture shows it, and
+    // through the same lens with no transform the title is in proportion. Its place at each frame is its transform's
+    // time samples (the turn, scale and move that best carry its first frame's corners to that frame's); where that
+    // leaves a corner more than 1e-4 px from where the picture shows it (its letters animate, or another lens bends
+    // it), its points and normals are written at every frame too. A mirrored transform turns its triangles round, so
+    // its faces stay outward.
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
         for (const Clip& c : seq.videoTracks[ti].clips) {
             if (!c.enabled || !c.isGenerator() || c.generator.type != "title3d" || !c.generator.s("camera_file").empty()) continue;
             if (cameraTrackOf(seq, ti, c.generator, 0, c.start) != int(track) || clipOn(seq.videoTracks[track], c.start) != &footage) continue;
             const std::shared_ptr<const CameraSolve> solve = parsedSolve(footage);
-            Title3DMesh mesh;
-            ModelCamera sc;
-            double groundY = 0;
-            bool onGround = false;
-            if (!solve || !title3dMesh(c.generator, 0, seq.width, seq.height, c.duration, seq.fpsValue(), mesh) ||
-                !clipCamera(p, seq, c, c.generator, c.start, 1, int(ti), 1, sc, groundY, onGround, nullptr))
-                continue;
-            const ModelCamera& tc = mesh.camera;
+            if (!solve) continue;
             auto inCamera = [](const ModelCamera& cam, double x, double y, double z) {
                 const double d[3] = {x - cam.C[0], y - cam.C[1], z - cam.C[2]};
                 return std::array<double, 3>{cam.R[0] * d[0] + cam.R[1] * d[1] + cam.R[2] * d[2], cam.R[3] * d[0] + cam.R[4] * d[1] + cam.R[5] * d[2],
                                              cam.R[6] * d[0] + cam.R[7] * d[1] + cam.R[8] * d[2]};
             };
-            // (the middle of its faces' box: of the whole title's where it has no faces)
-            const PosedTriangles& tr = mesh.triangles;
-            std::array<double, 3> lo{1e300, 1e300, 1e300}, hi{-1e300, -1e300, -1e300};
-            const bool faces = std::find(mesh.onFace.begin(), mesh.onFace.end(), 1) != mesh.onFace.end();
-            for (size_t i = 0; i < tr.indices.size(); ++i)
-                if (!faces || (i / 3 < mesh.onFace.size() && mesh.onFace[i / 3]))
-                    for (size_t a = 0; a < 3; ++a)
-                        lo[a] = std::min(lo[a], double(tr.positions[tr.indices[i] * 3 + a])), hi[a] = std::max(hi[a], double(tr.positions[tr.indices[i] * 3 + a]));
-            if (!(lo[0] <= hi[0])) continue;
-            const std::array<double, 3> qm = inCamera(tc, (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2);
-            if (!(qm[2] > 0)) continue;
-            const double u = tc.screen[0] * qm[0] / qm[2] + tc.screen[1] * qm[1] / qm[2] + tc.screen[2];
-            const double v = tc.screen[3] * qm[0] / qm[2] + tc.screen[4] * qm[1] / qm[2] + tc.screen[5];
-            // Where the clip's transform puts that point, and how it scales and turns the picture there.
-            const double W = seq.width, H = seq.height;
-            double U, V, Ux, Uy, Vx, Vy;
-            if (!clipFrameToSequence(p, seq, c, c.start, u / W, v / H, U, V) || !clipFrameToSequence(p, seq, c, c.start, (u + 1) / W, v / H, Ux, Uy) ||
-                !clipFrameToSequence(p, seq, c, c.start, u / W, (v + 1) / H, Vx, Vy))
-                continue;
-            const double ax = Ux - U, ay = Uy - V, bx = Vx - U, by = Vy - V;
-            const double grow = std::sqrt(std::fabs(ax * by - ay * bx)), turn = std::atan2(ay, ax);
-            const double cr = std::cos(turn), sr = std::sin(turn);
-            // That point seen through the solved camera, at the median depth of the solve's points in front of it.
-            const std::array<double, 6>& S = sc.screen;
-            const double det = S[0] * S[4] - S[1] * S[3];
-            if (!(std::fabs(det) > 0) || !(grow > 0)) continue;
-            const double xs = ((U - S[2]) * S[4] - (V - S[5]) * S[1]) / det, ys = ((V - S[5]) * S[0] - (U - S[2]) * S[3]) / det;
-            std::vector<double> depths;
-            for (const auto& pt : solve->points)
-                if (const double z = inCamera(sc, pt.X.x, pt.X.y, pt.X.z)[2]; z > 0) depths.push_back(z);
-            double D = 1;
-            if (!depths.empty()) {
-                std::sort(depths.begin(), depths.end());
-                const size_t n = depths.size();
-                D = n % 2 ? depths[n / 2] : (depths[n / 2 - 1] + depths[n / 2]) / 2;
-            }
-            // (scene units a unit of the title's space: a unit at its middle's depth spans as many pixels as one of the
-            // solved scene's does at D)
-            const double ft = std::sqrt(std::fabs(tc.screen[0] * tc.screen[4] - tc.screen[1] * tc.screen[3]));
-            const double k = grow * ft * D / (qm[2] * std::sqrt(std::fabs(det)));
-            auto toScene = [&](const std::array<double, 3>& q, bool direction) {
-                const double dx = direction ? q[0] : q[0] - qm[0], dy = direction ? q[1] : q[1] - qm[1], dz = direction ? q[2] : q[2] - qm[2];
-                const double s = direction ? 1 : k;
-                const std::array<double, 3> qs{(direction ? 0 : D * xs) + s * (dx * cr - dy * sr), (direction ? 0 : D * ys) + s * (dx * sr + dy * cr),
-                                               (direction ? 0 : D) + s * dz};
-                std::array<double, 3> X{sc.R[0] * qs[0] + sc.R[3] * qs[1] + sc.R[6] * qs[2], sc.R[1] * qs[0] + sc.R[4] * qs[1] + sc.R[7] * qs[2],
-                                        sc.R[2] * qs[0] + sc.R[5] * qs[1] + sc.R[8] * qs[2]};
-                if (!direction)
-                    for (int a = 0; a < 3; ++a) X[size_t(a)] += sc.C[size_t(a)];
-                return X;
+            auto onScreen = [](const ModelCamera& cam, const std::array<double, 3>& q, double& u, double& v) {
+                u = cam.screen[0] * q[0] / q[2] + cam.screen[1] * q[1] / q[2] + cam.screen[2];
+                v = cam.screen[3] * q[0] / q[2] + cam.screen[4] * q[1] / q[2] + cam.screen[5];
             };
+            // One frame of it: each corner (in the order of its triangles' corners) and its normal in the scene, the
+            // solved camera there, and whether the picture is mirrored.
+            struct Placed {
+                double tc = 0;
+                std::vector<double> X, N;
+                ModelCamera sc;
+                bool mirrored = false;
+            };
+            Title3DMesh first;
+            auto placeAt = [&](FrameTime t, Placed& out, Title3DMesh& mesh) {
+                ModelCamera& sc = out.sc;
+                double groundY = 0;
+                bool onGround = false;
+                if (!title3dMesh(c.generator, double(t - c.start), seq.width, seq.height, c.duration, seq.fpsValue(), mesh) ||
+                    !clipCamera(p, seq, c, c.generator, t, 1, int(ti), 1, sc, groundY, onGround, nullptr))
+                    return false;
+                const ModelCamera& tc = mesh.camera;
+                // (the middle of its faces' box: of the whole title's where it has no faces)
+                const PosedTriangles& tr = mesh.triangles;
+                std::array<double, 3> lo{1e300, 1e300, 1e300}, hi{-1e300, -1e300, -1e300};
+                const bool faces = std::find(mesh.onFace.begin(), mesh.onFace.end(), 1) != mesh.onFace.end();
+                for (size_t i = 0; i < tr.indices.size(); ++i)
+                    if (!faces || (i / 3 < mesh.onFace.size() && mesh.onFace[i / 3]))
+                        for (size_t a = 0; a < 3; ++a)
+                            lo[a] = std::min(lo[a], double(tr.positions[tr.indices[i] * 3 + a])), hi[a] = std::max(hi[a], double(tr.positions[tr.indices[i] * 3 + a]));
+                if (!(lo[0] <= hi[0])) return false;
+                const std::array<double, 3> qm = inCamera(tc, (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2);
+                if (!(qm[2] > 0)) return false;
+                double u0, v0;
+                onScreen(tc, qm, u0, v0);
+                // The clip's transform (an affine map of its picture) about that point.
+                const double W = seq.width, H = seq.height;
+                double U0, V0, Ux, Uy, Vx, Vy;
+                if (!clipFrameToSequence(p, seq, c, t, u0 / W, v0 / H, U0, V0) || !clipFrameToSequence(p, seq, c, t, (u0 + 1) / W, v0 / H, Ux, Uy) ||
+                    !clipFrameToSequence(p, seq, c, t, u0 / W, (v0 + 1) / H, Vx, Vy))
+                    return false;
+                const double ax = Ux - U0, ay = Uy - V0, bx = Vx - U0, by = Vy - V0;
+                const double grow = std::sqrt(std::fabs(ax * by - ay * bx));
+                const std::array<double, 6>& S = sc.screen;
+                const double det = S[0] * S[4] - S[1] * S[3];
+                if (!(std::fabs(det) > 0) || !(grow > 0)) return false;
+                std::vector<double> depths;
+                for (const auto& pt : solve->points)
+                    if (const double z = inCamera(sc, pt.X.x, pt.X.y, pt.X.z)[2]; z > 0) depths.push_back(z);
+                double D = 1;
+                if (!depths.empty()) {
+                    std::sort(depths.begin(), depths.end());
+                    const size_t n = depths.size();
+                    D = n % 2 ? depths[n / 2] : (depths[n / 2 - 1] + depths[n / 2]) / 2;
+                }
+                // (scene units a unit of the title's space: a unit at its middle's depth spans as many pixels as one of
+                // the solved scene's does at D)
+                const double ft = std::sqrt(std::fabs(tc.screen[0] * tc.screen[4] - tc.screen[1] * tc.screen[3]));
+                const double k = grow * ft * D / (qm[2] * std::sqrt(std::fabs(det)));
+                // A point of the title's camera space into the scene.
+                auto map = [&](const std::array<double, 3>& q) {
+                    double u, v;
+                    onScreen(tc, q, u, v);
+                    const double U = U0 + ax * (u - u0) + bx * (v - v0) - S[2], V = V0 + ay * (u - u0) + by * (v - v0) - S[5];
+                    const double xs = (U * S[4] - V * S[1]) / det, ys = (V * S[0] - U * S[3]) / det;
+                    const double d = D + k * (q[2] - qm[2]);
+                    const double qs[3] = {d * xs, d * ys, d};
+                    return std::array<double, 3>{sc.C[0] + sc.R[0] * qs[0] + sc.R[3] * qs[1] + sc.R[6] * qs[2],
+                                                 sc.C[1] + sc.R[1] * qs[0] + sc.R[4] * qs[1] + sc.R[7] * qs[2],
+                                                 sc.C[2] + sc.R[2] * qs[0] + sc.R[5] * qs[1] + sc.R[8] * qs[2]};
+                };
+                // Normals through the map's own derivative about the middle (its inverse transpose), so a mirrored or
+                // stretched title's normals stay square to its faces.
+                double J[9];
+                const double hstep = 1e-4 * qm[2];
+                for (int a = 0; a < 3; ++a) {
+                    std::array<double, 3> qa = qm, qb = qm;
+                    qa[size_t(a)] += hstep, qb[size_t(a)] -= hstep;
+                    const std::array<double, 3> A = map(qa), B = map(qb);
+                    for (int r = 0; r < 3; ++r) J[r * 3 + a] = (A[size_t(r)] - B[size_t(r)]) / (2 * hstep);
+                }
+                const double cof[9] = {J[4] * J[8] - J[5] * J[7], J[5] * J[6] - J[3] * J[8], J[3] * J[7] - J[4] * J[6],
+                                       J[2] * J[7] - J[1] * J[8], J[0] * J[8] - J[2] * J[6], J[1] * J[6] - J[0] * J[7],
+                                       J[1] * J[5] - J[2] * J[4], J[2] * J[3] - J[0] * J[5], J[0] * J[4] - J[1] * J[3]};
+                const double detJ = J[0] * cof[0] + J[1] * cof[1] + J[2] * cof[2];
+                if (!(std::fabs(detJ) > 0)) return false;
+                out.mirrored = detJ < 0;
+                out.X.clear(), out.N.clear();
+                out.X.reserve(tr.indices.size() * 3), out.N.reserve(tr.indices.size() * 3);
+                for (size_t i = 0; i < tr.indices.size(); ++i) {
+                    const size_t vi = tr.indices[i];
+                    const std::array<double, 3> X = map(inCamera(tc, tr.positions[vi * 3], tr.positions[vi * 3 + 1], tr.positions[vi * 3 + 2]));
+                    const double n[3] = {tc.R[0] * tr.normals[vi * 3] + tc.R[1] * tr.normals[vi * 3 + 1] + tc.R[2] * tr.normals[vi * 3 + 2],
+                                         tc.R[3] * tr.normals[vi * 3] + tc.R[4] * tr.normals[vi * 3 + 1] + tc.R[5] * tr.normals[vi * 3 + 2],
+                                         tc.R[6] * tr.normals[vi * 3] + tc.R[7] * tr.normals[vi * 3 + 1] + tc.R[8] * tr.normals[vi * 3 + 2]};
+                    // (J's inverse transpose is its cofactors over its determinant)
+                    double N[3];
+                    for (int r = 0; r < 3; ++r) N[r] = (cof[r * 3] * n[0] + cof[r * 3 + 1] * n[1] + cof[r * 3 + 2] * n[2]) / detJ;
+                    const double len = std::hypot(N[0], N[1], N[2]);
+                    for (int a = 0; a < 3; ++a) {
+                        out.X.push_back(X[size_t(a)]);
+                        out.N.push_back(len > 0 ? N[a] / len : 0);
+                    }
+                }
+                return true;
+            };
+            std::vector<Placed> frames;
+            const FrameTime from = std::max(c.start, footage.start), to = std::min(c.end(), footage.end());
+            for (FrameTime t = from; t < to; ++t) {
+                const int frame = cameraSolveFrame(seq, footage, *solve, t - footage.start);
+                if (frame < 0 || (!frames.empty() && frames.back().tc >= frame)) continue;
+                Placed f;
+                Title3DMesh mesh;
+                // (a frame where it shows nothing, or other triangles than at the first, is held from the one before)
+                if (!placeAt(t, f, mesh) || (!frames.empty() && f.X.size() != frames.front().X.size())) continue;
+                f.tc = frame;
+                if (frames.empty()) first = std::move(mesh);
+                frames.push_back(std::move(f));
+            }
+            if (frames.empty()) continue;
+            const PosedTriangles& tr = first.triangles;
+            const size_t nv = frames.front().X.size() / 3;
+            if (nv == 0) continue;
             SolvedSceneMesh m;
             m.title = true;
             m.name = c.name.empty() ? c.generator.s("text") : c.name;
             m.doubleSided = true;
-            if (mesh.model && !mesh.model->materials.empty()) m.roughness = mesh.model->materials[0].roughness, m.metallic = mesh.model->materials[0].metallic;
+            if (first.model && !first.model->materials.empty()) m.roughness = first.model->materials[0].roughness, m.metallic = first.model->materials[0].metallic;
+            // Its own space: the scene's at its first frame, about the middle of its corners there.
+            const Placed& f0 = frames.front();
+            double c0[3] = {0, 0, 0};
+            for (size_t i = 0; i < nv; ++i)
+                for (int a = 0; a < 3; ++a) c0[a] += f0.X[i * 3 + size_t(a)] / double(nv);
+            std::vector<double> P(nv * 3);
+            double pp = 0;
+            for (size_t i = 0; i < nv * 3; ++i) P[i] = f0.X[i] - c0[i % 3], pp += P[i] * P[i];
             double sum[3] = {0, 0, 0};
-            for (size_t i = 0; i < tr.indices.size(); ++i) {
+            for (size_t i = 0; i < nv; ++i) {
+                m.indices.push_back(uint32_t(i));
                 const size_t vi = tr.indices[i];
-                const std::array<double, 3> X = toScene(inCamera(tc, tr.positions[vi * 3], tr.positions[vi * 3 + 1], tr.positions[vi * 3 + 2]), false);
-                const std::array<double, 3> nc{tc.R[0] * tr.normals[vi * 3] + tc.R[1] * tr.normals[vi * 3 + 1] + tc.R[2] * tr.normals[vi * 3 + 2],
-                                               tc.R[3] * tr.normals[vi * 3] + tc.R[4] * tr.normals[vi * 3 + 1] + tc.R[5] * tr.normals[vi * 3 + 2],
-                                               tc.R[6] * tr.normals[vi * 3] + tc.R[7] * tr.normals[vi * 3 + 1] + tc.R[8] * tr.normals[vi * 3 + 2]};
-                const std::array<double, 3> N = toScene(nc, true);
-                m.indices.push_back(uint32_t(m.positions.size() / 3));
                 for (int a = 0; a < 3; ++a) {
-                    m.positions.push_back(float(X[size_t(a)]));
-                    m.normals.push_back(float(N[size_t(a)]));
+                    m.positions.push_back(float(P[i * 3 + size_t(a)]));
+                    m.normals.push_back(float(f0.N[i * 3 + size_t(a)]));
                     const float col = vi * 4 + size_t(a) < tr.colors.size() ? tr.colors[vi * 4 + size_t(a)] : 1.0f;
                     m.colors.push_back(col);
                     sum[a] += col;
                 }
             }
-            if (m.indices.empty()) continue;
-            const double n = double(m.indices.size());
-            m.color = {float(sum[0] / n), float(sum[1] / n), float(sum[2] / n), float(std::clamp(mesh.opacity, 0.0, 1.0))};
+            if (f0.mirrored)
+                for (size_t i = 0; i + 2 < m.indices.size(); i += 3) std::swap(m.indices[i + 1], m.indices[i + 2]);
+            m.color = {float(sum[0] / double(nv)), float(sum[1] / double(nv)), float(sum[2] / double(nv)), float(std::clamp(first.opacity, 0.0, 1.0))};
+            if (!(pp > 0)) continue;
+            // Each frame's transform: the rotation (Horn's, through the quaternion of the largest eigenvalue), scale and
+            // move that best carry the first frame's corners to this frame's.
+            struct Fit {
+                double R[9], s, T[3];
+            };
+            std::vector<Fit> fits;
+            bool exact = true;
+            for (const Placed& f : frames) {
+                Fit fit;
+                for (int a = 0; a < 3; ++a) {
+                    fit.T[a] = 0;
+                    for (size_t i = 0; i < nv; ++i) fit.T[a] += f.X[i * 3 + size_t(a)] / double(nv);
+                }
+                double Sm[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+                for (size_t i = 0; i < nv; ++i)
+                    for (int a = 0; a < 3; ++a)
+                        for (int b = 0; b < 3; ++b) Sm[a * 3 + b] += P[i * 3 + size_t(a)] * (f.X[i * 3 + size_t(b)] - fit.T[b]);
+                const double xx = Sm[0], xy = Sm[1], xz = Sm[2], yx = Sm[3], yy = Sm[4], yz = Sm[5], zx = Sm[6], zy = Sm[7], zz = Sm[8];
+                const std::vector<double> Nm{xx + yy + zz, yz - zy,      zx - xz,       xy - yx,       yz - zy, xx - yy - zz, xy + yx,       zx + xz,
+                                             zx - xz,      xy + yx,      -xx + yy - zz, yz + zy,       xy - yx, zx + xz,      yz + zy,       -xx - yy + zz};
+                std::vector<double> values, vecs;
+                symmetricEigen(Nm, 4, values, vecs);
+                double qw = vecs[3], qx = vecs[7], qy = vecs[11], qz = vecs[15];
+                const double ql = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+                qw /= ql, qx /= ql, qy /= ql, qz /= ql;
+                const double R[9] = {1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz),     2 * (qx * qz + qw * qy),
+                                     2 * (qx * qy + qw * qz),     1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx),
+                                     2 * (qx * qz - qw * qy),     2 * (qy * qz + qw * qx),     1 - 2 * (qx * qx + qy * qy)};
+                std::copy(R, R + 9, fit.R);
+                double yr = 0;
+                for (size_t i = 0; i < nv; ++i)
+                    for (int a = 0; a < 3; ++a)
+                        yr += (f.X[i * 3 + size_t(a)] - fit.T[a]) * (R[a * 3] * P[i * 3] + R[a * 3 + 1] * P[i * 3 + 1] + R[a * 3 + 2] * P[i * 3 + 2]);
+                fit.s = yr / pp;
+                // (how far that leaves each corner from where the picture shows it)
+                for (size_t i = 0; i < nv && exact; ++i) {
+                    std::array<double, 3> Y;
+                    for (int a = 0; a < 3; ++a)
+                        Y[size_t(a)] = fit.T[a] + fit.s * (R[a * 3] * P[i * 3] + R[a * 3 + 1] * P[i * 3 + 1] + R[a * 3 + 2] * P[i * 3 + 2]);
+                    const std::array<double, 3> qa = inCamera(f.sc, Y[0], Y[1], Y[2]), qb = inCamera(f.sc, f.X[i * 3], f.X[i * 3 + 1], f.X[i * 3 + 2]);
+                    double ua, va, ub, vb;
+                    onScreen(f.sc, qa, ua, va);
+                    onScreen(f.sc, qb, ub, vb);
+                    exact = qa[2] > 0 && std::hypot(ua - ub, va - vb) <= 1e-4;
+                }
+                fits.push_back(fit);
+            }
+            for (size_t fi = 0; fi < frames.size(); ++fi) {
+                const Fit& fit = fits[fi];
+                std::array<double, 16> M{};
+                for (int r = 0; r < 3; ++r)
+                    for (int cc = 0; cc < 3; ++cc) M[size_t(r * 4 + cc)] = fit.s * fit.R[cc * 3 + r];
+                M[12] = fit.T[0], M[13] = fit.T[1], M[14] = fit.T[2], M[15] = 1;
+                m.motion.push_back({frames[fi].tc, M});
+                if (exact) continue;
+                // (its corners and normals in its own space at that frame: the transform undone)
+                std::vector<float> pts(nv * 3), nrm(nv * 3);
+                for (size_t i = 0; i < nv; ++i)
+                    for (int a = 0; a < 3; ++a) {
+                        double x = 0, n = 0;
+                        for (int b = 0; b < 3; ++b)
+                            x += fit.R[b * 3 + a] * (frames[fi].X[i * 3 + size_t(b)] - fit.T[b]), n += fit.R[b * 3 + a] * frames[fi].N[i * 3 + size_t(b)];
+                        pts[i * 3 + size_t(a)] = float(x / fit.s);
+                        nrm[i * 3 + size_t(a)] = float(n);
+                    }
+                m.pointSamples.push_back({frames[fi].tc, std::move(pts)});
+                m.normalSamples.push_back({frames[fi].tc, std::move(nrm)});
+            }
             out.push_back(std::move(m));
         }
     return out;
