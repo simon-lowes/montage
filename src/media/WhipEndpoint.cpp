@@ -489,6 +489,14 @@ struct Feed {
     std::deque<std::vector<uint8_t>> out;
     size_t outBytes = 0;
     int64_t packets = 0, lost = 0, dropped = 0;
+    // (the most each holds, for status())
+    size_t mostOut = 0, mostHeld = 0, mostHeldSound = 0, mostTiming = 0;
+    void noteMost() {
+        mostOut = std::max(mostOut, outBytes);
+        mostHeld = std::max(mostHeld, video.heldBytes);
+        mostHeldSound = std::max(mostHeldSound, audio.held.size());
+        mostTiming = std::max(mostTiming, video.origins.size() + audio.origins.size() + audio.came.size() + gaps.size());
+    }
     std::atomic<int> keyframesAsked{0};
     double askedAt = 0;
     // The pictures' RTP times as handed on: moved to stay beside the sound by the sender's reports.
@@ -733,7 +741,11 @@ struct Feed {
         }
         const int64_t ts = s.unwrap(r.ts);
         trace("packet %c ts %lld bytes %zu came %.6f", isVideo ? 'V' : 'A', (long long)ts, n, now);
-        if (!isVideo) note(s.came, now, now - double(ts) / s.clock, 0.2);
+        if (!isVideo) {
+            note(s.came, now, now - double(ts) / s.clock, 0.2);
+            // (only the last kTimingKept seconds' are looked at: a sender that never reports does not grow the list)
+            while (s.came.size() > 1 && s.came.front().first < now - kTimingKept) s.came.pop_front();
+        }
         if (!s.seen || ts > s.lastExt) s.lastExt = ts, s.lastTs = r.ts;
         s.seen = true;
         s.ssrc = r.ssrc;
@@ -777,6 +789,7 @@ struct Feed {
             }
             tryStart(now);
         }
+        noteMost();
         // (a keyframe is asked for once a second at most)
         if (ask && now - askedAt < 1.0) ask = false;
         if (ask) askedAt = now, ++keyframesAsked;
@@ -814,6 +827,7 @@ struct Feed {
                             }
                         placePictures();
                         if (!started) tryStart(now);
+                        noteMost();
                     }
                 }
             }
@@ -1546,6 +1560,11 @@ Status Endpoint::status() const {
         st.lost = feed->lost;
         st.dropped = feed->dropped;
         st.keyframesAsked = feed->keyframesAsked;
+        st.queuedBytes = int64_t(feed->outBytes);
+        st.mostQueuedBytes = int64_t(feed->mostOut);
+        st.mostHeldBytes = int64_t(feed->mostHeld);
+        st.mostHeldSound = int(feed->mostHeldSound);
+        st.mostTimingKept = int(feed->mostTiming);
     }
     return st;
 }

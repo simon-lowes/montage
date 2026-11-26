@@ -10,6 +10,7 @@
 #ifndef _WIN32
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #endif
 
 #include <algorithm>
@@ -134,6 +135,9 @@
 #include "ReviewBrowsers.h"
 #ifdef MONTAGE_TEST_TURN
 #include <juice/juice.h>
+#endif
+#ifdef MONTAGE_TEST_RTC
+#include <rtc/rtc.hpp>
 #endif
 #include "core/ReviewPage.h"
 #ifndef _WIN32
@@ -28520,6 +28524,432 @@ colorspaces:
         if (bySender) qInfo("WHIP: judged by the sender's own reports, which put each beep %+.0f ms after its flash on average", senderSum / senderPaired * 1000);
         QVERIFY2(std::fabs(sum / paired) <= 0.040, (std::to_string(sum / paired) + (senderPaired ? "; by the sender's own reports " + std::to_string(senderSum / senderPaired) : std::string())).c_str());
         QVERIFY2(worst <= 0.040 + 1 / fps, std::to_string(worst).c_str());
+    }
+
+    // Phase 18: RTP and RTCP written by hand into the WHIP endpoint, over HTTP and over HTTPS with the test's own
+    // certificate. A sender of the test's own (libdatachannel, as Montage's end) offers H.264 and Opus, each with two
+    // SSRCs, and sends: sound before any picture; a flood of sender reports, some with no time, some for an SSRC not
+    // sent and some cut short; sequence numbers that jump on, back into the gap and on again past a restart; packets
+    // with no payload, with padding and with padding longer than the packet; the second SSRCs from then on; and a
+    // flood of sound while nothing reads. After each case the endpoint's queues are within their caps (status()'s
+    // counts) and a group of 25 pictures sent then is read from the endpoint and decodes.
+    void whipCraftedPackets_data() {
+        QTest::addColumn<bool>("https");
+        QTest::newRow("http") << false;
+        QTest::newRow("https") << true;
+    }
+    void whipCraftedPackets() {
+#ifndef MONTAGE_TEST_RTC
+        QSKIP("Built without WebRTC (libdatachannel)");
+#else
+        QFETCH(bool, https);
+        std::string why;
+        if (!whip::available(&why)) QSKIP(why.c_str());
+        const AVCodec* x264 = avcodec_find_encoder_by_name("libx264");
+        const AVCodec* h264 = avcodec_find_decoder(AV_CODEC_ID_H264);
+        if (!x264 || !h264) QSKIP("Needs FFmpeg's libx264 encoder and H.264 decoder");
+        // The pictures: 9 groups of 25 (each from a keyframe, its sequence and picture parameter sets before it), a bar
+        // moving across a grey ramp, 320 by 180, in Annex B.
+        struct Coded {
+            std::vector<uint8_t> bytes;
+            bool key = false;
+        };
+        std::vector<Coded> coded;
+        {
+            AVCodecContext* enc = avcodec_alloc_context3(x264);
+            auto freeEnc = qScopeGuard([&] { avcodec_free_context(&enc); });
+            enc->width = 320, enc->height = 180, enc->pix_fmt = AV_PIX_FMT_YUV420P;
+            enc->time_base = {1, 25}, enc->framerate = {25, 1};
+            enc->gop_size = 25, enc->max_b_frames = 0;
+            av_opt_set(enc->priv_data, "preset", "ultrafast", 0);
+            av_opt_set(enc->priv_data, "tune", "zerolatency", 0);
+            av_opt_set(enc->priv_data, "profile", "baseline", 0);
+            av_opt_set(enc->priv_data, "x264-params", "repeat-headers=1", 0);
+            QVERIFY(avcodec_open2(enc, x264, nullptr) >= 0);
+            AVFrame* f = av_frame_alloc();
+            AVPacket* pkt = av_packet_alloc();
+            auto freeBoth = qScopeGuard([&] {
+                av_frame_free(&f);
+                av_packet_free(&pkt);
+            });
+            f->width = 320, f->height = 180, f->format = AV_PIX_FMT_YUV420P;
+            QVERIFY(av_frame_get_buffer(f, 0) >= 0);
+            auto take = [&] {
+                while (avcodec_receive_packet(enc, pkt) >= 0) {
+                    coded.push_back({std::vector<uint8_t>(pkt->data, pkt->data + pkt->size), (pkt->flags & AV_PKT_FLAG_KEY) != 0});
+                    av_packet_unref(pkt);
+                }
+            };
+            for (int i = 0; i < 225; ++i) {
+                QVERIFY(av_frame_make_writable(f) >= 0);
+                for (int y = 0; y < 180; ++y)
+                    for (int x = 0; x < 320; ++x) f->data[0][y * f->linesize[0] + x] = uint8_t(std::abs(x - (i * 7) % 320) < 12 ? 235 : 40 + x / 2);
+                for (int y = 0; y < 90; ++y) {
+                    std::memset(f->data[1] + y * f->linesize[1], 128, 160);
+                    std::memset(f->data[2] + y * f->linesize[2], 128, 160);
+                }
+                f->pts = i;
+                f->pict_type = i % 25 == 0 ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+                QVERIFY(avcodec_send_frame(enc, f) >= 0);
+                take();
+            }
+            avcodec_send_frame(enc, nullptr);
+            take();
+        }
+        QCOMPARE(int(coded.size()), 225);
+        for (int g = 0; g < 9; ++g) QVERIFY(coded[size_t(g * 25)].key);
+
+        // The endpoint, on a port free for TCP and UDP both (its media shares the number).
+        int port = 0;
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QTcpServer t;
+            QUdpSocket u;
+            if (t.listen(QHostAddress::LocalHost, 0) && u.bind(QHostAddress::LocalHost, t.serverPort())) port = t.serverPort();
+        }
+        QVERIFY(port > 0);
+        whip::Settings ws;
+        ws.port = port;
+        ws.token = "a-token-made-up-for-this-test";
+        if (https) QVERIFY2(montage::output::makeReviewCertificate({"127.0.0.1"}, ws.certificatePem, ws.keyPem, &why), why.c_str());
+        whip::Endpoint ep;
+        QVERIFY2(ep.start(ws, &why), why.c_str());
+        QCOMPARE(QString::fromStdString(ep.url()).startsWith(https ? "https://" : "http://"), true);
+
+        // The sender: H.264 and Opus, each with two SSRCs (the second sent from case 6 on).
+        constexpr int kVideoPt = 102, kAudioPt = 111;
+        const uint32_t videoSsrc[2] = {0x11112222u, 0x33334444u}, audioSsrc[2] = {0x55556666u, 0x77778888u};
+        rtc::Configuration conf;
+        auto pc = std::make_shared<rtc::PeerConnection>(conf);
+        auto closePc = qScopeGuard([&] {
+            try {
+                pc->close();
+            } catch (const std::exception&) {
+            }
+        });
+        rtc::Description::Video vd("0", rtc::Description::Direction::SendOnly);
+        vd.addH264Codec(kVideoPt, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
+        vd.addSSRC(videoSsrc[0], "montage-test-video");
+        vd.addSSRC(videoSsrc[1], "montage-test-video");
+        std::shared_ptr<rtc::Track> vt = pc->addTrack(vd);
+        rtc::Description::Audio ad("1", rtc::Description::Direction::SendOnly);
+        ad.addOpusCodec(kAudioPt);
+        ad.addSSRC(audioSsrc[0], "montage-test-audio");
+        ad.addSSRC(audioSsrc[1], "montage-test-audio");
+        std::shared_ptr<rtc::Track> at = pc->addTrack(ad);
+        std::atomic<bool> gathered{false};
+        pc->onGatheringStateChange([&](rtc::PeerConnection::GatheringState g) {
+            if (g == rtc::PeerConnection::GatheringState::Complete) gathered = true;
+        });
+        pc->setLocalDescription();
+        QElapsedTimer t;
+        t.start();
+        while (!gathered && t.elapsed() < 10000) QThread::msleep(10);
+        QVERIFY(gathered);
+        const std::string offer = std::string(*pc->localDescription());
+        // The offer POSTed with the token, over plain HTTP or over TLS trusting the test's certificate alone.
+        QByteArray answer;
+        {
+            std::unique_ptr<QTcpSocket> c;
+            if (https) {
+                auto* tls = new QSslSocket;
+                c.reset(tls);
+                QSslConfiguration sc = QSslConfiguration::defaultConfiguration();
+                sc.setCaCertificates(QSslCertificate::fromData(QByteArray::fromStdString(ws.certificatePem), QSsl::Pem));
+                sc.setPeerVerifyMode(QSslSocket::VerifyPeer);
+                tls->setSslConfiguration(sc);
+                tls->connectToHostEncrypted("127.0.0.1", quint16(port));
+                QVERIFY2(tls->waitForEncrypted(10000), qPrintable(tls->errorString()));
+                QVERIFY(QString(tls->peerCertificate().digest(QCryptographicHash::Sha256).toHex(':')).compare(QString::fromStdString(ep.certificateFingerprint()), Qt::CaseInsensitive) == 0);
+            } else {
+                c = std::make_unique<QTcpSocket>();
+                c->connectToHost(QHostAddress::LocalHost, quint16(port));
+                QVERIFY(c->waitForConnected(5000));
+            }
+            const QByteArray body = QByteArray::fromStdString(offer);
+            c->write("POST /whip HTTP/1.1\r\nHost: 127.0.0.1:" + QByteArray::number(port) + "\r\nContent-Type: application/sdp\r\nAuthorization: Bearer " +
+                     QByteArray::fromStdString(ws.token) + "\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+            QByteArray got;
+            t.restart();
+            qsizetype head = -1, length = -1;
+            while (t.elapsed() < 15000) {
+                c->waitForReadyRead(100);
+                got += c->readAll();
+                if (head < 0 && (head = got.indexOf("\r\n\r\n")) >= 0) {
+                    const QRegularExpressionMatch lm = QRegularExpression("Content-Length: *(\\d+)", QRegularExpression::CaseInsensitiveOption).match(QString::fromLatin1(got.left(head)));
+                    length = lm.hasMatch() ? lm.captured(1).toLongLong() : -1;
+                }
+                if (head >= 0 && length >= 0 && got.size() >= head + 4 + length) break;
+            }
+            QVERIFY2(got.startsWith("HTTP/1.1 201"), got.left(200).constData());
+            answer = got.mid(head + 4, length);
+        }
+        pc->setRemoteDescription(rtc::Description(answer.toStdString(), rtc::Description::Type::Answer));
+        t.restart();
+        while (!(vt->isOpen() && at->isOpen()) && t.elapsed() < 15000) QThread::msleep(10);
+        QVERIFY2(vt->isOpen() && at->isOpen(), "The sender's tracks did not open");
+
+        // Sending: RTP packets and RTCP as written here.
+        uint16_t vSeq = 1000, aSeq = 5000;
+        uint32_t vTs = 90000, aTs = 48000;
+        int ssrcIndex = 0;
+        auto rtp = [](int pt, bool marker, uint16_t seq, uint32_t ts, uint32_t ssrc, const uint8_t* p, size_t n, int pad = 0) {
+            std::vector<uint8_t> d(12);
+            d[0] = uint8_t(0x80 | (pad > 0 ? 0x20 : 0));
+            d[1] = uint8_t((marker ? 0x80 : 0) | pt);
+            d[2] = uint8_t(seq >> 8), d[3] = uint8_t(seq);
+            d[4] = uint8_t(ts >> 24), d[5] = uint8_t(ts >> 16), d[6] = uint8_t(ts >> 8), d[7] = uint8_t(ts);
+            d[8] = uint8_t(ssrc >> 24), d[9] = uint8_t(ssrc >> 16), d[10] = uint8_t(ssrc >> 8), d[11] = uint8_t(ssrc);
+            d.insert(d.end(), p, p + n);
+            for (int i = 0; i < pad; ++i) d.push_back(i == pad - 1 ? uint8_t(pad) : 0);
+            return d;
+        };
+        int64_t sentRtp = 0;  // (RTP packets sent, not RTCP)
+        auto send = [&](const std::shared_ptr<rtc::Track>& track, const std::vector<uint8_t>& d) {
+            try {
+                if (track->send(reinterpret_cast<const rtc::byte*>(d.data()), d.size()) && (d.size() < 2 || d[1] < 200 || d[1] > 206)) ++sentRtp;
+            } catch (const std::exception&) {
+            }
+        };
+        auto ntpNow = [] {
+            const double s = QDateTime::currentMSecsSinceEpoch() / 1000.0 + 2208988800.0;
+            return (uint64_t(s) << 32) | uint64_t((s - std::floor(s)) * 4294967296.0);
+        };
+        auto report = [&](bool video, uint32_t ssrc, uint64_t ntp, uint32_t ts, int words = 6) {
+            std::vector<uint8_t> d(size_t(4 * (words + 1)), 0);
+            d[0] = 0x80, d[1] = 200, d[2] = uint8_t(words >> 8), d[3] = uint8_t(words);
+            d[4] = uint8_t(ssrc >> 24), d[5] = uint8_t(ssrc >> 16), d[6] = uint8_t(ssrc >> 8), d[7] = uint8_t(ssrc);
+            for (int k = 0; k < 8 && 8 + k < int(d.size()); ++k) d[size_t(8 + k)] = uint8_t(ntp >> (56 - 8 * k));
+            if (d.size() >= 20) d[16] = uint8_t(ts >> 24), d[17] = uint8_t(ts >> 16), d[18] = uint8_t(ts >> 8), d[19] = uint8_t(ts);
+            send(video ? vt : at, d);
+        };
+        // Twenty milliseconds of sound (a packet of Opus silence, made as large as asked).
+        auto sound = [&](size_t bytes = 3, int pad = 0) {
+            std::vector<uint8_t> opus(std::max<size_t>(3, bytes), 0);
+            opus[0] = 0xF8, opus[1] = 0xFF, opus[2] = 0xFE;
+            send(at, rtp(kAudioPt, false, aSeq++, aTs, audioSsrc[ssrcIndex], opus.data(), opus.size(), pad));
+            aTs += 960;
+        };
+        // A picture as RTP: each NAL unit by itself, or in FU-A fragments of 1000 bytes; the last packet marked.
+        auto picture = [&](const Coded& c, int pad = 0) {
+            std::vector<std::pair<const uint8_t*, size_t>> nals;
+            const uint8_t* b = c.bytes.data();
+            const size_t n = c.bytes.size();
+            size_t i = 0, start = std::string::npos;
+            while (i + 3 <= n) {
+                if (b[i] == 0 && b[i + 1] == 0 && (b[i + 2] == 1 || (i + 3 < n && b[i + 2] == 0 && b[i + 3] == 1))) {
+                    const size_t code = b[i + 2] == 1 ? 3 : 4;
+                    if (start != std::string::npos) nals.push_back({b + start, i - start});
+                    i += code;
+                    start = i;
+                } else {
+                    ++i;
+                }
+            }
+            if (start != std::string::npos && start < n) nals.push_back({b + start, n - start});
+            for (size_t k = 0; k < nals.size(); ++k) {
+                const auto [p, size] = nals[k];
+                const bool lastNal = k + 1 == nals.size();
+                if (size <= 1100) {
+                    send(vt, rtp(kVideoPt, lastNal, vSeq++, vTs, videoSsrc[ssrcIndex], p, size, pad));
+                    continue;
+                }
+                for (size_t off = 1; off < size; off += 1000) {
+                    const size_t piece = std::min<size_t>(1000, size - off);
+                    std::vector<uint8_t> fu{uint8_t((p[0] & 0xE0) | 28), uint8_t((off == 1 ? 0x80 : 0) | (off + piece >= size ? 0x40 : 0) | (p[0] & 0x1F))};
+                    fu.insert(fu.end(), p + off, p + off + piece);
+                    send(vt, rtp(kVideoPt, lastNal && off + piece >= size, vSeq++, vTs, videoSsrc[ssrcIndex], fu.data(), fu.size(), pad));
+                }
+            }
+            vTs += 3600;
+        };
+        // Sender reports for both streams' current times.
+        auto reports = [&] {
+            const uint64_t ntp = ntpNow();
+            report(true, videoSsrc[ssrcIndex], ntp, vTs);
+            report(false, audioSsrc[ssrcIndex], ntp, aTs);
+        };
+        // A group of 25 pictures from coded[from], with their sound and a report every 10 pictures.
+        auto group = [&](int from, int pad = 0) {
+            for (int i = 0; i < 25; ++i) {
+                if (i % 10 == 0) reports();
+                picture(coded[size_t(from + i)], pad);
+                sound();
+                sound();
+                QThread::msleep(8);
+            }
+        };
+
+        // Reading: the endpoint's packets taken as Capture takes them, the pictures put together from their RTP
+        // (by the payload type the endpoint's description gives) and decoded.
+        std::string sdp;
+        int videoPt = -1;
+        AVCodecContext* dec = avcodec_alloc_context3(h264);
+        AVFrame* frame = av_frame_alloc();
+        AVPacket* au = av_packet_alloc();
+        auto freeDec = qScopeGuard([&] {
+            avcodec_free_context(&dec);
+            av_frame_free(&frame);
+            av_packet_free(&au);
+        });
+        QVERIFY(avcodec_open2(dec, h264, nullptr) >= 0);
+        int decoded = 0;
+        std::vector<uint8_t> annexB;
+        std::vector<uint8_t> buf(65536);
+        auto readFor = [&](int ms) {
+            QElapsedTimer quiet;
+            quiet.start();
+            while (quiet.elapsed() < ms) {
+                const int n = ep.read(buf.data(), int(buf.size()), 20);
+                if (n < 0) break;
+                if (n < 12) continue;
+                quiet.restart();
+                const uint8_t* d = buf.data();
+                if ((d[1] & 0x7f) != videoPt) continue;
+                size_t off = 12 + 4 * size_t(d[0] & 0x0f), end = size_t(n);
+                if ((d[0] & 0x10) && off + 4 <= end) off += 4 + 4 * ((size_t(d[off + 2]) << 8) | d[off + 3]);
+                if ((d[0] & 0x20) && end > off) end -= std::min<size_t>(d[end - 1], end - off);
+                if (off >= end) continue;
+                const uint8_t type = d[off] & 0x1F;
+                static const uint8_t code[4] = {0, 0, 0, 1};
+                if (type >= 1 && type <= 23) {
+                    annexB.insert(annexB.end(), code, code + 4);
+                    annexB.insert(annexB.end(), d + off, d + end);
+                } else if (type == 28 && end - off >= 2) {
+                    if (d[off + 1] & 0x80) {
+                        annexB.insert(annexB.end(), code, code + 4);
+                        annexB.push_back(uint8_t((d[off] & 0xE0) | (d[off + 1] & 0x1F)));
+                    }
+                    annexB.insert(annexB.end(), d + off + 2, d + end);
+                }
+                if ((d[1] & 0x80) && !annexB.empty()) {
+                    au->data = annexB.data();
+                    au->size = int(annexB.size());
+                    if (avcodec_send_packet(dec, au) >= 0)
+                        while (avcodec_receive_frame(dec, frame) >= 0) ++decoded;
+                    annexB.clear();
+                }
+            }
+        };
+        // The caps, after each case.
+        auto withinCaps = [&](const char* after) {
+            const whip::Status st = ep.status();
+            qInfo("%s: %lld packets, %lld lost, %lld dropped; most queued %lld, held %lld bytes and %d sound packets, %d timing entries",
+                  after, (long long)st.packets, (long long)st.lost, (long long)st.dropped, (long long)st.mostQueuedBytes, (long long)st.mostHeldBytes,
+                  st.mostHeldSound, st.mostTimingKept);
+            if (st.mostQueuedBytes > (int64_t(68) << 20) + 1500) return QString("%1: %2 bytes queued").arg(after).arg(st.mostQueuedBytes);
+            if (st.mostHeldBytes > int64_t(16) << 20) return QString("%1: %2 bytes held").arg(after).arg(st.mostHeldBytes);
+            if (st.mostHeldSound > 500) return QString("%1: %2 sound packets held").arg(after).arg(st.mostHeldSound);
+            // (each of the four lists keeps an entry a tenth of a second at most, the sound's arrivals a fifth, over
+            // 15 s, and one more)
+            if (st.mostTimingKept > 3 * 152 + 77) return QString("%1: %2 timing entries").arg(after).arg(st.mostTimingKept);
+            if (!st.sender || st.ended) return QString("%1: the sender is gone").arg(after);
+            return QString();
+        };
+        // The next group decodes: 20 of its 25 pictures at least (the decoder may hold one back, and loopback UDP may
+        // lose a packet).
+        int nextGroup = 0;
+        auto groupDecodes = [&](const char* after, int pad = 0) {
+            const int before = decoded;
+            group(25 * nextGroup++, pad);
+            readFor(600);
+            return decoded - before >= 20 ? QString() : QString("%1: %2 pictures decoded of 25").arg(after).arg(decoded - before);
+        };
+        QString problem;
+
+        // 1. Sound with no picture yet, and so no reader: what is held stays within its 500 packets.
+        for (int i = 0; i < 3000; ++i) {
+            sound();
+            if (i % 200 == 0) QThread::msleep(2);
+        }
+        QThread::msleep(300);
+        QVERIFY2((problem = withinCaps("sound before any picture")).isEmpty(), qPrintable(problem));
+        QVERIFY(ep.status().mostHeldSound >= 400);
+        // The first group begins the feed; the reader comes.
+        group(25 * nextGroup++);
+        QVERIFY2(ep.waitForMedia(sdp, [&] { return t.elapsed() > 60000; }, &why), why.c_str());
+        const QRegularExpressionMatch vm = QRegularExpression("m=video \\d+ RTP/AVP (\\d+)").match(QString::fromStdString(sdp));
+        QVERIFY2(vm.hasMatch(), sdp.c_str());
+        videoPt = vm.captured(1).toInt();
+        QCOMPARE(videoPt, kVideoPt);
+        readFor(600);
+        QVERIFY2(decoded >= 20, qPrintable(QString::number(decoded)));
+        QVERIFY2((problem = groupDecodes("the first groups")).isEmpty(), qPrintable(problem));
+
+        // 2. A flood of sender reports: 3,000 for each stream with a millisecond's jitter; 200 with no time, 200 for
+        // an SSRC never sent, and 200 cut short (their length past the packet, or too short for a report).
+        for (int i = 0; i < 3000; ++i) {
+            const uint64_t ntp = ntpNow() + (uint64_t(i % 7) << 22);
+            report(true, videoSsrc[0], ntp, vTs);
+            report(false, audioSsrc[0], ntp, aTs);
+            if (i < 200) {
+                report(true, videoSsrc[0], 0, vTs);
+                report(false, 0x0BADF00Du, ntp, aTs);
+                report(i % 2 == 0, i % 2 == 0 ? videoSsrc[0] : audioSsrc[0], ntp, aTs, 3);
+            }
+            if (i % 300 == 0) QThread::msleep(5);
+        }
+        QVERIFY2((problem = withinCaps("a flood of reports")).isEmpty(), qPrintable(problem));
+        QVERIFY2((problem = groupDecodes("a flood of reports")).isEmpty(), qPrintable(problem));
+        QVERIFY(ep.status().reports);
+
+        // 3. Sequence numbers that jump: 2,000 on (counted lost), a packet back in that gap (filler data, which
+        // decodes to nothing), then 20,000 on (a sender starting its numbers afresh, not counted lost).
+        const int64_t lostBefore = ep.status().lost;
+        vSeq += 2000, aSeq += 2000;
+        QVERIFY2((problem = groupDecodes("a jump of 2000")).isEmpty(), qPrintable(problem));
+        const uint8_t filler[4] = {0x0C, 0xFF, 0xFF, 0x80};
+        send(vt, rtp(kVideoPt, false, uint16_t(vSeq - 500), vTs - 3600, videoSsrc[0], filler, sizeof filler));
+        vSeq += 20000, aSeq += 20000;
+        QVERIFY2((problem = groupDecodes("a jump of 20000")).isEmpty(), qPrintable(problem));
+        QVERIFY2((problem = withinCaps("sequence jumps")).isEmpty(), qPrintable(problem));
+        const int64_t lostJumps = ep.status().lost - lostBefore;
+        QVERIFY2(lostJumps >= 3998 && lostJumps < 4100, qPrintable(QString::number(lostJumps)));
+
+        // 4. Packets with no payload, then a group whose every packet is padded (each picture and sound packet with
+        // 1 to 40 bytes of it), then packets whose padding is longer than they are (passed over).
+        for (int i = 0; i < 20; ++i) {
+            send(vt, rtp(kVideoPt, false, vSeq++, vTs - 3600, videoSsrc[0], nullptr, 0));
+            send(at, rtp(kAudioPt, false, aSeq++, aTs - 960, audioSsrc[0], nullptr, 0));
+        }
+        QVERIFY2((problem = groupDecodes("padded packets", 17)).isEmpty(), qPrintable(problem));
+        for (int i = 0; i < 20; ++i) {
+            std::vector<uint8_t> bad = rtp(kVideoPt, true, vSeq++, vTs, videoSsrc[0], filler, sizeof filler);
+            bad[0] |= 0x20;
+            bad.back() = 200;  // (padding of 200 bytes in a packet of 16)
+            send(vt, bad);
+        }
+        vTs += 3600;
+        QVERIFY2((problem = groupDecodes("padding past the packet")).isEmpty(), qPrintable(problem));
+        QVERIFY2((problem = withinCaps("short and padded packets")).isEmpty(), qPrintable(problem));
+
+        // 5. Both streams go on under their second SSRCs, numbered and timed afresh.
+        ssrcIndex = 1;
+        vSeq = 17, aSeq = 40000, vTs = 1234567, aTs = 7654321;
+        reports();
+        QVERIFY2((problem = groupDecodes("new SSRCs")).isEmpty(), qPrintable(problem));
+        QVERIFY2((problem = withinCaps("new SSRCs")).isEmpty(), qPrintable(problem));
+
+        // 6. A flood of sound while nothing reads: 72 MB, past the 68 MB the queue keeps, so some is dropped; once
+        // read again the pictures after it decode.
+        const int64_t droppedBefore = ep.status().dropped, notTaken = sentRtp - ep.status().packets;
+        for (int i = 0; i < 60000; ++i) {
+            sound(1188);
+            // (no faster than the endpoint takes them: the loopback's buffers would lose the rest)
+            if (i % 100 == 99) {
+                QElapsedTimer pace;
+                pace.start();
+                while (pace.elapsed() < 2000 && sentRtp - ep.status().packets - notTaken > 150) QThread::msleep(1);
+            }
+        }
+        QThread::msleep(300);
+        QVERIFY2((problem = withinCaps("a flood of sound with no reader")).isEmpty(), qPrintable(problem));
+        QVERIFY2(ep.status().dropped > droppedBefore, qPrintable(QString::number(ep.status().dropped)));
+        QVERIFY(ep.status().mostQueuedBytes > int64_t(60) << 20);
+        readFor(400);
+        QVERIFY2(ep.status().queuedBytes < (1 << 20), qPrintable(QString::number(ep.status().queuedBytes)));
+        QVERIFY2((problem = groupDecodes("a flood of sound with no reader")).isEmpty(), qPrintable(problem));
+        qInfo("%d pictures decoded in all", decoded);
+#endif
     }
 
     // Phase 17: FFmpeg's own WHIP sender (its whip muxer, which needs FFmpeg 8 or later built with a TLS library for

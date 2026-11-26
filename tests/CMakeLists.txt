@@ -26,6 +26,11 @@ if(MONTAGE_HAVE_WEBRTC AND TARGET juice)
   target_link_libraries(test_render PRIVATE juice)
   target_compile_definitions(test_render PRIVATE MONTAGE_TEST_TURN)
 endif()
+if(MONTAGE_HAVE_WEBRTC AND TARGET datachannel)
+  # libdatachannel as a WHIP sender of the test's own, which writes its RTP and RTCP by hand
+  target_link_libraries(test_render PRIVATE datachannel)
+  target_compile_definitions(test_render PRIVATE MONTAGE_TEST_RTC)
+endif()
 # (The DCP tests alone take minutes on a slow container: 317 s in the nightly build's in October 2026.) Qt 6.4's
 # watchdog stops a run 300 s after it starts, whichever function it is in, so the run is given as long as ctest gives it.
 # (In CI in November 2026 the run took 641 s on Linux, with the browser review tests through a relay, and 614 s on macOS.)
