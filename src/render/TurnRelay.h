@@ -46,7 +46,7 @@ std::string relayPin(const std::string& text);
 // and wraps each packet for one of them in a Send indication, as RFC 8656 has them. Its one socket to the outside is
 // connected to the relay, so nothing leaves this computer for anywhere else, whatever addresses a viewer offers.
 // Every answer the relay gives once it knows the login must be signed with the login's key: one that is not is not
-// used, and is counted. All the bridges there are share one thread.
+// used, and is counted. The bridges there are share a thread for every four of them.
 class RelayBridge {
 public:
     // `host` is the relay's name or address, reached over UDP.
@@ -57,7 +57,7 @@ public:
     RelayBridge& operator=(const RelayBridge&) = delete;
 
     // Asks the relay for an address, once: of the family `prefer` says (4: IPv4, 6: IPv6), and of the other where
-    // the relay has none of that one. `done` is called once, on the bridges' thread, with "" when there is one or
+    // the relay has none of that one. `done` is called once, on the bridge's thread, with "" when there is one or
     // with why not (no answer in about six seconds, the relay's refusal, or a certificate that is not the relay's).
     void allocate(std::function<void(const std::string& error)> done) { allocate(4, std::move(done)); }
     void allocate(int prefer, std::function<void(const std::string& error)> done);
@@ -99,7 +99,8 @@ public:
     // the relay for an address", "Carrying over TCP", "Ended".
     std::string state() const;
 
-    // The threads the bridges alive run on (0 with none alive, else 1), and how many were ever started.
+    // The threads the bridges alive run on (a thread for every four bridges; 0 with none alive), and how many were
+    // ever started.
     static int threads();
     static uint64_t threadsStarted();
 

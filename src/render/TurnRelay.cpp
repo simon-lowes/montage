@@ -344,61 +344,80 @@ std::string mapLines(const std::string& sdp, const std::function<QString(const Q
 
 const char* transportName(RelayAddress::Transport t) { return t == RelayAddress::Transport::Tls ? "TLS" : t == RelayAddress::Transport::Tcp ? "TCP" : "UDP"; }
 
-// The one thread every bridge's sockets and timers live on: begun with the first bridge and ended with the last.
+// The threads the bridges' sockets and timers live on, a thread for every four bridges (kBridgesPerThread): each begun
+// with its first bridge and ended with its last. A bridge goes on the busiest thread that has room, so a few bridges
+// share one thread, and many are spread over a thread per four.
+constexpr int kBridgesPerThread = 4;
 struct BridgeThread {
-    std::mutex life;  // held while it is begun or ended
     std::thread thread;
-    int users = 0;
+    int users = 0;  // (under BridgeThreads::life)
     std::mutex m;
     std::condition_variable cv;
     QObject* home = nullptr;  // (under m)
     QEventLoop* loop = nullptr;
+};
+struct BridgeThreads {
+    std::mutex life;  // held while a thread is chosen, begun or ended
+    std::vector<std::unique_ptr<BridgeThread>> all;
     std::atomic<int> running{0};
     std::atomic<quint64> started{0};
 };
-BridgeThread& bridgeThread() {
-    static BridgeThread* t = new BridgeThread;  // (never destroyed: a bridge may outlive the statics)
+BridgeThreads& bridgeThreads() {
+    static BridgeThreads* t = new BridgeThreads;  // (never destroyed: a bridge may outlive the statics)
     return *t;
 }
-QObject* joinBridgeThread() {
-    BridgeThread& t = bridgeThread();
-    std::lock_guard life(t.life);
-    if (t.users++ == 0) {
-        t.thread = std::thread([&t] {
+// A bridge's thread, chosen and begun if it was not running.
+BridgeThread* joinBridgeThread() {
+    BridgeThreads& all = bridgeThreads();
+    std::lock_guard life(all.life);
+    BridgeThread* t = nullptr;
+    for (const auto& c : all.all)
+        if (c->users > 0 && c->users < kBridgesPerThread && (!t || c->users > t->users)) t = c.get();
+    if (!t)
+        for (const auto& c : all.all)
+            if (c->users == 0) {
+                t = c.get();
+                break;
+            }
+    if (!t) t = all.all.emplace_back(std::make_unique<BridgeThread>()).get();
+    if (t->users++ == 0) {
+        t->thread = std::thread([t, &all] {
             QEventLoop l;
             QObject h;
             {
-                std::lock_guard lock(t.m);
-                t.home = &h;
-                t.loop = &l;
+                std::lock_guard lock(t->m);
+                t->home = &h;
+                t->loop = &l;
             }
-            ++t.running;
-            ++t.started;
-            t.cv.notify_all();
+            ++all.running;
+            ++all.started;
+            t->cv.notify_all();
             l.exec();
             QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
             {
-                std::lock_guard lock(t.m);
-                t.home = nullptr;
-                t.loop = nullptr;
+                std::lock_guard lock(t->m);
+                t->home = nullptr;
+                t->loop = nullptr;
             }
-            --t.running;
+            --all.running;
         });
-        std::unique_lock lock(t.m);
-        t.cv.wait(lock, [&] { return t.home != nullptr; });
+        std::unique_lock lock(t->m);
+        t->cv.wait(lock, [&] { return t->home != nullptr; });
     }
-    std::lock_guard lock(t.m);
-    return t.home;
+    return t;
 }
-void leaveBridgeThread() {
-    BridgeThread& t = bridgeThread();
-    std::lock_guard life(t.life);
-    if (--t.users > 0) return;
+QObject* homeOf(BridgeThread* t) {
+    std::lock_guard lock(t->m);
+    return t->home;
+}
+void leaveBridgeThread(BridgeThread* t) {
+    std::lock_guard life(bridgeThreads().life);
+    if (--t->users > 0) return;
     {
-        std::lock_guard lock(t.m);
-        if (t.loop) QMetaObject::invokeMethod(t.loop, &QEventLoop::quit, Qt::QueuedConnection);
+        std::lock_guard lock(t->m);
+        if (t->loop) QMetaObject::invokeMethod(t->loop, &QEventLoop::quit, Qt::QueuedConnection);
     }
-    if (t.thread.joinable()) t.thread.join();
+    if (t->thread.joinable()) t->thread.join();
 }
 
 }  // namespace
@@ -559,8 +578,10 @@ std::string answerAlsoThroughRelay(const std::string& sdp, const std::string& re
     });
 }
 
-// A bridge's sockets and timer live on the bridges' thread, and everything below `// (on the thread)` runs there.
+// A bridge's sockets and timer live on its thread (one of the bridges' threads), and everything below `// (on the
+// thread)` runs there.
 struct RelayBridge::Impl {
+    BridgeThread* thread = nullptr;  // the one it lives on
     RelayAddress relay;
     QByteArray pin;  // (the certificate's SHA-256, when one is pinned)
     TurnLogin login;
@@ -1276,17 +1297,14 @@ RelayBridge::RelayBridge(RelayAddress relay, TurnLogin login) : d_(std::make_uni
     d_->pin = QByteArray::fromHex(QByteArray::fromStdString(relayPin(relay.pin)));
     d_->relay = std::move(relay);
     d_->login = std::move(login);
-    QObject* home = joinBridgeThread();
-    QMetaObject::invokeMethod(home, [d = d_.get()] { d->begin(); }, Qt::BlockingQueuedConnection);
+    d_->thread = joinBridgeThread();
+    QMetaObject::invokeMethod(homeOf(d_->thread), [d = d_.get()] { d->begin(); }, Qt::BlockingQueuedConnection);
 }
 
 RelayBridge::~RelayBridge() {
     Impl* d = d_.get();
-    QObject* home = nullptr;
-    {
-        std::lock_guard lock(bridgeThread().m);
-        home = bridgeThread().home;
-    }
+    BridgeThread* thread = d->thread;
+    QObject* home = homeOf(thread);
     if (home && QThread::currentThread() == home->thread()) {
         // (let go of on the bridges' own thread, which a callback should not do: nothing is waited for, and the
         // thread is left from another)
@@ -1295,10 +1313,10 @@ RelayBridge::~RelayBridge() {
         d_.release();
         QMetaObject::invokeMethod(
             home,
-            [d] {
+            [d, thread] {
                 delete d->ctx;
                 delete d;
-                std::thread([] { leaveBridgeThread(); }).detach();
+                std::thread([thread] { leaveBridgeThread(thread); }).detach();
             },
             Qt::QueuedConnection);
         return;
@@ -1318,7 +1336,7 @@ RelayBridge::~RelayBridge() {
             d->timer = nullptr;
         },
         Qt::BlockingQueuedConnection);
-    leaveBridgeThread();
+    leaveBridgeThread(thread);
 }
 
 void RelayBridge::letGo() {
@@ -1392,13 +1410,13 @@ std::string RelayBridge::state() const {
     return d_->stateText;
 }
 
-int RelayBridge::threads() { return bridgeThread().running; }
+int RelayBridge::threads() { return bridgeThreads().running; }
 
 namespace {
 std::atomic<int> relayTimeScale{1};
 }
 void RelayBridge::setTimeScaleForTests(int scale) { relayTimeScale = std::clamp(scale, 1, 20); }
 int RelayBridge::timeScale() { return relayTimeScale; }
-uint64_t RelayBridge::threadsStarted() { return bridgeThread().started; }
+uint64_t RelayBridge::threadsStarted() { return bridgeThreads().started; }
 
 }  // namespace montage::output

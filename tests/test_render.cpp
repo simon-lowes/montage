@@ -27313,14 +27313,16 @@ colorspaces:
                 }
             }
             QCOMPARE(relay.allocations.load(), 16);
-            QCOMPARE(RelayBridge::threads(), 1);
-            QCOMPARE(RelayBridge::threadsStarted(), started + 1);
+            QCOMPARE(RelayBridge::threads(), 4);
+            QCOMPARE(RelayBridge::threadsStarted(), started + 4);
 #ifdef Q_OS_LINUX
-            QCOMPARE(systemThreads(), before + 1);
+            QCOMPARE(systemThreads(), before + 4);
 #endif
+            std::vector<uint16_t> aliases;
             for (int k = 0; k < 16; ++k) {
                 const uint16_t alias = bridges[size_t(k)]->peer("127.0.0.1", viewers[size_t(k)]->localPort());
                 QVERIFY(alias != 0);
+                aliases.push_back(alias);
                 QByteArray got;
                 for (int i = 0; i < 50 && got.isEmpty(); ++i) {
                     ends[size_t(k)]->writeDatagram("picture " + QByteArray::number(k), QHostAddress::LocalHost, alias);
@@ -27330,6 +27332,57 @@ colorspaces:
                     }
                 }
                 QCOMPARE(got, "picture " + QByteArray::number(k));
+            }
+            // The rate: for two seconds each end sends 8 packets of 1200 bytes every 10 ms (7.7 Mbit/s a viewer, 123
+            // in all), read by the viewers as they come. Nearly every packet arrives (UDP on a busy machine may drop a
+            // few), and what was carried is measured.
+            {
+                const QByteArray packet(1200, 'p');
+                std::vector<int> sent(16, 0), got(16, 0);
+                QElapsedTimer clock;
+                clock.start();
+                auto drain = [&] {
+                    for (int k = 0; k < 16; ++k)
+                        while (viewers[size_t(k)]->hasPendingDatagrams()) {
+                            QByteArray d(int(viewers[size_t(k)]->pendingDatagramSize()), 0);
+                            if (viewers[size_t(k)]->readDatagram(d.data(), d.size()) == packet.size()) ++got[size_t(k)];
+                        }
+                };
+                for (int tick = 0; clock.elapsed() < 2000; ++tick) {
+                    while (clock.elapsed() < tick * 10) {
+                        drain();
+                        QThread::usleep(500);
+                    }
+                    for (int k = 0; k < 16; ++k)
+                        for (int i = 0; i < 8; ++i)
+                            if (ends[size_t(k)]->writeDatagram(packet, QHostAddress::LocalHost, aliases[size_t(k)]) == packet.size()) ++sent[size_t(k)];
+                    drain();
+                }
+                const qint64 sending = clock.elapsed();
+                QElapsedTimer late;
+                late.start();
+                auto all = [&] {
+                    for (int k = 0; k < 16; ++k)
+                        if (got[size_t(k)] < sent[size_t(k)]) return false;
+                    return true;
+                };
+                while (!all() && late.elapsed() < 3000) {
+                    drain();
+                    QThread::usleep(500);
+                }
+                int sentAll = 0, gotAll = 0, fewest = 1 << 30;
+                for (int k = 0; k < 16; ++k) {
+                    sentAll += sent[size_t(k)];
+                    gotAll += got[size_t(k)];
+                    fewest = std::min(fewest, sent[size_t(k)] ? 100 * got[size_t(k)] / sent[size_t(k)] : 0);
+                }
+                const double mbits = gotAll * packet.size() * 8.0 / 1e6 / (double(sending) / 1000);
+                qInfo().noquote() << QStringLiteral("16 bridges on 4 threads carried %1 of %2 packets of 1200 bytes in %3 ms: %4 Mbit/s "
+                                                    "(the fewest a viewer had: %5 %)")
+                                         .arg(gotAll).arg(sentAll).arg(sending).arg(mbits, 0, 'f', 1).arg(fewest);
+                QVERIFY2(sentAll > 16 * 8 * 150, qPrintable(QString::number(sentAll)));
+                QVERIFY2(fewest >= 95, qPrintable(QString::number(fewest)));
+                QVERIFY2(mbits > 16 * 7.7 * 0.9, qPrintable(QString::number(mbits)));
             }
             bridges.resize(1);
             QCOMPARE(RelayBridge::threads(), 1);
