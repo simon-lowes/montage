@@ -6843,6 +6843,106 @@ private slots:
         QCOMPARE(int(seeds.size()), 20);
     }
 
+    // Phase 18 #11 (CI only: SVT-JPEG-XS is built in CI, not here). montage_render's jpeg_xs_lossless, by itself: a
+    // sequence rendered to JPEG XS losslessly, each picture stated as lossless (Fq 0) and the same as the sequence's
+    // own picture coded losslessly here; asked of another codec, refused.
+    void jpegXsLosslessOverMcp() {
+        if (!jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 192, s.height = 108, s.fps = {25, 1};
+        Clip c = makeGeneratorClip(p, "color", 10);
+        c.generator.params["color.r"] = 0.7, c.generator.params["color.g"] = 0.35, c.generator.params["color.b"] = 0.2;
+        s.videoTracks[0].clips.push_back(c);
+        const QString project = QString::fromStdString(path("jxs-lossless.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& extra) {
+            QJsonObject args{{"project", project}};
+            for (auto it = extra.begin(); it != extra.end(); ++it) args[it.key()] = it.value();
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"output", QString::fromStdString(path("jxs-lossless.mov"))}, {"preset", "ProRes 422 HQ"}, {"jpeg_xs_lossless", true}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("jpeg_xs"), qPrintable(text(r)));
+        const QString out = QString::fromStdString(path("jxs-lossless.jxs"));
+        r = call({{"output", out}, {"video_codec", "jpeg_xs"}, {"jpeg_xs_sampling", "444"}, {"jpeg_xs_depth", 12}, {"jpeg_xs_lossless", true}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        JxsReader reader;
+        std::string err;
+        QVERIFY2(reader.open(out.toStdString(), &err), err.c_str());
+        QCOMPARE(reader.info().frames, int64_t(10));
+        QVERIFY(reader.info().header.lossless() && reader.info().header.depth == 12 && reader.info().sampling == JxsSampling::Ycc444);
+        // Lossless: decoded, coded losslessly again and decoded, the same picture.
+        JxsPicture back, again;
+        QVERIFY2(reader.picture(4, back, &err), err.c_str());
+        JxsEncodeSettings es;
+        es.width = back.width, es.height = back.height, es.depth = back.depth, es.sampling = back.sampling, es.lossless = true;
+        JxsEncoder enc;
+        QVERIFY2(enc.open(es, &err), err.c_str());
+        std::vector<uint8_t> cs;
+        QVERIFY2(enc.encode(back, cs, nullptr, &err), err.c_str());
+        JxsDecoder dec;
+        QVERIFY2(dec.decode(cs.data(), cs.size(), again, &err), err.c_str());
+        QVERIFY(again == back);
+        // And a lossy render of the same is a constant rate, stated so (Fq 8).
+        const QString lossy = QString::fromStdString(path("jxs-lossy.jxs"));
+        r = call({{"output", lossy}, {"video_codec", "jpeg_xs"}, {"jpeg_xs_sampling", "444"}, {"jpeg_xs_depth", 12}, {"jpeg_xs_bpp", 3}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        JxsReader lr;
+        QVERIFY2(lr.open(lossy.toStdString(), &err), err.c_str());
+        QVERIFY(!lr.info().header.lossless());
+    }
+
+    // Phase 18 #11 (CI only). montage_render's jpeg_xs_alpha, by itself: a title over nothing rendered to JPEG XS
+    // with alpha and read back, its alpha where the title is and clear around it; asked of another codec, refused.
+    void jpegXsAlphaOverMcp() {
+        if (!jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 192, s.height = 108, s.fps = {25, 1};
+        // (a solid square in the middle of a clear frame: a colour clip scaled to a third of the picture)
+        Clip c = makeGeneratorClip(p, "color", 6);
+        c.generator.params["color.r"] = 0.2, c.generator.params["color.g"] = 0.8, c.generator.params["color.b"] = 0.3;
+        c.motion.params["scale"] = Param(33.3);
+        s.videoTracks[0].clips.push_back(c);
+        const QString project = QString::fromStdString(path("jxs-alpha.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& extra) {
+            QJsonObject args{{"project", project}};
+            for (auto it = extra.begin(); it != extra.end(); ++it) args[it.key()] = it.value();
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"output", QString::fromStdString(path("jxs-alpha.mov"))}, {"preset", "ProRes 4444 (alpha)"}, {"jpeg_xs_alpha", true}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("jpeg_xs"), qPrintable(text(r)));
+        const QString out = QString::fromStdString(path("jxs-alpha.mxf"));
+        r = call({{"output", out}, {"video_codec", "jpeg_xs"}, {"jpeg_xs_sampling", "444"}, {"jpeg_xs_depth", 10}, {"jpeg_xs_alpha", true}, {"jpeg_xs_bpp", 8}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        JxsReader reader;
+        std::string err;
+        QVERIFY2(reader.open(out.toStdString(), &err), err.c_str());
+        QVERIFY(reader.info().alpha && reader.info().header.alpha());
+        JxsPicture pic;
+        QVERIFY2(reader.picture(2, pic, &err), err.c_str());
+        QVERIFY(pic.alpha);
+        const int top = (1 << pic.depth) - 1;
+        auto alphaAt = [&](int x, int y) { return int(pic.planes[3][size_t(y) * size_t(pic.width) + size_t(x)]); };
+        QVERIFY2(alphaAt(pic.width / 2, pic.height / 2) > top - 16, qPrintable(QString::number(alphaAt(pic.width / 2, pic.height / 2))));
+        QVERIFY2(alphaAt(4, 4) < 16 && alphaAt(pic.width - 5, pic.height - 5) < 16, qPrintable(QString("%1 %2").arg(alphaAt(4, 4)).arg(alphaAt(pic.width - 5, pic.height - 5))));
+    }
+
     void namedGrainProfiles() {
         // A profile Measure Grain saves under a name over MCP (montage_grain save_as) is kept in the project and in the
         // user's library (a file of the test's own here); montage_render's film_grain then takes the name and makes the

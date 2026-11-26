@@ -21915,6 +21915,111 @@ colorspaces:
         QVERIFY2(std::abs(int(later.planes[3][mid]) - 2048) <= 4, qPrintable(QString::number(later.planes[3][mid])));
     }
 
+    // Phase 18 #11 (CI only: SVT-JPEG-XS is built in CI, not here). The picture header as Montage reads it against
+    // what SVT-JPEG-XS reads: over codestreams the library's encoder writes with each sampling, depth, number of
+    // vertical and horizontal decompositions, colour transform and lossless coding the test drives, Montage's width,
+    // height, depth, components and sampling factors equal the library decoder's own, and its Fq, Cpih, Nly and Nlx
+    // are the ones the encoder was asked for (SVT's defaults: Fq 8 when lossy, 0 lossless).
+    void jpegXsHeaderAsTheLibraryReadsIt() {
+        using montage::JxsSampling;
+        if (!montage::jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        const int w = 256, h = 64;
+        int checked = 0, refused = 0;
+        for (const JxsSampling sampling : {JxsSampling::Ycc422, JxsSampling::Ycc444, JxsSampling::Rgb})
+            for (const bool alpha : {false, true})
+                for (const int depth : {8, 10, 12})
+                    for (const int v : {0, 1, 2})
+                        for (const int hz : {1, 3, 5})
+                            for (const bool lossless : {false, true}) {
+                                montage::JxsEncodeSettings es;
+                                es.width = w, es.height = h, es.depth = depth, es.sampling = sampling, es.alpha = alpha;
+                                es.decompV = v, es.decompH = hz, es.lossless = lossless, es.bppNum = 4;
+                                const std::string name = montage::jxsSamplingName(sampling) + (alpha ? "+alpha" : "") + " " + std::to_string(depth) +
+                                                         " bits, " + std::to_string(v) + "/" + std::to_string(hz) + " decompositions" + (lossless ? ", lossless" : "");
+                                montage::JxsEncoder enc;
+                                std::string why;
+                                if (!enc.open(es, &why)) {
+                                    ++refused;  // (a combination the library does not code)
+                                    continue;
+                                }
+                                montage::JxsPicture pic = jxsTestPicture(w, h, depth, sampling, checked);
+                                if (alpha) {
+                                    pic.alpha = true;
+                                    pic.planes[3].assign(size_t(w) * h, uint16_t((1 << depth) / 3));
+                                }
+                                std::vector<uint8_t> cs;
+                                QVERIFY2(enc.encode(pic, cs, nullptr, &why), (name + ": " + why).c_str());
+                                montage::JxsHeader mine, theirs;
+                                QVERIFY2(montage::readJxsHeader(cs.data(), cs.size(), mine), name.c_str());
+                                QVERIFY2(montage::jxsLibraryReading(cs.data(), cs.size(), theirs, &why), (name + ": " + why).c_str());
+                                QVERIFY2(mine.width == theirs.width && mine.height == theirs.height && mine.depth == theirs.depth &&
+                                             mine.components == theirs.components,
+                                         (name + ": " + std::to_string(mine.width) + "x" + std::to_string(mine.height) + " " + std::to_string(mine.depth) + " bits " +
+                                          std::to_string(mine.components) + " components; the library " + std::to_string(theirs.width) + "x" +
+                                          std::to_string(theirs.height) + " " + std::to_string(theirs.depth) + " " + std::to_string(theirs.components)).c_str());
+                                for (int c = 0; c < mine.components; ++c)
+                                    QVERIFY2(mine.sx[c] == theirs.sx[c] && mine.sy[c] == theirs.sy[c],
+                                             (name + ": component " + std::to_string(c) + " " + std::to_string(mine.sx[c]) + "x" + std::to_string(mine.sy[c]) +
+                                              ", the library " + std::to_string(theirs.sx[c]) + "x" + std::to_string(theirs.sy[c])).c_str());
+                                QVERIFY2(mine.fq == (lossless ? 0 : 8), (name + ": Fq " + std::to_string(mine.fq)).c_str());
+                                QVERIFY2(mine.cpih == (sampling == JxsSampling::Rgb && !alpha ? 1 : 0), (name + ": Cpih " + std::to_string(mine.cpih)).c_str());
+                                QVERIFY2(mine.decompV == v && mine.decompH == hz,
+                                         (name + ": Nly " + std::to_string(mine.decompV) + ", Nlx " + std::to_string(mine.decompH)).c_str());
+                                QCOMPARE(mine.alpha(), alpha);
+                                // (and it decodes, the picture as large as the header says)
+                                montage::JxsDecoder dec;
+                                montage::JxsPicture back;
+                                QVERIFY2(dec.decode(cs.data(), cs.size(), back, &why, sampling == JxsSampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444),
+                                         (name + ": " + why).c_str());
+                                QVERIFY(back.width == mine.width && back.height == mine.height && back.depth == mine.depth);
+                                if (lossless) QVERIFY2(back == pic, name.c_str());
+                                ++checked;
+                            }
+        qInfo("%d codestreams checked, %d combinations the library refused", checked, refused);
+        QVERIFY2(checked >= 150, qPrintable(QString::number(checked)));
+    }
+
+    // Phase 18 #11 (CI only). A lossless file of 100 pictures, each a different length (each picture's Lcod its own),
+    // raw and in MXF: every picture decodes exactly as it was, with one decoder made for the file.
+    void jpegXsLosslessOneDecoder() {
+        using montage::JxsSampling;
+        if (!montage::jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        QTemporaryDir dir;
+        const int w = 160, h = 96;
+        std::vector<montage::JxsPicture> pictures;
+        for (int f = 0; f < 100; ++f) pictures.push_back(jxsTestPicture(w, h, 10, JxsSampling::Ycc422, f));
+        for (const char* name : {"lossless.jxs", "lossless.mxf"}) {
+            const std::string file = (dir.path() + "/" + name).toStdString();
+#ifndef MONTAGE_WITH_BMX
+            if (QString(name).endsWith(".mxf")) continue;
+#endif
+            montage::JxsWriteSettings ws;
+            ws.container = montage::jxsContainerForPath(file);
+            ws.encode.width = w, ws.encode.height = h, ws.encode.depth = 10, ws.encode.sampling = JxsSampling::Ycc422, ws.encode.lossless = true;
+            std::string why;
+            {
+                montage::JxsWriter wr;
+                QVERIFY2(wr.open(file, ws, &why), (std::string(name) + ": " + why).c_str());
+                for (const montage::JxsPicture& p : pictures) QVERIFY2(wr.write(p, &why), why.c_str());
+                QVERIFY2(wr.finish(&why), why.c_str());
+            }
+            montage::JxsReader r;
+            QVERIFY2(r.open(file, &why), why.c_str());
+            QCOMPARE(r.info().frames, int64_t(100));
+            std::set<size_t> lengths;
+            for (int64_t n = 0; n < 100; ++n) {
+                std::vector<uint8_t> cs;
+                QVERIFY(r.codestream(n, cs));
+                lengths.insert(cs.size());
+                montage::JxsPicture back;
+                QVERIFY2(r.picture(n, back, &why), why.c_str());
+                QVERIFY2(back == pictures[size_t(n)], qPrintable(QString("%1: picture %2").arg(name).arg(n)));
+            }
+            QVERIFY2(lengths.size() > 10, qPrintable(QString::number(lengths.size())));
+            QCOMPARE(r.decodersMade(), 1);
+        }
+    }
+
     // Phase 17 #9 (CI only: SVT-JPEG-XS is built in CI, not here). Lossless JPEG XS at 10 and 12 bits, and alpha as a
     // fourth component: lossless pictures come back exactly, in Y'CbCr and R'G'B', with alpha or without, stated as
     // lossless in the picture header (Fq 0, the lossless profile); alpha coded at a rate comes back close; files keep
