@@ -23,6 +23,8 @@
 #include <ImfChannelList.h>
 #include <ImfCompositeDeepScanLine.h>
 #include <ImfCompression.h>
+#include <ImfDoubleAttribute.h>
+#include <ImfFloatAttribute.h>
 #include <ImfDeepFrameBuffer.h>
 #include <ImfDeepScanLineInputFile.h>
 #include <ImfDeepScanLineInputPart.h>
@@ -39,7 +41,9 @@
 #include <ImfInputPart.h>
 #include <ImfMultiPartInputFile.h>
 #include <ImfOutputFile.h>
+#include <ImfRationalAttribute.h>
 #include <ImfStringAttribute.h>
+#include <ImfTimeCodeAttribute.h>
 #include <ImfThreading.h>
 #include <half.h>
 #endif
@@ -316,6 +320,51 @@ std::string readExrColorInteropId(const std::string& file) {
 #else
     (void)file;
     return {};
+#endif
+}
+
+bool readExrAttributes(const std::string& file, std::map<std::string, ExrAttribute>& out, std::string* error) {
+    out.clear();
+#ifdef MONTAGE_WITH_OPENEXR
+    try {
+        Imf::InputFile in(file.c_str(), 1);
+        char buf[64];
+        for (auto it = in.header().begin(); it != in.header().end(); ++it) {
+            ExrAttribute a;
+            const Imf::Attribute& at = it.attribute();
+            a.type = at.typeName();
+            if (const auto* s = dynamic_cast<const Imf::StringAttribute*>(&at)) {
+                a.text = s->value();
+            } else if (const auto* f = dynamic_cast<const Imf::FloatAttribute*>(&at)) {
+                a.number = f->value();
+                std::snprintf(buf, sizeof buf, "%.9g", a.number);
+                a.text = buf;
+            } else if (const auto* d = dynamic_cast<const Imf::DoubleAttribute*>(&at)) {
+                a.number = d->value();
+                std::snprintf(buf, sizeof buf, "%.17g", a.number);
+                a.text = buf;
+            } else if (const auto* i = dynamic_cast<const Imf::IntAttribute*>(&at)) {
+                a.number = i->value();
+                a.text = std::to_string(i->value());
+            } else if (const auto* r = dynamic_cast<const Imf::RationalAttribute*>(&at)) {
+                a.number = double(r->value());
+                a.text = std::to_string(r->value().n) + "/" + std::to_string(r->value().d);
+            } else if (const auto* t = dynamic_cast<const Imf::TimeCodeAttribute*>(&at)) {
+                const Imf::TimeCode& tc = t->value();
+                std::snprintf(buf, sizeof buf, "%02d:%02d:%02d%c%02d", tc.hours(), tc.minutes(), tc.seconds(), tc.dropFrame() ? ';' : ':', tc.frame());
+                a.text = buf;
+            }
+            out[it.name()] = std::move(a);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = "Cannot read " + file + ": " + e.what();
+        return false;
+    }
+#else
+    (void)file;
+    if (error) *error = "This build of Montage reads OpenEXR headers only with the OpenEXR library";
+    return false;
 #endif
 }
 
@@ -804,6 +853,48 @@ std::string exrCompressionLabel(const std::string& name) {
     return it == labels.end() ? name : it->second;
 }
 
+#ifdef MONTAGE_WITH_OPENEXR
+namespace {
+
+// An attribute by name: OpenEXR's standard ones with their own types (a value that does not parse is left out), the
+// rest as strings.
+void insertAttribute(Imf::Header& header, const std::string& name, const std::string& value) {
+    static const std::set<std::string> floats{"nominalFocalLength", "tStop", "focus", "shutterAngle", "expTime", "aperture", "isoSpeed",
+                                              "utcOffset", "longitude", "latitude", "altitude", "xDensity", "whiteLuminance",
+                                              "pixelAspectRatio", "screenWindowWidth"};
+    auto number = [&](double& out) {
+        char* end = nullptr;
+        out = std::strtod(value.c_str(), &end);
+        return end != value.c_str() && *end == 0 && std::isfinite(out);
+    };
+    if (floats.count(name)) {
+        if (double d = 0; number(d)) header.insert(name, Imf::FloatAttribute(float(d)));
+    } else if (name == "imageCounter") {
+        if (double d = 0; number(d) && d == std::floor(d) && std::fabs(d) < 2147483647.0) header.insert(name, Imf::IntAttribute(int(d)));
+    } else if (name == "framesPerSecond" || name == "captureRate") {
+        long long n = 0, d = 1;
+        char tail = 0;
+        const int got = std::sscanf(value.c_str(), "%lld/%lld%c", &n, &d, &tail);
+        if ((got == 2 || (got == 1 && value.find('/') == std::string::npos)) && n > 0 && d > 0 && n <= 2147483647 && d <= 4294967295LL)
+            header.insert(name, Imf::RationalAttribute(Imf::Rational(int(n), unsigned(d))));
+    } else if (name == "timeCode") {
+        int hh = 0, mm = 0, ss = 0, ff = 0;
+        char sep = 0, tail = 0;
+        if (std::sscanf(value.c_str(), "%d:%d:%d%c%d%c", &hh, &mm, &ss, &sep, &ff, &tail) == 5 && (sep == ':' || sep == ';' || sep == '.' || sep == ',') &&
+            hh >= 0 && hh < 24 && mm >= 0 && mm < 60 && ss >= 0 && ss < 60 && ff >= 0 && ff < 60) {
+            try {
+                header.insert(name, Imf::TimeCodeAttribute(Imf::TimeCode(hh, mm, ss, ff, sep == ';' || sep == ',')));
+            } catch (const std::exception&) {
+            }
+        }
+    } else {
+        header.insert(name, Imf::StringAttribute(value));
+    }
+}
+
+}  // namespace
+#endif
+
 bool writeExr(const std::string& file, int width, int height, const std::vector<ExrOutLayer>& layers, const std::string& compression,
               const std::map<std::string, std::string>& attributes, std::string* error) {
 #ifdef MONTAGE_WITH_OPENEXR
@@ -817,7 +908,7 @@ bool writeExr(const std::string& file, int width, int height, const std::vector<
         }
         Imf::Header header(width, height);
         header.compression() = c;
-        for (const auto& [k, v] : attributes) header.insert(k, Imf::StringAttribute(v));
+        for (const auto& [k, v] : attributes) insertAttribute(header, k, v);
         // Half channels converted once, kept alive until the file is written.
         std::vector<std::vector<half>> halves;
         halves.reserve(layers.size());

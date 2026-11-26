@@ -14146,6 +14146,231 @@ private slots:
         QVERIFY(res.value("isError").toBool());  // (no clips)
     }
 
+    void vfxPullsCarryWhatThePlateKnows() {
+        if (!exrAvailable()) QSKIP("Needs the OpenEXR library");
+        // The footage: 4 s at 25 fps, grey, recorded on a camera and lens the media's metadata names, from 01:00:00:00.
+        const std::string footage = path("known-plate.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 64;
+            gs.height = 36;
+            gs.fps = Rational{25, 1};
+            Clip c = makeGeneratorClip(gen, "color", 100);
+            c.generator.params["color.r"] = Param(0.5);
+            c.generator.params["color.g"] = Param(0.5);
+            c.generator.params["color.b"] = Param(0.5);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.path = footage;
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        p.name = "Heist";
+        Sequence& s = *p.active();
+        s.name = "Reel 1";
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, footage);
+        m.metadata["camera_make"] = "Acme";
+        m.metadata["camera"] = "Acme C1";
+        m.metadata["camera_serial"] = "C1-0042";
+        m.metadata["lens_make"] = "Lensco";
+        m.metadata["lens"] = "Prime 35";
+        m.metadata["focal_length"] = "35mm";
+        m.metadata["t_stop"] = "T2.8";
+        m.metadata["focus_distance"] = "3.5";
+        m.metadata["shutter_angle"] = "172.8";
+        m.metadata["tape"] = "A001C003";
+        m.created = "2026-10-01T14:30:00+02:00";
+        m.timecode = 3600;
+        p.media.push_back(m);
+        // A shot at 400 %: source frames 40-59 for its five frames of the cut.
+        Clip a = makeClip(p, m, TrackKind::Video, s);
+        a.name = "Fast";
+        a.sourceIn = 40;
+        a.duration = 5;
+        a.speed = 4;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, a);
+        // A shot ramping from 100 % to 300 %, with the camera that filmed it solved over the footage it uses.
+        Clip b = makeClip(p, m, TrackKind::Video, s);
+        b.name = "Ramp";
+        b.sourceIn = 10;
+        b.start = 10;
+        b.duration = 10;
+        Param& sp = b.timing.params["speed"];
+        sp.addKey(0, 100);
+        sp.addKey(10, 300);
+        QVERIFY(b.ramped());
+        CameraSolve solve;
+        solve.width = 64, solve.height = 36, solve.focal = 50, solve.fps = 25, solve.start = 10 / 25.0, solve.oriented = true;
+        for (int i = 0; i < 20; ++i) {
+            SolvedCamera sc;
+            sc.valid = true;
+            sc.C = {0.1 * i, 1.6 - 0.01 * i, 4 + 0.05 * i};
+            solve.cameras.push_back(sc);
+        }
+        Effect track = makeEffect(p, "camera_track");
+        track.strings["solve"] = cameraSolveToString(solve);
+        b.effects.push_back(track);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, b);
+        auto file = [&](const VfxShot& sh, int n) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, ".%04d.exr", n);
+            return sh.folder + "/" + sh.name + buf;
+        };
+        // Without scaling, 8 source frames of handles either side; scaled by the speed, 32.
+        VfxPullOptions o;
+        o.folder = path("known-pulls");
+        o.scripts = true;
+        std::vector<VfxShot> shots;
+        std::string err;
+        QVERIFY2(exportVfxPulls(p, s, {a.id}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.size(), size_t(1));
+        QVERIFY(shots[0].headHandle == 8 && shots[0].tailHandle == 8);
+        o.folder = path("known-pulls-scaled");
+        o.scaleHandles = true;
+        QVERIFY2(exportVfxPulls(p, s, {a.id, b.id}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.size(), size_t(2));
+        const VfxShot fast = shots[0], ramp = shots[1];
+        QCOMPARE(fast.headHandle, 32);
+        QCOMPARE(fast.tailHandle, 32);
+        QCOMPARE(fast.firstFrame, 1001 - 32);
+        QCOMPARE(fast.cutOut, 1020);
+        QCOMPARE(fast.lastFrame, 1020 + 32);
+        QVERIFY(QFileInfo::exists(QString::fromStdString(file(fast, 969))));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(file(fast, 968))));
+        // The ramp's ends: 100 % at its head (8 frames), 300 % at its tail (24), as far as the footage goes (10 before it).
+        QCOMPARE(ramp.headHandle, 8);
+        QCOMPARE(ramp.tailHandle, 24);
+        // Every frame's header: the camera, lens and reel as strings, the lens's numbers as floats, the rate as a
+        // rational, the frame's number in the source and its timecode rising a frame at a time.
+        for (int n = 1001; n <= 1004; ++n) {
+            std::map<std::string, ExrAttribute> h;
+            QVERIFY2(readExrAttributes(file(fast, n), h, &err), err.c_str());
+            auto text = [&](const char* k) { return h.count(k) ? h[k].type + " " + h[k].text : std::string("missing"); };
+            QCOMPARE(text("cameraMake"), std::string("string Acme"));
+            QCOMPARE(text("cameraModel"), std::string("string Acme C1"));
+            QCOMPARE(text("cameraSerialNumber"), std::string("string C1-0042"));
+            QCOMPARE(text("lensMake"), std::string("string Lensco"));
+            QCOMPARE(text("lensModel"), std::string("string Prime 35"));
+            QCOMPARE(text("reelName"), std::string("string A001C003"));
+            QCOMPARE(text("capDate"), std::string("string 2026:10:01 14:30:00"));
+            QCOMPARE(h["utcOffset"].type, std::string("float"));
+            QCOMPARE(h["utcOffset"].number, -7200.0);
+            for (const auto& [k, v] : std::map<std::string, double>{{"nominalFocalLength", 35}, {"tStop", 2.8}, {"focus", 3.5}, {"shutterAngle", 172.8}}) {
+                QCOMPARE(h[k].type, std::string("float"));
+                QVERIFY2(std::fabs(h[k].number - v) < 1e-5, k.c_str());
+            }
+            QCOMPARE(text("framesPerSecond"), std::string("rational 25/1"));
+            QCOMPARE(text("captureRate"), std::string("rational 25/1"));
+            QCOMPARE(text("imageCounter"), std::string("int ") + std::to_string(40 + n - 1001));
+            char tc[16];
+            std::snprintf(tc, sizeof tc, "01:00:01:%02d", 15 + n - 1001);  // (source frame 40 is a second and 15 frames in)
+            QCOMPARE(text("timeCode"), std::string("timecode ") + tc);
+            QVERIFY(h["comments"].text.find("Fast") != std::string::npos && h["comments"].text.find("Heist") != std::string::npos);
+            QCOMPARE(text("colorInteropID").substr(0, 7), std::string("string "));  // (as before)
+        }
+        // The ramp's retime in its script: a TimeWarp whose curve maps each frame of the cut, from 1001, to the plate
+        // frame Montage shows there.
+        QFile nk(QString::fromStdString(ramp.script));
+        QVERIFY(nk.open(QIODevice::ReadOnly));
+        const QString script = QString::fromUtf8(nk.readAll());
+        nk.close();
+        const QRegularExpression lookupRe(QStringLiteral("TimeWarp \\{\\n lookup \\{\\{curve ([^}]*)\\}\\}"));
+        const QRegularExpressionMatch lookup = lookupRe.match(script);
+        QVERIFY2(lookup.hasMatch(), qPrintable(script));
+        const QStringList keys = lookup.captured(1).split(' ', Qt::SkipEmptyParts);
+        QCOMPARE(keys.size(), 2 * 10);
+        const Clip* placed = edit::clipById(s, b.id);
+        for (int k = 0; k < 10; ++k) {
+            QCOMPARE(keys[2 * k], QStringLiteral("x%1").arg(1001 + k));
+            // (the source frame shown, counted in the plate's numbers from the plate's first frame)
+            const double want = ramp.firstFrame + (placed->sourceFrameAt(placed->start + k) - ramp.sourceIn * 25);
+            QVERIFY2(std::fabs(keys[2 * k + 1].toDouble() - want) < 1e-6, qPrintable(keys[2 * k + 1] + " " + QString::number(want, 'f', 6)));
+        }
+        // The solve beside the ramp's plate as .chan: the camera at each plate frame, numbered from the frame its first
+        // solved frame (source frame 10) has in the plate, which the script reads into a camera.
+        QVERIFY(!ramp.chan.empty());
+        QVERIFY(fast.chan.empty());
+        QFile chan(QString::fromStdString(ramp.chan));
+        QVERIFY(chan.open(QIODevice::ReadOnly));
+        const QStringList lines = QString::fromUtf8(chan.readAll()).split('\n', Qt::SkipEmptyParts);
+        chan.close();
+        QCOMPARE(lines.size(), 20);
+        for (int i = 0; i < 20; ++i) {
+            const QStringList v = lines[i].split(' ', Qt::SkipEmptyParts);
+            QCOMPARE(v.size(), 8);
+            QCOMPARE(v[0].toInt(), ramp.cutIn + i);
+            QVERIFY(std::fabs(v[1].toDouble() - solve.cameras[size_t(i)].C.x) < 1e-6);
+            QVERIFY(std::fabs(v[2].toDouble() - solve.cameras[size_t(i)].C.y) < 1e-6);
+            QVERIFY(std::fabs(v[3].toDouble() - solve.cameras[size_t(i)].C.z) < 1e-6);
+        }
+        QCOMPARE(lines[0].split(' ').at(0).toInt(), 1001);
+        QVERIFY(script.contains("Camera2 {") && script.contains("translate {{curve x1001 0 x1002 0.1"));
+        // The shot list's OpenTimelineIO carries the retimes as time effects: a linear time warp at 400 %, and the ramp.
+        recordVfxShots(s, shots);
+        const QJsonObject otio = QJsonDocument::fromJson(QByteArray::fromStdString(vfxShotListOtio(s))).object();
+        const QJsonArray clips = otio.value("tracks").toObject().value("children").toArray().at(0).toObject().value("children").toArray();
+        QJsonObject fastEffect, rampEffect;
+        for (const QJsonValue& v : clips) {
+            const QJsonObject c = v.toObject();
+            if (c.value("name").toString() == "Fast") fastEffect = c.value("effects").toArray().at(0).toObject();
+            if (c.value("name").toString() == "Ramp") rampEffect = c.value("effects").toArray().at(0).toObject();
+        }
+        QCOMPARE(fastEffect.value("OTIO_SCHEMA").toString(), QString("LinearTimeWarp.1"));
+        QCOMPARE(fastEffect.value("time_scalar").toDouble(), 4.0);
+        QCOMPARE(rampEffect.value("OTIO_SCHEMA").toString(), QString("TimeEffect.1"));
+        const QJsonArray rampLookup = rampEffect.value("metadata").toObject().value("montage").toObject().value("retime").toArray();
+        QCOMPARE(rampLookup.size(), 10);
+        QVERIFY(std::fabs(rampLookup.at(9).toArray().at(1).toDouble() - keys[19].toDouble()) < 1e-6);
+        // Float values: a frame with values below 0 and over 1 keeps them, and clipped has none (graded in linear
+        // light from frames in linear light, so the plate is the footage's values as they are).
+        s.workingSpace = "linear-rec709";
+        const QString dir = QString::fromStdString(path("hot"));
+        QDir().mkpath(dir);
+        for (int n = 1; n <= 3; ++n) {
+            ExrOutLayer l;
+            l.channels = {"R", "G", "B"};
+            for (int i = 0; i < 16 * 8; ++i) l.data.insert(l.data.end(), {-0.25f, 1.5f, 0.5f});
+            QVERIFY2(writeExr((dir + QStringLiteral("/hot.%1.exr").arg(n, 4, 10, QLatin1Char('0'))).toStdString(), 16, 8, {l}, "zip", {}, &err), err.c_str());
+        }
+        ImageSequence frames;
+        QVERIFY(detectImageSequence((dir + "/hot.0001.exr").toStdString(), frames));
+        frames.fps = Rational{25, 1};
+        MediaItem hot = probeOrFail(p, imageSequencePath(frames));
+        hot.colorOverride = "linear-rec709";
+        p.media.push_back(hot);
+        Clip h = makeClip(p, hot, TrackKind::Video, s);
+        h.start = 40;
+        h.duration = 3;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, h);
+        auto extremes = [&](const VfxShot& sh) {
+            int w = 0, ht = 0;
+            std::vector<float> rgba;
+            std::pair<float, float> mm{1e9f, -1e9f};
+            if (!readExrLayer(file(sh, 1001), "", w, ht, rgba, &err)) return mm;
+            for (size_t i = 0; i < rgba.size(); i += 4)
+                for (size_t k = 0; k < 3; ++k) mm = {std::min(mm.first, rgba[i + k]), std::max(mm.second, rgba[i + k])};
+            return mm;
+        };
+        VfxPullOptions kept;
+        kept.folder = path("hot-kept");
+        kept.handles = 0;
+        QVERIFY2(exportVfxPulls(p, s, {h.id}, kept, &shots, nullptr, nullptr, &err), err.c_str());
+        const auto wide = extremes(shots.at(0));
+        QVERIFY2(wide.first < -0.2f && wide.second > 1.4f, qPrintable(QString("%1 %2").arg(wide.first).arg(wide.second)));
+        VfxPullOptions clipped = kept;
+        clipped.folder = path("hot-clipped");
+        clipped.clipNegative = clipped.clipOver = true;
+        QVERIFY2(exportVfxPulls(p, s, {h.id}, clipped, &shots, nullptr, nullptr, &err), err.c_str());
+        const auto narrow = extremes(shots.at(0));
+        QVERIFY2(narrow.first >= 0 && narrow.second <= 1, qPrintable(QString("%1 %2").arg(narrow.first).arg(narrow.second)));
+        QVERIFY(narrow.second > 0.99f);
+    }
+
     void bt2446OverMcp() {
         // An HDR master with an SDR still in it and a grey shot: the still brought into HDR by BT.2446 Method C, an SDR
         // trim target and an SDR render made with Method A.
@@ -42436,7 +42661,6 @@ private slots:
                 return sum;
             };
             const double secondBlur = differs(0, true), firstSame = differs(0, false);
-            }
             qInfo("a second card's own lens kept: blur %.2f on its half, %.4f on the first card's", secondBlur, firstSame);
             QVERIFY(secondBlur > 20);
             QCOMPARE(firstSame, 0.0);

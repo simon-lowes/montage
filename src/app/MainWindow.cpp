@@ -4475,6 +4475,11 @@ void MainWindow::vfxPullDialog() {
     handles->setValue(appSettings().value("vfx/handles", 8).toInt());
     handles->setSuffix(tr(" frames"));
     form->addRow(tr("Handles:"), handles);
+    auto* scaleHandles = new QCheckBox(tr("Scale the handles by each shot's speed"), &dlg);
+    scaleHandles->setObjectName(QStringLiteral("vfxScaleHandles"));
+    scaleHandles->setToolTip(tr("A shot at 400 % with 8 handles pulls 32 source frames either side"));
+    scaleHandles->setChecked(appSettings().value("vfx/scaleHandles", false).toBool());
+    form->addRow(scaleHandles);
     auto* cutIn = new QSpinBox(&dlg);
     cutIn->setRange(0, 100000);
     cutIn->setValue(1001);
@@ -4496,17 +4501,30 @@ void MainWindow::vfxPullDialog() {
     auto* mattes = new QCheckBox(tr("Add the clips' masks as mattes"), &dlg);
     mattes->setObjectName(QStringLiteral("vfxMattes"));
     mattes->setChecked(appSettings().value("vfx/mattes", false).toBool());
+    auto* clipNegative = new QCheckBox(tr("Clip values below 0"), &dlg);
+    clipNegative->setObjectName(QStringLiteral("vfxClipNegative"));
+    clipNegative->setChecked(appSettings().value("vfx/clipNegative", false).toBool());
+    auto* clipOver = new QCheckBox(tr("Clip values over 1"), &dlg);
+    clipOver->setObjectName(QStringLiteral("vfxClipOver"));
+    clipOver->setChecked(appSettings().value("vfx/clipOver", false).toBool());
     if (exrAvailable()) {
         for (const std::string& c : exrCompressions()) compression->addItem(QString::fromStdString(exrCompressionLabel(c)), QString::fromStdString(c));
         compression->setCurrentIndex(std::max(0, compression->findData(appSettings().value("vfx/compression", "zip").toString())));
         form->addRow(tr("OpenEXR compression:"), compression);
         form->addRow(sourceLayers);
         form->addRow(mattes);
+        auto* clipping = new QHBoxLayout;
+        clipping->addWidget(clipNegative);
+        clipping->addWidget(clipOver);
+        clipping->addStretch();
+        form->addRow(clipping);
         auto update = [=] {
             const bool exr = format->currentData().toString() == QLatin1String("exr");
             compression->setEnabled(exr);
             sourceLayers->setEnabled(exr);
             mattes->setEnabled(exr);
+            clipNegative->setEnabled(exr);
+            clipOver->setEnabled(exr);
         };
         connect(format, &QComboBox::currentIndexChanged, &dlg, update);
         update();
@@ -4514,6 +4532,8 @@ void MainWindow::vfxPullDialog() {
         compression->hide();
         sourceLayers->hide();
         mattes->hide();
+        clipNegative->hide();
+        clipOver->hide();
     }
     // The shots' names, and a compositing script each writing its first version where the returns are looked for.
     auto* names = new QLineEdit(&dlg);
@@ -4548,7 +4568,13 @@ void MainWindow::vfxPullDialog() {
         if (o.compression == "zip") o.compression.clear();  // (FFmpeg's writer, unless layers are wanted)
         o.sourceLayers = sourceLayers->isChecked();
         o.mattes = mattes->isChecked();
+        appSettings().setValue("vfx/clipNegative", clipNegative->isChecked());
+        appSettings().setValue("vfx/clipOver", clipOver->isChecked());
+        o.clipNegative = clipNegative->isChecked();
+        o.clipOver = clipOver->isChecked();
     }
+    o.scaleHandles = scaleHandles->isChecked();
+    appSettings().setValue("vfx/scaleHandles", o.scaleHandles);
     o.folder = folder.toStdString();
     o.format = format->currentData().toString().toStdString();
     o.handles = handles->value();
@@ -4569,6 +4595,7 @@ void MainWindow::vfxPullDialog() {
                               {"colorSpace", QString::fromStdString(o.colorSpace)}, {"amf", o.amf}, {"fdl", o.fdl},
                               {"compression", QString::fromStdString(o.compression)}, {"sourceLayers", o.sourceLayers}, {"mattes", o.mattes},
                               {"stMaps", o.stMaps}, {"namePattern", QString::fromStdString(o.namePattern)}, {"scripts", o.scripts},
+                              {"scaleHandles", o.scaleHandles}, {"clipNegative", o.clipNegative}, {"clipOver", o.clipOver},
                               {"returns", QString::fromStdString(o.returns)}, {"returnsPattern", QString::fromStdString(o.returnsPattern)}};
     const TaskOutcome r = dialogJobs_->run(state_, QStringLiteral("vfx-pull"), tr("Pulling shots..."),
                                            QJsonObject{{"sequence", QString::number(s->id)}, {"clips", ids}, {"options", options}}, this);

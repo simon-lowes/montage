@@ -15742,7 +15742,12 @@ void McpServer::Impl::addTools() {
             "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true},
             "fdl":{"type":"boolean","default":true},
             "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false},
-            "st_maps":{"type":"boolean","default":false}},
+            "st_maps":{"type":"boolean","default":false},
+            "scale_handles":{"type":"boolean","default":false,"description":"Handles scaled by each shot's speed at its ends (400 % with 8 handles: 32 source frames)"},
+            "plate_metadata":{"type":"boolean","default":true,"description":"OpenEXR: the source's timecode, reel, camera, lens and frame numbers in OpenEXR's standard header attributes"},
+            "clip_negative":{"type":"boolean","default":false,"description":"OpenEXR: values below 0 clipped to 0"},
+            "clip_over":{"type":"boolean","default":false,"description":"OpenEXR: values over 1 clipped to 1"},
+            "camera":{"type":"boolean","default":true,"description":"A solved shot's camera as Nuke's .chan beside its plate, read by its script"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -15757,6 +15762,11 @@ void McpServer::Impl::addTools() {
             o.sourceLayers = a.value("source_layers").toBool();
             o.mattes = a.value("mattes").toBool();
             o.stMaps = a.value("st_maps").toBool();
+            o.scaleHandles = a.value("scale_handles").toBool();
+            o.plateMetadata = a.value("plate_metadata").toBool(true);
+            o.clipNegative = a.value("clip_negative").toBool();
+            o.clipOver = a.value("clip_over").toBool();
+            o.camera = a.value("camera").toBool(true);
             o.namePattern = str(a, "name_pattern").toStdString();
             o.scripts = a.value("scripts").toBool();
             // (the sequence's returns folder and naming kept unless others are given)
@@ -15781,6 +15791,7 @@ void McpServer::Impl::addTools() {
                                {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}};
                 if (!s.fdl.empty()) sh["fdl"] = QString::fromStdString(s.fdl);
                 if (!s.script.empty()) sh["script"] = QString::fromStdString(s.script);
+                if (!s.chan.empty()) sh["camera"] = QString::fromStdString(s.chan);
                 if (!s.undistortMap.empty()) {
                     sh["undistort_map"] = QString::fromStdString(s.undistortMap);
                     sh["redistort_map"] = QString::fromStdString(s.redistortMap);
