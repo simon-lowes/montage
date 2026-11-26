@@ -2610,7 +2610,8 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         std::vector<float> depth;
         Geometry g;
         if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
-        Image layer = renderTitle3DInScene(p, seq, c, t, W, H, double(W) / seq.width, &depth);
+        const Title3DPictures pictures = title3dPictures(p, seq, c, t, o, W, H);
+        Image layer = renderTitle3DInScene(p, seq, c, t, W, H, double(W) / seq.width, &depth, &pictures);
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         // (into Rec.709 as a model's picture is, straight then premultiplied again, then into the working space)
         parallelRows(layer.height, [&](int y0, int y1) {

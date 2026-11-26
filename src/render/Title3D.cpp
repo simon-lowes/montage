@@ -271,6 +271,7 @@ struct Built {
     int super = kSuper, W = 0, H = 0;
     double opacity = 0;
     Camera cam;
+    Lighting light;
     M3 R;
     V3 T;
     double k = 1;
@@ -576,6 +577,7 @@ bool buildTitle3D(const Effect& g, double t, int w, int h, double scale, FrameTi
     light.light = normalized({std::sin(az) * std::cos(el), std::cos(az) * std::cos(el), std::sin(el)});
     light.ambient = std::clamp(g.pAt("ambient", t, 35) / 100, 0.0, 1.0);
     light.specular = std::clamp(g.pAt("specular", t, 40) / 100, 0.0, 1.0);
+    b.light = light;
 
     // Everything is projected first (clipped where it comes nearer than the near plane), so the raster only needs
     // to cover where the title lands.
@@ -881,11 +883,12 @@ std::vector<std::array<V3, 3>> faceTriangles(const std::vector<Contour>& contour
 
 uint64_t title3dSolidsDrawn() { return gSolidsDrawn.load(); }
 
-bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, FrameTime duration, double fps, Title3DMesh& out) {
+bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, FrameTime duration, double fps, Title3DMesh& out,
+                 const Title3DPictures* pictures) {
     out = Title3DMesh{};
     const int w = std::max(1, int(std::lround(seqWidth))), h = std::max(1, int(std::lround(seqHeight)));
     Built b;
-    if (!buildTitle3D(g, t, w, h, 1.0, duration, fps, nullptr, b) || !g.s("camera_file").empty()) return false;
+    if (!buildTitle3D(g, t, w, h, 1.0, duration, fps, pictures, b) || !g.s("camera_file").empty()) return false;
     // The title's camera space (raster pixels) to the scene's: a unit a sequence pixel, the frame at z = 0.
     const double unit = 1.0 / b.super;
     auto toWorld = [&](V3 q) { return V3{q.x * unit, q.y * unit, (q.z + b.cam.f) * unit}; };
@@ -893,11 +896,44 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
     out.camera.C = {0, 0, b.cam.f * unit};
     out.camera.screen = {b.cam.f * unit, 0, b.cam.cx * unit, 0, b.cam.f * unit, b.cam.cy * unit};
     out.camera.nearZ = b.cam.nearest * unit;
+    out.toLight = {b.light.light.x, b.light.light.y, b.light.light.z};  // (the camera's axes are the scene's)
+    out.ambient = float(b.light.ambient);
     PosedTriangles& tr = out.triangles;
+    // (a face or side filled with a track's picture: a material of its own with that picture, display-referred, as
+    // its texture; 0 when it is not)
+    auto model = std::make_shared<Model>();
+    std::vector<const Image*> textured;
+    auto pictureMaterial = [&](const Paint& paint) {
+        if (paint.kind != 2 || !paint.picture || paint.picture->empty()) return 0;
+        for (size_t i = 0; i < textured.size(); ++i)
+            if (textured[i] == paint.picture) return int(i) + 1;
+        textured.push_back(paint.picture);
+        return int(textured.size());
+    };
+    // Each corner's own light (the title's, as its own drawing lights that corner: colour = min(1, base x lm + la))
+    // and its base: a picture x keep + add where it is filled with one, else add.
+    float own[6] = {0, 0, 0, 0, 0, 0};
+    auto lit = [&](V3 n, V3 p, const Paint& paint, const float* plain, double u, double v) {
+        float lm, la;
+        b.light.parts(n, p, lm, la);
+        own[0] = lm, own[1] = la;
+        if (pictureMaterial(paint) > 0) {
+            own[2] = paint.keep;
+            std::copy(paint.add, paint.add + 3, own + 3);
+        } else {
+            own[2] = 0;
+            float c[3];
+            if (paint.kind != 0) paint.at(u, v, c);
+            else std::copy(plain, plain + 3, c);
+            std::copy(c, c + 3, own + 3);
+        }
+    };
+    double uvAt[2] = {0, 0};
     auto vertex = [&](V3 p, V3 n, const float* col) {
         tr.positions.insert(tr.positions.end(), {float(p.x), float(p.y), float(p.z)});
         tr.normals.insert(tr.normals.end(), {float(n.x), float(n.y), float(n.z)});
-        tr.uvs.insert(tr.uvs.end(), {0.0f, 0.0f});
+        tr.uvs.insert(tr.uvs.end(), {float(uvAt[0]), float(uvAt[1])});
+        out.ownLight.insert(out.ownLight.end(), own, own + 6);
         tr.tangents.insert(tr.tangents.end(), {0.0f, 0.0f, 0.0f, 0.0f});
         // (the title's colours are display colours, as its own drawing shows them: made linear for the scene)
         for (int c = 0; c < 3; ++c) {
@@ -915,10 +951,12 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
     for (size_t si = 0; si < b.solids.size(); ++si) {
         const Solid& so = b.solids[si];
         const M3 Rs = b.R * so.rot;
-        auto place = [&](V3 p) { return toWorld(b.R * (so.place(p) * b.k) + b.T); };
+        auto toCamera = [&](V3 p) { return b.R * (so.place(p) * b.k) + b.T; };
+        auto place = [&](V3 p) { return toWorld(toCamera(p)); };
+        int material = 0;
         auto triangle = [&](uint32_t a, uint32_t bb, uint32_t c, bool face = false) {
             tr.indices.insert(tr.indices.end(), {a, bb, c});
-            tr.materials.push_back(0);
+            tr.materials.push_back(material);
             out.letterOf.push_back(int(si));
             out.onFace.push_back(face ? 1 : 0);
         };
@@ -927,11 +965,16 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
             const double z = side == 0 ? b.zf : b.zf - so.depth;
             const V3 n = Rs * V3{0, 0, side == 0 ? 1.0 : -1.0};
             const Paint& paint = side == 0 ? so.front : so.back;
+            material = pictureMaterial(paint);
+            // (lit as its own drawing lights the face: once, where its plane meets the solid's axis)
+            const V3 onPlane = toCamera({0, 0, z});
             for (const auto& f : faces) {
                 uint32_t idx[3];
                 for (int v = 0; v < 3; ++v) {
                     float col[3];
                     colourAt(paint, f[size_t(v)], col);
+                    b.across(f[size_t(v)], uvAt[0], uvAt[1]);
+                    lit(n, onPlane, paint, side == 0 ? so.face : paint.c1, uvAt[0], uvAt[1]);
                     idx[v] = vertex(place({f[size_t(v)].x, f[size_t(v)].y, z}), n, col);
                 }
                 if (side == 0) triangle(idx[0], idx[1], idx[2], true);
@@ -941,6 +984,7 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
         if (so.depth <= 0) continue;
         // The sides, a quad along every edge, normals smoothed where the outline curves (as it is drawn alone).
         const double smooth = std::cos(35 * kDeg), zb = b.zf - so.depth;
+        material = pictureMaterial(so.sides);
         for (const Contour& c : so.contours) {
             const size_t n = c.pts.size();
             std::vector<V3> edgeN(n);
@@ -955,8 +999,14 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
                 float ca[3], cb[3];
                 colourAt(so.sides, c.pts[i], ca);
                 colourAt(so.sides, c.pts[j], cb);
-                const uint32_t q0 = vertex(place({c.pts[i].x, c.pts[i].y, b.zf}), Rs * na, ca), q1 = vertex(place({c.pts[j].x, c.pts[j].y, b.zf}), Rs * nb, cb),
-                               q2 = vertex(place({c.pts[j].x, c.pts[j].y, zb}), Rs * nb, cb), q3 = vertex(place({c.pts[i].x, c.pts[i].y, zb}), Rs * na, ca);
+                // (each corner lit where it is, with its own normal, as its own drawing lights the sides)
+                auto corner = [&](const V3& at, double z, V3 nn, const float* col) {
+                    b.across(at, uvAt[0], uvAt[1]);
+                    lit(Rs * nn, toCamera({at.x, at.y, z}), so.sides, so.side, uvAt[0], uvAt[1]);
+                    return vertex(place({at.x, at.y, z}), Rs * nn, col);
+                };
+                const uint32_t q0 = corner(c.pts[i], b.zf, na, ca), q1 = corner(c.pts[j], b.zf, nb, cb), q2 = corner(c.pts[j], zb, nb, cb),
+                               q3 = corner(c.pts[i], zb, na, ca);
                 // (outward: the edge's normal is (dy, -dx), so front, along the edge, then back is anticlockwise seen
                 // from outside)
                 triangle(q0, q3, q2);
@@ -965,13 +1015,26 @@ bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, F
         }
     }
     if (tr.indices.empty()) return false;
-    auto model = std::make_shared<Model>();
     ModelMaterial m;
     m.name = "title";
     m.metallic = 0;
     m.roughness = float(std::clamp(1 - 0.6 * std::clamp(g.pAt("specular", t, 40) / 100, 0.0, 1.0), 0.05, 1.0));
     m.doubleSided = true;  // (a flat title is seen from either side)
     model->materials.push_back(m);
+    // (each picture as its own drawing samples it: premultiplied, display-referred, at its own size, clamped)
+    for (const Image* pic : textured) {
+        ModelTexture tex;
+        tex.wrapS = tex.wrapT = ModelTexture::Wrap::Clamp;
+        ModelTexture::Level level;
+        level.width = pic->width, level.height = pic->height;
+        level.rgbaLinear.assign(pic->px.begin(), pic->px.end());
+        tex.levels.push_back(std::move(level));
+        ModelMaterial pm = m;
+        pm.name = "title picture";
+        pm.baseTexture = int(model->textures.size());
+        model->textures.push_back(std::move(tex));
+        model->materials.push_back(pm);
+    }
     out.model = std::move(model);
     out.opacity = b.opacity;
     return true;

@@ -42740,6 +42740,9 @@ private slots:
             g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.9), g.params["side_color.b"] = Param(0.3);
             sceneByDefault = sceneByDefault && g.p("in_scene", 0) == 1.0;
             g.params["in_scene"] = Param(inScene ? 1.0 : 0.0);
+            // (lit as a 3D layer is, as projects saved before Lit as Drawn Alone have it, so its light and the card's
+            // are the same light: titlesInTheSceneLitAsAlone has the title lit as it lights itself)
+            g.params["own_light"] = Param(0.0);
             return c;
         };
         ModelCamera front;
@@ -42865,10 +42868,181 @@ private slots:
         }
     }
 
+    void titlesInTheSceneLitAsAlone() {
+        // In the 3D layers' scene a 3D title is lit as its own drawing lights it (Lit as Drawn Alone, on for a new
+        // title): with a card far behind it whose own light is off, the turned title's pixels (faces and sides, away
+        // from its edges and from where its colour changes) are within 1/255 of the title drawn out of the scene; and
+        // a face filled with a test chart from a track shows it, mapped as the title maps it out of the scene, within
+        // 1/255 there too. A title with the setting off (as projects saved before it have it) is lit otherwise.
+        const int W = 320, H = 180;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        RenderOptions o;
+        Clip back;
+        back.id = p.newId();
+        back.duration = 10;
+        back.generator = makeEffect(p, "color");
+        back.generator.params["color.r"] = 0.1, back.generator.params["color.g"] = 0.1, back.generator.params["color.b"] = 0.3;
+        {
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 0.0;
+            back.effects.push_back(e);
+            ModelCamera cam;
+            std::string err;
+            QVERIFY2(effectCamera(p, s, back, back.effects[0], 0, 1, cam, &err), err.c_str());
+            back.effects[0].params["pos_z"] = cam.C[2] - 3000;
+        }
+        auto title = [&](const char* text, double rotX, double rotY) {
+            Clip c = makeGeneratorClip(p, "title3d", 10);
+            Effect& g = c.generator;
+            g.strings["text"] = text;
+            g.strings["font"] = "DejaVu Sans";
+            g.params["size"] = Param(90.0), g.params["depth"] = Param(24.0);
+            g.params["rot_x"] = Param(rotX), g.params["rot_y"] = Param(rotY);
+            g.params["light_angle"] = Param(-50.0), g.params["light_height"] = Param(30.0);
+            g.params["color.r"] = Param(0.9), g.params["color.g"] = Param(0.5), g.params["color.b"] = Param(0.2);
+            g.params["side_color.r"] = Param(0.3), g.params["side_color.g"] = Param(0.6), g.params["side_color.b"] = Param(0.9);
+            g.params["shadows"] = Param(0.0);  // (its own drawing casts none on itself)
+            return c;
+        };
+        // Where the title alone is whole and its colour even (each of the 5 x 5 pixels about it opaque and within
+        // 2/255 of it), from its render with nothing else.
+        auto evenAt = [&](const Image& alone) {
+            std::vector<char> even(size_t(W) * size_t(H), 0);
+            for (int y = 2; y < H - 2; ++y)
+                for (int x = 2; x < W - 2; ++x) {
+                    bool ok = true;
+                    for (int dy = -2; dy <= 2 && ok; ++dy)
+                        for (int dx = -2; dx <= 2 && ok; ++dx) {
+                            const float* q = alone.at(x + dx, y + dy);
+                            ok = q[3] >= 1 - 1e-6f;
+                            for (int k = 0; k < 3 && ok; ++k) ok = std::fabs(q[k] - alone.at(x, y)[k]) <= 2.0f / 255;
+                        }
+                    even[size_t(y) * size_t(W) + size_t(x)] = ok;
+                }
+            return even;
+        };
+        auto compare = [&](const char* what, const Image& in, const Image& out, const std::vector<char>& even, int& n) {
+            float worst = 0;
+            int wx = 0, wy = 0;
+            n = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    if (!even[size_t(y) * size_t(W) + size_t(x)]) continue;
+                    ++n;
+                    for (int k = 0; k < 3; ++k)
+                        if (std::fabs(in.at(x, y)[k] - out.at(x, y)[k]) > worst) worst = std::fabs(in.at(x, y)[k] - out.at(x, y)[k]), wx = x, wy = y;
+                }
+            qInfo("%s: %d px compared, %.3f/255 apart at worst (%d, %d: %.3f %.3f %.3f against %.3f %.3f %.3f)", what, n, worst * 255, wx, wy,
+                  in.at(wx, wy)[0], in.at(wx, wy)[1], in.at(wx, wy)[2], out.at(wx, wy)[0], out.at(wx, wy)[1], out.at(wx, wy)[2]);
+            return worst;
+        };
+
+        // ---- Turned and lit from the side, its faces and sides in and out of the scene.
+        {
+            Clip t = title("Hi", 15, 35);
+            s.videoTracks[1].clips = {t};
+            const std::vector<char> even = evenAt(renderSequenceFrame(p, s, 3, o));
+            s.videoTracks[0].clips = {back};
+            QVERIFY(title3dInScene(s, s.videoTracks[1].clips[0], 3));
+            QCOMPARE(s.videoTracks[1].clips[0].generator.p("own_light", 3), 1.0);
+            const Image in = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips[0].generator.params["in_scene"] = Param(0.0);
+            const Image out = renderSequenceFrame(p, s, 3, o);
+            int n = 0;
+            QVERIFY(compare("lit as alone", in, out, even, n) <= 1.0f / 255);
+            QVERIFY(n > 1500);
+            // (both its faces and its sides compared: pixels of the face's colour and of the sides')
+            int faces = 0, sides = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (even[size_t(y) * size_t(W) + size_t(x)]) (out.at(x, y)[0] > out.at(x, y)[2] ? faces : sides) += 1;
+            QVERIFY2(faces > 300 && sides > 100, qPrintable(QString("%1 %2").arg(faces).arg(sides)));
+            // Its light read as a 3D layer's (off, as projects saved before it have it) lights it otherwise.
+            s.videoTracks[1].clips[0].generator.params["in_scene"] = Param(1.0);
+            s.videoTracks[1].clips[0].generator.params["own_light"] = Param(0.0);
+            QVERIFY(compare("lit as a 3D layer", renderSequenceFrame(p, s, 3, o), out, even, n) > 4.0f / 255);
+            for (Track& k : s.videoTracks) k.clips.clear();
+        }
+
+        // ---- A face filled with a test chart from the bottom track, square on: as the title shows it out of the scene.
+        {
+            Clip chart = makeGeneratorClip(p, "bars", 10);
+            Clip t = title("HI", 0, 0);
+            t.generator.params["face_fill"] = Param(2.0);
+            t.generator.params["face_track"] = Param(1.0);
+            s.videoTracks[0].clips = {chart};
+            s.videoTracks[2].clips = {t};
+            const std::vector<char> even = evenAt([&] {
+                Sequence alone = s;
+                alone.videoTracks[0].clips.clear();
+                alone.videoTracks[2].clips[0].generator.params["face_fill"] = Param(0.0);
+                return renderSequenceFrame(p, alone, 3, o);
+            }());
+            const Image outFlat = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips = {back};
+            QVERIFY(title3dInScene(s, s.videoTracks[2].clips[0], 3));
+            const Image in = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[2].clips[0].generator.params["in_scene"] = Param(0.0);
+            const Image out = renderSequenceFrame(p, s, 3, o);
+            // (the chart's edges as the face shows it left out: where the picture out of the scene changes)
+            const std::vector<char> chartEven = evenAt(out);
+            std::vector<char> both(even.size());
+            int colours = 0;
+            std::set<int> seen;
+            for (size_t i = 0; i < both.size(); ++i) {
+                both[i] = even[i] && chartEven[i];
+                if (both[i]) {
+                    const float* q = out.at(int(i % size_t(W)), int(i / size_t(W)));
+                    seen.insert(int(q[0] * 4) * 100 + int(q[1] * 4) * 10 + int(q[2] * 4));
+                }
+            }
+            colours = int(seen.size());
+            int n = 0;
+            QVERIFY(compare("a face showing a chart", in, out, both, n) <= 1.0f / 255);
+            QVERIFY2(n > 800 && colours >= 4, qPrintable(QString("%1 px, %2 colours").arg(n).arg(colours)));
+            QVERIFY(compare("the same out of the scene with no card", out, outFlat, both, n) <= 1.0f / 255);
+            for (Track& k : s.videoTracks) k.clips.clear();
+        }
+    }
+
+    void titleInTheSceneInProjectsSavedBefore() {
+        // A project as a build before 27 November wrote it (the fixture): a card far behind, seen through the scene's
+        // Camera clip, and a turned 3D title standing in their scene with no Lit as Drawn Alone setting. Opened, the
+        // setting is not there, and its frames render byte for byte as they do with it set off by hand (the title lit
+        // by its light read as a 3D layer's, as it was); with it on, the title looks different. Saved again and opened,
+        // it renders the same.
+        const QString fixturePath = QString(MONTAGE_TEST_DATA_DIR) + "/projects/title-in-scene-before-27-nov.montage";
+        Project opened;
+        std::string err;
+        QVERIFY2(loadProject(fixturePath.toStdString(), opened, &err), err.c_str());
+        Sequence& os = *opened.active();
+        QCOMPARE(int(os.videoTracks.size()), 3);
+        const Clip& title = os.videoTracks[2].clips.at(0);
+        QCOMPARE(title.generator.type, std::string("title3d"));
+        QVERIFY(title.generator.params.count("in_scene") && !title.generator.params.count("own_light"));
+        QVERIFY(title3dInScene(os, title, 4));
+        Project off = opened, on = opened;
+        off.active()->videoTracks[2].clips[0].generator.params["own_light"] = Param(0.0);
+        on.active()->videoTracks[2].clips[0].generator.params["own_light"] = Param(1.0);
+        RenderOptions o;
+        for (FrameTime t : {FrameTime(0), FrameTime(4), FrameTime(9)}) {
+            const Image a = renderSequenceFrame(opened, os, t, o), b = renderSequenceFrame(off, *off.active(), t, o);
+            QVERIFY2(a.px == b.px, qPrintable(QString("frame %1").arg(t)));
+        }
+        QVERIFY(renderSequenceFrame(on, *on.active(), 4, o).px != renderSequenceFrame(opened, os, 4, o).px);
+        Project again;
+        QVERIFY2(projectFromJson(projectToJson(opened), again, &err), err.c_str());
+        QVERIFY(renderSequenceFrame(again, *again.active(), 4, o).px == renderSequenceFrame(opened, os, 4, o).px);
+        QVERIFY(makeEffect(again, "title3d").p("own_light", 0) > 0.5);  // (on for a new title)
+    }
+
     void titlesInTheSceneShadowEachOther() {
         // In the 3D layers' scene, a letter's shadow on the next letter and a 3D model's shadow on a letter fall where a
-        // ray-traced reference puts them: a pixel of a letter's face (seen square on and facing the light) is in shadow
-        // where the ray from its point towards the light meets one of the casters' triangles (the title's from
+        // ray-traced reference puts them: a pixel of a letter's face (seen square on and facing the title's own light)
+        // is in shadow where the ray from its point towards the light meets one of the casters' triangles (the title's from
         // title3dMesh, the model's from modelClipScene, as the scene has them). Every face pixel the render shadows and
         // the reference does not (or the other way) is within 1 px of one the reference shadows and one it lights.
         const int W = 320, H = 180;
@@ -43002,7 +43176,7 @@ private slots:
             e.params["camera"] = 0.0;
             e.params["pos_z"] = -3000.0;
             back.effects.push_back(e);
-            Clip ii = title("II", -35, 10);
+            Clip ii = title("II", -80, 50);
             const int k = addTextAnimator(ii.generator);
             const std::string pre = "ta" + std::to_string(k) + ".";
             ii.generator.params[pre + "end"] = Param(50.0);
@@ -43023,8 +43197,9 @@ private slots:
                     (mesh.letterOf[i] == 0 ? z0 : z1) = std::max(mesh.letterOf[i] == 0 ? z0 : z1, z);
                 }
             QVERIFY2(z0 > z1 + 50, qPrintable(QString("%1 %2").arg(z0).arg(z1)));
-            const ModelLight light = settingsLight(ii.generator, 3, {0, 0, 0}, 1);
-            const V toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+            // (its own light, as it lights itself: Lit as Drawn Alone)
+            QCOMPARE(ii.generator.p("own_light", 3), 1.0);
+            const V toLight = mesh.toLight;
             QVERIFY(toLight[2] > 0.2);
             compare("a letter's shadow on the next", shaded, unshaded, mesh, 1, trianglesOf(mesh.triangles), {}, toLight);
             for (Track& t : s.videoTracks) t.clips.clear();
@@ -43033,9 +43208,10 @@ private slots:
         // ---- A box (a 3D model, seen through its own camera) up and to the left of an "I", between it and the light,
         // out of the letter's way as the camera sees it: its shadow on the letter's face.
         {
-            Clip one = title("I", -60, 15);
-            const ModelLight light = settingsLight(one.generator, 3, {0, 0, 0}, 1);
-            const V toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+            Clip one = title("I", -73, 29);
+            Title3DMesh lit;
+            QVERIFY(title3dMesh(one.generator, 3, W, H, 10, 25, lit));
+            const V toLight = lit.toLight;
             QVERIFY(toLight[2] > 0.2);
             Clip box = makeGeneratorClip(p, "model3d", 10);
             Effect& b = box.generator;

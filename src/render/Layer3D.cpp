@@ -338,12 +338,14 @@ bool title3dInScene(const Sequence& seq, const Clip& c, FrameTime t) {
 }
 
 Image renderTitle3DInScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
-                           std::vector<float>* depth) {
+                           std::vector<float>* depth, const Title3DPictures* pictures) {
     const FrameTime lt = t - c.start;
     const Effect& g = c.generator;
     Title3DMesh mesh;
     ModelCamera cam;
-    if (!title3dMesh(g, double(lt), seq.width, seq.height, c.duration, seq.fpsValue(), mesh) || !effectCamera(p, seq, c, g, t, scale, cam)) {
+    const bool own = g.p("own_light", lt, 0) > 0.5;
+    if (!title3dMesh(g, double(lt), seq.width, seq.height, c.duration, seq.fpsValue(), mesh, own ? pictures : nullptr) ||
+        !effectCamera(p, seq, c, g, t, scale, cam)) {
         if (depth) depth->assign(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
         return Image(std::max(1, w), std::max(1, h));
     }
@@ -354,11 +356,24 @@ Image renderTitle3DInScene(const Project& p, const Sequence& seq, const Clip& c,
     std::array<double, 3> lo, hi;
     modelBounds(scene.triangles, lo, hi);
     const std::array<double, 3> mid{(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2};
-    float ambient = 0;
-    ModelLight light = settingsLight(g, lt, mid, std::max(hi[0] - lo[0], hi[1] - lo[1]), &ambient);
-    light.shadows = true;  // (it takes the scene's shadows, casting its own or not)
-    scene.lights.push_back(light);
-    scene.ambient = {ambient, ambient, ambient};
+    if (own) {
+        // Lit as it lights itself alone: its own light at its corners (and its faces' pictures as it maps them),
+        // the shadows falling from where that light is.
+        ModelLight light;
+        light.direction = {-mesh.toLight[0], -mesh.toLight[1], -mesh.toLight[2]};
+        light.shadows = true;
+        scene.lights.push_back(light);
+        scene.ownLight = std::move(mesh.ownLight);
+        scene.ownAmbient = mesh.ambient;
+        scene.ownLightShadows = 0;
+    } else {
+        // (as projects saved before Lit as Drawn Alone had it: its light read as a 3D layer's)
+        float ambient = 0;
+        ModelLight light = settingsLight(g, lt, mid, std::max(hi[0] - lo[0], hi[1] - lo[1]), &ambient);
+        light.shadows = true;  // (it takes the scene's shadows, casting its own or not)
+        scene.lights.push_back(light);
+        scene.ambient = {ambient, ambient, ambient};
+    }
     scene.castsShadows = g.p("shadows", lt, 0) > 0.5;
     const SceneShadows sh = sceneShadows(p, seq, t, "front", {}, {}, &c);
     if (sh.world) scene.shadowWorld = sh.world;

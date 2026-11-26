@@ -1400,6 +1400,9 @@ std::vector<EffectInfo> buildCatalog() {
                                // in their scene, by depth with them, lit as they are and shadowing them (off in
                                // projects saved before it: there the title floats over them as it did).
                                boolean("in_scene", "Stand in the 3D Layers' Scene", true),
+                               // In that scene, lit as its own drawing lights it (off in projects saved before it:
+                               // there its light is read as a 3D layer's).
+                               boolean("own_light", "Lit as Drawn Alone (in the 3D layers' scene)", true),
                                boolean("shadows", "Cast Shadows (in the 3D layers' scene)", true),
                            },
                            {str("text", "Text", StringKind::MultilineText, "3D Title"),
