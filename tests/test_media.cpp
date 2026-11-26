@@ -51012,6 +51012,67 @@ private slots:
         }
     }
 
+    // Phase 18 #12. The whole tape repair of the test tape (wow and flutter taken out, then the azimuth followed over
+    // time and put right, the right channel 0.37 samples late) takes at most half the time it took at the end of
+    // Phase 17, and gives the same sound to within 1e-6 and the same delay to within 1e-9.
+    void tapeRepairInHalfTheTime() {
+        constexpr int sr = 48000;
+        const double chords[4][3] = {{200, 300, 450}, {250, 375, 560}, {220, 330, 440}, {275, 350, 420}};
+        auto music = [&](double tau) {
+            double v = 0.3 * std::sin(2 * M_PI * 1000 * tau);
+            const auto& chord = chords[size_t(std::max(0.0, tau) / 0.5) % 4];
+            for (double f : chord) v += 0.06 * std::sin(2 * M_PI * f * tau) + 0.03 * std::sin(2 * M_PI * 2 * f * tau);
+            return v;
+        };
+        auto tauAt = [](double t) {
+            return t + 0.003 / (2 * M_PI * 0.8) * (1 - std::cos(2 * M_PI * 0.8 * t)) + 0.0005 / (2 * M_PI * 12) * (1 - std::cos(2 * M_PI * 12 * t));
+        };
+        const size_t n = size_t(20 * sr);
+        AudioBuffer tape;
+        tape.sampleRate = sr, tape.channels = 2;
+        tape.samples.resize(n * 2);
+        for (size_t i = 0; i < n; ++i) {
+            tape.samples[i * 2] = float(music(tauAt(double(i) / sr)));
+            tape.samples[i * 2 + 1] = float(music(tauAt((double(i) - 0.37) / sr)));
+        }
+        struct Back {
+            ~Back() { tapeRepairAsBefore(false); }
+        } back;
+        // (before: as Phase 17 left it, wow and flutter already the quick way and the azimuth as Montage first did it;
+        // each way is timed three times and its best time kept, the two ways taken in turn)
+        auto repair = [&](bool before, AudioBuffer& out, double& delay) {
+            AudioBuffer steadied;
+            QElapsedTimer clock;
+            clock.start();
+            bool ok = removeWowFlutter(tape, steadied, 1, 1);
+            tapeRepairAsBefore(before);
+            ok = ok && correctAzimuth(steadied, out, true, true, nullptr, &delay);
+            const double took = clock.nsecsElapsed() / 1e6;
+            tapeRepairAsBefore(false);
+            return ok ? took : -1.0;
+        };
+        AudioBuffer before, now;
+        double delayBefore = 0, delayNow = 0, slow = 1e18, quick = 1e18;
+        for (int go = 0; go < 3; ++go) {
+            const double s = repair(true, before, delayBefore), q = repair(false, now, delayNow);
+            QVERIFY(s >= 0 && q >= 0);
+            slow = std::min(slow, s), quick = std::min(quick, q);
+        }
+        qInfo("Tape repair of 20 s of stereo (wow and flutter, then azimuth over time): %.0f ms as before, %.0f ms now (%.1f times as fast, %u cores)",
+              slow, quick, slow / std::max(quick, 1e-3), std::thread::hardware_concurrency());
+        QVERIFY2(std::fabs(delayNow - 0.37) < 0.02, qPrintable(QString::number(delayNow)));
+        QVERIFY2(std::fabs(delayNow - delayBefore) < 1e-9, qPrintable(QString::number(delayNow - delayBefore)));
+        QCOMPARE(now.samples.size(), before.samples.size());
+        double worst = 0;
+        for (size_t i = 0; i < now.samples.size(); ++i) worst = std::max(worst, double(std::fabs(now.samples[i] - before.samples[i])));
+        QVERIFY2(worst <= 1e-6, qPrintable(QString::number(worst)));
+        QVERIFY2(quick * 2 <= slow, qPrintable(QStringLiteral("%1 ms against %2 ms, on %3 cores").arg(quick).arg(slow).arg(std::thread::hardware_concurrency())));
+        // Cancelled, the azimuth's correction stops and says so.
+        std::atomic<bool> cancel{true};
+        AudioBuffer stopped;
+        QVERIFY(!correctAzimuth(now, stopped, true, true, &cancel));
+    }
+
     void tapeAndArchiveRepair() {
         constexpr int sr = 48000;
         auto stereo = [](const std::vector<double>& l, const std::vector<double>& r) {

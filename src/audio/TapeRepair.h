@@ -46,7 +46,8 @@ bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, doubl
                       const std::atomic<bool>* cancel = nullptr, double* deviation = nullptr, bool* corrected = nullptr,
                       const std::function<void(double)>& progress = {});
 // For tests: wow and flutter taken out as Montage first did (each partial's DFT summed directly hop by hop, the sound
-// resampled on one thread), to check and time the quicker way against.
+// resampled on one thread), and the azimuth measured and put right so (an FFT for each channel, on one thread), to
+// check and time the quicker way against.
 void tapeRepairAsBefore(bool before);
 
 // How far the right channel (the second) lags the left, in samples (negative: it leads), over [from, to) (to < 0:
