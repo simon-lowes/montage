@@ -7153,6 +7153,7 @@ private slots:
                         QPointer<AutoMixDialog> gone(d);
                         delete other.data();
                         wentWithIt = gone.isNull();
+                        return;  // (the list of windows holds the freed ones)
                     }
             });
             close.start(20);
