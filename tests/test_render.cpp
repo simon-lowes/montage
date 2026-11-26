@@ -34454,6 +34454,162 @@ colorspaces:
         }
         if (tried == 0) QSKIP("This FFmpeg has no AV1 encoder");
     }
+
+    // The 25 November nightly: crafted OBUs. An OBU whose size runs past its packet, or a frame whose header is cut
+    // short by its size; a sequence header changed in the middle of a stream with no key frame after it; and a frame
+    // that names a reference slot holding no frame: each is refused by the header reader and the grain writer, and
+    // read no further than the packet (each crafted packet is a buffer of its own size, for Valgrind to see).
+    void av1CraftedObusRefused() {
+        if (!avcodec_find_encoder_by_name("libaom-av1")) QSKIP("This FFmpeg has no libaom encoder");
+        const std::vector<std::pair<std::string, std::string>> options = {{"cpu-used", "8"}, {"crf", "40"}, {"b", "0"}, {"lag-in-frames", "0"}};
+        auto draw = [](int f, AVFrame* fr) {
+            for (int p = 0; p < 3; ++p)
+                for (int y = 0; y < (p ? fr->height / 2 : fr->height); ++y)
+                    for (int x = 0; x < (p ? fr->width / 2 : fr->width); ++x) fr->data[p][ptrdiff_t(y) * fr->linesize[p] + x] = uint8_t(p ? 128 : 30 + ((x + y + f * 3) % 64) * 3);
+        };
+        av1streams::Stream a, b;
+        std::string err;
+        QVERIFY2(av1streams::encode("libaom-av1", options, 64, 64, 8, 6, draw, a, &err), err.c_str());
+        QVERIFY2(av1streams::encode("libaom-av1", options, 96, 64, 8, 3, draw, b, &err), err.c_str());
+        struct Obu {
+            int type = 0;
+            size_t start = 0, sizeAt = 0, payload = 0, end = 0;
+        };
+        auto obusOf = [](const std::vector<uint8_t>& pk) {
+            std::vector<Obu> out;
+            for (size_t at = 0; at < pk.size();) {
+                Obu o;
+                o.start = at;
+                o.type = (pk[at] >> 3) & 15;
+                const bool ext = pk[at] & 4, sized = pk[at] & 2;
+                at += ext ? 2 : 1;
+                o.sizeAt = at;
+                uint64_t len = pk.size() - at;
+                if (sized) {
+                    len = 0;
+                    for (int i = 0; at < pk.size(); ++i) {
+                        len |= uint64_t(pk[at] & 0x7f) << (7 * i);
+                        if (!(pk[at++] & 0x80)) break;
+                    }
+                }
+                o.payload = at, o.end = std::min(pk.size(), at + size_t(len));
+                at = o.end;
+                out.push_back(o);
+            }
+            return out;
+        };
+        auto leb = [](uint64_t v) {
+            std::vector<uint8_t> out;
+            do {
+                uint8_t x = uint8_t(v & 0x7f);
+                v >>= 7;
+                if (v) x |= 0x80;
+                out.push_back(x);
+            } while (v);
+            return out;
+        };
+        // An OBU of `pk` with its size field said to be `size` (the bytes after it as they are), up to `keep` bytes
+        // of the packet after the size field.
+        auto resized = [&](const std::vector<uint8_t>& pk, const Obu& o, uint64_t size, size_t keep) {
+            std::vector<uint8_t> out(pk.begin(), pk.begin() + ptrdiff_t(o.sizeAt));
+            const std::vector<uint8_t> l = leb(size);
+            out.insert(out.end(), l.begin(), l.end());
+            out.insert(out.end(), pk.begin() + ptrdiff_t(o.payload), pk.begin() + ptrdiff_t(std::min(pk.size(), o.payload + keep)));
+            return out;
+        };
+        auto fresh = [&](const av1streams::Stream& s, Av1HeaderReader& r) {
+            r = Av1HeaderReader{};
+            return s.config.empty() || r.configure(s.config.data(), s.config.size());
+        };
+        // Refused by a reader that has read `before` of stream `s` first, and by a grain writer that has rewritten them.
+        auto refused = [&](const av1streams::Stream& s, int before, const std::vector<uint8_t>& crafted, const char* why) {
+            Av1HeaderReader r;
+            if (!fresh(s, r)) return QStringLiteral("the configuration was not read");
+            Av1GrainWriter w;
+            std::vector<uint8_t> config = s.config, out;
+            if (!config.empty() && !w.configure(config)) return QStringLiteral("the writer took no configuration");
+            const auto none = [](int64_t) { return Av1FilmGrain{}; };
+            std::vector<Av1FrameHeader> hs;
+            for (int i = 0; i < before; ++i) {
+                const auto& pk = s.packets[size_t(i)];
+                if (!r.read(pk.data(), pk.size(), hs) || !w.rewrite(pk.data(), pk.size(), i, none, out))
+                    return QStringLiteral("packet %1 as it was is not read").arg(i);
+            }
+            const auto own = std::make_unique<uint8_t[]>(crafted.size());  // (exactly its size)
+            std::memcpy(own.get(), crafted.data(), crafted.size());
+            std::string e1, e2;
+            if (r.read(own.get(), crafted.size(), hs, &e1)) return QStringLiteral("the reader took it");
+            if (w.rewrite(own.get(), crafted.size(), before, none, out, &e2)) return QStringLiteral("the writer took it");
+            if (e1.find(why) == std::string::npos || e2.find(why) == std::string::npos)
+                return QStringLiteral("refused as \"%1\" and \"%2\", not \"%3\"").arg(QString::fromStdString(e1), QString::fromStdString(e2), why);
+            return QString();
+        };
+        auto typed = [&](const std::vector<uint8_t>& pk, int type) {
+            for (const Obu& o : obusOf(pk))
+                if (o.type == type) return o;
+            return Obu{-1};
+        };
+        // An OBU longer than its packet: its size said 1000 bytes past the end.
+        const std::vector<uint8_t>& key = a.packets[0];
+        const Obu frame = typed(key, 6);
+        QVERIFY(frame.type == 6 && (key[frame.start] & 2));  // (a frame OBU with its size)
+        QString why = refused(a, 0, resized(key, frame, frame.end - frame.payload + 1000, key.size()), "longer than its packet");
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // A frame whose size leaves no room for its header: two bytes, and the packet ending there.
+        why = refused(a, 0, resized(key, frame, 2, 2), "cut short");
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // An OBU's size whose bytes run off the end of the packet.
+        std::vector<uint8_t> runsOff(key.begin(), key.begin() + ptrdiff_t(frame.sizeAt));
+        runsOff.push_back(0x80);
+        why = refused(a, 0, runsOff, "ends inside an OBU's size");
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // A stream's sequence header OBU, from its key frame's packet or its configuration.
+        auto sequenceOf = [&](const av1streams::Stream& s) {
+            Obu o = typed(s.packets[0], 1);
+            if (o.type == 1) return std::vector<uint8_t>(s.packets[0].begin() + ptrdiff_t(o.start), s.packets[0].begin() + ptrdiff_t(o.end));
+            if (s.config.size() <= 4) return std::vector<uint8_t>();
+            const std::vector<uint8_t> inConfig(s.config.begin() + 4, s.config.end());
+            o = typed(inConfig, 1);
+            if (o.type != 1) return std::vector<uint8_t>();
+            return std::vector<uint8_t>(inConfig.begin() + ptrdiff_t(o.start), inConfig.begin() + ptrdiff_t(o.end));
+        };
+        // (a packet with a sequence header put after its temporal delimiter)
+        auto withSequence = [&](std::vector<uint8_t> pk, const std::vector<uint8_t>& sequence) {
+            const Obu td = typed(pk, 2);
+            pk.insert(pk.begin() + ptrdiff_t(td.type == 2 ? td.end : 0), sequence.begin(), sequence.end());
+            return pk;
+        };
+        // The other stream's sequence header before an inter frame of this one.
+        const std::vector<uint8_t>& keyB = b.packets[0];
+        const std::vector<uint8_t> sequenceB = sequenceOf(b), sequenceA = sequenceOf(a);
+        QVERIFY(!sequenceB.empty() && !sequenceA.empty());
+        why = refused(a, 3, withSequence(a.packets[3], sequenceB), "changed without a key frame");
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // ...while the same header again, and the other stream's before its own key frame, are taken.
+        {
+            Av1HeaderReader r;
+            QVERIFY(fresh(a, r));
+            std::vector<Av1FrameHeader> hs;
+            for (int i = 0; i < 3; ++i) QVERIFY2(r.read(a.packets[size_t(i)].data(), a.packets[size_t(i)].size(), hs, &err), err.c_str());
+            const std::vector<uint8_t> next = typed(keyB, 1).type == 1 ? keyB : withSequence(keyB, sequenceB);
+            QVERIFY2(r.read(next.data(), next.size(), hs, &err), err.c_str());
+            QCOMPARE(hs.size(), size_t(1));
+            QCOMPARE(hs[0].width, 96);
+            for (size_t i = 1; i < b.packets.size(); ++i) QVERIFY2(r.read(b.packets[i].data(), b.packets[i].size(), hs, &err), err.c_str());
+            QCOMPARE(r.sequence().maxWidth, 96);
+        }
+        // An inter frame read after its sequence header with no key frame before it: the slots it names hold nothing.
+        why = refused(a, 0, withSequence(a.packets[1], sequenceA), "refers to a reference slot that holds no frame");
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // (and the stream as it is, whole, is read)
+        {
+            Av1HeaderReader r;
+            QVERIFY(fresh(a, r));
+            std::vector<Av1FrameHeader> hs;
+            for (const auto& pk : a.packets) QVERIFY2(r.read(pk.data(), pk.size(), hs, &err), err.c_str());
+        }
+    }
+
     void av1GrainParametersFromAProfile() {
         // A measured grain (a model's: fine grain whose strength follows the square root of the light, its colours
         // correlated 0.7) fitted to AV1's parameters for a 640-wide coded picture; the synthesis run on stripes a stop

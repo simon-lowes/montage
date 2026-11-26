@@ -251,6 +251,19 @@ bool Av1HeaderReader::readSequence(const uint8_t* p, size_t n, std::string* erro
     return true;
 }
 
+bool Av1HeaderReader::sequenceHeader(const uint8_t* p, size_t n, std::string* error) {
+    // (the same again, as encoders send it before each key frame: nothing changes)
+    if (seq_.valid && n == seqBytes_.size() && std::equal(p, p + n, seqBytes_.begin())) return true;
+    // Another one begins a new coded video sequence: what the slots hold was made under the old one, so a shown key
+    // frame must come next, and it cannot come between a frame's header and its tiles.
+    if (seq_.valid && seenFrameHeader_) return no(error, "The AV1 sequence header changed inside a frame");
+    const bool had = seq_.valid;
+    if (!readSequence(p, n, error)) return false;
+    seqBytes_.assign(p, p + n);
+    if (had) keyFrameDue_ = true;
+    return true;
+}
+
 int Av1HeaderReader::relativeDistance(int a, int b) const {
     if (!seq_.enableOrderHint || seq_.orderHintBits <= 0) return 0;
     const int m = 1 << (seq_.orderHintBits - 1);
@@ -278,6 +291,7 @@ bool Av1HeaderReader::readFrameHeader(const uint8_t* p, size_t n, const Obu& obu
             const Slot& shown = slots_[h.showSlot];
             if (b.bad) return no(error, "An AV1 frame header is cut short");
             if (!shown.valid) return no(error, "An AV1 frame shows a reference slot that holds no frame");
+            if (keyFrameDue_) return no(error, "The AV1 sequence header changed without a key frame after it");
             h.frameType = shown.frameType;
             h.refreshFlags = h.frameType == kKeyFrame ? kAllFrames : 0;
             h.orderHint = shown.orderHint;
@@ -294,6 +308,7 @@ bool Av1HeaderReader::readFrameHeader(const uint8_t* p, size_t n, const Obu& obu
         h.showableFrame = h.showFrame ? h.frameType != kKeyFrame : b.flag();
         errorResilient = h.frameType == kSwitchFrame || (h.frameType == kKeyFrame && h.showFrame) ? true : b.flag();
     }
+    if (keyFrameDue_ && !(h.frameType == kKeyFrame && h.showFrame)) return no(error, "The AV1 sequence header changed without a key frame after it");
     if (h.frameType == kKeyFrame && h.showFrame)
         for (Slot& slot : slots_) slot.valid = false, slot.orderHint = 0;
     const bool disableCdfUpdate = b.flag();
@@ -415,6 +430,9 @@ bool Av1HeaderReader::readFrameHeader(const uint8_t* p, size_t n, const Obu& obu
         b.f(1);                 // is_motion_mode_switchable
         if (!errorResilient && s.enableRefFrameMvs) b.f(1);  // use_ref_frame_mvs
         for (int i = 0; i < 7; ++i) h.refSlot[i] = ref[i];
+        // (every reference must hold a frame, as decoders require: one lost, or never made, is refused)
+        for (const int r : ref)
+            if (!slots_[r].valid) return no(error, "An AV1 frame refers to a reference slot that holds no frame");
     }
     if (!s.reducedStill && !disableCdfUpdate) b.f(1);  // disable_frame_end_update_cdf
     if (b.bad || frameWidth <= 0 || frameHeight <= 0) return no(error, "An AV1 frame header is cut short");
@@ -684,6 +702,7 @@ bool Av1HeaderReader::readFrameHeader(const uint8_t* p, size_t n, const Obu& obu
     now.showable = h.showableFrame;
     now.grain = h.grain;
     pending_ = now;
+    keyFrameDue_ = false;
     return true;
 }
 
@@ -699,7 +718,7 @@ bool Av1HeaderReader::configure(const uint8_t* data, size_t size, std::string* e
     std::vector<Obu> obus;
     if (!splitObus(data + from, size - from, obus, error)) return false;
     for (const Obu& o : obus)
-        if (o.type == kObuSequence) return readSequence(data + from + o.payload, o.size, error);
+        if (o.type == kObuSequence) return sequenceHeader(data + from + o.payload, o.size, error);
     // (an av1C box may hold no OBUs: the sequence header then comes with the first packet)
     if (from > 0 && obus.empty()) return true;
     return no(error, "The AV1 codec configuration has no sequence header");
@@ -728,7 +747,7 @@ bool Av1HeaderReader::read(const uint8_t* data, size_t size, std::vector<Av1Fram
         if (o.type == kObuDelimiter) {
             seenFrameHeader_ = false;
         } else if (o.type == kObuSequence) {
-            if (!readSequence(p, o.size, error)) return false;
+            if (!sequenceHeader(p, o.size, error)) return false;
         } else if (o.type == kObuFrameHeader || o.type == kObuRedundantHeader || o.type == kObuFrame) {
             if (!seenFrameHeader_) {
                 if (!readFrameHeader(p, o.size, o, current_, error)) return false;
@@ -840,7 +859,7 @@ bool Av1GrainWriter::rewrite(const uint8_t* data, size_t size, int64_t frame, co
             r.seenFrameHeader_ = false;
             emit(o, p, o.size);
         } else if (o.type == kObuSequence) {
-            if (!r.readSequence(p, o.size, error)) return false;
+            if (!r.sequenceHeader(p, o.size, error)) return false;
             std::vector<uint8_t> copy(p, p + o.size);
             const size_t bit = r.seq_.filmGrainBit;
             copy[bit / 8] |= uint8_t(0x80 >> (bit % 8));
