@@ -126,7 +126,8 @@ public:
     TaskOutcome run(EditorState* state, const QString& kind, const QString& title, const QJsonObject& input, QWidget* parent) {
         return watch(start(state, kind, title, input), parent);
     }
-    // The tasks running or waiting here, in the order they run.
+    // The tasks running or waiting here, in the order they run: as many run at once as background jobs may
+    // (jobs::atOnce), a paused one not counted, and the rest wait their turn.
     struct TaskInfo {
         QString id, kind, title;
         double progress = 0;
@@ -135,6 +136,7 @@ public:
     };
     std::vector<TaskInfo> tasks() const;
     void setPaused(const QString& id, bool paused);  // (it waits at its next report of progress)
+    static int taskThreadsInUse();                   // threads of the tasks' pool held now (a paused task holds none)
     void stop(const QString& id);
     bool moveUp(const QString& id);                  // a waiting one, before the one ahead of it
     // A result kept and not applied because its clips had moved: the note of what moved ("" when none is offered).

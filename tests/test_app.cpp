@@ -7016,6 +7016,47 @@ private slots:
         QCOMPARE(state()->undoText(), QString("Auto Duck"));
     }
 
+    void dialogTasksKeepToAtOnce() {
+        // Tasks run as many at once as background jobs may (Settings' jobs/at_once), the rest waiting their turn; a
+        // paused task gives its thread back to the pool and its place to one waiting.
+        const int atOnce = jobs::atOnce();
+        jobs::setAtOnce(2);
+        auto putBack = qScopeGuard([atOnce] { jobs::setAtOnce(atOnce); });
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        DialogJobs::registerKind(QStringLiteral("test-wait"), TaskKind{[release](TaskRun& r) {
+                                                                          while (!release->load() && !r.cancelled()) {
+                                                                              r.progress(0.5);
+                                                                              QThread::msleep(10);
+                                                                          }
+                                                                          return !r.cancelled();
+                                                                      },
+                                                                      {}, false, {}});
+        DialogJobs jobsHere;
+        QStringList ids;
+        for (int i = 0; i < 3; ++i) ids << jobsHere.start(nullptr, QStringLiteral("test-wait"), QStringLiteral("Waiting %1").arg(i), {});
+        auto runningOnes = [&] {
+            QStringList out;
+            for (const auto& t : jobsHere.tasks())
+                if (t.running && !t.paused) out << t.id;
+            return out;
+        };
+        QCOMPARE(jobsHere.tasks().size(), size_t(3));
+        QCOMPARE(runningOnes(), QStringList(ids.mid(0, 2)));
+        QTRY_COMPARE(DialogJobs::taskThreadsInUse(), 2);
+        // The first paused: the third starts, and two threads are held.
+        jobsHere.setPaused(ids[0], true);
+        QTRY_COMPARE(runningOnes(), QStringList(ids.mid(1, 2)));
+        QTRY_COMPARE(DialogJobs::taskThreadsInUse(), 2);
+        QTest::qWait(300);
+        QCOMPARE(DialogJobs::taskThreadsInUse(), 2);
+        // Going on, it takes a thread again.
+        jobsHere.setPaused(ids[0], false);
+        QTRY_COMPARE(DialogJobs::taskThreadsInUse(), 3);
+        release->store(true);
+        QTRY_VERIFY_WITH_TIMEOUT(jobsHere.tasks().empty(), 20000);
+        QTRY_COMPARE(DialogJobs::taskThreadsInUse(), 0);
+    }
+
     void dialogTasksLookedOver() {
         // Auto Mix and the Conform Check are jobs in the store whose results are looked over in their dialogs. Left to
         // run, Auto Mix's plan is kept and offered, and looked over from there it mixes as a watched run does; the
