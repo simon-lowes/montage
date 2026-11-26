@@ -178,6 +178,9 @@ if(TARGET OpenGL::GL AND UNIX AND NOT APPLE)
 endif()
 montage_test_ofx(montage_test_ofx_crash MontageTestOfxCrash crash)
 target_compile_definitions(montage_test_ofx_crash PRIVATE MONTAGE_TEST_OFX_CRASH)
+# (a second binary of the same plug-ins under ids of their own, whose load action misbehaves on request)
+montage_test_ofx(montage_test_ofx_second MontageTestOfxSecond second)
+target_compile_definitions(montage_test_ofx_second PRIVATE MONTAGE_TEST_OFX_SECOND)
 # (on-screen controls and OpenGL renders, in the render tests the GPU job runs)
 add_dependencies(test_render montage_test_ofx montage-plugin-probe montage-pluginhost)
 target_compile_definitions(test_render PRIVATE MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
@@ -192,7 +195,7 @@ target_compile_definitions(test_plugins PRIVATE
   MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
   MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
   MONTAGE_PLUGIN_HOST="$<TARGET_FILE:montage-pluginhost>")
-add_dependencies(test_plugins montage_test_long_a montage_test_long_b)
+add_dependencies(test_plugins montage_test_long_a montage_test_long_b montage_test_ofx_second)
 
 if(TARGET PkgConfig::LILV)
   # An LV2 gain with latency, as a bundle (shared module + Turtle files).

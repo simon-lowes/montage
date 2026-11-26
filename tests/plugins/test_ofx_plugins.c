@@ -17,6 +17,9 @@
  * Test Invert also renders with OpenGL (the same formula in a shader) and has OpenGL on-screen controls: a green
  * square from canonical (100, 100) to (200, 200); Test Dissolve renders with OpenGL too.
  * With MONTAGE_TEST_OFX_CRASH defined it instead crashes while describing itself, for the scanner's blocklist.
+ * With MONTAGE_TEST_OFX_SECOND defined it is a second binary of the same plug-ins under ids of their own
+ * ("org.montage.test.second.invert" and so on), whose load action misbehaves on request (test_fault.h, call "load"),
+ * for a shared host's blame of the binary it was loading.
  * Test Invert misbehaves on request when rendering (test_fault.h, call "render"), Test Probe's controls when drawing
  * (call "draw"). */
 #include <stdlib.h>
@@ -69,6 +72,9 @@ static OfxStatus load(void) {
     gEffect = (OfxImageEffectSuiteV1*)gHost->fetchSuite(gHost->host, kOfxImageEffectSuite, 1);
     gParam = (OfxParameterSuiteV1*)gHost->fetchSuite(gHost->host, kOfxParameterSuite, 1);
     gDraw = (OfxDrawSuiteV1*)gHost->fetchSuite(gHost->host, kOfxDrawSuite, 1);
+#ifdef MONTAGE_TEST_OFX_SECOND
+    montage_test_fault("load", NULL, 0);
+#endif
     return gProp && gEffect && gParam ? kOfxStatOK : kOfxStatErrMissingHostFeature;
 }
 
@@ -965,14 +971,19 @@ static OfxStatus invertOverlay(const char* action, const void* handle, OfxProper
 }
 #endif
 
-static OfxPlugin gInvert = {kOfxImageEffectPluginApi, 1, "org.montage.test.invert", 1, 0, setHost, mainInvert};
-static OfxPlugin gTemporal = {kOfxImageEffectPluginApi, 1, "org.montage.test.temporal", 1, 0, setHost, mainTemporal};
-static OfxPlugin gProbe = {kOfxImageEffectPluginApi, 1, "org.montage.test.probe", 1, 0, setHost, mainProbe};
-static OfxPlugin gColour = {kOfxImageEffectPluginApi, 1, "org.montage.test.colour", 1, 0, setHost, mainColour};
+#ifdef MONTAGE_TEST_OFX_SECOND
+#define TEST_ID(name) "org.montage.test.second." name
+#else
+#define TEST_ID(name) "org.montage.test." name
+#endif
+static OfxPlugin gInvert = {kOfxImageEffectPluginApi, 1, TEST_ID("invert"), 1, 0, setHost, mainInvert};
+static OfxPlugin gTemporal = {kOfxImageEffectPluginApi, 1, TEST_ID("temporal"), 1, 0, setHost, mainTemporal};
+static OfxPlugin gProbe = {kOfxImageEffectPluginApi, 1, TEST_ID("probe"), 1, 0, setHost, mainProbe};
+static OfxPlugin gColour = {kOfxImageEffectPluginApi, 1, TEST_ID("colour"), 1, 0, setHost, mainColour};
 
-static OfxPlugin gDissolve = {kOfxImageEffectPluginApi, 1, "org.montage.test.dissolve", 1, 0, setHost, mainDissolve};
-static OfxPlugin gGenerator = {kOfxImageEffectPluginApi, 1, "org.montage.test.generator", 1, 0, setHost, mainGenerator};
-static OfxPlugin gMatte = {kOfxImageEffectPluginApi, 1, "org.montage.test.matte", 1, 0, setHost, mainMatte};
+static OfxPlugin gDissolve = {kOfxImageEffectPluginApi, 1, TEST_ID("dissolve"), 1, 0, setHost, mainDissolve};
+static OfxPlugin gGenerator = {kOfxImageEffectPluginApi, 1, TEST_ID("generator"), 1, 0, setHost, mainGenerator};
+static OfxPlugin gMatte = {kOfxImageEffectPluginApi, 1, TEST_ID("matte"), 1, 0, setHost, mainMatte};
 static OfxPlugin* gPlugins[] = {&gInvert, &gTemporal, &gProbe, &gColour, &gDissolve, &gGenerator, &gMatte};
 
 EXPORT int OfxGetNumberOfPlugins(void) {

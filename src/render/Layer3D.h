@@ -77,6 +77,17 @@ SceneShadows sceneShadows(const Project& p, const Sequence& seq, FrameTime t, co
                           const std::function<Image(const Clip&)>& cardLayer = {},
                           const std::function<Image(int track)>& trackLayer = {}, const Clip* self = nullptr);
 
+// Whether 3D title clip c stands in the 3D layers' scene at sequence frame t: its In the 3D Scene setting on (off in
+// projects saved before it), seen through no file's camera, and a card or a model seen through its own camera or the
+// scene's Camera clip on screen with it. There its letters are drawn as a model is, through the scene's camera, lit
+// by its light (read as a 3D layer's is), merged by depth with the cards and models, and casting and taking shadows
+// with them in the scene's one shadow map a light.
+bool title3dInScene(const Sequence& seq, const Clip& c, FrameTime t);
+// Its picture there (linear light, Rec. 709 primaries, premultiplied), w x h on the sequence's frame scaled by
+// `scale`, and the depth of what is drawn (0 where nothing).
+Image renderTitle3DInScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
+                           std::vector<float>* depth);
+
 // While one lives (on this thread), the scenes of shadows of `seq` are made once a frame: a sequence frame's render
 // opens one, so a light's shadow map is made once for every card and model in it. Pictures come from `cardLayer`
 // (a clip's picture at a frame, before its 3D Layer) and `trackLayer` (a track's at a frame).

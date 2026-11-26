@@ -106,17 +106,22 @@ struct HeldDiskSound : DiskSound {
     }
 };
 
-// The file at `path` opened and held (as above); nullptr when it is not there, or was removed while it was opened.
-std::FILE* holdFile(const std::string& path) {
+// A file opened to read, closed in every program Montage starts: a plug-in host would else keep it (and a cache
+// file's lock) while it runs, and the cache could not be tidied of it.
+std::FILE* openToRead(const std::string& path) {
 #ifndef _WIN32
-    // (closed in every program Montage starts: a plug-in host would else keep the file and its lock while it runs, and
-    // the cache could not be tidied of it)
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     std::FILE* f = fd >= 0 ? ::fdopen(fd, "rb") : nullptr;
     if (!f && fd >= 0) ::close(fd);
+    return f;
 #else
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    return std::fopen(path.c_str(), "rb");
 #endif
+}
+
+// The file at `path` opened and held (as above); nullptr when it is not there, or was removed while it was opened.
+std::FILE* holdFile(const std::string& path) {
+    std::FILE* f = openToRead(path);
     if (!f) return nullptr;
 #ifndef _WIN32
     // (where the file system has no locks, held as well as it can be: open)
@@ -194,7 +199,7 @@ AudioBufferPtr readHead(const DiskSound& d, int64_t from, int64_t frames, int ra
     head->sampleRate = rate;
     head->channels = 2;
     head->samples.assign(size_t(std::max<int64_t>(0, frames)) * 2, 0.0f);
-    std::FILE* f = std::fopen(d.file.c_str(), "rb");
+    std::FILE* f = openToRead(d.file);
     if (!f) return nullptr;
     const bool ok = seekFrame(f, from) &&
                     std::fread(head->samples.data(), sizeof(float), head->samples.size(), f) == head->samples.size();
@@ -443,7 +448,7 @@ struct Engine::Disk {
                 const int64_t n = std::min({int64_t(4096), w.capacity / 4, w.length - f, limit - ahead});
                 if (n <= 0) continue;
                 std::FILE*& file = files[w.disk->file];
-                if (!file) file = std::fopen(w.disk->file.c_str(), "rb");
+                if (!file) file = openToRead(w.disk->file);
                 chunk.assign(size_t(n) * 2, 0.0f);
                 if (file && seekFrame(file, w.fileStart + f)) {
                     const size_t got = std::fread(chunk.data(), sizeof(float), chunk.size(), file);

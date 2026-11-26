@@ -2781,6 +2781,9 @@ std::vector<TrackRef> nestRangeStays(const Sequence& s, FrameTime a, FrameTime b
 
 Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& given, const std::string& name) {
     if (b <= a) return Result::fail("Set In and Out points first");
+    // (an Out past the sequence's end: the compound ends where the sequence did, not after it)
+    b = std::min(b, s.duration());
+    if (b <= a) return Result::fail("Nothing between In and Out to nest");
     // The tracks taking part: unlocked, and seen or heard (a muted track's clips, or those silenced by another track's
     // solo, would be seen or heard once inside the compound: they stay where they are, as a locked track's do).
     std::vector<TrackRef> tracks;

@@ -1249,6 +1249,7 @@ private slots:
         QVERIFY(other && other->activate(48000, 512));
         QVERIFY(other->loadState(state));
         QVERIFY(std::fabs(other->parameter(0) - 300) < 1);
+        qInfo("AULowpass hosted in Montage's process: its settings taken up by a second instance");
     }
 
     // Phase 15 #2: Apple's own Audio Units in a plug-in host give what they give in Montage's process, bit for bit.
@@ -1290,6 +1291,8 @@ private slots:
                          qPrintable(QString("%1, block %2").arg(id).arg(b)));
             }
             QVERIFY(!bypassed(there.get()));
+            qInfo("%s: 40 blocks the same from its plug-in host (process %lld) as in Montage's process", id,
+                  static_cast<long long>(hostProcessOf(there.get())));
         }
     }
 #endif
@@ -2658,9 +2661,10 @@ private slots:
 
     void openFxPicturesFallBackToSharedMemory() {
         // A plug-in host gives its plug-in's picture back through shared memory unless it can share it from the GPU's
-        // memory. With no handle asked for, and, asked for one with MONTAGE_GPU_HANDLES=1, wherever one of the two
-        // sides cannot share it, the picture comes through shared memory, bit for bit the one made in Montage's
-        // process, and what was taken is counted and said, with why, as MONTAGE_GPU_LOG says it.
+        // memory. With handles turned off (MONTAGE_GPU_HANDLES=0), and, with no setting or asked for with
+        // MONTAGE_GPU_HANDLES=1, wherever one of the two sides cannot share it, the picture comes through shared memory,
+        // bit for bit the one made in Montage's process, and what was taken is counted and said, with why, as
+        // MONTAGE_GPU_LOG says it.
         ofx::Registry& reg = ofx::Registry::instance();
         reg.setCachePath(path("ofx-handles-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
@@ -2699,8 +2703,8 @@ private slots:
                    std::memcmp(here.px.data(), there.px.data(), here.px.size() * sizeof(float)) == 0;
         };
         Hosting h(Isolation::PerPlugin);
-        // Not asked for: shared memory, and it says how to ask.
-        qunsetenv("MONTAGE_GPU_HANDLES");
+        // Turned off: shared memory, and it says so.
+        qputenv("MONTAGE_GPU_HANDLES", "0");
         ofx::remote::resetPictureStats();
         Image there = picture;
         QVERIFY2(ofx::applyEffect(fx, 3, there, 1.0, {}, &err), err.c_str());
@@ -2709,12 +2713,13 @@ private slots:
         QCOMPARE(took.handles, 0L);
         QCOMPARE(took.sharedMemory, 1L);
         QCOMPARE(QString::fromStdString(took.last),
-                 QString("Test Invert's picture came from its plug-in host through shared memory: handles are not asked for "
-                         "(MONTAGE_GPU_HANDLES=1 asks)"));
+                 QString("Test Invert's picture came from its plug-in host through shared memory: handles are turned off "
+                         "(MONTAGE_GPU_HANDLES=0)"));
         QVERIFY(same(there));
-        // Asked for: a handle only where both sides can share one. Where one cannot (here: no OpenGL in a test without
-        // a display, a driver without the extensions, anything but Linux), shared memory again, with that reason.
-        qputenv("MONTAGE_GPU_HANDLES", "1");
+        // With no setting, asked for: a handle only where both sides can share one. Where one cannot (here: no OpenGL in
+        // a test without a display, a driver without the extensions, anything but Linux), shared memory again, with
+        // that reason.
+        qunsetenv("MONTAGE_GPU_HANDLES");
         there = picture;
         QVERIFY2(ofx::applyEffect(fx, 3, there, 1.0, {}, &err), err.c_str());
         took = ofx::remote::pictureStats();
@@ -2722,7 +2727,7 @@ private slots:
         if (took.handles == 0) {
             const QString start = "Test Invert's picture came from its plug-in host through shared memory: ";
             QCOMPARE(took.sharedMemory, 2L);
-            QVERIFY2(last.startsWith(start) && last.size() > start.size() && !last.contains("not asked for"), qPrintable(last));
+            QVERIFY2(last.startsWith(start) && last.size() > start.size() && !last.contains("turned off"), qPrintable(last));
             QVERIFY(same(there));
         } else {
             // (A machine where the picture is shared: the same picture, as 16-bit floats carry it.)
@@ -3524,6 +3529,60 @@ private slots:
         reg.unblock(delay->path);
         reg.scan();
         QVERIFY(reg.find("clap:org.montage.test.delay64").has_value());
+    }
+
+    // OpenFX in one host for every plug-in: Test Invert from one binary renders, then a plug-in from a second binary
+    // crashes the host as its binary loads. The second binary alone is blocked and blamed, and the first renders on in
+    // a new host.
+    void sharedHostBlamesTheOpenFxBinaryLoading() {
+        ofx::Registry& oreg = ofx::Registry::instance();
+        oreg.setCachePath(path("ofx-blame-cache.json").toStdString());
+        oreg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        const std::string good = MONTAGE_TEST_OFX_DIR "/good", second = MONTAGE_TEST_OFX_DIR "/second";
+        oreg.setSearchPaths({good, second});
+        QCOMPARE(oreg.scan(), 14);
+        ofx::PluginDesc first, crashes;
+        QVERIFY(oreg.find("org.montage.test.invert/1", first) && oreg.find("org.montage.test.second.invert/1", crashes));
+        QVERIFY(first.binary != crashes.binary);
+        Hosting hostingMode(Isolation::Shared, [](HostingSettings& s) { s.autoRestarts = 0; });
+        Project p = makeDefaultProject();
+        const Effect a = ofx::makeEffect(p, first), b = ofx::makeEffect(p, crashes);
+        std::string err;
+        auto render = [&](const Effect& e) {
+            Image img(8, 8);
+            img.fill(0.2f, 0.4f, 0.6f, 1.0f);
+            return ofx::applyEffect(e, 0, img, 1.0, {}, &err) ? img.at(3, 3)[0] : -1.0f;
+        };
+        auto host = [] {
+            int64_t pid = 0;
+            for (const HostInfo& h : runningHosts())
+                if (h.key == "ofx:all") pid = h.pid;
+            return pid;
+        };
+        {
+            Fault f("crash:load");  // (reaches the host as it starts: only the second binary's load action reads it)
+            QVERIFY2(std::fabs(render(a) - 0.8f) < 1e-5f, err.c_str());
+        }
+        const int64_t shared = host();
+        QVERIFY(shared > 0);
+        QCOMPARE(render(b), -1.0f);
+        QVERIFY2(err.find("crashed") != std::string::npos, err.c_str());
+        const auto blocked = oreg.blocked();
+        QCOMPARE(blocked.size(), size_t(1));
+        QCOMPARE(blocked[0].first, crashes.binary);
+        QVERIFY(QString::fromStdString(blocked[0].second).contains("while loading"));
+        QVERIFY(failureOf(crashes.id).has_value());
+        QCOMPARE(QString::fromStdString(failureOf(crashes.id)->kind), QString("load"));
+        QVERIFY(!failureOf(first.id).has_value());
+        ofx::PluginDesc found;
+        QVERIFY(!oreg.find(crashes.id, found) && oreg.find(first.id, found));
+        // The first binary's plug-in renders on, in a host started again.
+        QVERIFY2(std::fabs(render(a) - 0.8f) < 1e-5f, err.c_str());
+        QVERIFY(host() > 0 && host() != shared);
+        QVERIFY(!failureOf(first.id).has_value());
+        QCOMPARE(oreg.scan(), 7);  // (until the second binary changes)
+        oreg.setSearchPaths({good});
+        QCOMPARE(oreg.scan(), 7);
     }
 
     // Ids of 300 bytes that differ in their last byte alone, in one shared host: the one that crashes the host as it

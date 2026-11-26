@@ -3,7 +3,9 @@
 #include <QFileInfo>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <sstream>
 
@@ -1294,8 +1296,9 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
     // The models and cards, each with its material (numbered among its kind).
     auto meshName = [&](size_t m) {
         size_t n = 0;
-        for (size_t i = 0; i <= m; ++i) n += models[i].card == models[m].card;
-        return (models[m].card ? "Card_" : "Model_") + std::to_string(n);
+        auto kind = [&](size_t i) { return models[i].card ? 1 : models[i].title ? 2 : 0; };
+        for (size_t i = 0; i <= m; ++i) n += kind(i) == kind(m);
+        return (kind(m) == 1 ? "Card_" : kind(m) == 2 ? "Title_" : "Model_") + std::to_string(n);
     };
     // A package (.usdz) or a layer with its pictures beside it, named after it.
     const QFileInfo info(QString::fromStdString(path));
@@ -1351,6 +1354,13 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
                     o << (i ? ", " : "") << "(" << formatNumber(mesh.uvs[i], true) << ", " << formatNumber(1 - double(mesh.uvs[i + 1]), true) << ")";
                 o << "] (\n                interpolation = \"vertex\"\n            )\n";
             }
+            const bool colored = !mesh.colors.empty() && mesh.colors.size() == mesh.positions.size();
+            if (colored) {
+                o << "            color3f[] primvars:displayColor = [";
+                for (size_t i = 0; i + 2 < mesh.colors.size(); i += 3)
+                    o << (i ? ", " : "") << f3(mesh.colors[i], mesh.colors[i + 1], mesh.colors[i + 2], true);
+                o << "] (\n                interpolation = \"vertex\"\n            )\n";
+            }
             o << "            uniform token subdivisionScheme = \"none\"\n";
             o << "            rel material:binding = </Solve/Looks/" << name << ">\n        }\n";
         }
@@ -1362,9 +1372,14 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
               << "/Surface.outputs:surface>\n\n            def Shader \"Surface\"\n            {\n"
               << "                uniform token info:id = \"UsdPreviewSurface\"\n";
             const std::string look = "</Solve/Looks/" + name;
-            if (!mesh.picture.empty()) {
+            const bool colored = !mesh.colors.empty() && mesh.colors.size() == mesh.positions.size();
+            const bool pictured = !mesh.picture.empty() || !mesh.pictures.empty();
+            if (pictured) {
                 o << "                color3f inputs:diffuseColor.connect = " << look << "/Picture.outputs:rgb>\n"
                   << "                float inputs:opacity.connect = " << look << "/Picture.outputs:a>\n";
+            } else if (colored) {
+                o << "                color3f inputs:diffuseColor.connect = " << look << "/Colours.outputs:result>\n"
+                  << "                float inputs:opacity = " << formatNumber(mesh.color[3], true) << "\n";
             } else {
                 o << "                color3f inputs:diffuseColor = " << f3(mesh.color[0], mesh.color[1], mesh.color[2], true) << "\n"
                   << "                float inputs:opacity = " << formatNumber(mesh.color[3], true) << "\n";
@@ -1372,7 +1387,7 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
             o << "                float inputs:metallic = " << formatNumber(mesh.metallic, true) << "\n"
               << "                float inputs:roughness = " << formatNumber(mesh.roughness, true) << "\n"
               << "                token outputs:surface\n            }\n";
-            if (!mesh.picture.empty()) {
+            if (pictured) {
                 o << "\n            def Shader \"Picture\"\n            {\n"
                   << "                uniform token info:id = \"UsdUVTexture\"\n"
                   << "                asset inputs:file = @./" << (mesh.pictures.empty() ? pictureName(m) : sampleName(m, mesh.pictures.front().first)) << "@\n";
@@ -1390,6 +1405,13 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
                   << "                uniform token info:id = \"UsdPrimvarReader_float2\"\n"
                   << "                string inputs:varname = \"st\"\n"
                   << "                float2 outputs:result\n            }\n";
+            } else if (colored) {
+                // (its display colour, corner by corner; its plain colour where that is not read)
+                o << "\n            def Shader \"Colours\"\n            {\n"
+                  << "                uniform token info:id = \"UsdPrimvarReader_float3\"\n"
+                  << "                string inputs:varname = \"displayColor\"\n"
+                  << "                float3 inputs:fallback = " << f3(mesh.color[0], mesh.color[1], mesh.color[2], true) << "\n"
+                  << "                float3 outputs:result\n            }\n";
             }
             o << "        }\n";
         }
@@ -1404,22 +1426,50 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
         }
         return true;
     };
+    // (a changing picture's file, read when it is written: one in memory at a time)
+    auto read = [&](const std::string& file, std::string& bytes) {
+        std::ifstream f(file, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        if (f.bad() || !f.is_open()) {
+            if (error) *error = "Cannot read " + file;
+            return false;
+        }
+        return true;
+    };
+    std::string bytes;
     if (package) {
-        // (the layer first, as USDZ wants, then the pictures; each entry's data 64-byte aligned)
-        ZipWriter zip;
+        // (the layer first, as USDZ wants, then the pictures; each entry's data 64-byte aligned; written as made)
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            if (error) *error = "Cannot write " + path;
+            return false;
+        }
+        ZipWriter zip(&f);
         zip.add(stem + ".usda", o.str(), 64);
-        for (size_t m = 0; m < models.size(); ++m)
-            if (!models[m].pictures.empty())
-                for (const auto& [at, bytes] : models[m].pictures) zip.add(sampleName(m, at), bytes, 64);
-            else if (!models[m].picture.empty())
+        bool readAll = true;
+        for (size_t m = 0; m < models.size() && readAll && zip.ok(); ++m)
+            if (!models[m].pictures.empty()) {
+                for (const auto& [at, file] : models[m].pictures)
+                    if (!(readAll = read(file, bytes)) || (zip.add(sampleName(m, at), bytes, 64), !zip.ok())) break;
+            } else if (!models[m].picture.empty()) {
                 zip.add(pictureName(m), models[m].picture, 64);
-        return write(path, zip.finish());
+            }
+        if (readAll) zip.finish();
+        if (!readAll || !zip.ok()) {
+            const bool tooLarge = readAll && f.good();
+            f.close();
+            std::remove(path.c_str());
+            if (error && readAll)
+                *error = tooLarge ? "The scene is too large for a USDZ package (over 4 GB): write it as USDA, its pictures beside it" : "Cannot write " + path;
+            return false;
+        }
+        return true;
     }
     const std::string dir = info.absolutePath().toStdString() + "/";
     for (size_t m = 0; m < models.size(); ++m)
         if (!models[m].pictures.empty()) {
-            for (const auto& [at, bytes] : models[m].pictures)
-                if (!write(dir + sampleName(m, at), bytes)) return false;
+            for (const auto& [at, file] : models[m].pictures)
+                if (!read(file, bytes) || !write(dir + sampleName(m, at), bytes)) return false;
         } else if (!models[m].picture.empty() && !write(dir + pictureName(m), models[m].picture)) {
             return false;
         }

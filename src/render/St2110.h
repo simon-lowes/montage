@@ -316,6 +316,10 @@ std::vector<FastMetadata> segmentObject(uint32_t type, const uint8_t* data, size
 constexpr uint32_t kFrameItemType = 0x3FF4D0;
 FastMetadata frameItem(int64_t frame, const output::Timecode& tc);
 bool parseFrameItem(const FastMetadata& m, int64_t& frame, output::Timecode* tc = nullptr);
+// And the item they put with each frame of a PQ signal whose HDR metadata is stated (an experimental type too): the
+// user data words of its ST 2108-1 packet (hdrMetadataPacket), four bytes a word, big-endian, zeros after the last.
+// A receiver that takes the frames' fast metadata but not their ancillary data has the mastering peak from it.
+constexpr uint32_t kHdrItemType = 0x3FF4D1;
 // And back: the object's words from a stream's items of `type` in the order they came (the segments from offset 0 to
 // the one with K set, each where the one before ended); false while it is not whole.
 bool joinObject(const std::vector<FastMetadata>& items, uint32_t type, std::vector<uint32_t>& out);
@@ -355,6 +359,9 @@ struct HdrMetadata {
     bool display = false, lightLevel = false;
 };
 bool parseHdrMetadata(const AncPacket& p, HdrMetadata& out);
+// (kHdrItemType's item, and back)
+FastMetadata hdrItem(const output::Signal& s);
+bool parseHdrItem(const FastMetadata& m, HdrMetadata& out);
 // CEA-608/708 captions: a CDP (core/Cea708.h's captionCdp) in DID 61h, SDID 01h.
 AncPacket captionPacket(const std::vector<uint8_t>& cdp);
 

@@ -24,6 +24,7 @@
 #include <tuple>
 
 #include "Processing.h"
+#include "TemporalFx.h"
 
 namespace montage {
 
@@ -91,6 +92,25 @@ void applyRun(CharStyle& s, const TextRun& r, double px) {
 bool setsNothing(const TextRun& r) {
     return r.font.empty() && r.size <= 0 && r.bold < 0 && r.italic < 0 && !r.color && r.outline < 0 && !r.outlineColor && !r.tracking &&
            r.baseline == 0 && r.axes.empty();
+}
+
+// Whether the character at `at` of `text` is of a script written upright in vertical text (Chinese, Japanese, Korean,
+// Yi, and the full-width forms and the symbols and punctuation made for them), as vertical text with mixed
+// orientation sets it; the rest are turned a quarter.
+bool writtenUpright(const QString& text, int at) {
+    if (at < 0 || at >= text.size()) return false;
+    char32_t c = text[at].unicode();
+    if (QChar::isHighSurrogate(c) && at + 1 < text.size() && text[at + 1].isLowSurrogate()) c = QChar::surrogateToUcs4(text[at], text[at + 1]);
+    switch (QChar::script(c)) {
+        case QChar::Script_Han:
+        case QChar::Script_Hiragana:
+        case QChar::Script_Katakana:
+        case QChar::Script_Hangul:
+        case QChar::Script_Bopomofo:
+        case QChar::Script_Yi: return true;
+        default: break;
+    }
+    return (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF);
 }
 
 QFont fontOf(const CharStyle& s) {
@@ -830,7 +850,9 @@ struct TitleScene {
 bool titleIsStyledAt(const Effect& g, double t);
 
 // A plain title animated by letter or word: the longest line whose units are each placed by measuring the line from
-// its start (see buildTitle). Longer lines are rare, and placing their letters that way costs the letters squared.
+// its start (see buildTitle). Longer lines are rare, and placing their letters that way costs the letters squared;
+// so too many lines a little shorter, so a title's lines are measured so, from its first, only while the squares of
+// their lengths add up to no more than this length's square (the others placed as the longer ones are).
 constexpr int kLineMeasuredFromItsStart = 1000;
 
 TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& pathFn,
@@ -1081,14 +1103,21 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
         // through the text's transform to the layer and the layer's to the frame.
         std::vector<QTransform> svgPlace;
         std::vector<char> svgShown;
+        // (method="stretch": each letter placed in the path's own terms, along it and across it, then bent along it)
+        std::function<QPointF(QPointF)> svgBendPoint;
+        std::function<QPainterPath(const QTransform&, const QPainterPath&)> svgBend;
         std::vector<int> lineBase(rich.size() + 1, 0);
         for (size_t i = 0; i < rich.size(); ++i) lineBase[i + 1] = lineBase[i] + int(rich[i].clusters.size());
         if (svg) {
             const QTransform textTo = svg->matrix * layerTo;
             const double k = std::max(1e-9, std::sqrt(std::abs(textTo.determinant())));
             const int n = lineBase.back();
+            // (vertical: each letter's place kept as along the column, then across it, so that textLength and the
+            // anchor work along the column as they do along a line)
+            const bool vertical = svg->vertical;
             std::vector<QPointF> pos(static_cast<size_t>(n));
-            std::vector<double> adv(static_cast<size_t>(n));
+            std::vector<double> adv(static_cast<size_t>(n)), ascent(size_t(n), 0.0), descent(size_t(n), 0.0);
+            std::vector<char> upright(size_t(n), 0);
             std::vector<int> chunk(size_t(n), 0);
             PathSampler along;
             const bool alongPath = !svg->path.empty() && [&] {
@@ -1103,12 +1132,25 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                 for (const Cluster& cl : rich[i].clusters) {
                     const size_t q = gi++;
                     adv[q] = (cl.x1 - cl.x0) / k;
+                    if (vertical) {
+                        const QFontMetricsF fm(fontOf(cl.style));
+                        ascent[q] = fm.ascent() / k, descent[q] = fm.descent() / k;
+                        upright[q] = svg->orient == 1 || (svg->orient == 0 && writtenUpright(rich[i].text, cl.from));
+                        if (upright[q]) adv[q] = ascent[q] + descent[q];
+                    }
                     // (an absolute x or y starts a chunk of text, anchored on its own)
                     const bool hasX = q < svg->x.size() && svg->x[q], hasY = !alongPath && q < svg->y.size() && svg->y[q];
-                    if (hasX) pen.setX(*svg->x[q]);
-                    if (hasY) pen.setY(*svg->y[q]);
+                    const double ddx = q < svg->dx.size() ? svg->dx[q] : 0.0, ddy = q < svg->dy.size() ? svg->dy[q] : 0.0;
+                    if (vertical) {
+                        if (hasX) pen.setY(*svg->x[q]);
+                        if (hasY) pen.setX(*svg->y[q]);
+                        pen += QPointF(ddy, ddx);
+                    } else {
+                        if (hasX) pen.setX(*svg->x[q]);
+                        if (hasY) pen.setY(*svg->y[q]);
+                        pen += QPointF(ddx, ddy);
+                    }
                     if (q > 0 && (hasX || hasY)) ++chunks;
-                    pen += QPointF(q < svg->dx.size() ? svg->dx[q] : 0.0, q < svg->dy.size() ? svg->dy[q] : 0.0);
                     pos[q] = pen;
                     chunk[q] = chunks;
                     pen.rx() += adv[q];
@@ -1145,6 +1187,45 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
             const double startAt = alongPath ? (svg->startPercent ? svg->start / 100 * along.length() : svg->start) : 0.0;
             svgPlace.assign(size_t(n), QTransform());
             svgShown.assign(size_t(n), 1);
+            const bool bend = alongPath && svg->stretch;
+            if (bend) {
+                // A point in the path's terms (how far along it, how far across it: down the letter, as the text's y
+                // is) to the frame: on the path there, out along its normal; past an open path's ends, carried on
+                // along its ends' directions.
+                // (its own copy of the path: it is used after this block, where the path's sampler is gone)
+                const auto line = std::make_shared<const PathSampler>(along);
+                const bool right = svg->pathRight;
+                svgBendPoint = [line, right, textTo](QPointF a) {
+                    QPointF pt;
+                    double ang = 0;
+                    line->at(right ? line->length() - a.x() : a.x(), pt, ang);
+                    if (right) ang += M_PI;
+                    return textTo.map(pt + a.y() * QPointF(-std::sin(ang), std::cos(ang)));
+                };
+                // A letter's outline bent: flattened finely (to 1/512 of a frame pixel), its edges cut to half a frame
+                // pixel or less, and each point bent.
+                const double fine = 256 * k;
+                svgBend = [fine, k, bendPoint = svgBendPoint](const QTransform& toPath, const QPainterPath& glyph) {
+                    QPainterPath out;
+                    out.setFillRule(Qt::WindingFill);
+                    const double most = 0.5 / k;  // the longest edge bent as a line, in the path's terms
+                    for (const QPolygonF& poly : glyph.toSubpathPolygons(toPath * QTransform::fromScale(fine, fine))) {
+                        if (poly.size() < 2) continue;
+                        QPolygonF bent;
+                        QPointF prev = poly[0] / fine;
+                        bent << bendPoint(prev);
+                        for (int i = 1; i < poly.size(); ++i) {
+                            const QPointF cur = poly[i] / fine;
+                            const int cuts = std::min(4096, int(std::ceil(QLineF(prev, cur).length() / most)));
+                            for (int c = 1; c <= cuts; ++c) bent << bendPoint(prev + (cur - prev) * (double(c) / cuts));
+                            prev = cur;
+                        }
+                        out.addPolygon(bent);
+                        out.closeSubpath();
+                    }
+                    return out;
+                };
+            }
             for (size_t i = 0, gi = 0; i < rich.size(); ++i)
                 for (const Cluster& cl : rich[i].clusters) {
                     const size_t q = gi++;
@@ -1154,7 +1235,29 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     turn.rotate(r);
                     const QTransform own = QTransform::fromTranslate(-cl.x0, 0) * QTransform::fromScale(stretch / k, 1 / k) * turn;
                     const double y = pos[q].y() + svg->down;
-                    if (alongPath) {
+                    if (vertical) {
+                        // Down the column (pos: along it, then across it): upright, its box's top at the pen and its
+                        // middle on the column; or turned a quarter clockwise, its middle (half way between its ascent
+                        // and descent) on the column.
+                        const double down = pos[q].x(), across = pos[q].y();
+                        if (upright[q]) {
+                            const QTransform tall = QTransform::fromTranslate(-cl.x0, 0) * QTransform::fromScale(1 / k, 1 / k) * turn *
+                                                    QTransform::fromTranslate(0, ascent[q]) * QTransform::fromScale(1, stretch);
+                            svgPlace[q] = tall * QTransform::fromTranslate(across - (cl.x1 - cl.x0) / k / 2, down) * textTo;
+                        } else {
+                            QTransform quarter;
+                            quarter.rotate(90);
+                            svgPlace[q] = own * quarter * QTransform::fromTranslate(across - (ascent[q] - descent[q]) / 2, down) * textTo;
+                        }
+                    } else if (bend) {
+                        // In the path's terms, bent along it as it is drawn; off the ends of an open path it is not.
+                        const double mid = startAt + pos[q].x() + adv[q] / 2;
+                        if (!along.closed && (mid < 0 || mid > along.length())) {
+                            svgShown[q] = 0;
+                            continue;
+                        }
+                        svgPlace[q] = own * QTransform::fromTranslate(startAt + pos[q].x(), y);
+                    } else if (alongPath) {
                         // Its middle at its distance along the path, turned to the path there, dy across it; off the
                         // ends of an open path it is not drawn.
                         const double mid = startAt + pos[q].x() + adv[q] / 2;
@@ -1233,6 +1336,11 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     if (!svgShown[q]) continue;
                     place = svgPlace[q];
                     placedAngle = std::atan2(place.m12(), place.m11()) * 180 / M_PI;
+                    if (svgBend) {
+                        // (bent: turned as the path is under its middle)
+                        const QPointF a = svgBendPoint(place.map(QPointF(mid, 0))), b = svgBendPoint(place.map(QPointF(mid + 1e-3, 0)));
+                        placedAngle = std::atan2(b.y() - a.y(), b.x() - a.x()) * 180 / M_PI;
+                    }
                 } else if (onPath) {
                     QPointF pt;
                     double ang;
@@ -1244,7 +1352,7 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                 } else {
                     place.translate(lineX(int(i)) + alignShift, baseY);
                 }
-                const QPointF baselineMid = place.map(QPointF(mid, 0));
+                const QPointF baselineMid = svgBend ? svgBendPoint(place.map(QPointF(mid, 0))) : place.map(QPointF(mid, 0));
                 // The animations, about the cluster's middle.
                 double ox = 0, oy = 0, scl = 1, rot = 0, opac = 1, blur = 0;
                 std::array<double, 3> fill = cl.style.fill, oc = cl.style.outlineColor;
@@ -1269,7 +1377,8 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     if (const int u = legacyUnit(int(i), cl.from); u >= 0) unitMotion(textAnim, unitProgress(u), sec, u, heights[i], dyU, scU, opU);
                 opac = std::min(1.0, opac * opU);
                 scl *= scU;
-                QRectF placedBox = place.mapRect(cl.path.boundingRect().translated(shift[size_t(c)], 0));
+                QRectF placedBox = svgBend ? svgBend(place, cl.path.translated(shift[size_t(c)], 0)).boundingRect()
+                                           : place.mapRect(cl.path.boundingRect().translated(shift[size_t(c)], 0));
                 if (!cl.space) placedBounds = placedBounds.isNull() ? placedBox : placedBounds.united(placedBox);
                 const QPointF pivot(mid, -L.ascent * 0.35);
                 QTransform anim;
@@ -1281,7 +1390,7 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                 shiftTr.translate(shift[size_t(c)], 0);
                 const QTransform m = shiftTr * anim * place;
                 Piece pc;
-                if (opac > 0 && scl > 0) pc.path = m.map(cl.path);
+                if (opac > 0 && scl > 0) pc.path = svgBend ? svgBend(m, cl.path) : m.map(cl.path);
                 pc.opacity = opac;
                 pc.styled = true;
                 pc.fill = QColor::fromRgbF(float(fill[0]), float(fill[1]), float(fill[2]));
@@ -1317,16 +1426,23 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
     } else {
         bool settled = true;  // every unit in place: drawn as the plain title is, kerned across the units
         // How far along its line a unit starts: the advance of the line's text before it. In a line of up to
-        // kLineMeasuredFromItsStart characters that text is measured whole for each unit, as it always was. In a
-        // longer line (where that is the letters squared) each stretch from one unit's start to the next is measured
-        // once, with the character after it so that the kerning across the join is counted, and added to the last:
-        // the unit starts where the whole line, laid out at once, has it.
+        // kLineMeasuredFromItsStart characters that text is measured whole for each unit, as it always was, while
+        // the squares of the lengths of the lines so measured, from the first, add up to no more than that length's
+        // square. In a longer line, or past that (where that is the letters squared), each stretch from one unit's
+        // start to the next is measured once, with the character after it so that the kerning across the join is
+        // counted, and added to the last: the unit starts where the whole line, laid out at once, has it.
+        std::vector<char> fromStart(size_t(lines.size()), 0);
+        {
+            long long left = (long long)kLineMeasuredFromItsStart * kLineMeasuredFromItsStart;
+            for (qsizetype i = 0; i < lines.size(); ++i)
+                if (const long long len = lines[i].size(); len <= kLineMeasuredFromItsStart && len * len <= left) fromStart[size_t(i)] = 1, left -= len * len;
+        }
         const QFontMetricsF fmMain(f), fmSub(fs);
         int atLine = -1, atFrom = 0;
         double atX = 0;
         auto startOf = [&](const Unit& un, const QFontMetricsF& fm) {
             const QString& ln = lines[un.line];
-            if (ln.size() <= kLineMeasuredFromItsStart) return fm.horizontalAdvance(ln.left(un.from));
+            if (fromStart[size_t(un.line)]) return fm.horizontalAdvance(ln.left(un.from));
             if (un.line != atLine || un.from < atFrom) atLine = un.line, atFrom = 0, atX = 0;
             if (un.from > atFrom) {
                 const QString next = ln.mid(un.from, ln.at(un.from).isHighSurrogate() ? 2 : 1);
@@ -1606,10 +1722,10 @@ void applyTitleStyleSpans(Effect& g, const std::vector<std::pair<QString, std::o
 // ---------------------------------------------------------------------------
 // Text animations
 
-double textSelection(const Effect& g, int k, FrameTime t, double fps, FrameTime duration, int i, int n) {
+double textSelection(const Effect& g, int k, double t, double fps, FrameTime duration, int i, int n) {
     fps = fps > 0 ? fps : 30;
-    const double remaining = duration > 0 ? double(duration - 1 - t) / fps : 1e9;
-    return selection(readAnimator(g, k, t), double(t) / fps, remaining, i, n);
+    const double remaining = duration > 0 ? (double(duration - 1) - t) / fps : 1e9;
+    return selection(readAnimator(g, k, t), t / fps, remaining, i, n);
 }
 
 namespace {
@@ -1669,12 +1785,17 @@ std::string svgTextLayoutJson(const SvgTextLayout& l) {
         o["start"] = l.start;
         if (l.startPercent) o["start_pct"] = true;
         if (l.pathRight) o["right"] = true;
+        if (l.stretch) o["stretch"] = true;
     }
     if (l.textLength > 0) {
         o["length"] = l.textLength;
         if (l.adjustGlyphs) o["glyphs"] = true;
     }
     if (l.down != 0) o["down"] = l.down;
+    if (l.vertical) {
+        o["vertical"] = true;
+        if (l.orient) o["orient"] = l.orient;
+    }
     if (l.atX != 0 || l.atY != 0) o["at"] = QJsonArray{l.atX, l.atY};
     return QJsonDocument(o).toJson(QJsonDocument::Compact).toStdString();
 }
@@ -1721,6 +1842,9 @@ std::optional<SvgTextLayout> parseSvgTextLayout(const std::string& json) {
     l.textLength = std::max(0.0, finite(o.value("length").toDouble()));
     l.adjustGlyphs = o.value("glyphs").toBool();
     l.down = finite(o.value("down").toDouble());
+    l.stretch = o.value("stretch").toBool();
+    l.vertical = o.value("vertical").toBool();
+    l.orient = std::clamp(o.value("orient").toInt(), 0, 2);
     const QJsonArray at = o.value("at").toArray();
     if (at.size() == 2) l.atX = finite(at[0].toDouble()), l.atY = finite(at[1].toDouble());
     return l;
@@ -1856,7 +1980,7 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, Fram
                   const TitleLayerFn& layer) {
     const double shutter = std::clamp(g.p("letter_shutter", t, 180), 0.0, 720.0) / 360.0;
     const int n = std::clamp(int(std::lround(g.p("letter_samples", t, 16))), 2, 64);
-    if (g.p("letter_blur", t) <= 0.5 || shutter <= 0) return renderTitleAt(g, double(t), w, h, scale, duration, fps, path, layer);
+    if (g.p("letter_blur", t) <= 0.5 || shutter <= 0 || motionBlurOff()) return renderTitleAt(g, double(t), w, h, scale, duration, fps, path, layer);
     // (the frame's text laid out once for all its times: see FrameLayouts)
     FrameLayouts layouts;
     struct Scope {
@@ -1962,7 +2086,7 @@ Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, Frame
     return drawScene(g, t, s, w, h, scale, nullptr, QRect(0, 0, w, h));
 }
 
-std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing,
+std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, double t, double px, double defaultSize, double lineSpacing,
                                                 const QString& defaultText, int& letters, int& solids, int& words, int& nLines) {
     const std::vector<TextRun> runs = parseTextRuns(g.s("runs"));
     const QString text = QString::fromStdString(g.s("text", defaultText.toStdString()));
@@ -1970,7 +2094,7 @@ std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, do
     const std::vector<LineLayout> lines = layoutText(text.split('\n'), styles, g, double(t), px, defaultSize);
     double blockW = 0;
     for (const LineLayout& l : lines) blockW = std::max(blockW, l.width);
-    const int align = int(std::lround(g.p("align", t, 1)));
+    const int align = int(std::lround(g.pAt("align", t, 1)));
     std::vector<TitleCharOutline> out;
     letters = solids = words = 0;
     nLines = int(lines.size());
@@ -1998,7 +2122,7 @@ std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, do
     return out;
 }
 
-QPainterPath styledTextOutline(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing) {
+QPainterPath styledTextOutline(const Effect& g, double t, double px, double defaultSize, double lineSpacing) {
     const std::vector<TextRun> runs = parseTextRuns(g.s("runs"));
     if (runs.empty()) return {};
     const QString text = QString::fromStdString(g.s("text", "3D Title"));
@@ -2007,7 +2131,7 @@ QPainterPath styledTextOutline(const Effect& g, FrameTime t, double px, double d
     const std::vector<LineLayout> lines = layoutText(text.split('\n'), styles, g, t, px, defaultSize);
     double blockW = 0;
     for (const LineLayout& l : lines) blockW = std::max(blockW, l.width);
-    const int align = int(std::lround(g.p("align", t, 1)));
+    const int align = int(std::lround(g.pAt("align", t, 1)));
     QPainterPath out;
     out.setFillRule(Qt::WindingFill);
     double y = 0;

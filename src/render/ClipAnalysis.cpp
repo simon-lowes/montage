@@ -38,7 +38,7 @@ const MediaItem* videoMedia(const Project& p, const Clip& c, std::string* error)
 
 bool analyzeClipStabilization(const Project& p, const Sequence& s, const Clip& c, std::string& motion,
                               const TrackProgress& progress, const std::atomic<bool>* cancel, std::string* error, std::string* gyro,
-                              std::string* gyroNote) {
+                              std::string* gyroNote, const std::string* resume, const std::function<void(const std::string&)>& keep) {
     if (gyro) gyro->clear();
     if (gyroNote) gyroNote->clear();
     const MediaItem* m = videoMedia(p, c, error);
@@ -46,7 +46,11 @@ bool analyzeClipStabilization(const Project& p, const Sequence& s, const Clip& c
     const double a = sourceSeconds(s, c, 0), b = sourceSeconds(s, c, c.duration - 1);
     const double from = std::max(0.0, std::min(a, b) - 1.0);
     const double to = std::min(m->duration, std::max(a, b) + 1.0);
-    CameraMotion cm = analyzeCameraMotion(m->path, from, to, progress, cancel, error);
+    CameraMotion before;
+    const bool resumes = resume && cameraMotionFromString(*resume, before);
+    std::function<void(const CameraMotion&)> kept;
+    if (keep) kept = [&keep](const CameraMotion& so) { keep(cameraMotionToString(so)); };
+    CameraMotion cm = analyzeCameraMotion(m->path, from, to, progress, cancel, error, resumes ? &before : nullptr, kept);
     if (cm.steps.empty()) return false;
     motion = cameraMotionToString(cm);
     if (gyro && !m->projection.empty()) {

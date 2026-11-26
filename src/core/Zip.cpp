@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <ostream>
 
 namespace montage {
 
@@ -394,12 +395,21 @@ constexpr uint32_t kDosTime = 0, kDosDate = (1u << 5) | 1u;  // 1980-01-01 00:00
 
 }  // namespace
 
+void ZipWriter::flush() {
+    if (!to_ || out_.empty()) return;
+    if (!to_->write(out_.data(), std::streamsize(out_.size()))) ok_ = false;
+    flushed_ += out_.size();
+    out_.clear();
+}
+
 void ZipWriter::add(const std::string& name, const std::string& data, size_t align) {
     Item it;
     it.name = name;
     it.crc = crc32(data.data(), data.size());
     it.size = uint32_t(data.size());
-    it.offset = uint32_t(out_.size());
+    const uint64_t at = flushed_ + out_.size();
+    it.offset = uint32_t(at);
+    if (at + 30 + name.size() + align + 4 + data.size() > 0xFFFFFFFFull || items_.size() >= 0xFFFF) ok_ = false;
     put32(out_, 0x04034b50);
     put16(out_, 20);      // version needed
     put16(out_, 0x0800);  // UTF-8 names
@@ -414,7 +424,7 @@ void ZipWriter::add(const std::string& name, const std::string& data, size_t ali
     // USDZ packages pad theirs)
     size_t pad = 0;
     if (align > 1) {
-        const size_t at = out_.size() + 2 + name.size();
+        const size_t at = size_t(flushed_ + out_.size() + 2 + name.size());
         pad = (align - at % align) % align;
         if (pad && pad < 4) pad += align;
     }
@@ -425,12 +435,19 @@ void ZipWriter::add(const std::string& name, const std::string& data, size_t ali
         put16(out_, uint32_t(pad - 4));
         out_.append(pad - 4, '\0');
     }
-    out_ += data;
+    if (to_) {
+        flush();
+        if (!data.empty() && !to_->write(data.data(), std::streamsize(data.size()))) ok_ = false;
+        flushed_ += data.size();
+    } else {
+        out_ += data;
+    }
     items_.push_back(std::move(it));
 }
 
 std::string ZipWriter::finish() {
-    const uint32_t start = uint32_t(out_.size());
+    const uint64_t first = flushed_ + out_.size();
+    const uint32_t start = uint32_t(first);
     for (const Item& it : items_) {
         put32(out_, 0x02014b50);
         put16(out_, 20);  // made by
@@ -451,7 +468,8 @@ std::string ZipWriter::finish() {
         put32(out_, it.offset);
         out_ += it.name;
     }
-    const uint32_t size = uint32_t(out_.size()) - start;
+    const uint32_t size = uint32_t(flushed_ + out_.size() - first);
+    if (flushed_ + out_.size() + 22 > 0xFFFFFFFFull) ok_ = false;
     put32(out_, 0x06054b50);
     put16(out_, 0);
     put16(out_, 0);
@@ -460,9 +478,15 @@ std::string ZipWriter::finish() {
     put32(out_, size);
     put32(out_, start);
     put16(out_, 0);
-    std::string done;
-    done.swap(out_);
     items_.clear();
+    std::string done;
+    if (to_) {
+        flush();
+        if (!to_->flush()) ok_ = false;
+        flushed_ = 0;
+        return done;
+    }
+    done.swap(out_);
     return done;
 }
 

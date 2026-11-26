@@ -9,11 +9,20 @@
 // each gradient's outer product) of two bands a step coarser, σ 1 less σ 2.5 set against σ 2.5 less σ 6, through the
 // pair's generalised eigenvalues: alike when detail was lost alike every way, one well under the other when the
 // picture was smeared one way. (Coarser than the fine band, so that grain does not hide a smear.)
+//
+// The noise (grain, a sensor's at high gain) is taken off both bands first, so that grain, there whatever the focus,
+// does not read as detail. It is measured from what changes between a frame and its neighbours brought onto it along
+// the optical flow: grain changes from frame to frame, a picture's own fine texture moves with it. Areas the flow cannot
+// match (the forward and backward motion disagree) are left out. A still (a picture file) and a shot one frame long
+// fall back to the frame's own estimate (a mask that leaves smooth shading and most edges out), which reads fine
+// texture as noise too; so does any frame whose own estimate is the lower. (Frames that do not change at all, held
+// video, measure no noise: their grain, if any, is frozen into the picture and is part of it.)
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,11 +37,39 @@ struct FocusMeasure {
     double anisotropy = 0;  // 0: detail lost alike every way; towards 1: lost one way only (motion blur)
     double blurAngle = 0;   // degrees, the way detail was smeared (0 across, 90 up and down), where anisotropy says
     bool textured = false;  // enough detail to judge: a flat, black or nearly empty frame is not
+    double noise = 0;       // the noise's standard deviation taken off the bands (luma)
+    bool noiseBetweenFrames = false;  // measured between the frame and its neighbours (else on the frame alone)
     bool operator==(const FocusMeasure&) const = default;
 };
 
-// `luma` is w x h, row by row. `threads` 0 uses every core; the result is the same on any number.
-FocusMeasure measureFocus(const float* luma, int w, int h, int threads = 0);
+// `luma` is w x h, row by row. `threads` 0 uses every core; the result is the same on any number. `noise` is the noise
+// measured between frames (noiseBetweenFrames), used where it is under the frame's own estimate; negative: none.
+FocusMeasure measureFocus(const float* luma, int w, int h, int threads = 0, double noise = -1);
+
+// The noise's standard deviation (luma) in what changes between `luma` and each neighbour given (`prev`, `next`, either
+// may be null; each w x h) brought onto it along the optical flow, bicubically: tile by tile the robust spread of the
+// difference (the interpolation's own smoothing of the noise allowed for), the lower of the two neighbours' in each
+// tile, the median tile's. Points whose forward and backward motion disagree by half a pixel or more are left out.
+// Negative where nothing is left to measure.
+double noiseBetweenFrames(const float* luma, const float* prev, const float* next, int w, int h, int threads = 0);
+
+// A run of pictures measured in order, each once its next is known, with the noise between it and its neighbours.
+// Pictures after a cut are not set against the ones before it.
+class FocusRun {
+public:
+    explicit FocusRun(int threads = 0) : threads_(threads) {}
+    // Adds the next picture (w x h luma); `cut`: it starts a new run; `still`: a still picture, measured on itself alone
+    // (set against neither neighbour). Returns the measures of the pictures now done, in the order they were added (each
+    // picture's once, one call later than it was added, or at finish).
+    std::vector<FocusMeasure> add(std::vector<float> luma, int w, int h, bool cut, bool still = false);
+    std::vector<FocusMeasure> finish();
+
+private:
+    struct Picture;
+    FocusMeasure measure(const Picture& p) const;
+    int threads_ = 0;
+    std::shared_ptr<Picture> pending_;  // the picture waiting for its next (its noise against the one before it taken)
+};
 // An RGBA picture's (premultiplied or not: alpha is ignored) Rec.709 luma, clamped to 0..1.
 std::vector<float> lumaOf(const Image& img);
 
@@ -58,6 +95,7 @@ struct FocusShot {
     std::vector<FocusMeasure> frames;
     // What judgeFocus found: the best (90th percentile) and typical (median) sharpness of its frames without motion blur.
     double best = 0, typical = 0;
+    int64_t noiseBetween = 0;  // judgeFocus: how many of its frames had their noise measured between frames (the rest alone)
 };
 
 enum class FocusFinding { Soft, SoftAngle, MotionBlur };
@@ -92,6 +130,7 @@ struct MediaFocus {
     double typical = 0;
     std::vector<FocusIssue> issues;  // in the media's frames from 0
     std::string summary;
+    std::string grain;  // how its grain was measured: "grain measured between frames", or on each frame alone (a still)
 };
 std::vector<MediaFocus> checkMediaFocus(const Project& p, const std::vector<Id>& media, const FocusOptions& o,
                                         const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr);

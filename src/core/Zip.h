@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -52,18 +53,27 @@ private:
     std::vector<Entry> entries_;
 };
 
-// A zip archive of stored (uncompressed) entries, names in UTF-8, built in memory. `align` (when more than 1): the
-// entry's data starts at a multiple of it from the archive's start (USDZ's packages want 64).
+// A zip archive of stored (uncompressed) entries, names in UTF-8, built in memory or, given a stream, written to it
+// an entry at a time (only the names and checksums kept). `align` (when more than 1): the entry's data starts at a
+// multiple of it from the archive's start (USDZ's packages want 64).
 class ZipWriter {
 public:
+    explicit ZipWriter(std::ostream* to = nullptr) : to_(to) {}
     void add(const std::string& name, const std::string& data, size_t align = 0);
-    std::string finish();  // the archive's bytes (the writer is empty again)
+    std::string finish();  // the archive's bytes (written to the stream instead, if given; the writer is empty again)
+    // False once the archive holds more than a zip without its 64-bit extension can (4 GiB, 65,535 entries) or the
+    // stream would not take it: what was written is not a whole archive.
+    bool ok() const { return ok_; }
 
 private:
     struct Item {
         std::string name;
         uint32_t crc = 0, size = 0, offset = 0;
     };
+    void flush();
+    std::ostream* to_ = nullptr;
+    uint64_t flushed_ = 0;  // (bytes already written to the stream)
+    bool ok_ = true;
     std::string out_;
     std::vector<Item> items_;
 };

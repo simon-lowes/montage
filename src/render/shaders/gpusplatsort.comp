@@ -1,0 +1,141 @@
+#version 440
+// Gaussian splats (render/SplatRender's splatsForBlending) put in order for drawing: a stable radix sort of their keys
+// (each splat's depth as its float's bits, which order as the depths do for depths above 0, beside its index), four
+// bits a pass, the lowest first, so that equal depths keep the cloud's order. Each pass, over `blocks` blocks of 256
+// keys (p[0].y the pass's shift, p[0].z the blocks):
+//   0  each block's keys counted by digit, into hist[digit * blocks + block]
+//   1  an exclusive scan of hist (p[0].w entries), 1024 a workgroup, each workgroup's total kept in sums
+//   2  the exclusive scan of sums (p[0].w of them, one workgroup)
+//   3  sums added back to hist
+//   4  each key moved to its place: where its digit starts in its block, plus the keys of that digit before it there
+// and 5, the splats copied in their sorted order (their 3 texels each) for the draw: p[0].w of them, last to first
+// where p[1].x is set (the nearest last, for points).
+// Gaussians are blended as the CPU blends them, a 16-pixel tile at a time: each splat is an entry in each tile it
+// reaches (ents: its tile and the splat), the entries sorted by depth as above, then 6 each key replaced by its
+// entry's tile and sorted again by that (stable, so each tile's entries stay nearest first), then 7 each tile's
+// pixels (a workgroup a tile, p[1].x tiles across, p[1].yz the picture's size) through its entries (from starts),
+// the blend carried in `state` from batch to batch (p[1].w the first batch, p[2].x the last, which writes the picture:
+// colour premultiplied and coverage).
+layout(local_size_x = 256) in;
+layout(std140, binding = 0) uniform Params { vec4 p[16]; };
+layout(std430, binding = 1) readonly buffer KeysIn { uvec2 kin[]; };
+layout(std430, binding = 2) writeonly buffer KeysOut { uvec2 kout[]; };
+layout(std430, binding = 3) buffer Hist { uint hist[]; };
+layout(std430, binding = 4) buffer Sums { uint sums[]; };
+layout(std430, binding = 5) readonly buffer Records { vec4 rec[]; };
+layout(std430, binding = 6) writeonly buffer Instances { vec4 inst[]; };
+layout(std430, binding = 7) readonly buffer Entries { uvec2 ents[]; };
+layout(std430, binding = 8) readonly buffer Starts { uint starts[]; };
+layout(std430, binding = 9) buffer State { vec4 state[]; };
+layout(rgba32f, binding = 10) uniform writeonly image2D picture;
+
+shared uint s[2048];  // (the scatter's counts, 8 x 256; a scan's 256 sums)
+
+// An exclusive scan of values[base .. base + 1024) (4 a thread) within the workgroup, in place; the total handed back.
+uint scan1024(bool ofSums, uint base, uint count) {
+    const uint t = gl_LocalInvocationID.x;
+    uint v[4];
+    uint sum = 0u;
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint i = base + t * 4u + k;
+        v[k] = i < count ? (ofSums ? sums[i] : hist[i]) : 0u;
+        sum += v[k];
+    }
+    s[t] = sum;
+    barrier();
+    for (uint off = 1u; off < 256u; off <<= 1u) {
+        const uint add = t >= off ? s[t - off] : 0u;
+        barrier();
+        s[t] += add;
+        barrier();
+    }
+    uint run = s[t] - sum;  // (exclusive: what the threads before hold)
+    const uint total = s[255];
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint i = base + t * 4u + k;
+        if (i < count) {
+            if (ofSums) sums[i] = run;
+            else hist[i] = run;
+        }
+        run += v[k];
+    }
+    return total;
+}
+
+void main() {
+    const int mode = int(p[0].x);
+    const uint shift = uint(p[0].y), blocks = uint(p[0].z), count = uint(p[0].w);
+    const uint t = gl_LocalInvocationID.x, b = gl_WorkGroupID.x;
+    if (mode == 0) {
+        if (t < 16u) s[t] = 0u;
+        barrier();
+        const uint d = (kin[b * 256u + t].x >> shift) & 15u;
+        atomicAdd(s[d], 1u);
+        barrier();
+        if (t < 16u) hist[t * blocks + b] = s[t];
+    } else if (mode == 1) {
+        const uint total = scan1024(false, b * 1024u, count);
+        if (t == 0u) sums[b] = total;
+    } else if (mode == 2) {
+        scan1024(true, 0u, count);
+    } else if (mode == 3) {
+        const uint i = b * 256u + t;
+        if (i < count) hist[i] += sums[i / 1024u];
+    } else if (mode == 4) {
+        // Each key's rank among the keys of its digit before it in the block: a scan of each digit's flags, two digits
+        // to a word (16 bits each: at most 256).
+        const uvec2 k = kin[b * 256u + t];
+        const uint d = (k.x >> shift) & 15u;
+        for (uint w = 0u; w < 8u; ++w) s[w * 256u + t] = (d >> 1u) == w ? (1u << ((d & 1u) * 16u)) : 0u;
+        barrier();
+        for (uint off = 1u; off < 256u; off <<= 1u) {
+            uint add[8];
+            for (uint w = 0u; w < 8u; ++w) add[w] = t >= off ? s[w * 256u + t - off] : 0u;
+            barrier();
+            for (uint w = 0u; w < 8u; ++w) s[w * 256u + t] += add[w];
+            barrier();
+        }
+        const uint rank = ((s[(d >> 1u) * 256u + t] >> ((d & 1u) * 16u)) & 0xffffu) - 1u;
+        kout[hist[d * blocks + b] + rank] = k;
+    } else if (mode == 5) {
+        const uint i = b * 256u + t;
+        if (i < count) {
+            const uint from = kin[i].y, to = p[1].x > 0.5 ? count - 1u - i : i;
+            for (uint c = 0u; c < 3u; ++c) inst[to * 3u + c] = rec[from * 3u + c];
+        }
+    } else if (mode == 6) {
+        const uint i = b * 256u + t, e = kin[i].y;
+        kout[i] = uvec2(e == 0xffffffffu ? 0xffffffffu : ents[e].x, e);
+    } else if (mode == 7) {
+        const uint x = gl_WorkGroupID.x * 16u + t % 16u, y = gl_WorkGroupID.y * 16u + t / 16u, W = uint(p[1].y), H = uint(p[1].z);
+        if (x >= W || y >= H) return;
+        const uint tile = gl_WorkGroupID.y * uint(p[1].x) + gl_WorkGroupID.x, at = y * W + x;
+        // (T below 0: stopped, as the CPU stops, where the next splat would leave less than 1e-4 of the light)
+        vec4 st = p[1].w > 0.5 ? vec4(0.0, 0.0, 0.0, 1.0) : state[at];
+        if (st.w > 0.0) {
+            float T = st.w;
+            precise vec3 rgb = st.rgb;
+            bool stopped = false;
+            const float cx = float(x) + 0.5, cy = float(y) + 0.5;
+            for (uint k = starts[tile]; k < starts[tile + 1u]; ++k) {
+                const uint j = ents[kin[k].y].y;
+                const vec4 a = rec[j * 3u], q = rec[j * 3u + 1u], c = rec[j * 3u + 2u];
+                const float dx = a.x - cx, dy = a.y - cy;
+                precise float power = -0.5 * (q.x * dx * dx + q.z * dy * dy) - q.y * dx * dy;
+                if (power > 0.0 || power < q.w) continue;
+                const float alpha = min(0.99, a.w * exp(power));
+                precise float next = T * (1.0 - alpha);
+                if (next < 1e-4) {
+                    stopped = true;
+                    break;
+                }
+                precise float wgt = alpha * T;
+                rgb += wgt * c.rgb;
+                T = next;
+            }
+            st = vec4(rgb, stopped ? -T : T);
+        }
+        state[at] = st;
+        if (p[2].x > 0.5) imageStore(picture, ivec2(int(x), int(y)), vec4(st.rgb, 1.0 - abs(st.w)));
+    }
+}

@@ -14,12 +14,14 @@
 # (--enable-liboapv); its licence goes in that share folder too, and its command-line encoder and decoder (for the
 # APV tests, not packaged) under <stage>/oapv-apps.
 #
-# Needs the external libraries below (Homebrew: x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist nasm;
-# MSYS2 UCRT64: x264 x265 libvpx svt-av1 dav1d opus lame openjpeg2 srt librist nasm amf-headers ffnvcodec-headers libvpl),
-# and git, CMake and Ninja for OpenAPV.
+# Needs the external libraries below (Homebrew: x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist gnutls
+# nasm; MSYS2 UCRT64: x264 x265 libvpx svt-av1 dav1d opus lame openjpeg2 srt librist gnutls nasm amf-headers
+# ffnvcodec-headers libvpl), and git, CMake and Ninja for OpenAPV.
 #
 # The build is GPL-2.0-or-later (--enable-gpl, for x264 and x265) and never --enable-nonfree. Encoders Montage does
-# not offer for Dolby and DTS formats are left out.
+# not offer for Dolby and DTS formats are left out. Its TLS (HTTPS, and the DTLS that the whip muxer, FFmpeg's own
+# WHIP sender, needs) is GnuTLS (LGPL-2.1-or-later) on both systems, in place of the system's own (macOS's Secure
+# Transport has no DTLS, and whether MinGW's headers give Schannel's is not certain); never OpenSSL.
 set -euo pipefail
 
 VERSION=9.1
@@ -34,6 +36,7 @@ FLAGS=(
   --enable-gpl
   --enable-libx264 --enable-libx265 --enable-libvpx --enable-libsvtav1 --enable-libdav1d --enable-libopus
   --enable-libmp3lame --enable-libopenjpeg --enable-libsrt --enable-librist --enable-liboapv
+  --enable-gnutls
   --disable-encoder=ac3,ac3_fixed,ac3_mf,eac3,dca,truehd,mlp
 )
 case "$(uname -s)" in

@@ -587,11 +587,20 @@ void applyRemoveGrain(const Effect& e, FrameTime lt, Image& src, const std::vect
         for (int k = 0; k < 4; ++k) src.px[i * 4 + size_t(k)] += (clean.px[i * 4 + size_t(k)] - src.px[i * 4 + size_t(k)]) * matte[i];
 }
 
+// A transform's settings at clip-local frame lt (or, between frames, at `at`), as geometryFor reads them.
+template <class Read>
+Geometry geometryReading(const Read& P, double mw, double mh, int SW, int SH);
+
 Geometry geometryFor(const Effect& motion, FrameTime lt, double mw, double mh, int SW, int SH) {
+    return geometryReading([&](const char* n, double def) { return motion.p(n, lt, def); }, mw, mh, SW, SH);
+}
+
+template <class Read>
+Geometry geometryReading(const Read& P, double mw, double mh, int SW, int SH) {
     Geometry g;
     g.mw = std::max(1.0, mw);
     g.mh = std::max(1.0, mh);
-    int fit = int(motion.p("fit", lt, 0));
+    int fit = int(P("fit", 0));
     double fx = 1, fy = 1;
     switch (fit) {
         case 0: fx = fy = std::min(SW / g.mw, SH / g.mh); break;
@@ -599,29 +608,28 @@ Geometry geometryFor(const Effect& motion, FrameTime lt, double mw, double mh, i
         case 2: fx = SW / g.mw; fy = SH / g.mh; break;
         default: break;
     }
-    double s = motion.p("scale", lt, 100) / 100.0;
-    g.sx = fx * s * motion.p("scale_x", lt, 100) / 100.0;
-    g.sy = fy * s * motion.p("scale_y", lt, 100) / 100.0;
-    if (motion.p("flip_h", lt) > 0.5) g.sx = -g.sx;
-    if (motion.p("flip_v", lt) > 0.5) g.sy = -g.sy;
-    g.rot = motion.p("rotation", lt) * M_PI / 180.0;
-    g.px = motion.p("pos_x", lt);
-    g.py = motion.p("pos_y", lt);
-    g.ax = motion.p("anchor_x", lt);
-    g.ay = motion.p("anchor_y", lt);
-    g.cl = std::clamp(motion.p("crop_left", lt) / 100.0, 0.0, 1.0);
-    g.cr = std::clamp(motion.p("crop_right", lt) / 100.0, 0.0, 1.0);
-    g.ct = std::clamp(motion.p("crop_top", lt) / 100.0, 0.0, 1.0);
-    g.cb = std::clamp(motion.p("crop_bottom", lt) / 100.0, 0.0, 1.0);
-    g.opacity = std::clamp(motion.p("opacity", lt, 100) / 100.0, 0.0, 1.0);
+    double s = P("scale", 100) / 100.0;
+    g.sx = fx * s * P("scale_x", 100) / 100.0;
+    g.sy = fy * s * P("scale_y", 100) / 100.0;
+    if (P("flip_h", 0) > 0.5) g.sx = -g.sx;
+    if (P("flip_v", 0) > 0.5) g.sy = -g.sy;
+    g.rot = P("rotation", 0) * M_PI / 180.0;
+    g.px = P("pos_x", 0);
+    g.py = P("pos_y", 0);
+    g.ax = P("anchor_x", 0);
+    g.ay = P("anchor_y", 0);
+    g.cl = std::clamp(P("crop_left", 0) / 100.0, 0.0, 1.0);
+    g.cr = std::clamp(P("crop_right", 0) / 100.0, 0.0, 1.0);
+    g.ct = std::clamp(P("crop_top", 0) / 100.0, 0.0, 1.0);
+    g.cb = std::clamp(P("crop_bottom", 0) / 100.0, 0.0, 1.0);
+    g.opacity = std::clamp(P("opacity", 100) / 100.0, 0.0, 1.0);
     return g;
 }
 
-// The clip's transform at clip-local frame lt with its animation presets on top (core/ClipAnimation.h).
-Geometry clipGeometry(const Clip& c, FrameTime lt, double mw, double mh, int SW, int SH, double fps) {
-    Geometry g = geometryFor(c.motion, lt, mw, mh, SW, SH);
+// Its animation presets on top of transform `g` at clip-local time `at`.
+void animated(const Clip& c, double at, double fps, int SW, int SH, Geometry& g) {
     if (hasClipAnimation(c)) {
-        const AnimationPose a = clipAnimationPose(c, double(lt), fps);
+        const AnimationPose a = clipAnimationPose(c, at, fps);
         g.px += a.dx * SW;
         g.py += a.dy * SH;
         g.sx *= a.scale;
@@ -629,7 +637,78 @@ Geometry clipGeometry(const Clip& c, FrameTime lt, double mw, double mh, int SW,
         g.rot += a.rotation * M_PI / 180.0;
         g.opacity = std::clamp(g.opacity * a.opacity, 0.0, 1.0);
     }
+}
+
+// The clip's transform at clip-local frame lt with its animation presets on top (core/ClipAnimation.h).
+Geometry clipGeometry(const Clip& c, FrameTime lt, double mw, double mh, int SW, int SH, double fps) {
+    Geometry g = geometryFor(c.motion, lt, mw, mh, SW, SH);
+    animated(c, double(lt), fps, SW, SH, g);
     return g;
+}
+
+// The same between frames, at clip-local time `at` (exactly clipGeometry's at a whole frame).
+Geometry clipGeometryAt(const Clip& c, double at, double mw, double mh, int SW, int SH, double fps) {
+    if (at == std::floor(at) && std::fabs(at) < 9e15) return clipGeometry(c, FrameTime(at), mw, mh, SW, SH, fps);
+    Geometry g = geometryReading([&](const char* n, double def) { return c.motion.pAt(n, at, def); }, mw, mh, SW, SH);
+    animated(c, at, fps, SW, SH, g);
+    return g;
+}
+
+// Layers placed by their transforms (each time through a transform's shutter counted), for tests.
+std::atomic<uint64_t> gTransformDraws{0};
+
+// The transforms a clip's layer is drawn at through its transform's shutter (Motion Blur on the transform), `g` being
+// its transform at its frame lt (any offset the compositor gave it, as Stereo 3D's, kept at every time): none when its
+// motion blur is off or it does not move or change while the shutter is open, so it is drawn once. The samples are its
+// own number, or (adaptive) one for each output pixel the farthest-moving corner of the layer travels, 2 to 64.
+std::vector<Geometry> shutterGeometries(const Sequence& seq, const Clip& c, FrameTime lt, const Geometry& g, double mw, double mh, double scale) {
+    const Effect& m = c.motion;
+    if (m.empty() || m.p("motion_blur", lt, 0) <= 0.5 || motionBlurOff()) return {};
+    const double open = std::clamp(m.p("shutter", lt, 180), 0.0, 720.0) / 360;
+    if (!(open > 0)) return {};
+    const double phase = std::clamp(m.p("shutter_phase", lt, 0), -360.0, 360.0) / 360;
+    const int SW = seq.width, SH = seq.height;
+    const double fps = seq.fpsValue();
+    const Geometry here = clipGeometry(c, lt, mw, mh, SW, SH, fps);
+    auto at = [&](double f) {  // f across the shutter, 0 to 1
+        Geometry x = clipGeometryAt(c, double(lt) + phase + open * (f - 0.5), mw, mh, SW, SH, fps);
+        x.px += g.px - here.px, x.py += g.py - here.py;
+        return x;
+    };
+    auto same = [](const Geometry& a, const Geometry& b) {
+        return a.sx == b.sx && a.sy == b.sy && a.rot == b.rot && a.px == b.px && a.py == b.py && a.ax == b.ax && a.ay == b.ay && a.cl == b.cl &&
+               a.cr == b.cr && a.ct == b.ct && a.cb == b.cb && a.opacity == b.opacity;
+    };
+    // Where the layer's corners go (output pixels), followed through the shutter.
+    auto corners = [&](const Geometry& x, std::array<std::array<double, 2>, 4>& out) {
+        const double us[2] = {x.mw * x.cl, x.mw * (1 - x.cr)}, vs[2] = {x.mh * x.ct, x.mh * (1 - x.cb)};
+        const double cr = std::cos(x.rot), sr = std::sin(x.rot);
+        for (int k = 0; k < 4; ++k) {
+            const double rx = (us[k & 1] - x.mw / 2 - x.ax) * x.sx, ry = (vs[k >> 1] - x.mh / 2 - x.ay) * x.sy;
+            out[size_t(k)] = {(SW / 2.0 + x.px + rx * cr - ry * sr) * scale, (SH / 2.0 + x.py + rx * sr + ry * cr) * scale};
+        }
+    };
+    constexpr int probes = 16;
+    bool moves = false;
+    double far = 0;
+    std::array<double, 4> travelled{0, 0, 0, 0};
+    std::array<std::array<double, 2>, 4> last;
+    for (int i = 0; i <= probes; ++i) {
+        const Geometry x = at(double(i) / probes);
+        moves = moves || !same(x, g);
+        std::array<std::array<double, 2>, 4> now;
+        corners(x, now);
+        if (i > 0)
+            for (size_t k = 0; k < 4; ++k) travelled[k] += std::hypot(now[k][0] - last[k][0], now[k][1] - last[k][1]);
+        last = now;
+    }
+    if (!moves) return {};
+    for (double d : travelled) far = std::max(far, d);
+    const long fixed = std::lround(m.p("samples", lt, 0));
+    const int n = fixed > 0 ? int(std::clamp<long>(fixed, 2, 64)) : std::clamp(int(std::ceil(far - 1e-6)), 2, 64);
+    std::vector<Geometry> out;
+    for (int i = 0; i < n; ++i) out.push_back(at((i + 0.5) / n));
+    return out;
 }
 
 // Draws `src` (which depicts the media at any resolution) onto a canvas of
@@ -734,6 +813,7 @@ struct ClipSource {
     Image src;
     // Or, when asked to leave it (`deferFrame`), a Shape layer's paints for the GPU to draw (render/ShapeRaster) ...
     std::shared_ptr<const ShapeRaster> shapes;
+    std::shared_ptr<const gpu::SplatLayer> splats;  // ... or a splat clip's capture, worked out for the GPU to sort and blend ...
     // ... or the decoded frame and the space it is in: nothing ran on it yet.
     Frame16Ptr frame;
     const ColorSpace* frameSpace = nullptr;
@@ -1190,6 +1270,30 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             src = drawShapeRaster(raster);
             return true;
         }
+        // A splat clip the GPU sorts and blends itself (in the values its splats were trained on, the sequence's own when it
+        // is Rec.709 graded display-referred), each splat worked out here as the CPU's renderer works it out.
+        if (deferFrame && c.generator.type == "model3d" && std::lround(c.generator.p("shape", lt, 0)) == 0 && isSplatFile(c.generator.s("file"))) {
+            std::string why;
+            if (currentSceneGrading() || !sameColorSpace(rec709Space(), sequenceColorSpace(seq))) why = "the sequence is graded in another space than Rec.709";
+            else if (std::max(w, h) > gpu::maxTextureSize()) why = "a picture larger than the GPU takes";
+            if (why.empty() && gpu::takesSplats(&why)) {
+                std::shared_ptr<const SplatCloud> cloud;
+                Mat4 place;
+                ModelCamera cam;
+                SplatRenderOptions so;
+                if (splatClipScene(p, seq, c, t, double(w) / SW, cloud, place, cam, so, nullptr, !o.highQuality)) {
+                    auto layer = std::make_shared<gpu::SplatLayer>();
+                    layer->width = std::max(1, w), layer->height = std::max(1, h);
+                    layer->points = so.points, layer->linearColor = cloud->linearColor, layer->opacity = so.opacity;
+                    splatsForBlending(*cloud, place, cam, layer->width, layer->height, so, layer->records, layer->depths, &layer->tiles);
+                    out.splats = std::move(layer);
+                    return true;
+                }
+                // (one that cannot be drawn is the CPU's, which says why)
+            } else {
+                gpu::countSplatsOnCpu(why);
+            }
+        }
         src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError,
                                                                       modelLayerAt(p, seq, o), !o.highQuality)
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
@@ -1524,23 +1628,48 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     if (nf) into = toImage(*nf);
                     return bool(nf);
                 };
-                if (blur) {
+                // The shutter is open over a share of a sequence frame (centred on it): the source frames the clip
+                // shows over that time, read from its speed and Time Remapping, are those the picture is blurred
+                // through, so footage played fast is blurred over every source frame it passes and slow motion over
+                // a part of one; a frame held is not blurred at all. Frames made in between (Frame Blending, Optical
+                // Flow, AI frames) take the motion between the frames they are made from. (A Motion Blur saved before it
+                // followed the edit, with no follow_edit, is blurred over its shutter in source frames, as it was.)
+                const double open = blur && !motionBlurOff() ? std::clamp(blur->p("shutter", lt, 180), 0.0, 720.0) / 360 : 0;
+                const bool follow = blur && blur->p("follow_edit", lt, 0) > 0.5;
+                double from = -open / 2, to = open / 2;
+                if (follow) {
+                    const double perSeq = mf / seq.fpsValue();  // source frames a sequence frame of source position
+                    const double local = double(t - c.start);
+                    const double here = c.sourceAt(local);
+                    from = (c.sourceAt(local - open / 2) - here) * perSeq, to = (c.sourceAt(local + open / 2) - here) * perSeq;
+                    if (from > to) std::swap(from, to);  // (played backwards)
+                }
+                const double at = follow && between ? std::clamp(sec * mf - double(base), 0.0, 1.0) : 0.0;
+                if (open > 0 && to - from > 1e-9) {
                     const Image self = decoded.empty() ? src : decoded;
-                    Image prev, next;
-                    int havePrev = -1, haveNext = -1;  // not tried yet
-                    const std::vector<MotionFn> motion = chainedMotion(key, base, {-1, 1}, [&](int64_t i) -> const Image* {
+                    // The frames it runs over: as far as the shutter reaches, at least one either side.
+                    const int k0 = std::min(-1, int(std::floor(at + from))), k1 = std::max(1, int(std::ceil(at + to)));
+                    std::map<int64_t, Image> frames;
+                    std::map<int64_t, bool> have;
+                    std::vector<int> offsets;
+                    for (int k = k0; k <= k1; ++k)
+                        if (k != 0) offsets.push_back(k);
+                    const std::vector<MotionFn> motion = chainedMotion(key, base, offsets, [&](int64_t i) -> const Image* {
                         if (i == base) return &self;
-                        if (i == base - 1) {
-                            if (havePrev < 0) havePrev = fetch(i, prev);
-                            return havePrev ? &prev : nullptr;
-                        }
-                        if (i == base + 1) {
-                            if (haveNext < 0) haveNext = fetch(i, next);
-                            return haveNext ? &next : nullptr;
-                        }
-                        return nullptr;
+                        auto h = have.find(i);
+                        if (h == have.end()) h = have.emplace(i, fetch(i, frames[i])).first;
+                        return h->second ? &frames[i] : nullptr;
                     });
-                    src = motionBlur(src, motion[0], motion[1], blur->p("shutter", lt, 180) / 360);
+                    const double old = blur->p("shutter", lt, 180) / 360;
+                    if (at == 0 && std::fabs(from + old / 2) < 1e-9 && std::fabs(to - old / 2) < 1e-9) {
+                        // (footage at its own speed and rate: as it was always blurred)
+                        src = motionBlur(src, motion[size_t(-1 - k0)], motion[size_t(-k0)], old);
+                    } else {
+                        std::map<int, MotionFn> flows;
+                        for (size_t i = 0; i < offsets.size() && i < motion.size(); ++i)
+                            if (motion[i]) flows[offsets[i]] = motion[i];
+                        src = motionBlurPath(src, flows, at, from, to);
+                    }
                 }
                 if (flicker) {
                     const int r = std::clamp(int(std::lround(flicker->p("frames", lt, 3))), 1, 12);
@@ -1790,6 +1919,21 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
         }
     // Graded scene-referred, layers are composited in light (dissolves and blend modes mix light).
     if (const SceneGrading* sg = currentSceneGrading()) convertExactly(src, *sg->working, *sg->linear);
+    // Its transform's motion blur: the layer drawn at its transform at each time through the shutter, and the mean kept.
+    const std::vector<Geometry> through = shutterGeometries(seq, c, lt, g, cs.mw, cs.mh, o.scale);
+    gTransformDraws.fetch_add(through.empty() ? 1 : through.size());
+    if (!through.empty()) {
+        Image sum;
+        for (const Geometry& gs : through) {
+            Image one = transformLayer(src, gs, SW, seq.height, o.scale);
+            if (sum.empty()) sum = std::move(one);
+            else
+                for (size_t i = 0; i < sum.px.size(); ++i) sum.px[i] += one.px[i];
+        }
+        const float k = 1.0f / float(through.size());
+        for (float& v : sum.px) v *= k;
+        return sum;
+    }
     if (identityLayer(src, g, SW, seq.height, o.scale)) return std::move(src);  // a full-frame clip: no copy
     return transformLayer(src, g, SW, seq.height, o.scale);
 }
@@ -2392,7 +2536,7 @@ bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     const bool model = c.isGenerator() && c.generator.type == "model3d";  // (already in 3D: a 3D Layer does nothing to it)
     const bool deep = enabledEffect(seq, c, "make_deep") || (!model && enabledEffect(seq, c, "layer_3d")) ||
                       (c.isGenerator() && c.generator.type == "model3d" && c.generator.p("depth_merge", t - c.start, 0) > 0.5) ||
-                      !clipDeepFile(p, seq, c, t).empty();
+                      !clipDeepFile(p, seq, c, t).empty() || title3dInScene(seq, c, t);
     if (flattened) *flattened = deep && enabledEffect(seq, c, "flatten_deep");
     return deep;
 }
@@ -2458,6 +2602,25 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
                                       modelLayerAt(p, seq, o), !o.highQuality);
         if (!error.empty() && o.issues) o.issues->note(error);
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        intoWorking(layer, rec709Space(), seq, true);
+        f = throughTransform(deepFromFlat(layer.px.data(), W, H, depth.data(), 0), g.opacity);
+    } else if (c.isGenerator() && c.generator.type == "title3d" && !enabledEffect(seq, c, "make_deep") && title3dInScene(seq, c, t)) {
+        // A 3D title standing in the 3D layers' scene: its letters at their depths, through the clip's transform and
+        // opacity.
+        std::vector<float> depth;
+        Geometry g;
+        if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
+        Image layer = renderTitle3DInScene(p, seq, c, t, W, H, double(W) / seq.width, &depth);
+        if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        // (into Rec.709 as a model's picture is, straight then premultiplied again, then into the working space)
+        parallelRows(layer.height, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < layer.width; ++x) {
+                    float* q = layer.at(x, y);
+                    if (q[3] <= 0) continue;
+                    for (int k = 0; k < 3; ++k) q[k] = float(fromLinear(Transfer::Bt1886, std::max(0.0, double(q[k] / q[3])))) * q[3];
+                }
+        });
         intoWorking(layer, rec709Space(), seq, true);
         f = throughTransform(deepFromFlat(layer.px.data(), W, H, depth.data(), 0), g.opacity);
     } else if (const Effect* l3 = enabledEffect(seq, c, "layer_3d")) {
@@ -2707,6 +2870,7 @@ Image compositeLayer(const Project& p, const Sequence& seq, const Clip& c, Frame
 
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
     ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
+    const MotionBlurOffScope blurOff(!opts.motionBlur);
     // Graded scene-referred (render/ColorSpace.h): clips graded in the working space, layers composited in its light,
     // the frame made for one display (the one asked for, the one a sequence it is in is made for, else its delivery
     // space) and delivered through that display's output transform.
@@ -3169,6 +3333,9 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     } else if (cs.shapes) {
         out.shapes = cs.shapes;
         w = cs.shapes->width, h = cs.shapes->height;
+    } else if (cs.splats) {
+        out.splats = cs.splats;
+        w = cs.splats->width, h = cs.splats->height;
     } else {
         out.image = std::move(cs.src);
         w = out.image.width, h = out.image.height;
@@ -3197,9 +3364,37 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
                    ", converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
         else if (cs.frame) *why = "16-bit RGBA from the decoder";
         else if (cs.shapes) *why = "a Shape layer, drawn there";
+        else if (cs.splats) *why = std::to_string(cs.splats->depths.size()) + " splats, sorted and blended there";
         else *why = "a picture made on the CPU before its effects";
     }
-    // Placed as transformLayer places it (worked out here in double).
+    // Placed as transformLayer places it (worked out here in double); false for a transparent placement.
+    auto placement = [&](const Geometry& g, gpu::Placement& pl) {
+        const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
+        if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) return false;
+        const double cosr = std::cos(g.rot), sinr = std::sin(g.rot);
+        pl.scale = float(o.scale);
+        pl.opacity = float(g.opacity);
+        pl.axis = std::fabs(sinr) < 1e-9 && cosr > 0 && g.sx > 0 && g.sy > 0;
+        pl.cx = float(SW / 2.0 + g.px), pl.cy = float(SH / 2.0 + g.py), pl.cosr = float(cosr), pl.sinr = float(sinr);
+        pl.sx = float(g.sx), pl.sy = float(g.sy), pl.au = float(g.mw / 2 + g.ax), pl.av = float(g.mh / 2 + g.ay);
+        pl.u0 = float(u0), pl.u1 = float(u1), pl.v0 = float(v0), pl.v1 = float(v1);
+        pl.kx = float(w / g.mw), pl.ky = float(h / g.mh);
+        pl.px = float(std::fabs(g.sx) * o.scale), pl.py = float(std::fabs(g.sy) * o.scale);
+        return true;
+    };
+    // A transform moving through its shutter: the picture placed at each time and the mean kept there (a time at
+    // which it is transparent placed at nothing: it adds nothing to the mean).
+    if (const std::vector<Geometry> through = shutterGeometries(seq, c, cs.lt, cs.g, cs.mw, cs.mh, o.scale); !through.empty()) {
+        if (out.canvas) return cpu("an adjustment layer's transform's motion blur");
+        out.through.clear();
+        for (const Geometry& gs : through) {
+            gpu::Placement pl;
+            if (!placement(gs, pl)) pl.opacity = 0, pl.u0 = pl.v0 = 1, pl.u1 = pl.v1 = 0;  // (covering nothing)
+            out.through.push_back(pl);
+        }
+        if (why) *why += ", its transform's motion blur through " + std::to_string(through.size()) + " times there";
+        return GpuLayerResult::Drawn;
+    }
     const Geometry& g = cs.g;
     gpu::Placement& pl = out.place;
     Image probe;  // (identityLayer reads the size alone)
@@ -3208,8 +3403,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         pl.full = w == W && h == H;
         return GpuLayerResult::Drawn;
     }
-    const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
-    if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) {  // (a transparent layer)
+    if (!placement(g, pl)) {  // (a transparent layer)
         out.canvas = false;
         out.frame.reset();
         out.shapes.reset();
@@ -3217,15 +3411,6 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         out.ops.clear();
         return GpuLayerResult::Drawn;
     }
-    const double cosr = std::cos(g.rot), sinr = std::sin(g.rot);
-    pl.scale = float(o.scale);
-    pl.opacity = float(g.opacity);
-    pl.axis = std::fabs(sinr) < 1e-9 && cosr > 0 && g.sx > 0 && g.sy > 0;
-    pl.cx = float(SW / 2.0 + g.px), pl.cy = float(SH / 2.0 + g.py), pl.cosr = float(cosr), pl.sinr = float(sinr);
-    pl.sx = float(g.sx), pl.sy = float(g.sy), pl.au = float(g.mw / 2 + g.ax), pl.av = float(g.mh / 2 + g.ay);
-    pl.u0 = float(u0), pl.u1 = float(u1), pl.v0 = float(v0), pl.v1 = float(v1);
-    pl.kx = float(w / g.mw), pl.ky = float(h / g.mh);
-    pl.px = float(std::fabs(g.sx) * o.scale), pl.py = float(std::fabs(g.sy) * o.scale);
     return GpuLayerResult::Drawn;
 }
 
@@ -3254,6 +3439,7 @@ gpu::Layer cpuLayer(Image&& img) {
 // with why) when the frame as a whole is for the CPU.
 bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts, Image* out, QImage* out8) {
     ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
+    const MotionBlurOffScope blurOff(!opts.motionBlur);
     std::string why;
     auto fallback = [](const std::string& reason) {
         gpu::countFallback(reason);
@@ -5515,5 +5701,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
 }
 
 void setModelStandInsForTesting(ModelStandIns standIns) { gStandIns = std::move(standIns); }
+
+uint64_t transformLayerDraws() { return gTransformDraws.load(); }
 
 }  // namespace montage

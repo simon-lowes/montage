@@ -526,6 +526,11 @@ public:
         return false;
     }
     QByteArray log() const { return browser_ ? browser_->log() : QByteArray(); }
+    // One of the page's DevTools commands (Emulation.setDeviceMetricsOverride, say).
+    bool call(const QString& method, const QJsonObject& params, std::string* why) {
+        QJsonObject r;
+        return browser_ && browser_->call(method, params, &r, why);
+    }
 
 private:
     std::unique_ptr<HeadlessBrowser> browser_;

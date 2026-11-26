@@ -226,19 +226,22 @@ struct GlPicture {
     int width = 0, height = 0;
 };
 // Whether `e`'s plug-in, a clip effect's (or, `transition`, a transition's), is given textures (it renders with OpenGL,
-// in this process); `why` says why not.
+// in this process; or in a plug-in host whose pictures come back as handles to the GPU's memory, copied into the
+// compositor's texture: render/OfxRemote.h's renderInto); `why` says why not.
 bool rendersTextures(const Effect& e, std::string* why = nullptr, bool transition = false);
 // applyEffect from `from` into `to` (two textures of one size, in a context sharing with the plug-ins'; what was drawn
 // into `from` finished first). Called from the thread that renders the frame, with its scopes, not the compositor's
 // own. A plug-in that after all does not render them with OpenGL has `from` read back and its picture written into
-// `to` (counted in gpuReadBacks, and it is not given textures again). False (with `error`) as applyEffect: `to` is
-// then not to be used.
+// `to` (counted in gpuReadBacks, and it is not given textures again). A plug-in in a host has `from` read back
+// (counted) and its picture copied into `to` on the GPU where it comes as a handle (counted in gpuTextureRenders), else
+// written into it. False (with `error`) as applyEffect: `to` is then not to be used.
 bool applyEffectTexture(const Effect& e, double t, const GlPicture& from, const GlPicture& to, double scale, const FrameFetch& fetch = {},
                         std::string* error = nullptr, const ColorSpace* working = nullptr);
 // applyTransition likewise, from the two sides `from` and `to` into `out` (three textures of one size).
 bool applyTransitionTexture(const Effect& e, double t, double progress, const GlPicture& from, const GlPicture& to, const GlPicture& out,
                             double scale, std::string* error = nullptr, const ColorSpace* working = nullptr);
-// OpenGL renders read back into memory in this process, and those that went into a texture of the compositor's.
+// OpenGL renders read back into memory in this process (and pictures read back for plug-in hosts), and those that went
+// into a texture of the compositor's (a host's handle copied into it among them).
 int gpuReadBacks();
 int gpuTextureRenders();
 

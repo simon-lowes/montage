@@ -13,12 +13,23 @@ concurrency:
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90  # a stuck apt mirror or model host should not hold the runner for hours (a full run is about 55 minutes)
+    timeout-minutes: 120  # a stuck apt mirror or model host should not hold the runner for hours (a full run is about 80 minutes: a cold build about 40, the tests about 45)
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         timeout-minutes: 15
+        env:
+          MONTAGE_KEEP_ONNXRUNTIME_PACKAGE: ${{ runner.temp }}/onnxruntime.nupkg
         run: ./scripts/setup-deps.sh
+      - name: ONNX Runtime's package with one byte changed is refused
+        run: |
+          pkg="$RUNNER_TEMP/onnxruntime.nupkg"
+          scripts/setup-deps.sh --check-onnxruntime "$pkg"
+          cp "$pkg" "$RUNNER_TEMP/changed.nupkg"
+          python3 -I -c 'import sys; f = open(sys.argv[1], "r+b"); f.seek(1000000); b = f.read(1); f.seek(1000000); f.write(bytes([b[0] ^ 1]))' \
+            "$RUNNER_TEMP/changed.nupkg"
+          if scripts/setup-deps.sh --check-onnxruntime "$RUNNER_TEMP/changed.nupkg"; then echo "A changed package was taken" >&2; exit 1; fi
+          rm -f "$pkg" "$RUNNER_TEMP/changed.nupkg"
       - name: Rust version (part of the C2PA library's cache key)
         id: rust
         run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
@@ -52,7 +63,7 @@ jobs:
         run: |
           scripts/build-svt-jpegxs.sh ~/svt-jpegxs
           echo "MONTAGE_TEST_SVTJPEGXS=$HOME/svt-jpegxs/bin" >> "$GITHUB_ENV"
-      # SVT-AV1 v4.3.0, from a pinned tag checked against its commit: its encoder reads the film grain tables Montage
+      # SVT-AV1 v4.3.1, from a pinned tag checked against its commit: its encoder reads the film grain tables Montage
       # writes (--fgs-table), and the grain tests read the parameters it codes from them with Montage's own reader.
       - name: Cache SVT-AV1
         uses: actions/cache@v4
@@ -284,9 +295,19 @@ jobs:
           (sudo apt-get install -y --no-install-recommends coturn > /dev/null && (sudo systemctl stop coturn > /dev/null 2>&1 || true) && command -v turnserver > /dev/null) \
             && echo "MONTAGE_TEST_TURNSERVER=$(command -v turnserver)" >> "$GITHUB_ENV" \
             || echo "::warning::Could not install coturn; the browser review test through it will be skipped"
+      - name: tcpdump, to capture a review through the relay (the distribution's package, let capture without root)
+        run: |
+          sudo apt-get install -y --no-install-recommends tcpdump libcap2-bin > /dev/null
+          sudo setcap cap_net_raw,cap_net_admin=eip "$(command -v tcpdump)"
+          echo "MONTAGE_TEST_TCPDUMP=$(command -v tcpdump)" >> "$GITHUB_ENV"
       - name: Test
         env:
           MONTAGE_REQUIRE_FIREFOX: "1"  # (the runner's Firefox and geckodriver: the browser review test fails rather than skips without them)
+          # Qt's Linguist tools (Ubuntu's qt6-l10n-tools, installed by the set-up script) give the tests lupdate as
+          # MONTAGE_TEST_LUPDATE (tests/CMakeLists.txt): a tr() text missing from translations/*.ts fails
+          # everyTranslatableTextIsFound, which fails rather than skips here without lupdate.
+          MONTAGE_REQUIRE_LUPDATE: "1"
+          MONTAGE_REQUIRE_IPV6: "1"     # (the relay tests' ::1 rows fail rather than skip without an IPv6 loopback)
         run: ctest --test-dir build --output-on-failure
       - name: The window read over AT-SPI, as a screen reader on Linux reads it
         run: |
@@ -335,7 +356,7 @@ jobs:
           MONTAGE_GPU_LOG: "1"
         run: |
           # Every GPU test must run on both: a skip (no device, no shader compiler) fails the step.
-          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuDepthAndObjectMasks gpuYcbcrPlanes gpuHardwareFrames gpuHardwareFramesImportedOnce gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl ofxSharedTextures gpuOfxTextures gpuTextureBudget gpuMasksAndStepsFromThePicture openFxHandlesForEveryKindAndAfterAHostEnds"
+          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuDepthAndObjectMasks gpuYcbcrPlanes gpuHardwareFrames gpuHardwareFramesImportedOnce gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl ofxSharedTextures gpuOfxTextures gpuTextureBudget gpuMasksAndStepsFromThePicture gpuTransformMotionBlur openFxHandlesForEveryKindAndAfterAHostEnds openFxHandlesIntoTheCompositorsTextures"
           for backend in opengl vulkan; do
             echo "::group::$backend"
             MONTAGE_GPU=$backend xvfb-run -a build/tests/test_render $tests -o "$RUNNER_TEMP/$backend.txt,txt" -o -,txt || failed=1
@@ -348,8 +369,8 @@ jobs:
           exit "${failed:-0}"
       # Plug-in pictures shared from the GPU's memory between a plug-in host and Montage, run to the end: in a guest
       # whose kernel has udmabuf (QEMU and the kernel from Ubuntu's packages; KVM where the runner allows it), on
-      # llvmpipe through EGL under Xvfb. There a picture that does not come as a handle fails the test
-      # (MONTAGE_EXPECT_HANDLES).
+      # llvmpipe through EGL under Xvfb. There a picture that does not come as a handle, or one not copied into the
+      # compositor's texture in place, fails the test (MONTAGE_EXPECT_HANDLES).
       - name: QEMU and a kernel with udmabuf (Ubuntu's packages)
         timeout-minutes: 10
         run: |
@@ -359,9 +380,10 @@ jobs:
       - name: Plug-in pictures as DMA-BUFs, in the guest
         timeout-minutes: 30
         run: |
-          scripts/kvm-guest.sh "$RUNNER_TEMP/guest" env QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=xcb_egl MONTAGE_GPU_HANDLES=1 \
+          # (no MONTAGE_GPU_HANDLES: handles are asked for unless turned off)
+          scripts/kvm-guest.sh "$RUNNER_TEMP/guest" env QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=xcb_egl \
             MONTAGE_EXPECT_HANDLES=1 MONTAGE_GPU_LOG=1 QTEST_FUNCTION_TIMEOUT=900000 \
-            xvfb-run -a build/tests/test_render openFxHandlesForEveryKindAndAfterAHostEnds
+            xvfb-run -a build/tests/test_render openFxHandlesForEveryKindAndAfterAHostEnds openFxHandlesIntoTheCompositorsTextures
 
   # HDR viewing on Linux: the viewer under Weston (headless, GL on llvmpipe, Wayland's colour management) built from
   # source, as Ubuntu 24.04's Weston and wayland-protocols are too old for color-management-v1; Qt 6.8 for its RHI.
@@ -450,19 +472,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Qt
-          key: qt-6.12.0-linux_gcc_64-multimedia
+          key: qt-6.12.1-linux_gcc_64-multimedia
       - name: Qt 6.12 with Qt Multimedia (aqtinstall)
         run: |
-          if [ ! -d ~/Qt/6.12.0/gcc_64 ]; then
+          if [ ! -d ~/Qt/6.12.1/gcc_64 ]; then
             python3 -m venv ~/aqt && ~/aqt/bin/pip install -q aqtinstall==3.3.0
-            ~/aqt/bin/aqt install-qt linux desktop 6.12.0 linux_gcc_64 -m qtmultimedia -O ~/Qt
+            ~/aqt/bin/aqt install-qt linux desktop 6.12.1 linux_gcc_64 -m qtmultimedia -O ~/Qt
           fi
           # (its Wayland platform, whatever this Qt names the plug-in)
-          ls ~/Qt/6.12.0/gcc_64/plugins/platforms/ | grep -i wayland
+          ls ~/Qt/6.12.1/gcc_64/plugins/platforms/ | grep -i wayland
       - name: Configure
         run: |
           set -o pipefail
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="$HOME/Qt/6.12.0/gcc_64" \
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="$HOME/Qt/6.12.1/gcc_64" \
             -DMONTAGE_WAYLAND_BINDING=OFF | tee "$RUNNER_TEMP/configure.log"
           # (Qt's handling of the protocol, not Montage's binding)
           grep -q "HDR viewer on Wayland: Qt's colour management" "$RUNNER_TEMP/configure.log"

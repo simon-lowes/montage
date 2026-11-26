@@ -64,6 +64,12 @@ public:
     // next commit, the next frame). False, with the compositor's reason, if it failed.
     bool describe(const Description& description, std::string* error = nullptr);
     const Description* described() const;
+    // Commits the surface with no buffer (and the description set since its last frame), which takes it off the
+    // screen until its next frame maps it again, as a new view. Weston (16.0.2, and its main branch in November
+    // 2026) drops a shown surface's colour transformation when its description changes and makes it again only when
+    // it next rebuilds its list of views, leaving the surface out of every repaint until then; a surface mapped again
+    // is in that list afresh.
+    void remap();
 
     const Preferred& preferred() const;
     // Handles what arrived on the queue: the preferred description is read again if the compositor said it changed

@@ -1039,7 +1039,7 @@ Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, con
                                         "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "fill-rule", "opacity", "display",
                                         "visibility", "stop-color", "stop-opacity", "filter", "mask", "clip-path", "font-family",
                                         "font-size", "font-weight", "font-style", "text-anchor", "baseline-shift", "dominant-baseline",
-                                        "writing-mode"};
+                                        "writing-mode", "text-orientation", "glyph-orientation-vertical"};
     for (const char* p : props)
         if (auto it = n.attrs.find(p); it != n.attrs.end()) s[p] = it->second.trimmed();
     if (sheet && !sheet->empty() && (!work || *work <= kMaxCssWork)) {
@@ -1730,8 +1730,8 @@ public:
                 lay.start = v.empty() ? 0.0 : v[0];
                 // (side="right": along the path taken backwards)
                 lay.pathRight = onPath->attrs.count("side") && onPath->attrs.at("side").trimmed() == "right";
-                if (onPath->attrs.count("method") && onPath->attrs.at("method").trimmed() == "stretch")
-                    note("Text stretched along its path (its letters are set along it unbent)");
+                // (method="stretch": each letter bent along the path, not only set along it)
+                lay.stretch = onPath->attrs.count("method") && onPath->attrs.at("method").trimmed() == "stretch";
             } else {
                 note("Text on a path that is not there (laid out straight)");
             }
@@ -1744,9 +1744,21 @@ public:
                 lay.adjustGlyphs = n.attrs.count("lengthAdjust") && n.attrs.at("lengthAdjust").trimmed() == "spacingAndGlyphs";
             }
         }
+        // writing-mode: vertical text, set top to bottom, its letters upright or turned a quarter clockwise as
+        // text-orientation (or SVG 1.1's glyph-orientation-vertical) says (mixed: upright for scripts written
+        // upright, such as Chinese and Japanese, turned for the rest).
         if (const QString mode = st.count("writing-mode") ? st.at("writing-mode") : QString();
-            mode.startsWith("vertical") || mode.startsWith("tb"))
-            note("Vertical text (set left to right)");
+            mode.startsWith("vertical") || mode.startsWith("tb")) {
+            if (lay.path.empty()) {
+                lay.vertical = true;
+                const QString orient = st.count("text-orientation") ? st.at("text-orientation") : QString();
+                const QString old = st.count("glyph-orientation-vertical") ? st.at("glyph-orientation-vertical") : QString();
+                if (orient == "upright" || (orient.isEmpty() && (old == "0" || old == "0deg"))) lay.orient = 1;
+                else if (orient.startsWith("sideways") || (orient.isEmpty() && (old == "90" || old == "90deg"))) lay.orient = 2;
+            } else {
+                note("Vertical text on a path (set along it as horizontal text)");
+            }
+        }
         double x = lay.x.empty() || !lay.x[0] ? 0 : *lay.x[0], y = lay.y.empty() || !lay.y[0] ? 0 : *lay.y[0];
         SvgText t;
         t.text = str.toStdString();

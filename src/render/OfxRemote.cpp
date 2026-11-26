@@ -7,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "audio/PluginHostInternal.h"
@@ -201,31 +202,52 @@ void notePicture(const PluginDesc& d, bool handle, const std::string& why) {
     gPictures.last = std::move(line);
 }
 
-// Whether the host is asked for a handle; why not, otherwise.
-bool asksForHandle(const Host& host, std::string& why) {
+// Whether the user turned handles off (MONTAGE_GPU_HANDLES=0), the first reason given when they did.
+bool handlesTurnedOff(std::string& why) {
+    // (asked for unless turned off: CI's guest showed the path working on 24 November 2026, where both sides share)
+    const char* v = std::getenv("MONTAGE_GPU_HANDLES");
+    const std::string asked = v ? v : "";
+    if (asked != "0" && asked != "off") return false;
+    why = "handles are turned off (MONTAGE_GPU_HANDLES=0)";
+    return true;
+}
+
+// Whether hosts are asked for handles (the host aside); why not, otherwise.
+bool asksForHandlesNow(std::string& why) {
     auto no = [&](const std::string& reason) {
         why = reason;
         return false;
     };
-    const char* v = std::getenv("MONTAGE_GPU_HANDLES");
-    const std::string asked = v ? v : "";
-    if (asked != "1" && asked != "on") return no("handles are not asked for (MONTAGE_GPU_HANDLES=1 asks)");
+    if (handlesTurnedOff(why)) return false;
     {
         std::lock_guard lock(gPicturesM);
         if (!gHandlesOff.empty()) return no(gHandlesOff);
     }
-    if (!host.gpu) return no("its plug-in host renders without OpenGL");
     if (gl::servingOpenGl()) return no("OpenGL is busy with the render this picture is for");
     std::string cannot;
     if (!gl::importsDmaBuf(&cannot)) return no(cannot);
     return true;
 }
 
-// The picture a host shares, read from the texture it is imported as: its descriptors are at `post`, sent before the
+// Whether the host is asked for a handle; why not, otherwise.
+bool asksForHandle(const Host& host, std::string& why) {
+    if (handlesTurnedOff(why)) return false;
+    if (!host.gpu) {
+        why = "its plug-in host renders without OpenGL";
+        return false;
+    }
+    return asksForHandlesNow(why);
+}
+
+// The texture this thread's render is to go into (renderInto), and whether a handle was copied into it.
+thread_local unsigned tInto = 0;
+thread_local bool tInPlace = false;
+
+// The picture a host shares, read from the texture it is imported as (or copied from it into `into`, then not read): its descriptors are at `post`, sent before the
 // reply. Its descriptors and its fence are waited for `waitMs` at most (what is left of the render's own wait, so a
 // fence that is slow to signal holds the frame no longer than a slow render would). False, with why, when it cannot be
 // taken.
-bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w, int h, int waitMs, Image& out, std::string& why) {
+bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w, int h, int waitMs, unsigned into, Image& out, std::string& why) {
     if (ph.kind != 1 || ph.width != w || ph.height != h || !host.proc) {
         why = "the plug-in host's handle is not one Montage takes";
         return false;
@@ -247,11 +269,19 @@ bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w
     const bool ran = gl::run([&] {
         const unsigned texture = gl::importDmaBuf(buf, &why);
         if (!texture) return;
-        gl::readTexture(texture, w, h, true, out);
+        if (into) {
+            // (into the compositor's texture on the GPU, finished there so that its context draws what was copied)
+            ok = gl::copy(texture, into, w, h);
+            if (ok) gl::finish();
+            else why = "the shared picture could not be copied into the compositor's texture";
+        } else {
+            gl::readTexture(texture, w, h, true, out);
+            ok = !out.empty();
+            if (!ok) why = "the shared picture could not be read";
+        }
         gl::destroyTexture(texture);
-        ok = !out.empty();
-        if (!ok) why = "the shared picture could not be read";
     });
+    if (ran && ok && into) tInPlace = true;
     gl::closeDmaBuf(buf);
     if (!ran) why = "OpenGL for plugins is not running";
     return ran && ok;
@@ -260,6 +290,49 @@ bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w
 }  // namespace
 
 bool isolated() { return plugins::isolating(); }
+
+bool asksForHandles(std::string* why) {
+    std::string no;
+    if (!(gpuRendering() && gpuAvailable())) no = "plug-in hosts render without OpenGL";
+    else if (asksForHandlesNow(no)) return true;
+    if (why) *why = no;
+    return false;
+}
+
+bool renderInto(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
+                const Image* b, unsigned into, const FrameFetch* fetch, std::string* error, const ColorSpace* working, bool* inPlace) {
+    if (inPlace) *inPlace = false;
+    if (!into || w <= 0 || h <= 0) {
+        if (error) *error = "no texture to render into";
+        return false;
+    }
+    struct Into {
+        const unsigned was = tInto;
+        explicit Into(unsigned texture) { tInto = texture, tInPlace = false; }
+        ~Into() { tInto = was; }
+    } scope(into);
+    Image out;
+    if (!render(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working)) return false;
+    if (tInPlace) {
+        std::lock_guard lock(gPicturesM);
+        ++gPictures.inPlace;
+        if (inPlace) *inPlace = true;
+        return true;
+    }
+    // (through shared memory after all: written into the texture)
+    if (out.width != w || out.height != h) {
+        if (error) *error = d.label + " gave back a picture of the wrong size";
+        return false;
+    }
+    if (!gl::run([&] {
+            gl::writeTexture(into, out);
+            gl::finish();
+        })) {
+        if (error) *error = d.label + ": its picture could not be written into the compositor's texture";
+        return false;
+    }
+    return true;
+}
 
 PictureStats pictureStats() {
     std::lock_guard lock(gPicturesM);
@@ -308,6 +381,12 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
         if (error) *error = d.label + " is bypassed after failing in its plug-in host (Restart brings it back)";
         return false;
     }
+    // (the texture renderInto gave, taken for this render alone: renders the host asks for meanwhile, frames at other
+    // times, are not copied into it)
+    struct Into {
+        const unsigned texture = std::exchange(tInto, 0u);
+        ~Into() { tInto = texture; }
+    } into;
     const std::string key = keyFor(e, d);
     std::string err;
     std::unique_ptr<Link> link = takeLink(key, d.id, &err);
@@ -413,7 +492,7 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
             if (described) std::memcpy(&ph, wire::payload(c.base()), sizeof ph);
             // (what is left of this render's wait, 5 s at most, and a moment at the least for the descriptors to come)
             const int waitMs = int(std::clamp<int64_t>((timeout - (ipc::nowUs() - began)) / 1000, 50, 5000));
-            const bool taken = described && takeHandle(*link->host, link->post, ph, w, h, waitMs, out, why);
+            const bool taken = described && takeHandle(*link->host, link->post, ph, w, h, waitMs, into.texture, out, why);
             giveBack(key, std::move(link));
             if (taken) {
                 notePicture(d, true, {});
@@ -449,16 +528,20 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
     // It crashed or did not answer: bypassed this time, named, and started again for the next render (a few times).
     const std::string how = hostFailed(*link->host, d, bypassKey(e, d), r, timeout);
     if (asked) {
-        // A host that ended while its picture was to come as a handle: no handle is asked for from now on, and this
-        // picture is rendered again in a new host, through shared memory (once: nothing is asked of that one).
-        const std::string why = "its plug-in host ended while the picture was shared as a handle (" + d.label + " " + how + ")";
+        // A host that ended while its picture was to come as a handle: no handle is asked for from now on. One that
+        // crashed has this picture rendered again in a new host, through shared memory (once: nothing is asked of
+        // that one), as the handle may be what it died of; one that hung is not, as the plug-in would most likely
+        // hang there too, holding the frame a second timeout and spending a second restart.
+        const bool hung = r == Result::Timeout;
+        const std::string why = "its plug-in host " + std::string(hung ? "hung" : "ended") + " while the picture was shared as a handle (" + d.label +
+                                " " + how + ")";
         {
             std::lock_guard lock(gPicturesM);
             gHandlesOff = why;
         }
         if (logsPictures()) std::fprintf(stderr, "montage gpu: %s: pictures come through shared memory from now on\n", why.c_str());
         link.reset();
-        return renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
+        if (!hung) return renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
     }
     if (error) *error = d.label + " " + how;
     return false;

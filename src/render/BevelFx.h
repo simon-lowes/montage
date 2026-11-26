@@ -6,9 +6,8 @@
 // pixel, so sizes given in pixels look the same in previews at lower resolution. A frame's own border counts as an
 // edge: an opaque picture is bevelled along its sides.
 //
-// The GPU compositor has no pass of its own for these: a layer with one is drawn by this code and handed over as a
-// texture, as for the other effects render/Processing.cpp does not list as GPU filters, so both paths give the same
-// pixels.
+// On the GPU (render/shaders/gpufilter.frag's modes 78 and 79) the surface is made here, from the picture read back
+// when the step runs, and lit there.
 #pragma once
 
 #include <vector>
@@ -24,5 +23,11 @@ std::vector<float> edgeDistance(const Image& img);
 
 void edgeBevel(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void layerBevel(const Effect& e, FrameTime t, Image& img, double pixelScale);
+// Each one's surface (its height in pixels), with a ring of a pixel round the frame: (width + 2) x (height + 2)
+// values; empty where the bevel changes nothing.
+std::vector<float> edgeBevelSurface(const Effect& e, FrameTime t, const Image& img, double pixelScale);
+std::vector<float> layerBevelSurface(const Effect& e, FrameTime t, const Image& img, double pixelScale);
+// Layer Bevel's light (its direction, x and y across the frame, z up) for an angle and altitude in degrees.
+void bevelLight(double angleDeg, double altitudeDeg, double out[3]);
 
 }  // namespace montage::bevel

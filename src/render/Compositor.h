@@ -70,6 +70,9 @@ struct RenderOptions {
     bool slowEffects = false;
     // Program frames drawn on the GPU (render/GpuCompositor.h) where it can draw them, the CPU otherwise.
     bool gpu = false;
+    // Off: every motion blur through a shutter is left out (render/TemporalFx.h MotionBlurOffScope), nested sequences'
+    // too.
+    bool motionBlur = true;
     RenderIssues* issues = nullptr;               // told when a frame is not rendered in full
     const std::atomic<bool>* cancel = nullptr;    // stops a slow effect part way (the frame is then not final)
 };
@@ -90,6 +93,10 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t);
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 // Same as 8-bit RGBA (as toRgba8 makes it), for showing: from the GPU without a float frame in between when o.gpu.
 QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
+
+// How many times clips' layers have been placed by their transforms on the CPU since the program started: once a layer,
+// or once each time through its transform's shutter (motion blur on the transform), for tests.
+uint64_t transformLayerDraws();
 
 // For tests, where the models are not installed: what stands in for them on a clip's picture (the people's matte, the
 // still model's depth, the faces), on the CPU's path and the GPU's alike. An unset one is the model itself. Set before

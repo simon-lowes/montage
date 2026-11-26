@@ -34,6 +34,7 @@
 #include <sstream>
 
 #include "core/ClipAnimation.h"
+#include "core/KeyframeEdit.h"
 #include "core/GradeVersions.h"
 #include "core/CompositeGraph.h"
 #include "core/GradeGraph.h"
@@ -536,6 +537,25 @@ Clip& clipArg(Loaded& l, const QJsonObject& a, const char* key = "clip") {
     return *c;
 }
 
+// Which of a clip's settings `effect` (an effect id on it; omitted = its Transform) and `param` name.
+ParamAddress paramAddressArg(const Clip& c, const QJsonObject& a, bool needParam = true) {
+    ParamAddress out;
+    if (needParam && !a.value("param").isString()) throw ArgError{"\"param\" names the setting (as pos_x or opacity)"};
+    out.param = a.value("param").toString().toStdString();
+    const Id effect = Id(a.value("effect").toDouble(0));
+    if (effect == 0 || effect == c.motion.id) return out;
+    if (effect == c.audio.id) out.slot = ParamSlot::Audio;
+    else if (effect == c.timing.id) out.slot = ParamSlot::Timing;
+    else if (effect == c.generator.id) out.slot = ParamSlot::Generator;
+    else {
+        out.slot = ParamSlot::Effect;
+        out.effect = effect;
+        if (std::none_of(c.effects.begin(), c.effects.end(), [&](const Effect& e) { return e.id == effect; }))
+            throw ArgError{QStringLiteral("The clip has no effect %1").arg(qulonglong(effect))};
+    }
+    return out;
+}
+
 // A video clip by its id or its name.
 const Clip& videoClipArg(Loaded& l, const QJsonObject& a) {
     Sequence& s = l.seq();
@@ -702,6 +722,7 @@ QJsonObject projectJson(const Project& p) {
                        {"markers", markers},
                        {"media", media}};
     out["color_space"] = QString::fromStdString(sequenceColorSpace(s).id);
+    out["shutter_angle"] = s.shutterAngle;  // (what new transforms' and Motion Blurs' shutters start at)
     if (sceneReferredWorking(s)) {
         out["working_space"] = QString::fromStdString(workingColorSpace(s).id);
         out["output_transform"] = outputTransformKind(s) == OutputTransformKind::Aces2 ? "aces2" : "filmic";
@@ -807,19 +828,26 @@ QString json(const QJsonObject& o) { return QString::fromUtf8(QJsonDocument(o).t
 
 // ---- Tools ------------------------------------------------------------------------------
 
+// What a path can name: as written, as QFile and Montage's own writers take it ("ab:/x" a folder "ab:" in the current
+// one), and with each "name:" before it taken off in turn, as FFmpeg, which writes most outputs, takes "file:" and its
+// other protocols' names, nested as "md5:file:/x" (and "file:ab:/x" as the file "ab:/x"). One letter is a Windows drive.
+static QStringList spellings(const QString& path) {
+    QStringList out{path};
+    static const QRegularExpression scheme(QStringLiteral("^[A-Za-z][A-Za-z0-9+.\\-]+:"));
+    QString bare = path;
+    for (QRegularExpressionMatch m = scheme.match(bare); m.hasMatch() && out.size() < 64; m = scheme.match(bare)) out << (bare = bare.mid(m.capturedLength()));
+    return out;
+}
+
 // A path as the file system takes it: symbolic links followed as far as it exists (`existing`, that part; `whole`,
-// all of it exists), the rest kept as written under it.
+// all of it exists), the rest kept as written under it. `bare`: with the names before it that FFmpeg takes off
+// (spellings' last), else as written.
 struct ResolvedPath {
     QString name, existing;
     bool whole = false;
 };
-static ResolvedPath resolvedPath(const QString& path) {
-    // (FFmpeg, which writes most outputs, takes "file:" and its other protocols' names before a path, nested as
-    // "md5:file:/x": each is taken off, so they name the file they reach. One letter is a Windows drive.)
-    QString bare = path;
-    static const QRegularExpression scheme(QStringLiteral("^[A-Za-z][A-Za-z0-9+.\\-]+:"));
-    for (QRegularExpressionMatch m = scheme.match(bare); m.hasMatch(); m = scheme.match(bare)) bare = bare.mid(m.capturedLength());
-    QString clean = QDir::cleanPath(absolute(bare));
+static ResolvedPath resolvedPath(const QString& path, bool bare = true) {
+    QString clean = QDir::cleanPath(absolute(bare ? spellings(path).constLast() : path));
     QString rest;
     QFileInfo at(clean);
     // (what does not exist yet, an output and perhaps its folders, is kept as written under the part that does)
@@ -856,6 +884,12 @@ QString mcpFoldedName(const QString& name, McpNameRules rules) {
         // (either slash; a component's stream name, "x.pem:$DATA" or "x.pem::$DATA", is the file itself, and so is
         // one with dots or spaces after it, which Windows drops; the drive's own colon stays)
         out.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        // (the long and device forms, \\?\C:\x, \\.\C:\x and \\?\UNC\server\share, and this machine's own share of
+        // a drive, \\localhost\C$\x: the names they stand for)
+        if (out.startsWith(QLatin1String("//?/unc/"))) out.remove(2, 6);
+        else if (out.startsWith(QLatin1String("//?/")) || out.startsWith(QLatin1String("//./"))) out.remove(0, 4);
+        static const QRegularExpression ownShare(QStringLiteral("^//(?:localhost|127\\.0\\.0\\.1|\\[::1\\])/([a-z])\\$(?=/|$)"));
+        out.replace(ownShare, QStringLiteral("\\1:"));
         QStringList parts = out.split(QLatin1Char('/'));
         for (int i = 0; i < parts.size(); ++i) {
             QString& c = parts[i];
@@ -931,8 +965,12 @@ static bool reachedByIdentity(const ResolvedPath& p, const ResolvedPath& o, bool
 }
 
 bool mcpPathReaches(const QString& path, const QString& own, McpNameRules rules, bool orHolding) {
-    const ResolvedPath p = resolvedPath(path), o = resolvedPath(own);
-    return reachedByName(mcpFoldedName(p.name, rules), mcpFoldedName(o.name, rules), orHolding) || reachedByIdentity(p, o, orHolding);
+    const ResolvedPath o = resolvedPath(own, false);
+    for (const QString& spelt : spellings(path)) {
+        const ResolvedPath p = resolvedPath(spelt, false);
+        if (reachedByName(mcpFoldedName(p.name, rules), mcpFoldedName(o.name, rules), orHolding) || reachedByIdentity(p, o, orHolding)) return true;
+    }
+    return false;
 }
 
 // A path as one name for the file it is: symbolic links followed as far as the path exists, and the name folded as
@@ -1008,25 +1046,30 @@ QString mcpOwnFileNamed(const QString& tool, const QJsonObject& arguments, const
     std::vector<Own> owns;
     for (const auto& [file, what] : own)
         if (!file.empty()) {
-            const ResolvedPath at = resolvedPath(QString::fromStdString(file));
+            const ResolvedPath at = resolvedPath(QString::fromStdString(file), false);
             owns.push_back({at, mcpFoldedName(at.name, rules), what});
         }
     // (the parts of paths that exist, each looked up once: most texts that are no path at all resolve to one folder)
     QHash<QString, int> reached;
+    // (each way the path can be taken, written or as FFmpeg takes it: "ab:/../x" is the folder "ab:"'s parent's x to
+    // the one, /x to the other)
     auto named = [&](const QString& path, bool orHolding) -> const char* {
-        const ResolvedPath p = resolvedPath(path);
-        const QString pn = mcpFoldedName(p.name, rules);
-        for (const Own& o : owns)
-            if (reachedByName(pn, o.name, orHolding)) return o.what;
-        const QString key = p.existing + QLatin1Char('\n') + QLatin1Char(p.whole ? '1' : '0') + QLatin1Char(orHolding ? 'h' : '-');
-        auto it = reached.find(key);
-        if (it == reached.end()) {
-            int found = -1;
-            for (size_t i = 0; i < owns.size() && found < 0; ++i)
-                if (reachedByIdentity(p, owns[i].at, orHolding)) found = int(i);
-            it = reached.insert(key, found);
+        for (const QString& spelt : spellings(path)) {
+            const ResolvedPath p = resolvedPath(spelt, false);
+            const QString pn = mcpFoldedName(p.name, rules);
+            for (const Own& o : owns)
+                if (reachedByName(pn, o.name, orHolding)) return o.what;
+            const QString key = p.existing + QLatin1Char('\n') + QLatin1Char(p.whole ? '1' : '0') + QLatin1Char(orHolding ? 'h' : '-');
+            auto it = reached.find(key);
+            if (it == reached.end()) {
+                int found = -1;
+                for (size_t i = 0; i < owns.size() && found < 0; ++i)
+                    if (reachedByIdentity(p, owns[i].at, orHolding)) found = int(i);
+                it = reached.insert(key, found);
+            }
+            if (*it >= 0) return owns[size_t(*it)].what;
         }
-        return *it >= 0 ? owns[size_t(*it)].what : nullptr;
+        return nullptr;
     };
     // What the call is known to write: there, or a folder that holds one of them.
     for (const QString& w : paths.writes)
@@ -2133,6 +2176,15 @@ void McpServer::Impl::addTools() {
             }
             if (sameFile(output, file) || (check.needsReference && sameFile(output, absolute(str(a, "reference")))))
                 throw ArgError{"\"output\" must be a new file, not the damaged file or the reference"};
+            // (a relative output is beside the damaged file, where the guard on Montage's own files, which takes it from
+            // the current folder, did not look: the output as it is to be written is looked at here)
+            {
+                const QJsonObject written{{"output", output}};
+                if (const QString why = mcpOwnFileNamed(QStringLiteral("montage_repair_media"), written,
+                                                        mcpCallPaths(QStringLiteral("montage_repair_media"), written, false));
+                    !why.isEmpty())
+                    throw ArgError{why};
+            }
             if (QFileInfo::exists(output) && !a.value("overwrite").toBool())
                 throw ArgError{"\"output\" exists: pass overwrite to replace it"};
             std::optional<Loaded> l;
@@ -6413,13 +6465,17 @@ void McpServer::Impl::addTools() {
         "(`model`: strength at mid grey as a fraction of the light, response the power of the light it follows, 0.5 "
         "sensor-like to 1 negative-like, correlation between the channels, yellow_blue 0..1 of the colour on film's "
         "yellow-blue axis, fine_size and cluster_size in pixels of a frame `width` wide (1920 unless given), clusters their share of the power, "
-        "kurtosis, temporal); apply with `model` (any of those, the rest the defaults) uses the model in scene-linear light.",
+        "kurtosis, temporal); apply with `model` (any of those, the rest the defaults) uses the model in scene-linear light. "
+        "measure with save_as keeps the profile under that name in the project and, unless library is false, in the user's "
+        "library too; apply's profile and montage_export's film_grain then take the name.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["measure","apply"]},
             "clip":{"type":"number","description":"measure: the clip whose grain to measure"},
             "region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},
                       "description":"In pixels of the footage (default: the whole frame)"},
             "apply_to":{"type":"array","items":{"type":"number"},"description":"Clips to put the grain on"},
-            "profile":{"type":"string","description":"apply: a profile measure returned"},
+            "profile":{"type":"string","description":"apply: a profile measure returned, or a saved profile's name"},
+            "save_as":{"type":"string","description":"measure: a name to keep the profile under"},
+            "library":{"type":"boolean","default":true,"description":"save_as: in the user's library as well as the project"},
             "gauge":{"type":"string","enum":["65mm","35mm","16mm","super8"]},
             "mode":{"type":"string","enum":["add","replace"],"default":"add"},
             "amount":{"type":"number","default":100,"description":"Percent of the measured strength"},
@@ -6463,6 +6519,17 @@ void McpServer::Impl::addTools() {
                        QString::fromStdString(grainProfileText(profile));
                 result["profile"] = QString::fromStdString(grainProfileText(profile));
                 result["model"] = modelJson(fitGrainModel(profile));
+                if (a.contains("save_as")) {
+                    // Kept by name: in the project (saved below) and the user's library.
+                    const std::string name = a.value("save_as").toString().toStdString();
+                    if (std::string why; !checkGrainProfileName(name, &why)) return fail(QString::fromStdString(why));
+                    if (a.value("library").toBool(true))
+                        if (std::string why; !saveUserGrainProfile(name, profile, &why)) return fail(QString::fromStdString(why));
+                    l.project.grainProfiles[name] = grainProfileText(profile);
+                    save(l);
+                    result["saved_as"] = QString::fromStdString(name);
+                    text += QStringLiteral("\nSaved as \"%1\".").arg(QString::fromStdString(name));
+                }
             } else if (action == "apply") {
                 if (a.contains("model")) {
                     const QJsonObject mo = a.value("model").toObject();
@@ -6481,7 +6548,9 @@ void McpServer::Impl::addTools() {
                     model.width = int(std::lround(width));
                     useModel = true;
                 } else if (a.contains("profile")) {
-                    if (!parseGrainProfile(a.value("profile").toString().toStdString(), profile)) return fail(QStringLiteral("That is not a grain profile"));
+                    std::string given = a.value("profile").toString().toStdString();
+                    if (!parseGrainProfile(given, profile) && !(resolveFilmGrainSetting(l.project, given) && parseGrainProfile(given, profile)))
+                        return fail(QStringLiteral("That is not a grain profile, or the name of one saved"));
                 } else {
                     const QString g = a.value("gauge").toString(QStringLiteral("35mm"));
                     const QStringList names{QStringLiteral("65mm"), QStringLiteral("35mm"), QStringLiteral("16mm"), QStringLiteral("super8")};
@@ -13747,7 +13816,7 @@ void McpServer::Impl::addTools() {
             "color_space":{"type":"string","description":"Deliver in this display space (rec709, srgb, rec2100pq, rec2100hlg...) instead of the sequence's; an HDR sequence delivered in SDR is tone mapped"},
             "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"An HDR sequence delivered in SDR: \"\" Montage's roll-off, or ITU-R BT.2446 Method A or C (a sequence graded scene-referred goes through its output transform instead)"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
-            "film_grain":{"type":"string","description":"AV1 exports: carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned: that grain for every shot; \"off\" (the default): none"},
+            "film_grain":{"type":"string","description":"AV1 exports: carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned, or the name it was saved under (the project's, else the user's library's): that grain for every shot; \"off\" (the default): none"},
             "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
@@ -13786,6 +13855,8 @@ void McpServer::Impl::addTools() {
             "jpeg_xs_bpp":{"type":"number","minimum":0.5,"maximum":24,"default":5,"description":"JPEG XS: bits a pixel, a constant number of bytes each picture (3 to 8 for most mezzanine work)"},
             "jpeg_xs_sampling":{"type":"string","enum":["422","444","rgb"],"default":"422","description":"JPEG XS: 4:2:2 or 4:4:4 Y'CbCr, or R'G'B' (the preset's when it is a JPEG XS preset)"},
             "jpeg_xs_depth":{"type":"integer","enum":[8,10,12],"default":10,"description":"JPEG XS: bits a sample"},
+            "jpeg_xs_lossless":{"type":"boolean","default":false,"description":"JPEG XS: each picture coded losslessly, as many bytes as it takes (jpeg_xs_bpp unused)"},
+            "jpeg_xs_alpha":{"type":"boolean","default":false,"description":"JPEG XS: the sequence's alpha kept as a fourth component, at full size"},
             "av2_speed":{"type":"integer","minimum":0,"maximum":6,"default":6,"description":"AV2: AVM's speed preset, 0 slowest (smallest) to 6 fastest"},
             "av2_quality":{"type":"integer","minimum":0,"maximum":63,"default":32,"description":"AV2 without a bitrate: the quantiser, 0 (best) to 63"},
             "av2_10bit":{"type":"boolean","default":false,"description":"AV2: 10 bits (always for HDR)"},
@@ -13960,6 +14031,11 @@ void McpServer::Impl::addTools() {
                 if (st.audioCodec != "none") st.audioCodec = "pcm_s24le";
                 st.format.clear();
             }
+            if (a.contains("jpeg_xs_lossless") || a.contains("jpeg_xs_alpha")) {
+                if (st.videoCodec != "jpegxs") throw ArgError{"\"jpeg_xs_lossless\" and \"jpeg_xs_alpha\" are for JPEG XS (\"video_codec\": \"jpeg_xs\")"};
+                if (a.contains("jpeg_xs_lossless")) st.jpegXsLossless = a.value("jpeg_xs_lossless").toBool();
+                if (a.contains("jpeg_xs_alpha")) st.alpha = a.value("jpeg_xs_alpha").toBool();
+            }
             if (a.contains("jpeg_xs_bpp") || a.contains("jpeg_xs_sampling") || a.contains("jpeg_xs_depth")) {
                 if (st.videoCodec != "jpegxs") throw ArgError{"\"jpeg_xs_bpp\", \"jpeg_xs_sampling\" and \"jpeg_xs_depth\" are for JPEG XS (\"video_codec\": \"jpeg_xs\")"};
                 if (a.contains("jpeg_xs_bpp")) {
@@ -14053,7 +14129,7 @@ void McpServer::Impl::addTools() {
             st.cea708 = a.value("cea708").toBool(true);
             st.hdr10Plus = a.value("hdr10plus").toBool();
             st.filmGrain = str(a, "film_grain", "").toStdString();
-            if (std::string e; !checkFilmGrainSetting(st.filmGrain, &e)) throw ArgError{QString::fromStdString(e)};
+            if (std::string e; !resolveFilmGrainSetting(l.project, st.filmGrain, &e)) throw ArgError{QString::fromStdString(e)};
             st.adaptiveHdr = a.value("adaptive_hdr").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
@@ -14866,6 +14942,139 @@ void McpServer::Impl::addTools() {
                                                     : QStringLiteral("The expression fails at frame %1 (the keyed value is used): %2").arg(at).arg(QString::fromStdString(why)))
                                      : QStringLiteral("%1 has no expression").arg(QString::fromStdString(param));
             return ok(text, out);
+        });
+
+    add("montage_keyframes", "Keyframes of a setting",
+        "Read or set the keyframes of one of a clip's settings: `param` of the effect `effect` (an effect id; omitted = "
+        "the clip's Transform: pos_x, pos_y, scale, rotation, opacity...). get: each key's frame (from the clip's start), "
+        "value and interpolation towards the next key, and the value at each of `at` (clip frames, fractions allowed). "
+        "set: `keys`, each {frame, value, interpolation}, adds a key or changes the one on that frame (a key's value or "
+        "interpolation left out stays as it was). Interpolations: linear, hold, smooth, bezier, and the easings expo, "
+        "log, sine, circ, back, elastic and bounce, each _in, _out or _in_out (as \"sine_in_out\"); each is kept as itself.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"number"},
+            "param":{"type":"string"},"action":{"type":"string","enum":["get","set"],"default":"get"},
+            "keys":{"type":"array","items":{"type":"object","properties":{"frame":{"type":"integer"},"value":{"type":"number"},
+                "interpolation":{"type":"string"}},"required":["frame"]}},
+            "at":{"type":"array","items":{"type":"number"}}},"required":["project","clip","param"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Clip& c = clipArg(l, a);
+            const ParamAddress address = paramAddressArg(c, a);
+            const QString action = str(a, "action", "get");
+            if (action != "get" && action != "set") throw ArgError{"action is get or set"};
+            if (action == "set") {
+                Effect* owner = paramOwner(c, address);
+                if (!owner) throw ArgError{"The clip has no such effect"};
+                // A setting the effect has (as the Inspector lists it), at its default outside the keys when not set yet.
+                if (!owner->params.count(address.param)) {
+                    const std::vector<ParamInfo> infos = effectParams(*owner);
+                    const auto info = std::find_if(infos.begin(), infos.end(), [&](const ParamInfo& pi) { return pi.name == address.param; });
+                    if (info == infos.end())
+                        throw ArgError{QStringLiteral("%1 has no setting %2").arg(QString::fromStdString(owner->type), QString::fromStdString(address.param))};
+                    owner->params[address.param] = Param(info->def);
+                }
+                Param& p = owner->params[address.param];
+                const QJsonArray keys = a.value("keys").toArray();
+                if (keys.isEmpty()) throw ArgError{"\"keys\" lists the keys to set"};
+                for (const QJsonValue& v : keys) {
+                    const QJsonObject k = v.toObject();
+                    if (!k.value("frame").isDouble()) throw ArgError{"Each key has a \"frame\""};
+                    const FrameTime t = FrameTime(std::llround(k.value("frame").toDouble()));
+                    if (t < 0 || t >= std::max<FrameTime>(1, c.duration)) throw ArgError{QStringLiteral("Frame %1 is outside the clip").arg(t)};
+                    Interp interp = Interp::Linear;
+                    if (k.contains("interpolation") && !interpFromName(k.value("interpolation").toString().toStdString(), interp))
+                        throw ArgError{QStringLiteral("\"%1\" is not an interpolation").arg(k.value("interpolation").toString())};
+                    const bool had = p.keyAt(t) != nullptr;
+                    const Keyframe kept = had ? *p.keyAt(t) : Keyframe{};
+                    if (!had && !k.contains("value")) throw ArgError{QStringLiteral("No key is on frame %1: give its value").arg(t)};
+                    const double value = k.contains("value") ? k.value("value").toDouble() : kept.v;
+                    if (!std::isfinite(value)) throw ArgError{"A key's value is a number"};
+                    if (!k.contains("interpolation") && had) interp = kept.interp;
+                    p.addKey(t, value, interp);
+                    // (A key changed keeps its handles and its place between frames.)
+                    if (had)
+                        for (Keyframe& x : p.keys)
+                            if (x.t == t) x.inDt = kept.inDt, x.inDv = kept.inDv, x.outDt = kept.outDt, x.outDv = kept.outDv, x.sub = kept.sub;
+                }
+                save(l);
+            }
+            const Clip* cc = edit::clipById(l.seq(), c.id);
+            const Param* p = cc ? findParam(*cc, address) : nullptr;
+            QJsonArray keys, values;
+            if (p)
+                for (const Keyframe& k : p->keys)
+                    keys.append(QJsonObject{{"frame", double(k.t)}, {"value", k.v}, {"interpolation", QString::fromLatin1(interpName(k.interp))}});
+            for (const QJsonValue& v : a.value("at").toArray()) values.append(p ? p->keyedAtTime(v.toDouble()) : 0.0);
+            QJsonObject out{{"keys", keys}};
+            if (a.contains("at")) out["values"] = values;
+            return ok(QStringLiteral("%1 has %2 keys").arg(QString::fromStdString(address.param)).arg(keys.size()), out);
+        });
+
+    add("montage_scale_keys", "Stretch keyframes in time",
+        "Stretch or squeeze keyframes of a clip in time, so an animation plays slower or faster as a whole: each key's "
+        "time from `pivot` (a clip frame; default the first of them) times `factor` (2 twice as long, 0.5 half), to the "
+        "nearest frame, its Bezier handles with it; values stay. `param` of `effect` (omitted = the Transform), or every "
+        "keyed setting of that effect when `param` is left out; `keys` (clip frames) picks some of the keys (default all). "
+        "Refused, changing nothing, when keys would pass ones that stay, land on the same frame or leave the clip.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"number"},
+            "param":{"type":"string"},"factor":{"type":"number","exclusiveMinimum":0},"pivot":{"type":"number"},
+            "keys":{"type":"array","items":{"type":"integer"}}},"required":["project","clip","factor"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Clip& c = clipArg(l, a);
+            const double factor = a.value("factor").toDouble(0);
+            if (!(factor > 0) || !std::isfinite(factor)) throw ArgError{"factor is a number above 0"};
+            ParamAddress address = paramAddressArg(c, a, false);
+            Effect* owner = paramOwner(c, address);
+            if (!owner) throw ArgError{"The clip has no such effect"};
+            std::vector<std::string> names;
+            if (!address.param.empty()) {
+                if (!owner->params.count(address.param) || owner->params.at(address.param).keys.empty())
+                    throw ArgError{QStringLiteral("%1 has no keys").arg(QString::fromStdString(address.param))};
+                names.push_back(address.param);
+            } else {
+                for (const auto& [name, p] : owner->params)
+                    if (!p.keys.empty()) names.push_back(name);
+                if (names.empty()) throw ArgError{"Nothing there is keyed"};
+            }
+            std::vector<FrameTime> picked;
+            for (const QJsonValue& v : a.value("keys").toArray()) picked.push_back(FrameTime(v.toInt()));
+            auto chosen = [&](const Param& p) {
+                std::vector<FrameTime> out;
+                for (const Keyframe& k : p.keys)
+                    if (picked.empty() || std::find(picked.begin(), picked.end(), k.t) != picked.end()) out.push_back(k.t);
+                return out;
+            };
+            FrameTime first = std::numeric_limits<FrameTime>::max();
+            for (const std::string& n : names)
+                for (FrameTime t : chosen(owner->params.at(n))) first = std::min(first, t);
+            if (first == std::numeric_limits<FrameTime>::max()) throw ArgError{"None of those keys is there"};
+            const double pivot = a.contains("pivot") ? a.value("pivot").toDouble() : double(first);
+            const FrameTime last = std::max<FrameTime>(0, c.duration - 1);
+            // Every setting stretched, or none (a copy changed, kept only if all of them fit).
+            std::map<std::string, Param> stretched;
+            int moved = 0;
+            for (const std::string& n : names) {
+                Param p = owner->params.at(n);
+                const std::vector<FrameTime> keys = chosen(p);
+                if (keys.empty()) continue;
+                if (!scaleKeys(p, keys, pivot, factor, last))
+                    return fail(QStringLiteral("%1's keys cannot stretch that far: they would pass keys that stay, meet, or leave the clip")
+                                    .arg(QString::fromStdString(n)));
+                stretched[n] = std::move(p);
+                moved += int(keys.size());
+            }
+            for (auto& [n, p] : stretched) owner->params[n] = std::move(p);
+            save(l);
+            QJsonObject out{{"moved", moved}, {"pivot", pivot}};
+            QJsonObject times;
+            for (const auto& [n, p] : stretched) {
+                QJsonArray t;
+                for (const Keyframe& k : p.keys) t.append(double(k.t));
+                times[QString::fromStdString(n)] = t;
+            }
+            out["keys"] = times;
+            return ok(QStringLiteral("Stretched %1 keys by %2").arg(moved).arg(factor), out);
         });
 
     add("montage_ltc", "Timecode from LTC",
@@ -15894,6 +16103,7 @@ void McpServer::Impl::addTools() {
         "PCM sound) in a new numbered folder of \"Avid MediaFiles/MXF\" on the drive, so the sequence opens linked.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml","aaf"]},
             "output":{"type":"string"},"picture":{"type":"boolean","description":"AAF: include the video tracks (default true)"},
+            "fcpxml_version":{"type":"string","enum":["1.15","1.10"],"description":"FCPXML: the version written (default 1.15)"},
             "avid_media":{"type":"object","description":"AAF: write the media for Media Composer","properties":{
                 "drive":{"type":"string","description":"Where \"Avid MediaFiles\" goes (default: the AAF's folder)"},
                 "codec":{"type":"string","enum":["dnxhr_lb","dnxhr_sq","dnxhr_hq","dnxhr_hqx","dnxhr_444","dnxhd_lb","dnxhd_sq","dnxhd_hq"],"description":"Default dnxhr_sq; DNxHD is 1920 x 1080 only"},
@@ -15949,6 +16159,7 @@ void McpServer::Impl::addTools() {
                           res);
             }
             if (f != "otio" && f != "xml" && f != "fcpxml" && f != "edl") throw ArgError{"format must be edl, otio, xml, fcpxml or aaf"};
+            if (const QString v = a.value("fcpxml_version").toString("1.15"); v != "1.15" && v != "1.10") throw ArgError{"fcpxml_version must be 1.15 or 1.10"};
             const QString out = absolute(need(a, "output"));
             // A copy with each compositing graph's clip rendered to a file beside the export.
             Project baked = l.project;
@@ -15957,7 +16168,7 @@ void McpServer::Impl::addTools() {
             const Sequence& bs = *baked.findSequence(l.seq().id);
             const std::string text = f == "otio" ? exportOtio(baked, bs)
                                      : f == "xml" ? exportFcp7Xml(baked, bs)
-                                     : f == "fcpxml" ? exportFcpXml(baked, bs)
+                                     : f == "fcpxml" ? exportFcpXml(baked, bs, a.value("fcpxml_version").toString("1.15").toStdString())
                                                      : exportEdl(baked, bs);
             QFile file(out);
             if (!file.open(QIODevice::WriteOnly) || file.write(text.data(), qint64(text.size())) != qint64(text.size()))

@@ -68,16 +68,51 @@ FilmLookSettings filmLookSettings(const Effect& e, FrameTime t) {
     return s;
 }
 
-void filmLook(Image& img, const FilmLookSettings& s, FrameTime t) {
-    const int W = img.width, H = img.height;
-    if (img.empty()) return;
+FilmLookPlan filmLookPlan(int W, int H, const FilmLookSettings& s, FrameTime t) {
+    FilmLookPlan plan;
+    if (W <= 0 || H <= 0) return plan;
     const Gauge g = gaugeOf(s.gauge);
     const double unit = W / 1000.0;  // a thousandth of the frame's width
     // Gate weave and aberration: the frame moved, its red and blue a little apart.
-    const double wx = wander(double(t) * 0.25, 1.7) * s.weave * g.weave * unit * 1.2;
-    const double wy = wander(double(t) * 0.21, 5.3) * s.weave * g.weave * unit * 1.6;
-    const double ab = s.aberration * unit * 3;
-    if (std::fabs(wx) > 1e-3 || std::fabs(wy) > 1e-3 || ab > 1e-3) {
+    plan.wx = wander(double(t) * 0.25, 1.7) * s.weave * g.weave * unit * 1.2;
+    plan.wy = wander(double(t) * 0.21, 5.3) * s.weave * g.weave * unit * 1.6;
+    plan.aberration = s.aberration * unit * 3;
+    plan.moved = std::fabs(plan.wx) > 1e-3 || std::fabs(plan.wy) > 1e-3 || plan.aberration > 1e-3;
+    if (s.softness > 0) {
+        plan.softRadius = std::max(0.5, s.softness * g.softness * unit * 6);
+        plan.softMix = float(std::min(1.0, s.softness * 1.5));
+    }
+    plan.halation = s.halation, plan.bloom = s.bloom;
+    plan.haloRadius = unit * 16, plan.bloomRadius = unit * 60;
+    plan.flicker = 1 + float(s.flicker * 0.08 * std::sin(double(mix(uint32_t(t) * 2654435761U) & 0xffff) / 65535.0 * 6.2832));
+    plan.lift = float(s.fade * 0.08);
+    plan.vignette = s.vignette;
+    if (s.grain > 0) {
+        // Grain: noise on a grid the grain's size, new each frame.
+        plan.grainSize = std::max(0.6, g.grainSize * unit * 1.2);
+        plan.gridW = std::max(1, int(std::ceil(W / plan.grainSize))) + 1, plan.gridH = std::max(1, int(std::ceil(H / plan.grainSize))) + 1;
+        plan.noise.resize(size_t(plan.gridW) * size_t(plan.gridH) * 3);
+        const uint32_t seed = mix(uint32_t(t) * 2654435761U + 977U);
+        for (int y = 0; y < plan.gridH; ++y)
+            for (int x = 0; x < plan.gridW; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    // Mostly shared across the colours, as film's dye clouds are.
+                    const uint32_t shared = mix(seed ^ mix(uint32_t(x) * 73856093U ^ uint32_t(y) * 19349663U));
+                    const uint32_t own = mix(shared ^ uint32_t(c + 1) * 83492791U);
+                    plan.noise[(size_t(y) * size_t(plan.gridW) + size_t(x)) * 3 + size_t(c)] =
+                        (float(shared & 0xffff) / 65535.0f - 0.5f) * 0.8f + (float(own & 0xffff) / 65535.0f - 0.5f) * 0.2f;
+                }
+        plan.grain = float(s.grain * g.grain * 0.09);
+    }
+    return plan;
+}
+
+void filmLook(Image& img, const FilmLookSettings& s, FrameTime t) {
+    const int W = img.width, H = img.height;
+    if (img.empty()) return;
+    const FilmLookPlan plan = filmLookPlan(W, H, s, t);
+    const double wx = plan.wx, wy = plan.wy, ab = plan.aberration;
+    if (plan.moved) {
         const Image src = img;
         const double cx = W / 2.0, cy = H / 2.0, diag = std::hypot(cx, cy);
         auto sampleAt = [&](double x, double y, int c) {
@@ -102,31 +137,30 @@ void filmLook(Image& img, const FilmLookSettings& s, FrameTime t) {
         });
     }
     // Softness: a little of the picture's sharpness gone.
-    if (s.softness > 0) {
+    if (plan.softRadius > 0) {
         Image soft = img;
-        gaussianBlur(soft, std::max(0.5, s.softness * g.softness * unit * 6));
-        const float k = float(std::min(1.0, s.softness * 1.5));
+        gaussianBlur(soft, plan.softRadius);
+        const float k = plan.softMix;
         for (size_t i = 0; i < img.px.size(); ++i) img.px[i] += (soft.px[i] - img.px[i]) * k;
     }
     // Halation (red-orange, close round highlights) and bloom (neutral, wider).
-    if (s.halation > 0 || s.bloom > 0) {
-        const Image halo = s.halation > 0 ? highlights(img, 0.6f, unit * 16) : Image();
-        const Image bloom = s.bloom > 0 ? highlights(img, 0.75f, unit * 60) : Image();
+    if (plan.halation > 0 || plan.bloom > 0) {
+        const Image halo = plan.halation > 0 ? highlights(img, 0.6f, plan.haloRadius) : Image();
+        const Image bloom = plan.bloom > 0 ? highlights(img, 0.75f, plan.bloomRadius) : Image();
         const float tint[3] = {1.0f, 0.28f, 0.06f};
         for (size_t i = 0; i < img.px.size(); i += 4) {
             float* p = &img.px[i];
             const float hl = halo.empty() ? 0.0f : luma(&halo.px[i]);
             for (int c = 0; c < 3; ++c) {
-                if (!halo.empty()) p[c] += float(s.halation * 1.6) * tint[c] * hl;
-                if (!bloom.empty()) p[c] += float(s.bloom * 0.8) * bloom.px[i + size_t(c)];
+                if (!halo.empty()) p[c] += float(plan.halation * 1.6) * tint[c] * hl;
+                if (!bloom.empty()) p[c] += float(plan.bloom * 0.8) * bloom.px[i + size_t(c)];
             }
-            const float extra = std::max({halo.empty() ? 0.0f : float(s.halation) * halo.px[i + 3], bloom.empty() ? 0.0f : float(s.bloom) * bloom.px[i + 3]});
+            const float extra = std::max({halo.empty() ? 0.0f : float(plan.halation) * halo.px[i + 3], bloom.empty() ? 0.0f : float(plan.bloom) * bloom.px[i + 3]});
             p[3] = std::min(1.0f, p[3] + extra);
         }
     }
     // Flicker, lifted blacks and the vignette, per pixel.
-    const float flick = 1 + float(s.flicker * 0.08 * std::sin(double(mix(uint32_t(t) * 2654435761U) & 0xffff) / 65535.0 * 6.2832));
-    const float lift = float(s.fade * 0.08);
+    const float flick = plan.flicker, lift = plan.lift;
     const double cx = W / 2.0, cy = H / 2.0, corner = std::hypot(cx, cy);
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y)
@@ -135,26 +169,16 @@ void filmLook(Image& img, const FilmLookSettings& s, FrameTime t) {
                 const float a = p[3];
                 if (a <= 0) continue;
                 const double r = std::hypot(x + 0.5 - cx, y + 0.5 - cy) / corner;
-                const double v = 1 - s.vignette * 0.65 * std::clamp((r - 0.35) / 0.65, 0.0, 1.0) * std::clamp((r - 0.35) / 0.65, 0.0, 1.0);
+                const double v = 1 - plan.vignette * 0.65 * std::clamp((r - 0.35) / 0.65, 0.0, 1.0) * std::clamp((r - 0.35) / 0.65, 0.0, 1.0);
                 for (int c = 0; c < 3; ++c) p[c] = (lift * a + p[c] * (1 - lift)) * flick * float(v);
             }
     });
-    // Grain: noise on a grid the grain's size, new each frame, strongest in the mid-tones.
-    if (s.grain > 0) {
-        const double size = std::max(0.6, g.grainSize * unit * 1.2);
-        const int gw = std::max(1, int(std::ceil(W / size))) + 1, gh = std::max(1, int(std::ceil(H / size))) + 1;
-        std::vector<float> noise(size_t(gw) * size_t(gh) * 3);
-        const uint32_t seed = mix(uint32_t(t) * 2654435761U + 977U);
-        for (int y = 0; y < gh; ++y)
-            for (int x = 0; x < gw; ++x)
-                for (int c = 0; c < 3; ++c) {
-                    // Mostly shared across the colours, as film's dye clouds are.
-                    const uint32_t shared = mix(seed ^ mix(uint32_t(x) * 73856093U ^ uint32_t(y) * 19349663U));
-                    const uint32_t own = mix(shared ^ uint32_t(c + 1) * 83492791U);
-                    noise[(size_t(y) * size_t(gw) + size_t(x)) * 3 + size_t(c)] =
-                        (float(shared & 0xffff) / 65535.0f - 0.5f) * 0.8f + (float(own & 0xffff) / 65535.0f - 0.5f) * 0.2f;
-                }
-        const float amount = float(s.grain * g.grain * 0.09);
+    // Grain, strongest in the mid-tones.
+    if (plan.grain > 0) {
+        const double size = plan.grainSize;
+        const int gw = plan.gridW, gh = plan.gridH;
+        const std::vector<float>& noise = plan.noise;
+        const float amount = plan.grain;
         parallelRows(H, [&](int y0, int y1) {
             for (int y = y0; y < y1; ++y)
                 for (int x = 0; x < W; ++x) {

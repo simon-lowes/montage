@@ -2941,10 +2941,13 @@ QStringList dppSoundLabelIssues(const std::string& regXml, QStringList* order) {
         if (groups.empty()) return out;
     }
     const Label& group = groups.front();
-    // Each channel one label, each label one channel.
+    // Each channel one label, each label one channel. (A count past any sound track file's, as a crafted one up to
+    // INT_MAX, is told once, and its channels are not gone through one by one.)
+    constexpr int kMostChannels = 1024;
+    if (channelCount > kMostChannels) out << QStringLiteral("says it has %1 channels, more than any sound track file has (%2 at most here)").arg(channelCount).arg(kMostChannels);
     std::map<int, int> labelled;
     for (const Label& c : channels) ++labelled[c.channel];
-    for (int ch = 1; ch <= channelCount; ++ch) {
+    for (int ch = 1; channelCount <= kMostChannels && ch <= channelCount; ++ch) {
         const int n = labelled.count(ch) ? labelled[ch] : 0;
         if (n != 1) out << QStringLiteral("labels channel %1 %2 (ST 2067-2 5.3.6.2: each channel exactly one label)").arg(ch).arg(n ? QStringLiteral("%1 times").arg(n) : QStringLiteral("not at all"));
     }

@@ -1061,9 +1061,12 @@ std::vector<ConformShot> conformShotsFromJson(const QJsonValue& v) {
     return out;
 }
 
+void registerEncodeFolderTaskKind();  // (EncodeFoldersDialog.cpp)
+
 void registerDialogTaskKinds() {
     static std::once_flag once;
     std::call_once(once, [] {
+        registerEncodeFolderTaskKind();
         DialogJobs::registerKind(QStringLiteral("auto-duck"), {runDuck, applyDuck, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("scene-detect"), {runSceneCuts, applySceneCuts, false, nullptr});
         DialogJobs::registerKind(QStringLiteral("auto-mix"), {runMix, applyMixPlan, true, nullptr});

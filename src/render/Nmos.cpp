@@ -17,11 +17,14 @@
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QTcpServer>
+#include <QPointer>
 #include <QTcpSocket>
+#include <QThread>
 #include <QTimer>
 #include <QUdpSocket>
 #include <QUrl>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -440,9 +443,9 @@ void Node::stop() {
     delete rediscover_;
     rediscover_ = nullptr;
     if (o_.announce) announceNode();  // (a goodbye: its records' times to live 0)
-    delete run_;  // (the multicast DNS socket and timers with it)
+    delete run_;  // (the multicast DNS timers with it)
     run_ = nullptr;
-    mdns_.reset();
+    mdns_.reset();  // (the goodbye written, then its thread ended)
     lookups_ = 0;
     // Then unregistered (a short wait: the node goes either way).
     if (registered_ && net_ && !registry().isEmpty()) {
@@ -1598,8 +1601,116 @@ QString dnsLabel(QString s) {
 
 }  // namespace
 
+// What a multicast DNS datagram said that concerns the Node, read on the multicast DNS thread: a query for the Node
+// (the questions it asked of the Node's names), or a response's records of registries and of hosts' addresses.
+struct MdnsHeard {
+    bool query = false;
+    quint16 id = 0;
+    QHostAddress from;
+    quint16 port = 0;
+    QList<QByteArray> asked;
+    struct Record {
+        enum Kind { Service, Address, Srv, Txt } kind = Service;
+        QString name, value;  // lower case: the instance (and for a service, the instance it points at); a host's name
+        quint32 ttl = 0;
+        quint32 address = 0;
+        int port = 0, priority = 100;
+        bool prioritized = false;  // (a TXT record's pri was there)
+        bool usable = true;
+    };
+    std::vector<Record> records;
+};
+
+namespace {
+
+// A datagram read: false where it says nothing the Node takes (a query for others, another service's records, or one
+// it cannot read). `instance` and `host` the Node's names, lower case.
+bool parseMdns(const QByteArray& msg, const QString& instance, const QString& host, MdnsHeard& out) {
+    if (msg.size() < 12) return false;
+    const quint16 id = get16(msg, 0), flags = get16(msg, 2);
+    const int qd = get16(msg, 4), records = get16(msg, 6) + get16(msg, 8) + get16(msg, 10);
+    int at = 12;
+    const QString service = QStringLiteral("_nmos-node._tcp.local");
+    out.id = id;
+    out.query = !(flags & 0x8000);
+    for (int i = 0; i < qd && at < msg.size(); ++i) {
+        QString name;
+        if (!readName(msg, at, name) || at + 4 > msg.size()) break;
+        const quint16 type = get16(msg, at);
+        at += 4;
+        if (!out.query) continue;
+        const QString n = name.toLower();
+        const bool ours = (n == service && (type == kTypePtr || type == kTypeAny)) ||
+                          (n == instance && (type == kTypeSrv || type == kTypeTxt || type == kTypeAny)) ||
+                          (n == host && (type == kTypeA || type == kTypeAny)) ||
+                          (n == QStringLiteral("_services._dns-sd._udp.local") && type == kTypePtr);
+        if (ours) out.asked << question(name, type);
+    }
+    if (out.query) return !out.asked.isEmpty();
+    // A response: what it says of registries, and of hosts' addresses.
+    for (int i = 0; i < records && at < msg.size(); ++i) {
+        QString name;
+        if (!readName(msg, at, name) || at + 10 > msg.size()) break;
+        const quint16 type = get16(msg, at), length = get16(msg, at + 8);
+        const quint32 ttl = quint32(get16(msg, at + 4)) << 16 | get16(msg, at + 6);
+        int data = at + 10;
+        at = data + length;
+        if (at > msg.size()) break;
+        MdnsHeard::Record r;
+        r.name = name.toLower();
+        r.ttl = ttl;
+        if (type == kTypePtr && (r.name == QStringLiteral("_nmos-register._tcp.local") || r.name == QStringLiteral("_nmos-registration._tcp.local"))) {
+            QString pointed;
+            if (!readName(msg, data, pointed)) continue;
+            r.kind = MdnsHeard::Record::Service;
+            r.name = pointed.toLower();
+        } else if (!r.name.endsWith(QStringLiteral("._nmos-register._tcp.local")) && !r.name.endsWith(QStringLiteral("._nmos-registration._tcp.local"))) {
+            if (type != kTypeA || length != 4) continue;  // (another service's records: a Node's own, say)
+            r.kind = MdnsHeard::Record::Address;
+            r.address = quint32(get16(msg, data)) << 16 | get16(msg, data + 2);
+        } else if (ttl == 0) {
+            r.kind = MdnsHeard::Record::Service;  // (a goodbye: the instance goes)
+        } else if (type == kTypeSrv && length >= 7) {
+            QString target;
+            int t = data + 6;
+            if (!readName(msg, t, target)) continue;
+            r.kind = MdnsHeard::Record::Srv;
+            r.value = target.toLower(), r.port = get16(msg, data + 4);
+        } else if (type == kTypeTxt) {
+            r.kind = MdnsHeard::Record::Txt;
+            QString ver, proto, auth = QStringLiteral("false");
+            for (int p = data; p < data + length;) {
+                const int len = quint8(msg[p]);
+                if (p + 1 + len > data + length) break;  // (a string past its record's end)
+                const QByteArray kv = msg.mid(p + 1, len);
+                p += 1 + len;
+                const int eq = kv.indexOf('=');
+                const QByteArray k = kv.left(eq), value = kv.mid(eq + 1);
+                if (k == "api_ver") ver = QString::fromUtf8(value);
+                else if (k == "api_proto") proto = QString::fromUtf8(value);
+                else if (k == "api_auth") auth = QString::fromUtf8(value);
+                else if (k == "pri") r.priority = value.toInt(), r.prioritized = true;
+            }
+            // (as by unicast DNS: a registry speaking v1.3 over HTTP without authorisation)
+            r.usable = ver.split(',').contains(QStringLiteral("v1.3")) && proto == "http" && auth == "false";
+        } else {
+            continue;
+        }
+        out.records.push_back(std::move(r));
+    }
+    return !out.records.empty();
+}
+
+}  // namespace
+
 struct Node::Mdns {
-    QUdpSocket* socket = nullptr;  // (the Node's child)
+    // The socket, on a thread of its own: each datagram read and parsed there, and what concerns the Node handed to
+    // it (mdnsHeard); what the Node sends is written there too (mdnsSend), in order.
+    QThread* thread = nullptr;
+    QObject* io = nullptr;         // (on `thread`; the socket its child)
+    QUdpSocket* socket = nullptr;  // (used on `thread` alone, once started)
+    int run = 0;                   // (this start's: what an earlier one heard is not taken)
+    std::atomic<int> datagrams{0};
     QString instance, host;        // "<label>-<port>._nmos-node._tcp.local", "montage-<id>.local"
     QHostAddress address;
     int port = 0;
@@ -1621,14 +1732,34 @@ struct Node::Mdns {
     std::vector<std::pair<QHostAddress, int>> links;
     QElapsedTimer answered;
     bool answerDue = false;
-    bool onLink(const QHostAddress& from) const {
+    static bool onLink(const std::vector<std::pair<QHostAddress, int>>& links, const QHostAddress& from) {
         QHostAddress a = from;
         bool v4 = false;
         if (const quint32 four = a.toIPv4Address(&v4); v4) a = QHostAddress(four);
         if (a.isLoopback() || a.isLinkLocal()) return true;
         return std::any_of(links.begin(), links.end(), [&](const auto& l) { return a.isInSubnet(l.first, l.second); });
     }
+    ~Mdns() {
+        if (!thread) {
+            delete io;  // (the socket with it)
+            return;
+        }
+        // (what was still to be sent written first, a goodbye among it; the socket let go on its own thread)
+        if (io) QMetaObject::invokeMethod(io, [this] { delete io; }, Qt::BlockingQueuedConnection);
+        thread->quit();
+        thread->wait();
+        delete thread;
+    }
 };
+
+QThread* Node::mdnsThread() const { return mdns_ ? mdns_->thread : nullptr; }
+int Node::mdnsDatagrams() const { return mdns_ ? mdns_->datagrams.load() : 0; }
+
+void Node::mdnsSend(const QByteArray& message, const QHostAddress& to, quint16 port) {
+    if (!mdns_ || !mdns_->socket || !mdns_->io) return;
+    QUdpSocket* s = mdns_->socket;
+    QMetaObject::invokeMethod(mdns_->io, [s, message, to, port] { s->writeDatagram(message, to, port); }, Qt::QueuedConnection);
+}
 
 QByteArray Node::mdnsTxt() const {
     // IS-04's TXT record: the API's protocol, versions and authorisation; peer to peer (no registry), the resources'
@@ -1664,17 +1795,21 @@ void Node::announceNode() {
                                     record(QStringLiteral("_services._dns-sd._udp.local"), kTypePtr, false, stopping_ ? 0 : 4500, enumerate),
                                     record(m.instance, kTypeSrv, true, ttl, srv), record(m.instance, kTypeTxt, true, stopping_ ? 0 : 4500, mdnsTxt()),
                                     record(m.host, kTypeA, true, ttl, a)});
-    m.socket->writeDatagram(msg, QHostAddress(QStringLiteral("224.0.0.251")), kMdnsPort);
+    mdnsSend(msg, QHostAddress(QStringLiteral("224.0.0.251")), kMdnsPort);
 }
 
 void Node::startMdns() {
+    static std::atomic<int> runs{0};
     mdns_ = std::make_unique<Mdns>();
     Mdns& m = *mdns_;
-    m.socket = new QUdpSocket(run_);
+    m.run = ++runs;
+    m.io = new QObject;
+    m.socket = new QUdpSocket(m.io);
     // (shared with the system's own responder, where there is one)
     if (!m.socket->bind(QHostAddress::AnyIPv4, kMdnsPort, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
         mdnsError_ = m.socket->errorString();
-        m.socket = nullptr;
+        delete m.io;
+        m.io = nullptr, m.socket = nullptr;
         return;
     }
     m.socket->setSocketOption(QAbstractSocket::MulticastLoopbackOption, 1);
@@ -1696,120 +1831,31 @@ void Node::startMdns() {
     m.port = port();
     m.instance = dnsLabel(o_.label) + QStringLiteral("-%1._nmos-node._tcp.local").arg(m.port);
     m.host = QStringLiteral("montage-%1.local").arg(idText(nodeId_).left(8));
-    connect(m.socket, &QUdpSocket::readyRead, this, [this] {
-        if (!mdns_ || !mdns_->socket) return;
-        Mdns& md = *mdns_;
-        while (md.socket->hasPendingDatagrams()) {
-            const QNetworkDatagram d = md.socket->receiveDatagram(9000);
-            const QByteArray msg = d.data();
-            if (msg.size() < 12 || !md.onLink(d.senderAddress())) continue;  // (from off the local links: not heard)
-            const quint16 id = get16(msg, 0), flags = get16(msg, 2);
-            const int qd = get16(msg, 4), records = get16(msg, 6) + get16(msg, 8) + get16(msg, 10);
-            int at = 12;
-            const QString service = QStringLiteral("_nmos-node._tcp.local");
-            bool wanted = false;
-            QList<QByteArray> asked;
-            for (int i = 0; i < qd && at < msg.size(); ++i) {
-                QString name;
-                if (!readName(msg, at, name) || at + 4 > msg.size()) break;
-                const quint16 type = get16(msg, at);
-                at += 4;
-                if (flags & 0x8000) continue;
-                const QString n = name.toLower();
-                const bool ours = (n == service && (type == kTypePtr || type == kTypeAny)) ||
-                                  (n == md.instance.toLower() && (type == kTypeSrv || type == kTypeTxt || type == kTypeAny)) ||
-                                  (n == md.host.toLower() && (type == kTypeA || type == kTypeAny)) ||
-                                  (n == QStringLiteral("_services._dns-sd._udp.local") && type == kTypePtr);
-                if (ours) wanted = true, asked << question(name, type);
-            }
-            if (!(flags & 0x8000)) {
-                if (!wanted || stopping_) continue;
-                // A query for the Node: answered to the group, and straight back to a querier not on port 5353 (a
-                // one-shot query, RFC 6762's legacy unicast: its id and questions with the answer).
-                if (d.senderPort() == kMdnsPort) {
-                    // (once a second at most: a query sooner is answered when the second is up, one answer for all
-                    // asked meanwhile)
-                    const qint64 wait = md.answered.isValid() ? 1000 - md.answered.elapsed() : 0;
-                    if (wait <= 0) {
-                        md.answered.start();
-                        announceNode();
-                    } else if (!md.answerDue) {
-                        md.answerDue = true;
-                        QTimer::singleShot(std::chrono::milliseconds(wait), md.socket, [this] {
-                            if (!mdns_ || !mdns_->socket || stopping_) return;
-                            mdns_->answerDue = false;
-                            mdns_->answered.start();
-                            announceNode();
-                        });
-                    }
-                } else {
-                    QByteArray srv;
-                    put16(srv, 0), put16(srv, 0), put16(srv, quint16(md.port));
-                    putName(srv, md.host);
-                    QByteArray ptr, a;
-                    putName(ptr, md.instance);
-                    put32(a, md.address.toIPv4Address());
-                    const QByteArray answer = message(id, true, asked,
-                                                      {record(service, kTypePtr, false, 10, ptr), record(md.instance, kTypeSrv, false, 10, srv),
-                                                       record(md.instance, kTypeTxt, false, 10, mdnsTxt()), record(md.host, kTypeA, false, 10, a)});
-                    md.socket->writeDatagram(answer, d.senderAddress(), quint16(d.senderPort()));
-                }
-                continue;
-            }
-            // A response: what it says of registries, while browsing for them.
-            if (!md.browse) continue;
-            for (int i = 0; i < records && at < msg.size(); ++i) {
-                QString name;
-                if (!readName(msg, at, name) || at + 10 > msg.size()) break;
-                const quint16 type = get16(msg, at), length = get16(msg, at + 8);
-                const quint32 ttl = quint32(get16(msg, at + 4)) << 16 | get16(msg, at + 6);
-                int data = at + 10;
-                at = data + length;
-                if (at > msg.size()) break;
-                const QString n = name.toLower();
-                if (type == kTypePtr && (n == QStringLiteral("_nmos-register._tcp.local") || n == QStringLiteral("_nmos-registration._tcp.local"))) {
-                    QString instance;
-                    if (!readName(msg, data, instance)) continue;
-                    if (ttl == 0) md.found.erase(instance.toLower());  // (a goodbye)
-                    else if (md.found.size() < 256) md.found.emplace(instance.toLower(), Mdns::Found{});
-                } else if (!n.endsWith(QStringLiteral("._nmos-register._tcp.local")) && !n.endsWith(QStringLiteral("._nmos-registration._tcp.local"))) {
-                    if (type == kTypeA && length == 4) {
-                        if (ttl == 0) md.addresses.erase(n);  // (a goodbye)
-                        else if (md.addresses.size() < 1024 || md.addresses.count(n))
-                            md.addresses[n] = QHostAddress(quint32(get16(msg, data)) << 16 | get16(msg, data + 2));
-                    }
-                    continue;  // (another service's records: a Node's own, say)
-                } else if (ttl == 0 || (!md.found.count(n) && md.found.size() >= 256)) {
-                    if (ttl == 0) md.found.erase(n);
-                    continue;
-                } else if (type == kTypeSrv && length >= 7) {
-                    QString target;
-                    int t = data + 6;
-                    if (!readName(msg, t, target)) continue;
-                    Mdns::Found& f = md.found[n];
-                    f.target = target.toLower(), f.port = get16(msg, data + 4);
-                } else if (type == kTypeTxt) {
-                    Mdns::Found& f = md.found[n];
-                    QString ver, proto, auth = QStringLiteral("false");
-                    for (int p = data; p < data + length;) {
-                        const int len = quint8(msg[p]);
-                        if (p + 1 + len > data + length) break;  // (a string past its record's end)
-                        const QByteArray kv = msg.mid(p + 1, len);
-                        p += 1 + len;
-                        const int eq = kv.indexOf('=');
-                        const QByteArray k = kv.left(eq), value = kv.mid(eq + 1);
-                        if (k == "api_ver") ver = QString::fromUtf8(value);
-                        else if (k == "api_proto") proto = QString::fromUtf8(value);
-                        else if (k == "api_auth") auth = QString::fromUtf8(value);
-                        else if (k == "pri") f.priority = value.toInt();
-                    }
-                    f.txt = true;
-                    // (as by unicast DNS: a registry speaking v1.3 over HTTP without authorisation)
-                    f.usable = ver.split(',').contains(QStringLiteral("v1.3")) && proto == "http" && auth == "false";
-                }
-            }
+    // Read on the thread: a datagram from off the local links is not heard, and of the rest only what concerns the
+    // Node is handed to it (a busy network's queries for others and their services' records stay there).
+    const QString instance = m.instance.toLower(), host = m.host.toLower();
+    const auto links = m.links;
+    std::atomic<int>* datagrams = &m.datagrams;
+    QUdpSocket* s = m.socket;
+    const QPointer<Node> node(this);
+    const int run = m.run;
+    connect(s, &QUdpSocket::readyRead, m.io, [s, instance, host, links, datagrams, node, run] {
+        while (s->hasPendingDatagrams()) {
+            const QNetworkDatagram d = s->receiveDatagram(9000);
+            if (!Mdns::onLink(links, d.senderAddress())) continue;  // (from off the local links: not heard)
+            datagrams->fetch_add(1);
+            MdnsHeard heard;
+            if (!parseMdns(d.data(), instance, host, heard)) continue;
+            heard.from = d.senderAddress(), heard.port = quint16(d.senderPort());
+            QMetaObject::invokeMethod(node.data(), [node, run, heard = std::move(heard)] {
+                if (node) node->mdnsHeard(run, heard);
+            }, Qt::QueuedConnection);
         }
     });
+    m.thread = new QThread;
+    m.thread->setObjectName(QStringLiteral("Multicast DNS"));
+    m.io->moveToThread(m.thread);
+    m.thread->start();
     if (o_.announce) {
         m.announce = new QTimer(run_);
         m.announce->setInterval(1000);
@@ -1820,6 +1866,74 @@ void Node::startMdns() {
         });
         QTimer::singleShot(0, run_, [this] { announceNode(); });
         m.announce->start();
+    }
+}
+
+void Node::mdnsHeard(int run, const MdnsHeard& heard) {
+    if (!mdns_ || mdns_->run != run || !mdns_->socket) return;
+    Mdns& md = *mdns_;
+    if (heard.query) {
+        if (stopping_) return;
+        // A query for the Node: answered to the group, and straight back to a querier not on port 5353 (a one-shot
+        // query, RFC 6762's legacy unicast: its id and questions with the answer).
+        if (heard.port == kMdnsPort) {
+            // (once a second at most: a query sooner is answered when the second is up, one answer for all asked
+            // meanwhile)
+            const qint64 wait = md.answered.isValid() ? 1000 - md.answered.elapsed() : 0;
+            if (wait <= 0) {
+                md.answered.start();
+                announceNode();
+            } else if (!md.answerDue) {
+                md.answerDue = true;
+                QTimer::singleShot(std::chrono::milliseconds(wait), run_, [this] {
+                    if (!mdns_ || !mdns_->socket || stopping_) return;
+                    mdns_->answerDue = false;
+                    mdns_->answered.start();
+                    announceNode();
+                });
+            }
+        } else {
+            const QString service = QStringLiteral("_nmos-node._tcp.local");
+            QByteArray srv;
+            put16(srv, 0), put16(srv, 0), put16(srv, quint16(md.port));
+            putName(srv, md.host);
+            QByteArray ptr, a;
+            putName(ptr, md.instance);
+            put32(a, md.address.toIPv4Address());
+            const QByteArray answer = message(heard.id, true, heard.asked,
+                                              {record(service, kTypePtr, false, 10, ptr), record(md.instance, kTypeSrv, false, 10, srv),
+                                               record(md.instance, kTypeTxt, false, 10, mdnsTxt()), record(md.host, kTypeA, false, 10, a)});
+            mdnsSend(answer, heard.from, heard.port);
+        }
+        return;
+    }
+    // A response: what it says of registries, while browsing for them.
+    if (!md.browse) return;
+    for (const MdnsHeard::Record& r : heard.records) {
+        const QString& n = r.name;
+        switch (r.kind) {
+        case MdnsHeard::Record::Service:
+            if (r.ttl == 0) md.found.erase(n);  // (a goodbye)
+            else if (md.found.size() < 256) md.found.emplace(n, Mdns::Found{});
+            break;
+        case MdnsHeard::Record::Address:
+            if (r.ttl == 0) md.addresses.erase(n);  // (a goodbye)
+            else if (md.addresses.size() < 1024 || md.addresses.count(n)) md.addresses[n] = QHostAddress(r.address);
+            break;
+        case MdnsHeard::Record::Srv:
+        case MdnsHeard::Record::Txt: {
+            if (!md.found.count(n) && md.found.size() >= 256) break;
+            Mdns::Found& f = md.found[n];
+            if (r.kind == MdnsHeard::Record::Srv) {
+                f.target = r.value, f.port = r.port;
+            } else {
+                if (r.prioritized) f.priority = r.priority;
+                f.txt = true;
+                f.usable = r.usable;
+            }
+            break;
+        }
+        }
     }
 }
 
@@ -1853,7 +1967,7 @@ void Node::browseRegistries(std::function<void(std::vector<Registry>)> done) {
             if (!f.txt) qs << question(name, kTypeTxt);
             if (!f.target.isEmpty() && !md.addresses.count(f.target)) qs << question(f.target, kTypeA);
         }
-        md.socket->writeDatagram(message(0, false, qs, {}), QHostAddress(QStringLiteral("224.0.0.251")), kMdnsPort);
+        mdnsSend(message(0, false, qs, {}), QHostAddress(QStringLiteral("224.0.0.251")), kMdnsPort);
     };
     connect(m.browse, &QTimer::timeout, this, [this, ask] {
         Mdns& md = *mdns_;

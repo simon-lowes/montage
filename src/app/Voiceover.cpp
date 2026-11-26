@@ -244,8 +244,9 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         }
         std::string error;
         armed_ = clock_ == nullptr;
+        deviceGone_ = false;
         tap_ = engine.addInput(clock_, rate_, [this](const float* in, int channels, int frames, int64_t sample) {
-            if (!armed_.load()) return;
+            if (!armed_.load() || deviceGone_.load()) return;
             const audiodev::TakeAligner::Step step = aligner_.next(sample, frames);
             if (step.silence == 0 && step.skip >= frames) return;
             std::lock_guard<std::mutex> lock(pendingM_);
@@ -266,6 +267,9 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         // The device going away (unplugged, its server stopped) ends the take with everything it brought: told on the
         // engine's thread once the tap has had the last block, and acted on here.
         lostListener_ = engine.addLostListener([this, take = takeNumber_ + (clock_ ? 1 : 0)](const std::string& why) {
+            // (the tap takes nothing more from now on: playback, told first, opens the next device before stop() below
+            // runs, and its stand-in's microphone must not end the take; nightly 25 Nov)
+            deviceGone_ = true;
             QMetaObject::invokeMethod(this, [this, take, w = QString::fromStdString(why)] {
                 if (tap_ >= 0 && isRecording() && (take == takeNumber_)) lostDevice(w);
             }, Qt::QueuedConnection);

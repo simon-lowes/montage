@@ -52,8 +52,9 @@ public:
         bool charged = false;  // a try of its network's ration was taken (given back by right())
     };
 
-    // What has run out is forgotten (ask() does it too).
+    // What has run out is forgotten (ask() does it too, once a second at most: each request does not walk every list).
     void tidy(Clock::time_point now) {
+        tidied_ = now;
         forget(failures_, [&](const Failures& f) { return now - f.last > kFailureMemory; });
         forget(trusted_, [&](Clock::time_point t) { return now - t > kTrustedMemory; });
         forget(peers_, [&](const Bucket& b) { return now - b.at > std::chrono::minutes(1); });
@@ -67,7 +68,8 @@ public:
 
     // Before a passphrase from `address` (in `network`) is compared: Try, or why it is refused untried.
     Verdict ask(const QString& address, const QString& network, Clock::time_point now) {
-        tidy(now);
+        // (and whenever the record of addresses is past its size, which only tidy() brings back)
+        if (now - tidied_ >= std::chrono::seconds(1) || now < tidied_ || failures_.size() > kRecorded) tidy(now);
         const bool known = trusted(address);
         // (an address a reviewer is in lately, as a shared network's, is blocked only after many more)
         const auto onRecord = failures_.find(address);
@@ -178,6 +180,7 @@ private:
     Ration elsewhere_;                             // every network not listed, once the list is full
     std::map<QString, Clock::time_point> elsewhereWrong_;  // networks not listed that guessed wrong lately
     bool elsewhereBegun_ = false;
+    Clock::time_point tidied_{};  // when the maps were last swept of old entries
 };
 
 }  // namespace montage::output

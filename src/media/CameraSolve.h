@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -117,16 +118,22 @@ struct SolvedSceneMesh {
     std::string name;
     std::vector<float> positions, normals;  // 3 a vertex (normals may be empty)
     std::vector<float> uvs;                 // 2 a vertex, top left (0, 0) (may be empty)
+    // 3 a vertex, linear (may be empty): written as its display colour, which its material's colour is read from.
+    std::vector<float> colors;
     std::vector<uint32_t> indices;          // triangles
     std::array<float, 4> color{0.18f, 0.18f, 0.18f, 1};  // linear base colour and opacity
     float metallic = 0, roughness = 0.5f;
     bool doubleSided = false;
     bool card = false;  // a 3D layer's card (Card_N), not a model (Model_N)
-    // Its picture (PNG: sRGB, straight alpha) on its uvs as the material's colour and opacity (empty: none).
+    bool title = false;  // a 3D title's letters (Title_N)
+    // Its picture (PNG: sRGB, straight alpha) on its uvs as the material's colour and opacity (empty: none, or the
+    // pictures below).
     std::string picture;
-    // A picture that changes over the range: each time code where it changes and its picture there, held until the
-    // next (written as its texture's file's time samples, a file each; empty: `picture` throughout).
+    // A picture that changes over the range: each time code where it changes and the PNG file that holds its picture
+    // there, held until the next (written as its texture's file's time samples, a file each, read one at a time;
+    // empty: `picture` throughout). The files are in `spool`'s folder, removed with the mesh's last copy.
     std::vector<std::pair<double, std::string>> pictures;
+    std::shared_ptr<const void> spool;
     // Its place by time code (the solve's frames): the matrix from its own space (positions and normals then in it)
     // to the scene's, row vectors as USD writes them (its first three rows the axes, the fourth where it is). Empty:
     // it stands still, its positions in the scene's space.
@@ -134,10 +141,11 @@ struct SolvedSceneMesh {
 };
 // The camera, its points and the models placed in its scene as a USD scene (USDA): a camera moving through time codes
 // 0, 1, 2... (one a frame, at the footage's frame rate; a 36 mm wide film back), the points as a point cloud and each
-// model and 3D layer's card as a mesh with a plain material (a card with its uvs as primvars:st), a card's picture as
-// its UsdPreviewSurface's texture and its motion as its transform's time samples. Turned as writeNukeChan turns a scene
-// with no ground. To a .usdz path, a USDZ package: the layer first, then the pictures (each aligned to 64 bytes); to
-// a .usda path, the pictures beside it as <name>_Card_N.png.
+// model, 3D layer's card and 3D title as a mesh with a plain material (a card with its uvs as primvars:st), a card's
+// picture as its UsdPreviewSurface's texture, a title's colours as its display colour (primvars:displayColor, read by
+// its material through a UsdPrimvarReader_float3) and a card's motion as its transform's time samples. Turned as writeNukeChan turns a scene
+// with no ground. To a .usdz path, a USDZ package: the layer first, then the pictures (each aligned to 64 bytes;
+// false if that is more than a package holds: 4 GiB); to a .usda path, the pictures beside it as <name>_Card_N.png.
 bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::vector<SolvedSceneMesh>& models = {},
                     std::string* error = nullptr);
 

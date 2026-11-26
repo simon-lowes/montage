@@ -150,6 +150,13 @@ private:
     double hrdRate_ = 0, hrdBuffer_ = 0;
     std::vector<uint8_t> hrdSps_;  // H.264 and HEVC: the footage's SPS whose HRD the encoded parts are given
     HrdSplicer hrd_;
+    // MPEG-2: the mode of the sequence being written (0 a constant rate, 1 a variable one, -1 none yet) and, variable,
+    // the maximum and buffer its sequence headers state. A copy of another mode starts a sequence of its own.
+    int seqMode_ = -1;
+    double seqRate_ = 0, seqBuffer_ = 0;
+    bool startMpeg2Sequence(const Copy& c);
+    bool sameSequence(const Copy& c) const;
+    std::vector<uint8_t> seqEnd_;  // a sequence_end_code to put before the next packet written (no model to hold one)
     int heldFlags_ = 0;
     FrameTime lastCopiedHi_ = -2;
     // H.264 entered at a recovery point: what its I-picture's frame_num was (taken off those after it until an IDR

@@ -1,6 +1,7 @@
 #include "Capture.h"
 
 #include "audio/Ltc.h"
+#include "core/Cea708.h"
 
 #include <algorithm>
 #include <cctype>
@@ -31,6 +32,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/timecode.h>
@@ -286,6 +288,11 @@ double captureClockNow() { return std::chrono::duration<double>(std::chrono::ste
 
 double captureClock() { return captureClockNow(); }
 
+std::string captionSidecar(const std::string& recording) {
+    const size_t slash = recording.find_last_of("/\\"), dot = recording.find_last_of('.');
+    return (dot != std::string::npos && (slash == std::string::npos || dot > slash) ? recording.substr(0, dot) : recording) + ".mcc";
+}
+
 namespace {
 
 int64_t msFromNow(double seconds) { return nowMs() + int64_t(seconds * 1000); }
@@ -320,8 +327,12 @@ struct Input {
     std::unique_ptr<st2110::Input> st2110;
     std::deque<std::shared_ptr<st2110::InputFrame>> early2110;
     st2110::VideoFormat st2110Video;
+    int st2110Proxy = 0;  // (ST 2110-22's pictures decoded smaller while the feed is only watched: jpegxs_proxy=)
     bool st2110Full = false;
     int st2110Channels = 0;
+    // (a PQ feed's HDR metadata as it last stated it: kept for its pictures until it states it again)
+    st2110::HdrMetadata st2110Hdr;
+    bool st2110HdrStated = false;
     // A WHIP endpoint's feed (media/WhipEndpoint.h): the endpoint, and what FFmpeg's RTP reader takes it through (the
     // endpoint's description first, then its packets, by custom I/O). The endpoint outlives the reader.
     std::unique_ptr<whip::Endpoint> whip;
@@ -443,6 +454,11 @@ bool openSt2110(Recorder::State* s, const CaptureSource& src, bool wantVideo, bo
         x.interfaceAddress[1] = option((kind + "interface2").c_str());
     }
     if (const std::string w = option("wait"); !w.empty()) o.waitMs = std::clamp(std::atoi(w.c_str()), 0, 2000);
+    // (jpegxs_proxy=half or quarter: ST 2110-22 decoded at that size while the feed is only watched, as a
+    // multiviewer's tile needs no more; a recording from the same reception has it at full size again)
+    if (const std::string p = option("jpegxs_proxy"); !p.empty())
+        in.st2110Proxy = p == "quarter" || p == "2" ? 2 : p == "half" || p == "1" ? 1 : 0;
+    o.jpegXsProxy = s->settings.path.empty() ? in.st2110Proxy : 0;
     in.st2110 = std::make_unique<st2110::Input>();
     if (!in.st2110->open(streams, o, error)) {
         in.st2110.reset();
@@ -742,6 +758,25 @@ const char* hdrOf(const AVFrame* f) {
     return f->color_trc == AVCOL_TRC_SMPTE2084 ? "pq" : f->color_trc == AVCOL_TRC_ARIB_STD_B67 ? "hlg" : "";
 }
 
+// HDR metadata as FFmpeg's frames carry it (its decoders' side data): the mastering display (primaries R, G, B and
+// white in 0.00002 steps, luminance in 0.0001 nits) and the content light levels.
+void hdrSideData(AVFrame* f, const st2110::HdrMetadata& m) {
+    if (m.display)
+        if (AVMasteringDisplayMetadata* d = av_mastering_display_metadata_create_side_data(f)) {
+            for (int c = 0; c < 3; ++c)
+                for (int k = 0; k < 2; ++k) d->display_primaries[c][k] = av_make_q(int(std::lround(m.primaries[c][k] * 50000)), 50000);
+            for (int k = 0; k < 2; ++k) d->white_point[k] = av_make_q(int(std::lround(m.white[k] * 50000)), 50000);
+            d->max_luminance = av_make_q(int(std::lround(std::min(m.maxLuminance, 200000.0) * 10000)), 10000);
+            d->min_luminance = av_make_q(int(std::lround(std::min(m.minLuminance, 200000.0) * 10000)), 10000);
+            d->has_primaries = d->has_luminance = 1;
+        }
+    if (m.lightLevel)
+        if (AVContentLightMetadata* l = av_content_light_metadata_create_side_data(f)) {
+            l->MaxCLL = unsigned(std::max(0, m.maxCll));
+            l->MaxFALL = unsigned(std::max(0, m.maxFall));
+        }
+}
+
 // The scaler from a picture to R'G'B' at w by h (8-bit BGRA, or 16-bit RGBA for an HDR picture's code values), kept
 // and made again when what it was made for changes.
 SwsContext* rgbScaler(SwsContext* sws, int* kept, const AVFrame* f, int w, int h, bool deep) {
@@ -877,7 +912,19 @@ void LiveFeed::picture(const AVFrame* f) {
     }
 }
 
+namespace {
+int64_t steadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
+bool LiveFeed::wholeWanted() const {
+    const int64_t asked = wholeAsked_.load();
+    return asked != 0 && steadyMs() - asked < 1000;
+}
+
 LiveFeed::Full LiveFeed::full(int maxWidth, int maxHeight, int64_t after) const {
+    wholeAsked_ = std::max<int64_t>(1, steadyMs());
     Full out;
     AVFrame* f = nullptr;
     {
@@ -898,6 +945,15 @@ LiveFeed::Full LiveFeed::full(int maxWidth, int maxHeight, int64_t after) const 
         if (fullSws_ && *hdr) {
             ok = lightOf(fullSws_, f, w, h, out.light);
             out.space = hdrSpace(hdr).id;
+            if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
+                const auto* d = reinterpret_cast<const AVMasteringDisplayMetadata*>(sd->data);
+                if (d->has_luminance && d->max_luminance.den > 0 && d->min_luminance.den > 0)
+                    out.masteringMaxNits = std::max(0.0, av_q2d(d->max_luminance)), out.masteringMinNits = std::max(0.0, av_q2d(d->min_luminance));
+            }
+            if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
+                const auto* l = reinterpret_cast<const AVContentLightMetadata*>(sd->data);
+                out.maxCll = l->MaxCLL, out.maxFall = l->MaxFALL;
+            }
         } else if (fullSws_) {
             out.picture = QImage(w, h, QImage::Format_RGB32);
             uint8_t* dst[1] = {out.picture.bits()};
@@ -1066,6 +1122,7 @@ void Recorder::run() {
     bool watchOnly = file.path.empty();
     // JPEG XS: FFmpeg's raw pictures and PCM packets handed to its writer (the muxer FFmpeg's null one).
     bool jxsRecord = isJpegXs(file.codec) && !watchOnly;
+    bool jxsCopy = false;  // (an ST 2110-22 feed's codestreams written as they came, each carried as its picture's opaque_ref)
     std::unique_ptr<JxsWriter> jxs;
     AVFrame* jxsPicture = av_frame_alloc();
     std::vector<float> jxsSound;
@@ -1088,6 +1145,11 @@ void Recorder::run() {
     // ST 2110-41 fast metadata kept beside the recording, a line a frame (a dropped picture's items go with the next).
     std::vector<st2110::FastMetadata> metaCarried;
     std::unique_ptr<QFile> metaFile;
+    // The feed's caption data kept beside the recording as it came, every service and channel (captionSidecar).
+    std::unique_ptr<QFile> mccFile;
+    // The feed's other sound streams in the file too (allSound): each a track of its own, in its language.
+    std::vector<AVCodecContext*> xencs;
+    std::vector<AVStream*> xsts;
     // The feed's other sound streams (allSound): each converted and placed as the recorded one is.
     struct ExtraPlace {
         SwrContext* swr = nullptr;
@@ -1125,9 +1187,32 @@ void Recorder::run() {
     std::function<bool(AVFrame*, bool, AVRational)> placeSound;  // (putSound, for putPicture)
 
     auto write = [&](AVCodecContext* enc, AVStream* st, AVFrame* f) -> bool {
+        // (a picture that carries the feed's own codestream: written as it is, not coded again)
+        if (f && enc == venc && jxs && jxsCopy && f->opaque_ref && !watchOnly) {
+            if (cs.onPicture) cs.onPicture(f, fps.num, fps.den);
+            if (cs.live) cs.live->picture(f);
+            std::string why;
+            if (!jxs->writeCodestream(f->opaque_ref->data, f->opaque_ref->size, &why)) {
+                fatal = "Cannot write " + file.path + ": " + why;
+                return false;
+            }
+            return true;
+        }
         if (f && enc == venc) {
             if (cs.onPicture) cs.onPicture(f, fps.num, fps.den);
             if (cs.live) cs.live->picture(f);
+            if (const AVFrameSideData* cc = av_frame_get_side_data(f, AV_FRAME_DATA_A53_CC); cc && cc->size >= 3 && !watchOnly && f->pts >= 0) {
+                if (!mccFile) {
+                    mccFile = std::make_unique<QFile>(QString::fromStdString(captionSidecar(file.path)));
+                    if (mccFile->open(QIODevice::WriteOnly | QIODevice::Truncate)) mccFile->write(QByteArray::fromStdString(mccHeader(Rational{fps.num, fps.den})));
+                    else mccFile->setFileName(QString());
+                }
+                if (mccFile->isOpen()) {
+                    std::vector<CcTriplet> list(cc->size / 3);
+                    for (size_t i = 0; i < list.size(); ++i) list[i] = {cc->data[i * 3], cc->data[i * 3 + 1], cc->data[i * 3 + 2]};
+                    mccFile->write(QByteArray::fromStdString(mccFrame(list, Rational{fps.num, fps.den}, f->pts)));
+                }
+            }
         } else if (f && enc == aenc) {
             if (cs.onSound) cs.onSound(f);
             if (cs.live) cs.live->sound(f);
@@ -1203,6 +1288,8 @@ void Recorder::run() {
             // (a QuickTime file already holds all but the last fragment)
             if (venc) write(venc, vst, nullptr);
             if (aenc) write(aenc, ast, nullptr);
+            for (size_t k = 0; k < xencs.size(); ++k)
+                if (xencs[k]) write(xencs[k], xsts[k], nullptr);
             const int err = av_write_trailer(oc);
             if (err < 0 && fatal.empty()) fatal = "Cannot finish " + file.path + ": " + avError(err);
             // (JPEG XS: its MXF finished with what was recorded, as a QuickTime file keeps its fragments)
@@ -1217,6 +1304,11 @@ void Recorder::run() {
         if (fileMade && !headerWritten) QFile::remove(QString::fromStdString(file.path));
         if (metaFile) metaFile->close();
         metaFile.reset();
+        if (mccFile) mccFile->close();
+        mccFile.reset();
+        for (AVCodecContext*& x : xencs) avcodec_free_context(&x);
+        xencs.clear();
+        xsts.clear();
         vst = ast = nullptr;
         avcodec_free_context(&venc);
         avcodec_free_context(&aenc);
@@ -1236,6 +1328,9 @@ void Recorder::run() {
         mov = endsWith(file.path, ".mov");
         watchOnly = file.path.empty();
         jxsRecord = isJpegXs(file.codec) && !watchOnly;
+        jxsCopy = false;
+        for (Input& in : inputs)
+            if (in.st2110) in.st2110->setJpegXsProxy(watchOnly ? in.st2110Proxy : 0);
         switched = true;
         seconds = 0, frameLimit = 0;
         ranged = false, firstLabel = -1;
@@ -1497,6 +1592,38 @@ void Recorder::run() {
                 ast->time_base = aenc->time_base;
             }
         }
+        // The feed's other sound streams (allSound), each a track of the file in its language (QuickTime and MXF, not
+        // JPEG XS's writer), and the recorded one's language as the feed states it.
+        if (aenc && ast && !jxsRecord && cs.allSound && &ain == &inputs[0]) {
+            if (ain.fmt && ain.audioStream >= 0)
+                if (const AVDictionaryEntry* l = av_dict_get(ain.fmt->streams[ain.audioStream]->metadata, "language", nullptr, 0))
+                    av_dict_set(&ast->metadata, "language", l->value, 0);
+            const AVCodec* pcm = avcodec_find_encoder(AV_CODEC_ID_PCM_S24LE);
+            for (const Input::Extra& e : inputs[0].extras) {
+                AVCodecContext* x = avcodec_alloc_context3(pcm);
+                AVStream* xs = nullptr;
+                if (x) {
+                    x->sample_fmt = AV_SAMPLE_FMT_S32;
+                    x->sample_rate = 48000;
+                    const int n = std::min(8, std::max(1, e.dec ? e.dec->ch_layout.nb_channels : 2));
+                    if (e.dec && e.dec->ch_layout.nb_channels == n && e.dec->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC)
+                        av_channel_layout_copy(&x->ch_layout, &e.dec->ch_layout);
+                    else
+                        av_channel_layout_default(&x->ch_layout, n);
+                    x->time_base = {1, 48000};
+                    if (oc->oformat->flags & AVFMT_GLOBALHEADER) x->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+                    if (avcodec_open2(x, pcm, nullptr) < 0 || !(xs = avformat_new_stream(oc, nullptr))) avcodec_free_context(&x);
+                }
+                if (xs && x) {
+                    avcodec_parameters_from_context(xs->codecpar, x);
+                    xs->time_base = x->time_base;
+                    if (!e.language.empty()) av_dict_set(&xs->metadata, "language", e.language.c_str(), 0);
+                    if (!e.title.empty()) av_dict_set(&xs->metadata, "title", e.title.c_str(), 0);
+                }
+                xencs.push_back(x);
+                xsts.push_back(xs);
+            }
+        }
         // The sound streams named (the recorded one first), before the first picture is given.
         if (cs.onSoundTracks && aenc) {
             std::vector<CaptureSettings::SoundTrack> tracks(1);
@@ -1555,6 +1682,16 @@ void Recorder::run() {
             xs.encode.sampling = JxsSampling::Ycc422;
             xs.encode.bppNum = int(std::lround(file.jpegXsBpp * 1000));
             xs.encode.bppDen = 1000;
+            // (an ST 2110-22 feed of the recording's size: its codestreams kept, the file described as they are, and
+            // the encoder, for a picture that comes without one, made to match them)
+            const st2110::VideoFormat& v = in.st2110Video;
+            jxsCopy = !cs.recodeJpegXs && in.st2110 && v.jpegXs() && !v.interlaced && v.width == width && v.height == height;
+            if (jxsCopy) {
+                xs.encode.depth = v.depth;
+                xs.encode.sampling = v.sampling == st2110::Sampling::Ycc422 ? JxsSampling::Ycc422 : v.sampling == st2110::Sampling::Ycc444 ? JxsSampling::Ycc444 : JxsSampling::Rgb;
+                xs.encode.bppNum = int(std::lround(v.bpp * 1000));
+                xs.fullRange = in.st2110Full;
+            }
             xs.fpsNum = fps.num;
             xs.fpsDen = fps.den;
             xs.primaries = int(venc->color_primaries != AVCOL_PRI_UNSPECIFIED ? venc->color_primaries : AVCOL_PRI_BT709);
@@ -1574,6 +1711,7 @@ void Recorder::run() {
         }
         // (fast metadata an earlier recording here kept: not this one's)
         if (!watchOnly) QFile::remove(QString::fromStdString(st2110::fastMetadataSidecar(file.path)));
+        if (!watchOnly) QFile::remove(QString::fromStdString(captionSidecar(file.path)));
         headerWritten = true;
         if (cs.live) cs.live->begin(tc, fps.num, fps.den);
         std::lock_guard lock(s->m);
@@ -1656,7 +1794,10 @@ void Recorder::run() {
             ++s->st.dropped;
             return true;
         }
-        // The picture in the file's format (at its size, should the feed's change).
+        // The picture in the file's format (at its size, should the feed's change). Watched only, nothing is encoded,
+        // so a picture keeps its own size: an ST 2110-22 feed decoded smaller for a tile comes at its whole size again
+        // once a viewer shows it whole.
+        if (watchOnly) width = f->width, height = f->height;
         const int key[5] = {f->width, f->height, f->format, f->colorspace, f->color_range};
         if (!sws || !std::equal(key, key + 5, swsKey)) {
             sws = sws_getCachedContext(sws, f->width, f->height, AVPixelFormat(f->format), width, height, codec->pix, SWS_BICUBIC, nullptr, nullptr, nullptr);
@@ -1690,6 +1831,7 @@ void Recorder::run() {
             return false;
         }
         sws_scale(sws, f->data, f->linesize, 0, f->height, pic->data, pic->linesize);
+        if (jxsCopy && f->opaque_ref) pic->opaque_ref = av_buffer_ref(f->opaque_ref);
         // (its captions, with any a dropped picture had)
         if ((cc && cc->size > 0) || !ccCarried.empty()) {
             const size_t n = ccCarried.size() + (cc ? cc->size : 0);
@@ -1699,6 +1841,10 @@ void Recorder::run() {
             }
             ccCarried.clear();
         }
+        // (its HDR metadata, which a live view takes its peak from)
+        for (const AVFrameSideDataType t : {AV_FRAME_DATA_MASTERING_DISPLAY_METADATA, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL})
+            if (const AVFrameSideData* from = av_frame_get_side_data(f, t))
+                if (AVFrameSideData* d = av_frame_new_side_data(pic, t, from->size)) std::memcpy(d->data, from->data, from->size);
         if (interlaced) {
 #ifdef AV_FRAME_FLAG_INTERLACED
             pic->flags |= AV_FRAME_FLAG_INTERLACED | (topFirst ? AV_FRAME_FLAG_TOP_FIELD_FIRST : 0);
@@ -1864,7 +2010,7 @@ void Recorder::run() {
     // against the pictures', as putSound places the recorded one (silence where it is missing, trimmed where it runs
     // early; jitter under a tenth of a second left be), then given to onTrackSound.
     auto putExtra = [&](size_t k, AVFrame* f) -> bool {
-        if (!headerWritten || !cs.onTrackSound || k >= extraPlaces.size()) return true;
+        if (!headerWritten || (!cs.onTrackSound && (k >= xencs.size() || !xencs[k])) || k >= extraPlaces.size()) return true;
         ExtraPlace& x = extraPlaces[k];
         const int64_t endSample = std::min(soundEnd, frameLimit > 0 ? int64_t(std::llround(double(frameLimit) / av_q2d(fps) * 48000)) : INT64_MAX);
         if (x.next >= endSample || f->sample_rate <= 0) return true;
@@ -1891,10 +2037,31 @@ void Recorder::run() {
         }
         av_channel_layout_uninit(&layout);
         if (!x.swr) return true;
+        bool wrote = true;
         auto give = [&](AVFrame* g) {
             g->pts = x.next;
             x.next += g->nb_samples;
-            cs.onTrackSound(int(k + 1), g);
+            if (cs.onTrackSound) cs.onTrackSound(int(k + 1), g);
+            // (into its own track of the file: 24-bit, interleaved)
+            AVCodecContext* enc = k < xencs.size() ? xencs[k] : nullptr;
+            if (!enc || watchOnly || g->ch_layout.nb_channels != enc->ch_layout.nb_channels) return;
+            AVFrame* pcm = av_frame_alloc();
+            pcm->format = AV_SAMPLE_FMT_S32;
+            pcm->sample_rate = 48000;
+            av_channel_layout_copy(&pcm->ch_layout, &enc->ch_layout);
+            pcm->nb_samples = g->nb_samples;
+            if (av_frame_get_buffer(pcm, 0) >= 0) {
+                const int n = g->ch_layout.nb_channels;
+                auto* d = reinterpret_cast<int32_t*>(pcm->data[0]);
+                for (int c = 0; c < n; ++c) {
+                    const float* src = reinterpret_cast<const float*>(g->extended_data[c]);
+                    for (int i = 0; i < g->nb_samples; ++i)
+                        d[size_t(i) * size_t(n) + size_t(c)] = int32_t(std::lround(std::clamp(double(src[i]), -1.0, 1.0 - 1.0 / 8388608) * 8388608.0)) * 256;
+                }
+                pcm->pts = g->pts;
+                wrote = write(enc, xsts[k], pcm) && wrote;
+            }
+            av_frame_free(&pcm);
         };
         auto frameOf = [&](int n) {
             AVFrame* g = av_frame_alloc();
@@ -1947,7 +2114,7 @@ void Recorder::run() {
         g->nb_samples = int(std::min<int64_t>(g->nb_samples, endSample - x.next));
         give(g);
         av_frame_free(&g);
-        return true;
+        return wrote;
     };
     // A cue message from the feed, given once the recording has begun (its clock known).
     auto putCue = [&](const AVPacket* p, AVRational tb) {
@@ -2053,8 +2220,16 @@ void Recorder::run() {
         Input& in = inputs[item.input];
         const st2110::InputFrame& f = *item.st2110;
         const int64_t pts = f.ptpNs / 100;
+        // (a feed decoded smaller for a tile while it is only watched: at its own size again while a viewer shows it
+        // whole, as the Source monitor does a feed taken live; from the next codestream on)
+        if (watchOnly && in.st2110Proxy > 0 && in.st2110) in.st2110->setJpegXsProxy(cs.live && cs.live->wholeWanted() ? 0 : in.st2110Proxy);
         // (a picture dropped while the encoder caught up: its sound still goes in)
-        AVFrame* pic = !soundOnly && in.videoStream >= 0 ? rasterFrame(f.picture, in.st2110Full) : nullptr;
+        // (a picture decoded at a proxy size, from while the feed was only watched, is not recorded)
+        const bool proxySized = f.picture.width != in.st2110Video.width;
+        AVFrame* pic = !soundOnly && in.videoStream >= 0 && !(proxySized && !watchOnly) ? rasterFrame(f.picture, in.st2110Full) : nullptr;
+        // (an ST 2110-22 codestream, for a JPEG XS recording that keeps it)
+        if (pic && jxsRecord && !cs.recodeJpegXs && !f.codestream.empty())
+            if ((pic->opaque_ref = av_buffer_alloc(f.codestream.size()))) std::memcpy(pic->opaque_ref->data, f.codestream.data(), f.codestream.size());
         if (pic) {
             const st2110::VideoFormat& v = in.st2110Video;
             pic->pts = pic->best_effort_timestamp = pts;
@@ -2064,6 +2239,15 @@ void Recorder::run() {
             pic->color_trc = v.tcs == "PQ" ? AVCOL_TRC_SMPTE2084 : v.tcs == "HLG" ? AVCOL_TRC_ARIB_STD_B67 : wide ? AVCOL_TRC_BT2020_10 : AVCOL_TRC_BT709;
             if (v.interlaced) pic->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
             if (f.lostPackets) pic->flags |= AV_FRAME_FLAG_CORRUPT;
+            // (a PQ feed's HDR metadata: ST 2108-1 in its ancillary data, else Montage's own ST 2110-41 item, as side
+            // data FFmpeg's decoders give an HEVC feed's, for a live view's peak)
+            if (v.tcs == "PQ") {
+                for (const st2110::AncPacket& a : f.anc)
+                    if (st2110::parseHdrMetadata(a, in.st2110Hdr)) in.st2110HdrStated = true;
+                for (const st2110::FastMetadata& m : f.metadata)
+                    if (st2110::parseHdrItem(m, in.st2110Hdr)) in.st2110HdrStated = true;
+                if (in.st2110HdrStated) hdrSideData(pic, in.st2110Hdr);
+            }
             // (its time code, as the feed's own: SMPTE 12-M side data, as FFmpeg gives it)
             if (f.hasTimecode)
                 if (AVFrameSideData* sd = av_frame_new_side_data(pic, AV_FRAME_DATA_S12M_TIMECODE, sizeof(uint32_t) * 4)) {

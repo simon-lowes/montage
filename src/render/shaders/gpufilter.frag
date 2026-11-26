@@ -38,7 +38,8 @@
 // and the warps and stylizers of render/StyleFx and render/VideoFx, what is the same over the frame worked out on the CPU:
 //   26 a warp, each pixel bilinear from where it says (p[1].x): 0 Wave Warp, 1 Twirl, 2 Spherize, 3 Ripple, 4 Turbulent
 //      Displace (its noise made here by the CPU's hash), 5 Motion Tile (wrapped), 6 Camera Shake, 7 Corner Pin (p[2..4] the
-//      inverse map's rows, transparent outside)
+//      inverse map's rows, transparent outside), 8 Lens Distortion (p[2] the centre, the half diagonal and the amount;
+//      transparent where it reaches past the picture)
 //   27 Find Edges, 28 Emboss, 29 Halftone, 30 Duotone, 31 VHS (the table each row's shift, tearing and scanline), 32 Tilt-Shift's
 //      last step (the picture, orig, towards its blur by the distance from the band, and the saturation)
 //   33 Mesh Warp and Grid Warp (render/MeshWarp's drawWarp): the mesh's triangles, listed by the tiles they reach, in the table
@@ -57,6 +58,9 @@
 // smear along the flow.
 // 56 a Shape layer's paints (render/ShapeRaster): each pixel's tile's commands, each path's coverage from its backdrop and
 // lines, its paint laid down over what is below, groups through their opacity; p[1].x the tiles across.
+// 73 and above are gpueffects.frag's (the compositor draws those modes with it).
+// 72 Gaussian splats blended (render/SplatRender): a linear cloud's colour (p[1].x set) brought to display values under
+// its coverage, and the whole the layer's opacity (p[1].y) of that.
 // Lens Blur (Depth) (render/LensBlur's lensBlur, its plan worked out on the CPU from the depth; the state, S, twice the
 // layer's width: what is laid down so far, premultiplied in light, on the left, and on the right its coverage and
 // whether the pixel keeps its own value): 58 the picture in light with highlights lifted (left) and each pixel's
@@ -454,6 +458,18 @@ void main() {
     const ivec2 size = textureSize(srcTex, 0);
     const int mode = int(p[0].x);
     const vec4 px = texelFetch(srcTex, xy, 0);
+    if (mode == 72) {
+        vec4 c = px;
+        if (p[1].x > 0.5 && c.a > 0.0) {
+            const float cover = c.a;
+            for (int k = 0; k < 3; ++k) {
+                const float v = max(0.0, min(1.0, c[k] / cover));
+                c[k] = (v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055) * cover;
+            }
+        }
+        fragColor = c * p[1].y;
+        return;
+    }
     if (mode == 1) {
         const int r = int(p[1].x);
         const bool column = p[1].y > 0.5;
@@ -702,6 +718,17 @@ void main() {
             }
             sx = u * float(size.x);
             sy = v * float(size.y);
+            edge = 0;
+        } else if (kind == 8) {
+            // (render/VideoFx's Lens Distortion: positive barrel, negative pincushion)
+            const float cx = p[2].x, cy = p[2].y, norm = p[2].z, nx = (x - cx) / norm, ny = (y - cy) / norm;
+            const float f = 1.0 + p[2].w * 0.5 * (nx * nx + ny * ny);
+            sx = cx + nx * f * norm;
+            sy = cy + ny * f * norm;
+            if (!(sx >= 0.0 && sy >= 0.0 && sx <= float(size.x) && sy <= float(size.y))) {
+                fragColor = vec4(0.0);
+                return;
+            }
             edge = 0;
         }
         fragColor = sampleEdge(size, sx, sy, edge);

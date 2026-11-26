@@ -13,7 +13,10 @@
 #include <QDialog>
 #include <QJsonObject>
 #include <memory>
+#include <set>
+#include <string>
 #include <thread>
+#include <tuple>
 
 #include "core/Model.h"
 #include "media/Capture.h"
@@ -111,6 +114,9 @@ private:
     void nmosConnected();
     bool startLive(CaptureSettings& cs);  // false with error_ set
     void endLive();
+    // Markers placed on the growing clip (on any clip of the recording's media) made chapters of the live package,
+    // each once.
+    void markersToChapters();
 
     EditorState* state_;
     QComboBox* kind_;
@@ -150,6 +156,7 @@ private:
     QDoubleSpinBox* liveBreak_;
     QPushButton* liveChapter_;
     int liveChapters_ = 0;
+    std::set<std::tuple<Id, FrameTime, std::string>> liveMarkers_;  // (clip, marker's time, name: made chapters)
     QPushButton* record_;
     QLabel* status_;
     QTimer* tick_;

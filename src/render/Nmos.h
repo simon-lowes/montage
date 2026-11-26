@@ -34,6 +34,7 @@
 
 class QTcpServer;
 class QTcpSocket;
+class QThread;
 class QTimer;
 class QNetworkAccessManager;
 class QNetworkReply;
@@ -83,6 +84,8 @@ struct Registry {
 };
 
 // (the engine has no moc: callbacks rather than signals)
+struct MdnsHeard;  // (a multicast DNS datagram, read: render/Nmos.cpp)
+
 class Node : public QObject {
 public:
     explicit Node(QObject* parent = nullptr);
@@ -107,6 +110,10 @@ public:
     bool registered() const { return registered_; }
     // Why the Node is not announced by multicast DNS ("" when it is, or was not asked to be).
     QString mdnsError() const { return mdnsError_; }
+    // The thread multicast DNS datagrams are read and parsed on (not the Node's: only what concerns the Node or the
+    // registries it browses for is handed to it), and how many it has read there this run (null and 0 without one).
+    QThread* mdnsThread() const;
+    int mdnsDatagrams() const;
 
     // Ids, kept from one run to the next (made from the host name and label).
     QUuid nodeId() const { return nodeId_; }
@@ -220,6 +227,8 @@ private:
     std::unique_ptr<Mdns> mdns_;
     void startMdns();
     void announceNode();
+    void mdnsSend(const QByteArray& message, const QHostAddress& to, quint16 port);
+    void mdnsHeard(int run, const MdnsHeard& heard);
     QByteArray mdnsTxt() const;
     void mdnsChanged(int kind);  // a resource of kind `kind` (IS-04's ver_ order, -1 none) changed: announced again
     void browseRegistries(std::function<void(std::vector<Registry>)> done);

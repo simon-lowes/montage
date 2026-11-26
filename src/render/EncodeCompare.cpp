@@ -603,8 +603,10 @@ double vmafSecondsEstimate(int width, int height, int64_t frames, int every, int
     constexpr int kW = 480, kH = 270, kPairs = 8;
     static std::mutex mutex;
     static double scored = -1, unscored = 0;
+    static bool failed = false;  // (measured once: a run that failed is not tried again on every call)
     {
         std::lock_guard<std::mutex> lock(mutex);
+        if (failed) return 0;
         if (scored < 0) {
             QualityPicture a;
             a.width = kW, a.height = kH;
@@ -636,7 +638,10 @@ double vmafSecondsEstimate(int width, int height, int64_t frames, int every, int
                 return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / kPairs;
             };
             const double all = run(1), eighth = run(kPairs);
-            if (all < 0 || eighth < 0) return 0;
+            if (all < 0 || eighth < 0) {
+                failed = true;
+                return 0;
+            }
             // (eighth = (scored + 7 unscored) / 8)
             unscored = std::clamp((eighth * kPairs - all) / (kPairs - 1), 0.0, all);
             scored = all;

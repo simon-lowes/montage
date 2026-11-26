@@ -44,6 +44,9 @@ struct VfxPullOptions {
     // `returns` as the shot's first version, named by `returnsPattern` ("" = "{shot}_comp_v###").
     bool scripts = false;
     std::string returns, returnsPattern;
+    // Off: the plates without any motion blur through a shutter (the transforms', Motion Blur's, titles'), to be
+    // blurred where they are composited.
+    bool motionBlur = true;
 };
 
 struct VfxShot;

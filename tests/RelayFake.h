@@ -60,6 +60,7 @@ public:
     std::atomic<bool> refuseRefresh{false};   // a Refresh that keeps the address is answered 508 (it keeps it all the same)
     std::atomic<bool> forget{false};          // the next Refresh finds the address gone: 437, as after a restart
     std::atomic<bool> refusePermission{false};  // a CreatePermission answered 403 (the peer is not let in)
+    std::atomic<bool> unsignedRefusals{false};  // a refusal sent unsigned, as one made up on the way would be
     // Each answer's attributes changed before it is signed (and each packet passed on from a peer), a different way
     // every time, from this seed: values with bytes changed, cut short or longer, attributes left out, said twice
     // or under another's name. What arrives is well formed and rightly signed, and says something else.
@@ -69,6 +70,9 @@ public:
     std::atomic<int> loginsRefused{0}, loginsExpired{0}, familiesRefused{0};
     std::atomic<quint64> sendIndications{0}, channelData{0}, toPeers{0}, fromPeers{0};
     std::atomic<quint64> bytesOverUdp{0}, bytesOverStream{0};
+    // The connectivity checks it carried that say they are from the controlling end (ICE-CONTROLLING), and those of
+    // them whose tiebreaker is 0 (what some browsers send from a relay they reach over TCP or TLS).
+    std::atomic<quint64> controllingChecks{0}, zeroTiebreakers{0};
 
     // The Send indications passed on from the client whose relayed port is this one (a client's checks on pairs
     // that were not chosen are its own, not the chosen one's).
@@ -398,6 +402,17 @@ private:
         for (const auto& [type, value] : list) attribute(a, type, value);
     }
 
+    // A packet carried to a peer, counted when it is a check from the controlling end (and when its tiebreaker is 0).
+    void countCheck(const QByteArray& data) {
+        if (data.size() < 20 || get16(data, 0) != 0x0001 || data.mid(4, 4) != QByteArray::fromHex("2112a442")) return;
+        for (qsizetype at = 20; at + 4 <= data.size(); at += 4 + ((get16(data, at + 2) + 3) & ~3)) {
+            if (get16(data, at) != 0x802A || get16(data, at + 2) != 8 || at + 12 > data.size()) continue;
+            ++controllingChecks;
+            if (data.mid(at + 4, 8) == QByteArray(8, '\0')) ++zeroTiebreakers;
+            return;
+        }
+    }
+
     // One message from a client: a Send indication or a channel's data carried on, or a request answered.
     void heard(Client& c, const QByteArray& d, QUdpSocket* udp) {
         if (silent) return;
@@ -407,6 +422,7 @@ private:
             if (c.back && c.channels.contains(number) && 4 + size <= d.size()) {
                 ++channelData;
                 ++toPeers;
+                countCheck(d.mid(4, size));
                 c.back->writeDatagram(d.mid(4, size), real(c.channels[number].first), c.channels[number].second);
             }
             return;
@@ -453,6 +469,7 @@ private:
                     ++sendsByPort_[c.back->localPort()];
                 }
                 ++toPeers;
+                countCheck(data);
                 c.back->writeDatagram(data, real(peer), peerPort);
             }
             return;
@@ -553,8 +570,10 @@ private:
         mangled(a);
         note(QStringLiteral("%1 asks %2%3%4").arg(c.fromPort).arg(type, 4, 16, QChar('0')).arg(peerGiven ? " for " + peer.toString() + ":" + QString::number(peerPort) : QString()).arg(refused ? " (refused)" : ""));
         QByteArray answer = message(type | (refused ? 0x0110 : 0x0100), id, a);
-        answer[2] = char((a.size() + 24) >> 8), answer[3] = char((a.size() + 24) & 0xff);
-        attribute(answer, 0x0008, QMessageAuthenticationCode::hash(answer, key, QCryptographicHash::Sha1));
+        if (!refused || !unsignedRefusals) {
+            answer[2] = char((a.size() + 24) >> 8), answer[3] = char((a.size() + 24) & 0xff);
+            attribute(answer, 0x0008, QMessageAuthenticationCode::hash(answer, key, QCryptographicHash::Sha1));
+        }
         // (a byte of the signed answer changed on its way, as a box in the middle might: the relayed port's, the
         // lifetime's or the error's, whichever attribute comes first)
         if (corruptAnswers && answer.size() > 28) answer[27] = char(answer[27] ^ 0x01);

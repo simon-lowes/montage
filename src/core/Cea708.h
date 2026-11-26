@@ -35,8 +35,10 @@ std::vector<std::vector<CcTriplet>> captionCcData(const std::vector<Caption>& ca
 // say after each DTVCC packet (rows joined by '\n'; a window scrolls past its last row), each change a new caption
 // placed by its window's anchor (text growing on screen stays one); timed in frames at `fps`. `painted` says whether
 // text was written into windows on screen (roll-up, paint-on), which 608 reads better. False if no caption is found.
+// `service`: the caption service to read (1 to 63). With `building`, text growing on screen is a caption until a row is
+// begun, and the next holds the rows then and the new one, as a viewer sees roll-up and paint-on captions build.
 bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, Rational fps, std::vector<Caption>& out,
-                     std::string* error = nullptr, bool* painted = nullptr);
+                     std::string* error = nullptr, bool* painted = nullptr, int service = 1, bool building = false);
 
 // MacCaption MCC (V1.0): a SMPTE 334 caption distribution packet for every frame, with the 608 and 708 data above,
 // at the sequence's rate when MCC has it (24, 25, 30, 50, 60, and 29.97 and 59.94 drop frame), else at 29.97; V2.0 for
@@ -44,6 +46,12 @@ bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, 
 std::string captionsToMcc(const std::vector<Caption>& captions, Rational fps, const CaptionStyle& style = {});
 // Reads MCC: its 708 service 1 when it has pop-on captions, else 608 channel 1 (else the 708 there is).
 bool parseMcc(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
+// MCC written as caption data comes: the file's header for `fps` (MCC's rate for it, as captionsToMcc), then a line
+// for each frame (from 0) with its cc_data as it came, every service and channel (more than a packet's 31 entries in
+// further lines of the same time code). And every frame's cc_data back, with its time (seconds); false if not MCC.
+std::string mccHeader(Rational fps);
+std::string mccFrame(const std::vector<CcTriplet>& cc, Rational fps, int64_t frame);
+bool mccCcData(const std::string& text, Rational fps, std::vector<std::pair<double, CcTriplet>>& out);
 
 // A SMPTE 334-2 caption distribution packet (CDP) of one frame's cc_data (at most 31 entries) at `fps` (the CDP's
 // rate code: 23.976 to 60, else 29.97), numbered `sequence`: what an ANC packet with DID 61h and SDID 01h carries in
@@ -54,5 +62,17 @@ bool parseCdp(const uint8_t* data, size_t size, std::vector<CcTriplet>& out, boo
 // pop-on captions, else 608 channel 1 (else the 708 there is).
 bool captionsFromCc(const std::vector<std::pair<double, CcTriplet>>& triplets, Rational fps, std::vector<Caption>& out,
                     std::string* error = nullptr);
+
+// One caption language of a feed: a CTA-708 caption service or a CEA-608 channel, its captions.
+struct CcCaptionStream {
+    std::string id;        // "SERVICE1" to "SERVICE63", "CC1" to "CC4" (as HLS's INSTREAM-ID names them)
+    int service708 = 0;    // (or 0)
+    int channel608 = 0;    // 1 and 2 on field 1, 3 and 4 on field 2 (or 0)
+    std::vector<Caption> captions;
+};
+// Every 708 service and 608 channel in cc_data that has captions (708's by number, then 608's), each read on its own;
+// `building` as captionsFrom708 and captionsFrom608 take it.
+std::vector<CcCaptionStream> captionStreamsFromCc(const std::vector<std::pair<double, CcTriplet>>& triplets, Rational fps,
+                                                  bool building = false);
 
 }  // namespace montage

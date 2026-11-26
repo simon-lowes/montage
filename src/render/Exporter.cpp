@@ -1104,15 +1104,24 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     AVPixelFormat jxsFormat = AV_PIX_FMT_YUV422P10LE;
     if (jxsOut) {
         if (!jpegXsAvailable()) return fail("This build of Montage writes no JPEG XS (SVT-JPEG-XS)");
+        // (each format without alpha, and its counterpart with alpha: yuv422p10le and yuva422p10le)
+        const AVPixelFormat ok[] = {AV_PIX_FMT_YUV422P,    AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV422P12LE, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV444P10LE,
+                                    AV_PIX_FMT_YUV444P12LE, AV_PIX_FMT_GBRP,       AV_PIX_FMT_GBRP10LE,    AV_PIX_FMT_GBRP12LE};
+        const AVPixelFormat withAlpha[] = {AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA422P10LE, AV_PIX_FMT_YUVA422P12LE,
+                                           AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUVA444P10LE, AV_PIX_FMT_YUVA444P12LE,
+                                           AV_PIX_FMT_GBRAP,    AV_PIX_FMT_GBRAP10LE,    AV_PIX_FMT_GBRAP12LE};
         if (!s.pixFmt.empty()) {
             jxsFormat = av_get_pix_fmt(s.pixFmt.c_str());
-            const AVPixelFormat ok[] = {AV_PIX_FMT_YUV422P,    AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV422P12LE, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV444P10LE,
-                                        AV_PIX_FMT_YUV444P12LE, AV_PIX_FMT_GBRP,       AV_PIX_FMT_GBRP10LE,    AV_PIX_FMT_GBRP12LE};
-            if (std::find(std::begin(ok), std::end(ok), jxsFormat) == std::end(ok))
-                return fail("JPEG XS is written as 4:2:2 or 4:4:4 Y'CbCr, or R'G'B', at 8, 10 or 12 bits (yuv422p10le, yuv444p12le, gbrp12le...)");
+            if (const auto at = std::find(std::begin(withAlpha), std::end(withAlpha), jxsFormat); at != std::end(withAlpha)) {
+                if (!s.alpha) return fail("A JPEG XS format with alpha is written with alpha kept: ask for alpha, or choose the format without it");
+                jxsFormat = ok[at - std::begin(withAlpha)];
+            } else if (std::find(std::begin(ok), std::end(ok), jxsFormat) == std::end(ok)) {
+                return fail("JPEG XS is written as 4:2:2 or 4:4:4 Y'CbCr, or R'G'B', at 8, 10 or 12 bits, with alpha or without (yuv422p10le, yuva444p12le, gbrp12le...)");
+            }
         }
+        if (s.alpha) jxsFormat = withAlpha[std::find(std::begin(ok), std::end(ok), jxsFormat) - std::begin(ok)];
         if (s.jpegXsBpp < 0 || s.jpegXsBpp > 24) return fail("A JPEG XS rate is up to 24 bits a pixel");
-        if (s.alpha || interlacedOut) return fail("JPEG XS is written without alpha or fields");
+        if (interlacedOut) return fail("JPEG XS is written without fields");
         if (s.cea608 || s.embedCaptions) return fail("JPEG XS is written without embedded captions: burn them in, or deliver them beside the file");
         if (s.adaptiveHdr) return fail("JPEG XS is written without adaptive HDR metadata");
         if (s.twoPass || s.pass != 0) return fail("JPEG XS is written in one pass");
@@ -1309,11 +1318,20 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->gop_size = 1;
         } else if (c == "mpeg2video") {
             // XDCAM HD422: 4:2:2 MPEG-2 at a constant 50 Mb/s, a long GOP of 12 (15 at 30 and 60 frames a second), two
-            // B-frames, 10-bit DC precision, as Sony's discs and broadcasters' ingest expect.
-            const int64_t rate = s.videoBitrate > 0 ? s.videoBitrate : 50000000;
-            o.vctx->bit_rate = o.vctx->rc_min_rate = o.vctx->rc_max_rate = rate;
-            o.vctx->rc_buffer_size = 17825792;
-            o.vctx->rc_initial_buffer_occupancy = s.vbvInit > 0 ? int(std::clamp(s.vbvInit, 0.05, 1.0) * 17825792) : 17825792;
+            // B-frames, 10-bit DC precision, as Sony's discs and broadcasters' ingest expect. A stated VBV (`hrd`) sets
+            // the rate and buffer the sequence headers give: at a constant rate every picture's vbv_delay is set; at a
+            // variable one (0xFFFF) the rate is the most it may arrive at, the pictures coded under it.
+            const Mpeg2Vbv vbv = exportMpeg2Vbv(s);
+            if (!vbv.valid) {
+                av_dict_free(&opts);
+                return fail("An MPEG-2 VBV buffer is 16,384 to " + std::to_string(vbv.most) + " bits at this rate (" +
+                            std::to_string(vbv.buffer) + " asked), at a rate over 0");
+            }
+            o.vctx->rc_max_rate = vbv.rate;
+            o.vctx->rc_min_rate = vbv.cbr ? vbv.rate : 0;
+            o.vctx->bit_rate = vbv.cbr ? vbv.rate : std::min<int64_t>(s.videoBitrate > 0 ? s.videoBitrate : vbv.rate * 3 / 4, vbv.rate);
+            o.vctx->rc_buffer_size = int(vbv.buffer);
+            o.vctx->rc_initial_buffer_occupancy = s.vbvInit > 0 ? int(std::clamp(s.vbvInit, 0.05, 1.0) * double(vbv.buffer)) : int(vbv.buffer);
             o.vctx->gop_size = exportMpeg2Gop(s, dseq.fps);
             o.vctx->max_b_frames = 2;
             o.vctx->intra_dc_precision = 2;
@@ -1394,6 +1412,24 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             av_dict_set(&opts, "row-mt", "1", 0);
             av_dict_set(&opts, "deadline", s.preset.empty() ? "good" : s.preset.c_str(), 0);
             av_dict_set(&opts, "cpu-used", "4", 0);
+        } else if (c == "libaom-av1" && (s.hrd == "cbr" || s.hrd == "vbr")) {
+            // libaom with a stated HRD: AV1's decoder model in its sequence header (timing and decoder model info,
+            // each operating point's buffer delays) and in every frame header (its removal time), at the rate asked:
+            // exactly it at a constant rate, never more at a variable one. The buffer is the level's (AV1 states no
+            // other), which the rate is held under.
+            const int64_t rate = s.vbvMaxrate > 0 ? s.vbvMaxrate : s.videoBitrate;
+            if (rate <= 0) {
+                av_dict_free(&opts);
+                return fail("AV1's decoder model needs a rate: set the HRD rate or a video bit rate");
+            }
+            const bool cbr = s.hrd == "cbr";
+            o.vctx->rc_max_rate = rate;
+            o.vctx->rc_min_rate = cbr ? rate : 0;
+            o.vctx->bit_rate = cbr ? rate : std::min<int64_t>(s.videoBitrate > 0 ? s.videoBitrate : rate * 3 / 4, rate);
+            o.vctx->rc_buffer_size = int(std::min<int64_t>(s.vbvBuffer > 0 ? s.vbvBuffer : rate, INT_MAX));
+            av_dict_set(&opts, "aom-params", "timing-info=model", 0);
+            av_dict_set(&opts, "row-mt", "1", 0);
+            if (!s.preset.empty()) av_dict_set(&opts, "cpu-used", s.preset.c_str(), 0);
         } else if (c == "libsvtav1") {
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
             av_dict_set(&opts, "preset", s.preset.empty() ? "8" : s.preset.c_str(), 0);
@@ -1955,6 +1991,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         xs.encode.height = H;
         xs.encode.depth = d->comp[0].depth;
         xs.encode.sampling = (d->flags & AV_PIX_FMT_FLAG_RGB) ? JxsSampling::Rgb : d->log2_chroma_w ? JxsSampling::Ycc422 : JxsSampling::Ycc444;
+        xs.encode.alpha = (d->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        xs.encode.lossless = s.jpegXsLossless;
         const double bpp = s.jpegXsBpp > 0 ? s.jpegXsBpp : 5.0;
         xs.encode.bppNum = int(std::lround(bpp * 1000));
         xs.encode.bppDen = 1000;
@@ -1977,6 +2015,20 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!o.jxsPicture) return fail("Out of memory");
         if (!o.jxs->open(s.path, xs, &o.jxsError)) return fail(o.jxsError);
         opened = true;  // (removed if the export fails after the writer has finished it)
+    }
+    // Matroska has no place in a track for an ICC profile: Adobe RGB's goes in as an attachment of the ICC profile's
+    // media type, after every track is made (WebM takes no attachments).
+    if (outSpace.primaries == Primaries::AdobeRgb && o.vst && std::strcmp(o.oc->oformat->name, "matroska") == 0) {
+        const QByteArray icc = QColorSpace(QColorSpace::AdobeRgb).iccProfile();
+        if (AVStream* att = icc.isEmpty() ? nullptr : avformat_new_stream(o.oc, nullptr)) {
+            att->codecpar->codec_type = AVMEDIA_TYPE_ATTACHMENT;
+            att->codecpar->extradata = static_cast<uint8_t*>(av_mallocz(size_t(icc.size()) + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (!att->codecpar->extradata) return fail("Out of memory");
+            std::memcpy(att->codecpar->extradata, icc.constData(), size_t(icc.size()));
+            att->codecpar->extradata_size = int(icc.size());
+            av_dict_set(&att->metadata, "filename", "AdobeRGB1998.icc", 0);
+            av_dict_set(&att->metadata, "mimetype", "application/vnd.iccprofile", 0);
+        }
     }
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
@@ -2311,6 +2363,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.highQuality = true;
     ro.useProxies = s.useProxies;
     ro.gpu = s.gpu;
+    ro.motionBlur = s.motionBlur;
     // Graded scene-referred, the frames are made for the space delivered, through its own output transform (a trim
     // pass's target's, its trim after it; a scene-referred one gets the working space's light).
     const bool sceneGraded = sceneReferredWorking(seq);
@@ -3243,6 +3296,23 @@ bool exportInTwoPasses(const Project& p, const Sequence& seq, const ExportSettin
 
 int exportMpeg2Gop(const ExportSettings& s, Rational fps) { return s.gop > 0 ? s.gop : std::lround(fps.toDouble()) % 25 == 0 ? 12 : 15; }
 
+Mpeg2Vbv exportMpeg2Vbv(const ExportSettings& s) {
+    constexpr int64_t kXdcamBuffer = 17825792, kUnit = 16384;
+    Mpeg2Vbv v;
+    const bool stated = s.hrd == "cbr" || s.hrd == "vbr";
+    v.cbr = s.hrd != "vbr";
+    const int64_t rate = stated && s.vbvMaxrate > 0 ? s.vbvMaxrate : s.videoBitrate > 0 ? s.videoBitrate : 50000000;
+    const int64_t buffer = stated && s.vbvBuffer > 0 ? s.vbvBuffer : kXdcamBuffer;
+    v.rate = (rate + 399) / 400 * 400;
+    // (at a constant rate a picture's vbv_delay, 16 bits of a 90 kHz clock below 0xFFFF, must reach a full buffer:
+    // FFmpeg's encoder writes 0xFFFF, a variable rate's mark, into every picture of a longer one)
+    v.most = 2880 * kUnit;
+    if (v.cbr && v.rate > 0) v.most = std::min<int64_t>(v.most, (v.rate * 0xFFFF / 90000 + 1) / kUnit * kUnit);
+    v.buffer = (stated && s.vbvBuffer > 0 ? buffer : std::min(buffer, v.most)) / kUnit * kUnit;
+    v.valid = rate > 0 && v.buffer >= kUnit && v.buffer <= v.most;
+    return v;
+}
+
 void codedPictureSize(const Sequence& seq, const ExportSettings& s, int& W, int& H) {
     StereoView view = StereoView::Left;
     int across = 1, down = 1;
@@ -3382,7 +3452,7 @@ bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSetti
 
 bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames) {
     const std::string& c = s.videoCodec;
-    if (!s.hrdCheck || (c != "libx264" && c != "libx265" && c != "mpeg2video")) return false;
+    if (!s.hrdCheck || (c != "libx264" && c != "libx265" && c != "mpeg2video" && c != "libaom-av1")) return false;
     if (s.profile == "avci100" || s.path.find('%') != std::string::npos) return false;  // (intra only; image sequences)
     return copiedFrames > 0 || s.hrd == "cbr" || s.hrd == "vbr";
 }
@@ -3393,8 +3463,7 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // (grain carried as parameters: the cleaned sequence exported through here, then its frame headers written again)
     if (exportCarriesGrain(s)) {
         if (smartRendered) *smartRendered = 0;
-        if (hrd) *hrd = HrdReport{};
-        return exportCarryingGrain(p, seq, s, progress, cancel, error, encoderUsed, light, keptUnsigned);
+        return exportCarryingGrain(p, seq, s, progress, cancel, error, encoderUsed, light, keptUnsigned, nullptr, hrd);
     }
     // (the outermost call checks: two passes export again through here)
     static thread_local int depth = 0;
@@ -3895,8 +3964,8 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
         if (!stillRendition(seq, "", sro, sdrSpace, sdrPeak, error)) return false;
         if (sdrSpace->hdr()) sro.displaySpace = rec709Space().id, sdrSpace = &rec709Space();
         Image sdr = renderProgramFrame(p, seq, t, sro);
-        // A gain map's base says Rec.709 or Display P3: a trim to other primaries goes into Rec.709.
-        if (sdrSpace->primaries != Primaries::Bt709 && sdrSpace->primaries != Primaries::P3D65) {
+        // A gain map's base says Rec.709, Display P3 or Adobe RGB: a trim to other primaries goes into Rec.709.
+        if (sdrSpace->primaries != Primaries::Bt709 && sdrSpace->primaries != Primaries::P3D65 && !gainMapBaseIsAdobeRgb(*sdrSpace)) {
             convertColor(sdr, *sdrSpace, rec709Space(), sdrPeak);
             sdrSpace = &rec709Space();
         }

@@ -36,7 +36,8 @@ class PlaybackController;
 
 // A slot's velocity curve, drawn: the force a key is played with across (1-127), what comes out of it up (1-127),
 // straight between its points. Pressing where there is no point makes one, a drag moves a point, a double click takes
-// one away. Drawing over a curve that is not drawn (As Played, Soft, Hard) starts from that curve's two ends.
+// one away (a double click where there was none puts one down, as a click does: one change, not a point made and taken
+// away again). Drawing over a curve that is not drawn (As Played, Soft, Hard) starts from that curve's two ends.
 class VelocityCurveView : public QWidget {
     Q_OBJECT
 public:
@@ -67,6 +68,8 @@ private:
     bool has_ = false;
     std::vector<std::pair<int, int>> points_;  // (in order of the velocity in)
     int drag_ = -1;
+    std::pair<int, int> made_{-1, -1};  // (the point the last press that made one made, and when)
+    quint64 madeAt_ = 0;
 };
 
 class SamplerPanel : public QWidget {

@@ -417,6 +417,19 @@ std::string streamIccColorSpace(const AVStream* st) {
     return {};
 }
 
+// The colour space an ICC profile attached to a Matroska file names: an attachment of the ICC profile's media type,
+// as Montage writes for Adobe RGB ("" without one).
+std::string attachedIccColorSpace(const AVFormatContext* fmt) {
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVStream* st = fmt->streams[i];
+        const AVDictionaryEntry* mime = av_dict_get(st->metadata, "mimetype", nullptr, 0);
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_ATTACHMENT && mime && std::strcmp(mime->value, "application/vnd.iccprofile") == 0 &&
+            st->codecpar->extradata && st->codecpar->extradata_size > 0)
+            return iccProfileSpace(st->codecpar->extradata, size_t(st->codecpar->extradata_size));
+    }
+    return {};
+}
+
 // The colour space a still image's embedded ICC profile names, for images whose tags name none ("" when it has no
 // profile, or one of no space Montage reads differently: an sRGB profile reads as the Rec.709 default).
 std::string iccColorSpace(const std::string& path) {
@@ -900,6 +913,9 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         // of its own; video in MOV and MP4 carries the profile in the stream's colr box).
         if (st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED)
             if (const std::string icc = streamIccColorSpace(st); !icc.empty()) m.colorSpace = icc;
+        // (Matroska's, attached to the file)
+        if (st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED)
+            if (const std::string icc = attachedIccColorSpace(fmt); !icc.empty()) m.colorSpace = icc;
         // (an AVIF's, where this FFmpeg's probe does not hand on the picture's colour property: read from its meta box)
         if (HeifStillInfo hi; st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED && lowerExtension(file) == ".avif" && readHeifStill(file, hi) &&
                               hi.adobeRgb)

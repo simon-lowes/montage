@@ -903,7 +903,8 @@ bool sccFrame(const QString& tc, int64_t& out) {
 
 }  // namespace
 
-bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rational fps, std::vector<Caption>& out, std::string* error) {
+bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rational fps, std::vector<Caption>& out, std::string* error,
+                     int wanted, bool building) {
     const double f = fps.valid() ? fps.toDouble() : 30.0;
     auto frames = [f](double seconds) { return FrameTime(std::llround(seconds * f)); };
     enum class Mode { PopOn, PaintOn, RollUp } mode = Mode::PopOn;
@@ -913,6 +914,7 @@ bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rati
     double lineStart = -1;  // when the roll-up line being written began
     std::vector<Caption> caps;
     std::vector<size_t> open;  // roll-up lines still on screen
+    bool rolled = false;       // (built as shown) the lines moved up, and no line begun since
     auto commit = [&](double at) {
         if (since >= 0 && !shown.empty() && at > since) caps.push_back(shown.caption(frames(since), frames(at)));
         since = -1;
@@ -923,8 +925,18 @@ bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rati
     };
     auto put = [&](char32_t c, double at) {
         Screen608& m = mode == Mode::PopOn ? loading : shown;
+        if (building && mode != Mode::PopOn) {
+            // (built as it is shown: a line begun on screen ends the caption of the lines before it, unless they
+            // have just moved up for it, which ended that caption already)
+            if (m.rows[row].find_first_not_of(U' ') == std::u32string::npos && c != U' ') {
+                if (!rolled) commit(at);
+                if (!rolled || since < 0) since = at;
+                rolled = false;
+            }
+            if (since < 0) since = at;
+        }
         if (mode == Mode::PaintOn && since < 0) since = at;
-        if (mode == Mode::RollUp && lineStart < 0) lineStart = at;
+        if (mode == Mode::RollUp && lineStart < 0 && !building) lineStart = at;
         std::u32string& r = m.rows[row];
         const size_t i = size_t(std::min(col, 31));
         if (r.size() < i) r.resize(i, U' ');
@@ -938,11 +950,18 @@ bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rati
             caps.push_back({frames(lineStart), -1, l.toStdString(), {}});
             open.push_back(caps.size() - 1);
         }
+        // (built as shown: what was up ends as the lines move up, and what is left begins a caption)
+        if (building) commit(at);
         for (int r = std::max(1, row - rollRows + 1); r < row; ++r) shown.rows[r] = shown.rows[r + 1];
+        if (building)
+            for (int r = 1; r < std::max(1, row - rollRows + 1); ++r) shown.rows[r].clear();  // (rows above the window: not shown)
         shown.rows[row].clear();
         col = 0;
         lineStart = -1;
-        (void)at;
+        if (building) {
+            since = shown.empty() ? -1 : at;
+            rolled = true;
+        }
     };
     auto misc = [&](uint8_t b, double at) {
         switch (b) {
@@ -1003,6 +1022,11 @@ bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rati
         last = at;
         const uint8_t a = uint8_t((w >> 8) & 0x7f), b = uint8_t(w & 0x7f);
         if (a == 0 && b == 0) continue;  // padding
+        if (a >= 0x01 && a <= 0x0f) {  // XDS (field 2): no caption channel's until a control code of one
+            channel = 0;
+            lastControl = 0;
+            continue;
+        }
         if (a >= 0x10 && a <= 0x1f) {
             if ((w & 0x7f7f) == lastControl) {  // control codes are sent twice
                 lastControl = 0;
@@ -1010,11 +1034,12 @@ bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rati
             }
             lastControl = uint16_t(w & 0x7f7f);
             channel = (a & 0x08) ? 2 : 1;
-            if (channel != 1) continue;
-            if ((a == 0x14 || a == 0x15) && b >= 0x20 && b <= 0x2f) misc(b, at);
-            else if (a == 0x17 && b >= 0x21 && b <= 0x23) col = std::min(col + (b - 0x20), 32);  // tab offset
+            if (channel != wanted) continue;
+            const uint8_t c1 = uint8_t(a & ~0x08);  // (channel 2's codes as channel 1's)
+            if ((c1 == 0x14 || c1 == 0x15) && b >= 0x20 && b <= 0x2f) misc(b, at);
+            else if (c1 == 0x17 && b >= 0x21 && b <= 0x23) col = std::min(col + (b - 0x20), 32);  // tab offset
             else if (b >= 0x40) {
-                if (const int r = pacRow(a, b)) {
+                if (const int r = pacRow(c1, b)) {
                     if (mode == Mode::RollUp && r != row) {
                         // The roll-up window moves to the new base row.
                         for (int i = 0; i < rollRows; ++i)
@@ -1023,18 +1048,18 @@ bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rati
                     row = r;
                     col = (b & 0x10) ? ((b & 0x0e) >> 1) * 4 : 0;
                 }
-            } else if (a == 0x11 && b >= 0x20 && b <= 0x2f) {
+            } else if (c1 == 0x11 && b >= 0x20 && b <= 0x2f) {
                 put(U' ', at);  // a mid-row style change shows as a space
-            } else if (a == 0x11 && b >= 0x30 && b <= 0x3f) {
+            } else if (c1 == 0x11 && b >= 0x30 && b <= 0x3f) {
                 put(kSpecial[b - 0x30] ? kSpecial[b - 0x30] : U' ', at);
-            } else if ((a == 0x12 || a == 0x13) && b >= 0x20 && b <= 0x3f) {
+            } else if ((c1 == 0x12 || c1 == 0x13) && b >= 0x20 && b <= 0x3f) {
                 col = std::max(0, col - 1);  // replaces the basic character sent before it
-                put(extendedChar(a, b), at);
+                put(extendedChar(c1, b), at);
             }
             continue;
         }
         lastControl = 0;
-        if (channel != 1) continue;
+        if (channel != wanted) continue;
         if (a >= 0x20) put(basicChar(a), at);
         if (b >= 0x20) put(basicChar(b), at);
     }

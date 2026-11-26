@@ -38,6 +38,77 @@ void keyHandles(const std::vector<Keyframe>& keys, size_t i, double& inDt, doubl
     }
 }
 
+// ---- Easing curves ----
+// Each curve's "in" form f(u) is below; "out" is 1 - f(1 - u), "in and out" f(2u) / 2 in the first half and
+// 1 - f(2 - 2u) / 2 in the second. Exponential: (2^(10u) - 1) / 1023. Logarithmic: 1 - log10(10 - 9u) (slow at first
+// as its logarithm falls, the mirror of logarithmic out, log10(1 + 9u)). Sine: 1 - cos(u pi / 2). Circular:
+// 1 - sqrt(1 - u^2). Back: u^2 ((s + 1) u - s), s = 1.70158 (a tenth of the way back first). Elastic:
+// -2^(10u - 10) sin((10u - 10.75) 2pi / 3), and 0 at 0. Bounce: 1 - bounceOut(1 - u), bounceOut the four arcs of a
+// ball dropped on the floor (7.5625 u^2 on [0, 1/2.75), and so on).
+namespace {
+double bounceOut(double u) {
+    const double n = 7.5625, d = 2.75;
+    if (u < 1 / d) return n * u * u;
+    if (u < 2 / d) return u -= 1.5 / d, n * u * u + 0.75;
+    if (u < 2.5 / d) return u -= 2.25 / d, n * u * u + 0.9375;
+    return u -= 2.625 / d, n * u * u + 0.984375;
+}
+// A family's "in" curve (family: 0 exponential, 1 logarithmic, 2 sine, 3 circular, 4 back, 5 elastic, 6 bounce).
+double easeIn(int family, double u) {
+    switch (family) {
+        case 0: return (std::pow(2.0, 10 * u) - 1) / 1023;
+        case 1: return 1 - std::log10(10 - 9 * u);
+        case 2: return 1 - std::cos(u * M_PI / 2);
+        case 3: return 1 - std::sqrt(std::max(0.0, 1 - u * u));
+        case 4: {
+            const double s = 1.70158;
+            return u * u * ((s + 1) * u - s);
+        }
+        case 5: return u <= 0 ? 0 : u >= 1 ? 1 : -std::pow(2.0, 10 * u - 10) * std::sin((10 * u - 10.75) * 2 * M_PI / 3);
+        default: return 1 - bounceOut(1 - u);
+    }
+}
+}  // namespace
+
+bool isEasing(Interp i) { return int(i) >= int(Interp::ExpoIn) && int(i) <= int(Interp::BounceInOut); }
+
+double easeCurve(Interp i, double u) {
+    if (!isEasing(i)) return u;
+    u = std::clamp(u, 0.0, 1.0);
+    const int k = int(i) - int(Interp::ExpoIn), family = k / 3, form = k % 3;
+    if (form == 0) return easeIn(family, u);
+    if (form == 1) return 1 - easeIn(family, 1 - u);
+    return u < 0.5 ? easeIn(family, 2 * u) / 2 : 1 - easeIn(family, 2 - 2 * u) / 2;
+}
+
+const std::vector<Interp>& allInterps() {
+    static const std::vector<Interp> all = [] {
+        std::vector<Interp> v;
+        for (int i = 0; i <= int(Interp::BounceInOut); ++i) v.push_back(Interp(i));
+        return v;
+    }();
+    return all;
+}
+
+const char* interpName(Interp i) {
+    static const char* names[] = {"linear",      "hold",        "smooth",       "bezier",      "expo_in",       "expo_out",
+                                  "expo_in_out", "log_in",      "log_out",      "log_in_out",  "sine_in",       "sine_out",
+                                  "sine_in_out", "circ_in",     "circ_out",     "circ_in_out", "back_in",       "back_out",
+                                  "back_in_out", "elastic_in",  "elastic_out",  "elastic_in_out", "bounce_in",   "bounce_out",
+                                  "bounce_in_out"};
+    const int k = int(i);
+    return k >= 0 && k <= int(Interp::BounceInOut) ? names[k] : "linear";
+}
+
+bool interpFromName(const std::string& name, Interp& out) {
+    for (Interp i : allInterps())
+        if (name == interpName(i)) {
+            out = i;
+            return true;
+        }
+    return false;
+}
+
 namespace {
 // The value of keys at t, holding the first and last values outside them.
 double evalKeys(const std::vector<Keyframe>& keys, double t) {
@@ -71,6 +142,7 @@ double evalKeys(const std::vector<Keyframe>& keys, double t) {
         return bez(y0, y1, y2, y3, 0.5 * (lo + hi));
     }
     if (a.interp == Interp::Smooth) u = u * u * (3.0 - 2.0 * u);
+    else if (isEasing(a.interp)) u = easeCurve(a.interp, u);
     return a.v + (b.v - a.v) * u;
 }
 
@@ -192,7 +264,16 @@ double integrate(const Param& p, double x0, double x1) {
             double part;
             if (a.interp == Interp::Hold) part = a.v * u;
             else if (a.interp == Interp::Smooth) part = a.v * u + (b.v - a.v) * (u * u * u - u * u * u * u / 2);
-            else part = a.v * u + (b.v - a.v) * u * u / 2;
+            else if (isEasing(a.interp)) {
+                // (Simpson's rule over 64 steps: the curves have no common antiderivative.)
+                const int n = 64;
+                double sum = 0;
+                for (int j = 0; j <= n; ++j) {
+                    const double x = u * j / n;
+                    sum += (j == 0 || j == n ? 1 : j % 2 ? 4 : 2) * easeCurve(a.interp, x);
+                }
+                part = a.v * u + (b.v - a.v) * sum * u / (3 * n);
+            } else part = a.v * u + (b.v - a.v) * u * u / 2;
             if (x <= double(b.t)) return cum + part * dt;
             cum += part * dt;
         }

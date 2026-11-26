@@ -25,6 +25,7 @@
 #include <QRandomGenerator>
 #include <QSpinBox>
 #include <QStandardPaths>
+#include <QStyleHints>
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QVBoxLayout>
@@ -419,6 +420,8 @@ void VelocityCurveView::mousePressEvent(QMouseEvent* e) {
         if (it != points_.end() && it->first == v.first) it->second = v.second;  // (one point for a velocity in)
         else it = points_.insert(it, v);
         drag_ = int(it - points_.begin());
+        made_ = *it;
+        madeAt_ = e->timestamp();
     }
     update();
 }
@@ -442,9 +445,11 @@ void VelocityCurveView::mouseReleaseEvent(QMouseEvent* e) {
 
 void VelocityCurveView::mouseDoubleClickEvent(QMouseEvent* e) {
     if (!has_ || e->button() != Qt::LeftButton) return;
-    // (the press before it made or took hold of the point under the mouse)
+    // (the presses before it made or took hold of the point under the mouse: one the first of them made stays, as
+    // one click's would)
     const int at = pointNear(e->position().toPoint());
     if (at < 0) return;
+    if (points_[size_t(at)] == made_ && e->timestamp() - madeAt_ <= quint64(QGuiApplication::styleHints()->mouseDoubleClickInterval())) return;
     points_.erase(points_.begin() + at);
     drag_ = -1;
     emit drawn(points_);

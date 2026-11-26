@@ -47,9 +47,14 @@ ImportResult importEdl(Project& p, const std::string& text, Rational fps, const 
 
 // Final Cut Pro 7 XML (xmeml 5), which Premiere Pro and Resolve read and write.
 std::string exportFcp7Xml(const Project& p, const Sequence& s);
-// FCPXML 1.10 for Final Cut Pro: V1 as the primary storyline, other tracks
-// as connected clips, dissolves, titles, speed changes and markers.
-std::string exportFcpXml(const Project& p, const Sequence& s);
+// FCPXML, version 1.15 (the newest) or "1.10": V1 as the
+// primary storyline, other tracks as connected clips (each kept to the clip
+// it was connected to when read from FCPXML), dissolves, titles, speed
+// changes and their frame sampling, markers, caption tracks, audio roles,
+// each clip's transform, trim, opacity, blend mode, volume and pan with
+// their keyframes, and what a clip read from FCPXML held that Montage does
+// not use, written back as it was.
+std::string exportFcpXml(const Project& p, const Sequence& s, const std::string& version = "1.15");
 // Either XML flavour (told apart by the root element).
 ImportResult importXmlTimeline(Project& p, const std::string& xml, const MediaProber& probe = {});
 

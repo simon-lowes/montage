@@ -57,6 +57,9 @@ struct CaptureSettings {
     std::string codec = "prores_hq";     // prores_proxy, prores_lt, prores, prores_hq, dnxhr_lb, dnxhr_sq, dnxhr_hq, dnxhr_hqx,
                                          // jpeg_xs (10-bit 4:2:2 in MXF, ST 2124, through SVT-JPEG-XS)
     double jpegXsBpp = 5;                // jpeg_xs: bits a pixel (a constant number of bytes each picture)
+    // jpeg_xs from a progressive ST 2110-22 feed: its codestreams are written as they came, at the feed's bits a pixel,
+    // depth and sampling (`jpegXsBpp` unused), unless this asks for them to be coded again.
+    bool recodeJpegXs = false;
     std::string timecode;                // the first frame's ("hh:mm:ss:ff"); "" the feed's own, else the time of day
     double seconds = 0;                  // stop after this long (0: when stopped)
     double openTimeout = 10;             // seconds to wait for the feed to start (and to send again, at least 5)
@@ -82,8 +85,9 @@ struct CaptureSettings {
     // Every sound stream of the feed, not only the one recorded (a network stream's or file's: each language of a
     // broadcast, its commentary, its descriptions): the others given apart, track 1 on, placed against the pictures as
     // the recorded one is, at 48 kHz in planar float with their own channels (at most 8). `onSoundTracks` names them
-    // all (track 0 the recorded one) before the first picture is given. The file records track 0 only. (The feed's
-    // own sound streams: not with a sound device of its own.)
+    // all (track 0 the recorded one) before the first picture is given. A QuickTime or MXF file (not JPEG XS's)
+    // records each as a track of its own, in the language the feed states, after track 0. (The feed's own sound
+    // streams: not with a sound device of its own.)
     bool allSound = false;
     std::function<void(int track, const AVFrame* sound)> onTrackSound;
     struct SoundTrack {
@@ -139,15 +143,22 @@ public:
     // by `maxHeight`), converted on the calling thread (any but the recording's, which is not held up by it): an SDR
     // feed's as `picture`; an HDR feed's as `light`, its R'G'B' code values (0 to 1, alpha 1) in `space`
     // ("rec2100pq" or "rec2100hlg"), for render/HdrView.h and convertColor. Nothing (pictures 0) before the first
-    // picture, or when the latest is still picture number `after` (Now::pictures, as an earlier call gave it).
+    // picture, or when the latest is still picture number `after` (Now::pictures, as an earlier call gave it). An HDR
+    // feed's light as its HDR metadata states it, in nits (0 where it is not stated): the mastering display's peak
+    // and minimum, and the content light levels (an ST 2110 feed's ST 2108-1 packets or Montage's ST 2110-41 item,
+    // an HEVC feed's SEI messages).
     struct Full {
         int64_t pictures = 0;
         QImage picture;
         Image light;
         std::string space;
         int width = 0, height = 0;  // the feed's own size
+        double masteringMaxNits = 0, masteringMinNits = 0, maxCll = 0, maxFall = 0;
     };
     Full full(int maxWidth, int maxHeight, int64_t after = 0) const;
+    // A viewer asked for full() within the last second: a feed decoded smaller for a tile (ST 2110-22's
+    // jpegxs_proxy=) is decoded at its own size again while one does.
+    bool wholeWanted() const;
     // The timecode of picture `frame` (its number in the recording): the first's counted on at the feed's rate.
     std::string timecodeAt(int64_t frame) const;
     std::string firstTimecode() const;
@@ -167,11 +178,16 @@ private:
     SwsContext* sws_ = nullptr;
     int swsKey_[7] = {0, 0, -1, 0, 0, 0, 0};
     AVFrame* latest_ = nullptr;  // the latest picture as it came (a reference to its planes)
+    mutable std::atomic<int64_t> wholeAsked_{0};  // (when full() was last called: the steady clock's ms, 0 never)
     // (full()'s scaler, kept from call to call: one caller at a time)
     mutable std::mutex fullM_;
     mutable SwsContext* fullSws_ = nullptr;
     mutable int fullKey_[7] = {0, 0, -1, 0, 0, 0, 0};
 };
+
+// The feed's caption data kept beside a recording (".mcc" in place of its extension: MacCaption MCC, a line a frame
+// with every CTA-708 service and CEA-608 channel as it came), written once a picture brings any.
+std::string captionSidecar(const std::string& recording);
 
 // The clock CaptureSettings::label is asked by (seconds, steady).
 double captureClock();

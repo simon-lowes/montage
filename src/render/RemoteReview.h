@@ -140,12 +140,16 @@ struct ReviewStats {
     int queueMoves = 0;            // and viewers moved down a size because their link queued, before it lost anything
     int64_t linkExpires = 0;       // when the review link stops letting viewers in (seconds since 1970, UTC; 0: it does not)
     // Only through a relay: each viewer's way through it (render/TurnRelay.h's bridge), and the threads they share.
+    // Not only through a relay reached over TCP or TLS: the bridge beside Montage's own addresses of each viewer on it.
     struct Bridge {
         std::string viewer;        // the address the viewer's offer came from
         std::string state;         // "Carrying over TLS", "Asking the relay for an address", "Ended"
         std::string lastRefusal;   // what the relay last refused, or why the way through it ended ("" nothing)
         uint64_t toRelay = 0, fromRelay = 0;  // packets carried each way
         uint64_t answersRefused = 0;          // the relay's answers not used because they were not signed with the login
+        uint64_t checksRepaired = 0;          // the viewer's checks whose tiebreaker of 0 was made 1
+        bool beside = false;                  // beside Montage's own addresses (not the only way)
+        std::vector<uint16_t> ports;          // this computer's ports it and Montage's end use (RelayBridge::ports)
     };
     std::vector<Bridge> bridges;
     int bridgeThreads = 0;

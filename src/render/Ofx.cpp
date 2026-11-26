@@ -2904,7 +2904,18 @@ bool rendersTextures(const Effect& e, std::string* why, bool transition) {
         if (why) *why = reason;
         return false;
     };
-    if (remote::isolated()) return no("its plug-in renders in a host process");
+    if (remote::isolated()) {
+        // In a host: given the compositor's textures where its picture comes back as a handle, copied into the
+        // compositor's texture there (render/OfxRemote.h's renderInto).
+        if (!gl::available()) return no("plug-ins have no OpenGL here");
+        if (gl::servingOpenGl()) return no("OpenGL is busy with the render that asked for this picture");
+        PluginDesc d;
+        if (!Registry::instance().lookUp(e, d, why)) return false;
+        if (d.generator() || d.transition() != transition) return no(d.label + (transition ? " is not a transition" : " is not a clip effect"));
+        std::string cannot;
+        if (!remote::asksForHandles(&cannot)) return no(d.label + " renders in a plug-in host, and its pictures come through shared memory: " + cannot);
+        return true;
+    }
     if (!gUseGpu || !gl::available()) return no("plug-ins have no OpenGL here");
     if (tNoGl || gl::servingOpenGl()) return no("OpenGL is busy with the render that asked for this picture");
     PluginDesc d;
@@ -2920,12 +2931,45 @@ namespace {
 bool sameSize(const GlPicture& a, const GlPicture& b) { return a.texture && b.texture && a.width > 0 && a.height > 0 && a.width == b.width && a.height == b.height; }
 }  // namespace
 
+namespace {
+// A clip effect or a transition rendered in its plug-in host from the compositor's textures `sides` into `into`: the
+// sides read back for it (counted), and its picture copied into `into` on the GPU where it comes as a handle (counted
+// as a render into the texture), else written into it.
+bool hostedTexture(remote::Kind kind, const Effect& e, double t, double progress, const std::vector<GlPicture>& sides, const GlPicture& into,
+                   double scale, const FrameFetch* fetch, std::string* error, const ColorSpace* working) {
+    PluginDesc d;
+    std::string why;
+    auto fail = [&](std::string reason) {
+        if (error) *error = std::move(reason);
+        return false;
+    };
+    if (!Registry::instance().lookUp(e, d, &why)) return fail(why);
+    const bool transition = kind == remote::Kind::Transition;
+    if (d.generator() || d.transition() != transition)
+        return fail(d.label + (transition ? " is not a transition" : d.transition() ? " is a transition, not a clip effect" : " is a generator, not a clip effect"));
+    std::vector<Image> read(sides.size());
+    for (size_t i = 0; i < sides.size(); ++i) {
+        const GlPicture side = sides[i];
+        if (!gl::run([&] { gl::readTexture(side.texture, side.width, side.height, true, read[i]); }) || read[i].empty())
+            return fail(d.label + ": the compositor's picture could not be read back for it");
+        ++gGpuReadBacks;
+    }
+    bool inPlace = false;
+    if (!remote::renderInto(kind, e, d, t, progress, scale, into.width, into.height, &read[0], transition ? &read[1] : nullptr, into.texture, fetch,
+                            error, working, &inPlace))
+        return false;
+    if (inPlace) ++gGpuTextureRenders;
+    return true;
+}
+}  // namespace
+
 bool applyEffectTexture(const Effect& e, double t, const GlPicture& from, const GlPicture& to, double scale, const FrameFetch& fetch,
                         std::string* error, const ColorSpace* working) {
-    if (!sameSize(from, to) || remote::isolated() || !gl::available() || gl::servingOpenGl()) {
+    if (!sameSize(from, to) || !gl::available() || gl::servingOpenGl()) {
         if (error) *error = "no textures to render from and into";
         return false;
     }
+    if (remote::isolated()) return hostedTexture(remote::Kind::Effect, e, t, 0, {from}, to, scale, &fetch, error, working);
     PluginDesc d;
     Loaded* l = nullptr;
     GiveBack inst{acquire(e, d, l, error)};
@@ -2948,10 +2992,12 @@ bool applyEffectTexture(const Effect& e, double t, const GlPicture& from, const 
 
 bool applyTransitionTexture(const Effect& e, double t, double progress, const GlPicture& from, const GlPicture& to, const GlPicture& out,
                             double scale, std::string* error, const ColorSpace* working) {
-    if (!sameSize(from, out) || !sameSize(to, out) || remote::isolated() || !gl::available() || gl::servingOpenGl()) {
+    if (!sameSize(from, out) || !sameSize(to, out) || !gl::available() || gl::servingOpenGl()) {
         if (error) *error = "no textures to render from and into";
         return false;
     }
+    if (remote::isolated())
+        return hostedTexture(remote::Kind::Transition, e, t, std::clamp(progress, 0.0, 1.0), {from, to}, out, scale, nullptr, error, working);
     PluginDesc d;
     Loaded* l = nullptr;
     GiveBack inst{acquire(e, d, l, error)};

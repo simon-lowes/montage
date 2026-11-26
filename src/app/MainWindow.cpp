@@ -181,6 +181,7 @@ extern "C" {
 #include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
 #include "DialogJobs.h"
+#include "EncodeFoldersDialog.h"
 #include "DialogTasks.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
@@ -871,6 +872,7 @@ void MainWindow::buildPanels() {
         if (kind == QLatin1String("imf")) imfMade(result, nullptr);
     });
     dialogJobs_->resume();
+    EncodeFolderJobs::of(this, state_);  // (the encode folders looked at from now on)
     auto* queuePanel = new RenderQueuePanel(queue_, this);
     queuePanel->setDialogJobs(dialogJobs_);
     connect(queuePanel, &RenderQueuePanel::taskSaid, this, [this](const QString& text) { statusBar()->showMessage(text, 8000); });
@@ -1433,6 +1435,7 @@ void MainWindow::buildMenus() {
     add(file, QT_TR_NOOP("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
     add(file, QT_TR_NOOP("Import Image Sequence…"), QKeySequence(), [this] { bin_->importImageSequenceDialog(); })->setObjectName(QStringLiteral("importImageSequence"));
     add(file, QT_TR_NOOP("Watch Folders…"), QKeySequence(), [this] { watchFoldersDialog(); })->setObjectName(QStringLiteral("watchFolders"));
+    add(file, QT_TR_NOOP("Encode Folders…"), QKeySequence(), [this] { showEncodeFoldersDialog(this, state_); })->setObjectName(QStringLiteral("encodeFolders"));
     add(file, QT_TR_NOOP("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, QT_TR_NOOP("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
     add(file, QT_TR_NOOP("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
@@ -11151,11 +11154,12 @@ void MainWindow::exportInterchange(Interchange format) {
     const Kind kinds[] = {{"edl", tr("Export EDL"), tr("CMX 3600 EDL (*.edl)")},
                           {"otio", tr("Export OpenTimelineIO"), tr("OpenTimelineIO (*.otio)")},
                           {"xml", tr("Export Final Cut Pro 7 XML"), tr("Final Cut Pro 7 XML (*.xml)")},
-                          {"fcpxml", tr("Export FCPXML"), tr("FCPXML (*.fcpxml)")}};
+                          {"fcpxml", tr("Export FCPXML"), tr("FCPXML 1.15 (*.fcpxml);;FCPXML 1.10 (*.fcpxml)")}};
     const Kind& k = kinds[int(format)];
+    QString chosen;
     QString path = QFileDialog::getSaveFileName(this, k.title,
                                                 st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + "." + k.ext,
-                                                k.filter);
+                                                k.filter, &chosen);
     if (path.isEmpty()) return;
     // A copy with each compositing graph's clip rendered to a file beside the export.
     Project pr = state_->project();
@@ -11171,7 +11175,7 @@ void MainWindow::exportInterchange(Interchange format) {
     const std::string text = format == Interchange::Edl ? exportEdl(pr, sq)
                              : format == Interchange::Otio ? exportOtio(pr, sq)
                              : format == Interchange::Fcp7Xml ? exportFcp7Xml(pr, sq)
-                                                              : exportFcpXml(pr, sq);
+                                                              : exportFcpXml(pr, sq, chosen.contains("1.10") ? "1.10" : "1.15");
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size())) {
         QMessageBox::warning(this, tr("Export"), tr("Cannot write %1").arg(path));
@@ -11533,6 +11537,7 @@ void MainWindow::newSequence() {
             s.filmGauge = spec.filmGauge;
             s.workingSpace = spec.workingSpace;
             s.outputTransform = spec.outputTransform;
+            s.shutterAngle = spec.shutterAngle;
             return true;
         });
 }

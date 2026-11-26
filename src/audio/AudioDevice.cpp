@@ -678,6 +678,7 @@ struct Engine::Impl {
     DeviceSettings settings;
     DeviceSettings opened;  // what the stream was opened with (the settings, or what stood in for a device that is gone)
     bool standIn = false;
+    std::chrono::steady_clock::time_point standInTried;  // when the device chosen was last asked for, with a stand-in open
     std::string error;
     int preferredRate = 48000, wantOutputs = 2;
     std::vector<std::string> outputNames;
@@ -752,6 +753,7 @@ struct Engine::Impl {
     void feedInputs(Io& io, const Clients& c, int rate);
     void deliver(InputClient& t, const float* data, int ch, int frames, int64_t sample, int rate);
     bool openLocked(std::string* why);
+    void retryChosenLocked();
     bool openWith(const DeviceSettings& s, std::string* why);
     void closeLocked();
     void refreshRoundTrip();
@@ -1049,6 +1051,20 @@ bool Engine::Impl::openWith(const DeviceSettings& s, std::string* why) {
     return true;
 }
 
+// (nightly 25 Nov: once a stand-in was open nothing asked for the device chosen again, PortAudio lists devices again
+// only with no stream open, and the scrub retry only ran with none open: a device plugged back in was not used until
+// another was chosen and then it) A stand-in that nothing plays or records through is closed and the device chosen
+// asked for again, when a client comes to it, no more often than every few seconds (an open that does not find its
+// device has PortAudio list every device again): back, it is used from then on; not, the stand-in opens again.
+void Engine::Impl::retryChosenLocked() {
+    if (!standIn || !stream || std::chrono::steady_clock::now() - standInTried < std::chrono::seconds(3)) return;
+    {
+        std::lock_guard<std::mutex> l(m);
+        if (!outputs.empty() || !inputs.empty()) return;
+    }
+    openLocked(nullptr);
+}
+
 bool Engine::Impl::openLocked(std::string* why) {
     closeLocked();
     lost = false;
@@ -1068,6 +1084,7 @@ bool Engine::Impl::openLocked(std::string* why) {
         std::string altErr;
         if (openWith(alt, &altErr)) {
             standIn = true;
+            standInTried = std::chrono::steady_clock::now();
             error = err;
             return true;
         }
@@ -1120,8 +1137,9 @@ void Engine::setSettings(const DeviceSettings& s) {
     // Only the measured loopback changed: nothing to open again.
     DeviceSettings a = old, b = d_->settings;
     a.loopbackFrames = b.loopbackFrames, a.loopbackRate = b.loopbackRate, a.loopbackBuffer = b.loopbackBuffer;
-    if (a == b && (d_->stream || s.host == Host::Qt)) {
-        if (d_->stream && !d_->standIn) d_->opened = d_->settings;
+    // (the same device chosen again while a stand-in plays for it: asked for again, below)
+    if (a == b && ((d_->stream && !d_->standIn) || s.host == Host::Qt)) {
+        if (d_->stream) d_->opened = d_->settings;
         d_->refreshRoundTrip();
         return;
     }
@@ -1187,6 +1205,7 @@ int Engine::addOutput(const void* owner, int rate, int channels, Render render, 
         if (error) *error = "No audio device is chosen";
         return -1;
     }
+    d_->retryChosenLocked();
     auto c = std::make_shared<OutputClient>();
     c->owner = owner;
     c->rate = rate > 0 ? rate : 48000;
@@ -1259,6 +1278,7 @@ int Engine::addInput(const void* clockOwner, int rate, Tap tap, std::string* err
         if (error) *error = "No audio device is chosen";
         return -1;
     }
+    d_->retryChosenLocked();
     if (!d_->stream && !d_->openLocked(error)) return -1;
     if (d_->stream->inputs() <= 0) {
         if (error) *error = "The audio device was opened with no inputs";
@@ -1319,6 +1339,13 @@ int Engine::roundTripAt(int rate) const {
     const int dev = d_->devRate.load();
     if (dev <= 0) return 0;
     return int(std::llround(double(d_->roundTripFrames.load()) * rate / dev));
+}
+
+bool Engine::statusIfFree(EngineStatus& out) const {
+    std::unique_lock<std::recursive_mutex> lock(d_->openM, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    out = status();
+    return true;
 }
 
 EngineStatus Engine::status() const {

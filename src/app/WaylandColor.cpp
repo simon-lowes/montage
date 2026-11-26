@@ -35,7 +35,7 @@ struct WaylandColor::State {
     wl_surface* surface = nullptr;
     wp_color_management_surface_v1* cmSurface = nullptr;
     wp_color_management_surface_feedback_v1* feedback = nullptr;
-    wl_callback* frame = nullptr;  // asked of the surface when attached; gone once the frame is up
+    wl_callback* frame = nullptr;  // asked of the surface when attached or mapped again; gone once the frame is up
     bool entered = false;
     bool preferredChanged = false;
     Preferred preferred;
@@ -66,6 +66,8 @@ struct WaylandColor::State {
     // at the moment, or no answer). `out` is written only when Known.
     enum class Answer { Known, Unknown, Later };
     Answer read(wp_color_management_surface_feedback_v1* from, Preferred& out);
+    // Asks for `frame`, answered once the surface's next commit is up (one asked before is let go).
+    void askFrame();
 };
 
 namespace {
@@ -231,6 +233,19 @@ std::string WaylandColor::unsupported() const {
 
 bool WaylandColor::supportsHlg() const { return s_->has(s_->tfs, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG); }
 
+void WaylandColor::State::askFrame() {
+    // A frame callback on this queue (asked through a wrapper of Qt's wl_surface, so its answer comes here): it is
+    // answered when the frame of the surface's next commit is up.
+    if (frame) wl_callback_destroy(frame);
+    frame = nullptr;
+    if (auto* wrapper = static_cast<wl_surface*>(wl_proxy_create_wrapper(surface))) {
+        wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(wrapper), queue);
+        frame = wl_surface_frame(wrapper);
+        wl_proxy_wrapper_destroy(wrapper);
+        if (frame) wl_callback_add_listener(frame, &kFrameListener, this);
+    }
+}
+
 bool WaylandColor::attach(wl_surface* surface) {
     State& s = *s_;
     if (surface == s.surface && s.cmSurface) return true;
@@ -240,14 +255,7 @@ bool WaylandColor::attach(wl_surface* surface) {
     s.cmSurface = wp_color_manager_v1_get_surface(s.manager, surface);
     s.feedback = wp_color_manager_v1_get_surface_feedback(s.manager, surface);
     wp_color_management_surface_feedback_v1_add_listener(s.feedback, &kFeedbackListener, &s);
-    // A frame callback on this queue (asked through a wrapper of Qt's wl_surface, so its answer comes here): it is
-    // answered when the frame of the surface's next commit is up.
-    if (auto* wrapper = static_cast<wl_surface*>(wl_proxy_create_wrapper(surface))) {
-        wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(wrapper), s.queue);
-        s.frame = wl_surface_frame(wrapper);
-        wl_proxy_wrapper_destroy(wrapper);
-        if (s.frame) wl_callback_add_listener(s.frame, &kFrameListener, &s);
-    }
+    s.askFrame();
     s.preferredChanged = false;
     s.read(s.feedback, s.preferred);
     return wl_display_get_error(s.display) == 0;
@@ -312,6 +320,17 @@ bool WaylandColor::describe(const Description& d, std::string* error) {
     s.described = d;
     s.hasDescribed = true;
     return true;
+}
+
+void WaylandColor::remap() {
+    State& s = *s_;
+    if (!s.surface || !s.display) return;
+    wl_surface_attach(s.surface, nullptr, 0, 0);
+    wl_surface_commit(s.surface);
+    // Off its output until the next frame is up: what the compositor prefers for it meanwhile does not stand.
+    s.entered = false;
+    s.askFrame();
+    wl_display_flush(s.display);
 }
 
 const WaylandColor::Description* WaylandColor::described() const { return s_->hasDescribed ? &s_->described : nullptr; }

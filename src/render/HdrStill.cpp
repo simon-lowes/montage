@@ -1066,20 +1066,22 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
     const char* kind = hevc ? "HEIF" : "AVIF";
     if (sdr.empty() || sdr.width != hdr.width || sdr.height != hdr.height) return fail("Nothing to write");
     if (!hdrSpace.hdr() || sdrSpace.hdr()) return fail("A gain map needs an SDR picture and an HDR one");
-    if (sdrSpace.primaries != Primaries::Bt709 && sdrSpace.primaries != Primaries::P3D65)
-        return fail(std::string("The SDR picture of a gain-map ") + kind + " is in Rec.709 or Display P3 primaries");
+    const bool adobe = gainMapBaseIsAdobeRgb(sdrSpace);
+    if (sdrSpace.primaries != Primaries::Bt709 && sdrSpace.primaries != Primaries::P3D65 && !adobe)
+        return fail(std::string("The SDR picture of a gain-map ") + kind + " is in Rec.709, Display P3 or Adobe RGB primaries");
     const int W = sdr.width, H = sdr.height;
     QTemporaryDir dir;
     if (!dir.isValid()) return fail("Cannot make a temporary folder");
     std::string why;
-    // The base (8-bit, tagged with sRGB's curve, which is how gain map readers linearise it), encoded first: the map is
-    // made against what decoders will see of it.
+    // The base (8-bit, tagged with sRGB's curve, which is how gain map readers linearise it; Adobe RGB's by its own,
+    // gamma 2.2, with its ICC profile for the primaries no code point names), encoded first: the map is made against
+    // what decoders will see of it.
     if (hevc && (W > 65535 || H > 65535 || int64_t(W) * H > (1 << 27))) return fail("Too large for this HEIF writer");  // (as Montage reads them)
     // (In HEVC, larger than its levels take, the base and the map each a grid of tiles.)
     if (hevc && tile <= 0) tile = heifTile(W, H);
     std::vector<HeifItem> base, map;
     QImage seen;
-    const Av1Picture basePicture = ycbcr420(sdr, sdrSpace, 8, AVCOL_TRC_IEC61966_2_1);
+    const Av1Picture basePicture = ycbcr420(sdr, sdrSpace, 8, adobe ? AVCOL_TRC_GAMMA22 : AVCOL_TRC_IEC61966_2_1);
     auto readBack = [&](const std::vector<HeifItem>& picture, const QString& name, QImage& back) {
         // (Through a file of its own, as a reader sees it.)
         QByteArray file;
@@ -1108,7 +1110,7 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
     if (seen.isNull() || seen.width() != W || seen.height() != H) return fail("Cannot read back the picture: " + why);
     GainMapMetadata meta;
     std::vector<uint16_t> target;
-    if (!planGainMap(seen, sdrSpace.primaries, hdr, hdrSpace, meta, target)) return fail("Nothing to write");
+    if (!planGainMap(seen, sdrSpace.primaries, hdr, hdrSpace, meta, target, adobe ? 4 : 13)) return fail("Nothing to write");
     // The map in 8 bits: in AV1, R, G and B as they are (identity matrix) where the encoder takes them, else Y'CbCr
     // 4:4:4, else 4:2:0 (SVT-AV1's only one); in HEVC, Y'CbCr 4:2:0 (Main profile, which every HEVC decoder takes). (Each
     // attempt kept; the closest is used.)

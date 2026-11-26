@@ -645,12 +645,14 @@ HdrSurface::WaylandDisplay HdrSurface::waylandDisplay() {
 
 bool HdrSurface::waylandGone() {
 #if defined(MONTAGE_WAYLAND_COLOR)
+    if (waylandWentAway_) return true;
     if (!wayland_ || !wayland_->display()) return false;
     // Qt's connection now (another one once Qt has connected to a compositor again, the old one closed): the
     // surface's colour management was made on the old one, and nothing of it may be used again.
     QPlatformNativeInterface* native = QGuiApplication::platformNativeInterface();
     if (native && native->nativeResourceForIntegration("wl_display") == wayland_->display()) return false;
     wayland_->abandon();
+    waylandWentAway_ = true;
     stopHdr(tr("The Wayland compositor went away"));
     return true;
 #else
@@ -802,10 +804,18 @@ void HdrSurface::describeSurface() {
     d.transfer = picture_ && picture_->transfer == Transfer::Hlg && wayland_->supportsHlg() ? Transfer::Hlg : Transfer::Pq;
     if (picture_) d.light = hdrSurfaceLight(*picture_, headroom_);
     else if (const WaylandColor::Description* now = wayland_->described()) d = *now;  // (nothing to show yet: as it is)
-    if (const WaylandColor::Description* now = wayland_->described(); now && *now == d) return;
+    const WaylandColor::Description* now = wayland_->described();
+    if (now && *now == d) return;
+    const bool shownAlready = now != nullptr;  // (described before on this wl_surface, and shown so)
     std::string why;
-    if (!wayland_->describe(d, &why))
+    if (!wayland_->describe(d, &why)) {
         stopHdr(tr("The compositor did not take the HDR picture's description (%1)").arg(QString::fromStdString(why)));
+        return;
+    }
+    // A shown surface described anew is taken off the screen and mapped again by the frame drawn next (Weston
+    // shows it again only so: WaylandColor::remap), at most a frame showing what is beneath. The description changes
+    // only with the picture's transfer or light (another sequence, another display), never from frame to frame.
+    if (shownAlready) wayland_->remap();
 #endif
 }
 
@@ -824,6 +834,9 @@ void HdrSurface::setOverlay(const QImage& overlay) {
 
 void HdrSurface::exposeEvent(QExposeEvent*) {
     if (!gpu_ || !gpu_->rhi) return;
+    // (Wayland: shown again on another connection, Qt's to a compositor that took over from one that went away. The
+    // GPU's objects are the old connection's, and nothing is asked of them: back to SDR.)
+    if (waylandGone()) return;
     HdrSurfaceGpu& g = *gpu_;
     if (isExposed() && !g.hasSwapChain) {
         g.hasSwapChain = g.sc->createOrResize();
@@ -974,7 +987,7 @@ bool HdrSurface::forward(QEvent* e) {
 }
 
 void HdrSurface::render() {
-    if (!gpu_ || !gpu_->rhi || !gpu_->hasSwapChain || gpu_->notExposed) return;
+    if (!gpu_ || !gpu_->rhi || !gpu_->hasSwapChain || gpu_->notExposed || waylandGone()) return;
     HdrSurfaceGpu& g = *gpu_;
     // A swap chain that cannot be made again because the device is gone: back to SDR, as below.
     auto remade = [&] {

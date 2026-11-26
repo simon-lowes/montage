@@ -10,6 +10,7 @@
 #include "render/ColorSpace.h"
 #include "render/LensBlur.h"
 #include "render/ModelClip.h"
+#include "render/Title3D.h"
 #include "render/Processing.h"
 #include "render/TransferTables.h"
 
@@ -168,7 +169,17 @@ SceneShadows makeSceneShadows(const Project& p, const Sequence& seq, FrameTime t
         const FrameTime kt = t - k.start;
         Member m;
         m.id = k.id, m.track = ti;
-        if (k.isGenerator() && k.generator.type == "model3d") {
+        if (k.isGenerator() && k.generator.type == "title3d") {
+            // A 3D title standing in the scene: its letters' triangles.
+            if (world != "front" || !title3dInScene(seq, k, t)) return;
+            Title3DMesh mesh;
+            if (!title3dMesh(k.generator, double(kt), seq.width, seq.height, k.duration, seq.fpsValue(), mesh)) return;
+            std::array<double, 3> lo, hi;
+            if (!modelBounds(mesh.triangles, lo, hi)) return;
+            m.mid = (lo[1] + hi[1]) / 2;
+            m.casts = k.generator.p("shadows", kt, 0) > 0.5;
+            if (m.casts) m.caster.triangles = std::move(mesh.triangles);
+        } else if (k.isGenerator() && k.generator.type == "model3d") {
             if (std::lround(k.generator.p("shape", kt, 0)) == 0 && isSplatFile(k.generator.s("file"))) return;
             if (shadowWorldOf(seq, k, k.generator, t) != world) return;
             // (only its texture track's picture: where it casts)
@@ -307,6 +318,51 @@ SceneShadows sceneShadows(const Project& p, const Sequence& seq, FrameTime t, co
         if (!self || got.made->members.count(self->id)) return *got.made;
     }
     return makeSceneShadows(p, seq, t, world, cardLayer, trackLayer, self);
+}
+
+bool title3dInScene(const Sequence& seq, const Clip& c, FrameTime t) {
+    if (!c.isGenerator() || c.generator.type != "title3d" || !c.generator.s("camera_file").empty()) return false;
+    if (c.generator.p("in_scene", t - c.start, 0) <= 0.5) return false;
+    for (const Track& track : seq.videoTracks) {
+        if (track.muted) continue;
+        for (const Clip& k : track.clips) {
+            if (!k.enabled || t < k.start || t >= k.end() || k.id == c.id) continue;
+            if (k.isGenerator() && k.generator.type == "model3d") {
+                if (shadowWorldOf(seq, k, k.generator, t) == "front") return true;
+            } else if (const Effect* l = firstLayer3D(k); l && shadowWorldOf(seq, k, *l, t) == "front") {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+Image renderTitle3DInScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
+                           std::vector<float>* depth) {
+    const FrameTime lt = t - c.start;
+    const Effect& g = c.generator;
+    Title3DMesh mesh;
+    ModelCamera cam;
+    if (!title3dMesh(g, double(lt), seq.width, seq.height, c.duration, seq.fpsValue(), mesh) || !effectCamera(p, seq, c, g, t, scale, cam)) {
+        if (depth) depth->assign(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
+        return Image(std::max(1, w), std::max(1, h));
+    }
+    ModelScene scene;
+    scene.triangles = std::move(mesh.triangles);
+    scene.model = mesh.model.get();
+    scene.opacity = float(mesh.opacity);
+    std::array<double, 3> lo, hi;
+    modelBounds(scene.triangles, lo, hi);
+    const std::array<double, 3> mid{(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2};
+    float ambient = 0;
+    ModelLight light = settingsLight(g, lt, mid, std::max(hi[0] - lo[0], hi[1] - lo[1]), &ambient);
+    light.shadows = true;  // (it takes the scene's shadows, casting its own or not)
+    scene.lights.push_back(light);
+    scene.ambient = {ambient, ambient, ambient};
+    scene.castsShadows = g.p("shadows", lt, 0) > 0.5;
+    const SceneShadows sh = sceneShadows(p, seq, t, "front", {}, {}, &c);
+    if (sh.world) scene.shadowWorld = sh.world;
+    return renderModel(scene, cam, w, h, depth);
 }
 
 Image renderLitLayer3D(const Sequence& seq, const Effect& e, FrameTime lt, const Image& layer, const Layer3DPlace& pl,
@@ -494,6 +550,46 @@ const Clip* lensCamera(const Sequence& seq, const Clip& c, const Effect& e, Fram
     return cc && cameraFocus(*cc, t, f) ? cc : nullptr;
 }
 
+namespace {
+
+// Where a card with Focus Distance 0 focuses: the median depth, in front of `cam`, of the scene it stands in (the
+// middles of the cards and models seen through the same kind of camera at t, its own among them; with an even number,
+// halfway between the middle two). Alone, its own middle.
+double sceneMedianDepth(const Project& p, const Sequence& seq, const Clip& self, const Effect& e, FrameTime t, const Layer3DPlace& own,
+                        const ModelCamera& cam) {
+    auto ahead = [&](const V3& X) {
+        const V3 q{X[0] - cam.C[0], X[1] - cam.C[1], X[2] - cam.C[2]};
+        return cam.R[6] * q[0] + cam.R[7] * q[1] + cam.R[8] * q[2];
+    };
+    const std::string world = shadowWorldOf(seq, self, e, t);
+    std::vector<double> z{ahead(own.origin)};
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        const Track& track = seq.videoTracks[ti];
+        if (track.muted) continue;
+        for (const Clip& k : track.clips) {
+            if (!k.enabled || t < k.start || t >= k.end() || k.id == self.id) continue;
+            if (k.isGenerator() && k.generator.type == "model3d") {
+                if (shadowWorldOf(seq, k, k.generator, t) != world) continue;
+                ModelScene scene;
+                ModelCamera mc;
+                std::shared_ptr<const Model> model;
+                std::array<double, 3> lo, hi;
+                if (!modelClipScene(p, seq, k, t, seq.width, seq.height, 1, {}, scene, mc, model) || !modelBounds(scene.triangles, lo, hi)) continue;
+                z.push_back(ahead({(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2}));
+            } else if (const Effect* l = firstLayer3D(k); l && shadowWorldOf(seq, k, *l, t) == world) {
+                z.push_back(ahead(layer3dPlace(*l, t - k.start, seq.width, seq.height).origin));
+            }
+        }
+    }
+    std::erase_if(z, [](double d) { return !(d > 0); });
+    if (z.empty()) return ahead(own.origin);
+    std::sort(z.begin(), z.end());
+    const size_t n = z.size();
+    return n % 2 ? z[n / 2] : (z[n / 2 - 1] + z[n / 2]) / 2;
+}
+
+}  // namespace
+
 bool renderClipLayer3D(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, FrameTime t, const Image& layer, double scale,
                        Image& out, std::vector<float>* depth, std::string* error, const std::function<Image(const Clip&)>& cardLayer) {
     ModelCamera cam;
@@ -523,7 +619,9 @@ bool renderClipLayer3D(const Project& p, const Sequence& seq, const Clip& c, con
         double units = e.p("units_m", lt, 0);
         if (!(units > 0)) units = mode == 1 || mode == 2 ? 1 : 1000;
         double focus = e.p("focus_distance", lt, 0);
-        if (!(focus > 0)) {  // (the card's middle)
+        if (!(focus > 0) && e.p("focus_scene", lt, 0) > 0.5) {
+            focus = sceneMedianDepth(p, seq, c, e, t, pl, cam);
+        } else if (!(focus > 0)) {  // (the card's middle, as projects saved before the scene's depth was taken have it)
             const V3 q{pl.origin[0] - cam.C[0], pl.origin[1] - cam.C[1], pl.origin[2] - cam.C[2]};
             focus = cam.R[6] * q[0] + cam.R[7] * q[1] + cam.R[8] * q[2];
         }

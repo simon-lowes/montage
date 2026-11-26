@@ -7,6 +7,7 @@
 #include <ctime>
 #include <deque>
 #include <random>
+#include <set>
 #include <sstream>
 
 #include "History.h"
@@ -240,7 +241,7 @@ std::vector<std::vector<CcTriplet>> captionCcData(const std::vector<Caption>& ca
 // ---- Reading -----------------------------------------------------------------------
 
 bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, Rational fps, std::vector<Caption>& out, std::string* error,
-                     bool* painted) {
+                     bool* painted, int wantedService, bool building) {
     const double fpsv = fps.valid() ? fps.toDouble() : 30.0;
     struct Window {
         bool defined = false, visible = false;
@@ -267,7 +268,7 @@ bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, 
         for (int k = 0; k < 8; ++k)
             if (mask & (1 << k)) f(windows[size_t(k)]);
     };
-    // Service 1's bytes in one block.
+    // The service's bytes in one block.
     auto interpret = [&](const uint8_t* b, size_t n) {
         for (size_t j = 0; j < n;) {
             const uint8_t c = b[j++];
@@ -379,8 +380,10 @@ bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, 
         const bool sameShow = generation == onGeneration;
         if (now == onScreen && sameShow) return;
         onGeneration = generation;
-        // Text growing in a window already on screen (paint-on, a roll-up row being typed) stays one caption.
-        if (sameShow && !onScreen.empty() && now.size() > onScreen.size() && now.compare(0, onScreen.size(), onScreen) == 0) {
+        // Text growing in a window already on screen (paint-on, a roll-up row being typed) stays one caption (built
+        // as shown: until a row is begun).
+        if (sameShow && !onScreen.empty() && now.size() > onScreen.size() && now.compare(0, onScreen.size(), onScreen) == 0 &&
+            (!building || std::count(now.begin(), now.end(), '\n') == std::count(onScreen.begin(), onScreen.end(), '\n'))) {
             onScreen = now;
             return;
         }
@@ -422,7 +425,7 @@ bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, 
             const size_t size = header & 0x1F;
             if (service == 7 && i < want) service = packet[i++] & 0x3F;
             if (i + size > want) break;
-            if (service == 1) interpret(packet.data() + i, size);
+            if (service == wantedService) interpret(packet.data() + i, size);
             i += size;
         }
         packet.clear();
@@ -433,7 +436,7 @@ bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, 
     normalizeCaptions(caps);
     if (painted) *painted = paintedOn;
     if (caps.empty()) {
-        if (error) *error = "No CTA-708 captions found (service 1)";
+        if (error) *error = "No CTA-708 captions found (service " + std::to_string(wantedService) + ")";
         return false;
     }
     out = std::move(caps);
@@ -570,6 +573,13 @@ std::string captionsToMcc(const std::vector<Caption>& captions, Rational fps, co
         frames = std::max<int64_t>(frames, c.end + int64_t(std::lround(to)));
     }
     const std::vector<std::vector<CcTriplet>> data = captionCcData(timed, rate, frames, true, true, style);
+    std::string out = mccHeader(rate);
+    for (int64_t f = 0; f < frames; ++f) out += mccFrame(data[size_t(f)], rate, f);
+    return out;
+}
+
+std::string mccHeader(Rational fps) {
+    const MccRate& mr = mccRateFor(fps);
     std::string out = kMccHeader;
     if (std::string(mr.name) == "60DF") out.replace(out.find("V1.0"), 4, "V2.0");  // (V1.0 has no 59.94 drop frame)
     {
@@ -590,15 +600,25 @@ std::string captionsToMcc(const std::vector<Caption>& captions, Rational fps, co
         out += std::string("UUID=") + uuid + "\nCreation Program=Montage\nCreation Date=" + date + "\nCreation Time=" + clock +
                "\nTime Code Rate=" + mr.name + "\n\n";
     }
+    return out;
+}
+
+std::string mccFrame(const std::vector<CcTriplet>& cc, Rational fps, int64_t frame) {
+    const MccRate& mr = mccRateFor(fps);
+    const Rational rate{mr.num, mr.den};
     const bool drop = isDropFrameRate(rate);
-    for (int64_t f = 0; f < frames; ++f) {
-        const std::vector<uint8_t> cdp = captionCdp(data[size_t(f)], rate, uint16_t(f & 0xFFFF));
+    std::string out;
+    // (a packet holds 31 entries: more, as a picture dropped before hands on its own, go in further packets of the
+    // same time code)
+    for (size_t from = 0; from == 0 || from < cc.size(); from += 31) {
+        const std::vector<CcTriplet> part(cc.begin() + ptrdiff_t(std::min(from, cc.size())), cc.begin() + ptrdiff_t(std::min(from + 31, cc.size())));
+        const std::vector<uint8_t> cdp = captionCdp(part, rate, uint16_t(frame & 0xFFFF));
         std::vector<uint8_t> anc{0x61, 0x01, uint8_t(cdp.size())};
         anc.insert(anc.end(), cdp.begin(), cdp.end());
         unsigned ancSum = 0;
         for (uint8_t v : anc) ancSum += v;
         anc.push_back(uint8_t(ancSum & 0xFF));
-        out += formatTimecode(f, rate, drop) + "\t" + mccHex(anc) + "\n";
+        out += formatTimecode(frame, rate, drop) + "\t" + mccHex(anc) + "\n";
     }
     return out;
 }
@@ -608,10 +628,17 @@ bool parseMcc(const std::string& text, Rational fps, std::vector<Caption>& out, 
         if (error) *error = why;
         return false;
     };
-    const size_t skip = text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
-    if (text.compare(skip, 26, "File Format=MacCaption_MCC") != 0) return fail("Not an MCC caption file");
-    Rational rate{30000, 1001};
     std::vector<std::pair<double, CcTriplet>> triplets;
+    if (!mccCcData(text, fps, triplets)) return fail("Not an MCC caption file");
+    if (!captionsFromCc(triplets, fps, out)) return fail("No captions found in the MCC file");
+    return true;
+}
+
+bool mccCcData(const std::string& text, Rational fps, std::vector<std::pair<double, CcTriplet>>& triplets) {
+    triplets.clear();
+    const size_t skip = text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
+    if (text.compare(skip, 26, "File Format=MacCaption_MCC") != 0) return false;
+    Rational rate{30000, 1001};
     std::istringstream lines(text.substr(skip));
     std::string line;
     std::vector<uint8_t> bytes;
@@ -641,7 +668,6 @@ bool parseMcc(const std::string& text, Rational fps, std::vector<Caption>& out, 
         const double t = double(frame) / rate.toDouble();
         for (const CcTriplet& c : cc) triplets.push_back({t, c});
     }
-    if (!captionsFromCc(triplets, fps, out)) return fail("No captions found in the MCC file");
     return true;
 }
 
@@ -699,6 +725,78 @@ bool captionsFromCc(const std::vector<std::pair<double, CcTriplet>>& triplets, R
     if (!pairs.empty() && captionsFrom608(pairs, fps, out, &why)) return true;
     if (have708) return out = std::move(from708), true;
     return fail("No captions found");
+}
+
+
+std::vector<CcCaptionStream> captionStreamsFromCc(const std::vector<std::pair<double, CcTriplet>>& triplets, Rational fps, bool building) {
+    std::vector<CcCaptionStream> out;
+    // The 708 services that carry anything (a block of theirs in a whole packet).
+    std::set<int> services;
+    {
+        std::vector<uint8_t> packet;
+        size_t want = 0;
+        for (const auto& [t, cc] : triplets) {
+            (void)t;
+            if (!(cc[0] & 0x04)) continue;
+            const int type = cc[0] & 0x03;
+            if (type == 3) {
+                packet = {cc[1], cc[2]};
+                const size_t code = cc[1] & 0x3F;
+                want = code == 0 ? 128 : code * 2;
+            } else if (type == 2 && !packet.empty()) {
+                packet.push_back(cc[1]);
+                packet.push_back(cc[2]);
+            } else {
+                continue;
+            }
+            if (packet.size() < want) continue;
+            for (size_t i = 1; i < want;) {
+                const uint8_t header = packet[i++];
+                if (header == 0) break;
+                int service = header >> 5;
+                const size_t size = header & 0x1F;
+                if (service == 7 && i < want) service = packet[i++] & 0x3F;
+                if (i + size > want) break;
+                if (service > 0 && size > 0) services.insert(service);
+                i += size;
+            }
+            packet.clear();
+        }
+    }
+    for (int service : services) {
+        CcCaptionStream c;
+        c.service708 = service;
+        c.id = "SERVICE" + std::to_string(service);
+        if (captionsFrom708(triplets, fps, c.captions, nullptr, nullptr, service, building)) out.push_back(std::move(c));
+    }
+    // The 608 pairs of each field, on the line-21 clock from the frame each came in; CC1 and CC2 on field 1, CC3 and
+    // CC4 on field 2, told apart by their control codes.
+    for (int field = 0; field < 2; ++field) {
+        std::vector<std::pair<double, uint16_t>> pairs;
+        double last = -1;
+        int k = 0;
+        bool channels[2] = {false, false};
+        int channel = 0;
+        for (const auto& [t, cc] : triplets) {
+            if (t != last) last = t, k = 0;
+            if (!(cc[0] & 0x04) || (cc[0] & 0x03) != field) continue;
+            const double at = t + double(k++) * 1001.0 / 30000.0;
+            pairs.push_back({at, uint16_t((cc[1] << 8) | cc[2])});
+            const uint8_t a = cc[1] & 0x7f, b = cc[2] & 0x7f;
+            if (a >= 0x01 && a <= 0x0f) channel = 0;  // (XDS, field 2's other data)
+            else if (a >= 0x10 && a <= 0x1f) channel = (a & 0x08) ? 2 : 1;
+            else if (channel && (a >= 0x20 || b >= 0x20)) channels[channel - 1] = true;  // (text on it)
+        }
+        std::stable_sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (int ch = 1; ch <= 2; ++ch) {
+            if (!channels[ch - 1]) continue;
+            CcCaptionStream c;
+            c.channel608 = field * 2 + ch;
+            c.id = "CC" + std::to_string(c.channel608);
+            if (captionsFrom608(pairs, fps, c.captions, nullptr, ch, building)) out.push_back(std::move(c));
+        }
+    }
+    return out;
 }
 
 }  // namespace montage

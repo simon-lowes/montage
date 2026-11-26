@@ -39,6 +39,7 @@ struct NewSequenceSpec {
     std::string preferredDownmix;
     int mixingLevel = 0;
     std::string roomType;
+    double shutterAngle = 180;  // what new transforms and Motion Blurs are blurred through (Sequence::shutterAngle)
 };
 
 // Spin box that only accepts even values (most encoders need even frame sizes).
@@ -92,6 +93,7 @@ private:
     QSpinBox* mixingLevel_ = nullptr;
     QComboBox* roomType_ = nullptr;
     QComboBox* filmGauge_ = nullptr;
+    QSpinBox* shutter_ = nullptr;
     QCheckBox* spherical_ = nullptr;
     QCheckBox* vr180_ = nullptr;
     QCheckBox* stereo3d_ = nullptr;

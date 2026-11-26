@@ -28,8 +28,10 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <set>
 
 #include "EditorState.h"
+#include "render/Av1GrainExport.h"
 #include "RenderQueue.h"
 #include "core/AudioDescription.h"
 #include "core/Surround.h"
@@ -57,9 +59,11 @@ const QString kSettingsPreset = QStringLiteral("export/preset");
 bool hasVideo(const ExportSettings& s) { return !s.videoCodec.empty() && s.videoCodec != "none"; }
 bool hasAudio(const ExportSettings& s) { return !s.audioCodec.empty() && s.audioCodec != "none"; }
 
-// Whether an export's video can state an HRD: x264's and x265's (not AVC-Intra, whose class fixes its rate).
+// Whether an export's video can state an HRD: x264's and x265's (not AVC-Intra, whose class fixes its rate),
+// MPEG-2's VBV (which it always states: the row sets it), and libaom's AV1 decoder model.
 bool statesHrd(const ExportSettings& s) {
-    return (s.videoCodec == "libx264" || s.videoCodec == "libx265") && s.profile != "avci100";
+    return ((s.videoCodec == "libx264" || s.videoCodec == "libx265") && s.profile != "avci100") || s.videoCodec == "mpeg2video" ||
+           s.videoCodec == "libaom-av1";
 }
 
 bool usesCrf(const std::string& codec) {
@@ -219,9 +223,9 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     hrd_->addItem(tr("Not stated"), QString());
     hrd_->addItem(tr("Constant bit rate (CBR)"), QStringLiteral("cbr"));
     hrd_->addItem(tr("Variable bit rate (VBR)"), QStringLiteral("vbr"));
-    hrd_->setToolTip(tr("States a buffer model (HRD) in H.264 or H.265 video, as broadcast ingest checks it. Constant: exactly this "
-                        "rate, padded where the pictures need fewer bits. Variable: never more than this rate, at the quality set "
-                        "above. The export is checked against it when it is written."));
+    hrd_->setToolTip(tr("States a buffer model (HRD) in H.264 or H.265 video, AV1's decoder model, or sets MPEG-2's (its VBV), "
+                        "as broadcast ingest checks it. Constant: exactly this rate, padded where the pictures need fewer bits. Variable: never more than this "
+                        "rate, at the quality set above. The export is checked against it when it is written."));
     hrdRate_ = new QSpinBox(form_);
     hrdRate_->setObjectName(QStringLiteral("exportHrdRate"));
     hrdRate_->setRange(100, 800000);
@@ -436,7 +440,27 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
                               "then written beside it as AV1 film grain parameters, which the player's decoder puts back: the bits go "
                               "to the picture instead of the grain"));
     filmGrain_->setChecked(appSettings().value("export/filmGrain", false).toBool());
-    form->addRow(QString(), filmGrain_);
+    // Which grain: each shot's own, measured, or a profile Measure Grain saved by name (the project's, then the library's).
+    filmGrainProfile_ = new QComboBox(form_);
+    filmGrainProfile_->setObjectName(QStringLiteral("exportFilmGrainProfile"));
+    filmGrainProfile_->setToolTip(tr("The grain carried: each shot's own, measured, or a profile saved by name for every shot"));
+    filmGrainProfile_->addItem(tr("Each shot's own, measured"), QStringLiteral("measure"));
+    {
+        std::set<std::string> listed;
+        for (const auto& [name, text] : state_->project().grainProfiles)
+            if (listed.insert(name).second) filmGrainProfile_->addItem(tr("%1 (this project)").arg(QString::fromStdString(name)), QString::fromStdString(name));
+        for (const auto& [name, text] : userGrainProfiles())
+            if (listed.insert(name).second) filmGrainProfile_->addItem(tr("%1 (library)").arg(QString::fromStdString(name)), QString::fromStdString(name));
+    }
+    {
+        const int was = filmGrainProfile_->findData(appSettings().value("export/filmGrainProfile").toString());
+        if (was > 0) filmGrainProfile_->setCurrentIndex(was);
+    }
+    auto* grainRow = new QHBoxLayout;
+    grainRow->addWidget(filmGrain_);
+    grainRow->addWidget(filmGrainProfile_, 1);
+    form->addRow(QString(), grainRow);
+    connect(filmGrain_, &QCheckBox::toggled, this, [this] { updateControls(); });
     adaptiveHdr_ = new QCheckBox(tr("Adaptive HDR metadata (ST 2094-50, any display's headroom)"), form_);
     adaptiveHdr_->setObjectName(QStringLiteral("exportAdaptiveHdr"));
     adaptiveHdr_->setToolTip(tr("Each scene's reference white, headroom and the gain curve to its SDR rendition (the sequence's SDR trim, "
@@ -949,8 +973,9 @@ void ExportDialog::updateControls() {
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
     color_->setEnabled(video);
-    filmGrain_->setEnabled(video && (p->settings.videoCodec == "libsvtav1" || p->settings.videoCodec == "libaom-av1" || p->settings.videoCodec == "librav1e") &&
-                           (!rate_ || rate_->currentData().toString().isEmpty()) && !(credentials_ && credentials_->isChecked()));
+    // (with a rate change or Content Credentials too: the parameters go in after the one and before the other)
+    filmGrain_->setEnabled(video && (p->settings.videoCodec == "libsvtav1" || p->settings.videoCodec == "libaom-av1" || p->settings.videoCodec == "librav1e"));
+    filmGrainProfile_->setEnabled(filmGrain_->isEnabled() && filmGrain_->isChecked());
     {
         // HDR10+ is HDR10's: PQ output only.
         const Sequence* sq = state_ ? state_->sequence() : nullptr;
@@ -977,6 +1002,10 @@ void ExportDialog::updateControls() {
         const bool states = p && statesHrd(p->settings);
         const QString mode = states ? hrd_->currentData().toString() : QString();
         hrd_->setEnabled(states);
+        // (MPEG-2 always states a VBV: without one set, XDCAM HD422's)
+        const bool mpeg2 = p && p->settings.videoCodec == "mpeg2video";
+        hrd_->setItemText(0, mpeg2 ? tr("XDCAM HD422's own") : tr("Not stated"));
+        hrdBuffer_->setSpecialValueText(mpeg2 ? tr("XDCAM HD422's buffer") : tr("A second's buffer"));
         hrdRate_->setEnabled(!mode.isEmpty());
         hrdBuffer_->setEnabled(!mode.isEmpty());
         quality_->setEnabled(p && usesCrf(p->settings.videoCodec) && mode != QLatin1String("cbr"));
@@ -1114,7 +1143,25 @@ void ExportDialog::updateSummary() {
         const QString hrdMode = statesHrd(s) ? hrd_->currentData().toString() : QString();
         if (usesCrf(s.videoCodec) && hrdMode != QLatin1String("cbr"))
             line += (s.videoCodec == "liboapv" ? tr(", QP %1") : tr(", CRF %1")).arg(quality_->value());
-        if (!hrdMode.isEmpty()) {
+        if (s.videoCodec == "mpeg2video") {
+            // The VBV its sequence headers will state, as they count it (exportMpeg2Vbv).
+            ExportSettings stated = s;
+            stated.hrd = hrdMode.toStdString();
+            stated.vbvMaxrate = int64_t(hrdRate_->value()) * 1000;
+            stated.vbvBuffer = int64_t(hrdBuffer_->value()) * 1000;
+            const Mpeg2Vbv vbv = exportMpeg2Vbv(stated);
+            const QString rate = QString::number(double(vbv.rate) / 1000, 'f', vbv.rate % 1000 ? 1 : 0);
+            const QString buffer = QString::number(double(vbv.buffer) / 1000, 'f', 0);
+            if (!vbv.valid) line += tr(", a VBV buffer MPEG-2 cannot state at this rate (16 to %1 kbit)").arg(vbv.most / 1000);
+            else
+                line += (vbv.cbr ? tr(", a constant %1 kbit/s with its VBV stated (%2 kbit)") : tr(", no more than %1 kbit/s with its VBV stated (%2 kbit)"))
+                            .arg(rate, buffer);
+        } else if (!hrdMode.isEmpty() && s.videoCodec == "libaom-av1") {
+            // (AV1's decoder model states the level's buffer: the rate is the one asked)
+            line += (hrdMode == QLatin1String("cbr") ? tr(", a constant %1 kbit/s with its decoder model stated")
+                                                     : tr(", no more than %1 kbit/s with its decoder model stated"))
+                        .arg(hrdRate_->value());
+        } else if (!hrdMode.isEmpty()) {
             const int buffer = hrdBuffer_->value() > 0 ? hrdBuffer_->value() : hrdRate_->value();
             line += (hrdMode == QLatin1String("cbr") ? tr(", a constant %1 kbit/s with its buffer model stated (%2 kbit)")
                                                      : tr(", no more than %1 kbit/s with its buffer model stated (%2 kbit)"))
@@ -1255,8 +1302,11 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/allCaptions", allCaptions_->isChecked());
     s.cea608 = cea608_->isEnabled() && cea608_->isChecked();
     settings.setValue("export/cea608", cea608_->isChecked());
-    s.filmGrain = filmGrain_->isEnabled() && filmGrain_->isChecked() ? "measure" : "";
+    s.filmGrain = filmGrain_->isEnabled() && filmGrain_->isChecked() ? filmGrainProfile_->currentData().toString().toStdString() : "";
+    // (a name: the profile's text, so the job renders the grain chosen whatever is saved later)
+    if (!s.filmGrain.empty() && !resolveFilmGrainSetting(state_->project(), s.filmGrain)) s.filmGrain = "measure";
     settings.setValue("export/filmGrain", filmGrain_->isChecked());
+    settings.setValue("export/filmGrainProfile", filmGrainProfile_->currentData().toString());
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
     s.adaptiveHdr = adaptiveHdr_->isEnabled() && adaptiveHdr_->isChecked();

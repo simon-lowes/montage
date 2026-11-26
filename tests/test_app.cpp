@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <QPointingDevice>
 #include <complex>
 #include <limits>
 #include <QDialog>
@@ -66,6 +67,7 @@
 #include <QUdpSocket>
 #include <QTreeView>
 #include <QTreeWidget>
+#include <QScreen>
 #include <QJsonObject>
 #include <QJsonDocument>
 #include "core/ProjectLock.h"
@@ -233,6 +235,7 @@
 #include "PluginManagerDialog.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
+#include "EncodeFoldersDialog.h"
 #include "Accessibility.h"
 #include "LearnEffectDialog.h"
 #include "Theme.h"
@@ -286,11 +289,13 @@
 #include "core/Automation.h"
 #include "core/History.h"
 #include "render/GrainMatch.h"
+#include "render/Av1GrainExport.h"
 #include "render/LutExport.h"
 #include "render/Processing.h"
 #include "media/Segmenter.h"
 #include "HdrSurface.h"
 #include "MonitorPanel.h"
+#include "StillEdit.h"
 #include "PlaybackController.h"
 #include "Recovery.h"
 #include "RenderQueue.h"
@@ -2350,6 +2355,17 @@ private slots:
         QCOMPARE(slot().velocityCurve, 0);
         QVERIFY(slot().velocityPoints.empty());
         for (int v = 1; v <= 127; ++v) QCOMPARE(sampler::curveVelocity(slot(), v), v);
+        // Double-clicked where there is no point: one is put down, in one step (nightly 25 Nov: it was made and taken
+        // away again, two steps for nothing). (Through the window, as a mouse does it: two presses and releases that
+        // Qt takes as a double click, so the view has press, release, press, double click and release.)
+        const size_t undoAt = state()->history().undoCount();
+        QWindow* window = view->window()->windowHandle();
+        QVERIFY(window);
+        QTest::mouseDClick(window, Qt::LeftButton, Qt::NoModifier, window->mapFromGlobal(view->mapToGlobal(view->pointFor(60, 30))));
+        QVERIFY(mapsAsDrawn({{1, 1}, {60, 30}, {127, 127}}));
+        QCOMPARE(state()->history().undoCount(), undoAt + 1);
+        state()->undo();
+        QCOMPARE(slot().velocityCurve, 0);
         win_->findChild<QDockWidget*>("sampler")->hide();
         QTRY_VERIFY(!panel->isActive());
     }
@@ -3591,6 +3607,10 @@ private slots:
         CaptureDialog* dlg = win_->captureDialog();
         auto stopped = qScopeGuard([&] {
             dlg->stop();
+            // (a check that failed midway leaves no recording going for the tests after it)
+            QElapsedTimer ending;
+            ending.start();
+            while (dlg->isRecording() && ending.elapsed() < 30000) QTest::qWait(50);
             dlg->setLive({});
             dlg->hide();
         });
@@ -3611,18 +3631,59 @@ private slots:
         QTest::qWait(600);
         chapter->trigger();
         auto liveNow = [&] { return call({{"action", "status"}}).value("structuredContent").toObject().value("live").toObject(); };
+        auto readFile = [](const QString& f) {
+            QFile file(f);
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+        };
         QTRY_COMPARE_WITH_TIMEOUT(liveNow().value("cues").toInt(), 2, 5000);
         QTRY_COMPARE_WITH_TIMEOUT(liveNow().value("chapters").toInt(), 2, 5000);
+        // Phase 17: a marker placed on a clip of the growing recording is a chapter too, in chapters.vtt within a
+        // segment (2 seconds), at its place in the recording; the project changing again makes it no second one.
+        Id growing = 0;
+        QTRY_VERIFY_WITH_TIMEOUT((growing = Id(call({{"action", "status"}}).value("structuredContent").toObject().value("media").toDouble())) != 0, 5000);
+        QVERIFY(state()->apply("Growing clip", [growing](Project& p, Sequence& s) {
+            edit::Result placed = edit::placeMedia(p, s, growing, 0, 0, 4, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            // (on the recording's first clip, its picture's or else its sound's)
+            bool marked = false;
+            for (auto* tracks : {&s.videoTracks, &s.audioTracks})
+                for (Track& t : *tracks)
+                    for (Clip& c : t.clips)
+                        if (!marked && c.mediaId == growing) {
+                            c.markers.push_back(Marker{FrameTime(std::llround(3 * s.fps.toDouble())), 0, "From the clip", "", 0, false});
+                            marked = true;
+                        }
+            return placed;
+        }));
+        QElapsedTimer markedAt;
+        markedAt.start();
+        QString listed;
+        while (markedAt.elapsed() < 2500 && !(listed = readFile(folder + "/chapters.vtt")).contains("From the clip")) QTest::qWait(50);
+        if (!listed.contains("From the clip")) {
+            // (for a failure's message: the recording's clips and their markers as the project has them)
+            QString clips;
+            for (const Sequence& q : state()->project().sequences)
+                for (const auto* tracks : {&q.videoTracks, &q.audioTracks})
+                    for (const Track& t : *tracks)
+                        for (const Clip& c : t.clips)
+                            if (c.mediaId == growing)
+                                clips += QStringLiteral(" clip %1 (%2 markers%3)").arg(c.id).arg(c.markers.size()).arg(c.markers.empty() ? QString() : QStringLiteral(", the first at %1").arg(c.markers.front().t));
+            listed += "\nclips of media " + QString::number(growing) + ":" + clips + "; live chapters " + QString::number(liveNow().value("chapters").toInt());
+        }
+        QVERIFY2(listed.contains("00:00:03.000 --> ") && listed.contains("From the clip"), qPrintable(listed));
+        qInfo("The clip's marker was in chapters.vtt %lld ms after it was placed", (long long)markedAt.elapsed());
+        QCOMPARE(liveNow().value("chapters").toInt(), 3);
+        QVERIFY(state()->apply("Name", [](Project&, Sequence& s) {
+            s.name += " (live)";
+            return edit::Result{};
+        }));
+        QTest::qWait(300);
+        QCOMPARE(liveNow().value("chapters").toInt(), 3);
         QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 30000);
         QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live package ended"), 20000);
         QVERIFY2(dlg->statusText().contains("2 ad cue") && dlg->statusText().contains("2 sound stream"), qPrintable(dlg->statusText()));
         const QJsonObject live = liveNow();
         QCOMPARE(live.value("sound_renditions").toInt(), 2);
         QVERIFY(!live.value("captioned").toBool());
-        auto readFile = [](const QString& f) {
-            QFile file(f);
-            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
-        };
         const QString master = readFile(folder + "/master.m3u8");
         QCOMPARE(int(master.count("TYPE=AUDIO")), 2);
         QVERIFY(!master.contains("TYPE=SUBTITLES"));
@@ -3630,7 +3691,7 @@ private slots:
         const QString list = readFile(folder + "/" + video);
         QVERIFY2(list.contains("ID=\"cue-1\"") && list.contains("ID=\"cue-2\"") && list.contains("PLANNED-DURATION=1.500"), qPrintable(list));
         const QString chapters = readFile(folder + "/chapters.vtt");
-        QVERIFY2(chapters.contains("Second half") && chapters.contains("Chapter 2"), qPrintable(chapters));
+        QVERIFY2(chapters.contains("Second half") && chapters.contains("Chapter 2") && chapters.contains("From the clip"), qPrintable(chapters));
     }
 
     // ST 2110 streams recorded by an agent (montage_capture), their SDPs given as text: in the Captures bin with the
@@ -4367,6 +4428,152 @@ private slots:
         sizesBack();
         QCOMPARE(win_->size(), windowWas);
         QCOMPARE(panelSizes(), sizesWere);
+    }
+
+    // The same HDR feed live on the Source monitor under Weston with a BT.2100 PQ output (scripts/wayland-hdr-check.sh's
+    // "on" run, in CI): the window shown by the kiosk shell, the multiviewer that took the feed hidden, the monitor's
+    // HDR viewer on. Weston's screenshot of the monitor's picture is each grey's PQ code: the 203-nit grey within 2, the
+    // 1000-nit one within 4 (at the output's peak), as the HDR picture the monitor was given says.
+    void liveHdrOnWayland() {
+        const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
+        if (log.isEmpty() || qEnvironmentVariable("MONTAGE_TEST_WESTON_CM") != QLatin1String("true") ||
+            !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
+            QSKIP("Runs under Weston with a PQ output (scripts/wayland-hdr-check.sh)");
+#ifndef MONTAGE_HDR_VIEWER
+        QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
+#else
+        namespace st = st2110;
+        QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
+        state()->newProject();
+        int ports[3];
+        {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.ttl = 1;
+        const int W = 1280, H = 720;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        v.colorimetry = "BT2100", v.tcs = "PQ";
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        const double nits[2] = {203, 1000};
+        st::Raster raster(W, H, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < H; ++y) {
+            uint16_t* d = raster.row(y);
+            for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = uint16_t(std::lround(64 + 876 * fromLinear(Transfer::Pq, nits[x < W / 2 ? 0 : 1] / 203)));
+        }
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            const std::vector<float> sound(1920 * 2, 0.0f);
+            for (int t = 0; !stop && t < 25 * 300; ++t) {
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                if (!tx.send(raster, sound.data(), 1920, &tc, {}, &stop)) break;
+            }
+        });
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        MonitorPanel* source = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Source) source = m;
+        auto* playback = win_->findChild<PlaybackController*>("sourcePlayback");
+        QVERIFY(source && playback);
+        ViewerWidget* viewer = source->viewer();
+        Multiviewer* mv = win_->multiviewer();
+        const bool hdrWas = playback->hdrOutput(), viewerWas = viewer->hdrViewer();
+        auto finish = qScopeGuard([&] {
+            stop = true;
+            sending.join();
+            tx.close();
+            call({{"action", "live"}, {"watch", false}});
+            mv->clear();
+            mv->hide();
+            viewer->setHdrViewer(false);
+            source->setHdrViewer(viewerWas);
+            playback->setHdrOutput(hdrWas);
+            for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+                if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
+        });
+        QJsonObject r = call({{"action", "multiview"},
+                              {"inputs", QJsonArray{QJsonObject{{"label", "HDR cam"}, {"kind", "st2110"},
+                                                                {"url", QString::fromStdString(tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc())}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 5, 60000);
+        r = call({{"action", "live"}, {"input", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(source->liveShowing());
+        // (the kiosk shell shows the window last mapped: the multiviewer goes, and the main window is shown)
+        mv->hide();
+        win_->show();
+        win_->raise();
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowExposed(win_.get()));
+        playback->setHdrOutput(true);
+        source->setHdrViewer(true);
+        viewer->setHdrViewer(true);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer->hdrShowing(), qPrintable(viewer->hdrStatus()), 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->hdrPicture() && viewer->hdrPicture()->transfer == Transfer::Pq, 30000);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer->hdrSurface() && viewer->hdrSurface()->framesDrawn() > 0, qPrintable(viewer->hdrStatus()), 10000);
+        // What each grey is to be on the output: the monitor's HDR picture there, as the surface's signal.
+        const HdrPicturePtr pic = viewer->hdrPicture();
+        int expect[2];
+        for (int side = 0; side < 2; ++side) {
+            float px[4];
+            const size_t at = size_t(pic->height / 2) * size_t(pic->width) + size_t(pic->width / 4 + side * pic->width / 2);
+            qFloatFromFloat16(px, reinterpret_cast<const qfloat16*>(&pic->rgba[at * 4]), 4);
+            QVERIFY2(std::fabs(px[1] / (nits[side] / 203) - 1) < 0.04, qPrintable(QString::number(px[1])));
+            hdrSurfaceSignal(px, Transfer::Pq);
+            expect[side] = int(std::lround(px[1] * 255));
+        }
+        const QString shooter = qEnvironmentVariable("MONTAGE_TEST_WESTON_SCREENSHOOTER");
+        const QDir shots(qEnvironmentVariable("XDG_PICTURES_DIR"));
+        QVERIFY2(!shooter.isEmpty() && shots.exists(), "MONTAGE_TEST_WESTON_SCREENSHOOTER or XDG_PICTURES_DIR is not set");
+        QString said;
+        bool right = false;
+        for (int attempt = 0; attempt < 6 && !right; ++attempt) {  // (until the monitor has painted and Weston repainted)
+            QTest::qWait(500);
+            QVERIFY2(QProcess::execute(shooter, {}) == 0, "Weston's screenshooter failed");
+            const QStringList pngs = shots.entryList({QStringLiteral("wayland-screenshot-*.png")}, QDir::Files, QDir::Time);
+            QVERIFY2(!pngs.isEmpty(), "Weston's screenshooter wrote no picture");
+            const QImage shot = QImage(shots.filePath(pngs.first())).convertToFormat(QImage::Format_RGB32);
+            QVERIFY2(!shot.isNull(), "Weston's screenshot cannot be read");
+            QFile::remove(shots.filePath(QStringLiteral("live.png")));
+            QFile::rename(shots.filePath(pngs.first()), shots.filePath(QStringLiteral("live.png")));
+            const QRectF rect = viewer->imageRect().translated(QPointF(viewer->mapTo(viewer->window(), QPoint(0, 0))));
+            right = true;
+            QStringList got;
+            for (int side = 0; side < 2; ++side) {
+                const QPoint at(int(rect.left() + (side ? 0.75 : 0.25) * rect.width()), int(rect.center().y()));
+                if (!shot.rect().contains(at)) {
+                    right = false;
+                    got << QStringLiteral("%1,%2 is off the screenshot").arg(at.x()).arg(at.y());
+                    continue;
+                }
+                const QRgb px = shot.pixel(at);
+                const int within = side ? 4 : 2;
+                if (std::abs(qRed(px) - expect[side]) > within || std::abs(qGreen(px) - expect[side]) > within ||
+                    std::abs(qBlue(px) - expect[side]) > within)
+                    right = false;
+                got << QStringLiteral("%1 nits at %2,%3: %4 %5 %6, expected %7").arg(nits[side]).arg(at.x()).arg(at.y())
+                           .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect[side]);
+            }
+            said = got.join(QStringLiteral("; "));
+        }
+        qInfo().noquote() << "Weston's screenshot of the live feed:" << said;
+        QVERIFY2(right, qPrintable(said));
+#endif
     }
 
     // Tangent panels through a stand-in Tangent Hub: introduced, the controls file written, turns, resets and value
@@ -6431,6 +6638,104 @@ private slots:
         QVERIFY2(std::fabs(report.bitRate - 1200000) < 12000 && std::fabs(report.bufferBits - 1200000) < 12000, report.summary().c_str());
     }
 
+    void exportDialogMpeg2Vbv() {
+        // The Export dialog's HRD row sets MPEG-2's VBV: XDCAM HD422's own (a constant 50 Mb/s into 17,825,792 bits)
+        // until asked, else a constant or a variable rate into a buffer. The row states the rate and buffer as the
+        // sequence headers will (a buffer a whole number of 16,384 bits), and the buffer check of the file written finds
+        // the same, with every picture kept to it.
+        loadDemo();
+        RenderQueue* queue = win_->renderQueue();
+        const size_t before = queue->jobs().size();
+        const QVariant remembered = appSettings().value("export/preset");
+        auto putBack = qScopeGuard([&] {
+            appSettings().remove("export/hrd");
+            appSettings().remove("export/hrdRate");
+            appSettings().remove("export/hrdBuffer");
+            if (remembered.isValid()) appSettings().setValue("export/preset", remembered);
+            else appSettings().remove("export/preset");
+        });
+        int xdcam = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i)
+            if (exportPresets()[i].settings.videoCodec == "mpeg2video") xdcam = int(i);
+        QVERIFY(xdcam >= 0);
+        auto queued = [&](const char* mode, int rateKbit, int bufferKbit, const QString& stated, const QString& file, ExportSettings* out) {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* hrd = ed.findChild<QComboBox*>("exportHrd");
+            auto* rate = ed.findChild<QSpinBox*>("exportHrdRate");
+            auto* buffer = ed.findChild<QSpinBox*>("exportHrdBuffer");
+            QVERIFY(hrd && rate && buffer);
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(xdcam);
+            QVERIFY(hrd->isEnabled());
+            QCOMPARE(hrd->itemText(0), QStringLiteral("XDCAM HD422's own"));
+            hrd->setCurrentIndex(hrd->findData(QString::fromLatin1(mode)));
+            QCOMPARE(rate->isEnabled(), QByteArray(mode) != "");
+            rate->setValue(rateKbit);
+            buffer->setValue(bufferKbit);
+            const QString summary = ed.findChild<QLabel*>("exportSummary")->text();
+            QVERIFY2(summary.contains(stated), qPrintable(summary));
+            ed.findChild<QLineEdit*>("exportPath")->setText(file);
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(ed.result(), int(QDialog::Accepted));
+            QCOMPARE(queue->jobs().size(), before + 1);
+            *out = queue->jobs().back().settings;
+            queue->remove(queue->jobs().back().id);
+        };
+        // Rendered small and short; the buffer check finds what the row stated, and every picture keeps to it.
+        auto rendered = [&](ExportSettings s, bool cbr, double rate, double buffer) {
+            s.width = 320, s.height = 180;
+            s.in = 0, s.out = 50;
+            s.path = QFileInfo(QString::fromStdString(s.path)).dir().filePath(QFileInfo(QString::fromStdString(s.path)).completeBaseName() + ".mov").toStdString();
+            std::string err;
+            QVERIFY2(renderExport(state()->project(), state()->sequence()->id, s, 0, {}, nullptr, &err), err.c_str());
+            const HrdReport r = checkHrd(s.path);
+            QVERIFY2(r.checked && r.signalled && r.codec == "MPEG-2" && r.model == "VBV", r.summary().c_str());
+            QCOMPARE(r.cbr, cbr);
+            QCOMPARE(r.bitRate, rate);
+            QCOMPARE(r.bufferBits, buffer);
+            QVERIFY2(r.conforms(), (r.summary() + " " + (r.issues.empty() ? std::string() : r.issues.front().text)).c_str());
+        };
+        // XDCAM HD422's own, as before.
+        ExportSettings own;
+        queued("", 8000, 0, QStringLiteral("a constant 50000 kbit/s with its VBV stated (17826 kbit)"), dir_.path() + "/vbv-own.mxf", &own);
+        if (QTest::currentTestFailed()) return;
+        QCOMPARE(own.hrd, std::string());
+        // A variable rate of no more than 20 Mb/s into a 9,000 kbit buffer: 549 units of 16,384 bits.
+        ExportSettings vbr;
+        queued("vbr", 20000, 9000, QStringLiteral("no more than 20000 kbit/s with its VBV stated (8995 kbit)"), dir_.path() + "/vbv-vbr.mxf", &vbr);
+        if (QTest::currentTestFailed()) return;
+        QCOMPARE(vbr.hrd, std::string("vbr"));
+        QCOMPARE(vbr.vbvMaxrate, int64_t(20000000));
+        QCOMPARE(vbr.vbvBuffer, int64_t(9000000));
+        rendered(vbr, false, 20000000, 549 * 16384);
+        if (QTest::currentTestFailed()) return;
+        // A constant 8 Mb/s: XDCAM HD422's buffer would take 2.2 s to fill, longer than a vbv_delay can say, so the
+        // buffer is cut to the 355 units that fill in 0.73 s.
+        ExportSettings cbr;
+        queued("cbr", 8000, 0, QStringLiteral("a constant 8000 kbit/s with its VBV stated (5816 kbit)"), dir_.path() + "/vbv-cbr.mxf", &cbr);
+        if (QTest::currentTestFailed()) return;
+        rendered(cbr, true, 8000000, 355 * 16384);
+        if (QTest::currentTestFailed()) return;
+        // A buffer asked for that a constant 8 Mb/s cannot state is said to be one, and the export refuses it.
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(xdcam);
+            auto* hrd = ed.findChild<QComboBox*>("exportHrd");
+            hrd->setCurrentIndex(hrd->findData(QStringLiteral("cbr")));
+            ed.findChild<QSpinBox*>("exportHrdRate")->setValue(8000);
+            ed.findChild<QSpinBox*>("exportHrdBuffer")->setValue(9000);
+            const QString summary = ed.findChild<QLabel*>("exportSummary")->text();
+            QVERIFY2(summary.contains(QStringLiteral("a VBV buffer MPEG-2 cannot state at this rate (16 to 5816 kbit)")), qPrintable(summary));
+        }
+        ExportSettings tooLong = cbr;
+        tooLong.vbvBuffer = 9000000;
+        tooLong.path = (dir_.path() + "/vbv-too-long.mov").toStdString();
+        std::string err;
+        QVERIFY(!renderExport(state()->project(), state()->sequence()->id, tooLong, 0, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("16,384 to 5816320 bits at this rate"), err.c_str());
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(tooLong.path)));
+    }
+
     void dialogTaskHelper() {
         // Does nothing by itself. The tests of background tasks run this binary again with this as its only test, to
         // have a task begun, or taken up, in a process of its own that can be killed.
@@ -6629,6 +6934,60 @@ private slots:
         }
         disconnect(dialogs, &DialogJobs::finished, this, nullptr);
         state()->newProject();
+    }
+
+    void dialogTasksStayWithTheirProject() {
+        // A background task's result goes to the project it was begun on and to no other. Another project open when
+        // it ends (built the same way, so its sequence and clip ids are the same): the result is kept and offered,
+        // named with the project it was begun on, and applying it from the list is refused there. Its own project
+        // opened again: applied from the list.
+        DialogJobs* dialogs = win_->dialogJobs();
+        QVERIFY(dialogs);
+        auto build = [&]() -> Id {
+            state()->newProject();
+            const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+            if (ids.size() != 1) return Id(0);
+            const Id media = ids[0];
+            if (!state()->apply("Dialogue", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }))
+                return Id(0);
+            if (!state()->apply("Music", [media](Project& p, Sequence& s) {
+                    return edit::placeMedia(p, s, media, 0, 0, -1, V1, {TrackKind::Audio, 1}, false);
+                }))
+                return Id(0);
+            return trackAt(*state()->sequence(), {TrackKind::Audio, 1})->clips.front().id;
+        };
+        const Id music = build();
+        QVERIFY(music != Id(0));
+        const QString own = dir_.path() + "/task-own-project.montage";
+        QVERIFY(state()->save(own));
+        const auto gain = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), music);
+            return c && c->audio.params.count("gain_db") ? c->audio.params.at("gain_db") : Param(0.0);
+        };
+        QString offeredNote;
+        connect(dialogs, &DialogJobs::offered, this, [&](const QString&, const QString&, const QString& note) { offeredNote = note; });
+        auto done = qScopeGuard([&] {
+            disconnect(dialogs, &DialogJobs::offered, this, nullptr);
+            state()->newProject();
+        });
+        DuckOptions o;
+        const QString id = startInBackground(dialogs, [&] { AutoDuckDialog::apply(state(), {music}, {0}, o, win_.get()); });
+        QVERIFY(!id.isEmpty());
+        QCOMPARE(build(), music);
+        dialogs->setPaused(id, false);
+        QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 60000);
+        QVERIFY(!gain().animated());
+        QVERIFY2(offeredNote.contains("another project is open") && offeredNote.contains("task-own-project.montage"), qPrintable(offeredNote));
+        QCOMPARE(dialogs->offeredNote(id), offeredNote);
+        QString said;
+        QVERIFY(!dialogs->applyOffered(id, &said));
+        QVERIFY2(said.startsWith("It was not applied: another project is open"), qPrintable(said));
+        QVERIFY(!gain().animated());
+        QVERIFY(state()->open(own));
+        QVERIFY(!gain().animated());
+        QVERIFY2(dialogs->applyOffered(id, &said), qPrintable(said));
+        QVERIFY(gain().animated());
+        QCOMPARE(state()->undoText(), QString("Auto Duck"));
     }
 
     void dialogTasksLookedOver() {
@@ -6895,6 +7254,19 @@ private slots:
             QCOMPARE(result.value("issues").toArray().size(), 0);
             QCOMPARE(stretches(result), QString("0-6, 6-12, 12-18, 18-24"));
         }
+        // Told to go on before it reached the place it was to pause at: it goes on past that place to its end.
+        {
+            const QString parent = dir_.filePath("dcp-go-on");
+            qputenv("MONTAGE_JOBS_PAUSE_AT", "0.9");
+            const QString job = dialogs->start(state(), "dcp", "Making the DCP", dcpInput(parent));
+            qunsetenv("MONTAGE_JOBS_PAUSE_AT");
+            QVERIFY(!job.isEmpty());
+            dialogs->setPaused(job, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+            jobs::Record record;
+            QVERIFY(jobs::load(job, record));
+            QCOMPARE(record.status, QString("done"));
+        }
         // Stopped by hand part-way: no pictures are left in the folder.
         {
             const QString parent = dir_.filePath("dcp-stopped");
@@ -6912,6 +7284,34 @@ private slots:
             dialogs->stop(job);
             QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
             QVERIFY(QDir(parent).entryList({".montage-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+        }
+        // Stopped by hand while the made package is checked: the job is done, the package kept whole, and the window
+        // says it was made with its check stopped (not that it was cancelled).
+        {
+            const QString parent = dir_.filePath("dcp-check-stopped");
+            win_->statusBar()->clearMessage();
+            qputenv("MONTAGE_JOBS_PAUSE_AT", "0.9");
+            const QString job = dialogs->start(state(), "dcp", "Making the DCP", dcpInput(parent));
+            qunsetenv("MONTAGE_JOBS_PAUSE_AT");
+            QVERIFY(!job.isEmpty());
+            const auto paused = [&] {
+                for (const DialogJobs::TaskInfo& t : dialogs->tasks())
+                    if (t.id == job) return t.paused;
+                return false;
+            };
+            QTRY_VERIFY_WITH_TIMEOUT(paused(), 300000);
+            dialogs->stop(job);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+            const QJsonObject result = taskResult(job);
+            QVERIFY(result.value("stopped").toBool());
+            jobs::Record record;
+            QVERIFY(jobs::load(job, record));
+            QCOMPARE(record.status, QString("done"));
+            const QString folder = QString::fromStdString(dcpResultFromJson(result).folder);
+            QCOMPARE(QDir(parent).entryList({"JobTest_*"}, QDir::Dirs | QDir::NoDotAndDotDot).size(), 1);
+            QVERIFY(verifyDcp(folder.toStdString()).empty());
+            QVERIFY(dcpPictures(folder) == pictures);
+            QVERIFY2(win_->statusBar()->currentMessage().contains("its check was stopped"), qPrintable(win_->statusBar()->currentMessage()));
         }
 
         // ---- The IMF master.
@@ -11888,6 +12288,13 @@ private slots:
         QCOMPARE(mcpFoldedName(composed, McpNameRules::Windows), mcpFoldedName(decomposed, McpNameRules::Windows));
         QCOMPARE(mcpFoldedName(QStringLiteral("C:\\Users\\Ana\\DKDMs. \\new.xml::$DATA"), McpNameRules::Windows), QStringLiteral("c:/users/ana/dkdms/new.xml"));
         QCOMPARE(mcpFoldedName(QStringLiteral("C:/x/Roots.pem:$DATA"), McpNameRules::Windows), mcpFoldedName(QStringLiteral("c:/X/roots.pem"), McpNameRules::Windows));
+        // (the long and device forms of a name, and this machine's own share of a drive, as the names they stand for;
+        // another machine's share as itself)
+        for (const char* other : {"\\\\?\\C:\\Users\\Ana\\new.xml", "\\\\.\\C:\\Users\\Ana\\new.xml", "\\\\localhost\\C$\\Users\\Ana\\new.xml",
+                                  "//127.0.0.1/c$/Users/Ana/new.xml"})
+            QCOMPARE(mcpFoldedName(QString::fromLatin1(other), McpNameRules::Windows), QStringLiteral("c:/users/ana/new.xml"));
+        QCOMPARE(mcpFoldedName(QStringLiteral("\\\\?\\UNC\\Server\\Share\\x"), McpNameRules::Windows), QStringLiteral("//server/share/x"));
+        QCOMPARE(mcpFoldedName(QStringLiteral("\\\\elsewhere\\C$\\x"), McpNameRules::Windows), QStringLiteral("//elsewhere/c$/x"));
         QVERIFY(mcpFoldedName(QStringLiteral("/x/roots.pem:$DATA"), McpNameRules::Folded) != mcpFoldedName(QStringLiteral("/x/roots.pem"), McpNameRules::Folded));
         // Paths that do not exist yet, under this run's folder, are told apart by name alone.
         const QString folder = dir_.filePath("own-names");
@@ -11949,6 +12356,56 @@ private slots:
         QFile f(kept);
         QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll() == "<dkdm/>");
         QVERIFY(!QFileInfo::exists(dkdms + "/new.csv"));
+        // Nightly 25 Nov: a "name:" before a path, which FFmpeg takes off and QFile takes as a folder ("ab:" in the
+        // current one), is looked at both ways: "ab:/../Montage-DKDMs/new.csv" from this run's folder is Montage's
+        // DKDMs to QFile (and /Montage-DKDMs/new.csv to FFmpeg). Refused through the server too.
+        {
+            const QString cwdWas = QDir::currentPath();
+            auto back = qScopeGuard([&] { QDir::setCurrent(cwdWas); });
+#ifdef Q_OS_WIN
+            QVERIFY(QDir::setCurrent(folder));  // (Windows takes no ":" in a name, so no "ab:" folder can be made there)
+#else
+            QVERIFY(QDir::setCurrent(folder) && QDir().mkpath(folder + "/ab:"));
+#endif
+            QVERIFY(mcpPathReaches("ab:/../Montage-DKDMs/new.csv", dkdms, McpNameRules::Exact, false));
+            QVERIFY(mcpPathReaches("file:ab:/../Montage-DKDMs/new.csv", dkdms, McpNameRules::Exact, false));
+            QVERIFY(mcpPathReaches("ab:/..", dkdms, McpNameRules::Exact, true));
+            QVERIFY(!mcpPathReaches("ab:/../Montage-DKDMs2/new.csv", dkdms, McpNameRules::Exact, false));
+            QVERIFY(!mcpPathReaches("/Montage-DKDMs/new.csv", dkdms, McpNameRules::Exact, false));
+            for (const QString& path : {QStringLiteral("ab:/../Montage-DKDMs/new.csv"), QStringLiteral("md5:ab:/../Montage-DKDMs/new.csv")}) {
+                const QJsonObject r = call({{"path", path}});
+                QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+            }
+            QVERIFY(!QFileInfo::exists(dkdms + "/new.csv"));
+        }
+        // And montage_repair_media's relative output, which is beside the damaged file (here this run's folder, not
+        // the current one): "Montage-DKDMs/fixed.wav" is refused, and nothing is written there; elsewhere it repairs.
+        {
+            const QString damaged = folder + "/damaged.wav";
+            QFile w(damaged);
+            QVERIFY(w.open(QIODevice::WriteOnly));
+            QByteArray head("RIFF\xff\xff\xff\xffWAVEfmt ", 16);
+            const auto le = [&head](quint32 v, int bytes) {
+                for (int i = 0; i < bytes; ++i) head.append(char((v >> (8 * i)) & 0xff));
+            };
+            le(16, 4), le(1, 2), le(1, 2), le(48000, 4), le(96000, 4), le(2, 2), le(16, 2);
+            head.append("data", 4), le(0xffffffffu, 4);
+            QVERIFY(w.write(head) == 44 && w.write(QByteArray(9600, '\x10')) == 9600);
+            w.close();
+            QCOMPARE(checkRecording(damaged).kind, RepairKind::Wav);
+            auto repair = [&](const QString& output) {
+                const QJsonObject args{{"file", damaged}, {"output", output}};
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_repair_media"}, {"arguments", args}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QVERIFY(QDir::current().absolutePath() != QDir(folder).absolutePath());
+            const QJsonObject r = repair("Montage-DKDMs/fixed.wav");
+            QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+            QVERIFY(!QFileInfo::exists(dkdms + "/fixed.wav"));
+            const QJsonObject done = repair("fixed.wav");
+            QVERIFY2(!done.value("isError").toBool() && QFileInfo::exists(folder + "/fixed.wav"), QJsonDocument(done).toJson().constData());
+        }
     }
 
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
@@ -19091,6 +19548,378 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(edit::clipById(*state()->sequence(), red)->motion.params.at("rotation").repeat, Repeat::Hold);
     }
 
+    void keyframeStretchAndEasings() {
+        // Red's rotation keyed at 5, 15 and 25 with Bezier handles.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Keys", [red](Project&, Sequence& s) {
+            Param& r = edit::clipById(s, red)->motion.params["rotation"];
+            r.addKey(5, 0, Interp::Bezier);
+            r.addKey(15, 45, Interp::Bezier);
+            r.addKey(25, 90);
+            r.keys[0].outDt = 3, r.keys[0].outDv = 9;
+            r.keys[1].inDt = -2, r.keys[1].inDv = -6, r.keys[1].outDt = 2, r.keys[1].outDv = 6;
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        win_->raisePanel("keyframes");
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible() && panel->width() > 300);
+        QTRY_COMPARE(panel->clip(), red);
+        QCOMPARE(int(panel->rows().size()), 1);
+        const ParamAddress rot = panel->rows().front().address;
+        auto rotation = [&]() -> const Param& { return edit::clipById(*state()->sequence(), red)->motion.params.at("rotation"); };
+        auto times = [&] {
+            std::vector<FrameTime> t;
+            for (const Keyframe& k : rotation().keys) t.push_back(k.t);
+            return t;
+        };
+        using Times = std::vector<FrameTime>;
+        // Alt-dragging the last selected key to twice the selection's length stretches it from its first key: every
+        // time doubled (within a frame), the handles' times with them, in one undo step.
+        panel->select({{rot, 5}, {rot, 15}, {rot, 25}});
+        const size_t steps = state()->history().undoCount();
+        const QPoint last = panel->keyPoint(0, 25), twice = panel->keyPoint(0, 45);
+        QTest::mousePress(panel, Qt::LeftButton, Qt::AltModifier, last);
+        QMouseEvent move(QEvent::MouseMove, twice, panel->mapToGlobal(twice), Qt::NoButton, Qt::LeftButton, Qt::AltModifier);
+        QApplication::sendEvent(panel, &move);
+        QTest::mouseRelease(panel, Qt::LeftButton, Qt::AltModifier, twice);
+        const Times stretched = times();
+        QCOMPARE(stretched.size(), size_t(3));
+        QCOMPARE(stretched[0], FrameTime(5));
+        QVERIFY2(std::llabs(stretched[1] - 25) <= 1 && std::llabs(stretched[2] - 45) <= 1, qPrintable(QString("%1 %2").arg(stretched[1]).arg(stretched[2])));
+        const double factor = double(stretched[2] - 5) / 20;
+        QVERIFY(std::fabs(rotation().keys[0].outDt - 3 * factor) < 1e-9 && rotation().keys[0].outDv == 9);
+        QVERIFY(std::fabs(rotation().keys[1].inDt + 2 * factor) < 1e-9 && std::fabs(rotation().keys[1].outDt - 2 * factor) < 1e-9);
+        QCOMPARE(state()->history().undoCount(), steps + 1);
+        QCOMPARE(QString::fromStdString(state()->history().undoLabel()), QString("Stretch Keyframes"));
+        QCOMPARE(panel->selection().size(), size_t(3));  // the keys where they went
+        state()->undo();
+        QCOMPARE(times(), (Times{5, 15, 25}));
+        // The same from the panel's API, about the last key; refused when it would pass the clip's start.
+        panel->select({{rot, 15}, {rot, 25}});
+        QVERIFY(panel->stretchSelected(0.5, true));
+        QCOMPARE(times(), (Times{5, 20, 25}));
+        state()->undo();
+        panel->select({{rot, 15}, {rot, 25}});
+        QVERIFY(!panel->stretchSelected(3.0, true));  // 15 would go to -5
+        QCOMPARE(times(), (Times{5, 15, 25}));
+
+        // An easing from the panel's menu (Easing Curve, Elastic, Out) on the first key: the curve between 5 and 15
+        // at its eleven frames is the formula's, within 1e-6.
+        panel->select({});
+        QStringList offered;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            for (QAction* a : menu->findChildren<QAction*>())
+                if (!a->objectName().isEmpty()) offered << a->objectName();
+            for (QAction* a : menu->findChildren<QAction*>())
+                if (a->objectName() == "elastic_out") a->trigger();
+            menu->close();
+        });
+        const QPoint first = panel->keyPoint(0, 5);
+        QContextMenuEvent menuEvent(QContextMenuEvent::Mouse, first, panel->mapToGlobal(first));
+        QApplication::sendEvent(panel, &menuEvent);
+        for (Interp i : allInterps())
+            if (isEasing(i)) QVERIFY2(offered.contains(interpName(i)), interpName(i));
+        QCOMPARE(rotation().keys[0].interp, Interp::ElasticOut);
+        QVERIFY(panel->keyText({rot, 5}).contains("Elastic Out"));
+        auto elasticIn = [](double u) { return u == 0 ? 0.0 : -std::pow(2.0, 10 * u - 10) * std::sin((10 * u - 10.75) * 2 * M_PI / 3); };
+        auto bounceOut = [](double u) {
+            if (u < 1 / 2.75) return 7.5625 * u * u;
+            if (u < 2 / 2.75) return 7.5625 * (u - 1.5 / 2.75) * (u - 1.5 / 2.75) + 0.75;
+            if (u < 2.5 / 2.75) return 7.5625 * (u - 2.25 / 2.75) * (u - 2.25 / 2.75) + 0.9375;
+            return 7.5625 * (u - 2.625 / 2.75) * (u - 2.625 / 2.75) + 0.984375;
+        };
+        auto bounceInOut = [&](double u) { return u < 0.5 ? (1 - bounceOut(1 - 2 * u)) / 2 : 1 - (1 - bounceOut(2 * u - 1)) / 2; };
+        for (int j = 0; j <= 10; ++j) {
+            const double want = 45 * (1 - elasticIn(1 - j / 10.0));
+            QVERIFY2(std::fabs(rotation().at(5 + j) - want) < 1e-6, qPrintable(QString("%1: %2, not %3").arg(j).arg(rotation().at(5 + j)).arg(want)));
+        }
+
+        // Over MCP: read with its name and the values at the eleven frames, set to another easing, and stretched.
+        const QString project = dir_.path() + "/easing-mcp.montage";
+        QVERIFY(state()->save(project));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonArray at;
+        for (int j = 0; j <= 10; ++j) at.append(5 + j);
+        QJsonObject r = call("montage_keyframes", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"at", at}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject got = r.value("structuredContent").toObject();
+        QCOMPARE(got.value("keys").toArray().at(0).toObject().value("interpolation").toString(), QString("elastic_out"));
+        for (int j = 0; j <= 10; ++j)
+            QVERIFY(std::fabs(got.value("values").toArray().at(j).toDouble() - 45 * (1 - elasticIn(1 - j / 10.0))) < 1e-6);
+        r = call("montage_keyframes", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"action", "set"},
+                                       {"keys", QJsonArray{QJsonObject{{"frame", 5}, {"interpolation", "bounce_in_out"}}}}, {"at", at}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        got = r.value("structuredContent").toObject();
+        QCOMPARE(got.value("keys").toArray().at(0).toObject().value("interpolation").toString(), QString("bounce_in_out"));
+        QCOMPARE(got.value("keys").toArray().at(0).toObject().value("value").toDouble(), 0.0);  // (its value kept)
+        for (int j = 0; j <= 10; ++j) QVERIFY(std::fabs(got.value("values").toArray().at(j).toDouble() - 45 * bounceInOut(j / 10.0)) < 1e-6);
+        QVERIFY(call("montage_keyframes", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"action", "set"},
+                                           {"keys", QJsonArray{QJsonObject{{"frame", 5}, {"interpolation", "wobbly"}}}}})
+                    .value("isError").toBool());
+        r = call("montage_scale_keys", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"factor", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Param& scaled = edit::clipById(*back.active(), red)->motion.params.at("rotation");
+        QCOMPARE(scaled.keys.at(1).t, FrameTime(25));
+        QCOMPARE(scaled.keys.at(2).t, FrameTime(45));
+        QCOMPARE(scaled.keys.at(1).inDt, -4.0);
+        QCOMPARE(scaled.keys.at(0).interp, Interp::BounceInOut);
+        // Too far for the clip: refused, nothing written.
+        QVERIFY(call("montage_scale_keys", {{"project", project}, {"clip", double(red)}, {"param", "rotation"}, {"factor", 1000}}).value("isError").toBool());
+        state()->newProject();
+    }
+
+    void pinchAndSwipeGestures() {
+        loadDemo();
+        state()->setPlayhead(10);
+        MonitorPanel* program = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY(!viewer->imageRect().isEmpty());
+        viewer->fitView();
+        auto gesture = [](QWidget* w, Qt::NativeGestureType type, QPointF at, double value, QPointF delta = {}) {
+            QNativeGestureEvent e(type, QPointingDevice::primaryPointingDevice(), 2, at, QPointF(w->mapTo(w->window(), at.toPoint())),
+                                  QPointF(w->mapToGlobal(at.toPoint())), value, delta);
+            QApplication::sendEvent(w, &e);
+            return e.isAccepted();
+        };
+        // A pinch of 0.5 (Qt gives the change in scale, -0.5) halves the monitor's zoom, the picture's pixel under the
+        // pointer staying within a pixel of it.
+        const QPointF at(viewer->width() * 0.3, viewer->height() * 0.4);
+        QRectF r = viewer->imageRect();
+        QVERIFY(r.contains(at));
+        const QPointF pixel((at.x() - r.left()) / r.width(), (at.y() - r.top()) / r.height());
+        QVERIFY(gesture(viewer, Qt::ZoomNativeGesture, at, -0.5));
+        QCOMPARE(viewer->zoom(), 0.5);
+        r = viewer->imageRect();
+        QVERIFY(QLineF(QPointF(r.left() + pixel.x() * r.width(), r.top() + pixel.y() * r.height()), at).length() <= 1);
+        // Zoomed in (to 3), the same.
+        QVERIFY(gesture(viewer, Qt::ZoomNativeGesture, at, 5.0));
+        QCOMPARE(viewer->zoom(), 3.0);
+        r = viewer->imageRect();
+        QVERIFY(QLineF(QPointF(r.left() + pixel.x() * r.width(), r.top() + pixel.y() * r.height()), at).length() <= 1);
+        // A swipe to the right moves the picture a quarter of the monitor right; a pan follows the fingers.
+        const QPointF before = viewer->pan();
+        gesture(viewer, Qt::SwipeNativeGesture, at, 0);
+        QVERIFY(std::fabs(viewer->pan().x() - before.x() - viewer->width() / 4.0) < 1e-6 && std::fabs(viewer->pan().y() - before.y()) < 1e-6);
+        gesture(viewer, Qt::PanNativeGesture, at, 0, QPointF(-12, 7));
+        QVERIFY(std::fabs(viewer->pan().x() - before.x() - viewer->width() / 4.0 + 12) < 1e-6 && std::fabs(viewer->pan().y() - before.y() - 7) < 1e-6);
+        // A smart zoom (double tap) fits it again.
+        gesture(viewer, Qt::SmartZoomNativeGesture, at, 0);
+        QCOMPARE(viewer->zoom(), 1.0);
+        QCOMPARE(viewer->pan(), QPointF());
+        // The Source monitor's viewer takes them too.
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Source) {
+                QVERIFY(gesture(m->viewer(), Qt::ZoomNativeGesture, QPointF(10, 10), 1.0));
+                QCOMPARE(m->viewer()->zoom(), 2.0);
+                m->viewer()->fitView();
+            }
+
+        // On the timeline, a pinch zooms time about the pointer: the time under it stays (within a pixel); a swipe
+        // and a pan scroll.
+        timeline()->zoomToFit();
+        const int x = 176 + (viewport()->width() - 176) / 2;
+        const double ppf = timeline()->pixelsPerFrame(), under = timeline()->frameAtViewportX(x);
+        QVERIFY(gesture(viewport(), Qt::ZoomNativeGesture, QPointF(x, 40), 3.0));
+        QVERIFY(std::fabs(timeline()->pixelsPerFrame() - 4 * ppf) < 1e-9);
+        QVERIFY2(std::fabs(timeline()->frameAtViewportX(x) - under) * timeline()->pixelsPerFrame() <= 1,
+                 qPrintable(QString("%1 %2").arg(timeline()->frameAtViewportX(x)).arg(under)));
+        QVERIFY(gesture(viewport(), Qt::ZoomNativeGesture, QPointF(x, 40), -0.5));
+        QVERIFY(std::fabs(timeline()->pixelsPerFrame() - 2 * ppf) < 1e-9);
+        QVERIFY(std::fabs(timeline()->frameAtViewportX(x) - under) * timeline()->pixelsPerFrame() <= 1);
+        const int scrolled = timeline()->horizontalScrollBar()->value();
+        gesture(viewport(), Qt::PanNativeGesture, QPointF(x, 40), 0, QPointF(-30, 0));
+        QCOMPARE(timeline()->horizontalScrollBar()->value(), std::min(timeline()->horizontalScrollBar()->maximum(), scrolled + 30));
+        gesture(viewport(), Qt::SwipeNativeGesture, QPointF(x, 40), 0);  // to the right: back towards the start
+        QCOMPARE(timeline()->horizontalScrollBar()->value(),
+                 std::max(0, std::min(timeline()->horizontalScrollBar()->maximum(), scrolled + 30) - int(std::lround(viewport()->width() / 4.0))));
+        timeline()->zoomToFit();
+    }
+
+    void stillEditedInAnotherApplication() {
+        // A red still on V1, edited "elsewhere": the launcher stands in for the other application and a helper writes
+        // a green picture over the copy it was given.
+        state()->newProject();
+        const QString png = dir_.path() + "/edited-still.png";
+        QImage red(64, 36, QImage::Format_RGB32);
+        red.fill(qRgb(220, 0, 0));
+        QVERIFY(red.save(png));
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 64, s.height = 36;
+            return edit::placeMedia(p, s, ids[0], 0, 0, 30, V1, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        // (saved, so the copies go in "Edited Stills" beside it, in this test's folder)
+        QVERIFY(state()->save(dir_.path() + "/edited-still.montage"));
+        auto shown = [&] {
+            const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), 5, {});
+            return QColor::fromRgbF(f.at(32, 18)[0], f.at(32, 18)[1], f.at(32, 18)[2]);
+        };
+        QVERIFY2(shown().red() > 200 && shown().green() < 30, qPrintable(shown().name()));
+        StillEditor* editor = StillEditor::of(state());
+        QVERIFY(editor->canEdit(ids[0]));
+        const QString program = StillEditor::program();
+        StillEditor::setProgram({});
+        QString why;
+        QVERIFY(!editor->edit(ids[0], &why) && why.contains("Choose"));  // none chosen yet
+        StillEditor::setProgram(QStringLiteral("/opt/Picture Editor/editor"));
+        QStringList launched;
+        StillEditor::setLauncherForTesting([&](const QString& prog, const QString& file) {
+            launched << prog << file;
+            return true;
+        });
+        // From the clip's menu on the timeline.
+        state()->setSelection({clip}, false);
+        bool offered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            for (QAction* a : menu->findChildren<QAction*>())
+                if (a->objectName() == "editStillElsewhere") {
+                    offered = true;
+                    a->trigger();
+                }
+            menu->close();
+        });
+        const QPoint on = pointFor(1, V1);
+        QContextMenuEvent menuEvent(QContextMenuEvent::Mouse, on, viewport()->mapToGlobal(on));
+        QApplication::sendEvent(viewport(), &menuEvent);
+        QVERIFY(offered);
+        QCOMPARE(launched.size(), 2);
+        QCOMPARE(launched[0], QString("/opt/Picture Editor/editor"));
+        const QString copy = launched[1];
+        QCOMPARE(copy, editor->workingCopy(ids[0]));
+        QVERIFY(QFileInfo(copy).fileName().startsWith("edited-still (editing)") && copy != png);
+        QCOMPARE(QFileInfo(copy).absolutePath(), QDir(dir_.path()).filePath("Edited Stills"));
+        // The helper saves a green picture over it: within a second the clip shows it, as one undo step, the still
+        // keeping its name and the original untouched.
+        const size_t steps = state()->history().undoCount();
+        QImage green(64, 36, QImage::Format_RGB32);
+        green.fill(qRgb(0, 210, 0));
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY(green.save(copy));
+        while (shown().green() < 200 && clock.elapsed() < 1000) QTest::qWait(20);
+        QVERIFY2(shown().green() > 200 && shown().red() < 30, qPrintable(QString::number(clock.elapsed())));
+        QCOMPARE(state()->history().undoCount(), steps + 1);
+        QCOMPARE(QString::fromStdString(state()->history().undoLabel()), QString("Edit in Another Application"));
+        QCOMPARE(state()->project().findMedia(ids[0])->name, std::string("edited-still.png"));
+        QVERIFY(QFileInfo(QString::fromStdString(state()->project().findMedia(ids[0])->path)).fileName().startsWith("edited-still v2"));
+        QCOMPARE(QImage(png).pixel(5, 5), qRgb(220, 0, 0));
+        // Undo shows the picture from before; redo the edited one.
+        state()->undo();
+        QVERIFY(shown().red() > 200);
+        state()->redo();
+        QVERIFY(shown().green() > 200);
+        // Saved again (blue): the next version, another undo step.
+        QImage blue(64, 36, QImage::Format_RGB32);
+        blue.fill(qRgb(0, 0, 230));
+        QVERIFY(blue.save(copy));
+        clock.restart();
+        while (shown().blue() < 200 && clock.elapsed() < 1000) QTest::qWait(20);
+        QVERIFY(shown().blue() > 200);
+        QCOMPARE(state()->history().undoCount(), steps + 2);
+        StillEditor::setLauncherForTesting({});
+        StillEditor::setProgram(program);
+        state()->newProject();
+    }
+
+    void encodeFoldersEncodeEachFileOnce() {
+        // A folder encoded to WAV: three files copied into it slowly are each encoded once they stop growing, a
+        // fourth still being written waits, and after a restart nothing is encoded again.
+        const QString in = dir_.path() + "/encode-in", out = dir_.path() + "/encode-out";
+        QVERIFY(QDir().mkpath(in) && QDir().mkpath(out));
+        QVERIFY(win_->findChild<QAction*>("encodeFolders"));
+        const std::vector<EncodeFolder> saved = savedEncodeFolders();
+        saveEncodeFolders({{in, "Audio - WAV 24-bit", out}});
+        auto* jobs = EncodeFolderJobs::of(win_.get(), state());
+        jobs->setSettleMs(700);
+        const int startedBefore = jobs->started();
+        QFile source(QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        const QByteArray wav = source.readAll();
+        auto pause = [](int ms) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) QTest::qWait(20);
+        };
+        // Written in four pieces 200 ms apart.
+        auto slowCopy = [&](const QString& name) {
+            QFile f(in + "/" + name);
+            if (!f.open(QIODevice::WriteOnly)) return false;
+            const qint64 piece = wav.size() / 4 + 1;
+            for (qint64 at = 0; at < wav.size(); at += piece) {
+                f.write(wav.mid(at, piece));
+                f.flush();
+                pause(200);
+            }
+            return true;
+        };
+        for (const char* name : {"one.wav", "two.wav", "three.wav"}) QVERIFY(slowCopy(name));
+        // The fourth: a piece every 200 ms for as long as the others take.
+        QFile fourth(in + "/four.wav");
+        QVERIFY(fourth.open(QIODevice::WriteOnly));
+        auto encodedFiles = [&] { return QDir(out).entryList({"*.wav"}, QDir::Files); };
+        QElapsedTimer clock;
+        clock.start();
+        qint64 written = 0;
+        while (encodedFiles().size() < 3 && clock.elapsed() < 60000) {
+            fourth.write(wav.mid(written, 4096));
+            fourth.flush();
+            written += 4096;
+            pause(200);
+            QVERIFY(!encodedFiles().contains("four.wav"));
+        }
+        QCOMPARE(encodedFiles(), (QStringList{"one.wav", "three.wav", "two.wav"}));
+        QCOMPARE(jobs->started() - startedBefore, 3);
+        for (const QString& f : encodedFiles()) {
+            MediaItem m;
+            QVERIFY(probeMedia((out + "/" + f).toStdString(), m));
+            QVERIFY(m.hasAudio && std::fabs(m.duration - 11.0) < 0.3);
+        }
+        // Once the fourth is whole and left, it is encoded too.
+        fourth.write(wav.mid(written));
+        fourth.close();
+        clock.restart();
+        while (encodedFiles().size() < 4 && clock.elapsed() < 60000) pause(100);
+        QCOMPARE(encodedFiles().size(), 4);
+        QTRY_COMPARE_WITH_TIMEOUT(jobs->pending(), 0, 30000);
+        QCOMPARE(jobs->started() - startedBefore, 4);
+        std::map<QString, QDateTime> made;
+        for (const QString& f : encodedFiles()) made[f] = QFileInfo(out + "/" + f).lastModified();
+        // After a restart (a new watcher reading the ledger): nothing is encoded again.
+        delete jobs;
+        jobs = EncodeFolderJobs::of(win_.get(), state());
+        jobs->setSettleMs(700);
+        pause(2500);
+        QCOMPARE(jobs->started(), 0);
+        for (const QString& f : encodedFiles()) QCOMPARE(QFileInfo(out + "/" + f).lastModified(), made[f]);
+        EncodeFolderScan ledger({in, "Audio - WAV 24-bit", out});
+        QCOMPARE(ledger.encodedCount(), 4);
+        for (const char* name : {"one.wav", "two.wav", "three.wav", "four.wav"}) QVERIFY(ledger.encoded(name));
+        saveEncodeFolders(saved);
+        jobs->reloadFolders();
+    }
+
     void keyframeCopyPaste() {
         // Red's opacity fade and a blur's radius, copied and pasted onto Blue at the playhead.
         loadDemo();
@@ -23937,9 +24766,21 @@ print("added " + ui["name"])
     }
 
     void av1GrainExportSetting() {
-        // The export dialog offers Carry grain as parameters for AV1 presets only, not with a frame rate change, and
-        // the export it sets up measures each shot's grain; the choice is kept for the next export.
+        // The export dialog offers Carry grain as parameters for AV1 presets only (with a frame rate change too), and
+        // the export it sets up measures each shot's grain, or carries a profile saved by name (the project's, then
+        // the user's library's) as that profile's text; the choices are kept for the next export.
         loadDemo();
+        const QByteArray library = (dir_.path() + "/grain-library.json").toUtf8();
+        qputenv("MONTAGE_GRAIN_LIBRARY", library);
+        auto putBack = qScopeGuard([this] {
+            qunsetenv("MONTAGE_GRAIN_LIBRARY");
+            appSettings().remove("export/filmGrainProfile");
+            state()->mutableProject().grainProfiles.clear();
+        });
+        const std::string day2 = grainProfileText(stockGrain(1)), oldStock = grainProfileText(stockGrain(2));
+        state()->mutableProject().grainProfiles["Day 2 plate"] = day2;
+        std::string why;
+        QVERIFY2(saveUserGrainProfile("Old stock", stockGrain(2), &why), why.c_str());
         // (the dialog keeps the preset last used: put back as it was)
         const QVariant lastPreset = appSettings().value("export/preset");
         RenderQueue* queue = win_->renderQueue();
@@ -23955,18 +24796,26 @@ print("added " + ui["name"])
             ed.setQueue(queue);
             auto* preset = ed.findChild<QComboBox*>("exportPreset");
             auto* grain = ed.findChild<QCheckBox*>("exportFilmGrain");
-            QVERIFY(preset && grain);
+            auto* which = ed.findChild<QComboBox*>("exportFilmGrainProfile");
+            QVERIFY(preset && grain && which);
+            QCOMPARE(which->count(), 3);
+            QCOMPARE(which->itemData(0).toString(), QStringLiteral("measure"));
+            QCOMPARE(which->itemText(1), QStringLiteral("Day 2 plate (this project)"));
+            QCOMPARE(which->itemText(2), QStringLiteral("Old stock (library)"));
             preset->setCurrentIndex(mp4);
-            QVERIFY(!grain->isEnabled());
+            QVERIFY(!grain->isEnabled() && !which->isEnabled());
             preset->setCurrentIndex(av1);
             QVERIFY(grain->isEnabled());
             if (auto* rate = ed.findChild<QComboBox*>("exportRate"); rate && rate->count() > 1) {
                 rate->setCurrentIndex(1);
-                QVERIFY(!grain->isEnabled());
-                rate->setCurrentIndex(0);
                 QVERIFY(grain->isEnabled());
+                rate->setCurrentIndex(0);
             }
+            grain->setChecked(false);
+            QVERIFY(!which->isEnabled());
             grain->setChecked(true);
+            QVERIFY(which->isEnabled());
+            which->setCurrentIndex(0);
             ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/grain.mp4");
             ed.findChild<QPushButton*>("addToQueue")->click();
             QCOMPARE(queue->jobs().size(), jobs + 1);
@@ -23975,9 +24824,23 @@ print("added " + ui["name"])
             QCOMPARE(job.settings.videoCodec, std::string("libsvtav1"));
             queue->remove(job.id);
         }
+        // A profile by name: the job carries its text (the project's, then the library's).
+        for (int i : {1, 2}) {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(av1);
+            ed.findChild<QCheckBox*>("exportFilmGrain")->setChecked(true);
+            ed.findChild<QComboBox*>("exportFilmGrainProfile")->setCurrentIndex(i);
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/grain-named.mp4");
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(queue->jobs().size(), jobs + 1);
+            QCOMPARE(queue->jobs().back().settings.filmGrain, i == 1 ? day2 : oldStock);
+            queue->remove(queue->jobs().back().id);
+        }
         {
             ExportDialog again(state(), win_.get());
             QVERIFY(again.findChild<QCheckBox*>("exportFilmGrain")->isChecked());
+            QCOMPARE(again.findChild<QComboBox*>("exportFilmGrainProfile")->currentText(), QStringLiteral("Old stock (library)"));
         }
         appSettings().remove("export/filmGrain");
         if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
@@ -24632,25 +25495,337 @@ print("added " + ui["name"])
                 tenBit = true;
         QVERIFY2(tenBit, "no 10-bit buffer in Weston's protocol log");
         // Weston's screenshot of its PQ output: each bar's middle is the ramp's PQ code (8 bits) within 2.
-        const QImage shot = screenshot(QStringLiteral("hdr.png"));
-        QVERIFY2(!shot.isNull(), qPrintable(noShot));
-        const QRectF r = viewer.imageRect().translated(QPointF(viewer.mapTo(viewer.window(), QPoint(0, 0))));
-        QStringList said;
-        bool right = true;
-        for (int i = 0; i < 8; ++i) {
-            const QPoint at(int(r.left() + (i + 0.5) * r.width() / 8), int(r.center().y()));
-            QVERIFY(shot.rect().contains(at));
-            float signal[3] = {float(nits[i] / 203), float(nits[i] / 203), float(nits[i] / 203)};
-            hdrSurfaceSignal(signal, Transfer::Pq);
-            QVERIFY(std::fabs(signal[1] - nitsToCode(pq, nits[i])) < 1e-4);
-            const int expect = int(std::lround(signal[1] * 255));
-            const QRgb px = shot.pixel(at);
-            if (std::abs(qRed(px) - expect) > 2 || std::abs(qGreen(px) - expect) > 2 || std::abs(qBlue(px) - expect) > 2) right = false;
-            said << QStringLiteral("bar %1 (%2 nits) at %3,%4: %5 %6 %7, expected %8").arg(i).arg(nits[i]).arg(at.x()).arg(at.y())
-                        .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect);
+        auto bars = [&](const QString& name) {
+            const QImage shot = screenshot(name);
+            if (shot.isNull()) return noShot;
+            const QRectF r = viewer.imageRect().translated(QPointF(viewer.mapTo(viewer.window(), QPoint(0, 0))));
+            QStringList said;
+            bool right = true;
+            for (int i = 0; i < 8; ++i) {
+                const QPoint at(int(r.left() + (i + 0.5) * r.width() / 8), int(r.center().y()));
+                if (!shot.rect().contains(at)) return QStringLiteral("bar %1 is off the screenshot").arg(i);
+                float signal[3] = {float(nits[i] / 203), float(nits[i] / 203), float(nits[i] / 203)};
+                hdrSurfaceSignal(signal, Transfer::Pq);
+                if (std::fabs(signal[1] - nitsToCode(pq, nits[i])) >= 1e-4) return QStringLiteral("PQ's code for bar %1 is not PQ's").arg(i);
+                const int expect = int(std::lround(signal[1] * 255));
+                const QRgb px = shot.pixel(at);
+                if (std::abs(qRed(px) - expect) > 2 || std::abs(qGreen(px) - expect) > 2 || std::abs(qBlue(px) - expect) > 2) right = false;
+                said << QStringLiteral("bar %1 (%2 nits) at %3,%4: %5 %6 %7, expected %8").arg(i).arg(nits[i]).arg(at.x()).arg(at.y())
+                            .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect);
+            }
+            qInfo().noquote() << "Weston's screenshot" << name << said.join(QStringLiteral("; "));
+            return right ? QString() : said.join(QStringLiteral("; "));
+        };
+        const QString pqBars = bars(QStringLiteral("hdr.png"));
+        QVERIFY2(pqBars.isEmpty(), qPrintable(pqBars));
+        // The same light from a sequence in HLG: the surface described with HLG's transfer (named transfer 13) where
+        // Weston lists it, and with PQ, the picture converted, where it does not (Weston 16.0.2's colour manager lists
+        // no HLG), when Weston's screenshot is the ramp's PQ code within 2 again. (Qt's description is PQ for both.)
+        // On the surface showing the ramp, as when another sequence comes up in the viewer: its description changes
+        // (an HLG sequence's peak is 1000 nits, the ramp's 800). Weston 16.0.2 drops a shown surface's colour
+        // transformation when its description changes and makes it again only when it next rebuilds its list of
+        // views, leaving the surface out of every repaint until then ("skipped repaint: shader config failure" in
+        // its log), so the surface is taken off the screen and mapped again with its next frame (WaylandColor::remap).
+        const bool westonHlg = logged(QStringLiteral(".supported_tf_named(13)"));
+        const Transfer hlgDescribed = westonHlg && !throughQt ? Transfer::Hlg : Transfer::Pq;
+        qInfo().noquote() << "Weston" << (westonHlg ? "lists" : "does not list") << "HLG's transfer";
+        auto hlg = std::make_shared<HdrPicture>(*ramp);
+        hlg->transfer = Transfer::Hlg;
+        hlg->contentPeak = hdrContentPeak(*findColorSpace("rec2100hlg"), 1000);
+        const int beforeHlg = drawn();
+        viewer.setHdrPicture(hlg);
+        QTRY_VERIFY2_WITH_TIMEOUT(drawn() > beforeHlg, qPrintable(viewer.hdrSurface() ? QStringLiteral("no frame drawn") : viewer.hdrStatus()),
+                                  10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(described() == hlgDescribed, qPrintable(viewer.hdrStatus()), 10000);
+        QCOMPARE(viewer.hdrSurface(), surface);  // (the same surface, still showing)
+        if (!throughQt) {
+            // Described anew (Montage's binding): taken off the screen with what was set (a commit with no buffer)
+            // and mapped again by the next frame, after which the surface is on its output again.
+            QTRY_VERIFY2(logged(QStringLiteral(".set_mastering_luminance(50, 1000)")), "the new description is not in Weston's protocol log");
+            QTRY_VERIFY2(logged(QStringLiteral(".attach(nil, 0, 0)")), "no commit without a buffer in Weston's protocol log");
+            QTRY_VERIFY2_WITH_TIMEOUT(surface->waylandEntered(), "the surface's next frame was not reported", 10000);
         }
-        qInfo().noquote() << "Weston's screenshot:" << said.join(QStringLiteral("; "));
-        QVERIFY2(right, qPrintable(said.join(QStringLiteral("; "))));
+        QVERIFY2(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()));
+        if (hlgDescribed == Transfer::Hlg) {
+            QTRY_VERIFY2(logged(QStringLiteral(".set_tf_named(13)")), "no HLG description in Weston's protocol log");
+        } else {
+            QTest::qWait(500);  // (Weston repaints)
+            const QString hlgBars = bars(QStringLiteral("hlg.png"));
+            QVERIFY2(hlgBars.isEmpty(), qPrintable(hlgBars));
+        }
+#endif
+    }
+
+    void hdrViewerOnTwoOutputs() {
+        // Under a nested Weston with two outputs (scripts/wayland-hdr-check.sh's "two" run, in CI): Weston on its
+        // Wayland backend in an outer Weston, with its desktop shell and colour management, its output wayland0 SDR
+        // (1280x640) and wayland1 BT.2100 PQ (1024x720, reference white 203 nits, peak 1000). The viewer's window goes
+        // full screen on the SDR output, then on the PQ one, then on the SDR one again, as when a user moves it from
+        // one display to the other. Each time Weston's protocol log has Montage's surface entering that output, and the
+        // viewer is SDR and says why on the SDR output, and shows HDR, described anew as PQ, on the PQ one.
+        const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
+        if (log.isEmpty() || qEnvironmentVariable("MONTAGE_TEST_WESTON_CM") != QLatin1String("two") ||
+            !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
+            QSKIP("Runs under a nested Weston with two outputs (scripts/wayland-hdr-check.sh)");
+#ifndef MONTAGE_HDR_VIEWER
+        QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
+#else
+        QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
+        const bool throughQt = hdrViewerOnWaylandThroughQt();
+        QScreen* sdrScreen = nullptr;
+        QScreen* pqScreen = nullptr;
+        QStringList names;
+        for (QScreen* s : QGuiApplication::screens()) {
+            names << s->name();
+            if (s->name() == QLatin1String("wayland0")) sdrScreen = s;
+            if (s->name() == QLatin1String("wayland1")) pqScreen = s;
+        }
+        QVERIFY2(sdrScreen && pqScreen, qPrintable(names.join(QStringLiteral(", "))));
+        QCOMPARE(sdrScreen->size(), QSize(1280, 640));
+        QCOMPARE(pqScreen->size(), QSize(1024, 720));
+        // Montage's lines of the protocol log (the desktop shell's own client is in it too), from a byte offset on.
+        const QByteArray pid = QStringLiteral("(PID %1)").arg(QCoreApplication::applicationPid()).toLatin1();
+        auto ours = [&](qint64 from) {
+            QList<QByteArray> lines;
+            QFile f(log);
+            if (!f.open(QIODevice::ReadOnly) || !f.seek(from)) return lines;
+            for (const QByteArray& line : f.readAll().split('\n'))
+                if (line.contains(pid)) lines << line;
+            return lines;
+        };
+        auto logEnd = [&] { return QFileInfo(log).size(); };
+        // The wl_output Montage has for an output, from its name event: wl_output's own (version 4, which Qt 6.12
+        // binds), or the name event of the xdg_output made for it (Qt 6.8 binds wl_output at version 3, without one).
+        auto output = [&](const char* name) {
+            const QByteArray said = QByteArray(".name(\"") + name + "\")";
+            static const QByteArray made = "get_xdg_output(new id ";
+            QHash<QByteArray, QByteArray> outputOf;  // (zxdg_output_v1@n: its wl_output@m)
+            for (const QByteArray& line : ours(0)) {
+                qsizetype at = line.indexOf(made);
+                if (at >= 0) {
+                    const qsizetype id = at + made.size(), comma = line.indexOf(", ", id), close = line.indexOf(')', comma);
+                    if (comma > id && close > comma) outputOf[line.mid(id, comma - id)] = line.mid(comma + 2, close - comma - 2);
+                    continue;
+                }
+                if (!line.contains(said)) continue;
+                if ((at = line.indexOf(" ev wl_output@")) >= 0) return line.mid(at + 4, line.indexOf('.', at) - at - 4);
+                if ((at = line.indexOf(" ev zxdg_output_v1@")) >= 0) {
+                    const QByteArray wl = outputOf.value(line.mid(at + 4, line.indexOf('.', at) - at - 4));
+                    if (!wl.isEmpty()) return wl;
+                }
+            }
+            return QByteArray();
+        };
+        auto said = [&](qint64 from, const QByteArray& what) {
+            for (const QByteArray& line : ours(from))
+                if (line.contains(what)) return true;
+            return false;
+        };
+        // The configure Weston sent after `first` acknowledged (its own serial: an ack of an earlier configure, sent
+        // after `first` but before Weston's answer to it, does not count, as Qt has not taken the answer then).
+        auto answered = [&](qint64 from, const QByteArray& first) {
+            bool seen = false;
+            QByteArray ack;
+            for (const QByteArray& line : ours(from)) {
+                if (!ack.isEmpty() && line.contains(ack)) return true;
+                if (!seen) {
+                    seen = line.contains(first);
+                    continue;
+                }
+                const qsizetype at = line.indexOf(" ev xdg_surface@");
+                const qsizetype open = at < 0 ? -1 : line.indexOf(".configure(", at);
+                if (ack.isEmpty() && open > at && at >= 0) {
+                    const qsizetype close = line.indexOf(')', open);
+                    ack = ".ack_configure(" + line.mid(open + 11, close - open - 11) + ")";
+                }
+            }
+            return false;
+        };
+        QByteArray sdrOutput, pqOutput;
+        QTRY_VERIFY(!(sdrOutput = output("wayland0")).isEmpty() && !(pqOutput = output("wayland1")).isEmpty());
+        qInfo().noquote() << "Montage's outputs:" << sdrOutput << "(SDR)," << pqOutput << "(PQ)";
+
+        win_->hide();
+        auto restore = qScopeGuard([this] { win_->show(); });
+        ViewerWidget viewer;
+        viewer.resize(640, 360);  // (its size when not full screen)
+        viewer.winId();
+        viewer.windowHandle()->setScreen(sdrScreen);
+        qint64 from = logEnd();
+        const qint64 shown = from;
+        viewer.showFullScreen();
+        QVERIFY(QTest::qWaitForWindowExposed(&viewer));
+        QTRY_COMPARE_WITH_TIMEOUT(viewer.size(), sdrScreen->size(), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(said(from, ".enter(" + sdrOutput + ")"), "Montage's window did not enter the SDR output", 10000);
+        QImage sdr(viewer.size(), QImage::Format_RGBA8888);
+        sdr.fill(QColor(90, 90, 90));
+        viewer.setImage(sdr, 0);
+        // A PQ grey ramp from a sequence mastered at 800 nits on a BT.2020 display, as hdrViewerOnWayland's.
+        auto ramp = std::make_shared<HdrPicture>();
+        ramp->width = 64, ramp->height = 8;
+        ramp->contentPeak = 800.0 / 203;
+        ramp->maxCll = 800, ramp->maxFall = 200;
+        ramp->mastering = hdrMasteringPrimaries(*findColorSpace("rec2100pq"));
+        std::vector<float> texels(size_t(ramp->width) * size_t(ramp->height) * 4);
+        for (size_t i = 0; i < texels.size(); i += 4) {
+            const double nits[8] = {0, 5, 20, 50, 100, 203, 400, 800};
+            texels[i] = texels[i + 1] = texels[i + 2] = float(nits[(i / 4) % size_t(ramp->width) / 8] / 203);
+            texels[i + 3] = 1;
+        }
+        ramp->rgba.resize(texels.size());
+        qFloatToFloat16(reinterpret_cast<qfloat16*>(ramp->rgba.data()), texels.data(), qsizetype(texels.size()));
+        viewer.setHdrViewer(true);
+        viewer.setHdrPicture(ramp);
+        auto onSdr = [&] {
+            if (throughQt) {
+                // (Qt reads nothing back: its surface is PQ on an SDR output too, which Weston fits to the output)
+                QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
+                return;
+            }
+            QTRY_VERIFY2_WITH_TIMEOUT(!viewer.hdrStatus().isEmpty(), "still HDR on the SDR output", 10000);
+            QVERIFY(!viewer.hdrShowing());
+            QCOMPARE(viewer.hdrStatus(), QStringLiteral("This display does not show HDR"));
+            QCOMPARE(viewer.hdrHeadroom(), 1.0);
+        };
+        onSdr();
+        // Out of full screen (Weston's answer taken), then full screen on the other output, as Qt asks for it there.
+        auto moveTo = [&](QScreen* screen, const QByteArray& wlOutput, const char* what) {
+            const qint64 before = logEnd();
+            viewer.showNormal();
+            QTRY_VERIFY2_WITH_TIMEOUT(answered(before, ".unset_fullscreen()"), "Weston did not take the window out of full screen", 10000);
+            QTRY_COMPARE_WITH_TIMEOUT(viewer.size(), QSize(640, 360), 10000);
+            from = logEnd();
+            viewer.windowHandle()->setScreen(screen);
+            viewer.showFullScreen();
+            QTRY_COMPARE_WITH_TIMEOUT(viewer.size(), screen->size(), 10000);
+            QVERIFY2(said(from, ".set_fullscreen(" + wlOutput + ")"), what);
+            // (already there out of full screen, if Weston put it there: entered since it left full screen)
+            QTRY_VERIFY2_WITH_TIMEOUT(said(before, ".enter(" + wlOutput + ")"), what, 10000);
+        };
+        // The wl_surface whose colour management surface was last given an image description (since `since`).
+        auto describedSurface = [&](qint64 since) {
+            QHash<QByteArray, QByteArray> surfaceOf;  // (wp_color_management_surface_v1@n: its wl_surface@m)
+            QByteArray found;
+            for (const QByteArray& line : ours(since)) {
+                static const QByteArray made = "get_surface(new id ";
+                qsizetype at = line.indexOf(made + "wp_color_management_surface_v1@");
+                if (at >= 0) {
+                    const qsizetype id = at + made.size(), comma = line.indexOf(", ", id), close = line.indexOf(')', comma);
+                    if (comma > id && close > comma) surfaceOf[line.mid(id, comma - id)] = line.mid(comma + 2, close - comma - 2);
+                    continue;
+                }
+                at = line.indexOf(".set_image_description(wp_image_description_v1@");
+                if (at >= 0) {
+                    const qsizetype object = line.lastIndexOf(' ', at) + 1;
+                    found = surfaceOf.value(line.mid(object, at - object));
+                }
+            }
+            return found;
+        };
+        const qint64 moving = logEnd();
+        moveTo(pqScreen, pqOutput, "Montage's window did not enter the PQ output");
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->describedTransfer() == Transfer::Pq,
+                                  qPrintable(viewer.hdrStatus()), 10000);
+        // Montage's binding describes the surface anew for the output it enters (its headroom and mastering). Qt
+        // describes it from the window's colour space once, when it makes it (PQ on the SDR output too, which Weston
+        // fits to that output), and not again when it enters another: there the description to look for is that one,
+        // on the surface that entered the PQ output.
+        const qint64 describedFrom = throughQt ? shown : from;
+        QTRY_VERIFY2(said(describedFrom, ".set_image_description(wp_image_description_v1@"), "the surface was not described on the PQ output");
+        QTRY_VERIFY2(said(describedFrom, ".set_tf_named(11)"), "no PQ description on the PQ output");
+        const QByteArray hdrSurface = describedSurface(shown);
+        QVERIFY2(!hdrSurface.isEmpty(), "no wl_surface for the colour management surface described");
+        QTRY_VERIFY2_WITH_TIMEOUT(said(moving, hdrSurface + ".enter(" + pqOutput + ")"),
+                                  qPrintable(QStringLiteral("the described surface (%1) did not enter the PQ output").arg(QString::fromLatin1(hdrSurface))), 10000);
+        if (!throughQt) {
+            QTRY_VERIFY2_WITH_TIMEOUT(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())), 10000);
+            QTRY_VERIFY2(said(from, ".set_mastering_luminance(50, 800)"), "the master's light is not in the PQ output's description");
+        }
+        moveTo(sdrScreen, sdrOutput, "Montage's window did not enter the SDR output again");
+        onSdr();
+#endif
+    }
+
+    void hdrViewerWhenWestonGoes() {
+        // Under Weston (scripts/wayland-hdr-check.sh's "gone" run, in CI), with Qt's reconnection to a compositor on
+        // (QT_WAYLAND_RECONNECT): the viewer shows HDR on a PQ output, its Weston is killed, and Qt connects to the
+        // Weston that took over (MONTAGE_TEST_WESTON_NEXT, colour management on and an SDR output). Montage stays up:
+        // the viewer says the compositor went away, is shown by the new Weston (its screenshot the SDR picture's
+        // grey) and stays SDR there, saying why (asked again on the new display, which is not HDR).
+        const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
+        const qint64 westonPid = qEnvironmentVariableIntValue("MONTAGE_TEST_WESTON_PID");
+        const QByteArray next = qgetenv("MONTAGE_TEST_WESTON_NEXT");
+        if (log.isEmpty() || westonPid <= 0 || next.isEmpty() || !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
+            QSKIP("Runs under Weston with a second one to take over (scripts/wayland-hdr-check.sh)");
+#ifndef MONTAGE_HDR_VIEWER
+        QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
+#else
+        QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
+        QVERIFY2(qEnvironmentVariableIsSet("QT_WAYLAND_RECONNECT"), "Qt's reconnection is not on");
+        const bool throughQt = hdrViewerOnWaylandThroughQt();
+        win_->hide();
+        auto restore = qScopeGuard([this] { win_->show(); });
+        ViewerWidget viewer;
+        viewer.showFullScreen();
+        QVERIFY(QTest::qWaitForWindowExposed(&viewer));
+        QImage sdr(viewer.size(), QImage::Format_RGBA8888);
+        sdr.fill(QColor(90, 90, 90));
+        viewer.setImage(sdr, 0);
+        auto ramp = std::make_shared<HdrPicture>();
+        ramp->width = 64, ramp->height = 8;
+        ramp->contentPeak = 800.0 / 203;
+        ramp->mastering = hdrMasteringPrimaries(*findColorSpace("rec2100pq"));
+        std::vector<float> texels(size_t(ramp->width) * size_t(ramp->height) * 4);
+        for (size_t i = 0; i < texels.size(); i += 4) {
+            texels[i] = texels[i + 1] = texels[i + 2] = float(double((i / 4) % size_t(ramp->width)) / 16);
+            texels[i + 3] = 1;
+        }
+        ramp->rgba.resize(texels.size());
+        qFloatToFloat16(reinterpret_cast<qfloat16*>(ramp->rgba.data()), texels.data(), qsizetype(texels.size()));
+        QStringList said;  // (what the viewer said, each time that changed)
+        connect(&viewer, &ViewerWidget::hdrChanged, &viewer, [&] { said << viewer.hdrStatus(); });
+        viewer.setHdrViewer(true);
+        viewer.setHdrPicture(ramp);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrSurface() && viewer.hdrSurface()->framesDrawn() > 0, qPrintable(viewer.hdrStatus()), 10000);
+        // Killed as a crash would end it, the next Weston named for Qt's connection again. (Qt lets the old Weston's
+        // screen go as it connects again, and the new one's output is another.)
+        const QPointer<QScreen> was = viewer.windowHandle()->screen();
+        qputenv("WAYLAND_DISPLAY", next);
+        QCOMPARE(QProcess::execute(QStringLiteral("kill"), {QStringLiteral("-KILL"), QString::number(westonPid)}), 0);
+        QTRY_VERIFY2_WITH_TIMEOUT(was.isNull() && viewer.windowHandle() && viewer.windowHandle()->isExposed() &&
+                                      QGuiApplication::screens().size() == 1 && !QGuiApplication::screens().first()->name().isEmpty(),
+                                  "the viewer is not shown by the Weston that took over", 30000);
+        qInfo().noquote() << "The viewer said:" << said.join(QStringLiteral(" | "));
+        if (!throughQt) {
+            QTRY_VERIFY2_WITH_TIMEOUT(said.contains(QStringLiteral("The Wayland compositor went away")), qPrintable(said.join(QStringLiteral(" | "))), 10000);
+            QTest::qWait(2500);  // (the viewer asks again on the new display)
+            QVERIFY2(!viewer.hdrShowing() && !viewer.hdrStatus().isEmpty(), qPrintable(said.join(QStringLiteral(" | "))));
+            qInfo().noquote() << "On the new Weston's display the viewer says:" << viewer.hdrStatus();
+        }
+        // The new Weston's screenshot (its screenshooter finds it by WAYLAND_DISPLAY): the SDR grey, as Weston shows
+        // sRGB on an SDR output.
+        const QString shooter = qEnvironmentVariable("MONTAGE_TEST_WESTON_SCREENSHOOTER");
+        const QDir shots(qEnvironmentVariable("XDG_PICTURES_DIR"));
+        QVERIFY2(!shooter.isEmpty() && shots.exists(), "MONTAGE_TEST_WESTON_SCREENSHOOTER or XDG_PICTURES_DIR is not set");
+        QString grey;
+        bool right = false;
+        for (int attempt = 0; attempt < 6 && !right; ++attempt) {  // (until the viewer has painted and Weston repainted)
+            QTest::qWait(500);
+            QVERIFY2(QProcess::execute(shooter, {}) == 0, "Weston's screenshooter failed");
+            const QStringList pngs = shots.entryList({QStringLiteral("wayland-screenshot-*.png")}, QDir::Files, QDir::Time);
+            QVERIFY2(!pngs.isEmpty(), "Weston's screenshooter wrote no picture");
+            const QImage shot = QImage(shots.filePath(pngs.first())).convertToFormat(QImage::Format_RGB32);
+            QVERIFY2(!shot.isNull(), "Weston's screenshot cannot be read");
+            QFile::remove(shots.filePath(QStringLiteral("after.png")));
+            QFile::rename(shots.filePath(pngs.first()), shots.filePath(QStringLiteral("after.png")));
+            const QRgb px = shot.pixel(shot.width() / 2, shot.height() / 2);
+            grey = QStringLiteral("%1 %2 %3").arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px));
+            right = std::abs(qRed(px) - 90) <= 3 && std::abs(qGreen(px) - 90) <= 3 && std::abs(qBlue(px) - 90) <= 3;
+        }
+        qInfo().noquote() << "The new Weston shows the viewer's grey (sRGB 90) as" << grey;
+        if (!throughQt) QVERIFY2(right, qPrintable(grey));
 #endif
     }
 
@@ -26316,6 +27491,8 @@ print("added " + ui["name"])
     void everyTranslatableTextIsFound() {
         // lupdate finds every tr() text in the interface, each under the name Montage asks for it by.
         const QByteArray lupdate = qgetenv("MONTAGE_TEST_LUPDATE");
+        // (CI's Linux job sets MONTAGE_REQUIRE_LUPDATE, so the check fails there rather than skips without lupdate)
+        if (lupdate.isEmpty() && qEnvironmentVariableIsSet("MONTAGE_REQUIRE_LUPDATE")) QFAIL("MONTAGE_TEST_LUPDATE (Qt's lupdate) is not set");
         if (lupdate.isEmpty()) QSKIP("MONTAGE_TEST_LUPDATE (Qt's lupdate) is not set");
         const QString src = QStringLiteral(MONTAGE_SOURCE_DIR "/src");
         const QString ts = dir_.filePath("found.ts");
@@ -26362,6 +27539,36 @@ print("added " + ui["name"])
         }
         QVERIFY(checked > 4000);
         QVERIFY2(missing.isEmpty(), qPrintable(missing.mid(0, 20).join('\n')));
+        // Each translation file holds every text lupdate finds, under its class: a text added without running
+        // lupdate (cmake --build build --target montage_lupdate) fails here.
+        auto messages = [](const QString& path) {
+            QSet<QString> out;
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) return out;
+            QXmlStreamReader r(&file);
+            QString context;
+            while (!r.atEnd()) {
+                r.readNext();
+                if (!r.isStartElement()) continue;
+                if (r.name() == QLatin1String("name")) context = r.readElementText();
+                else if (r.name() == QLatin1String("source")) out.insert(context + QChar(0) + r.readElementText());
+            }
+            return out;
+        };
+        const QSet<QString> wanted = messages(ts);
+        QVERIFY(wanted.size() > 4000);
+        const QDir translations(QStringLiteral(MONTAGE_SOURCE_DIR "/translations"));
+        const QStringList files = translations.entryList({QStringLiteral("montage_*.ts")}, QDir::Files);
+        QVERIFY(files.size() >= 7);
+        for (const QString& name : files) {
+            const QSet<QString> held = messages(translations.filePath(name));
+            QStringList absent;
+            for (const QString& m : wanted)
+                if (!held.contains(m)) absent << QString(m).replace(QChar(0), QLatin1String(": "));
+            absent.sort();
+            QVERIFY2(absent.isEmpty(), qPrintable(name + QStringLiteral(" lacks %1 texts, run montage_lupdate:\n").arg(absent.size()) +
+                                                  absent.mid(0, 20).join('\n')));
+        }
     }
 
     void remoteGradingBothWays() {

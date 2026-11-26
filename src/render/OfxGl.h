@@ -50,6 +50,9 @@ void destroyTexture(unsigned texture);
 // Copies RGBA float texture `from` into `to` (both `width` x `height`) with its rows in the other order, on the GPU:
 // the compositor's textures have the picture's top row first, OpenFX's its bottom row. False when it could not.
 bool flip(unsigned from, unsigned to, int width, int height);
+// The same with the rows kept in their order, between textures of either float size (a DMA-BUF's 16-bit picture into
+// one of the compositor's 32-bit ones).
+bool copy(unsigned from, unsigned to, int width, int height);
 // Texture `texture`'s pixels read back (top row first when `topFirst` says its rows are stored so, else flipped to it).
 void readTexture(unsigned texture, int width, int height, bool topFirst, Image& out);
 // `img` written into texture `texture` (the same size), top row first.

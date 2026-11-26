@@ -454,7 +454,7 @@ Param remapParam(const Param& in, const std::vector<Piece>& pieces) {
                 const Keyframe& governing = *std::prev(std::upper_bound(keys.begin(), keys.end(), p,
                                                                         [](FrameTime v, const Keyframe& x) { return v < x.t; }));
                 interp = governing.interp;
-                sample = (interp == Interp::Smooth || interp == Interp::Bezier) && !(k && keyAt(q));
+                sample = (interp == Interp::Smooth || interp == Interp::Bezier || isEasing(interp)) && !(k && keyAt(q));
             }
             key.interp = sample ? Interp::Linear : interp;
             out.keys.push_back(key);

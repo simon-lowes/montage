@@ -81,8 +81,13 @@ std::string spaceForTags(int primaries, int transfer) {
     return id == "rec709" ? std::string() : id;
 }
 
-AVPixelFormat pixelFormat(JxsSampling s, int depth) {
+AVPixelFormat pixelFormat(JxsSampling s, int depth, bool alpha = false) {
     const int d = depth <= 8 ? 8 : depth <= 10 ? 10 : 12;
+    if (alpha) switch (s) {
+        case JxsSampling::Ycc422: return d == 8 ? AV_PIX_FMT_YUVA422P : d == 10 ? AV_PIX_FMT_YUVA422P10LE : AV_PIX_FMT_YUVA422P12LE;
+        case JxsSampling::Ycc444: return d == 8 ? AV_PIX_FMT_YUVA444P : d == 10 ? AV_PIX_FMT_YUVA444P10LE : AV_PIX_FMT_YUVA444P12LE;
+        case JxsSampling::Rgb: return d == 8 ? AV_PIX_FMT_GBRAP : d == 10 ? AV_PIX_FMT_GBRAP10LE : AV_PIX_FMT_GBRAP12LE;
+        }
     switch (s) {
     case JxsSampling::Ycc422: return d == 8 ? AV_PIX_FMT_YUV422P : d == 10 ? AV_PIX_FMT_YUV422P10LE : AV_PIX_FMT_YUV422P12LE;
     case JxsSampling::Ycc444: return d == 8 ? AV_PIX_FMT_YUV444P : d == 10 ? AV_PIX_FMT_YUV444P10LE : AV_PIX_FMT_YUV444P12LE;
@@ -91,8 +96,8 @@ AVPixelFormat pixelFormat(JxsSampling s, int depth) {
     return AV_PIX_FMT_NONE;
 }
 
-// FFmpeg's GBR planes are G, B, R; a picture's are R, G, B.
-int avPlane(JxsSampling s, int c) { return s == JxsSampling::Rgb ? (c + 2) % 3 : c; }
+// FFmpeg's GBR planes are G, B, R; a picture's are R, G, B (alpha is the fourth in both).
+int avPlane(JxsSampling s, int c) { return s == JxsSampling::Rgb && c < 3 ? (c + 2) % 3 : c; }
 
 }  // namespace
 
@@ -125,6 +130,7 @@ bool readJxsHeader(const uint8_t* data, size_t size, JxsHeader& out) {
             out.cw = be16(d + 12);
             out.hsl = be16(d + 14);
             out.components = d[16];
+            out.fq = d[20] >> 4;
             out.cpih = d[21] & 0x0F;
             out.decompV = d[22] & 0x0F;
             pih = true;
@@ -144,7 +150,9 @@ bool readJxsHeader(const uint8_t* data, size_t size, JxsHeader& out) {
 }
 
 bool jxsPictureFits(const JxsHeader& h, std::string* why) {
-    if (h.components != 3) return fail(why, "JPEG XS with " + std::to_string(h.components) + " components is not read here (three are)");
+    if (h.components != 3 && h.components != 4)
+        return fail(why, "JPEG XS with " + std::to_string(h.components) + " components is not read here (three are, or four with alpha)");
+    if (h.cpih == 3) return fail(why, "JPEG XS of a colour filter array (Bayer) is not read here");
     if (h.width < 1 || h.height < 1) return fail(why, "The JPEG XS codestream names no picture size");
     if (h.width > kJxsLargestSide || h.height > kJxsLargestSide || int64_t(h.width) * h.height > kJxsMostPixels)
         return fail(why, "A JPEG XS picture of " + std::to_string(h.width) + " x " + std::to_string(h.height) + " is larger than is read here");
@@ -170,13 +178,13 @@ std::string jxsSamplingName(JxsSampling s) {
     return s == JxsSampling::Ycc422 ? "YCbCr-4:2:2" : s == JxsSampling::Ycc444 ? "YCbCr-4:4:4" : "RGB";
 }
 
-JxsPicture::JxsPicture(int w, int h, int d, JxsSampling s) : width(w), height(h), depth(d), sampling(s) {
-    for (int c = 0; c < 3; ++c) planes[c].assign(size_t(planeWidth(c)) * size_t(std::max(h, 0)), 0);
+JxsPicture::JxsPicture(int w, int h, int d, JxsSampling s, bool withAlpha) : width(w), height(h), depth(d), sampling(s), alpha(withAlpha) {
+    for (int c = 0; c < planeCount(); ++c) planes[c].assign(size_t(planeWidth(c)) * size_t(std::max(h, 0)), 0);
 }
 
 bool JxsPicture::operator==(const JxsPicture& o) const {
-    return width == o.width && height == o.height && depth == o.depth && sampling == o.sampling && planes[0] == o.planes[0] &&
-           planes[1] == o.planes[1] && planes[2] == o.planes[2];
+    return width == o.width && height == o.height && depth == o.depth && sampling == o.sampling && alpha == o.alpha &&
+           planes[0] == o.planes[0] && planes[1] == o.planes[1] && planes[2] == o.planes[2] && (!alpha || planes[3] == o.planes[3]);
 }
 
 #ifdef MONTAGE_WITH_JPEGXS
@@ -193,7 +201,9 @@ void quietSvt() {
     (void)once;
 }
 
-ColourFormat_t colourFormat(JxsSampling s) {
+// (with alpha, R′G′B′A goes in as four components as they are: SVT's colour transform takes three)
+ColourFormat_t colourFormat(JxsSampling s, bool alpha) {
+    if (alpha) return s == JxsSampling::Ycc422 ? COLOUR_FORMAT_PLANAR_YUV422_ALPHA : COLOUR_FORMAT_PLANAR_4_COMPONENTS;
     return s == JxsSampling::Ycc422 ? COLOUR_FORMAT_PLANAR_YUV422 : s == JxsSampling::Ycc444 ? COLOUR_FORMAT_PLANAR_YUV444 : COLOUR_FORMAT_PLANAR_RGB;
 }
 
@@ -222,7 +232,7 @@ struct JxsEncoder::State {
     svt_jpeg_xs_image_config_t config{};
     uint32_t bytes = 0;
     bool open = false;
-    std::vector<uint8_t> planes8[3];  // (8-bit input)
+    std::vector<uint8_t> planes8[4];  // (8-bit input)
     std::vector<uint8_t> buffer;
 };
 
@@ -244,6 +254,7 @@ bool JxsEncoder::open(const JxsEncodeSettings& s, std::string* error) {
     if (s.depth < 8 || s.depth > 12) return fail(error, "JPEG XS is coded here at 8 to 12 bits");
     if (s.bppNum <= 0 || s.bppDen <= 0) return fail(error, "A JPEG XS bit rate is a positive number of bits a pixel");
     if (s.sampling == JxsSampling::Ycc422 && s.width % 2) return fail(error, "JPEG XS 4:2:2 pictures are an even number of pixels wide");
+    if (s.lossless && s.slices) return fail(error, "Lossless JPEG XS is not sent a slice at a time (each picture's length is its own)");
     State& st = *s_;
     st.s = s;
     std::memset(&st.api, 0, sizeof st.api);
@@ -252,9 +263,10 @@ bool JxsEncoder::open(const JxsEncodeSettings& s, std::string* error) {
     st.api.source_width = uint32_t(s.width);
     st.api.source_height = uint32_t(s.height);
     st.api.input_bit_depth = uint8_t(s.depth);
-    st.api.colour_format = colourFormat(s.sampling);
-    // (R′G′B′ through the reversible colour transform, as decoders take a Cpih=1 stream as R′G′B′)
-    st.api.enable_color_transform = s.sampling == JxsSampling::Rgb ? 1 : 0;
+    st.api.colour_format = colourFormat(s.sampling, s.alpha);
+    // (R′G′B′ through the reversible colour transform, as decoders take a Cpih=1 stream as R′G′B′; with alpha, the
+    // container says R′G′B′: MXF's RGBA descriptor)
+    st.api.enable_color_transform = s.sampling == JxsSampling::Rgb && !s.alpha ? 1 : 0;
     st.api.bpp_numerator = uint32_t(s.bppNum);
     st.api.bpp_denominator = uint32_t(s.bppDen);
     st.api.slice_height = uint32_t(std::max(s.sliceHeight, 4));
@@ -264,10 +276,18 @@ bool JxsEncoder::open(const JxsEncodeSettings& s, std::string* error) {
     st.api.slice_packetization_mode = s.slices ? 1 : 0;
     st.api.threads_num = uint32_t(threadsFor(s.threads));
     st.api.verbose = VERBOSE_NONE;
+    // Lossless: no truncation (Fq 0), each picture as long as it comes to, and no raw packets, as the lossless profile
+    // (MLS.12) asks.
+    if (s.lossless) {
+        st.api.lossless_enable = 1;
+        st.api.coding_raw_disable = 1;
+    }
     if (const SvtJxsErrorType_t e = svt_jpeg_xs_encoder_init(SVT_JPEGXS_API_VER_MAJOR, SVT_JPEGXS_API_VER_MINOR, &st.api); e != SvtJxsErrorNone)
         return fail(error, "SVT-JPEG-XS cannot code " + std::to_string(s.width) + " x " + std::to_string(s.height) + " at " +
-                               std::to_string(s.depth) + " bits and " + std::to_string(s.bppNum) + (s.bppDen != 1 ? "/" + std::to_string(s.bppDen) : "") +
-                               " bits a pixel (" + svtError(e) + ")");
+                               std::to_string(s.depth) + " bits" + (s.alpha ? " with alpha" : "") +
+                               (s.lossless ? std::string(" losslessly")
+                                           : " and " + std::to_string(s.bppNum) + (s.bppDen != 1 ? "/" + std::to_string(s.bppDen) : "") + " bits a pixel") +
+                               " (" + svtError(e) + ")");
     st.open = true;
     if (svt_jpeg_xs_encoder_get_image_config(SVT_JPEGXS_API_VER_MAJOR, SVT_JPEGXS_API_VER_MINOR, &st.api, &st.config, &st.bytes) != SvtJxsErrorNone ||
         st.bytes == 0) {
@@ -282,11 +302,11 @@ bool JxsEncoder::open(const JxsEncodeSettings& s, std::string* error) {
 bool JxsEncoder::encode(const JxsPicture& p, std::vector<uint8_t>& out, std::vector<uint32_t>* units, std::string* error) {
     State& st = *s_;
     if (!st.open) return fail(error, "The JPEG XS encoder is not open");
-    if (p.width != st.s.width || p.height != st.s.height || p.sampling != st.s.sampling || p.depth != st.s.depth)
-        return fail(error, "A picture of another size, sampling or depth than the JPEG XS encoder's");
+    if (p.width != st.s.width || p.height != st.s.height || p.sampling != st.s.sampling || p.depth != st.s.depth || p.alpha != st.s.alpha)
+        return fail(error, "A picture of another size, sampling, depth or alpha than the JPEG XS encoder's");
     svt_jpeg_xs_frame_t in;
     std::memset(&in, 0, sizeof in);
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < p.planeCount(); ++c) {
         const size_t n = size_t(st.config.components[c].width) * st.config.components[c].height;
         if (p.planes[c].size() < n) return fail(error, "A JPEG XS picture's plane is short");
         if (st.s.depth == 8) {
@@ -321,9 +341,10 @@ struct JxsDecoder::State {
     svt_jpeg_xs_decoder_api_t api{};
     svt_jpeg_xs_image_config_t config{};
     bool open = false;
+    int proxy = 0, openProxy = 0;  // (asked for, and the one the decoder was set up with)
     JxsHeader header;
     std::vector<uint8_t> headerBytes;
-    std::vector<uint8_t> planes[3];
+    std::vector<uint8_t> planes[4];
 };
 
 JxsDecoder::JxsDecoder() : s_(std::make_unique<State>()) {}
@@ -335,6 +356,9 @@ void JxsDecoder::close() {
     s_->headerBytes.clear();
 }
 
+void JxsDecoder::setProxy(int level) { s_->proxy = std::clamp(level, 0, 2); }
+int JxsDecoder::proxy() const { return s_->proxy; }
+
 bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::string* error, JxsSampling sampling444) {
     State& st = *s_;
     quietSvt();
@@ -342,8 +366,10 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
     if (!readJxsHeader(data, size, h)) return fail(error, "Not a JPEG XS codestream");
     // (a header may name 65,535 x 65,535: checked before the library or any plane is set up for it)
     if (!jxsPictureFits(h, error)) return false;
-    // (the decoder is set up for one header: another one, even of another rate alone, starts it again)
-    const bool same = st.open && st.headerBytes.size() == h.headerBytes && std::equal(data, data + h.headerBytes, st.headerBytes.begin());
+    // (the decoder is set up for one header: another one, even of another rate alone, starts it again; so does each
+    // lossless picture that states a length of its own)
+    const bool same = st.open && st.openProxy == st.proxy && st.headerBytes.size() == h.headerBytes &&
+                      std::equal(data, data + h.headerBytes, st.headerBytes.begin());
     if (!same) {
         close();
         std::memset(&st.api, 0, sizeof st.api);
@@ -351,19 +377,20 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
         st.api.verbose = VERBOSE_NONE;
         st.api.threads_num = uint32_t(threadsFor(0));
         st.api.packetization_mode = 0;
-        st.api.proxy_mode = proxy_mode_full;
+        st.api.proxy_mode = st.proxy == 2 ? proxy_mode_quarter : st.proxy == 1 ? proxy_mode_half : proxy_mode_full;
+        st.openProxy = st.proxy;
         if (const SvtJxsErrorType_t e = svt_jpeg_xs_decoder_init(SVT_JPEGXS_API_VER_MAJOR, SVT_JPEGXS_API_VER_MINOR, &st.api, data, size, &st.config);
             e != SvtJxsErrorNone)
             return fail(error, "SVT-JPEG-XS cannot decode this codestream (" + svtError(e) + ")");
         st.open = true;
         st.header = h;
         st.headerBytes.assign(data, data + h.headerBytes);
-        if (st.config.components_num != 3) {
+        if (st.config.components_num != 3 && st.config.components_num != 4) {
             close();
-            return fail(error, "JPEG XS with other than three components is not read here");
+            return fail(error, "JPEG XS with other than three components (or four with alpha) is not read here");
         }
         // (and what the library asks for is held to the same bound: 16-bit samples of the largest picture)
-        for (int c = 0; c < 3; ++c)
+        for (int c = 0; c < st.config.components_num; ++c)
             if (uint64_t(st.config.components[c].byte_size) > uint64_t(kJxsMostPixels) * 2 ||
                 uint64_t(st.config.components[c].width) * st.config.components[c].height > uint64_t(kJxsMostPixels)) {
                 close();
@@ -374,16 +401,20 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
             close();
             return fail(error, "The JPEG XS picture is larger than is read here");
         }
-        for (int c = 0; c < 3; ++c) st.planes[c].resize(st.config.components[c].byte_size);
+        for (int c = 0; c < st.config.components_num; ++c) st.planes[c].resize(st.config.components[c].byte_size);
     }
     JxsSampling sampling;
-    if (st.config.format == COLOUR_FORMAT_PLANAR_YUV422) sampling = JxsSampling::Ycc422;
-    else if (st.config.format == COLOUR_FORMAT_PLANAR_RGB) sampling = JxsSampling::Rgb;
-    else if (st.config.format == COLOUR_FORMAT_PLANAR_YUV444) sampling = sampling444;
-    else return fail(error, "This JPEG XS sampling is not read here (4:2:2 and 4:4:4 are)");
+    const int nc = st.config.components_num;
+    const ColourFormat_t f = st.config.format;
+    if (f == COLOUR_FORMAT_PLANAR_YUV422 || f == COLOUR_FORMAT_PLANAR_YUV422_ALPHA) sampling = JxsSampling::Ycc422;
+    else if (f == COLOUR_FORMAT_PLANAR_RGB || f == COLOUR_FORMAT_PLANAR_RGBA) sampling = JxsSampling::Rgb;
+    else if (f == COLOUR_FORMAT_PLANAR_YUV444 || f == COLOUR_FORMAT_PLANAR_4_COMPONENTS) sampling = sampling444;
+    else return fail(error, "This JPEG XS sampling is not read here (4:2:2 and 4:4:4 are, with alpha or without)");
+    const bool alpha = f == COLOUR_FORMAT_PLANAR_YUV422_ALPHA || f == COLOUR_FORMAT_PLANAR_RGBA || f == COLOUR_FORMAT_PLANAR_4_COMPONENTS;
+    if (alpha != (nc == 4)) return fail(error, "This JPEG XS layout of components is not read here");
     svt_jpeg_xs_frame_t in;
     std::memset(&in, 0, sizeof in);
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < nc; ++c) {
         in.image.data_yuv[c] = st.planes[c].data();
         in.image.stride[c] = st.config.components[c].width;
         in.image.alloc_size[c] = st.config.components[c].byte_size;
@@ -402,8 +433,8 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
         return fail(error, "SVT-JPEG-XS could not decode the codestream (" + svtError(e) + ")");
     }
     const int depth = st.config.bit_depth;
-    out = JxsPicture(int(st.config.width), int(st.config.height), depth, sampling);
-    for (int c = 0; c < 3; ++c) {
+    out = JxsPicture(int(st.config.width), int(st.config.height), depth, sampling, alpha);
+    for (int c = 0; c < nc; ++c) {
         const size_t n = std::min(out.planes[c].size(), size_t(st.config.components[c].width) * st.config.components[c].height);
         if (depth <= 8)
             for (size_t i = 0; i < n; ++i) out.planes[c][i] = st.planes[c][i];
@@ -430,10 +461,14 @@ bool JxsEncoder::open(const JxsEncodeSettings&, std::string* error) { return fai
 bool JxsEncoder::encode(const JxsPicture&, std::vector<uint8_t>&, std::vector<uint32_t>*, std::string* error) {
     return fail(error, "This build of Montage has no JPEG XS (SVT-JPEG-XS)");
 }
-struct JxsDecoder::State {};
+struct JxsDecoder::State {
+    int proxy = 0;
+};
 JxsDecoder::JxsDecoder() : s_(std::make_unique<State>()) {}
 JxsDecoder::~JxsDecoder() = default;
 void JxsDecoder::close() {}
+void JxsDecoder::setProxy(int level) { s_->proxy = std::clamp(level, 0, 2); }
+int JxsDecoder::proxy() const { return s_->proxy; }
 bool JxsDecoder::decode(const uint8_t*, size_t, JxsPicture&, std::string* error, JxsSampling) {
     return fail(error, "This build of Montage has no JPEG XS (SVT-JPEG-XS)");
 }
@@ -593,6 +628,7 @@ bool JxsReader::open(const std::string& file, std::string* error) {
         if (!indexCodestreams(st.f, st.index, st.info.header, error)) return false;
         st.info.frames = int64_t(st.index.size());
         st.info.sampling = samplingOf(st.info.header);
+        st.info.alpha = st.info.header.alpha();
         if (st.info.sampling == JxsSampling::Rgb) {
             st.info.matrix = 0;
             st.info.fullRange = true;
@@ -636,8 +672,14 @@ bool JxsReader::open(const std::string& file, std::string* error) {
                         st.info.verticalSubsampling = cd->haveVerticalSubsampling() ? int(cd->getVerticalSubsampling()) : 1;
                         st.info.componentDepth = int(cd->getComponentDepth());
                         st.info.fullRange = cd->haveBlackRefLevel() && cd->getBlackRefLevel() == 0;
+                        if (cd->haveAlphaSampleDepth()) st.info.alphaDepth = int(cd->getAlphaSampleDepth());
                     } else if (auto* rd = dynamic_cast<mxfpp::RGBAEssenceDescriptor*>(fd)) {
                         st.info.fullRange = !rd->haveComponentMinRef() || rd->getComponentMinRef() == 0;
+                        if (rd->havePixelLayout()) {
+                            const mxfRGBALayout l = rd->getPixelLayout();
+                            for (int i = 0; i < 8; ++i)
+                                if (l.components[i].code == 'A') st.info.alphaDepth = l.components[i].depth;
+                        }
                         if (!dynamic_cast<mxfpp::GenericPictureEssenceDescriptor*>(fd)->haveCodingEquations()) st.info.matrix = 0;
                     }
                     if (fd && fd->haveSubDescriptors())
@@ -682,6 +724,7 @@ bool JxsReader::open(const std::string& file, std::string* error) {
     }
     if (!readJxsHeader(first.data(), first.size(), st.info.header)) return fail(error, "The pictures of " + file + " are not JPEG XS codestreams");
     st.info.sampling = samplingOf(st.info.header);
+    st.info.alpha = st.info.header.alpha();
     if (st.info.sampling == JxsSampling::Ycc444 && st.mxf->GetTrackReader(st.pictureTrack)->GetTrackInfo()->essence_type == JPEGXS_RGBA)
         st.info.sampling = JxsSampling::Rgb;  // (R′G′B′ coded without the colour transform: the RGBA descriptor says so)
     st.info.colorSpace = spaceForTags(st.info.primaries, st.info.transfer);
@@ -728,9 +771,9 @@ bool JxsReader::frame(int64_t n, AVFrame* into, std::string* error) {
     av_frame_unref(into);
     into->width = p.width;
     into->height = p.height;
-    into->format = pixelFormat(p.sampling, p.depth);
+    into->format = pixelFormat(p.sampling, p.depth, p.alpha);
     if (av_frame_get_buffer(into, 0) < 0) return fail(error, "Out of memory");
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < p.planeCount(); ++c) {
         const int w = p.planeWidth(c);
         uint8_t* dst = into->data[avPlane(p.sampling, c)];
         const int ls = into->linesize[avPlane(p.sampling, c)];
@@ -850,6 +893,9 @@ bool JxsWriter::open(const std::string& path, const JxsWriteSettings& settings, 
     if (!st.encoder.open(settings.encode, error)) return false;
     if (settings.container == JxsContainer::Codestream) {
         if (settings.channels > 0) return fail(error, "A JPEG XS codestream file holds no sound: write MXF for sound");
+        // (four components coded as they are do not say R′G′B′: MXF's RGBA descriptor does)
+        if (settings.encode.alpha && settings.encode.sampling == JxsSampling::Rgb)
+            return fail(error, "A JPEG XS codestream file of R'G'B' with alpha would be read as Y'CbCr: write MXF for it");
         st.f.setFileName(QString::fromStdString(path));
         if (!st.f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return fail(error, "Could not write " + path);
         st.open = true;
@@ -914,7 +960,7 @@ bool JxsWriter::write(const JxsPicture& p, std::string* error) {
 bool JxsWriter::write(const AVFrame* frame, std::string* error) {
     State& st = *s_;
     const JxsEncodeSettings& e = st.s.encode;
-    const AVPixelFormat want = pixelFormat(e.sampling, e.depth);
+    const AVPixelFormat want = pixelFormat(e.sampling, e.depth, e.alpha);
     const AVFrame* f = frame;
     if (frame->format != want || frame->width != e.width || frame->height != e.height) {
         st.sws = sws_getCachedContext(st.sws, frame->width, frame->height, AVPixelFormat(frame->format), e.width, e.height, want, SWS_BICUBIC,
@@ -929,8 +975,8 @@ bool JxsWriter::write(const AVFrame* frame, std::string* error) {
         sws_scale(st.sws, frame->data, frame->linesize, 0, frame->height, st.converted->data, st.converted->linesize);
         f = st.converted;
     }
-    JxsPicture p(e.width, e.height, e.depth, e.sampling);
-    for (int c = 0; c < 3; ++c) {
+    JxsPicture p(e.width, e.height, e.depth, e.sampling, e.alpha);
+    for (int c = 0; c < p.planeCount(); ++c) {
         const int w = p.planeWidth(c);
         const uint8_t* src = f->data[avPlane(e.sampling, c)];
         const int ls = f->linesize[avPlane(e.sampling, c)];
@@ -997,14 +1043,26 @@ bool JxsWriter::writeCodestream(const uint8_t* data, size_t size, std::string* e
                 cd->setBlackRefLevel(st.s.fullRange ? 0 : 16u << (d - 8));
                 cd->setWhiteReflevel(st.s.fullRange ? (1u << d) - 1 : 235u << (d - 8));
                 cd->setColorRange(st.s.fullRange ? (1u << d) : (224u << (d - 8)) + 1);
+                if (e.alpha) cd->setAlphaSampleDepth(d);
             } else if (auto* rd = dynamic_cast<mxfpp::RGBAEssenceDescriptor*>(fd)) {
                 rd->setComponentMinRef(st.s.fullRange ? 0 : 16u << (d - 8));
                 rd->setComponentMaxRef(st.s.fullRange ? (1u << d) - 1 : 235u << (d - 8));
+                if (e.alpha) {
+                    // (bmx lays out R, G and B from the codestream's component table; alpha follows them, full range)
+                    mxfRGBALayout l = rd->havePixelLayout() ? rd->getPixelLayout() : mxfRGBALayout{};
+                    l.components[3].code = 'A';
+                    l.components[3].depth = uint8_t(d);
+                    rd->setPixelLayout(l);
+                    rd->setAlphaMinRef(0);
+                    rd->setAlphaMaxRef((1u << d) - 1);
+                }
             }
+            // (lossless: each picture is as long as it comes to, so the most one can be)
+            const double most = e.lossless ? double(st.encoder.bytesPerPicture()) : double(size);
             if (fd && fd->haveSubDescriptors())
                 for (mxfpp::SubDescriptor* sd : fd->getSubDescriptors())
                     if (auto* x = dynamic_cast<mxfpp::JPEGXSSubDescriptor*>(sd))
-                        x->setJPEGXSMaximumBitRate(uint32_t(std::ceil(double(size) * 8 * st.s.fpsNum / st.s.fpsDen / 1e6)));
+                        x->setJPEGXSMaximumBitRate(uint32_t(std::ceil(most * 8 * st.s.fpsNum / st.s.fpsDen / 1e6)));
         }
         ++st.frames;
         st.writeSound(false);

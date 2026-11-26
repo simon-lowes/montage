@@ -89,6 +89,13 @@ std::vector<EffectInfo> buildCatalog() {
                      boolean("flip_h", "Flip Horizontal"),
                      boolean("flip_v", "Flip Vertical"),
                      choice("fit", "Fit", {"Fit", "Fill", "Stretch", "None (1:1)"}, 0),
+                     // Motion blur through a shutter (degrees of a sequence frame, centred on the frame unless the phase
+                     // moves it): the layer drawn at its transform at each sample time and the mean kept; samples
+                     // adaptive (0) from how far a corner moves, or 2 to 64.
+                     boolean("motion_blur", "Motion Blur"),
+                     num("shutter", "Shutter Angle (°)", 0, 720, 180, 1),
+                     num("shutter_phase", "Shutter Phase (°)", -360, 360, 0, 1),
+                     num("samples", "Samples (0: Auto)", 0, 64, 0, 1),
                  },
                  {}});
     // Time Remapping: a keyframeable speed curve within the clip's length, and
@@ -731,7 +738,9 @@ std::vector<EffectInfo> buildCatalog() {
                   num("ground_y", "Ground Height (y)", -100000, 100000, 0, 0.01),
                   pct("ground_strength", "Ground Shadow Strength", 0, 100, 80),
                   boolean("depth_of_field", "Depth of Field (through the scene's camera: the Camera clip's)", false),
-                  num("focus_distance", "Focus Distance (0: the card's middle)", 0, 10000000, 0, 0.01),
+                  num("focus_distance", "Focus Distance (0: the scene's middle depth)", 0, 10000000, 0, 0.01),
+                  // (off in projects saved before it: Focus Distance 0 is the card's own middle there)
+                  boolean("focus_scene", "Focus Distance 0 Focuses on the Scene", true),
                   num("fstop", "F-Stop", 0.7, 64, 2.8, 0.1),
                   num("units_m", "Scene Units a Metre (0: 1000 for its own or the scene's camera, else 1)", 0, 1000000, 0, 0.001)},
                  {str("camera_file", "Take The Camera From (USD, glTF)", StringKind::File)}});
@@ -1071,7 +1080,11 @@ std::vector<EffectInfo> buildCatalog() {
                      {num("hold", "Hold Each Frame For (frames)", 1, 30, 3, 1)}, {}});
         // From the frames either side (render/TemporalFx.h; worked out where the source frame is read).
         c.push_back({"motion_blur", "Motion Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
-                     {num("shutter", "Shutter Angle (°)", 0, 720, 180, 1)}, {}});
+                     {num("shutter", "Shutter Angle (°)", 0, 720, 180, 1),
+                      // (measured in the sequence's time, through the clip's speed and Time Remapping; read as off in
+                      // projects saved before it, which blurred over the shutter in source frames)
+                      boolean("follow_edit", "Follow Speed Changes and Time Remapping", true)},
+                     {}});
         c.push_back({"deflicker", "Deflicker", EffectCategory::VideoFilter, "Repair",
                      {num("frames", "Frames Either Side", 1, 12, 3, 1), choice("area", "Even Out", {"Whole Frame", "Each Area (16 x 9)"}, 1),
                       pct("strength", "Strength", 0, 100, 100)},
@@ -1377,6 +1390,17 @@ std::vector<EffectInfo> buildCatalog() {
                                num("anim_out_dur", "Out Duration (s)", 0.05, 10, 0.8, 0.05),
                                num("camera_index", "The File's Camera Number", 1, 999, 1, 1),
                                num("units", "Size in the File's Scene (px a unit)", 0.001, 100000, 100, 0.1),
+                               // Letters that move blurred as they move, each letter on its own: renders through the
+                               // shutter (degrees of a frame, centred on it) averaged; letters that do not move are
+                               // drawn once.
+                               boolean("letter_blur", "Motion Blur"),
+                               num("letter_shutter", "Shutter Angle (°)", 0, 720, 180, 1),
+                               num("letter_samples", "Motion Blur Samples", 2, 64, 16, 1),
+                               // With cards or models seen through their own camera or the scene's on screen: drawn
+                               // in their scene, by depth with them, lit as they are and shadowing them (off in
+                               // projects saved before it: there the title floats over them as it did).
+                               boolean("in_scene", "Stand in the 3D Layers' Scene", true),
+                               boolean("shadows", "Cast Shadows (in the 3D layers' scene)", true),
                            },
                            {str("text", "Text", StringKind::MultilineText, "3D Title"),
                             str("font", "Font", StringKind::Font, "Sans Serif"),
@@ -2222,7 +2246,14 @@ Effect makeEffect(const std::string& type, Id id) {
     return e;
 }
 
-Effect makeEffect(Project& p, const std::string& type) { return makeEffect(type, p.newId()); }
+Effect makeEffect(Project& p, const std::string& type) {
+    Effect e = makeEffect(type, p.newId());
+    // (blurred through the active sequence's shutter)
+    if (const Sequence* s = p.active(); s && s->shutterAngle != 180)
+        for (const char* name : {"shutter", "letter_shutter"})
+            if (auto it = e.params.find(name); it != e.params.end() && !it->second.animated()) it->second = Param(s->shutterAngle);
+    return e;
+}
 
 const std::vector<std::string>& blendModes() {
     static const std::vector<std::string> modes = {"normal",  "add",     "multiply", "screen",     "overlay",

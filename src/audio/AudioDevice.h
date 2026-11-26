@@ -238,6 +238,9 @@ public:
     void holdStateForTest(int ms);
 
     EngineStatus status() const;
+    // The same, false at once (and `out` untouched) while another thread opens or closes the device: for what asks
+    // every so often, as the Monitoring panel's status line, which must not wait on a device being opened.
+    bool statusIfFree(EngineStatus& out) const;
     void resetXruns();
     // JACK: joins two ports by their full names (the device's own and others').
     bool connect(const std::string& from, const std::string& to);

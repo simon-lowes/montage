@@ -46,10 +46,10 @@ jobs:
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
         # FFmpeg itself is built below, from the libraries it uses.
-        run: brew install qtbase qtmultimedia qtshadertools qttools qttranslations opencolorio lilv libraw openjpeg jpeg-xl libmysofa onnxruntime openssl@3 ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus lame srt librist
+        run: brew install qtbase qtmultimedia qtshadertools qttools qttranslations opencolorio lilv libraw openjpeg jpeg-xl libmysofa onnxruntime openssl@3 ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus lame srt librist gnutls
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
-        run: echo "versions=$(brew list --versions x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "versions=$(brew list --versions x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist gnutls | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - name: Cache FFmpeg
         uses: actions/cache@v4
         with:
@@ -111,7 +111,28 @@ jobs:
             && echo "MONTAGE_TEST_PRORES_RAW=$f" >> "$GITHUB_ENV" \
             || echo "::warning::Could not fetch the ProRes RAW sample; its decode test will be skipped"
       - name: Test
+        env:
+          MONTAGE_REQUIRE_WHIP_MUXER: "1"  # (the bundled FFmpeg's WHIP sender to Capture's endpoint: fails rather than skips without it)
         run: ctest --test-dir build --output-on-failure
+      # ctest prints a test's lines only when it fails: the macOS-only tests run again here with every line printed, and
+      # the step fails unless each passed (not skipped) and said what it ran.
+      - name: The Audio Unit and AVFoundation tests, seen to run
+        working-directory: build/tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -o pipefail
+          ./test_plugins -v1 hostsAppleAudioUnits appleAudioUnitsInAHost 2>&1 | tee "$RUNNER_TEMP/audio-units.txt"
+          ./test_render -v1 exportsProRes12Bit 2>&1 | tee "$RUNNER_TEMP/avfoundation.txt"
+          status=0
+          for t in hostsAppleAudioUnits appleAudioUnitsInAHost; do
+            grep -q "^PASS   : .*::$t()" "$RUNNER_TEMP/audio-units.txt" || { echo "::error::$t did not pass"; status=1; }
+          done
+          grep -q "^PASS   : .*::exportsProRes12Bit()" "$RUNNER_TEMP/avfoundation.txt" || { echo "::error::exportsProRes12Bit did not pass"; status=1; }
+          grep -q "aufx:lpas:appl: 40 blocks the same from its plug-in host" "$RUNNER_TEMP/audio-units.txt" || { echo "::error::no Audio Unit ran in a host"; status=1; }
+          grep -q "AVFoundation read 2 frames" "$RUNNER_TEMP/avfoundation.txt" || { echo "::error::AVFoundation did not read the file"; status=1; }
+          if grep -h "^SKIP" "$RUNNER_TEMP/audio-units.txt" "$RUNNER_TEMP/avfoundation.txt"; then status=1; fi
+          exit "$status"
       - name: Package
         run: scripts/package-macos.sh build
       - uses: actions/upload-artifact@v4
@@ -159,7 +180,7 @@ jobs:
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p nasm:p
             qt6-base:p qt6-multimedia:p qt6-shadertools:p qt6-tools:p qt6-translations:p opencolorio:p lilv:p libraw:p openjpeg2:p libjxl:p libmysofa:p onnxruntime:p openssl:p rust:p expat:p
-            x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p lame:p srt:p librist:p amf-headers:p ffnvcodec-headers:p libvpl:p
+            x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p lame:p srt:p librist:p gnutls:p amf-headers:p ffnvcodec-headers:p libvpl:p
       - name: The abseil DLLs MSYS2's ONNX Runtime was built with
         # MSYS2 moves to a new abseil (its DLLs named for the release) before rebuilding every package on it; until
         # it rebuilds ONNX Runtime, the release that one needs is put back beside the new one, or nothing starts.
@@ -174,7 +195,7 @@ jobs:
           echo "::warning::ONNX Runtime still needs abseil $lts: its DLLs taken from $pkg"
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
-        run: echo "versions=$(pacman -Q $(printf 'mingw-w64-ucrt-x86_64-%s ' x264 x265 libvpx svt-av1 dav1d opus lame openjpeg2 srt librist amf-headers ffnvcodec-headers libvpl) | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "versions=$(pacman -Q $(printf 'mingw-w64-ucrt-x86_64-%s ' x264 x265 libvpx svt-av1 dav1d opus lame openjpeg2 srt librist gnutls amf-headers ffnvcodec-headers libvpl) | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - name: Cache FFmpeg
         uses: actions/cache@v4
         with:
@@ -233,6 +254,8 @@ jobs:
       - name: Test
         # Qt Test's console output does not reach this log on Windows, so a failing binary is run again writing its
         # results to a file; every failure is printed (and annotated) with where and why, and the log in full is kept.
+        env:
+          MONTAGE_REQUIRE_WHIP_MUXER: "1"  # (the bundled FFmpeg's WHIP sender to Capture's endpoint: fails rather than skips without it)
         run: |
           ctest --test-dir build --output-on-failure || {
             for t in $(ctest --test-dir build --rerun-failed --show-only=json-v1 | sed -n 's/.*"name" *: *"\(test_[a-z]*\)".*/\1/p' | sort -u); do

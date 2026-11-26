@@ -36,7 +36,26 @@ struct Rational {
 // ---------------------------------------------------------------------------
 // Keyframed parameters
 
-enum class Interp { Linear, Hold, Smooth, Bezier };
+// How a key's value goes over to the next key's: in a straight line, held, smoothly (eased in and out), along Bezier
+// handles, or along one of the easing curves, each easing in (slow away from the key), out (slow into the next key)
+// or both: exponential, logarithmic, sine, circular, back (overshooting), elastic and bounce. An easing is kept as
+// itself (easeCurve gives its formula), not as Bezier handles.
+enum class Interp {
+    Linear, Hold, Smooth, Bezier,
+    ExpoIn, ExpoOut, ExpoInOut, LogIn, LogOut, LogInOut, SineIn, SineOut, SineInOut, CircIn, CircOut, CircInOut,
+    BackIn, BackOut, BackInOut, ElasticIn, ElasticOut, ElasticInOut, BounceIn, BounceOut, BounceInOut
+};
+// Whether an interpolation is one of the easing curves (ExpoIn and after).
+bool isEasing(Interp i);
+// An easing's share of the way from one key to the next at u (0 at the key, 1 at the next; back, elastic and bounce
+// go beyond 0..1 on the way). Linear for the others.
+double easeCurve(Interp i, double u);
+// Interpolations by name, as projects and MCP write them: "linear", "hold", "smooth", "bezier", "expo_in",
+// "log_out", "sine_in_out" ... "bounce_in_out". interpFromName is false for a name it does not know.
+const char* interpName(Interp i);
+bool interpFromName(const std::string& name, Interp& out);
+// Every interpolation, in the order above.
+const std::vector<Interp>& allInterps();
 
 struct Keyframe {
     FrameTime t = 0;          // relative to the start of the owning clip
@@ -522,6 +541,10 @@ struct Clip {
     // effect: lift, gamma, gain, saturation, highlights, mid_detail; keyframable). None: the target as mapped.
     std::map<std::string, Effect> trims;
     std::optional<DuckLink> duck;  // (sound clips) its Auto Duck, when kept up to date
+    // What an interchange file said of the clip that Montage does not use, by format ("fcpxml": core/FcpXml.cpp's
+    // carried elements and attributes, and the element it was connected to), written back when the clip is exported
+    // in that format again.
+    std::map<std::string, std::string> foreign;
     bool operator==(const Clip&) const = default;
 };
 
@@ -821,6 +844,8 @@ struct Sequence {
     // Stereoscopic 3D: the sequence is made for two eyes (its size is one eye's); each is rendered from stereo footage's
     // own eye, clips' Stereo 3D effect placing them in depth; exports pack the eyes (render/Stereo.h).
     bool stereo3d = false;
+    // The shutter (degrees of a frame) new transforms, Motion Blurs, warps and titles' letters are blurred through.
+    double shutterAngle = 180;
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;
@@ -859,6 +884,9 @@ struct Project {
     std::vector<std::string> vocabulary;   // names and terms speech-to-text should expect (core/TranscriptCorrect.h)
     std::vector<std::string> soundCaptions;  // the sounds SDH captions describe (core/SdhCaptions.h); empty = the ready-made list
     std::vector<std::string> watchFolders;  // folders whose arriving media files are imported (app/EditorState)
+    // Grain profiles saved by name (Measure Grain's), each its text (render/GrainMatch.h grainProfileText): what an
+    // export's film grain setting may name (render/Av1GrainExport.h)
+    std::map<std::string, std::string> grainProfiles;
     ProjectScript script;  // the screenplay and its lined coverage (core/ScriptCut.h)
     // The version this project and a copy of it both started from (core/ProjectMerge.h), as project file JSON; null =
     // none. A copy made for someone keeps it, so the two can be merged later. Shared: undo snapshots copy the pointer.

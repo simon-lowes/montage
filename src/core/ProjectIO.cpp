@@ -77,21 +77,11 @@ MediaKind kindFrom(const QString& s) {
     return MediaKind::Video;
 }
 
-const char* interpName(Interp i) {
-    switch (i) {
-        case Interp::Linear: return "linear";
-        case Interp::Hold: return "hold";
-        case Interp::Smooth: return "smooth";
-        case Interp::Bezier: return "bezier";
-    }
-    return "linear";
-}
-
+// (Model.h's names; one Montage does not know reads as linear.)
 Interp interpFrom(const QString& s) {
-    if (s == "hold") return Interp::Hold;
-    if (s == "smooth") return Interp::Smooth;
-    if (s == "bezier") return Interp::Bezier;
-    return Interp::Linear;
+    Interp i = Interp::Linear;
+    interpFromName(s.toStdString(), i);
+    return i;
 }
 
 QJsonValue surroundToJson(const SurroundPan& p) {
@@ -392,6 +382,11 @@ QJsonObject clipToJson(const Clip& c) {
     if (c.linkGroup) o["link"] = double(c.linkGroup);
     if (c.colorLabel) o["label"] = c.colorLabel;
     if (!c.role.empty()) o["role"] = qs(c.role);
+    if (!c.foreign.empty()) {
+        QJsonObject f;
+        for (const auto& [k, v] : c.foreign) f[qs(k)] = qs(v);
+        o["foreign"] = f;
+    }
     if (c.duck) {
         const DuckLink& d = *c.duck;
         QJsonArray tracks, keys;
@@ -482,6 +477,8 @@ Clip clipFromJson(const QJsonObject& o) {
     c.linkGroup = Id(i64(o.value("link")));
     c.colorLabel = o.value("label").toInt(0);
     c.role = ss(o.value("role"));
+    const QJsonObject foreign = o.value("foreign").toObject();
+    for (auto it = foreign.constBegin(); it != foreign.constEnd(); ++it) c.foreign[it.key().toStdString()] = ss(it.value());
     if (const QJsonObject d = o.value("duck").toObject(); !d.isEmpty()) {
         DuckLink link;
         for (const QJsonValue& t : d.value("tracks").toArray()) link.tracks.push_back(Id(i64(t)));
@@ -856,8 +853,10 @@ QJsonObject captionTrackToJson(const CaptionTrack& t) {
         if (!c.colour.empty()) item.append(qs(c.colour));
         items.append(item);
     }
-    return QJsonObject{{"id", double(t.id)},        {"name", qs(t.name)}, {"language", qs(t.language)},
-                       {"visible", t.visible},      {"style", style},     {"captions", items}};
+    QJsonObject o{{"id", double(t.id)},   {"name", qs(t.name)},   {"language", qs(t.language)},
+                  {"visible", t.visible}, {"style", style},       {"captions", items}};
+    if (!t.format.empty()) o["format"] = qs(t.format);
+    return o;
 }
 
 CaptionTrack captionTrackFromJson(const QJsonObject& o) {
@@ -865,6 +864,7 @@ CaptionTrack captionTrackFromJson(const QJsonObject& o) {
     t.id = Id(i64(o.value("id")));
     t.name = ss(o.value("name"));
     t.language = ss(o.value("language"));
+    t.format = ss(o.value("format"));
     t.visible = o.value("visible").toBool(true);
     const QJsonObject so = o.value("style").toObject();
     CaptionStyle& st = t.style;
@@ -1048,6 +1048,7 @@ QJsonObject sequenceToJson(const Sequence& s) {
     if (!s.workingSpace.empty()) o["workingSpace"] = qs(s.workingSpace);
     if (!s.outputTransform.empty()) o["outputTransform"] = qs(s.outputTransform);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
+    if (s.shutterAngle != 180) o["shutterAngle"] = s.shutterAngle;
     if (!s.trimTargets.empty()) {
         QJsonArray targets;
         for (const TrimTarget& tt : s.trimTargets) {
@@ -1129,6 +1130,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.workingSpace = ss(o.value("workingSpace"));
     s.outputTransform = ss(o.value("outputTransform"));
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
+    s.shutterAngle = std::clamp(o.value("shutterAngle").toDouble(180), 0.0, 720.0);
     for (const auto& v : o.value("trimTargets").toArray()) {
         const QJsonObject tt = v.toObject();
         TrimTarget target{ss(tt.value("id")), ss(tt.value("name")), ss(tt.value("colorSpace")), std::clamp(tt.value("peakNits").toDouble(100), 100.0, 10000.0),
@@ -1508,6 +1510,11 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         for (const auto& f : p.watchFolders) folders.append(qs(f));
         root["watchFolders"] = folders;
     }
+    if (!p.grainProfiles.empty()) {
+        QJsonObject profiles;
+        for (const auto& [name, text] : p.grainProfiles) profiles.insert(qs(name), qs(text));
+        root["grainProfiles"] = profiles;
+    }
     if (!p.script.text.empty()) {
         QJsonArray lines;
         for (const auto& line : p.script.readings) {
@@ -1696,6 +1703,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         if (!w.toString().trimmed().isEmpty()) p.soundCaptions.push_back(ss(w));
     for (const auto& f : root.value("watchFolders").toArray())
         if (!f.toString().isEmpty()) p.watchFolders.push_back(ss(f));
+    {
+        const QJsonObject profiles = root.value("grainProfiles").toObject();
+        for (auto it = profiles.begin(); it != profiles.end(); ++it)
+            if (!it.key().trimmed().isEmpty() && !it.value().toString().isEmpty()) p.grainProfiles[it.key().toStdString()] = ss(it.value());
+    }
     for (const auto& w : root.value("fillerWords").toArray())
         if (!w.toString().trimmed().isEmpty()) p.fillerWords.push_back(ss(w));
     if (const QJsonObject so = root.value("script").toObject(); !so.isEmpty()) {

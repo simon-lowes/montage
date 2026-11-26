@@ -9,6 +9,7 @@
 // process is gone.
 #pragma once
 
+#include <QFile>
 #include <QJsonObject>
 #include <QString>
 #include <cstdint>
@@ -40,6 +41,9 @@ QString jobFolder(const QString& id, const QString& folder = {});
 // Written whole (a crash leaves the previous version); `updated` stamped. False when it cannot be written.
 bool save(Record r, const QString& folder = {});
 bool load(const QString& id, Record& r, const QString& folder = {});
+// A record's file opened to read, as the store reads it: on Windows sharing its deletion too, so that a save can put a
+// new record in place while a reader has it open (a job list, a second Montage) instead of waiting for it to let go.
+bool openRecord(QFile& f, const QString& path);
 // Every job in the store (`owner` empty: anyone's), by owner and order. A running job whose process is gone reads as
 // "interrupted".
 std::vector<Record> all(const QString& owner = {}, const QString& folder = {});

@@ -533,22 +533,33 @@ std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path,
         QImage base = asRgb32(QImage::fromData(f.read(info.mapOffset), "JPEG"));
         const QImage map = asMap(f.seek(info.mapOffset) ? QImage::fromData(f.read(info.mapLength), "JPEG") : QImage());
         if (base.isNull() || map.isNull()) return why = "Cannot decode " + path + " (too large, or damaged)", nullptr;
-        // From the base's primaries: Display P3 or sRGB's; a picture in others is put into Display P3 first.
+        // From the base's primaries: Display P3, Adobe RGB or sRGB's; a picture in others is put into Display P3 first.
+        // (Adobe RGB by its own curve, gamma 2.2: its greens are wider than Display P3's, and would be cut.)
         Primaries from = Primaries::Bt709;
+        int transfer = 13;
         if (const QColorSpace cs = base.colorSpace(); cs.isValid() && cs.primaries() == QColorSpace::Primaries::DciP3D65) {
             from = Primaries::P3D65;
+        } else if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::AdobeRgb &&
+                   (cs.transferFunction() == QColorSpace::TransferFunction::SRgb ||
+                    (cs.transferFunction() == QColorSpace::TransferFunction::Gamma && std::fabs(cs.gamma() - 2.2) < 0.02))) {
+            from = Primaries::AdobeRgb;
+            transfer = cs.transferFunction() == QColorSpace::TransferFunction::SRgb ? 13 : 4;
         } else if (cs.isValid() && cs.primaries() != QColorSpace::Primaries::SRgb) {
             base.convertToColorSpace(QColorSpace(QColorSpace::DisplayP3));
             from = Primaries::P3D65;
         }
-        return hdrRendition(base, 13, from, from, map, info.metadata);
+        return hdrRendition(base, transfer, from, from, map, info.metadata);
     });
     if (!out && error) *error = why;
     return out;
 }
 
+bool gainMapBaseIsAdobeRgb(const ColorSpace& sdrSpace) {
+    return sdrSpace.primaries == Primaries::AdobeRgb && sdrSpace.transfer == Transfer::Gamma22 && !sdrSpace.sceneReferred;
+}
+
 bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, const ColorSpace& hdrSpace, GainMapMetadata& meta,
-                 std::vector<uint16_t>& target) {
+                 std::vector<uint16_t>& target, int baseTransfer) {
     const QImage base = seen.convertToFormat(QImage::Format_RGB888);
     const int W = base.width(), H = base.height();
     if (W != hdr.width || H != hdr.height || W <= 0 || H <= 0) return false;
@@ -557,6 +568,8 @@ bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, 
     primariesMatrix(hdrSpace.primaries, basePrimaries, m);
     meta = GainMapMetadata();
     const double off = 1 / 64.0;
+    double lin[256];
+    for (int v = 0; v < 256; ++v) lin[v] = baseToLinear(baseTransfer, v / 255.0);
     // (Worked out twice, for their range and then their codes, rather than kept: at the largest sizes a full-size copy
     // is gigabytes.)
     auto gainsOf = [&](int y, auto&& use) {
@@ -566,7 +579,7 @@ bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, 
             double v[3];
             hdrLinear(hdrSpace, h, v);
             multiply(m, v);
-            for (int c = 0; c < 3; ++c) use(size_t(x) * 3 + size_t(c), std::log2((std::max(v[c], 0.0) + off) / (srgbToLinear(s[c] / 255.0) + off)));
+            for (int c = 0; c < 3; ++c) use(size_t(x) * 3 + size_t(c), std::log2((std::max(v[c], 0.0) + off) / (lin[s[c]] + off)));
         }
     };
     std::vector<double> lo(size_t(H), 1e9), hi(size_t(H), -1e9);
@@ -1153,13 +1166,18 @@ bool findGainMap(QFile& f, const AvifFile& a, GainMapAvif& out) {
     if (data.size() < 2 || data[0] != 0 || !readIsoMetadata(data, 1, data.size(), out.meta) || out.meta.baseIsHdr) return false;  // (version 0)
     ItemColour base;
     if (!itemColour(a, *out.base, base)) base.primaries = 1, base.transfer = 13;  // (unstated: sRGB)
-    if (!knownPrimaries(base.primaries, out.basePrimaries) || !baseTransferKnown(base.transfer)) return false;
+    // (Adobe RGB from the base's ICC profile, beside code points that name no primaries or alone)
+    if (base.adobeRgb && (base.primaries == 0 || base.primaries == 2)) out.basePrimaries = Primaries::AdobeRgb;
+    else if (!knownPrimaries(base.primaries, out.basePrimaries)) return false;
+    if (!baseTransferKnown(base.transfer)) return false;
     out.transfer = base.transfer;
     out.mathPrimaries = out.basePrimaries;
     if (!out.meta.useBaseColorSpace) {
         // (In the HDR rendition's primaries, as the tone-mapped item states them.)
         ItemColour hdr;
-        if (!itemColour(a, *out.tmap, hdr) || !knownPrimaries(hdr.primaries, out.mathPrimaries)) return false;
+        if (!itemColour(a, *out.tmap, hdr)) return false;
+        if (hdr.adobeRgb && (hdr.primaries == 0 || hdr.primaries == 2)) out.mathPrimaries = Primaries::AdobeRgb;
+        else if (!knownPrimaries(hdr.primaries, out.mathPrimaries)) return false;
     }
     return true;
 }
@@ -1311,22 +1329,26 @@ bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image&
     };
     if (sdr.empty() || sdr.width != hdr.width || sdr.height != hdr.height) return fail("Nothing to write");
     if (!hdrSpace.hdr() || sdrSpace.hdr()) return fail("A gain map needs an SDR picture and an HDR one");
-    if (sdrSpace.primaries != Primaries::Bt709 && sdrSpace.primaries != Primaries::P3D65)
-        return fail("The SDR picture of a gain-map JPEG is in Rec.709 or Display P3 primaries");
+    const bool adobe = gainMapBaseIsAdobeRgb(sdrSpace);
+    if (sdrSpace.primaries != Primaries::Bt709 && sdrSpace.primaries != Primaries::P3D65 && !adobe)
+        return fail("The SDR picture of a gain-map JPEG is in Rec.709, Display P3 or Adobe RGB primaries");
     const int W = sdr.width, H = sdr.height;
 
-    // The base, encoded first: the map is made against what decoders will see of it.
+    // The base, encoded first: the map is made against what decoders will see of it. (Adobe RGB's with its ICC
+    // profile, by its own curve.)
     QImage base(W, H, QImage::Format_RGBA8888);
     toRgba8(sdr, base.bits(), size_t(base.bytesPerLine()));
     base = base.convertToFormat(QImage::Format_RGB888);
     const bool p3 = sdrSpace.primaries == Primaries::P3D65;
     if (p3) base.setColorSpace(QColorSpace(QColorSpace::DisplayP3));
+    if (adobe) base.setColorSpace(QColorSpace(QColorSpace::AdobeRgb));
     const QByteArray baseJpeg = jpegBytes(base, quality);
     const QImage seen = QImage::fromData(baseJpeg, "JPEG").convertToFormat(QImage::Format_RGB888);
     if (baseJpeg.isEmpty() || seen.width() != W || seen.height() != H) return fail("Cannot encode the JPEG");
     GainMapMetadata meta;
     std::vector<uint16_t> target;
-    if (!planGainMap(seen, p3 ? Primaries::P3D65 : Primaries::Bt709, hdr, hdrSpace, meta, target)) return fail("Nothing to write");
+    if (!planGainMap(seen, adobe ? Primaries::AdobeRgb : p3 ? Primaries::P3D65 : Primaries::Bt709, hdr, hdrSpace, meta, target, adobe ? 4 : 13))
+        return fail("Nothing to write");
     // The map in 8 bits, at full chroma resolution.
     const QByteArray mapJpeg = encodeGainMap(target, W, H, [&](const QImage& map, QImage& back) {
         const QByteArray bytes = jpeg444(map, quality >= 95 ? 1 : 2);

@@ -307,6 +307,7 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         ExportSettings st;
         st.videoCodec = o.format;
         st.audioCodec = "none";
+        st.motionBlur = o.motionBlur;
         st.smartRender = false;
         st.colorSpace = o.colorSpace;
         if (st.colorSpace.empty() && sceneReferredWorking(seq) && o.format != "tiff") {

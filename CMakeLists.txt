@@ -142,8 +142,8 @@ if(MONTAGE_WITH_OPENEXR)
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   FetchContent_Declare(openexr
     GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/openexr.git
-    # v3.5.4, pinned by its commit (a tag can be moved)
-    GIT_TAG 86687e5f34e3a164820c5e280259550e3ca87c92)
+    # v3.5.5, pinned by its commit (a tag can be moved)
+    GIT_TAG 486e238dd28ba6fed22528005b05f9f15bef0cc0)
   FetchContent_MakeAvailable(openexr)
   if(NOT WIN32)
     # zstd marks its API visibility("default") over OpenEXRCore's hidden default, so the executable would export its
@@ -182,6 +182,14 @@ if(MONTAGE_WITH_BMX)
     GIT_TAG 346ba45dfd41f24f7582460caa56c9ef47dd9b4b  # v1.7, pinned by its commit (a tag can be moved)
     GIT_SUBMODULES "")
   FetchContent_MakeAvailable(bmx)
+  # bmx's JPEG XS parser takes codestreams of three components only, so it refuses one with alpha (four, which its
+  # component table already holds room for). Changed here before anything is compiled, once.
+  set(MONTAGE_BMX_JXS ${bmx_SOURCE_DIR}/src/essence_parser/JXSEssenceParser.cpp)
+  file(READ ${MONTAGE_BMX_JXS} MONTAGE_BMX_JXS_TEXT)
+  string(REPLACE "if (m_subDesc.JPEGXSNc != 3)" "if (m_subDesc.JPEGXSNc != 3 && m_subDesc.JPEGXSNc != 4)" MONTAGE_BMX_JXS_NEW "${MONTAGE_BMX_JXS_TEXT}")
+  if(NOT MONTAGE_BMX_JXS_NEW STREQUAL MONTAGE_BMX_JXS_TEXT)
+    file(WRITE ${MONTAGE_BMX_JXS} "${MONTAGE_BMX_JXS_NEW}")
+  endif()
   if(MINGW)
     # libMXF's Windows memory-mapped file guards its copies with MSVC's __try / __except, which GCC lacks.
     target_compile_options(MXF PRIVATE -include ${CMAKE_SOURCE_DIR}/third_party/bmx/mingw-seh.h)

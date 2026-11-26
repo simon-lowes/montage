@@ -64,7 +64,9 @@ struct ExportSettings {
     // H.264 and H.265 (x264, x265): a hypothetical reference decoder stated in the stream, as broadcast ingest checks
     // it (render/HrdCheck.h): "cbr" (a constant rate, filler data where the pictures need fewer bits), "vbr" (no more
     // than the rate, at the quality or bit rate asked), or empty (none stated). The HRD's rate is vbvMaxrate (0: the
-    // video bit rate), its buffer vbvBuffer bits (0: a second at the rate).
+    // video bit rate), its buffer vbvBuffer bits (0: a second at the rate). MPEG-2 always states its VBV: these set
+    // it (0 buffer: XDCAM HD422's), and empty is XDCAM HD422's own (exportMpeg2Vbv). AV1 from libaom: its decoder
+    // model stated, the rate kept to (the buffer the level's, AV1 stating no other).
     std::string hrd;
     int64_t vbvMaxrate = 0;
     int64_t vbvBuffer = 0;
@@ -83,6 +85,7 @@ struct ExportSettings {
     FrameTime out = -1;
     bool useProxies = false;
     bool gpu = false;                    // frames drawn on the GPU compositor where it can (render/GpuCompositor.h)
+    bool motionBlur = true;              // off: every motion blur through a shutter left out (plates for a VFX pull)
     bool alpha = false;                  // keep transparency (ProRes 4444 etc.)
     // A stereoscopic sequence's eyes as delivered (render/Stereo.h names): "sbs" side by side at full size (the
     // default), "sbs_half", "tb", "tb_half", or one picture ("left", "right", "anaglyph"). Packed exports carry stereo
@@ -121,9 +124,11 @@ struct ExportSettings {
     int jxlEffort = 3;
     bool jxlPremultiplied = false;
     // JPEG XS (videoCodec "jpegxs", coded by SVT-JPEG-XS, media/JpegXs.h): bits a pixel, a constant number of bytes each
-    // picture (0 = 5). Its sampling and depth are pixFmt's (yuv422p10le when empty; yuv444p…, gbrp…; 8, 10 or 12 bits);
-    // a .mxf path is MXF (ST 2124) with PCM sound, any other a raw codestream file without.
+    // picture (0 = 5). Its sampling and depth are pixFmt's (yuv422p10le when empty; yuv444p…, gbrp…; 8, 10 or 12 bits;
+    // with `alpha` the format's counterpart with alpha, yuva422p10le…, gbrap…); a .mxf path is MXF (ST 2124) with PCM
+    // sound, any other a raw codestream file without. `jpegXsLossless`: each picture coded losslessly (the rate unused).
     double jpegXsBpp = 0;
+    bool jpegXsLossless = false;
     // More layers in each OpenEXR frame (a VFX pull's source layers and mattes, render/VfxPull.h), written with the
     // OpenEXR library: called with the frame's sequence time and the picture's size, adding to `layers` (the picture is
     // the first, "") and header `attributes`. False stops the export with `error`.
@@ -327,6 +332,19 @@ bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames);
 
 // An MPEG-2 (XDCAM HD422) export's GOP at `fps`: the one asked for, else 12 frames (15 at 30 and 60 frames a second).
 int exportMpeg2Gop(const ExportSettings& s, Rational fps);
+// The VBV an MPEG-2 export's sequence headers state, as the stream has it: its rate (bits/s, a whole number of 400s,
+// rounded up as the header counts it) and buffer (a whole number of 16,384 bits, rounded down, so the encoder keeps
+// to the buffer stated), and whether every picture's vbv_delay is set (a constant rate) or 0xFFFF (a variable one).
+// From `hrd` ("cbr", "vbr"; vbvMaxrate, else the video bit rate; vbvBuffer, else XDCAM HD422's 17,825,792 bits), and
+// without one XDCAM HD422's: a constant video bit rate (50 Mb/s when none) into that buffer. At a constant rate the
+// buffer is no more than a vbv_delay can wait for it to fill (just under 0.73 s at the rate), and one not stated is cut
+// to that. Not valid when the buffer is under one unit or over `most` (2,880 units, 47,185,920 bits, the largest any
+// profile and level allows, 4:2:2 at high level; less at a constant rate), or the rate is not above 0.
+struct Mpeg2Vbv {
+    bool valid = false, cbr = true;
+    int64_t rate = 0, buffer = 0, most = 0;
+};
+Mpeg2Vbv exportMpeg2Vbv(const ExportSettings& s);
 // The picture an export codes: the chosen size (or the sequence's), each eye's when a stereoscopic sequence's eyes are
 // packed side by side or one above the other, made even.
 void codedPictureSize(const Sequence& seq, const ExportSettings& s, int& width, int& height);

@@ -94,11 +94,14 @@ struct AvifCodedItem {
 bool readHeifCodedItem(const std::string& path, AvifCodedItem& out);
 
 // For the writers: the map's metadata and target codes (0-255 in 256ths, three a pixel) for an HDR picture over a base as decoders
-// see it (`seen`, 8-bit sRGB-curve code values in `basePrimaries`); the map encoded with what a decoder reads back of
-// each attempt (`roundTrip` encodes `map` and decodes it into `back`) fed back into the codes, the closest kept; and
-// ISO 21496-1's metadata block.
+// see it (`seen`, 8-bit code values in `basePrimaries` by the curve H.273's `baseTransfer` names: 13 sRGB's, 4 gamma 2.2,
+// Adobe RGB's); the map encoded with what a decoder reads back of each attempt (`roundTrip` encodes `map` and decodes it
+// into `back`) fed back into the codes, the closest kept; and ISO 21496-1's metadata block.
 bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, const ColorSpace& hdrSpace, GainMapMetadata& meta,
-                 std::vector<uint16_t>& target);
+                 std::vector<uint16_t>& target, int baseTransfer = 13);
+// Whether a gain map's base is written in Adobe RGB (its primaries and curve, gamma 2.2, with its ICC profile) for an
+// SDR picture in `sdrSpace`; else the base is Rec.709 or Display P3, by sRGB's curve.
+bool gainMapBaseIsAdobeRgb(const ColorSpace& sdrSpace);
 QByteArray encodeGainMap(const std::vector<uint16_t>& target, int width, int height,
                          const std::function<QByteArray(const QImage& map, QImage& back)>& roundTrip);
 QByteArray isoGainMapMetadata(const GainMapMetadata& m);
@@ -107,7 +110,7 @@ QByteArray adobeGainMapXmp(const GainMapMetadata& m);
 
 // Writes `sdr` (code values in `sdrSpace`, an SDR display space) as the base and the map to `hdr` (code values in
 // `hdrSpace`, PQ or HLG), as a JPEG with both kinds of metadata. Pictures premultiplied over black, the same size; the
-// SDR one in Rec.709 or Display P3 primaries (what a JPEG states).
+// SDR one in Rec.709, Display P3 or Adobe RGB primaries (what a JPEG states).
 bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
                       const std::string& path, std::string* error = nullptr, GainMapMetadata* written = nullptr);
 

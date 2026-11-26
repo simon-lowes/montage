@@ -128,6 +128,7 @@ private:
     const void* clock_ = nullptr;
     int tap_ = -1, firstInput_ = 0, takeNumber_ = 0;
     std::atomic<bool> armed_{false};
+    std::atomic<bool> deviceGone_{false};  // (the device the take records from was lost: its tap takes nothing more)
     audiodev::TakeAligner aligner_;
     // (pending_ and spare_ change places at each drain, each keeping its room: nothing is allocated once a take runs)
     std::mutex pendingM_;

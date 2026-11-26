@@ -71,6 +71,15 @@ public:
     void addOverlay(std::function<void(QPainter&, const QRectF&)> paint) { overlays_.push_back(std::move(paint)); }
     QRectF imageRect() const;
     QSize sizeHint() const override { return {480, 270}; }
+    // Zoom (1: the picture fitted to the monitor, 2: twice that) and pan (the picture's centre from the monitor's, in
+    // pixels), from pinching and swiping on a trackpad or touch screen: zooming keeps the picture's pixel under the
+    // fingers where it is, a pan follows the fingers, a swipe moves the picture a quarter of the monitor, and a smart
+    // zoom (double tap) fits it again. Some of the picture always stays in view.
+    double zoom() const { return zoom_; }
+    QPointF pan() const { return pan_; }
+    void zoomAt(const QPointF& at, double factor);
+    void panBy(const QPointF& delta);
+    void fitView();
 
     // Split-screen compare: `reference` on the left of the divider, the
     // picture on the right. Drag the divider to wipe between them.
@@ -128,9 +137,13 @@ protected:
     void mousePressEvent(QMouseEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
     void mouseReleaseEvent(QMouseEvent* e) override;
+    bool event(QEvent* e) override;
 
 private:
     void paintContent(QPainter& p, bool picture);
+    void viewMoved();  // after a zoom or pan
+    double zoom_ = 1;
+    QPointF pan_;
     void updateHdr();
     void dropHdrSurface();
     void refreshOverlay(bool changed);  // false: uploaded only if it differs from the last

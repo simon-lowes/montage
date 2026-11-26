@@ -179,7 +179,9 @@ OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool 
 // caller then takes the processor built at the values).
 struct LiveLoan {
     OCIO::ConstCPUProcessorRcPtr cpu;
-    const OCIO::Processor* owner = nullptr;
+    // (Held, so that its address names no other processor while the loan lasts: the pools are cleared when there are
+    // too many, and one made again at the same address for another transform is not given this one's CPU processor.)
+    OCIO::ConstProcessorRcPtr owner;
     LiveLoan() = default;
     LiveLoan(const LiveLoan&) = delete;
     LiveLoan& operator=(const LiveLoan&) = delete;
@@ -197,7 +199,8 @@ std::map<const OCIO::Processor*, LivePool>& livePools() {
 LiveLoan::~LiveLoan() {
     if (!cpu) return;
     std::lock_guard lock(ocioMutex());
-    if (auto it = livePools().find(owner); it != livePools().end() && it->second.idle.size() < 16) it->second.idle.push_back(std::move(cpu));
+    if (auto it = livePools().find(owner.get()); it != livePools().end() && it->second.proc == owner && it->second.idle.size() < 16)
+        it->second.idle.push_back(std::move(cpu));
 }
 void liveProcessor(const Effect& e, FrameTime t, LiveLoan& loan) {
     OCIO::ConstProcessorRcPtr proc = processorOf(e, nullptr, true, t, true);
@@ -241,7 +244,7 @@ void liveProcessor(const Effect& e, FrameTime t, LiveLoan& loan) {
         return;
     }
     loan.cpu = std::move(cpu);
-    loan.owner = proc.get();
+    loan.owner = std::move(proc);
 }
 
 std::vector<std::string> names(int n, const std::function<const char*(int)>& at) {

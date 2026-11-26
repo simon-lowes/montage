@@ -1,6 +1,7 @@
 // montage-cli — headless rendering, probing and project assembly.
 #include <clocale>
 #include <QDateTime>
+#include <QDir>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -84,6 +85,7 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/GpuCompositor.h"
+#include "render/EncodeFolders.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
 #include "render/SegmentedExport.h"
@@ -118,6 +120,8 @@ int usage() {
                  "                     [--burn-timecode] [--burn-clip-name] [--burn-text TEXT] [--burn-corner 0-5]\n"
                  "                     [--watermark IMAGE [--watermark-corner 0-5] [--watermark-opacity 0..1]]\n"
                  "                     (corners: 0 top left, 1 top centre, 2 top right, 3-5 bottom)\n"
+                 "  montage-cli encode-folder <folder> --preset NAME -o <output folder> [--settle SECONDS] [--once]\n"
+                 "      (each file that lands in the folder encoded once it stops growing, once each)\n"
                  "  montage-cli farm <folder> submit <project.montage> -o <output> [--name NAME] [--segments N] [render's options]\n"
                  "                     (--segments: split at cuts into N parts that several nodes render, then one joins)\n"
                  "  montage-cli farm <folder> jobs|nodes [--json]\n"
@@ -156,7 +160,7 @@ int usage() {
                  "      [--avid-media [--drive DIR] [--codec dnxhr_sq] [--handles 30] [--bake]]   (for Media Composer: the media as\n"
                  "      MXF OP-Atom in DIR's \"Avid MediaFiles/MXF/<n>\", the AAF linked to it)\n"
                  "  montage-cli xml <project.montage> [-o out.xml]       (Final Cut Pro 7 XML)\n"
-                 "  montage-cli fcpxml <project.montage> [-o out.fcpxml]\n"
+                 "  montage-cli fcpxml <project.montage> [-o out.fcpxml] [--version 1.15|1.10]\n"
                  "  montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o <project.montage> [--fps N]\n"
                  "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120] [--gpu]\n"
                  "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate] [--speakers [N]]\n"
@@ -569,6 +573,66 @@ int cmdRender(const std::vector<std::string>& args) {
         for (const StemFile& f : files) std::printf("Wrote %s\n", f.path.c_str());
     }
     return 0;
+}
+
+// An encode folder (render/EncodeFolders.h): each file that lands in `folder` encoded with a preset into the output
+// folder once it has stopped growing, once each (the ledger in the output folder kept across runs). Runs until stopped,
+// or with --once until nothing is left to encode or still growing.
+int cmdEncodeFolder(const std::vector<std::string>& args) {
+    EncodeFolder f;
+    double settle = 3;
+    bool once = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--preset" && i + 1 < args.size()) f.preset = QString::fromStdString(args[++i]);
+        else if (a == "-o" && i + 1 < args.size()) f.output = QFileInfo(QString::fromStdString(args[++i])).absoluteFilePath();
+        else if (a == "--settle" && i + 1 < args.size()) settle = std::clamp(std::atof(args[++i].c_str()), 0.0, 3600.0);
+        else if (a == "--once") once = true;
+        else if (f.input.isEmpty() && !a.empty() && a[0] != '-') f.input = QFileInfo(QString::fromStdString(a)).absoluteFilePath();
+        else return usage();
+    }
+    if (f.input.isEmpty() || f.output.isEmpty() || f.preset.isEmpty()) return usage();
+    if (!findExportPreset(f.preset.toStdString())) {
+        std::fprintf(stderr, "error: there is no preset \"%s\" (see `montage-cli presets`)\n", f.preset.toUtf8().constData());
+        return 1;
+    }
+    if (!QFileInfo(f.input).isDir()) {
+        std::fprintf(stderr, "error: %s is not a folder\n", f.input.toUtf8().constData());
+        return 1;
+    }
+    std::signal(SIGINT, [](int) { gCancel = true; });
+    EncodeFolderScan scan(f, qint64(settle * 1000));
+    int encoded = 0, failed = 0;
+    const auto clock = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    for (bool first = true; !gCancel; first = false) {
+        const std::vector<QString> ready = scan.ready(clock());
+        for (const QString& name : ready) {
+            if (gCancel) break;
+            const QString in = QDir(f.input).filePath(name), out = scan.outputFor(name);
+            std::string err;
+            if (encodeFileWithPreset(in, f.preset, out, &err, [](double p) {
+                    std::fprintf(stderr, "\rEncoding... %5.1f%%", p * 100.0);
+                    std::fflush(stderr);
+                }, &gCancel)) {
+                std::fprintf(stderr, "\r");
+                scan.markDone(name, out);
+                std::printf("Encoded %s to %s\n", in.toUtf8().constData(), out.toUtf8().constData());
+                ++encoded;
+            } else {
+                std::fprintf(stderr, "\nerror: %s: %s\n", in.toUtf8().constData(), err.c_str());
+                scan.letGo(name);
+                ++failed;
+            }
+            std::fflush(stdout);
+        }
+        // (The first look only starts the clock on what is there.)
+        if (once && !first && ready.empty() && scan.waiting() == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(settle > 1 ? 1000 : 200));
+    }
+    std::printf("%d encoded, %d failed\n", encoded, failed);
+    return failed ? 1 : 0;
 }
 
 // The render farm (render/RenderFarm.h): jobs sent, listed, cancelled, retried and removed.
@@ -1178,9 +1242,10 @@ int cmdImport(const std::vector<std::string>& args) {
 
 int cmdInterchange(const std::vector<std::string>& args, const std::string& format) {
     if (args.empty()) return usage();
-    std::string out;
+    std::string out, version = "1.15";
     for (size_t i = 1; i < args.size(); ++i)
         if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--version" && i + 1 < args.size()) version = args[++i];
     Project p;
     if (!load(args[0], p)) return 1;
     // Each compositing graph's clip rendered to a file beside the export (standard output: beside the project).
@@ -1192,7 +1257,7 @@ int cmdInterchange(const std::vector<std::string>& args, const std::string& form
     const Sequence& s = *p.active();
     const std::string text = format == "otio"     ? exportOtio(p, s)
                              : format == "xml"    ? exportFcp7Xml(p, s)
-                             : format == "fcpxml" ? exportFcpXml(p, s)
+                             : format == "fcpxml" ? exportFcpXml(p, s, version)
                                                   : exportEdl(p, s);
     if (out.empty()) {
         std::fwrite(text.data(), 1, text.size(), stdout);
@@ -2247,6 +2312,7 @@ int main(int argc, char** argv) {
     if (cmd == "info") return cmdInfo(args);
     if (cmd == "merge") return cmdMerge(args);
     if (cmd == "render") return cmdRender(args);
+    if (cmd == "encode-folder") return cmdEncodeFolder(args);
     if (cmd == "farm") return cmdFarm(args);
     if (cmd == "node") return cmdNode(args);
     if (cmd == "st2110") return cmdSt2110(args);

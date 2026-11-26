@@ -170,6 +170,28 @@ void shiftKeys(Param& p, const std::vector<FrameTime>& keys, FrameTime delta) {
     std::stable_sort(p.keys.begin(), p.keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.t < b.t; });
 }
 
+bool scaleKeys(Param& p, const std::vector<FrameTime>& keys, double pivot, double factor, FrameTime last) {
+    if (!(factor > 0) || !std::isfinite(factor)) return false;
+    auto moving = [&](FrameTime t) { return std::find(keys.begin(), keys.end(), t) != keys.end(); };
+    std::vector<Keyframe> out = p.keys;
+    bool any = false;
+    for (Keyframe& k : out)
+        if (moving(k.t)) {
+            const double to = pivot + (double(k.t) - pivot) * factor;
+            if (std::fabs(to) > 1e15) return false;
+            k.t = FrameTime(std::llround(to));
+            if (k.t < 0 || k.t > last) return false;
+            k.inDt *= factor, k.outDt *= factor;
+            any = true;
+        }
+    if (!any) return false;
+    // In the same order as before, none on the same frame (the keys that stay where they were).
+    for (size_t i = 1; i < out.size(); ++i)
+        if (out[i].t <= out[i - 1].t) return false;
+    p.keys = std::move(out);
+    return true;
+}
+
 CopiedKeys copyKeys(const Clip& c, const std::vector<std::pair<ParamAddress, FrameTime>>& keys) {
     CopiedKeys out;
     FrameTime first = std::numeric_limits<FrameTime>::max();

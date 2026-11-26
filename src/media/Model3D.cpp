@@ -851,6 +851,16 @@ bool loadGltfSplats(const std::string& path, SplatCloud& out, std::string* error
             return fail("A buffer of " + path + " is shorter than the file says");
     if (cgltf_validate(data) != cgltf_result_success) return fail(path + " is not a valid glTF file");
     constexpr cgltf_size kMostSplats = cgltf_size(1) << 24;
+    // Accessors with no data behind them (no buffer view) are zeros of any length: what they unpack to is held to what
+    // a small file may make (64 MB of values in all), as the mesh loader holds its accessors.
+    constexpr cgltf_size kMostUnbacked = cgltf_size(1) << 24;
+    cgltf_size unbacked = 0;
+    for (cgltf_size i = 0; i < data->accessors_count; ++i) {
+        if (data->accessors[i].buffer_view) continue;
+        const cgltf_size n = data->accessors[i].count * std::max<cgltf_size>(1, cgltf_num_components(data->accessors[i].type));
+        if (data->accessors[i].count > kMostUnbacked || n > kMostUnbacked || (unbacked += n) > kMostUnbacked)
+            return fail(path + " is larger than Montage can load");
+    }
 
     std::vector<SplatCloud> parts;
     std::vector<std::string> notes;

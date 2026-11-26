@@ -276,6 +276,14 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     filmGauge_->setToolTip(tr("For a cut that goes back to film: the gauge its feet and frames, key numbers and film lists\n"
                               "(File › Export Film Lists) are counted in."));
     form->addRow(tr("Film:"), filmGauge_);
+    shutter_ = new QSpinBox(this);
+    shutter_->setObjectName(QStringLiteral("shutterAngle"));
+    shutter_->setRange(0, 720);
+    shutter_->setSingleStep(45);
+    shutter_->setSuffix(QStringLiteral("°"));
+    shutter_->setToolTip(tr("The shutter new transforms, Motion Blurs and titles' letters are blurred through, in degrees\n"
+                            "of a frame (180° is open for half of it)"));
+    form->addRow(tr("Shutter angle:"), shutter_);
     form->addRow(QString(), summary_);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -343,6 +351,7 @@ void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {
     stereo3d_->setChecked(spec.stereo3d);
     const int fg = filmGauge_->findData(QString::fromStdString(spec.filmGauge));
     filmGauge_->setCurrentIndex(fg >= 0 ? fg : 0);
+    shutter_->setValue(int(std::lround(std::clamp(spec.shutterAngle, 0.0, 720.0))));
     updateSummary();
 }
 
@@ -368,6 +377,7 @@ NewSequenceSpec SequenceSettingsDialog::spec() const {
     s.preferredDownmix = preferredDownmix_->currentData().toString().toStdString();
     s.mixingLevel = mixingLevel_->value() >= 80 ? mixingLevel_->value() : 0;
     s.roomType = s.mixingLevel ? roomType_->currentData().toString().toStdString() : std::string();
+    s.shutterAngle = shutter_->value();
     return s;
 }
 
@@ -447,6 +457,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     before.downmixCentreDb = seq.downmixCentreDb, before.downmixSurroundDb = seq.downmixSurroundDb;
     before.preferredDownmix = seq.preferredDownmix;
     before.mixingLevel = seq.mixingLevel, before.roomType = seq.roomType;
+    before.shutterAngle = seq.shutterAngle;
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("Sequence Settings"));
@@ -465,7 +476,8 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         after.vr180 == before.vr180 && after.stereo3d == before.stereo3d && after.filmGauge == before.filmGauge &&
         after.workingSpace == before.workingSpace && after.outputTransform == before.outputTransform &&
         after.downmixCentreDb == before.downmixCentreDb && after.downmixSurroundDb == before.downmixSurroundDb &&
-        after.preferredDownmix == before.preferredDownmix && after.mixingLevel == before.mixingLevel && after.roomType == before.roomType)
+        after.preferredDownmix == before.preferredDownmix && after.mixingLevel == before.mixingLevel && after.roomType == before.roomType &&
+        (after.shutterAngle == before.shutterAngle || std::lround(before.shutterAngle) == after.shutterAngle))
         return false;
 
     const std::string name = after.name.toStdString();
@@ -487,6 +499,8 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         s.downmixCentreDb = after.downmixCentreDb, s.downmixSurroundDb = after.downmixSurroundDb;
         s.preferredDownmix = after.preferredDownmix;
         s.mixingLevel = after.mixingLevel, s.roomType = after.roomType;
+        // (a shutter set another way, between whole degrees, kept unless it was changed here)
+        if (std::lround(before.shutterAngle) != after.shutterAngle) s.shutterAngle = after.shutterAngle;
         // Keep the media item that represents this sequence (for nesting) in sync.
         for (MediaItem& m : p.media) {
             if (m.kind != MediaKind::Sequence || m.sequenceId != s.id) continue;

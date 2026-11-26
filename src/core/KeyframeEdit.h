@@ -58,6 +58,11 @@ const Param* findParam(const Clip& c, const ParamAddress& a);
 // [0, last]; and the move itself (which assumes it is within that range).
 std::pair<FrameTime, FrameTime> shiftRange(const Param& p, const std::vector<FrameTime>& keys, FrameTime last);
 void shiftKeys(Param& p, const std::vector<FrameTime>& keys, FrameTime delta);
+// Stretching or squeezing several keys of a parameter in time about `pivot` (a clip frame), so an animation plays
+// faster or slower as a whole: each key's time from the pivot times `factor` (> 0), to the nearest frame, and its
+// Bezier handles' times with it (their values kept, so the curve keeps its shape). The keys keep their order, stay
+// apart and do not reach the keys that stay or leave [0, last]: false, and nothing changed, when they would.
+bool scaleKeys(Param& p, const std::vector<FrameTime>& keys, double pivot, double factor, FrameTime last);
 
 // Copying and pasting keyframes (After Effects, Premiere, Resolve): the keys
 // of each parameter, timed from the earliest key copied, pasted at a clip
