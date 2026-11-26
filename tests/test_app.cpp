@@ -20025,6 +20025,82 @@ const auto seq = [this] { return state()->sequence(); };
         jobs->reloadFolders();
     }
 
+    void encodeFolderFromTheCommandLine() {
+        // montage-cli encode-folder: three files put in the folder are each encoded once, a fourth still growing is
+        // passed over until it stops, and with --once it ends when nothing is left; run again, it encodes nothing.
+        const QString in = dir_.path() + "/cli-encode-in", out = dir_.path() + "/cli-encode-out";
+        QVERIFY(QDir().mkpath(in) && QDir().mkpath(out));
+        QFile source(QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        const QByteArray wav = source.readAll();
+        for (const char* name : {"one.wav", "two.wav", "three.wav"}) {
+            QFile f(in + "/" + name);
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write(wav) == wav.size());
+        }
+        QFile fourth(in + "/four.wav");
+        QVERIFY(fourth.open(QIODevice::WriteOnly));
+        qint64 written = 0;
+        QElapsedTimer sinceGrown;
+        auto grow = [&] {
+            // (a piece every 250 ms: the file's sound lasts far longer than the test needs it to grow)
+            if (sinceGrown.isValid() && sinceGrown.elapsed() < 250) return;
+            sinceGrown.start();
+            fourth.write(wav.mid(written, 2048));
+            fourth.flush();
+            written += 2048;
+        };
+        grow();
+        auto run = [&](QProcess& p) {
+            p.setProcessChannelMode(QProcess::SeparateChannels);
+            p.start(QStringLiteral(MONTAGE_CLI), {QStringLiteral("encode-folder"), in, QStringLiteral("--preset"), QStringLiteral("Audio - WAV 24-bit"),
+                                                  QStringLiteral("-o"), out, QStringLiteral("--settle"), QStringLiteral("1"), QStringLiteral("--once")});
+            return p.waitForStarted(30000);
+        };
+        auto encodedFiles = [&] { return QDir(out).entryList({"*.wav"}, QDir::Files); };
+        QProcess cli;
+        QVERIFY(run(cli));
+        QByteArray said;
+        QElapsedTimer clock;
+        clock.start();
+        while (encodedFiles().size() < 3 && clock.elapsed() < 120000 && cli.state() != QProcess::NotRunning) {
+            grow();
+            cli.waitForReadyRead(200);
+            said += cli.readAllStandardOutput();
+            QVERIFY2(!encodedFiles().contains("four.wav"), said.constData());
+        }
+        QCOMPARE(encodedFiles(), (QStringList{"one.wav", "three.wav", "two.wav"}));
+        // Still growing for 3 s more: still passed over, and the command waits for it.
+        QElapsedTimer more;
+        more.start();
+        while (more.elapsed() < 3000) {
+            grow();
+            cli.waitForReadyRead(200);
+            said += cli.readAllStandardOutput();
+        }
+        QVERIFY2(!encodedFiles().contains("four.wav"), said.constData());
+        QCOMPARE(cli.state(), QProcess::Running);
+        // Whole and left: encoded, and the command ends.
+        fourth.write(wav.mid(written));
+        fourth.close();
+        QVERIFY(cli.waitForFinished(120000));
+        said += cli.readAllStandardOutput();
+        QVERIFY2(cli.exitStatus() == QProcess::NormalExit && cli.exitCode() == 0, (said + cli.readAllStandardError()).constData());
+        QVERIFY2(said.contains("4 encoded, 0 failed"), said.constData());
+        QCOMPARE(said.count("Encoded "), 4);
+        QCOMPARE(encodedFiles().size(), 4);
+        for (const QString& f : encodedFiles()) {
+            MediaItem m;
+            QVERIFY(probeMedia((out + "/" + f).toStdString(), m));
+            QVERIFY(m.hasAudio && std::fabs(m.duration - 11.0) < 0.3);
+        }
+        // Run again: its ledger says each is done.
+        QProcess again;
+        QVERIFY(run(again));
+        QVERIFY(again.waitForFinished(60000));
+        const QByteArray second = again.readAllStandardOutput();
+        QVERIFY2(again.exitCode() == 0 && second.contains("0 encoded, 0 failed"), second.constData());
+    }
+
     void keyframeCopyPaste() {
         // Red's opacity fade and a blur's radius, copied and pasted onto Blue at the playhead.
         loadDemo();
@@ -27591,6 +27667,35 @@ print("added " + ui["name"])
             QLocale::setDefault(QLocale::c());
             QCOMPARE(other, c);
         }
+    }
+
+    void aHungFunctionIsNamed() {
+        // A test function that hangs is stopped by Qt's watchdog after the binary's QTEST_FUNCTION_TIMEOUT, and the
+        // log names it before the binary aborts. Run here as a second test_app made to hang in this function.
+        if (qEnvironmentVariableIsSet("MONTAGE_TEST_HANG_ON_PURPOSE")) {
+            QElapsedTimer waited;
+            waited.start();
+            while (waited.elapsed() < 180000) QThread::msleep(50);
+            QFAIL("the watchdog did not stop a function that hung for 180 s");
+        }
+        QProcess p;
+        p.setProcessChannelMode(QProcess::MergedChannels);
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("MONTAGE_TEST_HANG_ON_PURPOSE"), QStringLiteral("1"));
+        env.insert(QStringLiteral("QTEST_FUNCTION_TIMEOUT"), QStringLiteral("20000"));
+        env.insert(QStringLiteral("QTEST_DISABLE_STACK_DUMP"), QStringLiteral("1"));
+        p.setProcessEnvironment(env);
+        p.start(QCoreApplication::applicationFilePath(), {QStringLiteral("aHungFunctionIsNamed")});
+        QVERIFY(p.waitForStarted(30000));
+        QVERIFY(p.waitForFinished(170000));
+        const QString log = QString::fromLocal8Bit(p.readAll());
+        QVERIFY2(p.exitStatus() == QProcess::CrashExit || p.exitCode() != 0, qPrintable(log));
+        // The line that says the function timed out names it.
+        bool named = false;
+        for (const QString& line : log.split(QLatin1Char('\n')))
+            named = named || (line.contains(QLatin1String("aHungFunctionIsNamed()")) && line.contains(QLatin1String("timed out")));
+        QVERIFY2(named, qPrintable(log.right(2000)));
+        QVERIFY2(!log.contains(QLatin1String("the watchdog did not stop")), qPrintable(log.right(2000)));
     }
 
     void everyTranslatableTextIsFound() {
