@@ -28605,6 +28605,48 @@ colorspaces:
         QVERIFY2(peak > 0.05f, std::to_string(peak).c_str());
     }
 
+    // The 25 November nightly: a connection to the WHIP endpoint that sends no request (so no token) gives its slot
+    // up after 5 s, not 20.
+    void whipSlotsHeldBriefly() {
+        std::string why;
+        if (!whip::available(&why)) QSKIP(why.c_str());
+        whip::Endpoint e;
+        whip::Settings st;
+        st.token = "a-token-made-up-for-this-test";
+        QVERIFY2(e.start(st, &why), why.c_str());
+        QTcpSocket quiet, half;
+        quiet.connectToHost(QHostAddress::LocalHost, quint16(e.port()));
+        half.connectToHost(QHostAddress::LocalHost, quint16(e.port()));
+        QVERIFY(quiet.waitForConnected(2000) && half.waitForConnected(2000));
+        QElapsedTimer t;
+        t.start();
+        half.write("POST /whip HTTP/1.1\r\nHost: 127.0.0.1\r\n");  // (a request never finished)
+        half.flush();
+        qint64 quietGone = -1, halfGone = -1;
+        while (t.elapsed() < 15000 && (quietGone < 0 || halfGone < 0)) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+            quiet.waitForReadyRead(25);
+            half.waitForReadyRead(25);
+            if (quietGone < 0 && quiet.state() == QAbstractSocket::UnconnectedState) quietGone = t.elapsed();
+            if (halfGone < 0 && half.state() == QAbstractSocket::UnconnectedState) halfGone = t.elapsed();
+        }
+        QVERIFY2(quietGone >= 4000 && quietGone < 8000, std::to_string(quietGone).c_str());
+        QVERIFY2(halfGone >= 4000 && halfGone < 8000, std::to_string(halfGone).c_str());
+        // (a request made at once is still answered)
+        QTcpSocket asks;
+        asks.connectToHost(QHostAddress::LocalHost, quint16(e.port()));
+        QVERIFY(asks.waitForConnected(2000));
+        asks.write("OPTIONS /whip HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        QByteArray got;
+        QElapsedTimer w;
+        w.start();
+        while (w.elapsed() < 5000 && !got.contains("\r\n")) {
+            asks.waitForReadyRead(100);
+            got += asks.readAll();
+        }
+        QVERIFY2(got.startsWith("HTTP/1.1 "), got.constData());
+    }
+
     // Phase 17: the guest's page on a phone. Headless Chrome emulates a phone's screen, 390 by 844 (and touch), with
     // two cameras of its own: the page is laid out within the screen's width, nothing clipped, before and while it
     // sends; once it sends the camera it offers to switch cameras, and switching keeps the same connection and

@@ -312,6 +312,7 @@ using output::PassphraseGate;
 
 constexpr qsizetype kMaxHeader = 16 * 1024, kMaxBody = 256 * 1024;
 constexpr int kMaxConnections = 32, kMaxFromOneAddress = 8;
+constexpr int kRequestWaitMs = 5000;  // how long a connection may take to send its request
 constexpr size_t kHeldBytes = size_t(16) << 20;     // pictures kept before the feed begins (from the last keyframe)
 constexpr size_t kQueuedBytes = size_t(64) << 20;   // packets waiting to be read: past this, pictures are dropped
 constexpr double kReportsWait = 3.0;                // seconds the sender's reports are waited for before arrival lines the sound up
@@ -954,12 +955,14 @@ struct Endpoint::Impl {
         QObject::connect(c, &QAbstractSocket::disconnected, c, &QObject::deleteLater);
         QObject::connect(c, &QAbstractSocket::readyRead, c, [this, c] { read(c); });
         QObject::connect(c, &QAbstractSocket::errorOccurred, c, [c] { c->abort(); });
+        // (a slot is held 5 s for a request, and over HTTPS 5 s for the handshake before that: what sends nothing, or
+        // no token, gives its place up soon)
         auto* idle = new QTimer(c);
         idle->setSingleShot(true);
         QObject::connect(idle, &QTimer::timeout, c, [c] { c->abort(); });
-        idle->start(https ? 5000 : 20000);
+        idle->start(kRequestWaitMs);
         if (https) {
-            QObject::connect(c, &QSslSocket::encrypted, idle, [idle] { idle->start(20000); });
+            QObject::connect(c, &QSslSocket::encrypted, idle, [idle] { idle->start(kRequestWaitMs); });
             QSslConfiguration conf = QSslConfiguration::defaultConfiguration();
             conf.setLocalCertificate(certificate);
             conf.setPrivateKey(key);
