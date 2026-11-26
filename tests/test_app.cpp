@@ -43,6 +43,7 @@
 #include <QListView>
 #include <QListWidget>
 #include <QMimeData>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSlider>
 #include <QVBoxLayout>
@@ -28078,6 +28079,58 @@ print("added " + ui["name"])
             qInfo().noquote() << "Preferences in Arabic:" << screenshot(&d, QStringLiteral("preferences-ar-") + page.toLower());
         }
         QVERIFY2(cut.isEmpty(), qPrintable(cut.join('\n')));
+    }
+
+    void phase17DialogsInArabic() {
+        // In Arabic, the dialogs Phase 17 added to or made (Encode Folders, and the new rows of Export, Capture and
+        // Sequence Settings) lay out right to left within a 1280 by 800 screen with no text cut short. Each is saved as
+        // a picture to be looked at.
+        QCOMPARE(language::install("ar"), QString("ar"));
+        auto back = qScopeGuard([] { language::uninstall(); });
+        QStringList problems;
+        auto look = [&](QDialog* d, const QString& name) {
+            QCoreApplication::processEvents();
+            if (!d->isRightToLeft()) problems << name + QStringLiteral(" is not right to left");
+            if (d->width() > 1280 || d->height() > 800)
+                problems << QStringLiteral("%1 is %2 by %3").arg(name).arg(d->width()).arg(d->height());
+            for (const QString& c : cutShort(d)) problems << name + QStringLiteral(": ") + c;
+            // (rows that scroll up and down are not cut off at the side)
+            for (QScrollArea* a : d->findChildren<QScrollArea*>())
+                if (a->isVisible() && a->widget() && a->horizontalScrollBarPolicy() == Qt::ScrollBarAlwaysOff &&
+                    a->widget()->width() > a->viewport()->width())
+                    problems << QStringLiteral("%1: %2's rows are %3 wide in %4").arg(name, a->objectName()).arg(a->widget()->width()).arg(a->viewport()->width());
+            qInfo().noquote() << "In Arabic:" << screenshot(d, QStringLiteral("phase17-ar-") + name);
+        };
+        {
+            ExportDialog d(state(), win_.get());
+            d.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&d));
+            look(&d, QStringLiteral("export"));
+        }
+        {
+            CaptureDialog d(state(), win_.get());
+            d.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&d));
+            look(&d, QStringLiteral("capture"));
+        }
+        {
+            SequenceSettingsDialog d(win_.get());
+            d.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&d));
+            look(&d, QStringLiteral("sequence-settings"));
+        }
+        bool seen = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* d = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!d || d->objectName() != QLatin1String("encodeFoldersDialog")) return;
+            seen = true;
+            QTest::qWaitForWindowExposed(d);
+            look(d, QStringLiteral("encode-folders"));
+            d->reject();
+        });
+        showEncodeFoldersDialog(win_.get(), state());
+        QVERIFY(seen);
+        QVERIFY2(problems.isEmpty(), qPrintable(problems.join('\n')));
     }
 
     void aHungFunctionIsNamed() {

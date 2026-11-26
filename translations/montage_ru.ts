@@ -28917,14 +28917,6 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>on</source>
-        <translation type="unfinished">по</translation>
-    </message>
-    <message>
-        <source>off</source>
-        <translation type="unfinished">выключено</translation>
-    </message>
-    <message>
         <source>the system&apos;s</source>
         <translation type="unfinished"></translation>
     </message>
@@ -28942,6 +28934,14 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     </message>
     <message>
         <source>Locked by the facility&apos;s settings file %1, so it cannot be changed here.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Default: on</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Default: off</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

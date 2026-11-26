@@ -22,6 +22,9 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScreen>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QSettings>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrentRun>
@@ -145,6 +148,32 @@ QString safeFileName(QString name) {
 }
 
 int roundEven(double v) { return std::clamp(int(std::lround(v / 2.0)) * 2, 16, 8192); }
+
+// A scroll area as tall as what it holds, up to what its screen has room for: the dialog's rows scroll on a screen
+// too short for them (1280 by 800) instead of running off it.
+class FittedScroll : public QScrollArea {
+public:
+    using QScrollArea::QScrollArea;
+    QSize sizeHint() const override {
+        if (!widget()) return QScrollArea::sizeHint();
+        const QSize inner = widget()->sizeHint();
+        const QScreen* on = screen();
+        const int room = on ? std::max(480, on->availableGeometry().height() - 160) : inner.height();
+        const int bar = inner.height() > room ? verticalScrollBar()->sizeHint().width() : 0;
+        return {inner.width() + 2 * frameWidth() + bar, std::min(inner.height(), room) + 2 * frameWidth()};
+    }
+    // (never narrower than its rows: they are not cut off at the side)
+    QSize minimumSizeHint() const override {
+        const QSize least = QScrollArea::minimumSizeHint();
+        if (!widget()) return least;
+        return {widget()->minimumSizeHint().width() + 2 * frameWidth() + verticalScrollBar()->sizeHint().width(), least.height()};
+    }
+    // (rows shown or hidden change what it holds: the dialog's layout asks again)
+    bool eventFilter(QObject* o, QEvent* e) override {
+        if (o == widget() && e->type() == QEvent::LayoutRequest) updateGeometry();
+        return QScrollArea::eventFilter(o, e);
+    }
+};
 
 }  // namespace
 
@@ -739,11 +768,16 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     connect(buttons, &QDialogButtonBox::rejected, this, &ExportDialog::reject);
 
     auto* layout = new QVBoxLayout(this);
-    layout->addWidget(form_);
+    auto* scroll = new FittedScroll(this);
+    scroll->setObjectName(QStringLiteral("exportRows"));
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setWidget(form_);
+    layout->addWidget(scroll, 1);
     layout->addSpacing(4);
     layout->addWidget(progress_);
     layout->addWidget(eta_);
-    layout->addStretch(1);
     layout->addWidget(buttons);
 
     // Restore the last preset; the path is derived from it in presetChanged().

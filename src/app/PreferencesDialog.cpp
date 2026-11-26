@@ -259,7 +259,7 @@ QString PreferencesDialog::shownValue(const QString& key, const QVariant& value)
     const prefs::Setting& s = *prefs::find(key);
     switch (s.kind) {
         case prefs::Kind::Toggle:
-            return value.toBool() ? tr("on") : tr("off");
+            return {};  // (said whole where it is shown)
         case prefs::Kind::Whole:
             return s.unit ? QStringLiteral("%1 %2").arg(value.toInt()).arg(shown(s.unit)) : QString::number(value.toInt());
         case prefs::Kind::Number:
@@ -304,7 +304,9 @@ void PreferencesDialog::showRow(const QString& key) {
             r.editor->findChild<QLineEdit*>()->setText(v.toString());
     }
     filling_ = false;
-    r.fallback->setText(tr("Default: %1").arg(shownValue(key, prefs::defaultFor(key))));
+    // (a toggle's said whole: a lone "on" or "off" is too short a text to translate well)
+    if (prefs::find(key)->kind == prefs::Kind::Toggle) r.fallback->setText(prefs::defaultFor(key).toBool() ? tr("Default: on") : tr("Default: off"));
+    else r.fallback->setText(tr("Default: %1").arg(shownValue(key, prefs::defaultFor(key))));
     const QString by = prefs::overriddenBy(key);
     const QString lockedBy = prefs::lockedBy(key);
     QStringList notes;
