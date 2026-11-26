@@ -25,8 +25,11 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <pthread.h>
+#include <pthread/qos.h>
 #include <semaphore.h>
 #else
 #include <climits>
@@ -472,6 +475,51 @@ int64_t ownResidentBytes() {
     return int64_t(c.WorkingSetSize);
 }
 #else
+namespace {
+
+// The calling thread at the program's normal priority while a child is started from it, and back as it was after: a
+// child takes the priority of the thread that starts it, and the engine's feed thread is put ahead of other programs
+// (nightly 25 Nov: a plug-in host started from it ran ahead of everything else on the computer too).
+class NormalPriority {
+public:
+    NormalPriority() {
+#if defined(__APPLE__)
+        was_ = qos_class_self();
+        const qos_class_t normal = qos_class_main();
+        if (was_ != normal && pthread_set_qos_class_self_np(normal, 0) == 0) moved_ = true;
+#elif defined(__linux__)
+        tid_ = id_t(syscall(SYS_gettid));
+        errno = 0;
+        was_ = getpriority(PRIO_PROCESS, tid_);
+        const int e1 = errno;
+        errno = 0;
+        const int normal = getpriority(PRIO_PROCESS, id_t(getpid()));  // (the main thread's)
+        if (e1 == 0 && errno == 0 && was_ < normal && setpriority(PRIO_PROCESS, tid_, normal) == 0) moved_ = true;
+#endif
+    }
+    ~NormalPriority() {
+        if (!moved_) return;
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(was_, 0);
+#elif defined(__linux__)
+        setpriority(PRIO_PROCESS, tid_, was_);
+#endif
+    }
+    NormalPriority(const NormalPriority&) = delete;
+    NormalPriority& operator=(const NormalPriority&) = delete;
+
+private:
+    bool moved_ = false;
+#if defined(__APPLE__)
+    qos_class_t was_ = QOS_CLASS_UNSPECIFIED;
+#elif defined(__linux__)
+    id_t tid_ = 0;
+    int was_ = 0;
+#endif
+};
+
+}  // namespace
+
 std::unique_ptr<Process> Process::spawn(const std::string& exe, const std::vector<std::string>& args, std::string* error) {
     std::vector<std::string> all{exe};
     all.insert(all.end(), args.begin(), args.end());
@@ -488,7 +536,11 @@ std::unique_ptr<Process> Process::spawn(const std::string& exe, const std::vecto
     posix_spawnattr_setsigdefault(&attr, &all_signals);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
     pid_t pid = 0;
-    const int rc = posix_spawn(&pid, exe.c_str(), nullptr, &attr, argv.data(), environ);
+    int rc = 0;
+    {
+        const NormalPriority normal;
+        rc = posix_spawn(&pid, exe.c_str(), nullptr, &attr, argv.data(), environ);
+    }
     posix_spawnattr_destroy(&attr);
     if (rc != 0) {
         if (error) *error = "cannot start " + exe + ": " + std::strerror(rc);

@@ -237,15 +237,16 @@ class LoopbackStream : public Stream {
 public:
     LoopbackStream(const DeviceSettings& s, int rate, int inputs, int outputs, StreamCallbacks cb)
         : rate_(rate > 0 ? rate : 48000), buffer_(clampBuffer(s.bufferFrames)), inputs_(inputs), outputs_(outputs),
-          clock_(s.clock.empty() ? "Internal" : s.clock), cb_(std::move(cb)) {
+          clock_(s.clock.empty() ? "Internal" : s.clock), named_(!s.output.empty() || !s.input.empty()), cb_(std::move(cb)) {
         {
             std::lock_guard<std::mutex> lock(gLoopM);
             opt_ = gLoopOptions;
             gLoop = this;
         }
         reportedOut_ = opt_.reportedOutput;
-        // (never less than a buffer: what a callback hears was played before it, in a block before)
-        delay_ = std::max(buffer_, std::max(0, opt_.reportedInput) + std::max(0, opt_.reportedOutput) + std::max(0, opt_.unreported));
+        // (never less than the most a callback takes: what a callback hears was played before it, in a block before)
+        const int most = opt_.seed && opt_.doubleEvery > 0 ? 2 * buffer_ : buffer_;
+        delay_ = std::max(most, std::max(0, opt_.reportedInput) + std::max(0, opt_.reportedOutput) + std::max(0, opt_.unreported));
         line_.assign(size_t(delay_) * size_t(std::max(1, inputs_)), 0.0f);
         thread_ = std::thread([this] { run(); });
     }
@@ -269,9 +270,11 @@ public:
 
     void unplug() {
         // (as a device pulled out: no more callbacks, and its owner told)
-        gone_ = true;
+        if (gone_.exchange(true)) return;
         if (cb_.lost) cb_.lost("The loopback was unplugged");
     }
+    bool named() const { return named_; }
+    LoopbackCounts counts() const { return {taken_.load(), sounding_.load()}; }
     void changeRate(int rate, int reportedOutput) {
         pendingOut_ = reportedOutput;
         pendingRate_ = rate;
@@ -281,9 +284,16 @@ public:
 private:
     void run() {
         asADriversThread(int64_t(1e9 * buffer_ / rate_.load()));
-        std::vector<float> in(size_t(buffer_) * size_t(std::max(1, inputs_))), out(size_t(buffer_) * size_t(std::max(1, outputs_)));
+        std::vector<float> in(size_t(2 * buffer_) * size_t(std::max(1, inputs_))), out(size_t(2 * buffer_) * size_t(std::max(1, outputs_)));
         auto next = std::chrono::steady_clock::now();
         bool wasLate = false;
+        // (a busy computer's callbacks, the same for the same seed)
+        uint32_t dice = opt_.seed;
+        const auto roll = [&](int every) {
+            if (!opt_.seed || every <= 0) return false;
+            dice = dice * 1664525u + 1013904223u;
+            return (dice >> 8) % uint32_t(every) == 0;
+        };
         while (running_) {
             if (const int r = pendingRate_.exchange(0); r > 0 && r != rate_) {
                 if (const int o = pendingOut_.exchange(-1); o >= 0) reportedOut_ = o;
@@ -291,50 +301,60 @@ private:
                 if (cb_.rateChanged) cb_.rateChanged(r);
             }
             const auto period = std::chrono::nanoseconds(int64_t(1e9 * buffer_ / rate_.load()));
-            pull(in.data());
+            const bool late = roll(opt_.lateEvery), twice = roll(opt_.doubleEvery);
+            const int frames = twice ? 2 * buffer_ : buffer_;
+            pull(in.data(), frames);
             std::fill(out.begin(), out.end(), 0.0f);
+            if (late) std::this_thread::sleep_for(period);  // (then made up at once below: its time has passed)
             if (const int ms = stallMs_.exchange(0); ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-            if (cb_.process && !gone_.load()) cb_.process(in.data(), inputs_, out.data(), outputs_, buffer_);
-            push(out.data());
-            next += period;
+            if (cb_.process && !gone_.load()) cb_.process(in.data(), inputs_, out.data(), outputs_, frames);
+            push(out.data(), frames);
+            next += twice ? 2 * period : period;
             // An interface's clock runs on whatever its callbacks do: blocks late here (a coarse system timer, a busy
             // computer) are made up at once, back to back, so its sample count keeps to the time. A callback late by
             // more than a block and a timer tick is an xrun (an interface would have run out), counted once while late;
             // a thread held up for seconds (a debugger) starts the time afresh.
             const auto now = std::chrono::steady_clock::now();
-            const bool late = now > next + std::max<std::chrono::nanoseconds>(2 * period, std::chrono::milliseconds(25));
-            if (late && !wasLate) ++xruns_;
-            wasLate = late;
+            const bool behind = now > next + std::max<std::chrono::nanoseconds>(2 * period, std::chrono::milliseconds(25));
+            if (behind && !wasLate) ++xruns_;
+            wasLate = behind;
             if (now > next + std::chrono::seconds(2)) next = now;
             if (now < next) rtguard::sleepUntil(next);  // (on time: on Windows not to the system timer's next tick)
         }
     }
     // The delay line: a ring of delay_ frames (inputs_ channels), the oldest at ring_: read a block from there, and the
     // block just sent written where it was read, so it comes back delay_ frames on.
-    void pull(float* in) {
-        for (int i = 0; i < buffer_; ++i) {
+    void pull(float* in, int frames) {
+        for (int i = 0; i < frames; ++i) {
             for (int c = 0; c < inputs_; ++c) in[size_t(i) * size_t(inputs_) + size_t(c)] = line_[size_t(ring_) * size_t(inputs_) + size_t(c)];
             ring_ = (ring_ + 1) % delay_;
         }
     }
-    void push(const float* out) {
-        int w = (ring_ + delay_ - buffer_) % delay_;
-        for (int i = 0; i < buffer_; ++i) {
+    void push(const float* out, int frames) {
+        int w = (ring_ + delay_ - frames) % delay_;
+        int64_t sounding = 0;
+        for (int i = 0; i < frames; ++i) {
             for (int c = 0; c < inputs_; ++c) line_[size_t(w) * size_t(inputs_) + size_t(c)] = c < outputs_ ? out[size_t(i) * size_t(outputs_) + size_t(c)] : 0.0f;
+            if (outputs_ > 0 && out[size_t(i) * size_t(outputs_)] != 0.0f) ++sounding;
             w = (w + 1) % delay_;
+        }
+        if (!gone_.load()) {
+            sounding_ += sounding;
+            taken_ += frames;
         }
     }
 
     std::atomic<int> rate_;
     const int buffer_, inputs_, outputs_;
     std::string clock_;
+    const bool named_;  // opened by the device's name (not the host's default)
     StreamCallbacks cb_;
     LoopbackOptions opt_;
     int delay_ = 0, ring_ = 0;
     std::vector<float> line_;
     std::atomic<bool> running_{true}, gone_{false};
     std::atomic<int> pendingRate_{0}, stallMs_{0}, pendingOut_{-1}, reportedOut_{0};
-    std::atomic<int64_t> xruns_{0};
+    std::atomic<int64_t> xruns_{0}, taken_{0}, sounding_{0};
     std::thread thread_;
 };
 
@@ -343,7 +363,12 @@ private:
 void setLoopbackOptions(const LoopbackOptions& o) {
     std::lock_guard<std::mutex> lock(gLoopM);
     gLoopOptions = o;
-    if (o.unplugged && gLoop) gLoop->unplug();
+    if (gLoop && (o.unplugged || (o.away && gLoop->named()))) gLoop->unplug();
+}
+
+LoopbackCounts loopbackCounts() {
+    std::lock_guard<std::mutex> lock(gLoopM);
+    return gLoop ? gLoop->counts() : LoopbackCounts{};
 }
 
 LoopbackOptions loopbackOptions() {
@@ -371,7 +396,7 @@ std::unique_ptr<Stream> openStream(const DeviceSettings& s, int rate, int inputs
             return nullptr;
         case Host::Loopback:
             if (const int ms = loopbackOptions().openMs; ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-            if (loopbackOptions().unplugged) {
+            if (const LoopbackOptions o = loopbackOptions(); o.unplugged || (o.away && (!s.output.empty() || !s.input.empty()))) {
                 if (error) *error = "The loopback is unplugged";
                 return nullptr;
             }
@@ -441,6 +466,10 @@ struct Io {
     };
     std::vector<Block> blocks;
     std::atomic<int64_t> blocksWritten{0}, blocksRead{0};
+    // Every callback's place in the output ring, kept whether or not anything listens (so an input added just before
+    // a playback starts has the device's own count of what went out before it, not a guess from the time).
+    std::vector<Block> history;
+    std::atomic<int64_t> historyWritten{0};
     std::atomic<int> listeners{0};  // inputs added: blocks are kept only while something listens
     std::atomic<int64_t> overflows{0};  // input blocks let go because the feed thread was not keeping up
     std::atomic<int64_t> deviceFrames{0};
@@ -455,28 +484,60 @@ struct Io {
     int feedRate = 0;
     int cushion = 0;
     int64_t seenUnderruns = 0;
-    std::deque<Block> sent;  // the last blocks handed on: where the device's frames were in the output ring
+    std::deque<Block> sent;  // the callbacks' places in the output ring, as the device took them, oldest first
+    int64_t historyRead = 0;
+    bool sentFromStart = true;  // `sent` reaches back to the stream's first frame (none were let go unread)
 
-    // The output ring's place that went out at the device's frame `at`. Where the ring had run dry at that frame
-    // (silence went out), the next place that did go out and how many device frames later (`back`): the timeline is
-    // counted back from there. False when that is further back than is kept.
-    bool placeAt(int64_t at, int64_t& pos, int64_t& back) const {
+    // The callbacks' places since the last call, onto `sent` (the feed thread's).
+    void takeHistory() {
+        const int64_t hw = historyWritten.load(std::memory_order_acquire);
+        const int64_t size = int64_t(history.size());
+        if (hw - historyRead > size) {
+            // (the feed thread was held up longer than is kept: what went before is not known)
+            historyRead = hw - size;
+            sent.clear();
+            sentFromStart = false;
+        }
+        for (; historyRead < hw; ++historyRead) {
+            const Block b = history[size_t(historyRead) & size_t(size - 1)];
+            // (written over while it was read: the callbacks ran that far ahead; what is left is not known)
+            if (historyWritten.load(std::memory_order_acquire) - historyRead > size) {
+                sent.clear();
+                sentFromStart = false;
+                continue;
+            }
+            sent.push_back(b);
+        }
+        while (sent.size() > 4096) {
+            sent.pop_front();
+            sentFromStart = false;
+        }
+    }
+
+    // What went out at the device's frame `at`: the output ring's place (At); before the stream began (Before: nothing
+    // did); or not known, further back than is kept (Unknown). Where the ring had run dry at that frame (silence went
+    // out), the next place that did go out and how many device frames later (`back`): the timeline is counted back
+    // from there (Before when nothing has gone out since).
+    enum class Heard { At, Before, Unknown };
+    Heard placeAt(int64_t at, int64_t& pos, int64_t& back) const {
+        if (at < 0 && sentFromStart) return Heard::Before;
         for (auto it = sent.rbegin(); it != sent.rend(); ++it) {
-            if (at < it->device || at >= it->device + it->frames) continue;
+            if (at >= it->device + it->frames) break;  // (later than what has been kept: not yet known)
+            if (at < it->device) continue;
             if (at - it->device < it->ready) {
                 pos = it->outPos + (at - it->device);
                 back = 0;
-                return true;
+                return Heard::At;
             }
             for (auto later = it.base(); later != sent.end(); ++later)
                 if (later->ready > 0) {
                     pos = later->outPos;
                     back = later->device - at;
-                    return true;
+                    return Heard::At;
                 }
-            return false;
+            return Heard::Before;
         }
-        return false;
+        return Heard::Unknown;
     }
 
     // The stretches of `frames` device frames from `from` that heard the output ring's sound, as (offset, length):
@@ -507,6 +568,7 @@ struct Io {
         inCap = inCh > 0 ? 65536 : 0;
         in.assign(size_t(inCap) * size_t(inCh), 0.0f);
         blocks.assign(4096, Block{});
+        history.assign(8192, Block{});
     }
 
     void process(const float* input, int ic, float* output, int oc, int frames) noexcept;
@@ -531,6 +593,13 @@ void Io::process(const float* input, int ic, float* output, int oc, int frames) 
         for (int c = 0; c < k; ++c) dst[c] = src[c];
     }
     if (n < frames && primed.load(std::memory_order_relaxed)) underruns.fetch_add(1, std::memory_order_relaxed);
+    // Where this callback's frames were in the output ring (before its input block is handed on: the feed thread finds
+    // it there by the time it takes the block).
+    {
+        const int64_t hw = historyWritten.load(std::memory_order_relaxed);
+        history[size_t(hw) & (history.size() - 1)] = Block{frames, 0, n, r, base};
+        historyWritten.store(hw + 1, std::memory_order_release);
+    }
     // A loopback measurement: a click out, then what comes back.
     int state = measureState.load();
     if (state == 1) {
@@ -575,6 +644,7 @@ struct Segment {
     int64_t pos = 0, frames = 0;  // the ring's frames
     double sample = -1;           // the timeline sample (the output's rate) at pos, -1 when it is not the timeline's
     double step = 1;              // samples a ring frame
+    double made = 0;              // the output's own frames made before pos (since it was added)
 };
 
 struct OutputClient {
@@ -594,9 +664,14 @@ struct OutputClient {
     // so the clock holds when its rate changes.
     std::atomic<int64_t> renderedNs{0};
     int64_t renderedRem = 0;
+    // Its own frames mixed into the ring, and of them those the device has taken (as far as the last feed pass saw).
+    double made = 0;
+    std::atomic<int64_t> taken{0};
     ~OutputClient() { swr_free(&swr); }
 
     void place(int64_t pos, int frames, double sample, double step) {
+        const double before = made;
+        made += double(frames) * step;
         if (!segments.empty()) {
             Segment& last = segments.back();
             const bool follows = last.pos + last.frames == pos && last.step == step &&
@@ -606,8 +681,19 @@ struct OutputClient {
                 return;
             }
         }
-        segments.push_back({pos, frames, sample, step});
+        segments.push_back({pos, frames, sample, step, before});
         while (segments.size() > 512) segments.pop_front();
+    }
+    // The device has taken the ring up to `played`: how much of this output's that was.
+    void noteTaken(int64_t played) {
+        if (segments.empty() || played < segments.front().pos) return;
+        for (auto it = segments.rbegin(); it != segments.rend(); ++it)
+            if (played >= it->pos) {
+                const int64_t into = std::min<int64_t>(played - it->pos, it->frames);
+                const int64_t t = int64_t(std::llround(it->made + double(into) * it->step));
+                if (t > taken.load(std::memory_order_relaxed)) taken.store(t, std::memory_order_relaxed);
+                return;
+            }
     }
     // The timeline sample sent out at the ring's `pos` and how many samples a ring frame is; false when nothing of the
     // timeline was.
@@ -870,6 +956,12 @@ void Engine::Impl::feedOutputs(Io& io, const Clients& c, int rate) {
     }
     const int quantum = std::min(block, 512);
     const int64_t mask = io.outCap - 1;
+    // What the device has taken of each, from its own count (not what is mixed ahead of it).
+    {
+        const int64_t played = io.played.load(std::memory_order_acquire);
+        for (const auto& o : c.outputs)
+            if (o->io == &io) o->noteTaken(played);
+    }
     bool wrote = false;
     for (int guard = 0; guard < 4096; ++guard) {
         const int64_t w = io.written.load(std::memory_order_relaxed);
@@ -910,9 +1002,11 @@ void Engine::Impl::feedOutputs(Io& io, const Clients& c, int rate) {
 
 void Engine::Impl::feedInputs(Io& io, const Clients& c, int rate) {
     const int rt = roundTripFrames.load();
+    io.takeHistory();
     for (;;) {
         const int64_t br = io.blocksRead.load(std::memory_order_relaxed);
         if (br >= io.blocksWritten.load(std::memory_order_acquire)) break;
+        io.takeHistory();  // (to this block's callback at least)
         const Io::Block b = io.blocks[size_t(br) & (io.blocks.size() - 1)];
         const int64_t ir = io.inRead.load(std::memory_order_relaxed);
         const int ch = b.channels;
@@ -923,13 +1017,12 @@ void Engine::Impl::feedInputs(Io& io, const Clients& c, int rate) {
         }
         io.inRead.store(ir + b.frames, std::memory_order_release);
         io.blocksRead.store(br + 1, std::memory_order_release);
-        io.sent.push_back(b);
-        while (io.sent.size() > 512) io.sent.pop_front();
-        // What this block heard went out a round trip of the device's frames before it: its place in the output ring
-        // (kept block by block, so a ring that ran dry in between does not move it).
+        // What this block heard went out a round trip of the device's frames before it: its place in the output ring,
+        // from the device's own count of what each callback took (kept callback by callback, so a ring that ran dry in
+        // between, or a callback that ran late, does not move it).
         const int64_t from = b.device - rt;
         int64_t heardPos = 0, heardBack = 0;
-        const bool placed = io.placeAt(from, heardPos, heardBack);
+        const Io::Heard placed = io.placeAt(from, heardPos, heardBack);
         // Where the ring ran dry (the feed thread fell behind) the timeline stood still while the device went on: a
         // clocked input takes only the stretches that heard it move, each at its own place, so a take lands where it
         // was played. (One stretch, the whole block, where nothing ran dry or what was sent is not known.)
@@ -941,14 +1034,20 @@ void Engine::Impl::feedInputs(Io& io, const Clients& c, int rate) {
                 for (const auto& o : c.outputs)
                     if (o->owner == t->owner) clock = o.get();
             if (!clock || whole) {
-                // Where this block belongs: its clock's output at that place; where that is not known (the input began
-                // listening less than a round trip ago), the output sent out beside the block less the round trip. Both
-                // at the input's rate; before the output's first sample it is negative (nothing of the timeline yet).
+                // Where this block belongs: its clock's output at that place (none where what went out then was not
+                // its timeline, or went out before the stream began). Only where the device's count does not reach
+                // back that far (held up longer than is kept), the output sent out beside the block less the round
+                // trip. Both at the input's rate; before the output's first sample it is negative (nothing of the
+                // timeline yet).
+                // (macOS CI, 23 and 25 Nov: an ADR take one and two device buffers early, never seen on Linux. Before,
+                // a block whose heard place was not the timeline's (the program paused on the device a moment before)
+                // or was not yet kept took the output sent beside it less the round trip, which is wrong by however long
+                // the ring ran dry or the callbacks ran late in between: the likely cause.)
                 int64_t sample = -1;
                 double at = -1, step = 1;
-                if (clock && placed && clock->at(heardPos, at, step))
+                if (clock && placed == Io::Heard::At && clock->at(heardPos, at, step))
                     sample = int64_t(std::llround((at - double(heardBack) * step) * t->rate / clock->rate));
-                else if (clock && clock->at(b.outPos, at, step))
+                else if (clock && placed == Io::Heard::Unknown && clock->at(b.outPos, at, step))
                     sample = int64_t(std::llround((at - double(rt) * step) * t->rate / clock->rate));
                 deliver(*t, heard.data(), ch, b.frames, sample, rate);
                 continue;
@@ -956,7 +1055,7 @@ void Engine::Impl::feedInputs(Io& io, const Clients& c, int rate) {
             for (const auto& [off, len] : heardRuns) {
                 int64_t pos = 0, back = 0, sample = -1;
                 double at = -1, step = 1;
-                if (io.placeAt(from + off, pos, back) && clock->at(pos, at, step))
+                if (io.placeAt(from + off, pos, back) == Io::Heard::At && clock->at(pos, at, step))
                     sample = int64_t(std::llround((at - double(back) * step) * t->rate / clock->rate));
                 deliver(*t, heard.data() + size_t(off) * size_t(std::max(1, ch)), ch, len, sample, rate);
             }
@@ -1076,8 +1175,8 @@ bool Engine::Impl::openLocked(std::string* why) {
         return true;
     }
     // The device named is not there (unplugged, or its server stopped): the host's own choice stands in for it until
-    // it can be opened again, where the host has another.
-    if ((!settings.output.empty() || !settings.input.empty()) && settings.host != Host::Loopback) {
+    // it can be opened again, where the host has another (the loopback's default too, so that this is tested).
+    if (!settings.output.empty() || !settings.input.empty()) {
         DeviceSettings alt = settings;
         alt.output.clear();
         alt.input.clear();
@@ -1269,6 +1368,13 @@ double Engine::heardSeconds(int id) const {
     const int64_t block = int64_t(io->lastFrames.load()) * 1000000000 / rate;
     const int64_t since = nowNs() - io->lastNs.load();
     return double(delivered - block + std::clamp<int64_t>(since, 0, block)) / 1e9 - double(d_->outLatency.load()) / rate;
+}
+
+int64_t Engine::takenFrames(int id) const {
+    std::lock_guard<std::mutex> l(d_->m);
+    for (const auto& o : d_->outputs)
+        if (o->id == id) return o->taken.load(std::memory_order_relaxed);
+    return -1;
 }
 
 int Engine::addInput(const void* clockOwner, int rate, Tap tap, std::string* error) {
@@ -1488,9 +1594,20 @@ struct Feed::Ring {
     std::vector<float> buf;
     int64_t capacity = 0;  // frames
     int channels = 2;
-    std::atomic<int64_t> written{0}, read{0}, played{0}, starved{0}, dropTo{-1};
+    std::atomic<int64_t> written{0}, read{0}, dropTo{-1};
 
-    // The audio thread: what is queued, and silence after it.
+    // What each render made (the feed thread's, a few blocks ahead of the device): from which of its frames, how many
+    // were asked for and how many had sound, and the counts before it. Kept until the device has taken them.
+    struct Made {
+        int64_t from = 0;
+        int frames = 0, sound = 0;
+        int64_t played = 0, starved = 0;
+    };
+    mutable std::mutex madeM;
+    mutable std::deque<Made> made;
+    int64_t asked = 0, mixedSound = 0, mixedShort = 0;  // (the feed thread's)
+
+    // The engine's feed thread: what is queued, and silence after it.
     void render(float* out, int ch, int frames) {
         if (const int64_t d = dropTo.exchange(-1); d >= 0 && d > read.load()) read = d;
         const int64_t r = read.load(), w = written.load(std::memory_order_acquire);
@@ -1501,14 +1618,29 @@ struct Feed::Ring {
             for (int k = 0; k < ch; ++k) dst[k] = k < channels ? src[k] : 0.0f;
         }
         std::fill(out + size_t(std::max<int64_t>(0, n)) * size_t(ch), out + size_t(frames) * size_t(ch), 0.0f);
-        if (n > 0) {
-            read.store(r + n, std::memory_order_release);
-            played += n;
+        if (n > 0) read.store(r + n, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(madeM);
+            made.push_back({asked, frames, int(std::max<int64_t>(0, n)), mixedSound, mixedShort});
+            while (made.size() > 16384) made.pop_front();
         }
+        asked += frames;
+        mixedSound += std::max<int64_t>(0, n);
         // (frames short while it was playing: the writer did not keep up)
-        if (n < frames && n > 0) starved += frames - n;
+        if (n < frames && n > 0) mixedShort += frames - n;
     }
     int64_t readNow() const { return std::max(read.load(std::memory_order_acquire), dropTo.load()); }
+    // Played and starved as far as the device has taken `taken` of its frames.
+    std::pair<int64_t, int64_t> counts(int64_t taken) const {
+        std::lock_guard<std::mutex> lock(madeM);
+        while (made.size() > 1 && made[1].from <= taken) made.pop_front();
+        if (made.empty() || taken <= made.front().from) return made.empty() ? std::pair<int64_t, int64_t>{0, 0} : std::pair{made.front().played, made.front().starved};
+        const Made& m = made.front();
+        const int64_t into = std::min<int64_t>(taken - m.from, m.frames);
+        const int64_t played = m.played + std::min<int64_t>(into, m.sound);
+        const int64_t starved = m.starved + (m.sound > 0 && m.sound < m.frames ? std::clamp<int64_t>(into - m.sound, 0, m.frames - m.sound) : 0);
+        return {played, starved};
+    }
 };
 
 Feed::Feed(Engine& engine) : engine_(engine) {}
@@ -1555,9 +1687,9 @@ int64_t Feed::push(const float* interleaved, int frames) {
     return n;
 }
 
-int64_t Feed::played() const { return ring_ ? ring_->played.load() : 0; }
+int64_t Feed::played() const { return ring_ ? ring_->counts(std::max<int64_t>(0, engine_.takenFrames(id_))).first : 0; }
 
-int64_t Feed::starved() const { return ring_ ? ring_->starved.load() : 0; }
+int64_t Feed::starved() const { return ring_ ? ring_->counts(std::max<int64_t>(0, engine_.takenFrames(id_))).second : 0; }
 
 void Feed::clear() {
     if (ring_) ring_->dropTo = ring_->written.load();
