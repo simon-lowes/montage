@@ -7254,6 +7254,19 @@ private slots:
             QCOMPARE(result.value("issues").toArray().size(), 0);
             QCOMPARE(stretches(result), QString("0-6, 6-12, 12-18, 18-24"));
         }
+        // Told to go on before it reached the place it was to pause at: it goes on past that place to its end.
+        {
+            const QString parent = dir_.filePath("dcp-go-on");
+            qputenv("MONTAGE_JOBS_PAUSE_AT", "0.9");
+            const QString job = dialogs->start(state(), "dcp", "Making the DCP", dcpInput(parent));
+            qunsetenv("MONTAGE_JOBS_PAUSE_AT");
+            QVERIFY(!job.isEmpty());
+            dialogs->setPaused(job, false);
+            QTRY_VERIFY_WITH_TIMEOUT(dialogs->tasks().empty(), 300000);
+            jobs::Record record;
+            QVERIFY(jobs::load(job, record));
+            QCOMPARE(record.status, QString("done"));
+        }
         // Stopped by hand part-way: no pictures are left in the folder.
         {
             const QString parent = dir_.filePath("dcp-stopped");

@@ -21,6 +21,7 @@
 #include <QWidget>
 #include <QtConcurrent>
 #include <algorithm>
+#include <mutex>
 
 #include "EditorState.h"
 #include "core/EditOps.h"
@@ -141,6 +142,9 @@ struct DialogJobs::Shared {
     std::atomic<double> done{0};
     std::atomic<bool> cancel{false}, paused{false};
     double pauseAt = -1;  // pauses by itself once this far (MONTAGE_JOBS_PAUSE_AT: the tests' way to stop one part-way)
+    // (pauseAt, and a change to paused, are made under this: a pause or go-on asked by hand replaces a pause the task
+    // has yet to reach, so a go-on asked before the task got that far is not undone by the task pausing after it)
+    std::mutex pausing;
     QJsonObject result;
     std::string error;
 };
@@ -565,9 +569,12 @@ void DialogJobs::startTask(Task& t) {
         r.cancel = &sh->cancel;
         r.progress = [sh](double f) {
             sh->done = std::clamp(f, 0.0, 1.0);
-            if (sh->pauseAt >= 0 && f >= sh->pauseAt) {
-                sh->pauseAt = -1;
-                sh->paused = true;
+            {
+                const std::lock_guard<std::mutex> hold(sh->pausing);
+                if (sh->pauseAt >= 0 && f >= sh->pauseAt) {
+                    sh->pauseAt = -1;
+                    sh->paused = true;
+                }
             }
             while (sh->paused.load() && !sh->cancel.load()) QThread::msleep(20);
         };
@@ -771,7 +778,11 @@ std::vector<DialogJobs::TaskInfo> DialogJobs::tasks() const {
 }
 
 void DialogJobs::setPaused(const QString& id, bool paused) {
-    if (Task* t = task(id)) t->shared->paused = paused;
+    if (Task* t = task(id)) {
+        const std::lock_guard<std::mutex> hold(t->shared->pausing);
+        t->shared->pauseAt = -1;
+        t->shared->paused = paused;
+    }
     emit tasksChanged();
 }
 
