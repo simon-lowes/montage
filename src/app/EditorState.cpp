@@ -807,8 +807,9 @@ void EditorState::startAudioDecode(const MediaItem& m) {
 void EditorState::startCredentialRead(const MediaItem& m) {
     if (m.path.empty() || m.subclipOf || m.kind == MediaKind::Sequence || !contentCredentialsAvailable()) return;
     const std::string path = m.path;
-    const std::string file = mediaFileOnDisk(path);
-    if (!contentCredentialsFormat(file)) return;
+    // (credentials in the file, or in a manifest beside it, its sequence's frames or its package)
+    const std::string file = contentCredentialsFormat(mediaFileOnDisk(path)) ? mediaFileOnDisk(path) : path;
+    if (!contentCredentialsFormat(file) && !hasCredentialSidecar(file)) return;
     QPointer<EditorState> self(this);
     const uint64_t generation = projectGeneration_;
     const int read = ++credentialReads_[path];

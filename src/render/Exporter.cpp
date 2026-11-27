@@ -3016,9 +3016,18 @@ bool containerCarriesStreams(const std::string& path) {
 }
 
 bool exportCarriesCredentials(const ExportSettings& s) {
-    // One file of a kind that holds them (not numbered frames, nor a GIF).
-    static const std::set<std::string> frames{"png", "tiff", "exr", "dpx", "jxl", "gif"};
-    return contentCredentialsFormat(s.path) && !frames.count(s.videoCodec);
+    // In a file of a kind that holds them; beside any other file and beside numbered frames (media/ContentCredentials.h);
+    // not a GIF.
+    return !s.path.empty() && s.videoCodec != "gif";
+}
+
+std::string exportSignedPath(const ExportSettings& s) {
+    // (numbered frames as exportImpl names them: the path's own number, or one put before the extension)
+    if (!exportIsImageSequence(s) || s.path.find('%') != std::string::npos) return s.path;
+    std::string out = s.path;
+    const size_t slash = out.find_last_of("/\\"), dot = out.find_last_of('.');
+    out.insert(dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : out.size(), "_%06d");
+    return out;
 }
 
 namespace {
@@ -3437,8 +3446,9 @@ bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSetti
         CredentialOptions o;
         o.allowAiTraining = s.credentialAllowAiTraining;
         o.sources = made.sources;
+        o.redact = s.credentialRedact;
         std::string why;
-        if (!signContentCredentials(s.path, made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
+        if (!signContentCredentials(exportSignedPath(s), made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
             // The render is kept (it may have taken hours), unsigned, and said to be: it can be signed again later.
             if (error) *error = "Could not sign it with Content Credentials (" + why + "); the export is kept, unsigned, at " + s.path;
             if (keptUnsigned) *keptUnsigned = true;

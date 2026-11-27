@@ -145,6 +145,7 @@ private:
     QCheckBox* credentials_ = nullptr;
     QPushButton* credentialIdentity_ = nullptr;
     QCheckBox* aiTraining_ = nullptr;
+    QCheckBox* redactCredentials_ = nullptr;
     void chooseSigningIdentity();
     void showSigningIdentity();
     QPushButton* queueButton_ = nullptr;

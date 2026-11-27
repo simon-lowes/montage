@@ -13838,10 +13838,11 @@ void McpServer::Impl::addTools() {
             "as11":{"type":"object","additionalProperties":{"type":["string","number","boolean"]},"description":"AS-11 metadata by the names AS-11 gives them: core (SeriesTitle, ProgrammeTitle, EpisodeTitleNumber, ShimName, ShimVersion, AudioTrackLayout, PrimaryAudioLanguage, ClosedCaptionsPresent/Type/Language) and UK DPP (ProductionNumber, Synopsis, Originator, CopyrightYear, Distributor, PSEPass, SecondaryAudioLanguage, LineUpStart, IdentClockStart, CompletionDate, ContactEmail, ContactTelephoneNumber...). Unset ones come from the sequence: its name, languages, captions; line-up and clock from markers named Line-up and Clock, parts from markers with a duration named Part ..."},
             "anc_captions":{"type":"string","enum":["none","cea708","teletext","both"],"default":"none","description":"In a broadcast MXF delivery: the caption track as ancillary data (ST 436): CEA-708 caption packets (with 608) and/or OP-47 teletext subtitles"},
             "teletext_page":{"type":"integer","default":888,"description":"The teletext subtitle page (100 to 899)"},
-            "credentials":{"type":"object","description":"Sign it with Content Credentials (C2PA, as Premiere does): a signed record in the file that Montage made it, each AI model that generated or changed what is in the range, and the credentials its sources carried. MP4, MOV, WAV, MP3, JPEG, PNG and TIFF",
+            "credentials":{"type":"object","description":"Sign it with Content Credentials (C2PA): a signed record in the file that Montage made it, each AI model that generated or changed what is in the range, and the credentials its sources carried. In MP4, MOV, WAV, MP3, JPEG, PNG and TIFF files; beside other files and numbered frames (name.c2pa)",
                 "properties":{"certificate":{"type":"string","description":"The signing certificate chain (PEM, the signing certificate first; issued by a certificate authority, for digital signatures with e-mail protection or document signing use)"},
                     "key":{"type":"string","description":"Its private key (PEM)"},
-                    "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"}},"required":["certificate","key"]},
+                    "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"},
+                    "redact":{"type":"boolean","default":false,"description":"Leave out of them the sources' assertions that name people"}},"required":["certificate","key"]},
             "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph","mv"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), one picture, or mv: spatial video (both eyes coded as MV-HEVC in a MOV or MP4, for Vision Pro; needs the libx265 codec, 8-bit SDR)"},
             "spatial_baseline_mm":{"type":"number","default":64,"description":"Spatial video: the distance between the cameras' lenses (mm)"},
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
@@ -14188,14 +14189,15 @@ void McpServer::Impl::addTools() {
             if (stems != "none" && stems != "tracks" && stems != "buses" && stems != "roles")
                 throw ArgError{"\"stems\" must be none, tracks, buses or roles"};
             if (a.contains("credentials") && !a.value("credentials").isObject())
-                throw ArgError{"\"credentials\" is an object: {certificate, key, allow_ai_training}"};
+                throw ArgError{"\"credentials\" is an object: {certificate, key, allow_ai_training, redact}"};
             if (a.value("credentials").isObject()) {
                 const QJsonObject c = a.value("credentials").toObject();
                 st.credentialCertificate = absolute(need(c, "certificate")).toStdString();
                 st.credentialKey = absolute(need(c, "key")).toStdString();
                 st.credentialAllowAiTraining = c.value("allow_ai_training").toBool();
+                st.credentialRedact = c.value("redact").toBool();
                 if (!contentCredentialsAvailable()) throw ArgError{"This build of Montage cannot sign with Content Credentials (no C2PA library)"};
-                if (!exportCarriesCredentials(st)) throw ArgError{"Content Credentials cannot go in this kind of export (a single mp4, mov, wav, mp3, jpg, png or tif file can hold them)"};
+                if (!exportCarriesCredentials(st)) throw ArgError{"Content Credentials cannot go in a GIF"};
                 std::string why;
                 if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
             }

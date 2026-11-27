@@ -713,6 +713,11 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         aiTraining_->setToolTip(tr("Unticked, its credentials ask that it not be used to train AI models (CAWG training and mining)"));
         aiTraining_->setChecked(appSettings().value("export/allowAiTraining", false).toBool());
         form->addRow(QString(), aiTraining_);
+        redactCredentials_ = new QCheckBox(tr("Leave out the names of people in the sources' credentials"), form_);
+        redactCredentials_->setObjectName(QStringLiteral("exportRedactCredentials"));
+        redactCredentials_->setToolTip(tr("The sources' assertions that name their authors or signers are redacted from the new credentials"));
+        redactCredentials_->setChecked(appSettings().value("export/redactCredentials", false).toBool());
+        form->addRow(QString(), redactCredentials_);
         connect(credentials_, &QCheckBox::toggled, this, [this] { updateControls(); });
         connect(credentialIdentity_, &QPushButton::clicked, this, [this] { chooseSigningIdentity(); });
         showSigningIdentity();
@@ -1084,7 +1089,7 @@ void ExportDialog::updateControls() {
         const bool can = contentCredentialsAvailable() && p && exportCarriesCredentials(would);
         credentials_->setEnabled(can);
         credentials_->setToolTip(!contentCredentialsAvailable() ? tr("This build of Montage cannot sign (no C2PA library)")
-                                 : !can ? tr("Content Credentials cannot go in %1 exports: a single MP4, MOV, WAV, MP3, JPEG, PNG or TIFF file can hold them").arg(ext.toUpper())
+                                 : !can ? tr("Content Credentials cannot go in %1 exports").arg(ext.toUpper())
                                         : tr("A signed record in the file of who made it, with what, and each AI model that "
                                              "generated or changed it, with the credentials its sources carried; checked at "
                                              "contentcredentials.org/verify. Like Premiere's Content Credentials."));
@@ -1093,6 +1098,7 @@ void ExportDialog::updateControls() {
                                                                 : tr("Sign with Content Credentials (not possible here: exported unsigned)"));
         credentialIdentity_->setEnabled(can);
         aiTraining_->setEnabled(can && credentials_->isChecked());
+        redactCredentials_->setEnabled(can && credentials_->isChecked());
     }
     const QString vc = p ? QString::fromStdString(p->settings.videoCodec) : QString();
     const bool intra = vc == "prores_ks" || vc == "dnxhd";
@@ -1464,9 +1470,11 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.credentialCertificate = signer.certificatePath;
         s.credentialKey = signer.keyPath;
         s.credentialAllowAiTraining = aiTraining_->isChecked();
+        s.credentialRedact = redactCredentials_->isChecked();
     }
     settings.setValue("export/credentials", credentials_->isChecked());
     settings.setValue("export/allowAiTraining", aiTraining_->isChecked());
+    settings.setValue("export/redactCredentials", redactCredentials_->isChecked());
     if (rangeIsInOut()) {
         s.in = in;
         s.out = out;

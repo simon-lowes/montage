@@ -1848,6 +1848,11 @@ std::optional<ProxyOptions> MediaBinWidget::proxyOptionsDialog() {
     parseProxyFormat(format->currentData().toString().toStdString(), o.format);
     o.maxWidth = size->currentData().toInt();
     o.sound = sound->isChecked();
+    // Signing on (the Export dialog's Content Credentials, with an identity): a source's credentials are kept on its proxy.
+    const QString certificate = appSettings().value(QStringLiteral("credentials/certificate")).toString(),
+                  key = appSettings().value(QStringLiteral("credentials/key")).toString();
+    if (appSettings().value(QStringLiteral("export/credentials"), false).toBool() && !certificate.isEmpty() && !key.isEmpty())
+        o.credentialCertificate = certificate.toStdString(), o.credentialKey = key.toStdString();
     return o;
 }
 

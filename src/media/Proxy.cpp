@@ -1,4 +1,5 @@
 #include "Proxy.h"
+#include "ContentCredentials.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -133,7 +134,8 @@ bool createProxy(const std::string& source, const std::string& dest, const Proxy
     const int align = dnx ? 16 : 2;
     st.width = std::max(dnx ? 256 : align, int(std::lround(m.width * scale)) / align * align);
     st.height = std::max(dnx ? 128 : align, int(std::lround(m.height * scale)) / align * align);
-    return exportSequence(p, s, st, [&](double f, FrameTime) { if (progress) progress(f); }, cancel, error);
+    if (!exportSequence(p, s, st, [&](double f, FrameTime) { if (progress) progress(f); }, cancel, error)) return false;
+    return keepCredentialsThroughCopy(source, dest, {o.credentialCertificate, o.credentialKey, {}}, "A proxy made in Montage", error);
 }
 
 namespace {
