@@ -34057,12 +34057,13 @@ colorspaces:
                 QCOMPARE(rs.shots.size(), size_t(2));
                 QVERIFY(rs.shots[0].first == 0 && rs.shots[0].end == 50 && rs.shots[1].first == 50 && rs.shots[1].end == 100);
                 for (const StreamingShot& sh : rs.shots) {
-                    // The encoder was given the shot's cap and held it: no shot was encoded again, coarser, for it.
-                    QCOMPARE(sh.capEncodes, 0);
+                    // x264 and x265 were given the shot's cap and held it: no shot was encoded again, coarser, for it
+                    // (SVT-AV1's are measured, and encoded again where one is past it: counted, and reported).
+                    if (!av1) QCOMPARE(sh.capEncodes, 0);
                     if (sh.stopped == "cap") ++heldAtCap;
-                    qInfo("%s frames %lld-%lld: CRF %.2f, %.0f kb/s, VMAF %.2f (own size %.2f, trial %.2f), %d settings%s%s", rs.rendition.c_str(),
-                          (long long)sh.first, (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.ownVmaf, sh.trialVmaf, sh.trials,
-                          sh.stopped.empty() ? "" : ", stopped at the ", sh.stopped.c_str());
+                    qInfo("%s frames %lld-%lld: CRF %.2f, %.0f kb/s, VMAF %.2f (own size %.2f, trial %.2f), %d settings%s%s, %d encoded again for the cap",
+                          rs.rendition.c_str(), (long long)sh.first, (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.ownVmaf, sh.trialVmaf,
+                          sh.trials, sh.stopped.empty() ? "" : ", stopped at the ", sh.stopped.c_str(), sh.capEncodes);
                     // Within a VMAF of the target; or short of it at the cap or the floor, and said so; or past it
                     // at the coarsest setting there is to try, or where the shot costs next to nothing at any (the
                     // still card: the setting that reaches the target in the fewest bits).
