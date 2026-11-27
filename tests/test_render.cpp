@@ -28855,7 +28855,7 @@ colorspaces:
         const AVCodec* x264 = avcodec_find_encoder_by_name("libx264");
         const AVCodec* h264 = avcodec_find_decoder(AV_CODEC_ID_H264);
         if (!x264 || !h264) QSKIP("Needs FFmpeg's libx264 encoder and H.264 decoder");
-        // The pictures: 9 groups of 25 (each from a keyframe, its sequence and picture parameter sets before it), a bar
+        // The pictures: 10 groups of 25 (each from a keyframe, its sequence and picture parameter sets before it), a bar
         // moving across a grey ramp, 320 by 180, in Annex B.
         struct Coded {
             std::vector<uint8_t> bytes;
@@ -28887,7 +28887,7 @@ colorspaces:
                     av_packet_unref(pkt);
                 }
             };
-            for (int i = 0; i < 225; ++i) {
+            for (int i = 0; i < 250; ++i) {
                 QVERIFY(av_frame_make_writable(f) >= 0);
                 for (int y = 0; y < 180; ++y)
                     for (int x = 0; x < 320; ++x) f->data[0][y * f->linesize[0] + x] = uint8_t(std::abs(x - (i * 7) % 320) < 12 ? 235 : 40 + x / 2);
@@ -28903,8 +28903,8 @@ colorspaces:
             avcodec_send_frame(enc, nullptr);
             take();
         }
-        QCOMPARE(int(coded.size()), 225);
-        for (int g = 0; g < 9; ++g) QVERIFY(coded[size_t(g * 25)].key);
+        QCOMPARE(int(coded.size()), 250);
+        for (int g = 0; g < 10; ++g) QVERIFY(coded[size_t(g * 25)].key);
 
         // The endpoint, on a port free for TCP and UDP both (its media shares the number).
         int port = 0;
@@ -29211,6 +29211,17 @@ colorspaces:
         QVERIFY2((problem = withinCaps("sequence jumps")).isEmpty(), qPrintable(problem));
         const int64_t lostJumps = ep.status().lost - lostBefore;
         QVERIFY2(lostJumps >= 3998 && lostJumps < 4100, qPrintable(QString::number(lostJumps)));
+        // 3b. A stall: 5,000 packets of each stream missing and their RTP times 4 s on, as when Wi-Fi drops out for
+        // seconds. Counted lost, and a keyframe asked for (a browser sends none unasked).
+        QThread::msleep(1100);  // (a keyframe is asked for once a second at most)
+        const int64_t lostBeforeStall = ep.status().lost;
+        const int askedBeforeStall = ep.status().keyframesAsked;
+        vSeq += 5000, aSeq += 5000;
+        vTs += 4 * 90000, aTs += 4 * 48000;
+        QVERIFY2((problem = groupDecodes("a stall of 4 s")).isEmpty(), qPrintable(problem));
+        const int64_t lostStall = ep.status().lost - lostBeforeStall;
+        QVERIFY2(lostStall >= 9998 && lostStall < 10100, qPrintable(QString::number(lostStall)));
+        QVERIFY2(ep.status().keyframesAsked > askedBeforeStall, qPrintable(QString::number(ep.status().keyframesAsked)));
 
         // 4. Packets with no payload, then a group whose every packet is padded (each picture and sound packet with
         // 1 to 40 bytes of it), then packets whose padding is longer than they are (passed over).
@@ -29230,11 +29241,14 @@ colorspaces:
         QVERIFY2((problem = withinCaps("short and padded packets")).isEmpty(), qPrintable(problem));
 
         // 5. Both streams go on under their second SSRCs, numbered and timed afresh.
+        // (not counted lost, though their numbers and times jump: the new SSRC says they begin afresh)
+        const int64_t lostBeforeSsrcs = ep.status().lost;
         ssrcIndex = 1;
         vSeq = 17, aSeq = 40000, vTs = 1234567, aTs = 7654321;
         reports();
         QVERIFY2((problem = groupDecodes("new SSRCs")).isEmpty(), qPrintable(problem));
         QVERIFY2((problem = withinCaps("new SSRCs")).isEmpty(), qPrintable(problem));
+        QVERIFY2(ep.status().lost - lostBeforeSsrcs < 100, qPrintable(QString::number(ep.status().lost - lostBeforeSsrcs)));
 
         // 6. A flood of sound while nothing reads: 72 MB, past the 68 MB the queue keeps, so some is dropped; once
         // read again the pictures after it decode.

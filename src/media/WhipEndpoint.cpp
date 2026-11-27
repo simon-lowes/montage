@@ -726,20 +726,25 @@ struct Feed {
         const double now = secondsNow();
         bool ask = false;
         ++packets;
+        const int64_t ts = s.unwrap(r.ts);
         if (s.numbered) {
             const int16_t step = int16_t(r.seq - s.lastSeq);
-            // (a jump of more than a few seconds' packets is the sender starting its numbers afresh, not a loss)
-            if (step > 1 && step <= 3000) {
-                lost += step - 1;
-                ask = isVideo;
+            // A jump of a few seconds' packets is a loss. A longer one is a loss too where the RTP time moved on with
+            // it by more than a second under the same SSRC (a stall: Wi-Fi gone for seconds), and otherwise the
+            // sender starting its numbers afresh. Either way the pictures after it need a keyframe: a browser sends
+            // none unasked.
+            const bool far = step > 3000 || step < -3000;
+            const bool stalled = far && s.seen && r.ssrc == s.ssrc && ts - s.lastExt > int64_t(s.clock);
+            if ((step > 1 && step <= 3000) || stalled) {
+                lost += (stalled ? int64_t(uint16_t(r.seq - s.lastSeq)) : int64_t(step)) - 1;
                 if (isVideo && holding && !started) heldLost = true;
             }
-            if (step > 0 || step < -3000) s.lastSeq = r.seq;
+            if ((step > 1 || far) && isVideo) ask = true;
+            if (step > 0 || far) s.lastSeq = r.seq;
         } else {
             s.numbered = true;
             s.lastSeq = r.seq;
         }
-        const int64_t ts = s.unwrap(r.ts);
         trace("packet %c ts %lld bytes %zu came %.6f", isVideo ? 'V' : 'A', (long long)ts, n, now);
         if (!isVideo) {
             note(s.came, now, now - double(ts) / s.clock, 0.2);
