@@ -20309,7 +20309,13 @@ const auto seq = [this] { return state()->sequence(); };
                                                   QStringLiteral("-o"), out, QStringLiteral("--settle"), QStringLiteral("1"), QStringLiteral("--once")});
             return p.waitForStarted(30000);
         };
-        auto encodedFiles = [&] { return QDir(out).entryList({"*.wav"}, QDir::Files); };
+        // (a file being encoded is written under a name that begins with a dot, hidden on Linux and macOS but listed on
+        // Windows: only finished files count)
+        auto encodedFiles = [&] {
+            QStringList done = QDir(out).entryList({"*.wav"}, QDir::Files);
+            done.removeIf([](const QString& f) { return f.startsWith(QLatin1Char('.')); });
+            return done;
+        };
         QProcess cli;
         QVERIFY(run(cli));
         QByteArray said;
@@ -28548,10 +28554,15 @@ print("added " + ui["name"])
         QVERIFY(p.waitForFinished(170000));
         const QString log = QString::fromLocal8Bit(p.readAll());
         QVERIFY2(p.exitStatus() == QProcess::CrashExit || p.exitCode() != 0, qPrintable(log));
-        // The line that says the function timed out names it.
+        // The line that says the function timed out names it; on Windows, where the test log written so far can be
+        // lost when the binary aborts, the crash handler's line names it with how long it ran (the 20 s it was given).
         bool named = false;
-        for (const QString& line : log.split(QLatin1Char('\n')))
-            named = named || (line.contains(QLatin1String("aHungFunctionIsNamed()")) && line.contains(QLatin1String("timed out")));
+        static const QRegularExpression ran(QStringLiteral("aHungFunctionIsNamed\\S* function time: (\\d+) ?ms"));
+        for (const QString& line : log.split(QLatin1Char('\n'))) {
+            const QRegularExpressionMatch m = ran.match(line);
+            named = named || (line.contains(QLatin1String("aHungFunctionIsNamed()")) && line.contains(QLatin1String("timed out"))) ||
+                    (m.hasMatch() && m.captured(1).toLongLong() >= 19000);
+        }
         QVERIFY2(named, qPrintable(log.right(2000)));
         QVERIFY2(!log.contains(QLatin1String("the watchdog did not stop")), qPrintable(log.right(2000)));
     }
