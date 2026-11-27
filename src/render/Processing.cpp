@@ -2425,16 +2425,20 @@ void applyDustSpots(const Effect& e, FrameTime lt, Image& src, const Image* prev
     });
 }
 
-void applyFilmNegative(const Effect& e, FrameTime t, Image& img, Transfer transfer) {
+bool filmBaseFound(const Effect& e, FrameTime t) { return e.p("base_from", t) <= 0.5; }
+
+NegativeSettings filmNegativeSettings(const Effect& e, FrameTime t, const Image& img, Transfer transfer) {
     NegativeSettings s;
     s.encoding = ScanEncoding(std::clamp(int(std::lround(e.p("scan", t))), 0, 2));
-    if (e.p("base_from", t) > 0.5 || !filmBase(img, s.encoding, transfer, s.base)) {
+    if (!filmBaseFound(e, t) || !filmBase(img, s.encoding, transfer, s.base)) {
         s.base[0] = e.p("base_r", t, 0.9), s.base[1] = e.p("base_g", t, 0.55), s.base[2] = e.p("base_b", t, 0.35);
     }
     s.gamma = e.p("gamma", t, 0.6);
     s.exposure = e.p("exposure", t);
-    invertNegative(img, s, transfer);
+    return s;
 }
+
+void applyFilmNegative(const Effect& e, FrameTime t, Image& img, Transfer transfer) { invertNegative(img, filmNegativeSettings(e, t, img, transfer), transfer); }
 
 void applyPerfLock(const Effect& e, FrameTime t, Image& img) {
     PerfSettings s;
@@ -3586,11 +3590,12 @@ bool isGpuFilter(const std::string& type) {
                                                   "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare", "radial_blur",
                                                   "aperture_glare", "painterly", "depth_blur", "lens_distortion", "magnify",
                                                   "drop_shadow", "broadcast_safe", "lens_correction", "edge_bevel", "layer_bevel",
-                                                  "texture_pop", "film_look"};
+                                                  "texture_pop", "film_look", "aces_gamut_compress"};
     return filters.count(type) > 0;
 }
 
-// The working space's transfer function as gpufilter.frag knows it (the display curves the GPU composites in), or -1.
+}  // namespace
+
 int gpuTransfer(const ColorSpace& space) {
     switch (space.transfer) {
         case Transfer::Bt1886:
@@ -3602,6 +3607,8 @@ int gpuTransfer(const ColorSpace& space) {
         default: return -1;
     }
 }
+
+namespace {
 
 // A filter pass's table with the working space's transfer tables in its row 0 (decoding in x, encoding in y), `rows`
 // rows in all.
@@ -3779,8 +3786,9 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             op.clampFirst = true;
         }
     } else if (e.type == "ocio") {
-        // OCIO's own GPU shader (within its last digits of the CPU's transform), without a mask.
-        if (op.masked || !gpu::takesShaders()) return false;
+        // OCIO's own GPU shader (within its last digits of the CPU's transform); through a mask, the picture marked
+        // before and mixed with what it made after, as a filter is.
+        if (!gpu::takesShaders()) return false;
         std::shared_ptr<const gpu::ShaderStep> shader = ocioShaderStep(e);
         if (!shader) {
             Image probe(1, 1);
@@ -3794,6 +3802,20 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             else if (ends("contrastVal")) op.values.push_back(float(e.p("contrast", t, 1)));
             else if (ends("gammaVal")) op.values.push_back(float(e.p("gamma", t, 1)));
             else return false;  // (a value the effect does not set)
+        }
+        if (op.masked) {
+            gpu::ColorOp mark, step;
+            mark.kind = gpu::ColorOp::Mark;
+            step.kind = gpu::ColorOp::Shader;
+            step.shader = std::move(shader);
+            step.values = std::move(op.values);
+            op.values.clear();
+            op.kind = gpu::ColorOp::Mix;
+            gpuMask(e, t, op, width, height, pixelScale, false, true);  // (now with its shape drawn)
+            out.push_back(std::move(mark));
+            out.push_back(std::move(step));
+            out.push_back(std::move(op));
+            return true;
         }
         op.kind = gpu::ColorOp::Shader;
         op.shader = std::move(shader);
@@ -4649,7 +4671,17 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                     for (int c = 0; c < 3; ++c) fp.params[(at - 1) * 4 + r * 4 + c] = float(m[r * 3 + c]);
             };
             fp.params[0] = float(tf);
-            if (ty == "crosstalk") {
+            if (ty == "aces_gamut_compress") {
+                // (in AP1's light and back, as AcesGamutCompressor works: gpufilter.frag's 54; here where it is not run
+                // on the camera's picture, through a mask or after other effects)
+                double toAp1[9], fromAp1[9];
+                primariesMatrix(space.primaries, Primaries::Ap1, toAp1);
+                primariesMatrix(Primaries::Ap1, space.primaries, fromAp1);
+                fp.mode = 54;
+                fp.params[1] = e.p("direction", t, 0) >= 0.5 ? 1.0f : 0.0f;
+                rows3(2, toAp1);
+                rows3(5, fromAp1);
+            } else if (ty == "crosstalk") {
                 double m[9];
                 if (crosstalkMatrix(e, t, space, m)) {
                     fp.mode = 13;

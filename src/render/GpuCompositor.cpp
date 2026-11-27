@@ -1336,6 +1336,18 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         if (l.input && l.input->is1D) textures.push_back({4, table});
         return true;
     };
+    // The frame's source stage (gpucolor.frag's 27) on its straight colour `from`, w by h (or, `raw`, on mode 0's 16-bit
+    // RGBA): what it makes, straight, or null.
+    auto sourceStage = [&](QRhiTexture* from, bool raw, int w, int h) -> QRhiTexture* {
+        QRhiTexture* to = texture(T::RGBA32F, w, h, true);
+        if (!to) return nullptr;
+        float q[64] = {};
+        std::copy_n(l.sourceUniforms->data(), std::min<size_t>(64, l.sourceUniforms->size()), q);
+        q[0] = 27, q[4] = raw ? 1 : 0;
+        pass(colorPs_, to, u, {{raw ? 2 : 1, from}}, uniforms(u, q));
+        u = rhi_->nextResourceUpdateBatch();
+        return to;
+    };
     if (l.canvas) {
         if (!canvas) return nullptr;
         cur = canvas;
@@ -1386,7 +1398,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             u->uploadTexture(planes[i], QRhiTextureUploadEntry(0, 0, d));
         }
         // (A 1D input transform's table would take the chroma's binding: it goes through 26.)
-        const bool sized = W == yc.width && H == yc.height && !(l.input && l.input->is1D);
+        // (Nor a source stage, which comes between.)
+        const bool sized = W == yc.width && H == yc.height && !(l.input && l.input->is1D) && !l.sourceUniforms;
         QRhiTexture* made = texture(T::RGBA32F, yc.width, yc.height, true);
         if (!made) return nullptr;
         p[0] = 24;
@@ -1420,6 +1433,11 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             };
             if (W != yc.width && !(made = resample(made, yc.width, W, true))) return nullptr;
             if (H != yc.height && !(made = resample(made, yc.height, H, false))) return nullptr;
+            if (l.sourceUniforms) {
+                QRhiTexture* staged = sourceStage(made, false, W, H);
+                release(made);
+                if (!(made = staged)) return nullptr;
+            }
             cur = texture(T::RGBA32F, W, H, true);
             if (!cur) return nullptr;
             std::fill(p, p + 64, 0.0f);
@@ -1438,13 +1456,17 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         QRhiTextureSubresourceUploadDescription d(l.frame->px.data(), quint32(size_t(w) * h * 8));
         d.setDataStride(quint32(w) * 8);
         u->uploadTexture(raw, QRhiTextureUploadEntry(0, 0, d));
-        p[0] = 0;  // unpack
-        std::vector<std::pair<int, QRhiTexture*>> textures = {{2, raw}};
+        // (through its source stage first, if any: unpacked straight by it, then taken in as 24's are, 26)
+        QRhiTexture* staged = l.sourceUniforms ? sourceStage(raw, true, w, h) : nullptr;
+        if (l.sourceUniforms && !staged) return nullptr;
+        p[0] = staged ? 26 : 0;  // unpack
+        std::vector<std::pair<int, QRhiTexture*>> textures = {{staged ? 1 : 2, staged ? staged : raw}};
         if (!inputLut(p, textures)) return nullptr;
         QRhiBuffer* ub = uniforms(u, p);
         pass(colorPs_, cur, u, textures, ub);
         u = rhi_->nextResourceUpdateBatch();
         release(raw);
+        if (staged) release(staged);
     } else if (l.shapes) {
         // A Shape layer's paints, each pixel from its tile's commands in the table (render/ShapeRaster).
         const ShapeRaster& sr = *l.shapes;

@@ -166,6 +166,15 @@ FadeLevels fadeLevels(const Image& img) {
     return f;
 }
 
+Image fadeSamples(const Image& img) {
+    if (img.empty()) return {};
+    const int step = strideFor(img, 250000), w = (img.width + step - 1) / step, h = (img.height + step - 1) / step;
+    Image out(w, h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) std::copy_n(img.at(x * step, y * step), 4, out.at(x, y));
+    return out;  // (fewer than 4 × 250,000 pixels: read whole, its stride 1)
+}
+
 FadeLevels meanFadeLevels(const std::vector<FadeLevels>& levels) {
     FadeLevels m;
     if (levels.empty()) return m;
@@ -198,6 +207,40 @@ void restoreFade(Image& img, const FadeLevels& f, double strength) {
             c[i] += strength * (lo + range * m - c[i]);
         }
     });
+}
+
+void sourceStageUniforms(const NegativeSettings* negative, const FadeLevels* fade, double strength, int tf, float q[64]) {
+    q[7] = float(tf);
+    q[5] = q[6] = 0;
+    if (negative) {
+        // (as invertNegative)
+        const double gamma = std::max(0.05, negative->gamma);
+        q[5] = 1;
+        for (int i = 0; i < 3; ++i) {
+            q[8 + i] = float(std::max(1e-9, transmittance(negative->base[i], negative->encoding, Transfer(tf))));
+            q[28 + i] = float(negative->base[i]);
+        }
+        q[11] = negative->encoding == ScanEncoding::Linear ? 0.0f : negative->encoding == ScanEncoding::PrintingDensity ? 1.0f : 2.0f;
+        q[12] = float(gamma), q[13] = float(std::pow(10.0, -kWhiteDensity / gamma)), q[14] = float(std::exp2(negative->exposure));
+    }
+    strength = std::clamp(strength, 0.0, 1.0);
+    if (fade && strength > 0) {
+        // (as restoreFade)
+        const FadeLevels& f = *fade;
+        int ref = 0;
+        for (int i = 1; i < 3; ++i)
+            if (f.hi[i] - f.lo[i] > f.hi[ref] - f.lo[ref]) ref = i;
+        auto middle = [&](int i) { return std::clamp((f.mid[i] - f.lo[i]) / std::max(1e-4f, f.hi[i] - f.lo[i]), 0.02f, 0.98f); };
+        if (f.hi[ref] - f.lo[ref] > 1e-4) {
+            q[6] = 1;
+            for (int i = 0; i < 3; ++i) {
+                q[16 + i] = f.lo[i];
+                q[20 + i] = std::max(1e-4f, f.hi[i] - f.lo[i]);
+                q[24 + i] = float(std::clamp(double(std::log(middle(ref)) / std::log(middle(i))), 0.25, 4.0));
+            }
+            q[19] = f.lo[ref], q[23] = f.hi[ref] - f.lo[ref], q[15] = float(strength);
+        }
+    }
 }
 
 // ---- Perforations --------------------------------------------------------------------------------------------------------

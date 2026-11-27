@@ -18,7 +18,9 @@
 //   21 its matte, 22 a running minimum or maximum along a row or column, 23 a box blur along a row or column.
 // and a decoded frame's Y′CbCr planes, as media/Image's ycbcrToRgba converts them: 24 the planes (Y in srcTex, Cb and
 // Cr in table and maskTex, or both in table) to straight RGB, 25 that resampled along a row or column, 26 straight RGB
-// (srcTex) as mode 0 takes a decoded frame (24 does that itself when p[8].z says so).
+// (srcTex) as mode 0 takes a decoded frame (24 does that itself when p[8].z says so), 27 a decoded frame's straight
+// colour (srcTex, or with p[1].x the 16-bit RGBA of mode 0 in src16) through its source stage, as render/FilmScan's
+// invertNegative (p[1].y) then restoreFade (p[1].z) do it, in the frame's own curve p[1].w (sourceStageUniforms).
 // Through the effect's mask where it has one (p[13..15]): its shape drawn on the CPU (maskTex), an HSL qualifier on
 // the colour as it comes in, inverted and faded, and the picture mixed with what the effect made by it (all four
 // channels, premultiplied, as the CPU mixes them).
@@ -479,12 +481,101 @@ vec4 keyer(int mode, vec3 c, float a, ivec2 xy) {
     return vec4(o * na, na);
 }
 
+// ---- The source stage (27) ----
+// The display curves' functions, as gpufilter.frag's toLinearTf and fromLinearTf (render/ColorSpace's toLinear and
+// fromLinear: below black as black): 0 BT.1886, 1 sRGB, 2 linear, 3 PQ (203 nits 1), 4 HLG (scene light), 22 a power of
+// 563/256.
+const float kM1 = 2610.0 / 16384.0, kM2 = 2523.0 / 4096.0 * 128.0, kC1 = 3424.0 / 4096.0, kC2 = 2413.0 / 4096.0 * 32.0,
+            kC3 = 2392.0 / 4096.0 * 32.0;
+const float kHa = 0.17883277, kHb = 1.0 - 4.0 * 0.17883277, kHc = 0.55991073;
+float powPos(float x, float y) { return x > 0.0 ? pow(x, y) : 0.0; }
+float toLinearTf(int tf, float v) {
+    if (tf == 0) return powPos(v, 2.4);
+    if (tf == 1) {
+        v = max(v, 0.0);
+        return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
+    }
+    if (tf == 3) {
+        const float q = powPos(clamp(v, 0.0, 1.0), 1.0 / kM2);
+        return 10000.0 * powPos(max(q - kC1, 0.0) / (kC2 - kC3 * q), 1.0 / kM1) / 203.0;
+    }
+    if (tf == 4) {
+        v = clamp(v, 0.0, 1.0);
+        return v <= 0.5 ? v * v / 3.0 : (exp((v - kHc) / kHa) + kHb) / 12.0;
+    }
+    if (tf == 22) return powPos(v, 563.0 / 256.0);
+    return v;
+}
+float fromLinearTf(int tf, float l) {
+    if (tf == 0) return powPos(l, 1.0 / 2.4);
+    if (tf == 1) {
+        l = max(l, 0.0);
+        return l <= 0.0031308 ? 12.92 * l : 1.055 * pow(l, 1.0 / 2.4) - 0.055;
+    }
+    if (tf == 3) {
+        const float y = powPos(clamp(l * 203.0 / 10000.0, 0.0, 1.0), kM1);
+        return pow((kC1 + kC2 * y) / (1.0 + kC3 * y), kM2);
+    }
+    if (tf == 4) {
+        const float e = max(l, 0.0);
+        return e <= 1.0 / 12.0 ? sqrt(3.0 * e) : kHa * log(12.0 * e - kHb) + kHc;
+    }
+    if (tf == 22) return powPos(l, 256.0 / 563.0);
+    return l;
+}
+// ln(1 + x) and e^x - 1, exact near 0.
+float log1pOf(float x) { return abs(x) < 1e-2 ? x * (1.0 - x * (0.5 - x * (1.0 / 3.0 - x * 0.25))) : log(1.0 + x); }
+float expm1Of(float x) { return abs(x) < 1e-2 ? x * (1.0 + x * (0.5 + x * (1.0 / 6.0 + x / 24.0))) : exp(x) - 1.0; }
+// Film Negative (p[2].xyz the base's light and p[7].xyz its code values, p[2].w the scan's encoding: 0 linear, 1
+// printing density, else the curve; p[3].x its gamma, y the black it lifts, z the print's gain), then Faded Colour Restore (p[4].xyz each channel's low
+// level, p[5].xyz its span, p[6].xyz its gamma; p[4].w and p[5].w the reference channel's low level and range; p[3].w
+// the strength), each channel by itself.
+vec3 sourceStage(vec3 c) {
+    const int tf = int(p[1].w);
+    const float kMostDensity = 2.046, kLn10 = 2.30258509299;
+    for (int i = 0; i < 3; ++i) {
+        float v = c[i];
+        if (p[1].y > 0.5) {
+            // The density over the base (as the log of their lights' ratio), and the light from it, near the base's
+            // own colour from the code values' difference where the curve allows, not as a difference of near equals:
+            // light there is near black, where a display curve is steep.
+            const float b = p[7][i];
+            float L;
+            if (p[2].w < 0.5) L = v > 1e-9 && b > 1e-9 ? log1pOf((b - v) / v) : log(p[2][i] / max(1e-9, v));
+            else if (p[2].w < 1.5) L = (v - b) * kMostDensity * kLn10;
+            else if ((tf == 0 || tf == 2 || tf == 22) && v > 1e-6 && b > 1e-6) L = (tf == 0 ? 2.4 : tf == 22 ? 563.0 / 256.0 : 1.0) * log1pOf((b - v) / v);
+            else if (tf == 1 && v > 0.04045 && b > 0.04045) L = 2.4 * log1pOf((b - v) / (v + 0.055));
+            else L = log(p[2][i] / max(1e-9, toLinearTf(tf, v)));
+            const float d = clamp(L / kLn10, 0.0, kMostDensity);
+            const float light = p[3].y * expm1Of(d / p[3].x * kLn10) / (1.0 - p[3].y) * p[3].z;
+            v = fromLinearTf(tf, light);
+        }
+        if (p[1].z > 0.5) {
+            const float n = (v - p[4][i]) / p[5][i];
+            const float m = n <= 0.0 ? n : n >= 1.0 ? 1.0 + (n - 1.0) * p[6][i] : pow(n, p[6][i]);
+            v += p[3].w * (p[4].w + p[5].w * m - v);
+        }
+        c[i] = v;
+    }
+    return c;
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const int mode = int(p[0].x);
     if (mode >= 24) {
         if (mode == 25) {
             fragColor = resampled(xy);
+            return;
+        }
+        if (mode == 27) {
+            vec4 c = texelFetch(srcTex, xy, 0);
+            if (p[1].x > 0.5) {
+                const vec4 lo = texelFetch(src16, ivec2(xy.x * 2, xy.y), 0), hi = texelFetch(src16, ivec2(xy.x * 2 + 1, xy.y), 0);
+                c = vec4(lo.r, lo.g, hi.r, hi.g);
+            }
+            if (c.a > 0.0) c.rgb = sourceStage(c.rgb);
+            fragColor = c;
             return;
         }
         const vec4 c = mode == 24 ? ycbcr(xy) : texelFetch(srcTex, xy, 0);

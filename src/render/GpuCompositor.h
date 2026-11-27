@@ -164,6 +164,9 @@ struct Layer {
     bool canvas = false;                 // an adjustment layer's: the canvas as drawn so far, at the canvas's size ...
     Frame16Ptr frame;                    // or a decoded frame, RGBA or Y′CbCr planes (premultiplied on the GPU) ...
     std::shared_ptr<const Lut3D> input;  // ... and its input transform, if any
+    // ... and its source stage before it (Film Negative, Faded Colour Restore) on the frame's straight code values: the
+    // 64 uniforms of gpucolor.frag's 27 (render/FilmScan's sourceStageUniforms); or none
+    std::shared_ptr<const std::vector<float>> sourceUniforms;
     Image image;                         // or a picture made on the CPU (premultiplied, working space)
     std::shared_ptr<const ShapeRaster> shapes;  // or a Shape layer's paints, drawn here (gpufilter.frag's 56) at their size
     std::shared_ptr<const SplatLayer> splats;   // or a splat clip's capture, sorted and blended here at its size

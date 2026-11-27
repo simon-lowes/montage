@@ -39089,9 +39089,9 @@ colorspaces:
             // (deep pictures and layers in 3D)
             "make_deep", "deep_holdout", "deep_grade", "deep_slice", "flatten_deep", "layer_3d",
             // (with no GPU form yet)
-            "patch_fill", "paint", "film_negative", "fade_restore"};
-        // (through a mask: on the CPU, not run on the camera's picture as they are without one)
-        const std::set<std::string> cpuOnlyMasked = {"aces_gamut_compress", "ocio"};
+            "patch_fill", "paint"};
+        // (through a mask: none now; ACES Gamut Compress and the OpenColorIO Transform are drawn through it)
+        const std::set<std::string> cpuOnlyMasked = {};
         std::vector<std::string> fellBack, unlisted, nowGpu;
         int tried = 0;
         for (const EffectInfo& info : effectCatalog()) {
@@ -39228,6 +39228,156 @@ colorspaces:
                                                         lookAt({0.3, -0.2, 1.2}, {0, 0, 0}, 400, 640, 360)}, 640, 360}};
         gpu::resetStats();
         int frames = 0;
+    void gpuSourceStageAndMaskedColour() {
+        // Film Negative and Faded Colour Restore as the GPU's source stage (each channel's curve, measured from the frame
+        // on the CPU, before the input transform), and ACES Gamut Compress and the OpenColorIO Transform through a
+        // feathered mask: each at three settings, on a video's Y′CbCr planes and on a still with transparency, within
+        // 1/1023 of the CPU, drawn on the GPU with nothing made on the CPU.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 96, s.height = 54;
+        // A negative's scan as video (an orange base, darker where the picture is lighter), five frames, and a still.
+        const std::string video = dir.filePath("negative.mkv").toStdString();
+        QVERIFY(writeYcbcrVideo(video, AV_PIX_FMT_YUV420P10LE, 96, 54, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, AVCHROMA_LOC_LEFT,
+                                [](int c, int x, int y) {
+                                    const double v = c == 0 ? 0.55 - 0.3 * std::sin(x * 0.05 + y * 0.04) : c == 1 ? 0.38 + 0.06 * std::sin(x * 0.09) : 0.6 + 0.05 * std::cos(y * 0.1);
+                                    return int(std::lround((16 + (c ? 224 : 219) * v) * 4));
+                                },
+                                5));
+        QImage q(96, 54, QImage::Format_RGBA64);
+        for (int y = 0; y < 54; ++y)
+            for (int x = 0; x < 96; ++x)
+                q.setPixelColor(x, y, QColor::fromRgbF(0.85f - 0.5f * float(x) / 96, 0.5f - 0.3f * float(y) / 54, 0.32f - 0.2f * std::sin(x * 0.1f),
+                                                       x < 8 ? 1.0f : std::min(1.0f, 0.3f + 0.7f * float((x * 3 + y) % 41) / 40)));
+        const QString still = dir.filePath("still.png");
+        QVERIFY(q.save(still));
+        std::vector<Id> media;
+        for (const std::string& path : {video, still.toStdString()}) {
+            MediaItem m;
+            QVERIFY(probeMedia(path, m));
+            m.id = p.newId();
+            p.media.push_back(m);
+            media.push_back(m.id);
+        }
+        QVERIFY(edit::placeMedia(p, s, media[0], 0, 0, 5, {TrackKind::Video, 0}, {}, false).ok);
+        Image cpu;  // (the CPU's frame the last compare drew)
+        // (`black`: a channel under 4/1023 on both counts as the same, the print's black, where Film Negative's density
+        // over a base found in the frame is the last digits of the colour either decoded, the print's curve steep there)
+        auto compare = [&](const QString& what, bool black = false) {
+            RenderOptions o;
+            o.highQuality = true;  // (the decoder's chroma as the GPU interpolates it, as gpuYcbcrPlanes has it)
+            cpu = renderProgramFrame(p, s, 2, o);
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, 2, o);
+            const gpu::Stats after = gpu::stats();
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0;
+            size_t at = 0;
+            int blacks = 0;
+            for (size_t i = 0; i < cpu.px.size(); ++i) {
+                const double d = std::fabs(double(cpu.px[i]) - onGpu.px[i]);
+                if (black && i % 4 != 3 && d > 1.0 / 1023 && std::max(cpu.px[i], onGpu.px[i]) < 4.0f / 1023) {
+                    ++blacks;
+                    continue;
+                }
+                if (d > worst) worst = d, at = i;
+            }
+            if (blacks) qInfo("%s: %d channels in the print's black differ by more", qPrintable(what), blacks);
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QStringLiteral("%1: off by %2 at pixel %3 channel %4 (cpu %5, gpu %6)")
+                                                         .arg(what).arg(worst).arg(at / 4).arg(at % 4).arg(cpu.px[at]).arg(onGpu.px[at])));
+        };
+        using Settings = std::vector<std::pair<const char*, double>>;
+        const std::vector<std::pair<const char*, std::vector<Settings>>> stages = {
+            {"film_negative", {{}, {{"base_from", 1}, {"base_r", 0.8}, {"base_g", 0.5}, {"base_b", 0.35}, {"gamma", 0.8}, {"exposure", 0.5}},
+                               {{"scan", 2}, {"base_from", 1}, {"base_r", 0.1}, {"base_g", 0.25}, {"base_b", 0.4}, {"gamma", 0.5}}}},
+            {"fade_restore", {{}, {{"strength", 50}, {"frames", 0}}, {{"strength", 80}, {"frames", 2}}}}};
+        Image plain;
+        for (int clip = 0; clip < 2; ++clip) {
+            Clip& c = s.videoTracks[0].clips.at(0);
+            const QString source = clip ? "the still" : "the video";
+            c.effects.clear();
+            compare(source + " as it is");
+            plain = cpu;
+            for (const auto& [type, settings] : stages)
+                for (size_t k = 0; k < settings.size(); ++k)
+                    for (int masked = 0; masked < 2; ++masked) {
+                        Effect e = makeEffect(p, type);
+                        for (const auto& [name, v] : settings[k]) e.params[name] = v;
+                        // (a mask on either is left alone, on the CPU and the GPU alike: they run on the source)
+                        if (masked) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.5, e.params["mask.h"] = 0.4, e.params["mask.feather"] = 8.0;
+                        c.effects = {e};
+                        compare(QStringLiteral("%1 %2, setting %3%4").arg(source, type).arg(k + 1).arg(masked ? " (masked)" : ""),
+                                std::string(type) == "film_negative");
+                        QVERIFY2(cpu.px != plain.px, type);  // (it changes the picture)
+                    }
+            // Both, the restoration measuring the frame through the negative.
+            c.effects = {makeEffect(p, "film_negative"), makeEffect(p, "fade_restore")};
+            compare(source + ": a negative restored", true);
+            if (!clip) {
+                // The still in the video's place.
+                s.videoTracks[0].clips.clear();
+                QVERIFY(edit::placeMedia(p, s, media[1], 0, 0, 5, {TrackKind::Video, 0}, {}, false).ok);
+                QCOMPARE(s.videoTracks[0].clips.size(), size_t(1));
+            }
+        }
+        // ACES Gamut Compress (forward and back) and an OpenColorIO Transform through a feathered mask, with the HSL
+        // qualifier and inverted, on the still.
+        Clip& c = s.videoTracks[0].clips.at(0);
+        std::vector<std::pair<QString, Effect>> masked;
+        for (const double direction : {0.0, 1.0}) {
+            Effect e = makeEffect(p, "aces_gamut_compress");
+            e.params["direction"] = direction;
+            masked.push_back({QStringLiteral("ACES Gamut Compress, direction %1").arg(direction), e});
+        }
+        if (ocioAvailable() && gpu::takesShaders()) {
+            QFile f(dir.filePath("look.ocio"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(R"(ocio_profile_version: 2
+roles:
+  default: linear
+  scene_linear: linear
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  Monitor:
+    - !<View> {name: Video, colorspace: video}
+colorspaces:
+  - !<ColorSpace>
+    name: linear
+    encoding: scene-linear
+  - !<ColorSpace>
+    name: video
+    encoding: sdr-video
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<MatrixTransform> {matrix: [0.6, 0.3, 0.1, 0, 0.1, 0.8, 0.1, 0, 0.05, 0.1, 0.85, 0, 0, 0, 0, 1]}
+        - !<ExponentWithLinearTransform> {gamma: 2.4, offset: 0.055, direction: inverse}
+)");
+            f.close();
+            Effect e = makeEffect(p, "ocio");
+            e.strings["config"] = f.fileName().toStdString();
+            e.strings["mode"] = "Colour Space";
+            e.strings["src"] = "linear", e.strings["dst"] = "video";
+            masked.push_back({"an OpenColorIO Transform", e});
+        } else {
+            qInfo("the OpenColorIO Transform not tried: %s", ocioAvailable() ? "this GPU compiles no shaders" : "built without OpenColorIO");
+        }
+        for (auto& [what, e] : masked)
+            for (int k = 0; k < 3; ++k) {
+                Effect m = e;
+                m.params["mask.shape"] = 1.0, m.params["mask.w"] = 0.5, m.params["mask.h"] = 0.4, m.params["mask.feather"] = 8.0;
+                if (k == 1) m.params["mask.invert"] = 1.0, m.params["mask.opacity"] = 70.0;
+                if (k == 2) m.params["mask.qualify"] = 1.0, m.params["mask.hue"] = 20.0, m.params["mask.hue_width"] = 90.0;
+                c.effects = {m};
+                compare(QStringLiteral("%1 through a mask, setting %2").arg(what).arg(k + 1));
+            }
+    }
         for (const Case& k : cases) {
             const SplatCloud& cloud = *k.cloud;
             SplatFilter draft;

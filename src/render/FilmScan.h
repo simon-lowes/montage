@@ -42,11 +42,18 @@ struct FadeLevels {
     float lo[3] = {0, 0, 0}, mid[3] = {0.5f, 0.5f, 0.5f}, hi[3] = {1, 1, 1};
 };
 FadeLevels fadeLevels(const Image& img);
+// The pixels fadeLevels reads of `img`, as a picture of their own: fadeLevels of it is fadeLevels of `img`, and of `img`
+// changed pixel by pixel when they are changed alike (the GPU's source stage measures a frame through its negative so).
+Image fadeSamples(const Image& img);
 // The mean of several frames' levels (a shot's, so the restoration holds steady).
 FadeLevels meanFadeLevels(const std::vector<FadeLevels>& levels);
 // Faded dyes brought back: each channel's levels and gamma (`levels`, the frame's or the shot's) matched to those of the
 // channel that kept the widest range, so the picture's black, white and middle come back neutral; by `strength` (0..1).
 void restoreFade(Image& img, const FadeLevels& levels, double strength);
+// The two as the GPU's source stage runs them (render/shaders/gpucolor.frag's 27): invertNegative by `negative`, then
+// restoreFade by `fade` at `strength` (either null: not run), on each channel in closed form, in the curve the shader
+// numbers `tf` (render/Processing's gpuTransfer): p[1].y to p[7] of its 16 vec4s, set in `q`.
+void sourceStageUniforms(const NegativeSettings* negative, const FadeLevels* fade, double strength, int tf, float q[64]);
 
 // ---- Perforations --------------------------------------------------------------------------------------------------------
 

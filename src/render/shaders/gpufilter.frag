@@ -58,6 +58,8 @@
 // smear along the flow.
 // 56 a Shape layer's paints (render/ShapeRaster): each pixel's tile's commands, each path's coverage from its backdrop and
 // lines, its paint laid down over what is below, groups through their opacity; p[1].x the tiles across.
+// 54 ACES Gamut Compress (render/Gamut's AcesGamutCompressor), on the working space's light in AP1: p[1].x the curve, p[1].y
+// 1 to take compressed colours back out; p[2..4].xyz into AP1 by rows, p[5..7].xyz back.
 // 73 and above are gpueffects.frag's (the compositor draws those modes with it).
 // 72 Gaussian splats blended (render/SplatRender): a linear cloud's colour (p[1].x set) brought to display values under
 // its coverage, and the whole the layer's opacity (p[1].y) of that.
@@ -462,6 +464,17 @@ vec3 glareLight(int gx, int gy, int f, float threshold) {
 // Lens Blur's weight of a pixel's layers (bin0 in x, the nearer one's share in y) for layer k.
 float lbWeight(vec4 b, int k) { return int(b.x) == k ? 1.0 - b.y : int(b.x) + 1 == k ? b.y : 0.0; }
 
+// ACES's reference gamut compression's distance curve (render/Gamut's compressDistance, its power 1.2).
+float rgcDistance(float dist, float lim, float thr, bool inverse) {
+    if (dist < thr) return dist;
+    const float pwr = 1.2;
+    const float scl = (lim - thr) / pow(pow((1.0 - thr) / (lim - thr), -pwr) - 1.0, 1.0 / pwr);
+    const float nd = (dist - thr) / scl, q = pow(nd, pwr);
+    if (!inverse) return thr + scl * nd / pow(1.0 + q, 1.0 / pwr);
+    if (dist >= thr + scl) return dist;  // (beyond what the forward curve reaches)
+    return thr + scl * pow(-(q / (q - 1.0)), 1.0 / pwr);
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const ivec2 size = textureSize(srcTex, 0);
@@ -477,6 +490,22 @@ void main() {
             }
         }
         fragColor = c * p[1].y;
+        return;
+    }
+    if (mode == 54) {
+        if (px.a <= 0.0) {
+            fragColor = px;
+            return;
+        }
+        const int tf = int(p[1].x);
+        const vec3 l = linearOf(tf, px.rgb / px.a);
+        vec3 c = vec3(dot(p[2].xyz, l), dot(p[3].xyz, l), dot(p[4].xyz, l));
+        const float ach = max(c.r, max(c.g, c.b));
+        if (ach != 0.0) {
+            const vec3 lim = vec3(1.147, 1.264, 1.312), thr = vec3(0.815, 0.803, 0.880);
+            for (int k = 0; k < 3; ++k) c[k] = ach - rgcDistance((ach - c[k]) / abs(ach), lim[k], thr[k], p[1].y > 0.5) * abs(ach);
+        }
+        fragColor = vec4(codeOf(tf, vec3(dot(p[5].xyz, c), dot(p[6].xyz, c), dot(p[7].xyz, c))) * px.a, px.a);
         return;
     }
     if (mode == 1) {
