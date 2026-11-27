@@ -57,9 +57,13 @@ bool StillEditor::canEdit(Id media) const {
     return QFileInfo::exists(QString::fromStdString(mediaFileOnDisk(m->path)));
 }
 
+bool StillEditor::ours(const Copy& c) const {
+    return c.generation == state_->projectGeneration() || (!c.project.isEmpty() && c.project == state_->filePath());
+}
+
 QString StillEditor::workingCopy(Id media) const {
-    for (const auto& [copy, id] : copies_)
-        if (id == media) return copy;
+    for (const auto& [copy, c] : copies_)
+        if (c.media == media && ours(c)) return copy;
     return {};
 }
 
@@ -84,7 +88,7 @@ bool StillEditor::edit(Id media, QString* why) {
         for (int n = 1;; ++n) {
             copy = folder + '/' + original.completeBaseName() + (n == 1 ? QStringLiteral(" (editing)") : QStringLiteral(" (editing %1)").arg(n)) + suffix;
             const auto taken = copies_.find(copy);
-            if (taken == copies_.end() || taken->second == media) break;
+            if (taken == copies_.end() || (taken->second.media == media && ours(taken->second))) break;
         }
         if (QFileInfo::exists(copy)) {
             watcher_->removePath(copy);
@@ -92,8 +96,8 @@ bool StillEditor::edit(Id media, QString* why) {
         }
         if (!QFile::copy(original.absoluteFilePath(), copy)) return fail(tr("Could not copy %1 to edit it").arg(original.fileName()));
         QFile(copy).setPermissions(QFile(copy).permissions() | QFileDevice::WriteOwner);
-        for (auto it = copies_.begin(); it != copies_.end();) it = it->second == media ? copies_.erase(it) : std::next(it);
-        copies_[copy] = media;
+        for (auto it = copies_.begin(); it != copies_.end();) it = it->second.media == media && ours(it->second) ? copies_.erase(it) : std::next(it);
+        copies_[copy] = {media, state_->projectGeneration(), state_->filePath()};
     }
     if (!watcher_->files().contains(copy)) watcher_->addPath(copy);
     // An application bundle is opened by the system (macOS); anything else is run with the file.
@@ -111,7 +115,10 @@ int StillEditor::takeSaved() {
     for (const QString& copy : paths) {
         const auto found = copies_.find(copy);
         if (found == copies_.end()) continue;
-        const Id media = found->second;
+        // (saved while another project is open: that project is left alone, and its own still changes once it is open
+        // again and the copy saved)
+        if (!ours(found->second)) continue;
+        const Id media = found->second.media;
         // Saved by writing a new file over it: the new file watched.
         if (QFileInfo::exists(copy) && !watcher_->files().contains(copy)) watcher_->addPath(copy);
         // Not a whole picture yet (still being written): looked at again in a moment.

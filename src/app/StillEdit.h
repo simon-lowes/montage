@@ -59,7 +59,15 @@ private:
     EditorState* state_;
     QFileSystemWatcher* watcher_;
     QTimer* quiet_;
-    std::map<QString, Id> copies_;  // working copy -> its media
+    // A working copy's still: its media in the project open when the copy was made (that project's generation and
+    // file; a saved copy changes only that project, open again, never another that has the same media id).
+    struct Copy {
+        Id media = 0;
+        uint64_t generation = 0;
+        QString project;
+    };
+    std::map<QString, Copy> copies_;  // working copy -> its still
+    bool ours(const Copy& c) const;    // whether the copy's project is the one open
     std::set<QString> saved_;       // copies written to since last looked at
 };
 

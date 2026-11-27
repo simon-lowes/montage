@@ -20304,6 +20304,66 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    // Nightly 27 Nov: a still's working copy saved while another project is open changes nothing there, even where
+    // that project has a still under the same media id. With its own project open again, the next save updates its
+    // own still.
+    void stillEditLeavesAnotherProjectAlone() {
+        const QString program = StillEditor::program();
+        StillEditor::setProgram(QStringLiteral("/opt/Picture Editor/editor"));
+        QStringList launched;
+        StillEditor::setLauncherForTesting([&](const QString&, const QString& file) {
+            launched << file;
+            return true;
+        });
+        auto still = [&](const QString& name, QRgb colour) {
+            const QString png = dir_.path() + "/" + name;
+            QImage img(64, 36, QImage::Format_RGB32);
+            img.fill(colour);
+            return img.save(png) ? png : QString();
+        };
+        auto pause = [](int ms) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) QTest::qWait(20);
+        };
+        state()->newProject();
+        const auto a = state()->importFiles({still("still-of-a.png", qRgb(220, 0, 0))});
+        QCOMPARE(a.size(), size_t(1));
+        QVERIFY(state()->save(dir_.path() + "/still-a.montage"));
+        StillEditor* editor = StillEditor::of(state());
+        QVERIFY(editor->edit(a[0]));
+        QCOMPARE(launched.size(), 1);
+        const QString copy = launched[0];
+        // Another project, whose still has the same media id; the copy saved green meanwhile.
+        state()->newProject();
+        const auto b = state()->importFiles({still("still-of-b.png", qRgb(90, 90, 90))});
+        QCOMPARE(b, a);
+        const std::string bPath = state()->project().findMedia(b[0])->path;
+        const size_t steps = state()->history().undoCount();
+        QImage green(64, 36, QImage::Format_RGB32);
+        green.fill(qRgb(0, 210, 0));
+        QVERIFY(green.save(copy));
+        pause(1000);
+        QCOMPARE(editor->takeSaved(), 0);
+        QCOMPARE(state()->project().findMedia(b[0])->path, bPath);
+        QCOMPARE(state()->history().undoCount(), steps);
+        QVERIFY(editor->workingCopy(b[0]).isEmpty());
+        // Its own project open again: the copy is its still's, and saving it updates that still.
+        QVERIFY(state()->open(dir_.path() + "/still-a.montage"));
+        QCOMPARE(editor->workingCopy(a[0]), copy);
+        QImage blue(64, 36, QImage::Format_RGB32);
+        blue.fill(qRgb(0, 0, 230));
+        QVERIFY(blue.save(copy));
+        auto updated = [&] { return QFileInfo(QString::fromStdString(state()->project().findMedia(a[0])->path)).fileName().startsWith("still-of-a v2"); };
+        QElapsedTimer clock;
+        clock.start();
+        while (!updated() && clock.elapsed() < 3000) QTest::qWait(20);
+        QVERIFY(updated());
+        StillEditor::setLauncherForTesting({});
+        StillEditor::setProgram(program);
+        state()->newProject();
+    }
+
     void encodeFoldersEncodeEachFileOnce() {
         // A folder encoded to WAV: three files copied into it slowly are each encoded once they stop growing, a
         // fourth still being written waits, and after a restart nothing is encoded again.
