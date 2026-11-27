@@ -210,6 +210,10 @@ public:
     // The connections kept (as of the last hundredth of a second), and how many the 512 kept have let go to make room.
     int connectionsKept() const;
     int64_t connectionsLetGo() const;
+    // The connections that ended in an error of their own (the system's: reset, refused a write), and the last one's
+    // text with what was still to be sent on it.
+    int64_t connectionsFailed() const;
+    std::string lastConnectionError() const;
     // Each connection's send buffer in the system, in bytes, from the next start (0, the default: the system's own,
     // which grows with the connection; 1 MB under Windows). Small, an answer a client does not read waits in the
     // origin and not in the system: for tests of what such clients make the origin hold.

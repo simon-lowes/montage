@@ -37089,7 +37089,14 @@ colorspaces:
             f.write(QByteArray(size, 'x'));
         }
         LiveOrigin origin;
+#ifdef Q_OS_MACOS
+        // (on macOS no smaller than the loopback's 16 KB segment: with 8 KB the last client had been sent only the
+        // answer's head, 300 bytes, and the origin had no connection left, none let go; whether they ended in an
+        // error is said below)
+        origin.setSendBuffer(64 << 10);
+#else
         origin.setSendBuffer(8 << 10);
+#endif
         std::string err;
         QVERIFY2(origin.start(dir.path().toStdString(), 0, [](const std::string&) { return false; }, &err), err.c_str());
         constexpr int kClients = 600, kKept = 512;
@@ -37140,10 +37147,18 @@ colorspaces:
             int n = 0;
             if (ioctl(int(last.socketDescriptor()), FIONREAD, &n) == 0) queued = n;
 #endif
+            // (and all the clients': whether the answers reached them, or the connections ended at the origin)
+            long long allQueued = 0;
+#ifndef _WIN32
+            for (const auto& c : clients)
+                if (int k = 0; ioctl(int(c->socketDescriptor()), FIONREAD, &k) == 0) allQueued += k;
+#endif
             return QString("%1 kept, %2 let go, %3 bytes waiting in the origin, %4 of the clients closed; at most %5 kept and %6 bytes "
-                           "waiting while they came; the last client's receive buffer %7, %8 bytes waiting for it in its system")
+                           "waiting while they came; the last client's receive buffer %7, %8 bytes waiting for it in its system, "
+                           "%9 for all of them; %10 connections ended in an error at the origin, the last: %11")
                 .arg(origin.connectionsKept()).arg(origin.connectionsLetGo()).arg(origin.bytesWaiting()).arg(closed).arg(mostKept)
-                .arg(mostWaiting).arg(last.socketOption(QAbstractSocket::ReceiveBufferSizeSocketOption).toInt()).arg(queued);
+                .arg(mostWaiting).arg(last.socketOption(QAbstractSocket::ReceiveBufferSizeSocketOption).toInt()).arg(queued)
+                .arg(allQueued).arg(origin.connectionsFailed()).arg(QString::fromStdString(origin.lastConnectionError()));
         };
         QVERIFY2(origin.connectionsKept() == kKept, qPrintable(said()));
         QVERIFY2(origin.connectionsLetGo() == int64_t(kClients - kKept), qPrintable(said()));

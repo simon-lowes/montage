@@ -2172,6 +2172,8 @@ struct LiveOrigin::State {
     std::atomic<int64_t> heldBytes{0};  // (bytes handed to connections that their clients have not taken yet)
     std::atomic<int> keptNow{0};
     std::atomic<int64_t> letGo{0};      // (connections let go by the 512 kept)
+    std::atomic<int64_t> failed{0};     // (connections ended by an error of their own; the last one's text, under m)
+    std::string lastError;
     int sendBuffer = 0;
 
     // A connection's one request (each answered, then closed). Kept until its socket is gone.
@@ -2536,6 +2538,14 @@ struct LiveOrigin::State {
                 // (a file or a growing segment: its next piece as soon as there is room for it)
                 if (!raw->done && (raw->sending || raw->streaming)) attempt(*raw);
             });
+            QObject::connect(socket, &QAbstractSocket::errorOccurred, &server, [this, raw](QAbstractSocket::SocketError e) {
+                if (raw->gone) return;
+                ++failed;
+                const std::string text = raw->socket->errorString().toStdString() + " (" + std::to_string(int(e)) + "), " +
+                                         std::to_string(raw->socket->bytesToWrite()) + " bytes still to send" + (raw->done ? ", answered" : "");
+                std::lock_guard lock(m);
+                lastError = text;
+            });
             QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
             // (the request goes with its socket)
             QObject::connect(socket, &QObject::destroyed, &server, [this, raw] {
@@ -2622,6 +2632,13 @@ int64_t LiveOrigin::bytesWaiting() const { return s_->heldBytes.load(); }
 int LiveOrigin::connectionsKept() const { return s_->keptNow.load(); }
 
 int64_t LiveOrigin::connectionsLetGo() const { return s_->letGo.load(); }
+
+int64_t LiveOrigin::connectionsFailed() const { return s_->failed.load(); }
+
+std::string LiveOrigin::lastConnectionError() const {
+    std::lock_guard lock(s_->m);
+    return s_->lastError;
+}
 
 void LiveOrigin::setSendBuffer(int bytes) { s_->sendBuffer = std::max(0, bytes); }
 
