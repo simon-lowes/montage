@@ -20068,6 +20068,21 @@ colorspaces:
         QVERIFY(st::parseHdrItem(hdrWords, hw) && hw.display && hw.lightLevel && hw.maxCll == 1000 && hw.maxFall == 400);
         QVERIFY(std::abs(hw.maxLuminance - 1000) < 1e-9 && std::abs(hw.primaries[1][0] - 0.265) < 1e-9 && std::abs(hw.white[1] - 0.3290) < 1e-9);
         QVERIFY(!st::parseHdrItem(st::frameItem(1, {}), hw));
+        // Nightly 27 Nov: the mastering display and the light levels sent in packets of their own are both kept; a
+        // packet cut short, or one that states neither, leaves what was stated as it was.
+        st::AncPacket mastering = meta, light = meta, cut = meta, junk = meta;
+        mastering.data.resize(28);
+        light.data.erase(light.data.begin(), light.data.begin() + 28);
+        cut.data.resize(20);
+        junk.data = {0x05, 0x02, 0xAB, 0xCD};
+        st::HdrMetadata apart;
+        QVERIFY(st::parseHdrMetadata(mastering, apart) && apart.display && !apart.lightLevel);
+        QVERIFY(st::parseHdrMetadata(light, apart) && apart.display && apart.lightLevel && apart.maxCll == 1000 && apart.maxFall == 400);
+        QVERIFY(std::abs(apart.maxLuminance - 1000) < 1e-9 && std::abs(apart.primaries[0][0] - 0.680) < 1e-9);
+        for (const st::AncPacket& p : {cut, junk}) {
+            QVERIFY(!st::parseHdrMetadata(p, apart));
+            QVERIFY(apart.display && apart.lightLevel && apart.maxCll == 1000 && std::abs(apart.maxLuminance - 1000) < 1e-9);
+        }
         // The reference output's ST 2110 backend sends that item with each frame of a PQ signal whose HDR metadata is
         // stated (and names it in its stream's DIT, beside its frame item); for a signal that states none, only the frame
         // item.

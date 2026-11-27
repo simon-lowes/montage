@@ -1085,7 +1085,9 @@ AncPacket hdrMetadataPacket(const output::Signal& s) {
 
 bool parseHdrMetadata(const AncPacket& p, HdrMetadata& out) {
     if (p.did != 0x41 || p.sdid != 0x0C) return false;
-    out = {};
+    // (read into its own, and only what it states taken: a packet with the light levels alone keeps the mastering
+    // display an earlier one stated, and one cut short or stating neither changes nothing)
+    HdrMetadata got;
     const auto& d = p.data;
     auto u16 = [&](size_t i) { return double(uint32_t(d[i]) << 8 | d[i + 1]); };
     for (size_t i = 0; i + 2 <= d.size();) {
@@ -1096,22 +1098,34 @@ bool parseHdrMetadata(const AncPacket& p, HdrMetadata& out) {
         if (type == 0 && len == 26 && d[b] == 0x89 && d[b + 1] == 0x18) {
             static const int rgb[3] = {1, 2, 0};  // (G B R in, R G B out)
             for (int c = 0; c < 3; ++c) {
-                out.primaries[rgb[c]][0] = u16(b + 2 + size_t(c) * 4) / 50000;
-                out.primaries[rgb[c]][1] = u16(b + 4 + size_t(c) * 4) / 50000;
+                got.primaries[rgb[c]][0] = u16(b + 2 + size_t(c) * 4) / 50000;
+                got.primaries[rgb[c]][1] = u16(b + 4 + size_t(c) * 4) / 50000;
             }
-            out.white[0] = u16(b + 14) / 50000;
-            out.white[1] = u16(b + 16) / 50000;
-            out.maxLuminance = (u16(b + 18) * 65536 + u16(b + 20)) / 10000;
-            out.minLuminance = (u16(b + 22) * 65536 + u16(b + 24)) / 10000;
-            out.display = true;
+            got.white[0] = u16(b + 14) / 50000;
+            got.white[1] = u16(b + 16) / 50000;
+            got.maxLuminance = (u16(b + 18) * 65536 + u16(b + 20)) / 10000;
+            got.minLuminance = (u16(b + 22) * 65536 + u16(b + 24)) / 10000;
+            got.display = true;
         } else if (type == 1 && len == 6 && d[b] == 0x90 && d[b + 1] == 0x04) {
-            out.maxCll = int(u16(b + 2));
-            out.maxFall = int(u16(b + 4));
-            out.lightLevel = true;
+            got.maxCll = int(u16(b + 2));
+            got.maxFall = int(u16(b + 4));
+            got.lightLevel = true;
         }
         i = b + len;
     }
-    return out.display || out.lightLevel;
+    if (got.display) {
+        std::memcpy(out.primaries, got.primaries, sizeof out.primaries);
+        std::memcpy(out.white, got.white, sizeof out.white);
+        out.maxLuminance = got.maxLuminance;
+        out.minLuminance = got.minLuminance;
+        out.display = true;
+    }
+    if (got.lightLevel) {
+        out.maxCll = got.maxCll;
+        out.maxFall = got.maxFall;
+        out.lightLevel = true;
+    }
+    return got.display || got.lightLevel;
 }
 
 FastMetadata hdrItem(const output::Signal& s) {

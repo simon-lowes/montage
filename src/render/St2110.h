@@ -350,7 +350,9 @@ bool parseAtc(const AncPacket& p, output::Timecode& out, AtcType* type = nullptr
 // 60p).
 std::vector<AncPacket> timecodePackets(const output::Timecode& tc, Rational fps, int field);
 // ST 2108-1 static HDR metadata (DID 41h, SDID 0Ch): the mastering display (ST 2086: its primaries, D65 white, peak and
-// minimum) and the content light levels, as HEVC's SEI messages carry them; and back (primaries R, G, B: x, y).
+// minimum) and the content light levels, as HEVC's SEI messages carry them; and back (primaries R, G, B: x, y). Read
+// back into `out`, a packet changes only what it states (one with the light levels alone keeps the mastering display
+// an earlier one gave); one cut short, or stating neither, changes nothing and gives false.
 AncPacket hdrMetadataPacket(const output::Signal& s);
 struct HdrMetadata {
     double primaries[3][2] = {}, white[2] = {};
