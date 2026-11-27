@@ -13,12 +13,6 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #endif
-#ifdef __APPLE__
-#include <cerrno>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#endif
 
 #include <algorithm>
 #include <QBuffer>
@@ -37076,9 +37070,9 @@ colorspaces:
     // are closed and the last 512 kept, and those are then sent their whole answers. (Each connection's system buffers
     // are made small, the client's before it connects, so the answers wait in the origin as they would for players
     // past a slow link: macOS and Windows otherwise take a whole 96 KB answer into the system, and a connection whose
-    // answer the system took is finished and closed by the origin, so nothing is kept to count. On macOS, which grows a
-    // receive buffer past what is asked, each client's connection is made without TCP options, so with no window
-    // scaling its window can never be more than 65,535 bytes.)
+    // answer the system took is finished and closed by the origin, so nothing is kept to count. On macOS, where the
+    // systems take 392 KB of each answer whatever is asked, the answers are larger, and 224 of the 512 kept are
+    // requests for a segment still being made, below.)
     void liveOriginKeeps512() {
 #ifndef _WIN32
         // (1,200 sockets in this process: the client's and the origin's of each)
@@ -37093,27 +37087,42 @@ colorspaces:
         // (on macOS no smaller than the loopback's 16 KB segment: with 8 KB the last client had been sent only the
         // answer's head, 300 bytes, and the origin had no connection left, none let go)
         const int sendBuffer = 64 << 10;
+        // On macOS what the systems take of an answer is set by the loopback, not by what is asked. Its route gives a
+        // connection 48 KB pipes (bsd/net/if_loop.c), so a client's receive buffer is 65,328 bytes once connected,
+        // four 16,332-byte segments (tcp_mss), and XNU grows a buffer an application sized by sixteen segments once
+        // (tcp_sbrcv_grow_rwin, while it is within that of the 4,096 asked): 326,640 bytes, as CI reported on 74c58b5.
+        // With the origin's 64 KB send buffer the two systems take 392,176 bytes of an answer. An answer is finished
+        // only when its last piece is handed to its connection, and the origin hands on no more than 256 KB past what
+        // the systems took, so the answer is 490,000 bytes: finished once they have taken 233,856, with 97,824 left
+        // at the origin. Linux and Windows take far less, and a 250,000-byte answer is finished at once.
+        const int size = 490000;
+        // TCP's memory on macOS is a 32nd of the machine's (tcp_init; 224 MB on CI's 7 GB runner), and past it
+        // tcp_input drops what comes: so it went for client 321 when 6dba0d6 had the origin send 512-byte segments,
+        // each counted at the size of the whole buffer it was cut from. 512 answers held as above would need 200 MB,
+        // so 224 of the 512 kept are requests the origin holds by its own rule, for a segment still being made, with
+        // nothing yet to send: 289 connections at most hold answers, 113 MB.
+        constexpr int kHeldOpen = 224;
 #else
         const int sendBuffer = 8 << 10;
-#endif
-        // Each client's answer: just under the 256 KB the origin holds an answer whole in, and so as far past what the
-        // connection's two systems take as can be (Windows takes one of the origin's 64 KB pieces whole, whatever the
-        // connection's buffer). On macOS a receive buffer asked small is grown anyway, by sixteen segments at a time
-        // and twice over (XNU's tcp_sbrcv_grow_rwin, for a buffer an application sized: 4,096 + 32 x 16,332 = 526,720
-        // bytes on CI, as reported), so there each client asks for no TCP options as it connects. Without the window
-        // scale option a connection's window is a 16-bit count (RFC 7323), so its system can take at most 65,535 bytes
-        // into the client and the origin's 64 KB send buffer at most 65,536: 131,071 of the 250,000, whatever the
-        // buffers grow to, and the origin holds the rest.
+        // (just under the 256 KB an answer is held whole in, and so as far past what the systems take as can be:
+        // Windows takes one of the origin's 64 KB pieces whole, whatever the connection's buffer)
         const int size = 250000;
+        constexpr int kHeldOpen = 0;
+#endif
+
         {
             QFile f(dir.filePath("seg_3.m4s"));
             QVERIFY(f.open(QIODevice::WriteOnly));
             f.write(QByteArray(size, 'x'));
+            QFile live(dir.filePath("live.m4s"));  // (being made, and nothing of it yet)
+            QVERIFY(live.open(QIODevice::WriteOnly));
         }
+        std::atomic<bool> making{true};
         LiveOrigin origin;
         origin.setSendBuffer(sendBuffer);
         std::string err;
-        QVERIFY2(origin.start(dir.path().toStdString(), 0, [](const std::string&) { return false; }, &err), err.c_str());
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, [&making](const std::string& rel) { return rel == "live.m4s" && making.load(); }, &err),
+                 err.c_str());
         constexpr int kClients = 600, kKept = 512;
         std::vector<std::unique_ptr<QTcpSocket>> clients;
         std::vector<QByteArray> got(kClients);
@@ -37123,38 +37132,37 @@ colorspaces:
         // take answers into their buffers later)
         int mostKept = 0;
         int64_t mostWaiting = 0;
+        // (said when a client is not answered: what the origin keeps, and on macOS what TCP dropped for want of memory)
+        const auto notAnswered = [&](int i) {
+            QString memory;
+#ifdef Q_OS_MACOS
+            QProcess netstat;
+            netstat.start(QStringLiteral("netstat"), {QStringLiteral("-s"), QStringLiteral("-p"), QStringLiteral("tcp")});
+            if (netstat.waitForFinished(5000))
+                for (const QByteArray& line : netstat.readAllStandardOutput().split('\n'))
+                    if (line.contains("memory")) memory += QStringLiteral("; ") + QString::fromLatin1(line.simplified());
+#endif
+            return QString("client %1 was not answered: %2 kept, %3 let go, %4 bytes waiting in the origin; %5 connections ended in an "
+                           "error at the origin, the last: %6%7")
+                .arg(i).arg(origin.connectionsKept()).arg(origin.connectionsLetGo()).arg(origin.bytesWaiting())
+                .arg(origin.connectionsFailed()).arg(QString::fromStdString(origin.lastConnectionError())).arg(memory);
+        };
         for (int i = 0; i < kClients; ++i) {
             auto s = std::make_unique<QTcpSocket>();
             s->setReadBufferSize(1);  // (a byte of the answer taken, to know it was sent, and nothing more)
             // (bound first, so its system buffer is small from the start: the window it offers is settled as it
-            // connects, and Windows does not shrink it afterwards. And again once connected: macOS made it 326,640
-            // bytes as it connected (CI, 74c58b5), more than the answer, whatever was asked. Asked small from the start
-            // its window is offered unscaled, under 64 KB, and asked small again it offers no more than that)
+            // connects, and Windows does not shrink it afterwards. And again once connected, but on macOS, where
+            // that would let the buffer grow from 4,096 bytes again, to 526,720 (CI, a37afd4))
             QVERIFY2(s->bind(QHostAddress::LocalHost, 0), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
             s->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 4096);
-#ifdef Q_OS_MACOS
-            // (no window scale option in its SYN: the connection's window stays under 64 KB)
-            const int noOptions = 1;
-            QVERIFY2(setsockopt(int(s->socketDescriptor()), IPPROTO_TCP, TCP_NOOPT, &noOptions, sizeof noOptions) == 0,
-                     qPrintable(QString("client %1: TCP_NOOPT, errno %2").arg(i).arg(errno)));
-#endif
             s->connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
             QVERIFY2(s->waitForConnected(5000), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
+#ifndef Q_OS_MACOS
             s->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 4096);
-#ifdef Q_OS_MACOS
-            // (and the connection made is the socket asked so: its system says it has no window scaling)
-            {
-                tcp_connection_info info{};
-                socklen_t length = sizeof info;
-                QVERIFY2(getsockopt(int(s->socketDescriptor()), IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &length) == 0,
-                         qPrintable(QString("client %1: TCP_CONNECTION_INFO, errno %2").arg(i).arg(errno)));
-                QVERIFY2(!(info.tcpi_options & TCPCI_OPT_WSCALE) && info.tcpi_rcv_wscale == 0,
-                         qPrintable(QString("client %1: window scaling on (options %2, scale %3)").arg(i).arg(uint(info.tcpi_options)).arg(int(info.tcpi_rcv_wscale))));
-            }
 #endif
-            s->write("GET /seg_3.m4s HTTP/1.1\r\nHost: x\r\n\r\n");
+            s->write(i < kHeldOpen ? "GET /live.m4s HTTP/1.1\r\nHost: x\r\n\r\n" : "GET /seg_3.m4s HTTP/1.1\r\nHost: x\r\n\r\n");
             QVERIFY(s->waitForBytesWritten(5000) || s->bytesToWrite() == 0);
-            QVERIFY2(s->waitForReadyRead(5000), qPrintable(QString("client %1 was not answered").arg(i)));
+            if (!s->waitForReadyRead(5000)) QFAIL(qPrintable(notAnswered(i)));
             // (the origin's thread sees what its system took of the answer before the next client comes)
             QThread::msleep(4);
             mostKept = std::max(mostKept, origin.connectionsKept());
@@ -37195,8 +37203,14 @@ colorspaces:
         };
         QVERIFY2(origin.connectionsKept() == kKept, qPrintable(said()));
         QVERIFY2(origin.connectionsLetGo() == int64_t(kClients - kKept), qPrintable(said()));
-        QVERIFY2(origin.bytesWaiting() >= int64_t(kKept) * 4096, qPrintable(said()));
-        // Every client now reads: the first 88 were let go, the last 512 are sent their whole answers.
+        QVERIFY2(origin.bytesWaiting() >= int64_t(kKept - kHeldOpen) * 4096, qPrintable(said()));
+        // (the requests for the segment being made were all kept: none is let go to make room, as they are not answers
+        // their clients have not taken)
+        for (int i = 0; i < kHeldOpen; ++i)
+            QVERIFY2(clients[size_t(i)]->state() == QAbstractSocket::ConnectedState, qPrintable(QString("client %1 was closed").arg(i)));
+        // Every client now reads, and the segment is made: the first 88 asking for the file were let go, the rest are
+        // sent their whole answers, and the segment's end.
+        making = false;
         for (int i = 0; i < kClients; ++i) {
             QTcpSocket* s = clients[size_t(i)].get();
             got[size_t(i)] = s->readAll();
@@ -37210,26 +37224,33 @@ colorspaces:
         };
         t.restart();
         while (t.elapsed() < 15000 && !finished()) QTest::qWait(20);
-        // The ones let go are those whose clients had taken nothing for longest: the first 88, but for a few by the
-        // line, as a system can take a little more of an answer a moment later, which makes that client's taking
-        // newer than the next one's (here on Linux, one run in four had client 84 answered and 88 closed).
-        constexpr int kByTheLine = 16;
+        // The ones let go are those whose clients had taken nothing for longest: the first 88 asking for the file, but
+        // for a few by the line, as a system can take a little more of an answer a moment later, which makes that
+        // client's taking newer than the next one's (here on Linux, one run in four had client 84 answered and 88
+        // closed).
+        constexpr int kByTheLine = 16, kLine = kHeldOpen + kClients - kKept;
         int closed = 0, whole = 0;
         QString byTheLine;
         for (int i = 0; i < kClients; ++i) {
             QByteArray& in = got[size_t(i)];
             in += clients[size_t(i)]->readAll();
             const qsizetype head = in.indexOf("\r\n\r\n");
+            if (i < kHeldOpen) {
+                QVERIFY2(in.startsWith("HTTP/1.1 200") && in.contains("Transfer-Encoding: chunked") && in.size() == head + 4 + 5 &&
+                             in.endsWith("0\r\n\r\n"),
+                         qPrintable(QString("client %1: %2").arg(i).arg(QString::fromLatin1(in.right(80)))));
+                continue;
+            }
             const bool all = in.startsWith("HTTP/1.1 200") && head > 0 && in.size() - (head + 4) == size;
-            QVERIFY2(all || i < kClients - kKept + kByTheLine, qPrintable(QString("client %1: %2 bytes").arg(i).arg(in.size())));
-            QVERIFY2(!all || i >= kClients - kKept - kByTheLine, qPrintable(QString("client %1 was sent its whole answer").arg(i)));
+            QVERIFY2(all || i < kLine + kByTheLine, qPrintable(QString("client %1: %2 bytes").arg(i).arg(in.size())));
+            QVERIFY2(!all || i >= kLine - kByTheLine, qPrintable(QString("client %1 was sent its whole answer").arg(i)));
             ++(all ? whole : closed);
-            if (all != (i >= kClients - kKept)) byTheLine += QString(" %1 %2").arg(i).arg(all ? "answered" : "closed");
+            if (all != (i >= kLine)) byTheLine += QString(" %1 %2").arg(i).arg(all ? "answered" : "closed");
         }
-        qInfo("%d closed and %d answered whole, in %lld ms;%s", closed, whole, (long long)began.elapsed(),
-              byTheLine.isEmpty() ? " the first 88 closed" : qPrintable(" by the line:" + byTheLine));
+        qInfo("%d closed and %d answered whole, %d kept for a segment being made, in %lld ms;%s", closed, whole, kHeldOpen,
+              (long long)began.elapsed(), byTheLine.isEmpty() ? " the first 88 closed" : qPrintable(" by the line:" + byTheLine));
         QCOMPARE(closed, kClients - kKept);
-        QCOMPARE(whole, kKept);
+        QCOMPARE(whole, kKept - kHeldOpen);
     }
 
     // Nightly 15 Nov: low latency HLS as a player is promised it. The preload hint after a segment's last part
