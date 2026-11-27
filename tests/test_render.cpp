@@ -28048,12 +28048,17 @@ colorspaces:
             relay.madeUpRealm = made.realm;
             relay.madeUpNonce = made.nonce;
             relay.madeUpChallenge = made.code;
-            // Three Refreshes kept by the relay (about three seconds), each answered first by a made-up challenge. (Both
-            // counts waited for: the relay counts a Refresh before it looks whether to make a challenge up for it, so
-            // with the Refreshes alone the last could find the challenges already turned off.)
+            // Three Refreshes kept by the relay (about three seconds), each answered first by a made-up challenge, and
+            // the bridge's count of an answer it would not use. (All three waited for: the relay counts a Refresh before
+            // it looks whether to make a challenge up for it, so with the Refreshes alone the last could find the
+            // challenges already turned off; and a 438 with a nonce alone is asked again with that nonce three times,
+            // each time challenged again, so the bridge counts only the fourth challenge in a row, which three counted
+            // could find turned off too.)
             QElapsedTimer waited;
             waited.start();
-            while (waited.elapsed() < 12000 && (relay.refreshes < refreshesBefore + 3 || relay.challengesMadeUp < madeBefore + 3)) QThread::msleep(20);
+            while (waited.elapsed() < 12000 &&
+                   (relay.refreshes < refreshesBefore + 3 || relay.challengesMadeUp < madeBefore + 3 || bridge.answersRefused() < 1))
+                QThread::msleep(20);
             relay.madeUpChallenge = 0;
             QVERIFY2(relay.refreshes >= refreshesBefore + 3, qPrintable(row + "; " + relay.told()));
             QVERIFY2(relay.challengesMadeUp >= madeBefore + 3, qPrintable(row));
