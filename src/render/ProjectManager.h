@@ -49,6 +49,7 @@ struct ConsolidateOptions {
     // The new files' names: "" each source's (trimmed copies with "_trim"); or a pattern of {sequence}, {shot} (010,
     // 020... by its first clip's place in that sequence's cut), {clip} (the media's name), {reel}, {tape}, {scene},
     // {take} (its metadata) and, for image sequences, {frame} (the number; without it, after the name: "name.0001.exr").
+    // A file copied whole keeps its own name.
     std::string namePattern;
     int folderDepth = 0;         // this many of each source's folders kept above it in Media (0: none)
     // Clips nothing shows left out (ConsolidateResult::leftOut): disabled ones, and those hidden their whole length

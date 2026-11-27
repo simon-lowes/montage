@@ -6811,6 +6811,39 @@ private slots:
         QCOMPARE(QString::fromStdString(o.name), QString("Handoff"));
         QCOMPARE(o.sequences, std::vector<Id>{state()->sequence()->id});
         QVERIFY(!o.trim);
+        {
+            // The choices for finishing, set and read back as they were: DPX sequences with 12-frame handles, named by a
+            // pattern, the clips nothing shows left out and the grades baked.
+            ProjectManagerDialog finishing(state(), win_.get());
+            ConsolidateOptions finish;
+            finish.trim = true;
+            finish.output = "frames";
+            finish.frames = "dpx";
+            finish.handleUnit = "frames";
+            finish.handleFrames = 12;
+            finish.namePattern = "{shot}_{clip}.{frame}";
+            finish.folderDepth = 1;
+            finish.leaveOutHidden = true;
+            finish.bake = true;
+            finishing.setChoices(finish);
+            QVERIFY(finishing.findChild<QComboBox*>("pmFrames")->isEnabled());
+            QVERIFY(!finishing.findChild<QComboBox*>("pmCodec")->isEnabled());
+            QCOMPARE(consolidateChoicesJson(finishing.options()), consolidateChoicesJson(finish));
+            // A preset kept in the project is offered; chosen, it sets the dialog, and the compare view says what it sets.
+            QVERIFY(state()->apply("Preset", [](Project& p, Sequence&) {
+                p.consolidatePresets["Hand-off"] = R"({"output":"trimmed","handleUnit":"none"})";
+                return edit::Result{};
+            }));
+            ProjectManagerDialog withPreset(state(), win_.get());
+            auto* preset = withPreset.findChild<QComboBox*>("pmPreset");
+            QVERIFY(preset->findData("Hand-off") > 0);
+            preset->setCurrentIndex(preset->findData("Hand-off"));
+            QCOMPARE(withPreset.findChild<QComboBox*>("pmMode")->currentIndex(), 2);
+            QCOMPARE(withPreset.options().handleUnit, std::string("none"));
+            const QString compared = withPreset.compareText("Hand-off");
+            QVERIFY2(compared.contains("output: trimmed") && compared.contains("handleUnit: none (the default gives seconds)"), qPrintable(compared));
+            state()->undo();
+        }
         // Collect: the sound is copied beside the new project, which opens.
         QVERIFY(win_->runProjectManager(o));
         QVERIFY(QFileInfo::exists(dir_.path() + "/handoff/Handoff.montage"));

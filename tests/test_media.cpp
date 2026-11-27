@@ -24797,6 +24797,329 @@ if ui["pressed"] == "add":
         QCOMPARE(bytesOf(second[1]), bytesOf(path("whole-1.png")));
     }
 
+    void consolidateForFinishing() {
+        if (!exrAvailable()) QSKIP("Needs the OpenEXR library");
+        // Sources: 80 frames at 25 fps (256 x 144, as small as DNxHR goes) of a changing picture as ProRes, DNxHR, H.264
+        // (a key frame every 10 frames) and an OpenEXR sequence numbered from 1001, and a sound.
+        const int W = 256, H = 144;
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = W, gs.height = H, gs.fps = Rational{25, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 80);
+        ramp.generator.params["color.r"].addKey(0, 0.05);
+        ramp.generator.params["color.r"].addKey(79, 0.95);
+        ramp.generator.params["color.g"].addKey(0, 0.8);
+        ramp.generator.params["color.g"].addKey(79, 0.2);
+        ramp.generator.params["color.b"] = Param(0.4);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        std::string err;
+        auto source = [&](const char* name, const char* codec, const char* profile, int gop) {
+            ExportSettings st;
+            st.path = path(name);
+            st.videoCodec = codec;
+            st.profile = profile;
+            st.gop = gop;
+            st.audioCodec = "none";
+            return exportSequence(gen, gs, st, nullptr, nullptr, &err);
+        };
+        QVERIFY2(source("pmf-prores.mov", "prores_ks", "", 0), err.c_str());
+        QVERIFY2(source("pmf-dnx.mov", "dnxhd", "dnxhr_hq", 0), err.c_str());
+        QVERIFY2(source("pmf-h264.mp4", "libx264", "", 10), err.c_str());
+        const QString plates = QString::fromStdString(path("pmf-plate"));
+        QDir().mkpath(plates);
+        for (int n = 0; n < 80; ++n) {
+            ExrOutLayer l{"", {"R", "G", "B"}, std::vector<float>(size_t(W) * H * 3)};
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    for (int ch = 0; ch < 3; ++ch) l.data[(size_t(y) * W + x) * 3 + ch] = 0.01f * float(n) + 0.002f * float(x) + 0.1f * float(ch);
+            QVERIFY2(writeExr((plates + QStringLiteral("/plate.%1.exr").arg(1001 + n)).toStdString(), W, H, {l}, "zip", {}, &err), err.c_str());
+        }
+        writeWav(path("pmf-sound.wav"), 48000, 3.2, 0.2f, 0.2f);
+        ImageSequence plateFrames;
+        plateFrames.pattern = (plates + "/plate.%04d.exr").toStdString();
+        plateFrames.first = 1001, plateFrames.last = 1080, plateFrames.fps = Rational{25, 1};
+
+        Project p = makeDefaultProject();
+        p.name = "Finish";
+        Sequence& s = *p.active();
+        s.name = "Cut";
+        s.width = W, s.height = H, s.fps = Rational{25, 1};
+        MediaItem pro = probeOrFail(p, path("pmf-prores.mov")), dnx = probeOrFail(p, path("pmf-dnx.mov")), avc = probeOrFail(p, path("pmf-h264.mp4")),
+                  exr = probeOrFail(p, imageSequencePath(plateFrames)), snd = probeOrFail(p, path("pmf-sound.wav"));
+        exr.colorOverride = "linear-rec709";  // (the plates are in linear light, some of their values over 1)
+        for (const MediaItem* m : {&pro, &dnx, &avc, &exr, &snd}) p.media.push_back(*m);
+        auto place = [&](Sequence& seq, const MediaItem& m, int track, FrameTime start, double in, FrameTime duration, double speed = 1) {
+            Clip c = makeClip(p, m, TrackKind::Video, seq);
+            c.start = start, c.sourceIn = in, c.duration = duration, c.speed = speed;
+            while (int(seq.videoTracks.size()) <= track) seq.videoTracks.push_back(Track{});
+            edit::overwrite(p, seq, {TrackKind::Video, track}, c);
+            return c.id;
+        };
+        // The cut: each source in turn, a ProRes shot at 200 %, a DNxHR shot hidden under an opaque ProRes one above,
+        // an H.264 shot disabled, and the sound under the first two seconds.
+        place(s, pro, 0, 0, 20, 10);
+        place(s, dnx, 0, 10, 30, 10);
+        place(s, avc, 0, 20, 25, 10);
+        place(s, exr, 0, 30, 15, 10);
+        place(s, pro, 0, 40, 40, 5, 2.0);
+        place(s, dnx, 0, 50, 0, 10);
+        place(s, pro, 1, 50, 55, 10);
+        const Id disabled = place(s, avc, 0, 60, 60, 5);
+        edit::clipById(s, disabled)->enabled = false;
+        {
+            Clip c = makeClip(p, snd, TrackKind::Audio, s);
+            c.duration = 50;
+            edit::overwrite(p, s, {TrackKind::Audio, 0}, c);
+        }
+        const Id cutId = s.id;
+        // A sequence each of the ProRes and the H.264 shots alone, and one of the ProRes shot inverted.
+        Sequence proOnly = makeSequence(p, "ProRes", W, H, Rational{25, 1});
+        place(proOnly, pro, 0, 0, 20, 10);
+        Sequence avcOnly = makeSequence(p, "H264", W, H, Rational{25, 1});
+        place(avcOnly, avc, 0, 0, 25, 10);
+        Sequence graded = makeSequence(p, "Graded", W, H, Rational{25, 1});
+        const Id gradedClip = place(graded, pro, 0, 0, 20, 10);
+        edit::clipById(graded, gradedClip)->effects.push_back(makeEffect("invert", p.newId()));
+        const Id proId = proOnly.id, avcId = avcOnly.id, gradedId = graded.id;
+        p.sequences.push_back(proOnly), p.sequences.push_back(avcOnly), p.sequences.push_back(graded);
+        auto frame = [](const Project& pr, Id seq, FrameTime f) {
+            RenderOptions ro;
+            ro.highQuality = true;  // (as an export decodes, which the copies were made by)
+            return renderProgramFrame(pr, *pr.findSequence(seq), f, ro);
+        };
+        auto worst = [](const Image& a, const Image& b) {
+            if (a.px.size() != b.px.size() || a.px.empty()) return 1e9f;
+            float w = 0;
+            for (size_t i = 0; i < a.px.size(); ++i) w = std::max(w, std::fabs(a.px[i] - b.px[i]));
+            return w;
+        };
+        const std::vector<std::pair<Id, std::string>> hidden = hiddenClips(p, *p.findSequence(cutId));
+        QCOMPARE(hidden.size(), size_t(2));
+
+        // To OpenEXR sequences with 12-frame handles, named by a pattern, the clips nothing shows left out.
+        ConsolidateOptions o;
+        o.folder = path("pmf-frames");
+        o.name = "Frames";
+        o.sequences = {cutId};
+        o.output = "frames";
+        o.frames = "exr";
+        o.handleUnit = "frames";
+        o.handleFrames = 12;
+        o.namePattern = "{sequence}_{shot}_{clip}.{frame}";
+        o.leaveOutHidden = true;
+        ConsolidateResult res;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.leftOut.size(), size_t(2));
+        const QString leftOut = QString::fromStdString(res.leftOut[0] + "\n" + res.leftOut[1]);
+        QVERIFY2(leftOut.contains("(disabled)") && leftOut.contains("(hidden under pmf-prores.mov)"), qPrintable(leftOut));
+        Project frames;
+        QVERIFY2(loadProject(res.projectPath, frames, &err), err.c_str());
+        // Each source's used frames and 12 either side, numbered as the source's frames: ProRes 20-65 (its three
+        // shots), DNxHR 30-40 (the hidden shot gone), H.264 25-35, the plates 15-25 (as 1016-1026).
+        struct Expect {
+            Id media;
+            const char* name;
+            int first, last;
+        };
+        for (const Expect& e : {Expect{pro.id, "Cut_010_pmf-prores", 8, 76}, Expect{dnx.id, "Cut_020_pmf-dnx", 18, 51},
+                                Expect{avc.id, "Cut_030_pmf-h264", 13, 46}, Expect{exr.id, "Cut_040_plate", 1004, 1037}}) {
+            const MediaItem* m = frames.findMedia(e.media);
+            QVERIFY(m);
+            ImageSequence got;
+            QVERIFY2(parseImageSequencePath(m->path, got), m->path.c_str());
+            QCOMPARE(QFileInfo(QString::fromStdString(got.pattern)).fileName(), QString(e.name) + ".%04d.exr");
+            QCOMPARE(QFileInfo(QFileInfo(QString::fromStdString(got.pattern)).path()).fileName(), QString(e.name));
+            QCOMPARE(got.first, e.first);
+            QCOMPARE(got.last, e.last);
+            QVERIFY(!QFileInfo::exists(QString::fromStdString(imageSequenceFrame(got, e.last + 1))));
+            // Each frame is the source's decode in its linear light (as an export of it alone makes it), within 1/1023.
+            const ColorSpace* light = findColorSpace(m->colorSpace);
+            QVERIFY2(light && light->transfer == Transfer::Linear, m->colorSpace.c_str());
+            for (int n = e.first; n <= e.last; n += 11) {
+                int w = 0, h = 0;
+                std::vector<float> out, want;
+                QVERIFY2(readExrLayer(imageSequenceFrame(got, n), "", w, h, out, &err), err.c_str());
+                QCOMPARE(w, W);
+                if (e.media == exr.id) {
+                    QVERIFY(readExrLayer(imageSequenceFrame(plateFrames, n), "", w, h, want, &err));
+                } else {
+                    Project one = makeDefaultProject();
+                    Sequence& os = *one.active();
+                    os.width = W, os.height = H, os.fps = Rational{25, 1};
+                    MediaItem src = *p.findMedia(e.media);
+                    one.media.push_back(src);
+                    Clip c = makeClip(one, src, TrackKind::Video, os);
+                    c.sourceIn = n, c.duration = 1;
+                    edit::overwrite(one, os, {TrackKind::Video, 0}, c);
+                    RenderOptions ro;
+                    ro.highQuality = true;
+                    Image img = renderProgramFrame(one, os, 0, ro);
+                    convertColor(img, sequenceColorSpace(os), *light, std::clamp(os.hdrPeakNits, 100.0, 10000.0));
+                    want.assign(img.px.begin(), img.px.end());
+                }
+                QCOMPARE(out.size(), want.size());
+                float d = 0;
+                for (size_t i = 0; i < out.size(); ++i)
+                    if (i % 4 != 3) d = std::max(d, std::fabs(out[i] - want[i]));
+                QVERIFY2(d <= 1.0f / 1023, qPrintable(QStringLiteral("%1 frame %2: %3").arg(e.name).arg(n).arg(d)));
+            }
+        }
+        // The sound is copied whole; the new cut renders as the old, frame for frame, within 1/255.
+        QVERIFY(frames.findMedia(snd.id) && QString::fromStdString(frames.findMedia(snd.id)->path).endsWith("Media/pmf-sound.wav"));
+        for (FrameTime f = 0; f < 65; ++f) {
+            const float d = worst(frame(frames, cutId, f), frame(p, cutId, f));
+            QVERIFY2(d <= 1.0f / 255, qPrintable(QStringLiteral("frame %1: %2").arg(f).arg(d)));
+        }
+
+        // Trimmed in its own format: the ProRes shot's packets are its source's, byte for byte, and no frame is coded.
+        auto packets = [](const std::string& file) {
+            std::vector<QByteArray> out;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            AVPacket* pkt = av_packet_alloc();
+            while (v >= 0 && av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == v) out.emplace_back(reinterpret_cast<const char*>(pkt->data), pkt->size);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            return out;
+        };
+        o = ConsolidateOptions{};
+        o.folder = path("pmf-trimmed");
+        o.sequences = {proId};
+        o.output = "trimmed";
+        o.handleUnit = "frames";
+        o.handleFrames = 12;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.trimmed, 1);
+        QCOMPARE(res.framesCoded, 0);
+        QCOMPARE(res.framesCopied, 34);
+        Project trimmed;
+        QVERIFY2(loadProject(res.projectPath, trimmed, &err), err.c_str());
+        const std::vector<QByteArray> was = packets(path("pmf-prores.mov")), now = packets(trimmed.findMedia(pro.id)->path);
+        QCOMPARE(now.size(), size_t(34));
+        for (size_t i = 0; i < now.size(); ++i) QVERIFY2(now[i] == was.at(8 + i), qPrintable(QStringLiteral("packet %1").arg(i)));
+        for (FrameTime f = 0; f < 10; ++f) QCOMPARE(worst(frame(trimmed, proId, f), frame(p, proId, f)), 0.0f);
+        // The H.264 shot: only the GOPs at its ends are coded again (frames 13-19 and 40-46), those between copied.
+        o.folder = path("pmf-trimmed-h264");
+        o.sequences = {avcId};
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.framesCopied + res.framesCoded, 34);
+        QVERIFY2(res.framesCopied >= 20 && res.framesCoded <= 14,
+                 qPrintable(QStringLiteral("%1 copied, %2 coded").arg(res.framesCopied).arg(res.framesCoded)));
+        QVERIFY2(loadProject(res.projectPath, trimmed, &err), err.c_str());
+        QVERIFY(QString::fromStdString(trimmed.findMedia(avc.id)->path).endsWith("pmf-h264_trim.mov"));
+        for (FrameTime f = 0; f < 10; ++f) {
+            const float d = worst(frame(trimmed, avcId, f), frame(p, avcId, f));
+            QVERIFY2(d <= 1.0f / 255, qPrintable(QStringLiteral("frame %1: %2").arg(f).arg(d)));
+        }
+
+        // Baked: the inverted shot rendered in with its handles; the new clip plays it plainly, as the sequence showed it.
+        o = ConsolidateOptions{};
+        o.folder = path("pmf-baked");
+        o.sequences = {gradedId};
+        o.bake = true;
+        o.handleUnit = "frames";
+        o.handleFrames = 12;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.baked, 1);
+        Project baked;
+        QVERIFY2(loadProject(res.projectPath, baked, &err), err.c_str());
+        const Clip& plain = baked.findSequence(gradedId)->videoTracks[0].clips.at(0);
+        QVERIFY(plain.effects.empty());
+        QCOMPARE(plain.sourceIn, 12.0);
+        QVERIFY(!baked.findMedia(pro.id));  // (nothing else uses the ProRes source)
+        const MediaItem* bakedMedia = baked.findMedia(plain.mediaId);
+        QVERIFY(bakedMedia && std::llround(bakedMedia->duration * 25) == 34);
+        for (FrameTime f = 0; f < 10; ++f) {
+            const float d = worst(frame(baked, gradedId, f), frame(p, gradedId, f));
+            QVERIFY2(d <= 1.0f / 255, qPrintable(QStringLiteral("frame %1: %2").arg(f).arg(d)));
+        }
+
+        // Presets: a facility's "Finish" (DPX, 8-frame handles) and the project's, which sets 12 frames: the project's
+        // value wins, the facility's DPX stays, and the compare view lists the one difference.
+        const QString facility = QString::fromStdString(path("pmf-facility"));
+        const QByteArray hadFacility = qgetenv("MONTAGE_FACILITY_PRESETS");
+        qputenv("MONTAGE_FACILITY_PRESETS", facility.toUtf8());
+        auto putBack = qScopeGuard([&] {
+            if (hadFacility.isNull()) qunsetenv("MONTAGE_FACILITY_PRESETS");
+            else qputenv("MONTAGE_FACILITY_PRESETS", hadFacility);
+        });
+        QVERIFY2(writePreset(facility.toStdString(), "Finish", R"({"output":"frames","frames":"dpx","handleUnit":"frames","handleFrames":8})", &err),
+                 err.c_str());
+        QVERIFY(!writePreset(facility.toStdString(), "a/b", "{}", &err));
+        p.consolidatePresets["Finish"] = R"({"handleFrames":12})";
+        const ConsolidatePresets presets = loadConsolidatePresets(p, path("pmf-no-user"));
+        QCOMPARE(presets.names(), std::vector<std::string>{"Finish"});
+        ConsolidateOptions fromPreset;
+        std::map<std::string, PresetLevel> from;
+        QVERIFY2(resolvePreset(presets, "Finish", fromPreset, &from, &err), err.c_str());
+        QCOMPARE(fromPreset.handleFrames, 12);
+        QCOMPARE(fromPreset.frames, std::string("dpx"));
+        QCOMPARE(fromPreset.output, std::string("frames"));
+        QVERIFY(from["handleFrames"] == PresetLevel::Project && from["frames"] == PresetLevel::Facility);
+        const std::vector<PresetDifference> diff = comparePreset(presets, "Finish", PresetLevel::Project);
+        QCOMPARE(diff.size(), size_t(1));
+        QCOMPARE(diff[0].key, std::string("handleFrames"));
+        QCOMPARE(diff[0].value, std::string("12"));
+        QCOMPARE(diff[0].wider, std::string("8"));
+        QCOMPARE(diff[0].widerLevel, std::string("facility"));
+        QVERIFY(!resolvePreset(presets, "Missing", fromPreset, nullptr, &err));
+        // The choices go through JSON and back unchanged.
+        ConsolidateOptions round;
+        QVERIFY(applyConsolidateChoices(consolidateChoicesJson(o), round, &err));
+        QCOMPARE(consolidateChoicesJson(round), consolidateChoicesJson(o));
+        // Kept with the project; a project saved before there were presets opens with none.
+        QVERIFY(saveProject(p, path("pmf-presets.montage")));
+        Project back;
+        QVERIFY(loadProject(path("pmf-presets.montage"), back));
+        QCOMPARE(back.consolidatePresets, p.consolidatePresets);
+        Project old;
+        QVERIFY2(loadProject(MONTAGE_TEST_DATA_DIR "/projects/blur-and-focus-before-24-nov.montage", old, &err), err.c_str());
+        QVERIFY(old.consolidatePresets.empty());
+
+        // A job cut short half-way and taken up again ends with the same files as one that ran through.
+        auto listing = [](const std::string& folder) {
+            QStringList out;
+            QDirIterator it(QString::fromStdString(folder) + "/Media", QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext()) {
+                const QString f = it.next();
+                QFile file(f);
+                if (!file.open(QIODevice::ReadOnly)) return QStringList{"unreadable " + f};
+                out << f.mid(int(folder.size())) + " " + QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha1).toHex();
+            }
+            out.sort();
+            return out;
+        };
+        o = ConsolidateOptions{};
+        o.sequences = {cutId};
+        o.output = "frames";
+        o.handleUnit = "frames";
+        o.handleFrames = 2;
+        o.folder = path("pmf-through");
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        const QStringList through = listing(o.folder);
+        QVERIFY(through.size() > 20);
+        std::atomic<bool> stop{false};
+        std::vector<std::string> began;
+        o.folder = path("pmf-resumed");
+        o.began = [&](const std::string& f) {
+            began.push_back(f);
+            if (began.size() == 3) stop = true;  // (stopped once the third file is begun)
+        };
+        QVERIFY(!consolidateProject(p, o, &res, {}, &stop, &err));
+        QCOMPARE(began.size(), size_t(3));
+        o.replace = began;
+        o.began = {};
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(listing(o.folder), through);
+        for (const char* d : {"pmf-frames", "pmf-trimmed", "pmf-trimmed-h264", "pmf-baked", "pmf-facility", "pmf-through", "pmf-resumed", "pmf-plate"})
+            QDir(QString::fromStdString(path(d))).removeRecursively();
+    }
+
     void smartRendering() {
         // The source: one second of a changing ramp in ProRes 422 HQ, 128 x 72 at 25 fps.
         Project gen = makeDefaultProject();
@@ -47595,6 +47918,170 @@ private slots:
         const QByteArray store = QJsonDocument(read.value("manifest_store").toObject()).toJson();
         QVERIFY2(store.contains("Camera original") && store.contains("componentOf"), store.left(4000).constData());
         QVERIFY(!call("montage_read_credentials", {{"path", MONTAGE_TEST_DATA_DIR "/jfk.wav"}}).value("structuredContent").toObject().value("present").toBool());
+    }
+
+    void credentialsBesideAndThroughTheJob() {
+        // Where a manifest beside a file goes, and what it binds: a file's own name, a sequence's name before its number,
+        // a package folder's name beside the folder; the frames in order of number, a package's files in order of name.
+        QCOMPARE(credentialSidecarPath("/x/cut.mxf"), std::string("/x/cut.c2pa"));
+        QCOMPARE(credentialSidecarPath("/x/seq/shot.%04d.exr"), std::string("/x/seq/shot.c2pa"));
+        const QString seqDir = QString::fromStdString(path("beside/seq")), pkg = QString::fromStdString(path("beside/PKG"));
+        QDir().mkpath(seqDir);
+        QDir().mkpath(pkg + "/sub");
+        auto write = [](const QString& f, const QByteArray& data) {
+            QFile out(f);
+            return out.open(QIODevice::WriteOnly) && out.write(data) == data.size();
+        };
+        for (int n : {1003, 1001, 1002}) QVERIFY(write(seqDir + QStringLiteral("/shot.%1.exr").arg(n), QByteArray::number(n)));
+        QVERIFY(write(pkg + "/b.mxf", "b") && write(pkg + "/a.xml", "a") && write(pkg + "/sub/c.mxf", "c") && write(pkg + "/old.c2pa", "x"));
+        const std::vector<std::string> frames = credentialBoundFiles((seqDir + "/shot.%04d.exr").toStdString());
+        QCOMPARE(frames.size(), size_t(3));
+        QVERIFY(QString::fromStdString(frames[0]).endsWith("shot.1001.exr") && QString::fromStdString(frames[2]).endsWith("shot.1003.exr"));
+        ImageSequence seq;
+        seq.pattern = (seqDir + "/shot.%04d.exr").toStdString();
+        seq.first = 1001, seq.last = 1003;
+        QCOMPARE(credentialBoundFiles(imageSequencePath(seq)), frames);
+        QCOMPARE(credentialSidecarPath(imageSequencePath(seq)), (seqDir + "/shot.c2pa").toStdString());
+        QCOMPARE(credentialSidecarPath(pkg.toStdString()), path("beside/PKG.c2pa"));
+        const std::vector<std::string> files = credentialBoundFiles(pkg.toStdString());
+        QCOMPARE(files.size(), size_t(3));  // (the old manifest is not bound)
+        QVERIFY(QString::fromStdString(files[0]).endsWith("PKG/a.xml") && QString::fromStdString(files[1]).endsWith("PKG/b.mxf") &&
+                QString::fromStdString(files[2]).endsWith("PKG/sub/c.mxf"));
+        QVERIFY(!hasCredentialSidecar(pkg.toStdString()));
+        // Numbered frames are signed as the export names them.
+        ExportSettings st;
+        st.videoCodec = "exr";
+        st.path = path("beside/plate.exr");
+        QCOMPARE(exportSignedPath(st), path("beside/plate_%06d.exr"));
+        st.path = path("beside/plate.%04d.exr");
+        QCOMPARE(exportSignedPath(st), st.path);
+        QVERIFY(exportCarriesCredentials(st));
+        // A copy's manifest: transcoded from its parent, the parent's assertions naming people redacted.
+        const std::string store = R"({"active_manifest":"urn:c2pa:cam","manifests":{"urn:c2pa:cam":{"assertions":[
+            {"label":"c2pa.actions.v2"},{"label":"stds.schema-org.CreativeWork"},{"label":"cawg.identity"}]}}})";
+        const std::vector<std::string> people = personAssertions(store);
+        QCOMPARE(people.size(), size_t(2));
+        QCOMPARE(people[0], std::string("self#jumbf=/c2pa/urn:c2pa:cam/c2pa.assertions/stds.schema-org.CreativeWork"));
+        CredentialOptions copy;
+        copy.parent = "/x/cam.mp4";
+        copy.parentDescription = "The part used, cut by Montage";
+        const QJsonObject def = QJsonDocument::fromJson(QByteArray::fromStdString(credentialManifestJson("/x/cut.mxf", {}, copy, "parent", people))).object();
+        QCOMPARE(def.value("format").toString(), QString("application/mxf"));
+        const QJsonObject first = def.value("assertions").toArray()[0].toObject().value("data").toObject().value("actions").toArray()[0].toObject();
+        QCOMPARE(first.value("action").toString(), QString("c2pa.transcoded"));
+        QCOMPARE(first.value("parameters").toObject().value("ingredientIds").toArray()[0].toString(), QString("parent"));
+        QCOMPARE(first.value("description").toString(), QString("The part used, cut by Montage"));
+        QCOMPARE(def.value("redactions").toArray().size(), 2);
+        // Said in the Media bin's tooltip.
+        CredentialSummary said;
+        said.present = true, said.state = "Valid", said.issuer = "Montage tests", said.through = "cam.mp4", said.beside = true;
+        QCOMPARE(credentialsLabel(said), std::string("Signed by Montage tests (valid); kept through a copy of cam.mp4; in a manifest beside the file"));
+        // With no signer a copy is left as it was.
+        std::string err;
+        QVERIFY(keepCredentialsThroughCopy(frames[0], frames[1], {}, "copy", &err));
+
+        const std::string certs = MONTAGE_TEST_DATA_DIR "/c2pa/chain.pem", key = MONTAGE_TEST_DATA_DIR "/c2pa/signer.key";
+        QDir(QString::fromStdString(path("beside"))).removeRecursively();
+        if (!contentCredentialsAvailable()) QSKIP("Built without the C2PA library (scripts/build-c2pa.sh) for the rest");
+        QDir().mkpath(QString::fromStdString(path("beside")));
+        auto flip = [](const std::string& f, qint64 at) {
+            QFile io(QString::fromStdString(f));
+            if (!io.open(QIODevice::ReadWrite) || !io.seek(at)) return false;
+            char ch = 0;
+            if (!io.getChar(&ch) || !io.seek(at)) return false;
+            return io.putChar(char(ch ^ 0x5a));
+        };
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 256, gs.height = 144, gs.fps = Rational{25, 1};  // (as small as DNxHR goes)
+        Clip ramp = makeGeneratorClip(gen, "color", 25);
+        ramp.generator.params["color.r"].addKey(0, 0.1);
+        ramp.generator.params["color.r"].addKey(24, 0.9);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        auto render = [&](const Project& pr, const Sequence& sq, const std::string& file, const char* codec, const char* profile, bool redact = false) {
+            ExportSettings e;
+            e.path = file;
+            e.videoCodec = codec;
+            e.profile = profile;
+            e.audioCodec = "none";
+            e.credentialCertificate = certs, e.credentialKey = key, e.credentialRedact = redact;
+            return exportSequence(pr, sq, e, nullptr, nullptr, &err);
+        };
+        // An MXF export: a manifest beside it that the reader finds valid, and invalid once a byte of it changes.
+        const std::string mxf = path("beside/cut.mxf");
+        QVERIFY2(render(gen, gs, mxf, "dnxhd", "dnxhr_sq"), err.c_str());
+        CredentialSummary c;
+        QVERIFY2(readContentCredentials(mxf, c, &err), err.c_str());
+        QVERIFY2(c.present && c.beside && c.state == "Valid", c.state.c_str());
+        QVERIFY(flip(mxf, QFileInfo(QString::fromStdString(mxf)).size() / 2));
+        QVERIFY2(readContentCredentials(mxf, c, &err), err.c_str());
+        QCOMPARE(c.state, std::string("Invalid"));
+        // An OpenEXR sequence export: one manifest beside its frames, invalid once a byte of one frame changes.
+        const std::string plates = path("beside/exr/plate.%04d.exr");
+        QDir().mkpath(QString::fromStdString(path("beside/exr")));
+        QVERIFY2(render(gen, gs, plates, "exr", ""), err.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(path("beside/exr/plate.c2pa"))));
+        QVERIFY2(readContentCredentials(plates, c, &err) && c.present && c.state == "Valid", c.state.c_str());
+        const std::vector<std::string> written = credentialBoundFiles(plates);
+        QCOMPARE(written.size(), size_t(25));
+        QVERIFY(flip(written[12], QFileInfo(QString::fromStdString(written[12])).size() - 10));
+        QVERIFY2(readContentCredentials(plates, c, &err), err.c_str());
+        QCOMPARE(c.state, std::string("Invalid"));
+
+        // A signed camera file consolidated (a trimmed copy), then exported: the camera's credentials are the parent of
+        // the copy's, and the copy's an ingredient of the export's.
+        const std::string cam = path("beside/cam.mp4");
+        {
+            ExportSettings e;
+            e.path = cam, e.videoCodec = "libx264", e.audioCodec = "none";
+            QVERIFY2(exportSequence(gen, gs, e, nullptr, nullptr, &err), err.c_str());
+            CredentialOptions original;
+            original.title = "Camera original";
+            QVERIFY2(signContentCredentials(cam, {}, {certs, key, {}}, original, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 128, s.height = 72, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, cam);
+        p.media.push_back(m);
+        Clip shot = makeClip(p, m, TrackKind::Video, s);
+        shot.sourceIn = 5, shot.duration = 10;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, shot);
+        ConsolidateOptions o;
+        o.folder = path("beside/consolidated");
+        o.output = "movie";
+        o.codec = "libx264";
+        o.handleUnit = "none";
+        o.credentialCertificate = certs, o.credentialKey = key;
+        ConsolidateResult res;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        Project after;
+        QVERIFY(loadProject(res.projectPath, after));
+        const std::string trimmed = after.findMedia(m.id)->path;
+        QVERIFY2(readContentCredentials(trimmed, c, &err) && c.present && c.state == "Valid", c.state.c_str());
+        QCOMPARE(c.through, std::string("cam.mp4"));
+        QVERIFY(credentialsLabel(c).find("kept through a copy of cam.mp4") != std::string::npos);
+        const std::string delivered = path("beside/final.mp4");
+        QVERIFY2(render(after, *after.active(), delivered, "libx264", ""), err.c_str());
+        QVERIFY2(readContentCredentials(delivered, c, &err) && c.present && c.state == "Valid", c.state.c_str());
+        // (the export's manifest, the copy's and the camera's)
+        const QJsonObject manifests = QJsonDocument::fromJson(QByteArray::fromStdString(c.json)).object().value("manifests").toObject();
+        QVERIFY2(manifests.size() >= 3, c.json.c_str());
+        bool chain = false;
+        for (auto it = manifests.begin(); it != manifests.end(); ++it)
+            for (const QJsonValue& v : it.value().toObject().value("ingredients").toArray())
+                chain |= v.toObject().value("title").toString() == "cam.mp4" && v.toObject().value("relationship").toString() == "parentOf" &&
+                         v.toObject().contains("active_manifest");
+        QVERIFY2(chain, c.json.c_str());
+        // A proxy carries them too.
+        ProxyOptions po;
+        po.credentialCertificate = certs, po.credentialKey = key;
+        QVERIFY2(createProxy(cam, path("beside/cam_proxy.mp4"), po, {}, nullptr, &err), err.c_str());
+        QVERIFY2(readContentCredentials(path("beside/cam_proxy.mp4"), c, &err) && c.present && c.through == "cam.mp4", c.json.c_str());
+        // Redacted, the export is still valid.
+        QVERIFY2(render(after, *after.active(), path("beside/redacted.mp4"), "libx264", "", true), err.c_str());
+        QVERIFY2(readContentCredentials(path("beside/redacted.mp4"), c, &err) && c.present && c.state == "Valid", c.state.c_str());
+        QDir(QString::fromStdString(path("beside"))).removeRecursively();
     }
 
     void voiceConversion() {

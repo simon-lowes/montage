@@ -328,7 +328,16 @@ std::string patternName(const std::string& pattern, const Project& q, const Medi
     QString out = QString::fromStdString(pattern);
     out.replace(QStringLiteral("{sequence}"), seq ? QString::fromStdString(seq->name) : QString());
     out.replace(QStringLiteral("{shot}"), QString::fromStdString(shot));
-    out.replace(QStringLiteral("{clip}"), QFileInfo(QString::fromStdString(m.name)).completeBaseName());
+    // (an image sequence by its frames' name, without their numbers: "plate" for plate.%04d.exr)
+    QString clip = QFileInfo(QString::fromStdString(m.name)).completeBaseName();
+    if (ImageSequence frames; parseImageSequencePath(m.path, frames)) {
+        const QString file = QFileInfo(QString::fromStdString(frames.pattern)).fileName();
+        const qsizetype at = file.indexOf(QLatin1Char('%'));
+        clip = at > 0 ? file.left(at) : QString();
+        while (!clip.isEmpty() && QStringLiteral(" ._-").contains(clip.back())) clip.chop(1);
+        if (clip.isEmpty()) clip = QFileInfo(QString::fromStdString(m.name)).completeBaseName();
+    }
+    out.replace(QStringLiteral("{clip}"), clip);
     out.replace(QStringLiteral("{reel}"), meta("reel").isEmpty() ? meta("tape") : meta("reel"));
     out.replace(QStringLiteral("{tape}"), meta("tape"));
     out.replace(QStringLiteral("{scene}"), meta("scene"));
@@ -863,6 +872,10 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
                 tg = movieTarget(o.codec.empty() ? (ownCodec.empty() ? std::string("prores_ks") : ownCodec) : o.codec, coding, o.codec.empty() && !ownCodec.empty());
             }
             const std::string space = trimSound ? std::string() : spaceFor(m, tg.frames && o.frames == "exr");
+            // (OpenEXR frames of footage in linear light come through a sequence graded in that light, so its values
+            // below 0 and over 1 are kept as they are rather than through a display's range)
+            if (const ColorSpace& mine = mediaColorSpace(m); tg.frames && o.frames == "exr" && mine.sceneReferred && mine.transfer == Transfer::Linear)
+                ts.workingSpace = mine.id;
             ExportSettings st;
             st.videoCodec = tg.codec;
             st.profile = tg.profile;
@@ -918,7 +931,10 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             if (!rebase(path, from, to - from)) return false;
             if (!keep(original, path, mode == "trimmed" ? "The part used, cut by Montage" : "The part used, transcoded by Montage")) return false;
             if (!space.empty() && !trimSound) {
-                m.colorSpace = space;
+                // (video made for a display, written in linear light, holds that display's light: read back as that)
+                const ColorSpace* written = findColorSpace(space);
+                const bool displayLight = written && written->sceneReferred && !sceneReferredWorking(ts) && !mediaColorSpace(m).sceneReferred;
+                m.colorSpace = displayLight ? displayLightOf(*written).id : space;
                 m.colorOverride.clear();
             }
             if (tg.frames) {
@@ -960,7 +976,8 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
                 continue;
             }
             const std::string ext = utf8(src.extension());
-            const fs::path dest = uniqueIn(dir, named.empty() ? utf8(src.stem()) : movieName(utf8(src.stem())), ext, taken, own);
+            // (a file copied whole keeps its name: the pattern names what is made from the footage)
+            const fs::path dest = uniqueIn(dir, utf8(src.stem()), ext, taken, own);
             begin(dest);
             // (a copy the run before had finished stays as it is; one it had only begun is written over)
             const bool mine = own.count(utf8(dest)) > 0, whole = mine && alreadyWhole(src, dest);
