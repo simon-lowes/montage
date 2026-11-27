@@ -959,6 +959,73 @@ private slots:
         QCOMPARE(std::count_if(restored.begin(), restored.end(), [](const Marker& m) { return m.chapter; }), 1);
     }
 
+    // Phase 18 #11 (CI only: SVT-JPEG-XS is built in CI, not here). The Export dialog's JPEG XS rate offers
+    // Lossless: chosen with the JPEG XS 4:2:2 preset, the settings say lossless, and the file made from them holds the
+    // same codestreams, picture for picture, as montage_render's jpeg_xs_lossless makes of the same range.
+    void exportJpegXsLossless() {
+        if (!jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        loadDemo();
+        const QVariant keptRate = appSettings().value("export/jpegXsBpp"), keptPreset = appSettings().value("export/preset");
+        auto putBack = qScopeGuard([&] {
+            for (const auto& [key, value] : {std::pair{"export/jpegXsBpp", keptRate}, std::pair{"export/preset", keptPreset}})
+                if (value.isValid()) appSettings().setValue(key, value);
+                else appSettings().remove(key);
+        });
+        int xs = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i)
+            if (xs < 0 && exportPresets()[i].settings.videoCodec == "jpegxs" && exportPresets()[i].settings.pixFmt == "yuv422p10le") xs = int(i);
+        QVERIFY(xs >= 0);
+        // What the dialog queues with Lossless chosen.
+        RenderQueue* queue = win_->renderQueue();
+        const size_t before = queue->jobs().size();
+        ExportSettings s;
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(xs);
+            auto* rate = ed.findChild<QComboBox*>("exportJpegXsRate");
+            QVERIFY(rate && rate->isEnabled());
+            const int lossless = rate->findData(-1.0);
+            QVERIFY(lossless >= 0);
+            QCOMPARE(rate->itemText(lossless), QString("Lossless"));
+            rate->setCurrentIndex(lossless);
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.filePath("lossless-dialog.mxf"));
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(ed.result(), int(QDialog::Accepted));
+            QCOMPARE(queue->jobs().size(), before + 1);
+            s = queue->jobs().back().settings;
+            queue->remove(queue->jobs().back().id);
+        }
+        QVERIFY(s.videoCodec == "jpegxs" && s.jpegXsLossless);
+        // (the first five frames, by the dialog's settings and over MCP)
+        const double fps = state()->sequence()->fpsValue();
+        s.in = 0, s.out = 5;
+        s.path = dir_.filePath("lossless-dialog.mxf").toStdString();
+        std::string err;
+        QVERIFY2(exportSequence(state()->project(), *state()->sequence(), s, nullptr, nullptr, &err), err.c_str());
+        const QString project = dir_.filePath("lossless-mcp.montage"), overMcp = dir_.filePath("lossless-mcp.mxf");
+        QVERIFY(saveProject(state()->project(), project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_render"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"output", overMcp}, {"preset", QString::fromStdString(exportPresets()[size_t(xs)].name)},
+                                                                               {"jpeg_xs_lossless", true}, {"in", 0}, {"out", 5 / fps}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        JxsReader a, b;
+        QVERIFY2(a.open(s.path, &err), err.c_str());
+        QVERIFY2(b.open(overMcp.toStdString(), &err), err.c_str());
+        QVERIFY(a.info().header.lossless() && b.info().header.lossless());
+        QCOMPARE(a.info().frames, int64_t(5));
+        QCOMPARE(b.info().frames, a.info().frames);
+        for (int64_t n = 0; n < a.info().frames; ++n) {
+            std::vector<uint8_t> ca, cb;
+            QVERIFY(a.codestream(n, ca, &err) && b.codestream(n, cb, &err));
+            QVERIFY2(ca == cb, qPrintable(QStringLiteral("picture %1: %2 and %3 bytes").arg(n).arg(ca.size()).arg(cb.size())));
+        }
+    }
+
     void qualityCheckDialog() {
         loadDemo();
         QVERIFY(win_->findChild<QAction*>("qualityCheck"));

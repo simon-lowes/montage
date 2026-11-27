@@ -100,7 +100,7 @@ private:
     QComboBox* pngCompression_ = nullptr;  // PNG frames: how hard the compressor works (always lossless)
     QComboBox* pngBits_ = nullptr;         // and 8 or 16 bits a channel
     QComboBox* jxlQuality_ = nullptr;      // JPEG XL frames: lossless or a distance
-    QComboBox* jpegXsRate_ = nullptr;      // JPEG XS: bits a pixel (0: the preset's)
+    QComboBox* jpegXsRate_ = nullptr;      // JPEG XS: bits a pixel (0: the preset's; -1: lossless)
     QComboBox* jxlDepth_ = nullptr;        // and their depth (the preset's, 8 or 16-bit, half or float)
     QCheckBox* jxlPremultiplied_ = nullptr;  // and alpha written premultiplied
     QCheckBox* smart_ = nullptr;

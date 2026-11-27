@@ -527,8 +527,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     jpegXsRate_->setObjectName(QStringLiteral("exportJpegXsRate"));
     jpegXsRate_->addItem(tr("The preset's"), 0.0);
     for (double bpp : {2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0}) jpegXsRate_->addItem(tr("%1 bits a pixel").arg(bpp), bpp);
+    // (each picture exactly as it was, as many bytes as it takes)
+    jpegXsRate_->addItem(tr("Lossless"), -1.0);
     jpegXsRate_->setCurrentIndex(std::max(0, jpegXsRate_->findData(appSettings().value("export/jpegXsBpp", 0.0).toDouble())));
-    jpegXsRate_->setToolTip(tr("JPEG XS's rate: each picture the same number of bytes, its width times its height times this, over 8"));
+    jpegXsRate_->setToolTip(tr("JPEG XS's rate: each picture the same number of bytes, its width times its height times this, over 8; or lossless, each picture as many bytes as it takes"));
     if (jpegXsAvailable()) form->addRow(tr("JPEG XS:"), jpegXsRate_);
     else jpegXsRate_->hide();
     // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
@@ -1332,6 +1334,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     }
     if (jpegXsRate_->isEnabled()) {
         if (const double bpp = jpegXsRate_->currentData().toDouble(); bpp > 0) s.jpegXsBpp = bpp;
+        else if (bpp < 0) s.jpegXsLossless = true;
         settings.setValue("export/jpegXsBpp", jpegXsRate_->currentData());
     }
     if (jxlPremultiplied_->isEnabled()) {
