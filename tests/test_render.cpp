@@ -36945,6 +36945,10 @@ colorspaces:
         std::vector<QByteArray> got(kClients);
         QElapsedTimer began;
         began.start();
+        // (what the origin kept and held at most while the clients came, said if the count fails: the systems may
+        // take answers into their buffers later)
+        int mostKept = 0;
+        int64_t mostWaiting = 0;
         for (int i = 0; i < kClients; ++i) {
             auto s = std::make_unique<QTcpSocket>();
             s->setReadBufferSize(1);  // (a byte of the answer taken, to know it was sent, and nothing more)
@@ -36959,6 +36963,8 @@ colorspaces:
             QVERIFY2(s->waitForReadyRead(5000), qPrintable(QString("client %1 was not answered").arg(i)));
             // (the origin's thread sees what its system took of the answer before the next client comes)
             QThread::msleep(4);
+            mostKept = std::max(mostKept, origin.connectionsKept());
+            mostWaiting = std::max(mostWaiting, origin.bytesWaiting());
             clients.push_back(std::move(s));
         }
         // (all within the 20 s an unread answer is kept for)
@@ -36971,8 +36977,13 @@ colorspaces:
         const auto said = [&] {
             int closed = 0;
             for (const auto& s : clients) closed += s->state() != QAbstractSocket::ConnectedState;
-            return QString("%1 kept, %2 let go, %3 bytes waiting in the origin, %4 of the clients closed")
-                .arg(origin.connectionsKept()).arg(origin.connectionsLetGo()).arg(origin.bytesWaiting()).arg(closed);
+            // (and where an answer went: the last client's receive buffer as its system has it, and the bytes waiting
+            // for it there, which are its system's buffer and the one byte read)
+            QTcpSocket& last = *clients.back();
+            return QString("%1 kept, %2 let go, %3 bytes waiting in the origin, %4 of the clients closed; at most %5 kept and %6 bytes "
+                           "waiting while they came; the last client's receive buffer %7, %8 bytes come to it")
+                .arg(origin.connectionsKept()).arg(origin.connectionsLetGo()).arg(origin.bytesWaiting()).arg(closed).arg(mostKept)
+                .arg(mostWaiting).arg(last.socketOption(QAbstractSocket::ReceiveBufferSizeSocketOption).toInt()).arg(last.bytesAvailable());
         };
         QVERIFY2(origin.connectionsKept() == kKept, qPrintable(said()));
         QVERIFY2(origin.connectionsLetGo() == int64_t(kClients - kKept), qPrintable(said()));
