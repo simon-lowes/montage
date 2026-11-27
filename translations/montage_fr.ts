@@ -13434,6 +13434,42 @@ Do you want to replace it?</source>
         <source>Content Credentials cannot go in %1 exports</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Code regions finer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Parts of the picture given more of the bits than the rest, each frame&apos;s passed to the encoder: H.264, HEVC and VP9 (VP9 then codes in its real-time mode)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Faces</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each face found in the picture, a little larger than the face</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip masks</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The bounds of every clip&apos;s effect masks, as their keys and trackers move them</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Box</source>
+        <translation type="unfinished">Boîte</translation>
+    </message>
+    <message>
+        <source>A rectangle of the frame: its left, top, width and height in percent of the frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How much finer than the rest: at 100 %, a fifth of the encoder&apos;s quantiser range</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::FootageNotesDialog</name>
@@ -24180,6 +24216,62 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
             <numerusform></numerusform>
             <numerusform></numerusform>
         </translation>
+    </message>
+    <message>
+        <source>Save Grain Profile…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain as Decoded</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Program monitor shows each shot cleaned of its grain with the grain put back from AV1 film grain parameters, as a player&apos;s decoder puts it back (paused frames at full resolution)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain as Decoded is off: the sequence changed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save Grain Profile</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This project and my library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep in:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not save the profile: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Saved the grain of %1 as the profile %2, in this project and your library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Saved the grain of %1 as the profile %2 in this project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain as Decoded needs a sequence with something in it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Measuring each shot&apos;s grain…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain as Decoded: %1 of %2 shots carry grain as parameters</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
