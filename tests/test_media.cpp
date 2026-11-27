@@ -19014,10 +19014,13 @@ private slots:
         QCOMPARE(dc[1].toObject().value("type").toString(), QString("transition"));
         const QJsonObject g = dc[2].toObject();
         QCOMPARE(g.value("type").toString(), QString("gain"));
+        // Its gain from 0 dB at the clip's start (5 frames in) to -12 dB 30 frames on, with points between where AAF's
+        // amplitude, linear between points, would stray from the straight line in dB.
         const QJsonArray pts = g.value("params").toObject().value("points").toArray();
-        QCOMPARE(pts.size(), 2);
-        QVERIFY(std::fabs(pts[1].toArray()[1].toDouble() - std::pow(10.0, -12.0 / 20)) < 1e-4);
-        QVERIFY(std::fabs(pts[1].toArray()[0].toDouble() - 35.0 / 65) < 1e-6);  // 30 frames in, plus the 5 it starts early
+        QVERIFY(pts.size() >= 2);
+        QVERIFY(std::fabs(pts[0].toArray()[0].toDouble() - 5.0 / 65) < 1e-6 && std::fabs(pts[0].toArray()[1].toDouble() - 1) < 1e-4);
+        QVERIFY(std::fabs(pts.last().toArray()[1].toDouble() - std::pow(10.0, -12.0 / 20)) < 1e-4);
+        QVERIFY(std::fabs(pts.last().toArray()[0].toDouble() - 35.0 / 65) < 1e-6);  // 30 frames in, plus the 5 it starts early
         const QJsonObject clip = g.value("inputs").toArray()[0].toObject();
         QVERIFY(clip.value("file").toString().endsWith("jfk.wav"));
         QCOMPARE(clip.value("fade_out").toInt(), 12);
@@ -19027,6 +19030,295 @@ private slots:
         QVERIFY(music[1].toObject().value("inputs").toArray()[0].toObject().value("file").toString().endsWith("tone-stereo%20L.wav"));
         QVERIFY(tr[2].toObject().value("components").toArray()[1].toObject().value("inputs").toArray()[0].toObject()
                     .value("file").toString().endsWith("tone-stereo%20R.wav"));
+    }
+
+    void aafCarriesPanAutomationAndRamps() {
+        // A steady mono sound (half scale, 6 s at 48 kHz) and a 6 s movie at 25 fps.
+        const int rate = 48000;
+        const std::string steady = path("steady-mono.wav");
+        {
+            QFile f(QString::fromStdString(steady));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int frames = rate * 6;
+            QByteArray data;
+            QDataStream out(&data, QIODevice::WriteOnly);
+            out.setByteOrder(QDataStream::LittleEndian);
+            out.writeRawData("RIFF", 4);
+            out << quint32(36 + frames * 2);
+            out.writeRawData("WAVEfmt ", 8);
+            out << quint32(16) << quint16(1) << quint16(1) << quint32(rate) << quint32(rate * 2) << quint16(2) << quint16(16);
+            out.writeRawData("data", 4);
+            out << quint32(frames * 2);
+            for (int i = 0; i < frames; ++i) out << qint16(16384);
+            f.write(data);
+        }
+        std::string err;
+        const std::string movieFile = path("ramp-movie.mp4");
+        {
+            Project src = makeDefaultProject();
+            Sequence& ss = *src.active();
+            ss.fps = {25, 1};
+            ss.width = 160, ss.height = 120;
+            edit::overwrite(src, ss, {TrackKind::Video, 0}, makeGeneratorClip(src, "color", 150));
+            ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+            st.path = movieFile;
+            st.preset = "ultrafast";
+            QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        s.width = 160, s.height = 120;
+        s.name = "Mix Handover";
+        const MediaItem sound = probeOrFail(p, steady);
+        p.media.push_back(sound);
+        const MediaItem movie = probeOrFail(p, movieFile);
+        p.media.push_back(movie);
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        s.audioTracks.resize(2);
+        auto place = [&](int track, FrameTime at, double in, FrameTime len) {
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = sound.id;
+            c.name = sound.name;
+            c.start = at;
+            c.duration = len;
+            c.sourceIn = in;
+            c.audio = makeEffect(p, "volume");
+            s.audioTracks[size_t(track)].clips.push_back(c);
+            return c.id;
+        };
+        const Id a = place(0, 0, 0, 100), b = place(1, 20, 50, 60);
+        Track& dialogue = s.audioTracks[0];
+        Track& effects = s.audioTracks[1];
+        dialogue.name = "Dialogue";
+        effects.name = "Effects";
+        // The dialogue clip's gain keyed with easings and a straight run, its pan moving then held; the track's
+        // volume and pan riding as automation lanes.
+        Param gain;
+        gain.addKey(0, 0.0, Interp::SineInOut);
+        gain.addKey(30, -9.0);
+        gain.addKey(60, -3.0, Interp::ExpoOut);
+        gain.addKey(90, -15.0);
+        Param pan;
+        pan.addKey(0, -0.5);
+        pan.addKey(40, 0.7, Interp::Hold);
+        pan.addKey(70, 0.2);
+        edit::clipById(s, a)->audio.params["gain_db"] = gain;
+        edit::clipById(s, a)->audio.params["pan"] = pan;
+        dialogue.volumeDb = -2;
+        dialogue.volumeAuto.addKey(0, -2.0);
+        dialogue.volumeAuto.addKey(50, -8.0, Interp::SineIn);
+        dialogue.volumeAuto.addKey(100, -1.0);
+        dialogue.panAuto.addKey(10, -0.2);
+        dialogue.panAuto.addKey(80, 0.4);
+        // The effects clip at -4 dB, its pan held left then right; the track's fader at -6 dB and panned right.
+        Param held;
+        held.addKey(0, -0.3, Interp::Hold);
+        held.addKey(30, 0.3, Interp::Hold);
+        edit::clipById(s, b)->audio.params["gain_db"] = Param(-4.0);
+        edit::clipById(s, b)->audio.params["pan"] = held;
+        effects.volumeDb = -6;
+        effects.pan = 0.25;
+        // The picture: a speed ramp from normal speed (eased) to double and down to half.
+        {
+            Clip v;
+            v.id = p.newId();
+            v.mediaId = movie.id;
+            v.name = movie.name;
+            v.start = 10;
+            v.duration = 80;
+            v.sourceIn = 10;
+            v.timing = makeEffect(p, "time");
+            Param speed;
+            speed.addKey(0, 100, Interp::SineInOut);
+            speed.addKey(40, 200);
+            speed.addKey(80, 50);
+            v.timing.params["speed"] = speed;
+            s.videoTracks.resize(1);
+            s.videoTracks[0].name = "Picture";
+            s.videoTracks[0].clips = {v};
+        }
+        const Clip ramp = s.videoTracks[0].clips[0];
+        QVERIFY(ramp.ramped());
+
+        const std::string aaf = path("Mix Handover.aaf");
+        AafExportResult r;
+        QVERIFY2(exportAaf(p, s, aaf, &r, {}, nullptr, &err), err.c_str());
+        QCOMPARE(r.audioTracks, 2);
+        QCOMPARE(r.videoClips, 1);
+        QCOMPARE(r.trackLanes, 4);  // the dialogue's volume and pan lanes, the effects fader and pan
+        QVERIFY(r.curves > 0);
+        QVERIFY(std::none_of(r.warnings.begin(), r.warnings.end(), [](const std::string& w) { return w.find("constant speed") != std::string::npos; }));
+        QVERIFY(std::any_of(r.warnings.begin(), r.warnings.end(), [](const std::string& w) { return w.find("written as points along the curve") != std::string::npos; }));
+
+        // Read back by Montage's import: every level within 0.01 dB and every pan within a thousandth at each frame,
+        // a key within a frame of each key, the held pan held, and the ramp showing the same source frame within one.
+        const auto read = [&](const std::string& file, Project& in) -> const Sequence* {
+            const ImportResult ir = importAaf(in, file, [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+            if (!ir.ok || !ir.offline.empty()) return nullptr;
+            return in.findSequence(ir.sequence);
+        };
+        const auto near = [](const Param& keyed, const Param& back, double within) {
+            for (const Keyframe& k : keyed.keys)
+                if (std::none_of(back.keys.begin(), back.keys.end(), [&](const Keyframe& b) { return std::fabs(b.time() - k.time()) <= within; }))
+                    return false;
+            return true;
+        };
+        Project in = makeDefaultProject();
+        const Sequence* rs = read(aaf, in);
+        QVERIFY(rs);
+        QCOMPARE(rs->audioTracks.size(), size_t(2));
+        const Track& rd = rs->audioTracks[0];
+        const Track& re = rs->audioTracks[1];
+        QCOMPARE(rd.name, std::string("Dialogue"));
+        QVERIFY(rd.clips.size() == 1 && re.clips.size() == 1);
+        const Clip& ra = rd.clips[0];
+        const Clip& rb = re.clips[0];
+        QVERIFY(ra.start == 0 && ra.duration == 100 && rb.start == 20 && rb.duration == 60);
+        const Param& rg = ra.audio.params.at("gain_db");
+        const Param& rp = ra.audio.params.at("pan");
+        double worstDb = 0, worstPan = 0;
+        for (int f = 0; f <= 100; ++f) {
+            worstDb = std::max(worstDb, std::fabs(rg.atTime(f) - gain.atTime(f)));
+            worstPan = std::max(worstPan, std::fabs(rp.atTime(f) - pan.atTime(f)));
+            worstDb = std::max(worstDb, std::fabs(trackVolumeAt(rd, f) - trackVolumeAt(dialogue, f)));
+            worstPan = std::max(worstPan, std::fabs(trackPanAt(rd, f) - trackPanAt(dialogue, f)));
+        }
+        QVERIFY2(worstDb < 0.01 && worstPan < 0.001, qPrintable(QString("%1 dB, pan %2").arg(worstDb).arg(worstPan)));
+        QVERIFY(near(gain, rg, 1) && near(pan, rp, 1) && near(dialogue.volumeAuto, rd.volumeAuto, 1) && near(dialogue.panAuto, rd.panAuto, 1));
+        QVERIFY(std::fabs(rb.audio.p("gain_db", 0) + 4) < 0.01);
+        const Param& rh = rb.audio.params.at("pan");
+        QVERIFY(rh.keys.size() == 2 && rh.keys[0].interp == Interp::Hold && rh.keys[0].t == 0 && rh.keys[1].t == 30);
+        QVERIFY(std::fabs(rh.atTime(29) + 0.3) < 0.001 && std::fabs(rh.atTime(30) - 0.3) < 0.001);
+        QVERIFY(!re.volumeAuto.animated() && std::fabs(re.volumeDb + 6) < 0.01 && std::fabs(re.pan - 0.25) < 0.001);
+        QCOMPARE(rs->videoTracks.size(), size_t(1));
+        QCOMPARE(rs->videoTracks[0].clips.size(), size_t(1));
+        const Clip& rr = rs->videoTracks[0].clips[0];
+        QVERIFY(rr.ramped() && rr.start == ramp.start && rr.duration == ramp.duration);
+        double worstFrame = 0;
+        for (int f = 0; f < ramp.duration; ++f) worstFrame = std::max(worstFrame, std::fabs(rr.sourceAt(f) - ramp.sourceAt(f)));
+        QVERIFY2(worstFrame < 1, qPrintable(QString::number(worstFrame)));
+
+        // The mix as Montage plays the project, and as it plays the AAF read back: within 0.05 dB every 10 ms.
+        const auto mixOf = [](const Project& pp, const Sequence& ss) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(rate) * 4 * 2);
+            mixer.mix(pp, ss, 0, rate * 4, out.data());
+            return out;
+        };
+        const auto worstMix = [](const std::vector<float>& x, const std::vector<float>& y) {
+            double worst = 0;
+            for (size_t i = 0; i + 1 < x.size(); i += 480 * 2)
+                for (size_t ch = 0; ch < 2; ++ch)
+                    if (std::fabs(x[i + ch]) > 1e-3) worst = std::max(worst, std::fabs(20 * std::log10(std::fabs(double(y[i + ch])) / std::fabs(double(x[i + ch])))));
+            return worst;
+        };
+        const std::vector<float> heard = mixOf(p, s);
+        QVERIFY(std::any_of(heard.begin(), heard.end(), [](float v) { return std::fabs(v) > 0.05f; }));
+        // (a mono file handed over at its own level: once it was decoded as two channels at -3 dB and one written)
+        const std::vector<float> backMix = mixOf(in, *rs);
+        const double asLanes = worstMix(heard, backMix);
+        QVERIFY2(asLanes < 0.05, qPrintable(QString("%1 dB").arg(asLanes)));
+
+        // With the automation baked: the tracks' volume in the clips' gain, the tracks left at 0 dB, the mix the same.
+        {
+            AafExportOptions bake;
+            bake.bakeAutomation = true;
+            const std::string baked = path("Mix Handover baked.aaf");
+            AafExportResult br;
+            QVERIFY2(exportAaf(p, s, baked, &br, {}, nullptr, &err, bake), err.c_str());
+            QCOMPARE(br.trackLanes, 2);  // the pans only
+            Project bin = makeDefaultProject();
+            const Sequence* bs = read(baked, bin);
+            QVERIFY(bs && bs->audioTracks.size() == 2);
+            for (const Track& t : bs->audioTracks) QVERIFY(!t.volumeAuto.animated() && std::fabs(t.volumeDb) < 1e-6);
+            const double asGain = worstMix(heard, mixOf(bin, *bs));
+            QVERIFY2(asGain < 0.05, qPrintable(QString("%1 dB").arg(asGain)));
+        }
+        // Through MCP, baking chosen.
+        {
+            const QString project = QString::fromStdString(path("handover.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_export_timeline"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"format", "aaf"}, {"picture", false},
+                                                                                   {"bake_automation", true}, {"output", QString::fromStdString(path("handover.aaf"))}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            QCOMPARE(res.value("structuredContent").toObject().value("track_lanes").toInt(), 2);
+        }
+
+        // An independent reader (pyaaf2), when there is one: each lane where the export put it, with its interpolation.
+        const QByteArray python = qgetenv("MONTAGE_TEST_PYAAF2");
+        if (python.isEmpty()) return;
+        QProcess py;
+        py.start(QString::fromLocal8Bit(python), {"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/aaf_check.py"), QString::fromStdString(aaf)});
+        QVERIFY(py.waitForFinished(60000));
+        QVERIFY2(py.exitCode() == 0, py.readAllStandardError().constData());
+        const QJsonObject j = QJsonDocument::fromJson(py.readAllStandardOutput()).object();
+        QJsonObject tracks;
+        for (const QJsonValue t : j.value("tracks").toArray()) tracks[t.toObject().value("name").toString()] = t;
+        QVERIFY(tracks.contains("Dialogue") && tracks.contains("Effects") && tracks.contains("Picture"));
+        const auto only = [](const QJsonObject& track) { return track.value("components").toArray(); };
+        const auto parameter = [](const QJsonObject& op, const char* name) { return op.value("parameters").toObject().value(name).toObject(); };
+        // A varying lane's value at a frame of its operation, as AAF interpolates it.
+        const auto valueAt = [](const QJsonObject& lane, double length, double frame) {
+            const QJsonArray pts = lane.value("points").toArray();
+            const bool constant = lane.value("interpolation_name").toString() == "ConstantInterp";
+            double v = pts[0].toArray()[1].toDouble();
+            for (int i = 0; i + 1 < pts.size(); ++i) {
+                const double t0 = pts[i].toArray()[0].toDouble() * length, t1 = pts[i + 1].toArray()[0].toDouble() * length;
+                if (frame < t0) break;
+                const double v0 = pts[i].toArray()[1].toDouble(), v1 = pts[i + 1].toArray()[1].toDouble();
+                v = frame >= t1 ? v1 : constant ? v0 : v0 + (v1 - v0) * (frame - t0) / std::max(1e-12, t1 - t0);
+            }
+            return v;
+        };
+        // The dialogue track: its volume lane, then its pan lane, over its clip's pan, over its gain.
+        const QJsonArray dc = only(tracks["Dialogue"].toObject());
+        QCOMPARE(dc.size(), 1);
+        const QJsonObject volume = dc[0].toObject();
+        QCOMPARE(volume.value("op").toString(), QString("Audio Gain"));
+        const QJsonObject volumeLane = parameter(volume, "Amplitude");
+        QCOMPARE(volumeLane.value("interpolation_name").toString(), QString("LinearInterp"));
+        const QJsonObject trackPan = volume.value("inputs").toArray()[0].toObject();
+        QCOMPARE(trackPan.value("op").toString(), QString("Audio Pan"));
+        const QJsonObject clipPan = trackPan.value("inputs").toArray()[0].toObject();
+        QCOMPARE(clipPan.value("op").toString(), QString("Audio Pan"));
+        const QJsonObject clipGain = clipPan.value("inputs").toArray()[0].toObject();
+        QCOMPARE(clipGain.value("op").toString(), QString("Audio Gain"));
+        QVERIFY(clipGain.value("inputs").toArray()[0].toObject().value("file").toString().endsWith("steady-mono.wav"));
+        double laneDb = 0, lanePan = 0;
+        for (int f = 0; f <= 100; ++f) {
+            laneDb = std::max(laneDb, std::fabs(20 * std::log10(valueAt(volumeLane, 100, f)) - trackVolumeAt(dialogue, f)));
+            laneDb = std::max(laneDb, std::fabs(20 * std::log10(valueAt(parameter(clipGain, "Amplitude"), 100, f)) - gain.atTime(f)));
+            lanePan = std::max(lanePan, std::fabs(valueAt(parameter(trackPan, "Pan"), 100, f) * 2 - 1 - trackPanAt(dialogue, f)));
+            lanePan = std::max(lanePan, std::fabs(valueAt(parameter(clipPan, "Pan"), 100, f) * 2 - 1 - pan.atTime(f)));
+        }
+        QVERIFY2(laneDb < 0.01 && lanePan < 0.001, qPrintable(QString("%1 dB, pan %2").arg(laneDb).arg(lanePan)));
+        // The effects track: its fader and pan as constants, its clip's pan held.
+        const QJsonObject fader = only(tracks["Effects"].toObject())[0].toObject();
+        QVERIFY(std::fabs(parameter(fader, "Amplitude").value("constant").toDouble() - std::pow(10.0, -6.0 / 20)) < 1e-4);
+        const QJsonObject faderPan = fader.value("inputs").toArray()[0].toObject();
+        QVERIFY(std::fabs(parameter(faderPan, "Pan").value("constant").toDouble() - 0.625) < 1e-4);
+        const QJsonObject heldPan = faderPan.value("inputs").toArray()[1].toObject();  // (after the filler)
+        QCOMPARE(parameter(heldPan, "Pan").value("interpolation_name").toString(), QString("ConstantInterp"));
+        QCOMPARE(parameter(heldPan, "Pan").value("points").toArray().size(), 2);
+        // The picture: Motion Control with its speed varying, linear between points, as the ramp plays.
+        const QJsonArray pc = only(tracks["Picture"].toObject());
+        const QJsonObject motion = pc[1].toObject();  // (after the filler)
+        QCOMPARE(motion.value("op").toString(), QString("Motion Control"));
+        const QJsonObject ratio = parameter(motion, "Speed Ratio");
+        QCOMPARE(ratio.value("interpolation_name").toString(), QString("LinearInterp"));
+        QVERIFY(ratio.value("points").toArray().size() > 3);
+        double laneSpeed = 0;
+        for (int f = 0; f < 80; ++f) laneSpeed = std::max(laneSpeed, std::fabs(valueAt(ratio, 80, f) - ramp.speedAt(f)));
+        QVERIFY2(laneSpeed < 0.01, qPrintable(QString::number(laneSpeed)));
     }
 
     void sharedProjectsOverMcp() {

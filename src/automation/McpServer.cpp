@@ -16161,12 +16161,14 @@ void McpServer::Impl::addTools() {
     add("montage_export_timeline", "Export the timeline",
         "Write the active sequence as an EDL, OpenTimelineIO, Final Cut Pro 7 XML (Premiere, Resolve), FCPXML (Final Cut "
         "Pro) or AAF (Pro Tools, Fairlight, Media Composer: the audio tracks linked to mono WAVs written to a \"<name> "
-        "Media\" folder beside it, with crossfades, fades and clip gain; the video tracks linked to the original files, "
-        "with dissolves and constant speed, unless picture is false). With avid_media, an AAF for Media Composer with the "
+        "Media\" folder beside it, with crossfades, fades, clip gain and pan with their keys, and each track's volume and pan "
+        "with its automation, or with bake_automation the track's volume played into its clips' gain; the video tracks "
+        "linked to the original files, with dissolves, constant speed and speed ramps, unless picture is false). With avid_media, an AAF for Media Composer with the "
         "cut's media written as it keeps its own: MXF OP-Atom (DNxHD or DNxHR picture at the sequence's size and rate, mono "
         "PCM sound) in a new numbered folder of \"Avid MediaFiles/MXF\" on the drive, so the sequence opens linked.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml","aaf"]},
             "output":{"type":"string"},"picture":{"type":"boolean","description":"AAF: include the video tracks (default true)"},
+            "bake_automation":{"type":"boolean","description":"AAF: each track's volume and its automation played into its clips' gain (default false: written as the track's own)"},
             "fcpxml_version":{"type":"string","enum":["1.15","1.10"],"description":"FCPXML: the version written (default 1.15)"},
             "avid_media":{"type":"object","description":"AAF: write the media for Media Composer","properties":{
                 "drive":{"type":"string","description":"Where \"Avid MediaFiles\" goes (default: the AAF's folder)"},
@@ -16184,6 +16186,8 @@ void McpServer::Impl::addTools() {
                 AafExportOptions o;
                 const QJsonValue pv = a.value("picture");
                 o.picture = pv.isString() ? pv.toString().compare("false", Qt::CaseInsensitive) != 0 && pv.toString() != "0" : pv.toBool(true);
+                const QJsonValue bv = a.value("bake_automation");
+                o.bakeAutomation = bv.isString() ? bv.toString().compare("true", Qt::CaseInsensitive) == 0 || bv.toString() == "1" : bv.toBool(false);
                 if (a.contains("avid_media")) {
                     if (!a.value("avid_media").isObject()) throw ArgError{"avid_media must be an object"};
                     const QJsonObject av = a.value("avid_media").toObject();
@@ -16213,7 +16217,7 @@ void McpServer::Impl::addTools() {
                 for (const std::string& w : r.warnings) warnings.append(QString::fromStdString(w));
                 QJsonObject res{{"output", out}, {"audio_tracks", r.audioTracks}, {"clips", r.clips},
                                 {"crossfades", r.transitions}, {"video_tracks", r.videoTracks}, {"video_clips", r.videoClips},
-                                {"dissolves", r.videoTransitions}, {"media", files}, {"warnings", warnings}};
+                                {"dissolves", r.videoTransitions}, {"track_lanes", r.trackLanes}, {"media", files}, {"warnings", warnings}};
                 if (o.avid.enabled) res["media_folder"] = QString::fromStdString(r.mediaFolder);
                 return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 %6 files; %7 video tracks, %8 clips, %9 dissolves")
                               .arg(out).arg(r.audioTracks).arg(r.clips).arg(r.transitions).arg(files.size())

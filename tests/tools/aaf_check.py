@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Reads an AAF file with pyaaf2 (an independent reader) and prints what it
 finds as JSON: the top-level composition's tracks and their components, each
-source clip followed through its master mob to the file it plays. After
+source clip followed through its master mob to the file it plays, and each
+operation (gain, pan, speed) with its parameters, constant or varying. After
 --mxf, MXF files whose package IDs it reports too (pyaaf2's MXF reader).
 Used by test_media when MONTAGE_TEST_PYAAF2 names a Python with pyaaf2."""
 import json, sys
@@ -13,18 +14,27 @@ def walk(seg, out):
         for c in seg.components:
             walk(c, out)
     elif kind == "OperationGroup":
-        params = {}
+        # Each parameter by its definition's name too, a varying one with its interpolation's name and AUID.
+        params, named = {}, {}
         for p in seg.parameters:
             pv = type(p).__name__
+            try:
+                name = p.name
+            except Exception:
+                name = str(p.auid)
             if pv == "ConstantValue":
                 params["constant"] = float(p.value)
+                named[name] = {"constant": float(p.value)}
             else:
-                params["points"] = [[float(cp.time), float(cp.value)] for cp in p["PointList"]]
+                points = [[float(cp.time), float(cp.value)] for cp in p["PointList"]]
+                params["points"] = points
+                interp = p.interpolationdef
+                named[name] = {"points": points, "interpolation": str(interp.auid), "interpolation_name": interp.name}
         inner = []
         for s in seg.segments:
             walk(s, inner)
         out.append({"type": "gain", "op": seg.operation.name, "op_id": str(seg.operation.auid), "length": seg.length, "params": params,
-                    "inputs": inner})
+                    "parameters": named, "inputs": inner})
     elif kind == "Transition":
         out.append({"type": "transition", "length": seg.length, "cut": seg["CutPoint"].value, "op": seg["OperationGroup"].value.operation.name})
     elif kind == "Filler":

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -16,6 +17,7 @@
 #include "audio/ElasticAudio.h"
 #include "audio/SpeechCleanup.h"
 #include "core/Aaf.h"
+#include "core/Automation.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interpretation.h"
@@ -80,6 +82,9 @@ const char* const kAudioGain = "9d2ea894-0968-11d3-8a38-0050040ef7d2";      // O
 const char* const kAudioDissolve = "0c3bea41-fc05-11d2-8a29-0050040ef7d2";  // OperationDef_MonoAudioDissolve
 const char* const kAmplitude = "e4962321-2267-11d3-8a4c-0050040ef7d2";      // ParameterDef_Amplitude
 const char* const kLinear = "5b6c85a4-0ede-11d3-80a9-006008143e6f";         // InterpolationDef_Linear
+const char* const kConstant = "5b6c85a5-0ede-11d3-80a9-006008143e6f";       // InterpolationDef_Constant
+const char* const kAudioPan = "9d2ea893-0968-11d3-8a38-0050040ef7d2";       // OperationDef_MonoAudioPan
+const char* const kPan = "e4962322-2267-11d3-8a4c-0050040ef7d2";            // ParameterDef_Pan (0 left, 1/2 centre, 1 right)
 const char* const kRationalType = "03010100-0000-0000-060e-2b3401040101";
 const char* const kTopLevel = "0d010102-0101-0700-060e-2b3404010101";        // Usage_TopLevel
 const char* const kOpPattern = "0d011201-0100-0000-060e-2b3404010105";
@@ -243,27 +248,177 @@ struct Placed {
     int64_t crossfadeCut = -1;   // with the clip before: the edit point, when they cross-fade
 };
 
-Obj gainParameter(const Clip& c, int64_t offset, int64_t length) {
-    auto it = c.audio.params.find("gain_db");
-    if (it == c.audio.params.end()) return nullptr;
-    const Param& gp = it->second;
-    auto amp = [](double db) { return int32_t(std::lround(std::pow(10.0, db / 20) * 1000000)); };
-    if (!gp.animated()) {
-        if (std::fabs(gp.value) < 0.01) return nullptr;
-        Obj v = make(kConstantValue);
-        v->bytes(0x4c01, aafAuid(kAmplitude)).indirectRational(0x4d01, amp(gp.value), 1000000);
-        return v;
+// A lane as AAF holds it: points (the operation's frames, AAF's value), held from each to the next (AAF's constant
+// interpolation) or linear between them; `curved` where points were put between the keys to follow a curve.
+struct Lane {
+    bool held = false, curved = false;
+    std::vector<std::pair<double, double>> points;
+};
+
+// The points that play a lane: `keys` (in order; `offset` frames added puts them in the operation's frames), its value
+// at an operation frame as Montage plays it (`at`), that value as AAF's (`aaf`), and the AAF values close enough to
+// stand for it (`band`). Held keys are written as they are; otherwise the keys, and between them, on whole frames, as
+// few points as keep what AAF interpolates linearly within the band of what Montage plays.
+Lane lanePoints(const std::vector<Keyframe>& keys, double offset, const std::function<double(double)>& at, const std::function<double(double)>& aaf,
+                const std::function<std::pair<double, double>(double)>& band) {
+    Lane out;
+    if (keys.empty()) return out;
+    const bool held = std::all_of(keys.begin(), keys.end() - 1, [](const Keyframe& k) { return k.interp == Interp::Hold; });
+    if (held || keys.size() == 1) {
+        out.held = true;
+        for (const Keyframe& k : keys) out.points.emplace_back(k.time() + offset, aaf(at(k.time() + offset)));
+        return out;
     }
-    // Keyframes: times as fractions of the operation's length, linear between them.
+    // The keys and every whole frame between them, the keys to be kept; and where a key holds to the next among keys
+    // that do not (AAF holds a whole lane or none of it), its value kept to a thousandth of a frame before the next,
+    // so that the jump is a step of a sample or two.
+    std::vector<std::pair<double, bool>> ts;
+    for (const Keyframe& k : keys) ts.emplace_back(k.time() + offset, true);
+    for (size_t i = 0; i + 1 < keys.size(); ++i)
+        if (keys[i].interp == Interp::Hold && keys[i + 1].time() - keys[i].time() > 0.002) ts.emplace_back(keys[i + 1].time() - 0.001 + offset, true);
+    for (double f = std::ceil(keys.front().time() + offset); f < keys.back().time() + offset; f += 1) ts.emplace_back(f, false);
+    std::sort(ts.begin(), ts.end());
+    std::vector<std::pair<double, bool>> uniq;
+    for (const auto& t : ts) {
+        if (!uniq.empty() && std::fabs(uniq.back().first - t.first) < 1e-9) uniq.back().second = uniq.back().second || t.second;
+        else uniq.push_back(t);
+    }
+    std::vector<double> v(uniq.size()), a(uniq.size());
+    for (size_t i = 0; i < uniq.size(); ++i) {
+        v[i] = at(uniq[i].first);
+        a[i] = aaf(v[i]);
+    }
+    // From each point kept, as far on as a straight line stays within the band of every point it passes (the slopes
+    // that do narrowing as it goes), and never past a key.
+    size_t i = 0;
+    out.points.emplace_back(uniq[0].first, a[0]);
+    while (i + 1 < uniq.size()) {
+        double lo = -std::numeric_limits<double>::infinity(), hi = std::numeric_limits<double>::infinity();
+        size_t best = i + 1;
+        for (size_t j = i + 1; j < uniq.size(); ++j) {
+            const double dt = std::max(1e-12, uniq[j].first - uniq[i].first);
+            const double slope = (a[j] - a[i]) / dt;
+            if (j > i + 1 && (slope < lo || slope > hi)) break;
+            best = j;
+            if (uniq[j].second) break;  // (a key is kept)
+            const auto [bl, bh] = band(v[j]);
+            lo = std::max(lo, (bl - a[i]) / dt);
+            hi = std::min(hi, (bh - a[i]) / dt);
+            if (lo > hi) break;
+        }
+        out.points.emplace_back(uniq[best].first, a[best]);
+        i = best;
+    }
+    // (curved where points other than the keys were needed)
+    out.curved = out.points.size() > keys.size();
+    return out;
+}
+
+// AAF's gain (an amplitude) and pan (0 left to 1 right) from Montage's dB and -1..1.
+// The AAF values that stand for Montage's: gain within 0.003 dB, pan within a 5000th of its travel.
+double amplitudeOf(double db) { return std::pow(10.0, std::max(-60.0, db) / 20); }
+std::pair<double, double> gainBand(double db) { return {amplitudeOf(db - 0.003), amplitudeOf(db + 0.003)}; }
+double panOf(double pan) { return (std::clamp(pan, -1.0, 1.0) + 1) / 2; }
+std::pair<double, double> panBand(double pan) { return {panOf(pan) - 0.0002, panOf(pan) + 0.0002}; }
+
+// The part of a lane over an operation `length` frames long: points before its start or after its end replaced by its
+// value there.
+Lane within(Lane lane, int64_t length) {
+    const auto valueAt = [&](double t) {
+        const auto& ps = lane.points;
+        if (t <= ps.front().first) return ps.front().second;
+        for (size_t i = 0; i + 1 < ps.size(); ++i)
+            if (t < ps[i + 1].first) {
+                if (lane.held) return ps[i].second;
+                const double u = (t - ps[i].first) / std::max(1e-12, ps[i + 1].first - ps[i].first);
+                return ps[i].second + (ps[i + 1].second - ps[i].second) * u;
+            }
+        return ps.back().second;
+    };
+    if (lane.points.empty()) return lane;
+    const double end = double(std::max<int64_t>(0, length));
+    std::vector<std::pair<double, double>> in;
+    if (lane.points.front().first < 0) in.emplace_back(0.0, valueAt(0));
+    for (const auto& p : lane.points)
+        if (p.first >= 0 && p.first <= end) in.push_back(p);
+    if (lane.points.back().first > end) in.emplace_back(end, valueAt(end));
+    if (in.empty()) in.emplace_back(0.0, valueAt(0));
+    lane.points = std::move(in);
+    return lane;
+}
+
+// A lane as a parameter of an operation `length` frames long: a constant value, or a varying one with its points'
+// times as fractions of that length (a thousandth of a frame apart at least).
+Obj laneParameter(const char* parameterDef, Lane lane, int64_t length) {
+    lane = within(std::move(lane), length);
+    if (lane.points.empty()) return nullptr;
+    const auto value = [](double v) { return int32_t(std::llround(v * 1000000)); };
+    if (lane.points.size() == 1) {
+        Obj c = make(kConstantValue);
+        c->bytes(0x4c01, aafAuid(parameterDef)).indirectRational(0x4d01, value(lane.points.front().second), 1000000);
+        return c;
+    }
     Obj v = make(kVaryingValue);
-    v->bytes(0x4c01, aafAuid(kAmplitude)).weak(0x4e01, AafRefTable::InterpolationDefinitions, 0x1b01, aafAuid(kLinear));
-    for (const Keyframe& k : gp.keys) {
-        const int64_t at = std::clamp<int64_t>(k.t + offset, 0, length);
+    v->bytes(0x4c01, aafAuid(parameterDef)).weak(0x4e01, AafRefTable::InterpolationDefinitions, 0x1b01, aafAuid(lane.held ? kConstant : kLinear));
+    const int64_t scale = std::clamp<int64_t>(int64_t(2000000000) / std::max<int64_t>(1, length), 1, 1000);
+    const int64_t den = std::max<int64_t>(1, length) * scale;
+    for (const auto& [t, x] : lane.points) {
+        const int64_t num = std::clamp<int64_t>(std::llround(t * double(scale)), 0, den);
         Obj cp = make(kControlPoint);
-        cp->rational(0x1a03, int32_t(at), int32_t(std::max<int64_t>(1, length))).indirectRational(0x1a02, amp(k.v), 1000000);
+        cp->rational(0x1a03, int32_t(num), int32_t(den)).indirectRational(0x1a02, value(x), 1000000);
         v->add(0x4e02, "PointList", std::move(cp));
     }
     return v;
+}
+
+// A clip's gain over an operation from `offset` frames before the clip for `length` frames (`extra` dB on top at each
+// clip frame: a track's volume baked in); null when it is 0 dB throughout.
+Obj gainParameter(const Clip& c, int64_t offset, int64_t length, int* curves, const std::function<double(double)>& extra = {}) {
+    auto it = c.audio.params.find("gain_db");
+    const Param* gp = it == c.audio.params.end() ? nullptr : &it->second;
+    if (extra) {
+        // (baked: the two together every frame of the clip, as points where AAF's linear amplitude would miss them)
+        Param both;
+        for (int64_t f = -offset; f <= length - offset; ++f) both.addKey(FrameTime(f), (gp ? gp->atTime(double(f)) : 0.0) + extra(double(f)));
+        if (gp)
+            for (const Keyframe& k : gp->keys)
+                if (k.sub > 0) both.addKeyAt(k.time(), gp->atTime(k.time()) + extra(k.time()));
+        thinKeys(both.keys, 0.0005);
+        if (std::all_of(both.keys.begin(), both.keys.end(), [](const Keyframe& k) { return std::fabs(k.v) < 0.01; })) return nullptr;
+        const Lane lane = lanePoints(both.keys, double(offset), [&](double f) { return both.atTime(f - double(offset)); }, amplitudeOf, gainBand);
+        return laneParameter(kAmplitude, lane, length);
+    }
+    if (!gp) return nullptr;
+    if (!gp->animated()) {
+        if (std::fabs(gp->value) < 0.01) return nullptr;
+        return laneParameter(kAmplitude, Lane{true, false, {{0.0, amplitudeOf(gp->value)}}}, length);
+    }
+    const Lane lane = lanePoints(gp->keys, double(offset), [&](double f) { return gp->atTime(f - double(offset)); }, amplitudeOf, gainBand);
+    if (lane.curved && curves) ++*curves;
+    return laneParameter(kAmplitude, lane, length);
+}
+
+// A clip's pan, the same way; null when it is centred throughout.
+Obj panParameter(const Clip& c, int64_t offset, int64_t length, int* curves) {
+    auto it = c.audio.params.find("pan");
+    if (it == c.audio.params.end()) return nullptr;
+    const Param& pp = it->second;
+    if (!pp.animated()) {
+        if (std::fabs(pp.value) < 1e-4) return nullptr;
+        return laneParameter(kPan, Lane{true, false, {{0.0, panOf(pp.value)}}}, length);
+    }
+    const Lane lane = lanePoints(pp.keys, double(offset), [&](double f) { return pp.atTime(f - double(offset)); }, panOf, panBand);
+    if (lane.curved && curves) ++*curves;
+    return laneParameter(kPan, lane, length);
+}
+
+// An operation over `input` (`length` frames) with one parameter.
+Obj operation(const char* operationDef, const char* parameterDef, int64_t length, Obj input, Obj parameter, const char* dataDef = nullptr) {
+    Obj op = dataDef ? component(kOperationGroup, length, dataDef) : soundComponent(kOperationGroup, length);
+    op->weak(0x0b01, AafRefTable::OperationDefinitions, 0x1b01, aafAuid(operationDef))
+        .add(0x0b02, "InputSegments", std::move(input))
+        .addToSet(0x0b03, "Parameters", 0x1b01, aafAuid(parameterDef), std::move(parameter));
+    return op;
 }
 
 }  // namespace
@@ -464,8 +619,7 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                 pc.end = c.end();
                 // AAF carries a constant speed; a ramp plays at its average and a reversed clip forwards, from its
                 // first frame in the file (its source In).
-                const auto timing = c.timing.params.find("speed");
-                if (c.reverse || (timing != c.timing.params.end() && timing->second.animated())) ++motion;
+                if (c.reverse) ++motion;
                 const double speed = c.ramped() ? c.sourceExtent() / std::max<double>(1, double(c.duration)) : c.speed;
                 pc.ratio = std::max(1e-6, std::fabs(speed)) * ts;
                 pc.sourceStart = std::max(0.0, c.sourceIn) * ts;
@@ -532,7 +686,7 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         if (overBlack)
             res.warnings.push_back(std::to_string(overBlack) + " clip(s) above V1 were baked over black (the media has no transparency): titles and "
                                    "pictures in pictures there cover the tracks below");
-        if (motion) res.warnings.push_back(std::to_string(motion) + " video clip(s) with speed ramps or reversed play at a constant speed forwards in the AAF");
+        if (motion) res.warnings.push_back(std::to_string(motion) + " reversed video clip(s) play forwards in the AAF");
         if (notDissolve) res.warnings.push_back(std::to_string(notDissolve) + " video transition(s) became dissolves");
         if (fades) res.warnings.push_back(std::to_string(fades) + " fade(s) to or from black are not carried");
         if (shortened) res.warnings.push_back(std::to_string(shortened) + " dissolve(s) were shortened or cut: not enough media beyond the edit");
@@ -574,13 +728,14 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             if (picked.empty() && m && probeMedia(m->path, probe) && probe.channels == 1) picked = {0};
             if (buf->channels == 1 && picked.size() != 1) picked = {0};
         } else {
+            // A mono file as its one channel (as the pool plays it), not upmixed to two at -3 dB and one of those written.
+            MediaItem probe;
+            if (picked.empty() && temp.empty() && probeMedia(from, probe) && probe.channels == 1) picked = {0};
             buf = decodeAudio(from, kRate, error, nullptr, picked);
         }
         if (!temp.empty()) QFile::remove(QString::fromStdString(temp));
         if (!buf) return false;
-        MediaItem probe;
-        int channels = 2;
-        if (picked.size() == 1 || (picked.empty() && temp.empty() && probeMedia(from, probe) && probe.channels == 1)) channels = 1;
+        const int channels = picked.size() == 1 ? 1 : 2;
         s.samples = buf->frames();
         s.frames = double(s.samples) * fps / kRate;
         std::string base = safeName(s.name);
@@ -816,6 +971,15 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         dict->addToSet(0x2604, "ParameterDefinitions", 0x1b01, aafAuid(kAmplitude), std::move(amplitude));
         dict->addToSet(0x2609, "InterpolationDefinitions", 0x1b01, aafAuid(kLinear),
                        definition(kInterpolationDefinition, kLinear, "LinearInterp", "Linear keyframe interpolation"));
+        dict->addToSet(0x2609, "InterpolationDefinitions", 0x1b01, aafAuid(kConstant),
+                       definition(kInterpolationDefinition, kConstant, "ConstantInterp", "Constant keyframe interpolation"));
+        Obj pan = definition(kOperationDefinition, kAudioPan, "Audio Pan", "Mono audio pan");
+        pan->weak(0x1e01, AafRefTable::DataDefinitions, 0x1b01, aafAuid(kSound)).u8(0x1e02, 0).u32(0x1e07, 1);
+        pan->weakSet(0x1e09, "ParametersDefined", AafRefTable::ParameterDefinitions, 0x1b01, {aafAuid(kPan)});
+        dict->addToSet(0x2603, "OperationDefinitions", 0x1b01, aafAuid(kAudioPan), std::move(pan));
+        Obj panDef = definition(kParameterDefinition, kPan, "Pan", "Pan: 0 left, 1/2 centre, 1 right");
+        panDef->weak(0x1f01, AafRefTable::TypeDefinitions, 0x0005, aafAuid(kRationalType));
+        dict->addToSet(0x2604, "ParameterDefinitions", 0x1b01, aafAuid(kPan), std::move(panDef));
     }
 
     // Mobs: for each source a master mob, and a file source mob per channel.
@@ -953,6 +1117,32 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                 pc.picture->used = std::max(pc.picture->used, needed / fps);
                 if (std::fabs(pc.ratio - 1) < 1e-9) {
                     sequence->add(0x1001, "Components", sourceClip(length, in, pc.picture->masterMob, pc.picture->vc3 ? 2 : 1, kPicture));
+                } else if (const Clip& c = *pc.clip; c.ramped() && !(avid.enabled && avid.bake)) {
+                    // A speed ramp: Motion Control with the speed varying as the clip's does (file frames per timeline
+                    // frame, its average the ratio the clip was placed by), so each frame shows the file's frame the
+                    // cut does.
+                    const double average = c.sourceExtent() / std::max<double>(1, double(c.duration));
+                    const double unit = pc.ratio / std::max(1e-9, average);
+                    const int64_t offset = c.start - start;  // (from the operation's start to the clip's)
+                    const auto speedAt = [&](double f) { return c.speedAt(f - double(offset)) * unit; };
+                    std::vector<Keyframe> keys = c.timing.params.at("speed").keys;
+                    if (keys.empty()) keys.push_back(Keyframe{});
+                    // (the whole operation: its first and last frames too)
+                    Keyframe first, last;
+                    first.t = FrameTime(-offset);
+                    last.t = FrameTime(length - offset);
+                    const bool held = std::all_of(keys.begin(), keys.end() - 1, [](const Keyframe& k) { return k.interp == Interp::Hold; }) && keys.size() > 1;
+                    first.interp = last.interp = held ? Interp::Hold : Interp::Linear;
+                    if (keys.front().time() > double(first.t) + 1e-9) keys.insert(keys.begin(), first);
+                    if (keys.back().time() < double(last.t) - 1e-9) keys.push_back(last);
+                    const Lane lane = lanePoints(keys, double(offset), speedAt, [](double v) { return v; },
+                                                 [](double v) { return std::pair{v - 1e-4 * std::max(1.0, v), v + 1e-4 * std::max(1.0, v)}; });
+                    if (lane.curved) ++res.curves;
+                    const double extent = c.sourceOffset(double(length - offset)) - c.sourceOffset(double(-offset));
+                    const int64_t used = std::max<int64_t>(1, int64_t(std::ceil(extent * unit - 1e-9)));
+                    sequence->add(0x1001, "Components",
+                                  operation(kSpeedControl, kSpeedRatio, length, sourceClip(used, in, pc.picture->masterMob, pc.picture->vc3 ? 2 : 1, kPicture),
+                                            laneParameter(kSpeedRatio, lane, length), kPicture));
                 } else {
                     const int64_t used = std::max<int64_t>(1, int64_t(std::ceil(double(length) * pc.ratio - 1e-9)));  // every frame it shows
                     Obj op = component(kOperationGroup, length, kPicture);
@@ -973,6 +1163,8 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             ++res.videoTracks;
         }
     }
+    int stereoPans = 0;  // stereo clips and tracks with a pan (a balance), which AAF's mono pan does not hold
+    const bool bakeVolume = options.bakeAutomation;
     for (const Track* t : tracks) {
         // The clips, extended into their handles where fades and crossfades reach.
         std::vector<Placed> placed;
@@ -1049,27 +1241,61 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                 Obj clip = avid.enabled ? sourceClip(length, sourceStart, pc.source->masterMobs[slot - 1], 2) : sourceClip(length, sourceStart, pc.source->masterMob, slot);
                 if (fadeIn > 0) clip->i64(0x1202, fadeIn).u8(0x1203, pc.powerIn ? 2 : 1);
                 if (pc.fadeOut > 0 && !next) clip->i64(0x1204, pc.fadeOut).u8(0x1205, pc.powerOut ? 2 : 1);
-                Obj gain = gainParameter(*pc.clip, pc.clip->start - start, length);
-                if (gain) {
-                    Obj op = soundComponent(kOperationGroup, length);
-                    op->weak(0x0b01, AafRefTable::OperationDefinitions, 0x1b01, aafAuid(kAudioGain))
-                        .add(0x0b02, "InputSegments", std::move(clip))
-                        .addToSet(0x0b03, "Parameters", 0x1b01, aafAuid(kAmplitude), std::move(gain));
-                    sequence->add(0x1001, "Components", std::move(op));
-                } else {
-                    sequence->add(0x1001, "Components", std::move(clip));
-                }
+                // Its gain (with the track's volume, baked), then its pan (a mono track's), each an operation over it.
+                std::function<double(double)> baked;
+                if (bakeVolume) baked = [t, at = pc.clip->start](double f) { return trackVolumeAt(*t, double(at) + f); };
+                Obj segment = std::move(clip);
+                if (Obj gain = gainParameter(*pc.clip, pc.clip->start - start, length, ch == 0 ? &res.curves : nullptr, baked))
+                    segment = operation(kAudioGain, kAmplitude, length, std::move(segment), std::move(gain));
+                if (channels == 1)
+                    if (Obj pan = panParameter(*pc.clip, pc.clip->start - start, length, &res.curves))
+                        segment = operation(kAudioPan, kPan, length, std::move(segment), std::move(pan));
+                if (channels > 1 && ch == 0 && pc.clip->audio.params.count("pan") &&
+                    (pc.clip->audio.params.at("pan").animated() || std::fabs(pc.clip->audio.params.at("pan").value) > 1e-4))
+                    ++stereoPans;
+                sequence->add(0x1001, "Components", std::move(segment));
                 cursor = start + length;
                 prev = &pc;
                 ++res.clips;
             }
             sequence->i64(0x0202, cursor);
+            // The track's volume and pan (its fader, and its automation lanes as it plays them), as operations over its
+            // sequence: the volume over both sides of a stereo track, the pan over a mono one's.
+            Obj segment = std::move(sequence);
+            const auto lane = [&](const std::function<double(double)>& at, bool moves, double still, const char* parameter, double nothing,
+                                  const std::function<double(double)>& aaf, const std::function<std::pair<double, double>(double)>& band) -> Obj {
+                if (!moves) {
+                    if (std::fabs(still - nothing) < 1e-4) return nullptr;
+                    return laneParameter(parameter, Lane{true, false, {{0.0, aaf(still)}}}, cursor);
+                }
+                Param heard;
+                for (int64_t f = 0; f <= cursor; ++f) heard.addKey(FrameTime(f), at(double(f)));
+                thinKeys(heard.keys, parameter == kAmplitude ? 0.0005 : 0.00001);
+                if (std::all_of(heard.keys.begin(), heard.keys.end(), [&](const Keyframe& k) { return std::fabs(k.v - nothing) < 1e-4; })) return nullptr;
+                return laneParameter(parameter, lanePoints(heard.keys, 0, [&](double f) { return heard.atTime(f); }, aaf, band), cursor);
+            };
+            if (channels == 1 && cursor > 0)
+                if (Obj pan = lane([t](double f) { return trackPanAt(*t, f); }, automationReads(trackAutomation(*t)) && t->panAuto.animated(), trackPanAt(*t, 0), kPan, 0, panOf,
+                                   panBand)) {
+                    segment = operation(kAudioPan, kPan, cursor, std::move(segment), std::move(pan));
+                    if (ch == 0) ++res.trackLanes;
+                }
+            if (!bakeVolume && cursor > 0)
+                if (Obj volume = lane([t](double f) { return trackVolumeAt(*t, f); }, trackVolumeAnimated(*t), trackVolumeAt(*t, 0), kAmplitude, 0,
+                                      amplitudeOf, gainBand)) {
+                    segment = operation(kAudioGain, kAmplitude, cursor, std::move(segment), std::move(volume));
+                    if (ch == 0) ++res.trackLanes;
+                }
+            if (channels > 1 && ch == 0 && (std::fabs(t->pan) > 1e-4 || t->panAuto.animated())) ++stereoPans;
             const std::string name = t->name.empty() ? "A" + std::to_string(physical) : t->name;
             comp->add(0x4403, "Slots", timelineSlot(slotId++, channels == 1 ? name : name + (ch == 0 ? " L" : " R"), physical++, num, den,
-                                                    std::move(sequence)));
+                                                    std::move(segment)));
             ++res.audioTracks;
         }
     }
+    if (stereoPans) res.warnings.push_back(std::to_string(stereoPans) + " pan(s) of stereo clips or tracks are not carried: AAF pans mono sound");
+    if (res.curves)
+        res.warnings.push_back(std::to_string(res.curves) + " keyframed lane(s) with curves AAF cannot hold were written as points along the curve");
     content->addToSet(0x1901, "Mobs", 0x4401, compId, std::move(comp));
 
     // Each picture file: a master mob, and a file source mob whose descriptor (CDCI) and locator name the file.
