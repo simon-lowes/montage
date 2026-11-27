@@ -36280,9 +36280,16 @@ colorspaces:
                       shot, off * 100, grainSize(back), grainSize(own540), wantSize);
                 // (the size against the grain itself at the rung's size, the grainy sequence rendered at 960 by 540:
                 // the profile's size, measured over the ramp on the source, takes in more of the low frequencies where
-                // the grain is weak, and is reported. Phase 16 holds a size to 10 %; here it is held to 35 %, as AV1's
-                // autoregression fitted to the stronger shot's profile makes grain about a third finer than the
-                // profile's at this size, the coding's noise left out; the weaker shot's comes out within 2 %)
+                // the grain is weak, and is reported. Phase 16 holds a size to 10 %; here it is held to 35 %, and the
+                // fit is not the cause, AV1's model is: a decoder makes the grain in blocks of 32 samples, each cut at
+                // a random offset from one 64-sample template, so what is coarser than a block is not carried as it is
+                // (it repeats from block to block, and a 64-pixel window sees less of it at its lowest frequency and
+                // more at a block's), and grain sized from where its spectrum falls to half reads finer. For the
+                // stronger shot here, the coefficients' own grain, drawn without the blocks, is 2.70 px, the grainy
+                // sequence's own size at 540 lines; drawn as a decoder draws it, on a flat grey, 2.19 px; on the
+                // ramp, measured as here, 1.96 px, 27 % finer. Fitted to grain 1.1 to 1.6 times coarser, the grain a
+                // decoder draws is further from the profile's at every one of them, not nearer. The weaker shot's
+                // comes out within 2 %)
                 QVERIFY2(std::fabs(grainSize(back) / grainSize(own540) - 1) < 0.35,
                          qPrintable(QString("%1 for %2").arg(grainSize(back)).arg(grainSize(own540))));
             }
