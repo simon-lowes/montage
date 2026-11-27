@@ -17,6 +17,7 @@
 #include <QVBoxLayout>
 
 #include "EditorState.h"
+#include "Language.h"
 #include "Settings.h"
 #include "render/ColorSpace.h"
 
@@ -165,7 +166,7 @@ ProjectManagerDialog::ProjectManagerDialog(EditorState* state, QWidget* parent) 
     colour_->setObjectName(QStringLiteral("pmColour"));
     colour_->addItem(tr("Each file's own"), QString());
     colour_->addItem(tr("The working space"), QStringLiteral("working"));
-    for (const ColorSpace& cs : colorSpaces()) colour_->addItem(QString::fromStdString(cs.label), QString::fromStdString(cs.id));
+    for (const ColorSpace& cs : colorSpaces()) colour_->addItem(language::engine(cs.label), QString::fromStdString(cs.id));
     form->addRow(tr("Colour space:"), colour_);
     names_ = new QLineEdit(this);
     names_->setObjectName(QStringLiteral("pmNames"));
