@@ -1317,7 +1317,10 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     // MPEG-2: each GOP copied keeps its own mode: a constant rate (it states its vbv_delay), or a variable one (0xFFFF)
     // with the maximum rate and buffer its sequence header states. Where the mode changes the sequence is ended (a
     // sequence_end_code) and the GOP starts one of its own, so no sequence states two; such a GOP must be closed (its
-    // leading B-pictures would refer to a picture the new sequence does not have).
+    // leading B-pictures would refer to a picture the new sequence does not have). A GOP at a constant rate is copied
+    // only into an export at a constant rate: the parts encoded beside it then state their delays too, where an
+    // export at a variable rate would give them 0xFFFF in the same sequence.
+    const bool exportConstant = m->rc_max_rate > 0 && m->rc_max_rate == m->rc_min_rate && m->rc_buffer_size >= 16384;
     int lastMode = -1;
     double lastRate = 0, lastBuffer = 0;
     for (size_t ri = 0; ri < lg->runs_.size(); ++ri) {
@@ -1363,6 +1366,8 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
                 const bool another = lastMode >= 0 && (c.mpegMode != lastMode || (variable && (g.rate != lastRate || g.buffer != lastBuffer)));
                 if (variable && (g.rate <= 0 || g.buffer < 16384 || g.need > g.buffer)) {
                     ok = false;  // (no maximum stated to keep, or pictures its own buffer could not hold)
+                } else if (!variable && !exportConstant) {
+                    ok = false;  // (its delays among the encoded parts' 0xFFFF)
                 } else if (another && !g.idr) {
                     ok = false;  // (an open GOP cannot start a sequence)
                 } else {

@@ -27715,6 +27715,81 @@ private slots:
         QVERIFY2(same >= copied, qPrintable(QStringLiteral("%1 of %2").arg(same).arg(copied)));
     }
 
+    // Nightly 27 Nov: MPEG-2 footage at a constant rate (every vbv_delay set) exported at a variable rate with smart
+    // rendering on. Its GOPs are not copied, since the parts encoded beside them would say 0xFFFF in the same
+    // sequence: every picture of the export says 0xFFFF, and its buffer check holds. And the buffer check says so when
+    // one sequence mixes the two: the constant footage's pictures, then the variable one's, with no sequence end
+    // between them.
+    void mpeg2ConstantFootageInAVariableExport() {
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg to make the files with");
+        auto footage = [&](const std::string& file, const QStringList& rate) {
+            QProcess pr;
+            pr.start(ffmpeg, QStringList{"-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25,noise=alls=10:allf=t",
+                                         "-frames:v", "60", "-c:v", "mpeg2video", "-pix_fmt", "yuv420p", "-g", "12", "-bf", "2", "-field_order",
+                                         "progressive", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"} +
+                                 rate + QStringList{QString::fromStdString(file)});
+            return pr.waitForFinished(300000) && pr.exitCode() == 0;
+        };
+        const QStringList constant{"-b:v", "20M", "-minrate", "20M", "-maxrate", "20M", "-bufsize", "14548992", "-rc_init_occupancy", "14548992",
+                                   "-flags", "+cgop", "-sc_threshold", "1000000000"};
+        const QStringList variable{"-b:v", "6M", "-maxrate", "12M", "-bufsize", "9781248"};
+        const std::string cbrFile = path("mpeg2-cbr-into-vbr.mov");
+        QVERIFY(footage(cbrFile, constant));
+        const HrdReport in = checkHrd(cbrFile);
+        QVERIFY2(in.checked && in.cbr && in.conforms(), in.summary().c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, cbrFile);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 5, 55, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings ex;
+        ex.videoCodec = "mpeg2video";
+        ex.audioCodec = "none";
+        ex.pixFmt = "yuv420p";
+        ex.gop = 12;
+        ex.videoBitrate = 15000000;
+        ex.hrd = "vbr";
+        ex.vbvMaxrate = 20000000;
+        ex.path = path("mpeg2-cbr-into-vbr-out.mov");
+        std::string err;
+        int copied = -1;
+        HrdReport after;
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied, nullptr, nullptr, &after), err.c_str());
+        QCOMPARE(copied, 0);
+        int pictures = 0, delays = 0;
+        for (const CodedPacket& c : codedPackets(ex.path)) {
+            const uint8_t* d = reinterpret_cast<const uint8_t*>(c.data.constData());
+            const size_t n = size_t(c.data.size());
+            for (size_t i = 0; i + 8 <= n; ++i) {
+                if (d[i] || d[i + 1] || d[i + 2] != 1 || d[i + 3] != 0x00) continue;
+                const uint32_t v = uint32_t(d[i + 4]) << 24 | uint32_t(d[i + 5]) << 16 | uint32_t(d[i + 6]) << 8 | d[i + 7];
+                ++pictures;
+                delays += ((v >> 3) & 0xffff) != 0xffff;
+            }
+        }
+        QCOMPARE(pictures, 50);
+        QCOMPARE(delays, 0);
+        const HrdReport r = checkHrd(ex.path);
+        QVERIFY2(r.checked && !r.cbr && r.conforms(), (r.summary() + " " + (r.issues.empty() ? std::string() : r.issues.front().text)).c_str());
+        // One sequence with both: the constant footage's elementary stream (its sequence end taken off, where the
+        // encoder wrote one), then a variable one's. The check finds the change where the variable pictures begin.
+        const std::string cbrStream = path("mpeg2-mixed-a.m2v"), vbrStream = path("mpeg2-mixed-b.m2v"), joined = path("mpeg2-mixed-one-sequence.m2v");
+        QVERIFY(footage(cbrStream, constant) && footage(vbrStream, variable));
+        QFile a(QString::fromStdString(cbrStream)), b(QString::fromStdString(vbrStream)), j(QString::fromStdString(joined));
+        QVERIFY(a.open(QIODevice::ReadOnly) && b.open(QIODevice::ReadOnly) && j.open(QIODevice::WriteOnly));
+        QByteArray first = a.readAll();
+        if (first.endsWith(QByteArray::fromHex("000001b7"))) first.chop(4);
+        QVERIFY(j.write(first) == first.size() && j.write(b.readAll()) > 0);
+        a.close(), b.close(), j.close();
+        const HrdReport mixed = checkHrd(joined);
+        QVERIFY2(mixed.checked && !mixed.conforms(), mixed.summary().c_str());
+        bool said = false;
+        for (const HrdIssue& i : mixed.issues) said = said || (i.kind == "mixed" && i.frame == 60);
+        QVERIFY2(said, mixed.issues.empty() ? mixed.summary().c_str() : (mixed.issues.front().kind + ": " + mixed.issues.front().text).c_str());
+    }
+
     void mpeg2MixedRateJoin() {
         // Two MPEG-2 clips cut together: one at a variable rate (6 Mb/s, no more than 12 Mb/s into 9,781,248 bits,
         // every vbv_delay 0xFFFF, open GOPs), then one at a constant 20 Mb/s into 14,548,992 bits (every vbv_delay

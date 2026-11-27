@@ -41,8 +41,9 @@ namespace montage {
 struct HrdIssue {
     int64_t frame = 0;  // the access unit, in decoding order (0 = the first)
     int64_t shown = 0;  // the frame it shows, in display order (counted from the file's first)
-    // "underflow", "overflow", "initial delay", "rate", "timing", or "concatenation" (HEVC: a join whose buffering
-    // period asks for a removal earlier than the buffer allows, so the decoder waits)
+    // "underflow", "overflow", "initial delay", "rate", "timing", "concatenation" (HEVC: a join whose buffering
+    // period asks for a removal earlier than the buffer allows, so the decoder waits), or "mixed" (MPEG-2: a sequence
+    // whose pictures state their vbv_delay and then 0xFFFF, or the other way)
     std::string kind;
     std::string text;
     int schedule = 0;   // which of the stream's schedules it was found on (an index into HrdReport::schedules)
