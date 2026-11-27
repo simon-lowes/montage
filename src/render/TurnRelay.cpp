@@ -608,6 +608,9 @@ struct RelayBridge::Impl {
         Address peer;
         quint16 peerPort = 0;
         std::function<void(const Message* answer)> done;  // (null: no answer in time)
+        // An unsigned 401 or 438 not taken as a challenge: the request's answer if nothing signed has come by the time
+        // it would be sent again (the relay's own refusal, as of a login whose time is up, is often unsigned).
+        std::shared_ptr<const Message> held;
     };
     struct Alias {
         QUdpSocket* socket = nullptr;
@@ -757,6 +760,10 @@ struct RelayBridge::Impl {
             if (it == requests.end()) continue;
             Request r = std::move(it->second);
             requests.erase(it);
+            if (r.held) {
+                if (r.done) r.done(r.held.get());
+                continue;
+            }
             if (r.unproven) {
                 // (answers came, but none that the login's key had signed: said as it is, where the request's end is told)
                 setError("The TURN relay did not answer in a way Montage could check: " + std::to_string(r.unproven) +
@@ -868,18 +875,38 @@ struct RelayBridge::Impl {
 
     // An answer to a request: the relay's realm and nonce are taken from a 401 or 438 and the request sent again
     // with the login (three times at most); anything else is the request's answer. Once Montage signs its
-    // requests, an answer that is not signed with the same key (any but a 401 or 438, which carry the relay's
-    // challenge) is not used and is counted: the request goes on waiting (over UDP, sent again as before). A refusal
-    // counts as much as a success: an unsigned 437 or 403 from anyone on the way would end a bridge or a join.
+    // requests, an answer that is not signed with the same key is not used and is counted: the request goes on
+    // waiting (over UDP, sent again as before). A refusal counts as much as a success: an unsigned 437 or 403 from
+    // anyone on the way would end a bridge or a join. A 401 or 438 carries the relay's challenge, which a relay may
+    // send unsigned; once Montage signs, only such a challenge's nonce is taken, and only to ask again under the same
+    // realm and key: one that names another realm, or that would end the request (no nonce, or asked three times
+    // already), is counted as unsigned too, and held: it is the request's answer only if nothing signed comes by the
+    // time the request would be sent again (an answer from anyone on the way does not win the race with the relay's).
     void answered(const Message& m, const QByteArray& raw) {
         auto it = requests.find(m.id);
         if (it == requests.end() || (m.type & ~0x0110) != it->second.method) return;
         const int answerCode = (m.type & 0x0110) == kError ? errorCode(m) : 0;
         const bool challenge = answerCode == 401 || answerCode == 438;
-        if (!key.isEmpty() && !challenge && !signedRight(raw)) {
-            ++refused;
-            ++it->second.unproven;
-            return;
+        if (!key.isEmpty() && !signedRight(raw)) {
+            const QByteArray* n = challenge ? m.find(kNonce) : nullptr;
+            const QByteArray* rl = m.find(kRealm);
+            Request& waiting = it->second;
+            const bool again = n && waiting.logins < 3 && (answerCode == 438 || waiting.logins == 0) && (!rl || *rl == realm);
+            if (!again) {
+                ++refused;
+                ++waiting.unproven;
+                if (challenge && !waiting.held) {
+                    waiting.held = std::make_shared<const Message>(m);
+                    waiting.sends = int(std::size(kResendMs));
+                    waiting.resendAt = std::min(waiting.resendAt, now() + kResendMs[0]);
+                }
+                return;
+            }
+            Request r = std::move(waiting);
+            requests.erase(it);
+            nonce = *n;
+            ++r.logins;
+            return send(std::move(r));
         }
         Request r = std::move(it->second);
         requests.erase(it);

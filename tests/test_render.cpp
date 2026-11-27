@@ -27838,6 +27838,71 @@ colorspaces:
         }
     }
 
+    // Nightly 27 Nov: a 401 or 438 challenge that is not signed, made up by someone on the way and arriving ahead of
+    // the relay's own answer to each Refresh, does not end the bridge, put it in error or change its login. With no
+    // nonce, or a realm of its own, it is counted and not used, and the relay's signed answer keeps the address; a
+    // 438 with a nonce and no other realm is asked again under the same login, and the relay's answer is taken in
+    // the end. The relay never sees a login it refuses.
+    void reviewRelayUnsignedChallengesKeepTheBridge() {
+        using namespace montage::output;
+        using montage::reviewtest::FakeRelay;
+        // (the bridges' protocol clock ten times as fast: a Refresh every second rather than every ten seconds)
+        RelayBridge::setTimeScaleForTests(10);
+        auto realTime = qScopeGuard([] { RelayBridge::setTimeScaleForTests(1); });
+        FakeRelay::Config config;
+        config.udp = true;
+        config.user = "reviewer";
+        config.password = "relay-password-27";
+        config.lifetime = 20;
+        const TurnLogin login{"reviewer", "relay-password-27"};
+        FakeRelay relay(config);
+        std::string why;
+        QVERIFY2(relay.start(&why), why.c_str());
+        struct Case {
+            int code;
+            bool realm, nonce;
+        };
+        for (const Case& made : {Case{401, false, false}, Case{401, true, true}, Case{438, true, true}, Case{438, false, true}}) {
+            const QString row = QStringLiteral("%1%2%3").arg(made.code).arg(made.realm ? " with a realm of its own" : "").arg(made.nonce ? " with a nonce" : "");
+            RelayBridge bridge("127.0.0.1", uint16_t(relay.port()), login);
+            struct Said {
+                std::mutex m;
+                std::condition_variable cv;
+                bool done = false;
+                std::string error;
+            };
+            auto said = std::make_shared<Said>();
+            bridge.allocate(4, [said](const std::string& error) {
+                std::lock_guard lock(said->m);
+                said->done = true;
+                said->error = error;
+                said->cv.notify_all();
+            });
+            {
+                std::unique_lock lock(said->m);
+                QVERIFY2(said->cv.wait_for(lock, std::chrono::seconds(15), [&] { return said->done; }) && said->error.empty(), qPrintable(row));
+            }
+            const int refusedBefore = relay.loginsRefused, refreshesBefore = relay.refreshes, madeBefore = relay.challengesMadeUp;
+            relay.madeUpRealm = made.realm;
+            relay.madeUpNonce = made.nonce;
+            relay.madeUpChallenge = made.code;
+            // Three Refreshes kept by the relay (about three seconds), each answered first by a made-up challenge.
+            QElapsedTimer waited;
+            waited.start();
+            while (waited.elapsed() < 12000 && relay.refreshes < refreshesBefore + 3) QThread::msleep(20);
+            relay.madeUpChallenge = 0;
+            QVERIFY2(relay.refreshes >= refreshesBefore + 3, qPrintable(row + "; " + relay.told()));
+            QVERIFY2(relay.challengesMadeUp >= madeBefore + 3, qPrintable(row));
+            QVERIFY2(!bridge.ended(), qPrintable(row));
+            QVERIFY2(bridge.lastError().empty(), qPrintable(row + ": " + QString::fromStdString(bridge.lastError())));
+            QCOMPARE(relay.loginsRefused.load(), refusedBefore);
+            // Counted as not signed: each one with no nonce or another realm, and a 438's once it has been asked
+            // again three times.
+            QVERIFY2(bridge.answersRefused() >= 1, qPrintable(row));
+            QCOMPARE(QString::fromStdString(bridge.state()), QStringLiteral("Carrying over UDP"));
+        }
+    }
+
     // Phase 16: a review only through a relay that is reached over TCP, over TLS, or on ::1 alone, played in Chrome
     // (and Firefox where there is one and the relay's certificate does not stand in its way). The "fake" rows use the
     // test's own relay, which counts what it carries: every picture Montage sends goes to it over that transport,
