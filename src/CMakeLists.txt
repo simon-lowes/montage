@@ -257,6 +257,7 @@ add_library(montage_engine STATIC
   render/Av1FilmGrain.h render/Av1FilmGrain.cpp
   render/Av1Headers.h render/Av1Headers.cpp
   render/Av1GrainExport.h render/Av1GrainExport.cpp
+  render/CodingRegions.h render/CodingRegions.cpp
   render/ProjectManager.h render/ProjectManager.cpp
   render/AutoBroll.h render/AutoBroll.cpp
   render/AutoMix.h render/AutoMix.cpp

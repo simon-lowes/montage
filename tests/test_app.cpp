@@ -25144,6 +25144,77 @@ print("added " + ui["name"])
         else appSettings().remove("export/preset");
     }
 
+    void regionsCodedFinerSetting() {
+        // The export dialog offers Regions Coded Finer for H.264, HEVC and VP9 presets: faces, the clips' masks and a
+        // box at a strength go to the job as its regions, and are kept for the next export.
+        loadDemo();
+        const QVariant lastPreset = appSettings().value("export/preset");
+        auto putBack = qScopeGuard([&] {
+            appSettings().remove("export/regions");
+            appSettings().remove("export/regionsOn");
+            if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
+            else appSettings().remove("export/preset");
+        });
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        int av1 = -1, mp4 = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i) {
+            if (av1 < 0 && exportPresets()[i].settings.videoCodec == "libsvtav1") av1 = int(i);
+            if (mp4 < 0 && exportPresets()[i].settings.videoCodec == "libx264") mp4 = int(i);
+        }
+        QVERIFY(av1 >= 0 && mp4 >= 0);
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* regions = ed.findChild<QCheckBox*>("exportRegions");
+            auto* faces = ed.findChild<QCheckBox*>("exportRegionFaces");
+            auto* masks = ed.findChild<QCheckBox*>("exportRegionMasks");
+            auto* box = ed.findChild<QCheckBox*>("exportRegionBox");
+            auto* left = ed.findChild<QDoubleSpinBox*>("exportRegionLeft");
+            auto* width = ed.findChild<QDoubleSpinBox*>("exportRegionWidth");
+            auto* strength = ed.findChild<QSpinBox*>("exportRegionStrength");
+            QVERIFY(preset && regions && faces && masks && box && left && width && strength);
+            preset->setCurrentIndex(av1);
+            QVERIFY(!regions->isEnabled());
+            preset->setCurrentIndex(mp4);
+            QVERIFY(regions->isEnabled());
+            regions->setChecked(false);
+            QVERIFY(!faces->isEnabled() && !box->isEnabled() && !left->isEnabled());
+            regions->setChecked(true);
+            QVERIFY(faces->isEnabled() && masks->isEnabled() && box->isEnabled());
+            faces->setChecked(false);
+            masks->setChecked(true);
+            box->setChecked(true);
+            QVERIFY(left->isEnabled());
+            left->setValue(0);
+            width->setValue(50);
+            ed.findChild<QDoubleSpinBox*>("exportRegionTop")->setValue(0);
+            ed.findChild<QDoubleSpinBox*>("exportRegionHeight")->setValue(100);
+            strength->setValue(80);
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/regions.mp4");
+            ed.findChild<QPushButton*>("addToQueue")->click();
+            QCOMPARE(queue->jobs().size(), jobs + 1);
+            const std::vector<CodingRegion>& got = queue->jobs().back().settings.regions;
+            QCOMPARE(got.size(), size_t(2));
+            QCOMPARE(got[0].kind, std::string("mask"));
+            QCOMPARE(got[0].strength, 0.8);
+            QCOMPARE(got[1].kind, std::string("box"));
+            QVERIFY(got[1].x == 0 && got[1].y == 0 && got[1].w == 0.5 && got[1].h == 1);
+            QVERIFY(checkCodingRegions(got));
+            queue->remove(queue->jobs().back().id);
+        }
+        {
+            // Kept: the next dialog has them as they were.
+            ExportDialog again(state(), win_.get());
+            QVERIFY(again.findChild<QCheckBox*>("exportRegions")->isChecked());
+            QVERIFY(again.findChild<QCheckBox*>("exportRegionMasks")->isChecked() && again.findChild<QCheckBox*>("exportRegionBox")->isChecked());
+            QVERIFY(!again.findChild<QCheckBox*>("exportRegionFaces")->isChecked());
+            QCOMPARE(again.findChild<QSpinBox*>("exportRegionStrength")->value(), 80);
+            QCOMPARE(again.findChild<QDoubleSpinBox*>("exportRegionWidth")->value(), 50.0);
+        }
+    }
+
     void streamingDialogScoringSettings() {
         // Export Streaming Package's display size and Lowest CRF: off until rates are set per shot, and the package
         // they set up is scored at the size chosen and searched no finer than the CRF given, as its ladder.csv says.

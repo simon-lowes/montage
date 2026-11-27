@@ -11,6 +11,7 @@
 #include "media/Exr.h"
 #include "render/LightLevel.h"
 #include "render/HrdCheck.h"
+#include "render/CodingRegions.h"
 
 namespace montage {
 
@@ -153,6 +154,11 @@ struct ExportSettings {
     // it is encoded and written beside it as AV1 film grain parameters, which the decoder puts back. "measure" (each
     // shot's measured as Measure Grain does), a grain profile's text (one for every shot), or "" / "off".
     std::string filmGrain;
+    // Regions Coded Finer (render/CodingRegions.h): faces, a clip's masks or a box given more of the bits, each frame's
+    // passed to the encoder as regions of interest (x264, x265 and VP9 only; VP9 then codes in its real-time mode).
+    // `regionsGiven`, when set, is told each frame's rectangles (from the export's first) as they are given.
+    std::vector<CodingRegion> regions;
+    std::function<void(FrameTime frame, const std::vector<CodedRegion>& given)> regionsGiven;
     // Adaptive HDR metadata (PQ and HLG exports, render/AdaptiveHdr.h): each scene's reference white, headroom and the
     // gain curve to its SDR rendition (its SDR trim, else Montage's own mapping), carried in HEVC and AV1 video on every
     // frame so displays of any headroom tone map it as the grade did.

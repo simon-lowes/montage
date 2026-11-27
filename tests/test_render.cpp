@@ -109,6 +109,7 @@
 #include "render/EncodeCompare.h"
 #include "render/Scte35.h"
 #include "render/StreamingPackage.h"
+#include "render/RenderFarm.h"
 #include "render/LivePackage.h"
 #include "media/Capture.h"
 #include "media/WhipEndpoint.h"
@@ -35346,6 +35347,228 @@ colorspaces:
             QVERIFY2(shown[size_t(i)].apply && shown[size_t(i)].sameParameters(want), qPrintable(QString("frame %1").arg(i)));
             QVERIFY(beside[size_t(i)].hasGrain && beside[size_t(i)].grain.sameParameters(shown[size_t(i)]) && beside[size_t(i)].grain.seed == shown[size_t(i)].seed);
         }
+    }
+    void regionsCodedFiner() {
+        // A clip of fine texture all over (a still grain panning two pixels a frame) with a box over its left half,
+        // coded finer: at the same file size within 2 % (the export with regions given the bit rate that makes it so),
+        // the left half's luma PSNR is at least 1 dB higher, and the right half's lower, than without regions, for
+        // x264 and x265 (asserted) and VP9 (measured and reported: libvpx takes VP9's regions in its real-time mode
+        // only, and both are made in it). Each is measured against a lossless render of the sequence.
+        QTemporaryDir dir;
+        const int W = 640, H = 360, kFrames = 48;
+        std::vector<uint8_t> texture(size_t(W + 2 * kFrames) * H);
+        {
+            uint32_t r = 12345;
+            std::vector<double> raw(texture.size());
+            for (double& v : raw) {
+                r = r * 1664525u + 1013904223u;
+                v = double(r >> 8) / double(1 << 24);
+            }
+            const int TW = W + 2 * kFrames;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < TW; ++x) {
+                    double sum = 0;
+                    int n = 0;
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const int xx = std::clamp(x + dx, 0, TW - 1), yy = std::clamp(y + dy, 0, H - 1);
+                            sum += raw[size_t(yy) * TW + xx] * (dx == 0 && dy == 0 ? 4 : 1), n += dx == 0 && dy == 0 ? 4 : 1;
+                        }
+                    texture[size_t(y) * TW + x] = uint8_t(std::clamp(std::lround(40 + 170 * sum / n), 16L, 235L));
+                }
+        }
+        const QString file = dir.filePath("texture.y4m");
+        QVERIFY(writeY4m(file, W, H, kFrames, [&](int f, auto& y, auto& cb, auto& cr) {
+            for (int r = 0; r < H; ++r) std::copy_n(&texture[size_t(r) * (W + 2 * kFrames) + size_t(2 * f)], W, &y[size_t(r) * W]);
+            std::fill(cb.begin(), cb.end(), uint8_t(128));
+            std::fill(cr.begin(), cr.end(), uint8_t(128));
+        }, 24));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {24, 1};
+        MediaItem m;
+        QVERIFY(probeMedia(file.toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false).ok);
+        QCOMPARE(s.duration(), FrameTime(kFrames));
+        ExportSettings ref;
+        ref.videoCodec = "ffv1", ref.pixFmt = "yuv420p", ref.audioCodec = "none";
+        ref.path = dir.filePath("reference.mkv").toStdString();
+        std::string err;
+        QVERIFY2(exportSequence(p, s, ref, {}, nullptr, &err), err.c_str());
+        CodingRegion left;
+        left.kind = "box", left.x = 0, left.y = 0, left.w = 0.5, left.h = 1, left.strength = 0.5;
+        struct Case {
+            const char* codec;
+            int64_t bitrate;
+        };
+        for (const Case& c : {Case{"libx264", 700000}, Case{"libx265", 500000}, Case{"libvpx-vp9", 600000}}) {
+            if (!avcodec_find_encoder_by_name(c.codec)) {
+                qInfo("%s: not in this FFmpeg", c.codec);
+                continue;
+            }
+            const bool vp9 = std::strcmp(c.codec, "libvpx-vp9") == 0;
+            ExportSettings plain;
+            plain.videoCodec = c.codec, plain.audioCodec = "none", plain.videoBitrate = c.bitrate, plain.preset = vp9 ? "" : "fast";
+            plain.path = dir.filePath(QString("%1-plain.mkv").arg(c.codec)).toStdString();
+            // (VP9's without regions in the same real-time mode: a region that lies nowhere, a mask of no clip)
+            CodingRegion nowhere;
+            nowhere.kind = "mask", nowhere.clip = std::numeric_limits<Id>::max();
+            if (vp9) plain.regions = {nowhere};
+            QVERIFY2(exportSequence(p, s, plain, {}, nullptr, &err), err.c_str());
+            const qint64 plainSize = QFileInfo(QString::fromStdString(plain.path)).size();
+            ExportSettings finer = plain;
+            finer.regions = {left};
+            std::vector<std::vector<CodedRegion>> given;
+            finer.regionsGiven = [&](FrameTime f, const std::vector<CodedRegion>& g) {
+                if (given.size() <= size_t(f)) given.resize(size_t(f) + 1);
+                given[size_t(f)] = g;
+            };
+            // The bit rate that makes it the plain one's size within 2 %: from the plain one's, each try's size against
+            // its rate (on a log scale) aimed at the plain size.
+            finer.path = dir.filePath(QString("%1-finer.mkv").arg(c.codec)).toStdString();
+            double rate = double(c.bitrate), lastRate = 0, lastSize = 0;
+            qint64 size = 0;
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                finer.videoBitrate = int64_t(std::llround(rate));
+                given.clear();
+                QVERIFY2(exportSequence(p, s, finer, {}, nullptr, &err), err.c_str());
+                size = QFileInfo(QString::fromStdString(finer.path)).size();
+                qInfo("%s with regions at %.0f b/s: %lld bytes (%lld without)", c.codec, rate, (long long)size, (long long)plainSize);
+                if (std::fabs(double(size) / double(plainSize) - 1) <= 0.02) break;
+                double slope = 1;
+                if (lastSize > 0 && std::fabs(std::log(rate / lastRate)) > 1e-3) slope = std::clamp(std::log(double(size) / lastSize) / std::log(rate / lastRate), 0.2, 3.0);
+                lastRate = rate, lastSize = double(size);
+                rate *= std::exp(std::log(double(plainSize) / double(size)) / slope);
+            }
+            QVERIFY2(std::fabs(double(size) / double(plainSize) - 1) <= 0.02, qPrintable(QString("%1: %2 bytes for %3").arg(c.codec).arg(size).arg(plainSize)));
+            QCOMPARE(given.size(), size_t(kFrames));
+            for (const auto& g : given) QVERIFY(g.size() == 1 && g[0] == (CodedRegion{0, 0, W / 2, H, -0.1}));
+            double inF = 0, outF = 0, inP = 0, outP = 0;
+            QVERIFY2(regionPsnr(ref.path, finer.path, given, inF, outF, nullptr, &err), err.c_str());
+            QVERIFY2(regionPsnr(ref.path, plain.path, given, inP, outP, nullptr, &err), err.c_str());
+            qInfo("%s at %lld bytes: the left half %.2f dB with regions, %.2f without (%+.2f); the right half %.2f with, %.2f without (%+.2f)", c.codec,
+                  (long long)size, inF, inP, inF - inP, outF, outP, outF - outP);
+            if (vp9) continue;
+            QVERIFY2(inF >= inP + 1 && outF < outP, qPrintable(QString("%1: left %2 for %3, right %4 for %5").arg(c.codec).arg(inF).arg(inP).arg(outF).arg(outP)));
+        }
+    }
+    void regionsCodedFinerFollowMasks() {
+        // A clip's ellipse mask keyed to move across the frame and grow, on a clip at half size moved off the centre:
+        // the rectangles given to the encoder are the mask's box, through the clip's transform, frame by frame (each
+        // corner where the clip's own frame puts it, rounded outwards to whole pixels of the coded picture, here half
+        // the sequence's size). An inverted mask and a box give their own; faces give none without the model. With
+        // regions that lie nowhere (a clip without masks) the x264 export is byte for byte the one without regions.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360, s.fps = {25, 1};
+        Clip c = makeGeneratorClip(p, "color", 20);
+        c.motion = makeEffect(p, "transform");
+        c.motion.params["scale"] = 50.0;
+        c.motion.params["pos_x"] = 100.0;
+        c.motion.params["pos_y"] = -40.0;
+        Effect e = makeEffect(p, "invert");
+        e.params["mask.shape"] = Param(1.0);
+        e.params["mask.x"].addKey(0, 0.3), e.params["mask.x"].addKey(19, 0.7);
+        e.params["mask.y"].addKey(0, 0.4), e.params["mask.y"].addKey(19, 0.6);
+        e.params["mask.w"].addKey(0, 0.2), e.params["mask.w"].addKey(19, 0.4);
+        e.params["mask.h"] = Param(0.3);
+        c.effects.push_back(e);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        Clip bare = makeGeneratorClip(p, "color", 20);
+        bare.start = 20;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, bare);
+        QCOMPARE(s.videoTracks[0].clips.size(), size_t(2));
+        const Clip& masked = s.videoTracks[0].clips[0];
+        const Id bareId = s.videoTracks[0].clips[1].id;
+        CodingRegion mask;
+        mask.kind = "mask", mask.clip = masked.id, mask.strength = 0.8;
+        const int CW = 320, CH = 180;  // (the coded picture)
+        for (FrameTime f = 0; f < 20; ++f) {
+            const Effect& me = masked.effects.back();
+            // The ellipse's extremes in the clip's own frame (the sequence's size), placed by the transform: the clip's
+            // middle at (320 + 100, 180 - 40), its frame at half size about it.
+            const double cx = me.p("mask.x", f) * 640, cy = me.p("mask.y", f) * 360, a = me.p("mask.w", f) * 640 / 2, b = me.p("mask.h", f) * 360 / 2;
+            auto X = [&](double u) { return 420 + (u - 320) * 0.5; };
+            auto Y = [&](double v) { return 140 + (v - 180) * 0.5; };
+            const CodedRegion want{int(std::floor(X(cx - a) / 2)), int(std::floor(Y(cy - b) / 2)), int(std::ceil(X(cx + a) / 2)), int(std::ceil(Y(cy + b) / 2)),
+                                   codingRegionOffset(0.8)};
+            const std::vector<CodedRegion> got = codedRegionsAt(p, s, {mask}, f, CW, CH);
+            QVERIFY2(got.size() == 1, qPrintable(QString("frame %1: %2 regions").arg(f).arg(got.size())));
+            // (the outline is a polygon of 72 points round the ellipse: its extremes within a pixel of the ellipse's)
+            QVERIFY2(std::abs(got[0].left - want.left) <= 1 && std::abs(got[0].top - want.top) <= 1 && std::abs(got[0].right - want.right) <= 1 &&
+                         std::abs(got[0].bottom - want.bottom) <= 1 && got[0].qoffset == want.qoffset,
+                     qPrintable(QString("frame %1: %2 %3 %4 %5 for %6 %7 %8 %9").arg(f).arg(got[0].left).arg(got[0].top).arg(got[0].right).arg(got[0].bottom)
+                                    .arg(want.left).arg(want.top).arg(want.right).arg(want.bottom)));
+        }
+        // The same frame by frame as the export gives them to x264, and none past the clip.
+        ExportSettings es;
+        es.videoCodec = "libx264", es.audioCodec = "none", es.width = CW, es.height = CH, es.crf = 30, es.preset = "ultrafast";
+        es.path = dir.filePath("mask.mp4").toStdString();
+        es.regions = {mask};
+        std::vector<std::vector<CodedRegion>> given(40);
+        es.regionsGiven = [&](FrameTime f, const std::vector<CodedRegion>& g) { given[size_t(f)] = g; };
+        std::string err;
+        QVERIFY2(exportSequence(p, s, es, {}, nullptr, &err), err.c_str());
+        for (FrameTime f = 0; f < 40; ++f) {
+            const std::vector<CodedRegion> want = f < 20 ? codedRegionsAt(p, s, {mask}, f, CW, CH) : std::vector<CodedRegion>{};
+            const std::vector<CodedRegion>& g = given[size_t(f)];
+            QVERIFY2(g == want, qPrintable(QString("frame %1: %2 given (%3 %4 %5 %6), %7 wanted").arg(f).arg(g.size()).arg(g.empty() ? 0 : g[0].left)
+                                               .arg(g.empty() ? 0 : g[0].top).arg(g.empty() ? 0 : g[0].right).arg(g.empty() ? 0 : g[0].bottom).arg(want.size())));
+        }
+        // A box, the stronger first; an inverted mask none; faces none without a picture.
+        CodingRegion box;
+        box.kind = "box", box.x = 0.25, box.y = 0.5, box.w = 0.5, box.h = 0.5, box.strength = 1;
+        const std::vector<CodedRegion> both = codedRegionsAt(p, s, {mask, box}, 5, CW, CH);
+        QVERIFY(both.size() == 2 && both[0] == (CodedRegion{80, 90, 240, 180, -0.2}));
+        Sequence inverted = s;
+        inverted.videoTracks[0].clips[0].effects.back().params["mask.invert"] = Param(1.0);
+        QVERIFY(codedRegionsAt(p, inverted, {mask}, 5, CW, CH).empty());
+        CodingRegion faces;
+        faces.kind = "faces";
+        QVERIFY(codedRegionsAt(p, s, {faces}, 5, CW, CH).empty());
+        // Refused for encoders that cannot take them, and badly formed ones.
+        ExportSettings av1 = es;
+        av1.videoCodec = "libsvtav1";
+        av1.path = dir.filePath("av1.mkv").toStdString();
+        QVERIFY(!exportSequence(p, s, av1, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("x264"), err.c_str());
+        CodingRegion bad = box;
+        bad.w = 0.9;
+        QVERIFY(!checkCodingRegions({bad}, &err));
+        std::vector<CodingRegion> read;
+        QVERIFY2(codingRegionsFromJson(codingRegionsToJson({mask, box, faces}), read, &err), err.c_str());
+        QVERIFY(read == (std::vector<CodingRegion>{mask, box, faces}));
+        // Kept with an export's settings (a queued or farmed job's), and left out of settings without them.
+        {
+            ExportSettings with;
+            with.regions = {mask, box, faces};
+            const QJsonObject o = exportSettingsToJson(with);
+            ExportSettings back;
+            QVERIFY2(exportSettingsFromJson(o, back, &err), err.c_str());
+            QVERIFY(back.regions == with.regions);
+            QVERIFY(!exportSettingsToJson(ExportSettings{}).contains("regions"));
+            QJsonObject broken = o;
+            broken["regions"] = QJsonArray{QJsonObject{{"kind", "elbow"}}};
+            QVERIFY(!exportSettingsFromJson(broken, back, &err));
+        }
+        // Regions that lie nowhere: byte for byte the export without them.
+        ExportSettings none = es;
+        none.regions.clear();
+        none.regionsGiven = {};
+        none.path = dir.filePath("none.mp4").toStdString();
+        QVERIFY2(exportSequence(p, s, none, {}, nullptr, &err), err.c_str());
+        ExportSettings nowhere = none;
+        CodingRegion bareMask;
+        bareMask.kind = "mask", bareMask.clip = bareId;
+        nowhere.regions = {bareMask};
+        nowhere.path = dir.filePath("nowhere.mp4").toStdString();
+        QVERIFY2(exportSequence(p, s, nowhere, {}, nullptr, &err), err.c_str());
+        QFile a(QString::fromStdString(none.path)), b(QString::fromStdString(nowhere.path));
+        QVERIFY(a.open(QIODevice::ReadOnly) && b.open(QIODevice::ReadOnly));
+        QVERIFY(a.readAll() == b.readAll());
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the

@@ -33,6 +33,7 @@
 
 #include "EditorState.h"
 #include "render/Av1GrainExport.h"
+#include "render/CodingRegions.h"
 #include "RenderQueue.h"
 #include "core/AudioDescription.h"
 #include "core/Surround.h"
@@ -462,6 +463,64 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     grainRow->addWidget(filmGrainProfile_, 1);
     form->addRow(QString(), grainRow);
     connect(filmGrain_, &QCheckBox::toggled, this, [this] { updateControls(); });
+    {
+        // Regions coded finer: faces found in the picture, the clips' masks as they are tracked, and a box, given more
+        // of the bits (the encoder's regions of interest), as remembered from the last export.
+        regions_ = new QCheckBox(tr("Code regions finer"), form_);
+        regions_->setObjectName(QStringLiteral("exportRegions"));
+        regions_->setToolTip(tr("Parts of the picture given more of the bits than the rest, each frame's passed to the encoder: "
+                                "H.264, HEVC and VP9 (VP9 then codes in its real-time mode)"));
+        regionFaces_ = new QCheckBox(tr("Faces"), form_);
+        regionFaces_->setObjectName(QStringLiteral("exportRegionFaces"));
+        regionFaces_->setToolTip(tr("Each face found in the picture, a little larger than the face"));
+        regionMasks_ = new QCheckBox(tr("Clip masks"), form_);
+        regionMasks_->setObjectName(QStringLiteral("exportRegionMasks"));
+        regionMasks_->setToolTip(tr("The bounds of every clip's effect masks, as their keys and trackers move them"));
+        regionBox_ = new QCheckBox(tr("Box"), form_);
+        regionBox_->setObjectName(QStringLiteral("exportRegionBox"));
+        regionBox_->setToolTip(tr("A rectangle of the frame: its left, top, width and height in percent of the frame"));
+        regionStrength_ = new QSpinBox(form_);
+        regionStrength_->setObjectName(QStringLiteral("exportRegionStrength"));
+        regionStrength_->setRange(5, 100);
+        regionStrength_->setSuffix(QStringLiteral(" %"));
+        regionStrength_->setToolTip(tr("How much finer than the rest: at 100 %, a fifth of the encoder's quantiser range"));
+        const char* edgeNames[4] = {"exportRegionLeft", "exportRegionTop", "exportRegionWidth", "exportRegionHeight"};
+        for (int i = 0; i < 4; ++i) {
+            regionBoxEdges_[i] = new QDoubleSpinBox(form_);
+            regionBoxEdges_[i]->setObjectName(QLatin1String(edgeNames[i]));
+            regionBoxEdges_[i]->setRange(i < 2 ? 0 : 1, 100);
+            regionBoxEdges_[i]->setDecimals(1);
+            regionBoxEdges_[i]->setSuffix(QStringLiteral(" %"));
+        }
+        std::vector<CodingRegion> was;
+        codingRegionsFromJson(appSettings().value("export/regions").toString().toStdString(), was);
+        double strength = 0.5;
+        CodingRegion box;
+        box.w = box.h = 0.5, box.x = box.y = 0.25;
+        for (const CodingRegion& r : was) {
+            strength = r.strength;
+            if (r.kind == "faces") regionFaces_->setChecked(true);
+            if (r.kind == "mask") regionMasks_->setChecked(true);
+            if (r.kind == "box") regionBox_->setChecked(true), box = r;
+        }
+        regionStrength_->setValue(int(std::lround(strength * 100)));
+        const double edges[4] = {box.x, box.y, box.w, box.h};
+        for (int i = 0; i < 4; ++i) regionBoxEdges_[i]->setValue(edges[i] * 100);
+        regions_->setChecked(appSettings().value("export/regionsOn", false).toBool());
+        auto* row = new QHBoxLayout;
+        row->addWidget(regions_);
+        row->addWidget(regionStrength_);
+        row->addWidget(regionFaces_);
+        row->addWidget(regionMasks_);
+        row->addStretch(1);
+        form->addRow(QString(), row);
+        auto* boxRow = new QHBoxLayout;
+        boxRow->addWidget(regionBox_);
+        for (QDoubleSpinBox* e : regionBoxEdges_) boxRow->addWidget(e);
+        boxRow->addStretch(1);
+        form->addRow(QString(), boxRow);
+        for (QCheckBox* b : {regions_, regionFaces_, regionMasks_, regionBox_}) connect(b, &QCheckBox::toggled, this, [this] { updateControls(); });
+    }
     adaptiveHdr_ = new QCheckBox(tr("Adaptive HDR metadata (ST 2094-50, any display's headroom)"), form_);
     adaptiveHdr_->setObjectName(QStringLiteral("exportAdaptiveHdr"));
     adaptiveHdr_->setToolTip(tr("Each scene's reference white, headroom and the gain curve to its SDR rendition (the sequence's SDR trim, "
@@ -985,6 +1044,13 @@ void ExportDialog::updateControls() {
     // (with a rate change or Content Credentials too: the parameters go in after the one and before the other)
     filmGrain_->setEnabled(video && (p->settings.videoCodec == "libsvtav1" || p->settings.videoCodec == "libaom-av1" || p->settings.videoCodec == "librav1e"));
     filmGrainProfile_->setEnabled(filmGrain_->isEnabled() && filmGrain_->isChecked());
+    regions_->setEnabled(video && encoderTakesRegions(p->settings.videoCodec));
+    {
+        const bool on = regions_->isEnabled() && regions_->isChecked();
+        for (QCheckBox* b : {regionFaces_, regionMasks_, regionBox_}) b->setEnabled(on);
+        for (QDoubleSpinBox* e : regionBoxEdges_) e->setEnabled(on && regionBox_->isChecked());
+        regionStrength_->setEnabled(on);
+    }
     {
         // HDR10+ is HDR10's: PQ output only.
         const Sequence* sq = state_ ? state_->sequence() : nullptr;
@@ -1317,6 +1383,26 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     if (!s.filmGrain.empty() && !resolveFilmGrainSetting(state_->project(), s.filmGrain)) s.filmGrain = "measure";
     settings.setValue("export/filmGrain", filmGrain_->isChecked());
     settings.setValue("export/filmGrainProfile", filmGrainProfile_->currentData().toString());
+    {
+        std::vector<CodingRegion> regions;
+        const double strength = regionStrength_->value() / 100.0;
+        auto with = [&](const char* kind) {
+            CodingRegion r;
+            r.kind = kind, r.strength = strength;
+            return r;
+        };
+        if (regionFaces_->isChecked()) regions.push_back(with("faces"));
+        if (regionMasks_->isChecked()) regions.push_back(with("mask"));
+        if (regionBox_->isChecked()) {
+            CodingRegion r = with("box");
+            r.x = regionBoxEdges_[0]->value() / 100, r.y = regionBoxEdges_[1]->value() / 100;
+            r.w = std::min(regionBoxEdges_[2]->value() / 100, 1 - r.x), r.h = std::min(regionBoxEdges_[3]->value() / 100, 1 - r.y);
+            if (r.w > 0 && r.h > 0) regions.push_back(r);
+        }
+        if (regions_->isEnabled() && regions_->isChecked()) s.regions = regions;
+        settings.setValue("export/regionsOn", regions_->isChecked());
+        settings.setValue("export/regions", QString::fromStdString(codingRegionsToJson(regions)));
+    }
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
     s.adaptiveHdr = adaptiveHdr_->isEnabled() && adaptiveHdr_->isChecked();

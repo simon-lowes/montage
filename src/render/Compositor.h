@@ -107,6 +107,8 @@ struct ModelStandIns {
     std::function<std::shared_ptr<const std::vector<FaceBox>>(const Image& shown)> faces;
 };
 void setModelStandInsForTesting(ModelStandIns standIns);
+// The faces in a picture as the renderer finds them (YuNet, or what stands in for it in tests); null without the model.
+std::shared_ptr<const std::vector<FaceBox>> facesInPicture(const Image& shown);
 
 // Maps between a clip's own frame (u, v as fractions of its media frame, as
 // masks use) and the sequence frame (pixels) at timeline frame t, following

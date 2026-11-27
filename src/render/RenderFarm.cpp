@@ -585,6 +585,8 @@ QJsonObject exportSettingsToJson(const ExportSettings& s) {
         extra.append(x);
     }
     o["extraAudio"] = extra;
+    // (regions coded finer: only when there are any, so settings without them are written as before)
+    if (!s.regions.empty()) o["regions"] = QJsonDocument::fromJson(QByteArray::fromStdString(codingRegionsToJson(s.regions))).array();
     return o;
 }
 
@@ -610,6 +612,12 @@ bool exportSettingsFromJson(const QJsonObject& o, ExportSettings& s, std::string
             if (r.error.empty()) r.error = xr.error;
             s.extraAudio.push_back(std::move(a));
         }
+    }
+    if (o.contains("regions")) {
+        std::string why;
+        if (!o.value("regions").isArray() ||
+            !codingRegionsFromJson(QJsonDocument(o.value("regions").toArray()).toJson(QJsonDocument::Compact).toStdString(), s.regions, &why))
+            if (r.error.empty()) r.error = "the export setting \"regions\" is not a list of regions" + (why.empty() ? std::string() : ": " + why);
     }
     if (!r.error.empty()) return fail(error, r.error);
     return true;

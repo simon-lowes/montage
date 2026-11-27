@@ -13868,6 +13868,9 @@ void McpServer::Impl::addTools() {
             "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"An HDR sequence delivered in SDR: \"\" Montage's roll-off, or ITU-R BT.2446 Method A or C (a sequence graded scene-referred goes through its output transform instead)"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "film_grain":{"type":"string","description":"AV1 exports: carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned, or the name it was saved under (the project's, else the user's library's): that grain for every shot; \"off\" (the default): none"},
+            "regions":{"type":"array","description":"Regions coded finer (H.264, HEVC and VP9): parts of the picture given more of the bits, each frame's passed to the encoder as regions of interest. Each is {kind: \"box\" (x, y, w, h: fractions of the frame, from its top left), \"mask\" (the masks of clip `clip`, or of every clip with masks; `effect` for one effect's mask, as tracked) or \"faces\" (each face found), strength: 0 to 1, default 0.5 (at 1, a fifth of the encoder's quantiser range finer)}; where they overlap the stronger wins. VP9 with regions codes in its real-time mode, as libvpx takes them only there. In a streaming package, boxes and masks go to its H.264 and HEVC rungs, each at its own size",
+                "items":{"type":"object","properties":{"kind":{"type":"string","enum":["box","mask","faces"]},"strength":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"w":{"type":"number"},"h":{"type":"number"},"clip":{"type":"integer"},"effect":{"type":"integer"}}}},
+            "region_report":{"type":"boolean","default":false,"description":"With regions: the export made again without them and both measured against a lossless render: luma PSNR inside and outside the regions, VMAF of the whole picture, and both sizes"},
             "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
@@ -14182,6 +14185,22 @@ void McpServer::Impl::addTools() {
             st.hdr10Plus = a.value("hdr10plus").toBool();
             st.filmGrain = str(a, "film_grain", "").toStdString();
             if (std::string e; !resolveFilmGrainSetting(l.project, st.filmGrain, &e)) throw ArgError{QString::fromStdString(e)};
+            if (a.contains("regions")) {
+                const QJsonValue rv = a.value("regions");
+                if (!rv.isArray()) throw ArgError{"\"regions\" is a list of boxes, masks and faces"};
+                if (std::string e; !codingRegionsFromJson(QJsonDocument(rv.toArray()).toJson(QJsonDocument::Compact).toStdString(), st.regions, &e))
+                    throw ArgError{QString::fromStdString(e)};
+                if (!st.regions.empty() && a.contains("farm")) throw ArgError{"Regions coded finer are made here, not on a render farm"};
+            }
+            const bool regionReport = a.value("region_report").toBool() && !st.regions.empty();
+            std::vector<std::vector<CodedRegion>> regionsGiven;
+            if (regionReport)
+                st.regionsGiven = [&regionsGiven](FrameTime f, const std::vector<CodedRegion>& g) {
+                    if (f >= 0) {
+                        if (regionsGiven.size() <= size_t(f)) regionsGiven.resize(size_t(f) + 1);
+                        regionsGiven[size_t(f)] = g;
+                    }
+                };
             st.adaptiveHdr = a.value("adaptive_hdr").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
@@ -14371,6 +14390,22 @@ void McpServer::Impl::addTools() {
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
             // Smart rendering: pictures of untouched footage copied from the source, not encoded again.
             o["copied_frames"] = copiedFrames;
+            if (regionReport) {
+                // (the same export made again without its regions, both measured inside and outside them)
+                RegionReport rr;
+                if (!regionCodingReport(l.project, s, st, regionsGiven, rr, cancelFlag(), &err)) return fail(QString::fromStdString(err));
+                o["regions"] = QJsonObject{{"bytes", double(rr.bytes)},
+                                           {"bytes_without", double(rr.bytesWithout)},
+                                           {"psnr_inside", rr.psnrInside},
+                                           {"psnr_outside", rr.psnrOutside},
+                                           {"psnr_inside_without", rr.psnrInsideWithout},
+                                           {"psnr_outside_without", rr.psnrOutsideWithout},
+                                           {"vmaf", rr.vmaf},
+                                           {"vmaf_without", rr.vmafWithout},
+                                           {"frames_with_regions", double(rr.framesWithRegions)},
+                                           {"inside_share", rr.insideShare}};
+                text += QStringLiteral("\n") + QString::fromStdString(rr.summary());
+            }
             if (copiedFrames > 0) text += QStringLiteral("\n%1 frame%2 copied from the source as coded (smart rendering)").arg(copiedFrames).arg(copiedFrames == 1 ? "" : "s");
             if (hrd.checked || !hrd.error.empty()) {
                 // (checked after a long-GOP smart render or a stated HRD; a file that does not keep it is kept, warned about)

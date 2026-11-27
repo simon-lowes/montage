@@ -5702,6 +5702,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
 }
 
 void setModelStandInsForTesting(ModelStandIns standIns) { gStandIns = std::move(standIns); }
+std::shared_ptr<const std::vector<FaceBox>> facesInPicture(const Image& shown) { return facesIn(shown); }
 
 uint64_t transformLayerDraws() { return gTransformDraws.load(); }
 
