@@ -34,22 +34,54 @@ EncodeFolderScan::EncodeFolderScan(EncodeFolder folder, qint64 settleMs) : folde
 
 QString EncodeFolderScan::ledgerPath() const { return QDir(folder_.output).filePath(QStringLiteral(".montage-encoded.json")); }
 
+namespace {
+QString entryKey(const QString& input, const QString& preset) { return input + QLatin1Char('\n') + preset; }
+}  // namespace
+
+QString EncodeFolderScan::key(const QString& file) const {
+    return entryKey(QDir::cleanPath(QDir(folder_.input).absoluteFilePath(file)), folder_.preset);
+}
+
 void EncodeFolderScan::reload() {
     ledger_.clear();
     QFile f(ledgerPath());
     if (!f.open(QIODevice::ReadOnly)) return;
-    const QJsonObject files = QJsonDocument::fromJson(f.readAll()).object().value("files").toObject();
+    const QJsonObject all = QJsonDocument::fromJson(f.readAll()).object();
+    // (a ledger of before: by bare name, whichever folder or preset it was)
+    const QJsonObject files = all.value("files").toObject();
     for (auto it = files.begin(); it != files.end(); ++it) {
         const QJsonObject o = it.value().toObject();
-        ledger_[it.key()] = {qint64(o.value("size").toDouble()), qint64(o.value("modified").toDouble()), o.value("output").toString()};
+        ledger_[it.key()] = {qint64(o.value("size").toDouble()), qint64(o.value("modified").toDouble()), o.value("output").toString(), {}, {}};
+    }
+    for (const QJsonValue& v : all.value("encodes").toArray()) {
+        const QJsonObject o = v.toObject();
+        const QString input = o.value("input").toString(), preset = o.value("preset").toString();
+        if (input.isEmpty()) continue;
+        ledger_[entryKey(input, preset)] = {qint64(o.value("size").toDouble()), qint64(o.value("modified").toDouble()), o.value("output").toString(), input, preset};
     }
 }
 
-bool EncodeFolderScan::encoded(const QString& file) const {
-    const auto it = ledger_.find(file);
-    if (it == ledger_.end()) return false;
+const EncodeFolderScan::Done* EncodeFolderScan::entryFor(const QString& file) const {
+    if (const auto it = ledger_.find(key(file)); it != ledger_.end()) return &it->second;
+    const auto old = ledger_.find(file);
+    if (old == ledger_.end()) return nullptr;
     const QFileInfo fi(QDir(folder_.input).filePath(file));
-    return fi.size() == it->second.size && fi.lastModified().toMSecsSinceEpoch() == it->second.modified;
+    return fi.size() == old->second.size && fi.lastModified().toMSecsSinceEpoch() == old->second.modified ? &old->second : nullptr;
+}
+
+bool EncodeFolderScan::encoded(const QString& file) const {
+    const Done* d = entryFor(file);
+    if (!d) return false;
+    const QFileInfo fi(QDir(folder_.input).filePath(file));
+    return fi.size() == d->size && fi.lastModified().toMSecsSinceEpoch() == d->modified;
+}
+
+int EncodeFolderScan::encodedCount() const {
+    const QString input = QDir::cleanPath(QDir(folder_.input).absolutePath());
+    int n = 0;
+    for (const auto& [k, d] : ledger_)
+        n += d.input.isEmpty() || (d.preset == folder_.preset && QFileInfo(d.input).absolutePath() == input);
+    return n;
 }
 
 std::vector<QString> EncodeFolderScan::ready(qint64 now) {
@@ -94,16 +126,29 @@ bool EncodeFolderScan::markDone(const QString& file, const QString& output) {
         d.size = fi.size(), d.modified = fi.lastModified().toMSecsSinceEpoch();
     }
     d.output = output;
+    d.input = QDir::cleanPath(QDir(folder_.input).absoluteFilePath(file));
+    d.preset = folder_.preset;
     if (t != taken_.end()) taken_.erase(t);
-    reload();  // (another process may have added to it)
-    ledger_[file] = d;
+    reload();  // (another process, or another folder sharing the output folder, may have added to it)
+    // (its entry of before, by bare name, now this one's)
+    if (const auto old = ledger_.find(file); old != ledger_.end() && entryFor(file) == &old->second) ledger_.erase(old);
+    ledger_[key(file)] = d;
     QJsonObject files;
-    for (const auto& [name, done] : ledger_)
-        files[name] = QJsonObject{{"size", double(done.size)}, {"modified", double(done.modified)}, {"output", done.output}};
+    QJsonArray encodes;
+    for (const auto& [name, done] : ledger_) {
+        QJsonObject o{{"size", double(done.size)}, {"modified", double(done.modified)}, {"output", done.output}};
+        if (done.input.isEmpty()) {
+            files[name] = o;
+            continue;
+        }
+        o["input"] = done.input;
+        o["preset"] = done.preset;
+        encodes.append(o);
+    }
     QDir().mkpath(folder_.output);
     QSaveFile f(ledgerPath());
     if (!f.open(QIODevice::WriteOnly)) return false;
-    f.write(QJsonDocument(QJsonObject{{"files", files}}).toJson());
+    f.write(QJsonDocument(QJsonObject{{"files", files}, {"encodes", encodes}}).toJson());
     return f.commit();
 }
 
@@ -114,19 +159,24 @@ void EncodeFolderScan::letGo(const QString& file) {
     }
 }
 
-QString EncodeFolderScan::outputFor(const QString& file) const {
+QString EncodeFolderScan::outputFor(const QString& file, const std::vector<QString>& busy) const {
     const ExportPreset* p = findExportPreset(folder_.preset.toStdString());
     const QString ext = p ? QString::fromStdString(p->extension) : QStringLiteral("mp4");
     const QString base = QFileInfo(file).completeBaseName();
+    const Done* mine = entryFor(file);
     std::set<QString> taken;
     for (const auto& [name, done] : ledger_)
-        if (name != file) taken.insert(QFileInfo(done.output).fileName());
+        if (&done != mine) taken.insert(QFileInfo(done.output).fileName());
+    // (what other encodes are writing now: in the output folder, by name)
+    const QString into = QDir::cleanPath(QDir(folder_.output).absolutePath());
+    for (const QString& b : busy)
+        if (QDir::cleanPath(QFileInfo(b).absolutePath()) == into) taken.insert(QFileInfo(b).fileName());
     for (int n = 1;; ++n) {
         const QString name = (n == 1 ? base : QStringLiteral("%1 %2").arg(base).arg(n)) + '.' + ext;
         const QString path = QDir(folder_.output).filePath(name);
-        // (Its own earlier encode is written over; another file's, or a file not from here, is not.)
-        const auto mine = ledger_.find(file);
-        const bool own = mine != ledger_.end() && QFileInfo(mine->second.output).fileName() == name;
+        // (Its own earlier encode is written over; another file's, another folder's or preset's, or a file not from
+        // here, is not.)
+        const bool own = mine && QFileInfo(mine->output).fileName() == name && !taken.count(name);
         if (own || (!taken.count(name) && !QFileInfo::exists(path))) return path;
     }
 }

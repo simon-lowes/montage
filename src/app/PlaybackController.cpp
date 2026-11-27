@@ -9,6 +9,7 @@
 #include "core/Adr.h"
 #include "media/Loudness.h"
 #include "render/RenderCache.h"
+#include "render/Av1GrainExport.h"
 
 #include <QAudioDevice>
 #include <QAudioFormat>
@@ -65,6 +66,7 @@ public:
         double hdrWhite = 203;                         // the nits that display shows SDR white at
         double hdrHeadroom = 1;                        // and its headroom (its peak over SDR white), for adaptive HDR metadata
         bool scopeWorking = false;  // the scopes read the working space (a sequence graded scene-referred)
+        std::shared_ptr<const GrainAsDecoded> grain;  // Grain as Decoded: the cleaned sequence with its grain put back
     };
     void request(const Request& r) {
         {
@@ -178,7 +180,7 @@ private:
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
                r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr &&
                r.trim == ctx_.trim && r.gpu == ctx_.gpu && r.hdrCalibration == ctx_.hdrCalibration && r.hdrWhite == ctx_.hdrWhite &&
-               r.hdrHeadroom == ctx_.hdrHeadroom && r.scopeWorking == ctx_.scopeWorking;
+               r.hdrHeadroom == ctx_.hdrHeadroom && r.scopeWorking == ctx_.scopeWorking && r.grain == ctx_.grain;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -194,6 +196,21 @@ private:
         o.trimTarget = r.trim;
         o.displaySpace = "rec709";  // HDR and wide-gamut sequences are previewed tone mapped to SDR
         o.gpu = r.gpu;
+        if (r.grain) {
+            // Grain as Decoded: the cleaned sequence, in its own space, given its grain as the decoder gives it, then
+            // shown as Rec.709.
+            RenderOptions g = o;
+            g.displaySpace.clear();
+            g.gpu = false;
+            g.trimTarget.clear();
+            Image img = renderProgramFrame(r.grain->cleanProject(), r.grain->cleanSequence(), t, g);
+            r.grain->apply(t, img);
+            if (!sameColorSpace(sequenceColorSpace(*s), rec709Space())) convertColor(img, sequenceColorSpace(*s), rec709Space(), s->hdrPeakNits);
+            Rendered out;
+            out.view = QImage(img.width, img.height, QImage::Format_RGBA8888);
+            toRgba8(img, out.view.bits(), size_t(out.view.bytesPerLine()));
+            return out;
+        }
         // A rendered preview of this frame (kept at playback's scale) is used as it is, paused too.
         RenderOptions co = o;
         if (r.cacheScale > 0) co.scale = r.cacheScale;
@@ -985,6 +1002,12 @@ void PlaybackController::setScopesReadWorking(bool on) {
     requestFrame();
 }
 
+void PlaybackController::setGrainAsDecoded(std::shared_ptr<const GrainAsDecoded> g) {
+    if (grain_ == g) return;
+    grain_ = std::move(g);
+    requestFrame();
+}
+
 void PlaybackController::setStereoView(StereoView v) {
     if (stereoView_ == v) return;
     stereoView_ = v;
@@ -1005,7 +1028,7 @@ void PlaybackController::requestFrame() {
     const bool preview = picturePreview_ && !isPlaying();
     worker_->request({preview ? picturePreview_ : project_, sequenceId_, preview && picturePreviewAt_ >= 0 ? picturePreviewAt_ : position_, renderScale(),
                       useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_,
-                      hdrHeadroom_, scopesWorking_});
+                      hdrHeadroom_, scopesWorking_, grain_});
 }
 
 void PlaybackController::setPicturePreview(std::shared_ptr<const Project> p, FrameTime at) {
@@ -1229,7 +1252,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_, scopesWorking_});
+        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_, scopesWorking_, grain_});
         syncOutput();
         emit positionChanged(t);
     }

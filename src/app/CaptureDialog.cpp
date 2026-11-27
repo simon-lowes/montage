@@ -23,8 +23,11 @@
 #include <QStandardPaths>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <algorithm>
+#include <cmath>
 
 #include "EditorState.h"
+#include "FittedScroll.h"
 #include "ReferenceOutputPanel.h"
 #include "Settings.h"
 #include "audio/AudioDevice.h"
@@ -63,7 +66,11 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     setObjectName(QStringLiteral("captureDialog"));
     connect(state_, &EditorState::projectChanged, this, &CaptureDialog::markersToChapters);
     QSettings settings = appSettings();
-    auto* layout = new QVBoxLayout(this);
+    // (the rows scroll on a screen too short for them; the buttons stay below)
+    auto* outer = new QVBoxLayout(this);
+    auto* rows = new QWidget(this);
+    auto* layout = new QVBoxLayout(rows);
+    layout->setContentsMargins(0, 0, 0, 0);
     auto* intro = new QLabel(tr("Records a live feed (a network stream or a camera, capture card or sound card on this computer) "
                                 "with its timecode. A QuickTime recording is in the Captures bin a second after it starts and "
                                 "grows there as it records, so it can be cut in straight away."),
@@ -343,7 +350,10 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     record_->setObjectName(QStringLiteral("captureRecord"));
     connect(record_, &QPushButton::clicked, this, [this] { isRecording() ? stop() : (void)record(); });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::hide);  // (recording goes on with it hidden)
-    layout->addWidget(buttons);
+    auto* scroll = new FittedScroll(rows, this);
+    scroll->setObjectName(QStringLiteral("captureRows"));
+    outer->addWidget(scroll, 1);
+    outer->addWidget(buttons);
 
     tick_ = new QTimer(this);
     tick_->setInterval(250);
@@ -470,7 +480,7 @@ bool CaptureDialog::startLive(CaptureSettings& cs) {
     // (the feed's own ad cues, an MPEG transport stream's)
     cs.onCue = [p](const std::vector<uint8_t>& section, double zero, double at) { p->cueFromFeed(section, zero, at); };
     liveChapters_ = 0;
-    liveMarkers_.clear();
+    liveMarks_.clear();
     packager_ = std::move(packager);
     QSettings settings = appSettings();
     settings.setValue(QStringLiteral("capture/liveFolder"), o.folder);
@@ -480,6 +490,9 @@ bool CaptureDialog::startLive(CaptureSettings& cs) {
 
 void CaptureDialog::markersToChapters() {
     if (!packager_ || !recording_ || !imported_ || !packager_->status().running) return;
+    // The markers on the recording's clips now, each place and name once, in the order of their places.
+    std::vector<LiveMark> now;
+    auto same = [](const LiveMark& a, const LiveMark& b) { return std::abs(a.at - b.at) < 1e-6 && a.name == b.name; };
     for (const Sequence& seq : state_->project().sequences) {
         const double fps = seq.fps.valid() ? seq.fps.toDouble() : 25;
         for (const auto* tracks : {&seq.videoTracks, &seq.audioTracks})
@@ -487,14 +500,39 @@ void CaptureDialog::markersToChapters() {
                 for (const Clip& c : t.clips) {
                     if (c.mediaId != imported_) continue;
                     for (const Marker& m : c.markers) {
-                        if (m.shotChange || m.adBreak || !liveMarkers_.insert({c.id, m.t, m.name}).second) continue;
-                        ++liveChapters_;
+                        if (m.shotChange || m.adBreak) continue;
                         // (its place in the recording: the clip's source frames, as its in-point, at the sequence's rate)
-                        const std::string title = m.name.empty() ? tr("Chapter %1").arg(liveChapters_).toStdString() : m.name;
-                        packager_->chapter(title, std::max(0.0, (double(m.t) + m.sub) / fps));
+                        LiveMark k{std::max(0.0, (double(m.t) + m.sub) / fps), m.name, {}, {}};
+                        if (std::none_of(now.begin(), now.end(), [&](const LiveMark& o) { return same(o, k); })) now.push_back(std::move(k));
                     }
                 }
     }
+    std::stable_sort(now.begin(), now.end(), [](const LiveMark& a, const LiveMark& b) { return a.at < b.at; });
+    // Those made chapters already keep them; of the rest, a marker that is gone and one that is new, in order, are
+    // the same marker moved or renamed, its chapter moved or renamed; the others that are new become chapters.
+    std::vector<LiveMark> before = std::move(liveMarks_);
+    std::vector<bool> kept(before.size(), false);
+    std::vector<LiveMark*> fresh;
+    for (LiveMark& k : now) {
+        size_t i = 0;
+        while (i < before.size() && (kept[i] || !same(before[i], k))) ++i;
+        if (i < before.size()) {
+            kept[i] = true;
+            k.key = before[i].key, k.title = before[i].title;
+        } else {
+            fresh.push_back(&k);
+        }
+    }
+    size_t gone = 0;
+    for (LiveMark* k : fresh) {
+        while (gone < before.size() && kept[gone]) ++gone;
+        const LiveMark* was = gone < before.size() ? &before[gone++] : nullptr;
+        if (!was) ++liveChapters_;
+        k->key = was ? was->key : std::to_string(++liveMarkKeys_);
+        k->title = !k->name.empty() ? k->name : was && was->name.empty() ? was->title : tr("Chapter %1").arg(liveChapters_).toStdString();
+        packager_->chapter(k->title, k->at, k->key);
+    }
+    liveMarks_ = std::move(now);
 }
 
 void CaptureDialog::endLive() {

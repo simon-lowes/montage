@@ -97,6 +97,7 @@ void ViewerWidget::setFocusPeaking(bool on) {
         // (turned on again later, no old frame's peaking is shown while the new one is worked out)
         peaked_ = QImage();
         peakedKey_ = -1;
+        ++peakingTurn_;  // (and what is being peaked now is not kept when it lands)
     }
     update();
 }
@@ -182,7 +183,7 @@ QImage ViewerWidget::paintedPicture() {
         // Worked out off the interface thread; one at a time, so frames that came meanwhile are passed over for the latest.
         peakingWatch_ = new QFutureWatcher<QImage>(this);
         const qint64 key = exposed.cacheKey();
-        connect(peakingWatch_, &QFutureWatcher<QImage>::finished, this, [this, key, state] {
+        connect(peakingWatch_, &QFutureWatcher<QImage>::finished, this, [this, key, state, turn = peakingTurn_] {
             const QImage result = peakingWatch_->result();
             peakingWatch_->deleteLater();
             peakingWatch_ = nullptr;
@@ -190,7 +191,7 @@ QImage ViewerWidget::paintedPicture() {
             QImage exposedNow;
             QSize sizeNow;
             const QString stateNow = peakingWanted(exposedNow, sizeNow);
-            if (peaking_ && !(peakedKey_ == exposedNow.cacheKey() && peakedState_ == stateNow && !peaked_.isNull())) {
+            if (peaking_ && turn == peakingTurn_ && !(peakedKey_ == exposedNow.cacheKey() && peakedState_ == stateNow && !peaked_.isNull())) {
                 peaked_ = result;
                 peakedKey_ = key;
                 peakedState_ = state;
@@ -486,6 +487,28 @@ bool ViewerWidget::hdrShowing() const {
 #else
     return false;
 #endif
+}
+
+QString hdrShownAsText(bool wanted, bool showing, Transfer described, Transfer picture, const QString& why) {
+    if (!wanted) return {};
+    if (showing) {
+        if (described == Transfer::Hlg) return ViewerWidget::tr("HLG");
+        if (described == Transfer::Pq)
+            return picture == Transfer::Hlg ? ViewerWidget::tr("PQ (converted from HLG)") : ViewerWidget::tr("PQ");
+        return ViewerWidget::tr("HDR");
+    }
+    // (an SDR picture: no reason; the display's own refusal said as the menu says it; any other reason as it is)
+    if (why.isEmpty()) return ViewerWidget::tr("SDR");
+    if (why == ViewerWidget::tr("This display does not show HDR")) return ViewerWidget::tr("SDR: this display does not take HDR");
+    return ViewerWidget::tr("SDR: %1").arg(why.left(1).toLower() + why.mid(1));
+}
+
+QString ViewerWidget::hdrShownAs() const {
+    Transfer described = Transfer::Linear;
+#ifdef MONTAGE_HDR_VIEWER
+    if (surface_) described = surface_->describedTransfer();
+#endif
+    return hdrShownAsText(hdrWanted_, hdrShowing(), described, hdrPicture_ ? hdrPicture_->transfer : Transfer::Pq, hdrStatus_);
 }
 
 double ViewerWidget::hdrSdrWhiteNits() const {

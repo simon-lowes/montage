@@ -25,8 +25,14 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
 // render() of a clip effect or a transition into `into`, a texture of the plug-ins' OpenGL context (render/OfxGl.h)
 // w x h, RGBA float, top row first (one of the GPU compositor's, which shares them): a picture that comes as a handle
 // is copied into it on the GPU, not read back; one through shared memory is written into it. `inPlace` says which.
+// A clip effect's `a` may be left out (null) for `from`, its picture as a texture of that context too: then given to
+// the host as a DMA-BUF it imports where both sides can (sendsInputHandles), else read back from it.
 bool renderInto(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
-                const Image* b, unsigned into, const FrameFetch* fetch, std::string* error, const ColorSpace* working, bool* inPlace = nullptr);
+                const Image* b, unsigned into, const FrameFetch* fetch, std::string* error, const ColorSpace* working, bool* inPlace = nullptr,
+                unsigned from = 0);
+// Whether a clip effect's picture in is given to hosts as a handle now (Montage exporting DMA-BUFs, and asking for
+// handles back); why not, otherwise.
+bool sendsInputHandles(std::string* why = nullptr);
 // Whether hosts are asked for their pictures as handles now (as below); why not, otherwise.
 bool asksForHandles(std::string* why = nullptr);
 
@@ -44,6 +50,10 @@ struct PictureStats {
     long handles = 0, sharedMemory = 0;
     long asked = 0;    // renders a handle was asked for (one that came back through shared memory is counted in both)
     long inPlace = 0;  // handles copied on the GPU into the texture renderInto was given (counted in handles too)
+    // Clip effects' pictures in from renderInto's `from`: given to the host as handles, or read back for it (when
+    // handles are not sent, or the host asked for the picture through shared memory, saying why: lastInput).
+    long inputHandles = 0, inputReadBacks = 0;
+    std::string lastInput;
     std::string last;  // the last picture's, as MONTAGE_GPU_LOG says it ("... through shared memory: <why>")
 };
 PictureStats pictureStats();

@@ -102,10 +102,13 @@ private:
     };
     static bool splitObus(const uint8_t* data, size_t size, std::vector<Obu>& out, std::string* error);
     bool readSequence(const uint8_t* p, size_t n, std::string* error);
+    bool sequenceHeader(const uint8_t* p, size_t n, std::string* error);  // one met in the stream (or its configuration)
     bool readFrameHeader(const uint8_t* p, size_t n, const Obu& obu, Parsed& out, std::string* error);
     void finishFrame(const Parsed& f);
 
     Av1Sequence seq_;
+    std::vector<uint8_t> seqBytes_;  // the sequence header's payload as read
+    bool keyFrameDue_ = false;       // it changed: a shown key frame must come next
     Slot slots_[8];
     // The frame being read: its header seen, and whether its tile groups have ended.
     bool seenFrameHeader_ = false;

@@ -40,6 +40,7 @@
 #include "render/VfxShots.h"
 #include "Settings.h"
 #include "ThumbnailCache.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -83,7 +84,7 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
     });
     // Growing media: files being written looked at every second.
     clock_ = [] { return QDateTime::currentMSecsSinceEpoch(); };
-    growingRefreshMs_ = appSettings().value(QStringLiteral("media/growingRefreshMs"), 15000).toInt();
+    growingRefreshMs_ = prefs::whole(QStringLiteral("media/growingRefreshMs"));
     growthTimer_ = new QTimer(this);
     growthTimer_->setInterval(1000);
     connect(growthTimer_, &QTimer::timeout, this, &EditorState::checkGrowingMedia);
@@ -749,7 +750,7 @@ bool EditorState::isMediaGrowing(Id media) const {
 
 void EditorState::setGrowingRefreshMs(int ms) {
     growingRefreshMs_ = std::max(0, ms);
-    appSettings().setValue(QStringLiteral("media/growingRefreshMs"), growingRefreshMs_);
+    prefs::set(QStringLiteral("media/growingRefreshMs"), growingRefreshMs_);
 }
 
 void EditorState::refreshGrowingMedia() {
@@ -806,8 +807,9 @@ void EditorState::startAudioDecode(const MediaItem& m) {
 void EditorState::startCredentialRead(const MediaItem& m) {
     if (m.path.empty() || m.subclipOf || m.kind == MediaKind::Sequence || !contentCredentialsAvailable()) return;
     const std::string path = m.path;
-    const std::string file = mediaFileOnDisk(path);
-    if (!contentCredentialsFormat(file)) return;
+    // (credentials in the file, or in a manifest beside it, its sequence's frames or its package)
+    const std::string file = contentCredentialsFormat(mediaFileOnDisk(path)) ? mediaFileOnDisk(path) : path;
+    if (!contentCredentialsFormat(file) && !hasCredentialSidecar(file)) return;
     QPointer<EditorState> self(this);
     const uint64_t generation = projectGeneration_;
     const int read = ++credentialReads_[path];
@@ -1023,7 +1025,7 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
     std::vector<MediaItem> items;
     // Numbered frames in render formats, two or more of a run chosen: one image sequence each.
     std::map<std::string, std::pair<ImageSequence, int>> runs;
-    if (appSettings().value(QStringLiteral("import/imageSequences"), true).toBool())
+    if (prefs::toggle(QStringLiteral("import/imageSequences")))
         for (const QString& path : paths)
             if (ImageSequence seq; isFrameFormat(path.toStdString()) && detectImageSequence(QFileInfo(path).absoluteFilePath().toStdString(), seq)) {
                 auto& run = runs[seq.pattern];
@@ -1052,7 +1054,7 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
             continue;
         }
         // A layered Photoshop file, in layers or as a sequence when so preferred (a step of its own).
-        if (const QString how = appSettings().value(QStringLiteral("import/psd"), QStringLiteral("merged")).toString();
+        if (const QString how = prefs::text(QStringLiteral("import/psd"));
             !fi.isDir() && isPsdFile(path.toStdString()) && how != QLatin1String("merged")) {
             QString err;
             const auto layers = importPsd(path, how == QLatin1String("sequence") ? PsdImport::Sequence : PsdImport::Layers, &err);
@@ -1175,7 +1177,7 @@ std::vector<Id> EditorState::placeSound(const QString& path, int64_t first, int6
         return {};
     }
     QString file = QFileInfo(path).absoluteFilePath();
-    if (appSettings().value(QStringLiteral("soundLibrary/copyToProject"), false).toBool() && !path_.isEmpty()) {
+    if (prefs::toggle(QStringLiteral("soundLibrary/copyToProject")) && !path_.isEmpty()) {
         // Into the project's folder, once: a file of that name there with the same bytes is this one.
         const QDir dir(QFileInfo(path_).absolutePath() + QStringLiteral("/Sound Effects"));
         dir.mkpath(QStringLiteral("."));

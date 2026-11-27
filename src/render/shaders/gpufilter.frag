@@ -58,6 +58,8 @@
 // smear along the flow.
 // 56 a Shape layer's paints (render/ShapeRaster): each pixel's tile's commands, each path's coverage from its backdrop and
 // lines, its paint laid down over what is below, groups through their opacity; p[1].x the tiles across.
+// 54 ACES Gamut Compress (render/Gamut's AcesGamutCompressor), on the working space's light in AP1: p[1].x the curve, p[1].y
+// 1 to take compressed colours back out; p[2..4].xyz into AP1 by rows, p[5..7].xyz back.
 // 73 and above are gpueffects.frag's (the compositor draws those modes with it).
 // 72 Gaussian splats blended (render/SplatRender): a linear cloud's colour (p[1].x set) brought to display values under
 // its coverage, and the whole the layer's opacity (p[1].y) of that.
@@ -324,7 +326,8 @@ float smoothstepFx(float a, float b, float x) {
     const float u = clamp((x - a) / (b - a), 0.0, 1.0);
     return u * u * (3.0 - 2.0 * u);
 }
-// Halftone's dot: 1 inside it, for the cell round (x, y) on the grid turned by (c, s).
+// Halftone's dot: 1 inside it, for the cell round (x, y) on the grid turned by (c, s), and the most of the eight round
+// it whose dots reach (x, y) (a dark cell's dot is wider than the cell: drawn into its neighbours round, as on the CPU).
 // (a place within 1/1000 of a cell of the screen's lines is taken as on them, as on the CPU: at 45 degrees -x * s + y * c is
 // exactly 0 on the diagonal, which fused multiply-adds turn into a tiny value either side of it, and with it the cell)
 float onScreenLine(float u) {
@@ -334,13 +337,21 @@ float onScreenLine(float u) {
 float halftoneDot(ivec2 size, float x, float y, float c, float s, int channel) {
     const float cell = p[1].x;
     const float u = onScreenLine((x * c + y * s) / cell), v = onScreenLine((-x * s + y * c) / cell);
-    const float cu = floor(u) + 0.5, cv = floor(v) + 0.5;
-    const vec4 at = sampleEdge(size, (cu * c - cv * s) * cell, (cu * s + cv * c) * cell, 1);
-    const float a = at.a > 0.0 ? at.a : 1.0;
-    const float tone = clamp((channel < 0 ? lumaOf(at) : at[channel]) / a, 0.0, 1.0);
-    const float r = cell * sqrt((1.0 - tone) / 3.14159265358979);
-    const float d = length(vec2(u - cu, v - cv)) * cell;
-    return smoothstepFx(r + 0.5, r - 0.5, d);
+    const float reach = cell * sqrt(1.0 / 3.14159265358979) + 0.5;  // (the widest dot's soft edge)
+    float most = 0.0;
+    for (int k = 0; k < 9; ++k) {
+        // (its own cell first, then the neighbours whose widest dot could reach it)
+        const int o = k == 0 ? 4 : (k <= 4 ? k - 1 : k);
+        const float cu = floor(u) + float(o % 3 - 1) + 0.5, cv = floor(v) + float(o / 3 - 1) + 0.5;
+        const float d = length(vec2(u - cu, v - cv)) * cell;
+        if (k > 0 && !(d < reach)) continue;
+        const vec4 at = sampleEdge(size, (cu * c - cv * s) * cell, (cu * s + cv * c) * cell, 1);
+        const float a = at.a > 0.0 ? at.a : 1.0;
+        const float tone = clamp((channel < 0 ? lumaOf(at) : at[channel]) / a, 0.0, 1.0);
+        const float r = cell * sqrt((1.0 - tone) / 3.14159265358979);
+        most = max(most, smoothstepFx(r + 0.5, r - 0.5, d));
+    }
+    return most;
 }
 
 // The table's i-th texel, its rows read as one run.
@@ -453,6 +464,17 @@ vec3 glareLight(int gx, int gy, int f, float threshold) {
 // Lens Blur's weight of a pixel's layers (bin0 in x, the nearer one's share in y) for layer k.
 float lbWeight(vec4 b, int k) { return int(b.x) == k ? 1.0 - b.y : int(b.x) + 1 == k ? b.y : 0.0; }
 
+// ACES's reference gamut compression's distance curve (render/Gamut's compressDistance, its power 1.2).
+float rgcDistance(float dist, float lim, float thr, bool inverse) {
+    if (dist < thr) return dist;
+    const float pwr = 1.2;
+    const float scl = (lim - thr) / pow(pow((1.0 - thr) / (lim - thr), -pwr) - 1.0, 1.0 / pwr);
+    const float nd = (dist - thr) / scl, q = pow(nd, pwr);
+    if (!inverse) return thr + scl * nd / pow(1.0 + q, 1.0 / pwr);
+    if (dist >= thr + scl) return dist;  // (beyond what the forward curve reaches)
+    return thr + scl * pow(-(q / (q - 1.0)), 1.0 / pwr);
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const ivec2 size = textureSize(srcTex, 0);
@@ -468,6 +490,22 @@ void main() {
             }
         }
         fragColor = c * p[1].y;
+        return;
+    }
+    if (mode == 54) {
+        if (px.a <= 0.0) {
+            fragColor = px;
+            return;
+        }
+        const int tf = int(p[1].x);
+        const vec3 l = linearOf(tf, px.rgb / px.a);
+        vec3 c = vec3(dot(p[2].xyz, l), dot(p[3].xyz, l), dot(p[4].xyz, l));
+        const float ach = max(c.r, max(c.g, c.b));
+        if (ach != 0.0) {
+            const vec3 lim = vec3(1.147, 1.264, 1.312), thr = vec3(0.815, 0.803, 0.880);
+            for (int k = 0; k < 3; ++k) c[k] = ach - rgcDistance((ach - c[k]) / abs(ach), lim[k], thr[k], p[1].y > 0.5) * abs(ach);
+        }
+        fragColor = vec4(codeOf(tf, vec3(dot(p[5].xyz, c), dot(p[6].xyz, c), dot(p[7].xyz, c))) * px.a, px.a);
         return;
     }
     if (mode == 1) {
@@ -1504,8 +1542,11 @@ void main() {
             const int ox = int(p[2].y), oy = int(p[2].z), w = int(p[2].w), h = int(p[3].x), halfW = int(p[3].y);
             vec4 c = vec4(0.0);
             float a = 0.0;
-            for (int yy = 2 * y; yy < min(h, 2 * y + 2); ++yy)
-                for (int x2 = 2 * xx; x2 < min(w, 2 * xx + 2); ++x2) {
+            // (over the two by two below, by constant bounds: Direct3D's HLSL would unroll it, and cannot by these)
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int yy = 2 * y + dy, x2 = 2 * xx + dx;
+                    if (yy >= h || x2 >= w) continue;
                     const ivec2 at = ivec2(ox + x2, oy + yy);
                     const float ai = fromS ? texelFetch(extra, at + ivec2(halfW, 0), 0).x : texelFetch(srcTex, at + ivec2(halfW, 0), 0).x;
                     if (ai <= 0.0) continue;

@@ -691,6 +691,7 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
         filled.normals.resize(nv * 3, 0.0f), filled.uvs.resize(nv * 2, 0.0f), filled.tangents.resize(nv * 4, 0.0f), filled.colors.resize(nv * 4, 1.0f);
     }
     const PosedTriangles& T = whole ? s.triangles : filled;
+    const bool ownLit = !s.ownLight.empty() && s.ownLight.size() == nv * 6;
     const size_t nt = T.indices.size() / 3;
     for (const uint32_t i : T.indices)
         if (i >= nv) return out;  // (indices past the vertices: nothing drawn)
@@ -848,6 +849,32 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
             return true;
         };
         float base[4] = {m.baseColor[0], m.baseColor[1], m.baseColor[2], m.baseColor[3]}, c[4];
+        if (ownLit) {
+            // (as a 3D title lights itself: its own light at the corners, the shadows of that light's map)
+            double f[6];
+            for (size_t k = 0; k < 6; ++k) f[k] = lerp(s.ownLight, 6, k, wt);
+            float pic[4] = {0, 0, 0, 0};
+            if (f[2] != 0 && tex(m.baseTexture, pic) && pic[3] > 1e-6f)
+                for (int k = 0; k < 3; ++k) pic[k] /= pic[3];
+            double vis = 1;
+            if (s.ownLightShadows >= 0 && size_t(s.ownLightShadows) < s.lights.size() && shadows[size_t(s.ownLightShadows)]) {
+                V3 L;
+                double E[3];
+                if (incoming(s.lights[size_t(s.ownLightShadows)], P, L, E)) {
+                    const V3 pa = position(ix[0]), pb = position(ix[1]), pc = position(ix[2]);
+                    V3 geo = unit(cross(pb - pa, pc - pa));
+                    if (dot(geo, unit(eye - P)) < 0) geo = geo * -1;
+                    vis = lightVisible(*shadows[size_t(s.ownLightShadows)], P, std::max(0.0, dot(geo, L)));
+                }
+            }
+            const double lm = s.ownAmbient + (f[0] - s.ownAmbient) * vis, la = f[1] * vis;
+            for (int k = 0; k < 3; ++k) {
+                const double b = pic[k] * f[2] + f[3 + k];
+                rgba[k] = float(std::pow(std::clamp(b * lm + la, 0.0, 1.0), 2.4));
+            }
+            rgba[3] = 1;
+            return;
+        }
         float paint[3] = {0, 0, 0};
         const float painted = paintAt(tri, P, paint);
         // (a picture projected as it is, over what is there)

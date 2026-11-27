@@ -54,7 +54,11 @@ QJsonObject optionsJson(const ConsolidateOptions& o) {
     return QJsonObject{{"folder", QString::fromStdString(o.folder)}, {"name", QString::fromStdString(o.name)},
                        {"sequences", sequences},                     {"trim", o.trim},
                        {"handles", o.handles},                       {"codec", QString::fromStdString(o.codec)},
-                       {"keepUnused", o.keepUnused}};
+                       {"keepUnused", o.keepUnused},
+                       // (the choices for finishing: render/ProjectManager.h)
+                       {"choices", QJsonDocument::fromJson(QByteArray::fromStdString(consolidateChoicesJson(o))).object()},
+                       {"credentialCertificate", QString::fromStdString(o.credentialCertificate)},
+                       {"credentialKey", QString::fromStdString(o.credentialKey)}};
 }
 
 ConsolidateOptions optionsFromJson(const QJsonObject& j) {
@@ -66,6 +70,11 @@ ConsolidateOptions optionsFromJson(const QJsonObject& j) {
     o.handles = j.value("handles").toDouble(1.0);
     o.codec = j.value("codec").toString(QStringLiteral("prores_ks")).toStdString();
     o.keepUnused = j.value("keepUnused").toBool();
+    // (a job kept by an earlier version has none, and its choices are the defaults)
+    if (j.value("choices").isObject())
+        applyConsolidateChoices(QJsonDocument(j.value("choices").toObject()).toJson(QJsonDocument::Compact).toStdString(), o);
+    o.credentialCertificate = j.value("credentialCertificate").toString().toStdString();
+    o.credentialKey = j.value("credentialKey").toString().toStdString();
     return o;
 }
 
@@ -172,6 +181,7 @@ DialogJobs::DialogJobs(QObject* parent, const QString& folder) : QObject(parent)
                     r.step = paused ? QStringLiteral("paused") : QString();
                     r.progress = std::clamp(t->shared->done.load(), r.progress, 1.0);
                 });
+                if (paused) QTimer::singleShot(0, this, &DialogJobs::startWaitingTasks);  // (its place goes to one waiting)
             }
         }
         if (any) emit tasksChanged();
@@ -549,8 +559,7 @@ QString DialogJobs::startOn(const Project& project, EditorState* state, const QS
     const QString id = t->id;
     marks_[id] = t->project;
     tasks_.push_back(std::move(t));
-    startTask(*tasks_.back());
-    emit tasksChanged();
+    startWaitingTasks();  // (at once, unless as many as background jobs may run are running)
     return id;
 }
 
@@ -576,7 +585,11 @@ void DialogJobs::startTask(Task& t) {
                     sh->paused = true;
                 }
             }
+            if (!sh->paused.load() || sh->cancel.load()) return;
+            // Paused, it gives its thread back to the pool while it waits, and takes one again to go on.
+            taskThreads()->releaseThread();
             while (sh->paused.load() && !sh->cancel.load()) QThread::msleep(20);
+            taskThreads()->reserveThread();
         };
         r.progress(0);
         // (stopped by hand, it ends well only where it made what it was for and stopped only what came after, a
@@ -597,18 +610,21 @@ void DialogJobs::startTask(Task& t) {
 }
 
 void DialogJobs::startWaitingTasks() {
-    // (tasks a dialog starts run at once; those taken up again share the places background jobs have)
+    // (as many tasks run at once as background jobs may, jobs::atOnce; one paused gives its place up, and those taken
+    // up again wait their turn with the rest)
     int running = 0;
-    for (const auto& t : tasks_) running += t->started ? 1 : 0;
+    for (const auto& t : tasks_) running += t->started && !t->shared->paused.load() ? 1 : 0;
     for (const auto& t : tasks_) {
         if (t->started) continue;
         if (running >= jobs::atOnce()) break;
-        emit resumed(t->title);
+        if (t->resumed) emit resumed(t->title);
         startTask(*t);
         ++running;
     }
     emit tasksChanged();
 }
+
+int DialogJobs::taskThreadsInUse() { return taskThreads()->activeThreadCount(); }
 
 QString DialogJobs::movedNote(const Project& then, const Project& now, const QJsonObject& input) {
     const Id sequence = Id(input.value("sequence").toString().toULongLong());
@@ -773,7 +789,7 @@ TaskOutcome DialogJobs::watch(const QString& id, QWidget* parent) {
 std::vector<DialogJobs::TaskInfo> DialogJobs::tasks() const {
     std::vector<TaskInfo> out;
     for (const auto& t : tasks_)
-        out.push_back({t->id, t->kind, t->title, t->shared->done.load(), t->started, t->shared->paused.load(), {}});
+        out.push_back({t->id, t->kind, t->title, t->shared->done.load(), t->started, t->shared->paused.load(), {}, t->input});
     return out;
 }
 

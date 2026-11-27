@@ -344,61 +344,80 @@ std::string mapLines(const std::string& sdp, const std::function<QString(const Q
 
 const char* transportName(RelayAddress::Transport t) { return t == RelayAddress::Transport::Tls ? "TLS" : t == RelayAddress::Transport::Tcp ? "TCP" : "UDP"; }
 
-// The one thread every bridge's sockets and timers live on: begun with the first bridge and ended with the last.
+// The threads the bridges' sockets and timers live on, a thread for every four bridges (kBridgesPerThread): each begun
+// with its first bridge and ended with its last. A bridge goes on the busiest thread that has room, so a few bridges
+// share one thread, and many are spread over a thread per four.
+constexpr int kBridgesPerThread = 4;
 struct BridgeThread {
-    std::mutex life;  // held while it is begun or ended
     std::thread thread;
-    int users = 0;
+    int users = 0;  // (under BridgeThreads::life)
     std::mutex m;
     std::condition_variable cv;
     QObject* home = nullptr;  // (under m)
     QEventLoop* loop = nullptr;
+};
+struct BridgeThreads {
+    std::mutex life;  // held while a thread is chosen, begun or ended
+    std::vector<std::unique_ptr<BridgeThread>> all;
     std::atomic<int> running{0};
     std::atomic<quint64> started{0};
 };
-BridgeThread& bridgeThread() {
-    static BridgeThread* t = new BridgeThread;  // (never destroyed: a bridge may outlive the statics)
+BridgeThreads& bridgeThreads() {
+    static BridgeThreads* t = new BridgeThreads;  // (never destroyed: a bridge may outlive the statics)
     return *t;
 }
-QObject* joinBridgeThread() {
-    BridgeThread& t = bridgeThread();
-    std::lock_guard life(t.life);
-    if (t.users++ == 0) {
-        t.thread = std::thread([&t] {
+// A bridge's thread, chosen and begun if it was not running.
+BridgeThread* joinBridgeThread() {
+    BridgeThreads& all = bridgeThreads();
+    std::lock_guard life(all.life);
+    BridgeThread* t = nullptr;
+    for (const auto& c : all.all)
+        if (c->users > 0 && c->users < kBridgesPerThread && (!t || c->users > t->users)) t = c.get();
+    if (!t)
+        for (const auto& c : all.all)
+            if (c->users == 0) {
+                t = c.get();
+                break;
+            }
+    if (!t) t = all.all.emplace_back(std::make_unique<BridgeThread>()).get();
+    if (t->users++ == 0) {
+        t->thread = std::thread([t, &all] {
             QEventLoop l;
             QObject h;
             {
-                std::lock_guard lock(t.m);
-                t.home = &h;
-                t.loop = &l;
+                std::lock_guard lock(t->m);
+                t->home = &h;
+                t->loop = &l;
             }
-            ++t.running;
-            ++t.started;
-            t.cv.notify_all();
+            ++all.running;
+            ++all.started;
+            t->cv.notify_all();
             l.exec();
             QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
             {
-                std::lock_guard lock(t.m);
-                t.home = nullptr;
-                t.loop = nullptr;
+                std::lock_guard lock(t->m);
+                t->home = nullptr;
+                t->loop = nullptr;
             }
-            --t.running;
+            --all.running;
         });
-        std::unique_lock lock(t.m);
-        t.cv.wait(lock, [&] { return t.home != nullptr; });
+        std::unique_lock lock(t->m);
+        t->cv.wait(lock, [&] { return t->home != nullptr; });
     }
-    std::lock_guard lock(t.m);
-    return t.home;
+    return t;
 }
-void leaveBridgeThread() {
-    BridgeThread& t = bridgeThread();
-    std::lock_guard life(t.life);
-    if (--t.users > 0) return;
+QObject* homeOf(BridgeThread* t) {
+    std::lock_guard lock(t->m);
+    return t->home;
+}
+void leaveBridgeThread(BridgeThread* t) {
+    std::lock_guard life(bridgeThreads().life);
+    if (--t->users > 0) return;
     {
-        std::lock_guard lock(t.m);
-        if (t.loop) QMetaObject::invokeMethod(t.loop, &QEventLoop::quit, Qt::QueuedConnection);
+        std::lock_guard lock(t->m);
+        if (t->loop) QMetaObject::invokeMethod(t->loop, &QEventLoop::quit, Qt::QueuedConnection);
     }
-    if (t.thread.joinable()) t.thread.join();
+    if (t->thread.joinable()) t->thread.join();
 }
 
 }  // namespace
@@ -559,8 +578,10 @@ std::string answerAlsoThroughRelay(const std::string& sdp, const std::string& re
     });
 }
 
-// A bridge's sockets and timer live on the bridges' thread, and everything below `// (on the thread)` runs there.
+// A bridge's sockets and timer live on its thread (one of the bridges' threads), and everything below `// (on the
+// thread)` runs there.
 struct RelayBridge::Impl {
+    BridgeThread* thread = nullptr;  // the one it lives on
     RelayAddress relay;
     QByteArray pin;  // (the certificate's SHA-256, when one is pinned)
     TurnLogin login;
@@ -587,6 +608,9 @@ struct RelayBridge::Impl {
         Address peer;
         quint16 peerPort = 0;
         std::function<void(const Message* answer)> done;  // (null: no answer in time)
+        // An unsigned 401 or 438 not taken as a challenge: the request's answer if nothing signed has come by the time
+        // it would be sent again (the relay's own refusal, as of a login whose time is up, is often unsigned).
+        std::shared_ptr<const Message> held;
     };
     struct Alias {
         QUdpSocket* socket = nullptr;
@@ -736,6 +760,10 @@ struct RelayBridge::Impl {
             if (it == requests.end()) continue;
             Request r = std::move(it->second);
             requests.erase(it);
+            if (r.held) {
+                if (r.done) r.done(r.held.get());
+                continue;
+            }
             if (r.unproven) {
                 // (answers came, but none that the login's key had signed: said as it is, where the request's end is told)
                 setError("The TURN relay did not answer in a way Montage could check: " + std::to_string(r.unproven) +
@@ -847,18 +875,38 @@ struct RelayBridge::Impl {
 
     // An answer to a request: the relay's realm and nonce are taken from a 401 or 438 and the request sent again
     // with the login (three times at most); anything else is the request's answer. Once Montage signs its
-    // requests, an answer that is not signed with the same key (any but a 401 or 438, which carry the relay's
-    // challenge) is not used and is counted: the request goes on waiting (over UDP, sent again as before). A refusal
-    // counts as much as a success: an unsigned 437 or 403 from anyone on the way would end a bridge or a join.
+    // requests, an answer that is not signed with the same key is not used and is counted: the request goes on
+    // waiting (over UDP, sent again as before). A refusal counts as much as a success: an unsigned 437 or 403 from
+    // anyone on the way would end a bridge or a join. A 401 or 438 carries the relay's challenge, which a relay may
+    // send unsigned; once Montage signs, only such a challenge's nonce is taken, and only to ask again under the same
+    // realm and key: one that names another realm, or that would end the request (no nonce, or asked three times
+    // already), is counted as unsigned too, and held: it is the request's answer only if nothing signed comes by the
+    // time the request would be sent again (an answer from anyone on the way does not win the race with the relay's).
     void answered(const Message& m, const QByteArray& raw) {
         auto it = requests.find(m.id);
         if (it == requests.end() || (m.type & ~0x0110) != it->second.method) return;
         const int answerCode = (m.type & 0x0110) == kError ? errorCode(m) : 0;
         const bool challenge = answerCode == 401 || answerCode == 438;
-        if (!key.isEmpty() && !challenge && !signedRight(raw)) {
-            ++refused;
-            ++it->second.unproven;
-            return;
+        if (!key.isEmpty() && !signedRight(raw)) {
+            const QByteArray* n = challenge ? m.find(kNonce) : nullptr;
+            const QByteArray* rl = m.find(kRealm);
+            Request& waiting = it->second;
+            const bool again = n && waiting.logins < 3 && (answerCode == 438 || waiting.logins == 0) && (!rl || *rl == realm);
+            if (!again) {
+                ++refused;
+                ++waiting.unproven;
+                if (challenge && !waiting.held) {
+                    waiting.held = std::make_shared<const Message>(m);
+                    waiting.sends = int(std::size(kResendMs));
+                    waiting.resendAt = std::min(waiting.resendAt, now() + kResendMs[0]);
+                }
+                return;
+            }
+            Request r = std::move(waiting);
+            requests.erase(it);
+            nonce = *n;
+            ++r.logins;
+            return send(std::move(r));
         }
         Request r = std::move(it->second);
         requests.erase(it);
@@ -1276,17 +1324,14 @@ RelayBridge::RelayBridge(RelayAddress relay, TurnLogin login) : d_(std::make_uni
     d_->pin = QByteArray::fromHex(QByteArray::fromStdString(relayPin(relay.pin)));
     d_->relay = std::move(relay);
     d_->login = std::move(login);
-    QObject* home = joinBridgeThread();
-    QMetaObject::invokeMethod(home, [d = d_.get()] { d->begin(); }, Qt::BlockingQueuedConnection);
+    d_->thread = joinBridgeThread();
+    QMetaObject::invokeMethod(homeOf(d_->thread), [d = d_.get()] { d->begin(); }, Qt::BlockingQueuedConnection);
 }
 
 RelayBridge::~RelayBridge() {
     Impl* d = d_.get();
-    QObject* home = nullptr;
-    {
-        std::lock_guard lock(bridgeThread().m);
-        home = bridgeThread().home;
-    }
+    BridgeThread* thread = d->thread;
+    QObject* home = homeOf(thread);
     if (home && QThread::currentThread() == home->thread()) {
         // (let go of on the bridges' own thread, which a callback should not do: nothing is waited for, and the
         // thread is left from another)
@@ -1295,10 +1340,10 @@ RelayBridge::~RelayBridge() {
         d_.release();
         QMetaObject::invokeMethod(
             home,
-            [d] {
+            [d, thread] {
                 delete d->ctx;
                 delete d;
-                std::thread([] { leaveBridgeThread(); }).detach();
+                std::thread([thread] { leaveBridgeThread(thread); }).detach();
             },
             Qt::QueuedConnection);
         return;
@@ -1318,7 +1363,7 @@ RelayBridge::~RelayBridge() {
             d->timer = nullptr;
         },
         Qt::BlockingQueuedConnection);
-    leaveBridgeThread();
+    leaveBridgeThread(thread);
 }
 
 void RelayBridge::letGo() {
@@ -1392,13 +1437,13 @@ std::string RelayBridge::state() const {
     return d_->stateText;
 }
 
-int RelayBridge::threads() { return bridgeThread().running; }
+int RelayBridge::threads() { return bridgeThreads().running; }
 
 namespace {
 std::atomic<int> relayTimeScale{1};
 }
 void RelayBridge::setTimeScaleForTests(int scale) { relayTimeScale = std::clamp(scale, 1, 20); }
 int RelayBridge::timeScale() { return relayTimeScale; }
-uint64_t RelayBridge::threadsStarted() { return bridgeThread().started; }
+uint64_t RelayBridge::threadsStarted() { return bridgeThreads().started; }
 
 }  // namespace montage::output

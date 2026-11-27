@@ -11,6 +11,7 @@
 #include "media/Exr.h"
 #include "render/LightLevel.h"
 #include "render/HrdCheck.h"
+#include "render/CodingRegions.h"
 
 namespace montage {
 
@@ -153,6 +154,11 @@ struct ExportSettings {
     // it is encoded and written beside it as AV1 film grain parameters, which the decoder puts back. "measure" (each
     // shot's measured as Measure Grain does), a grain profile's text (one for every shot), or "" / "off".
     std::string filmGrain;
+    // Regions Coded Finer (render/CodingRegions.h): faces, a clip's masks or a box given more of the bits, each frame's
+    // passed to the encoder as regions of interest (x264, x265 and VP9 only; VP9 then codes in its real-time mode).
+    // `regionsGiven`, when set, is told each frame's rectangles (from the export's first) as they are given.
+    std::vector<CodingRegion> regions;
+    std::function<void(FrameTime frame, const std::vector<CodedRegion>& given)> regionsGiven;
     // Adaptive HDR metadata (PQ and HLG exports, render/AdaptiveHdr.h): each scene's reference white, headroom and the
     // gain curve to its SDR rendition (its SDR trim, else Montage's own mapping), carried in HEVC and AV1 video on every
     // frame so displays of any headroom tone map it as the grade did.
@@ -247,14 +253,18 @@ struct ExportSettings {
     std::vector<Id> extraCaptions;
     // Content Credentials (media/ContentCredentials.h): the file signed with this certificate chain and key (PEM),
     // saying Montage made it, how AI was used in the range exported, and carrying its sources' own credentials. Empty =
-    // not signed. An export that cannot be signed (a format that cannot hold them, a refused certificate) fails, leaving
-    // no file.
+    // not signed. An export that cannot be signed (a refused certificate) fails, leaving no file. A file that cannot hold
+    // them (MXF, Matroska...) and numbered frames are signed in a manifest beside them. `credentialRedact`: the sources'
+    // assertions that name people are left out of the new manifest.
     std::string credentialCertificate, credentialKey;
     bool credentialAllowAiTraining = false;
+    bool credentialRedact = false;
 };
 
-// Whether an export with these settings can be signed with Content Credentials: a single file of a kind that holds them.
+// Whether an export with these settings can be signed with Content Credentials: in the file, or beside it (not a GIF).
 bool exportCarriesCredentials(const ExportSettings& s);
+// What its credentials are signed for: the file, or its numbered frames' pattern as the export names them.
+std::string exportSignedPath(const ExportSettings& s);
 
 struct ExportPreset {
     std::string name;

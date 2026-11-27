@@ -854,13 +854,16 @@ bool loadGltfSplats(const std::string& path, SplatCloud& out, std::string* error
     // Accessors with no data behind them (no buffer view) are zeros of any length: what they unpack to is held to what
     // a small file may make (64 MB of values in all), as the mesh loader holds its accessors.
     constexpr cgltf_size kMostUnbacked = cgltf_size(1) << 24;
-    cgltf_size unbacked = 0;
-    for (cgltf_size i = 0; i < data->accessors_count; ++i) {
-        if (data->accessors[i].buffer_view) continue;
-        const cgltf_size n = data->accessors[i].count * std::max<cgltf_size>(1, cgltf_num_components(data->accessors[i].type));
-        if (data->accessors[i].count > kMostUnbacked || n > kMostUnbacked || (unbacked += n) > kMostUnbacked)
-            return fail(path + " is larger than Montage can load");
+    {
+        cgltf_size unbacked = 0;
+        for (cgltf_size i = 0; i < data->accessors_count; ++i) {
+            if (data->accessors[i].buffer_view) continue;
+            const cgltf_size n = data->accessors[i].count * std::max<cgltf_size>(1, cgltf_num_components(data->accessors[i].type));
+            if (data->accessors[i].count > kMostUnbacked || n > kMostUnbacked || (unbacked += n) > kMostUnbacked)
+                return fail(path + " is larger than Montage can load");
+        }
     }
+    cgltf_size unbacked = 0;  // (the zeros unpacked so far)
 
     std::vector<SplatCloud> parts;
     std::vector<std::string> notes;
@@ -932,20 +935,25 @@ bool loadGltfSplats(const std::string& path, SplatCloud& out, std::string* error
             if (find("KHR_gaussian_splatting:SH_DEGREE_4_COEF_0", cgltf_type_vec3)) note("The colour's fourth-degree harmonics are left out");
             SplatCloud part;
             part.count = size_t(n), part.shDegree = degree;
+            // (Each time zeros are unpacked counts towards the same 64 MB: one accessor can serve every value of a
+            // primitive, and many nodes can show one mesh, so counting each accessor once does not hold them.)
+            bool tooLarge = false;
             auto unpack = [&](const cgltf_accessor* a, size_t components, std::vector<float>& to) {
+                if (!a->buffer_view && (unbacked += cgltf_size(n) * components) > kMostUnbacked) return !(tooLarge = true);
                 to.assign(size_t(n) * components, 0.0f);
                 return cgltf_accessor_unpack_floats(a, to.data(), cgltf_size(to.size())) == cgltf_size(to.size());
             };
             bool whole = unpack(position, 3, part.positions) && unpack(rotation, 4, part.rotations) && unpack(scale, 3, part.scales) &&
                          unpack(opacity, 1, part.opacities) && unpack(constant, 3, part.colors);
             const size_t K = size_t(part.shCoefficients());
-            part.sh.assign(size_t(n) * K * 3, 0.0f);
             std::vector<float> one;
+            if (whole) part.sh.assign(size_t(n) * K * 3, 0.0f);
             for (size_t j = 0; j < higher.size() && whole; ++j) {
                 whole = unpack(higher[j], 3, one);
                 for (size_t i = 0; i < size_t(n) && whole; ++i)
                     for (size_t ch = 0; ch < 3; ++ch) part.sh[(i * K + j) * 3 + ch] = one[i * 3 + ch];
             }
+            if (tooLarge) return fail(path + " is larger than Montage can load");
             if (!whole) return fail(path + " has splats whose values cannot be read");
             for (float& v : part.scales) v = v >= 0 ? v : 0.0f;                              // (never negative; not a number hidden later)
             for (float& v : part.opacities) v = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;

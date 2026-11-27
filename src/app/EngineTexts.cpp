@@ -881,6 +881,7 @@ const char* const kTexts[] = {
     QT_TRANSLATE_NOOP("Engine", "Linear Rec.709 (scene)"),
     QT_TRANSLATE_NOOP("Engine", "Lip Height"),
     QT_TRANSLATE_NOOP("Engine", "Lip Sync"),
+    QT_TRANSLATE_NOOP("Engine", "Lit as Drawn Alone (in the 3D layers' scene)"),
     QT_TRANSLATE_NOOP("Engine", "Lit by a Light"),
     QT_TRANSLATE_NOOP("Engine", "Lit by the Scene"),
     QT_TRANSLATE_NOOP("Engine", "Little Planet"),

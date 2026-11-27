@@ -1,4 +1,5 @@
 #include "ModelFiles.h"
+#include "core/Preferences.h"
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -10,6 +11,7 @@
 namespace montage {
 
 std::string modelsDirectory() {
+    if (const QString chosen = prefs::text(QStringLiteral("models/folder")); !chosen.isEmpty()) return chosen.toStdString();
     QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     if (dir.isEmpty()) dir = QDir::homePath() + "/.montage";
     return dir.toStdString();

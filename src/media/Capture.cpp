@@ -1559,6 +1559,13 @@ void Recorder::run() {
                 return false;
             }
             avcodec_parameters_from_context(vst->codecpar, venc);
+            // The feed's HDR metadata, as its first picture states it, in the file's header: QuickTime's mdcv and
+            // clli, MXF's mastering display (the muxers read it from the stream, not from the pictures).
+            for (const auto& [from, to] : {std::pair{AV_FRAME_DATA_MASTERING_DISPLAY_METADATA, AV_PKT_DATA_MASTERING_DISPLAY_METADATA},
+                                           std::pair{AV_FRAME_DATA_CONTENT_LIGHT_LEVEL, AV_PKT_DATA_CONTENT_LIGHT_LEVEL}})
+                if (const AVFrameSideData* sd = av_frame_get_side_data(f, from))
+                    if (AVPacketSideData* d = av_packet_side_data_new(&vst->codecpar->coded_side_data, &vst->codecpar->nb_coded_side_data, to, sd->size, 0))
+                        std::memcpy(d->data, sd->data, sd->size);
             vst->time_base = venc->time_base;
             vst->avg_frame_rate = fps;
             av_dict_set(&vst->metadata, "timecode", tc.c_str(), 0);
@@ -1864,10 +1871,15 @@ void Recorder::run() {
                 av_frame_free(&pic);
                 return false;
             }
+            // (counted as recorded at once: when the last slots before a set length came empty, no picture after them
+            // is written to count them)
             std::lock_guard lock(s->m);
             ++s->st.repeated;
+            s->st.frames = nextFrame;
+            s->st.seconds = double(nextFrame) / av_q2d(fps);
         }
-        nextFrame = std::max(nextFrame, at);
+        // (no further than a set length: its sound ends there too)
+        nextFrame = std::max(nextFrame, frameLimit > 0 ? std::min(at, frameLimit) : at);
         if (frameLimit > 0 && nextFrame >= frameLimit) {
             av_frame_free(&pic);
             timedOut = true;

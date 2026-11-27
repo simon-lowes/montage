@@ -58,8 +58,21 @@ Image motionBlur(const Image& src, const MotionFn& back, const MotionFn& fwd, do
     return out;
 }
 
+std::vector<int> motionBlurOffsets(double at, double from, double to) {
+    std::vector<int> out;
+    if (!std::isfinite(at) || !std::isfinite(from) || !std::isfinite(to)) from = to = at = 0;
+    const double lo = std::clamp(at + from, -double(kMotionBlurReach), 0.0), hi = std::clamp(at + to, 0.0, double(kMotionBlurReach));
+    const int k0 = std::min(-1, int(std::floor(lo))), k1 = std::max(1, int(std::ceil(hi)));
+    for (int k = k0; k <= k1; ++k)
+        if (k != 0) out.push_back(k);
+    return out;
+}
+
 Image motionBlurPath(const Image& src, const std::map<int, MotionFn>& flows, double at, double from, double to) {
-    if (src.empty() || !(to > from) || flows.empty()) return src;
+    if (src.empty() || !(to > from) || flows.empty() || !std::isfinite(at) || !std::isfinite(from) || !std::isfinite(to)) return src;
+    at = std::clamp(at, 0.0, 1.0);
+    from = std::clamp(from, -kMotionBlurSpan, kMotionBlurSpan), to = std::clamp(to, -kMotionBlurSpan, kMotionBlurSpan);
+    if (!(to > from)) return src;
     // The whole frames the path runs over.
     const int k0 = std::min(0, int(std::floor(at + from))), k1 = std::max(1, int(std::ceil(at + to)));
     const size_t nk = size_t(k1 - k0 + 1);

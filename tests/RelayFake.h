@@ -61,13 +61,17 @@ public:
     std::atomic<bool> forget{false};          // the next Refresh finds the address gone: 437, as after a restart
     std::atomic<bool> refusePermission{false};  // a CreatePermission answered 403 (the peer is not let in)
     std::atomic<bool> unsignedRefusals{false};  // a refusal sent unsigned, as one made up on the way would be
+    // A challenge made up on the way, unsigned, that reaches the client ahead of the relay's own answer to each Refresh
+    // that keeps the address: 0 none, else 401 or 438, with a realm of its own and a nonce where asked.
+    std::atomic<int> madeUpChallenge{0};
+    std::atomic<bool> madeUpRealm{false}, madeUpNonce{true};
     // Each answer's attributes changed before it is signed (and each packet passed on from a peer), a different way
     // every time, from this seed: values with bytes changed, cut short or longer, attributes left out, said twice
     // or under another's name. What arrives is well formed and rightly signed, and says something else.
     std::atomic<quint32> mangle{0};
     // What it has done.
     std::atomic<int> connections{0}, allocations{0}, refreshes{0}, released{0}, permissions{0}, channelBinds{0};
-    std::atomic<int> loginsRefused{0}, loginsExpired{0}, familiesRefused{0};
+    std::atomic<int> loginsRefused{0}, loginsExpired{0}, familiesRefused{0}, challengesMadeUp{0};
     std::atomic<quint64> sendIndications{0}, channelData{0}, toPeers{0}, fromPeers{0};
     std::atomic<quint64> bytesOverUdp{0}, bytesOverStream{0};
     // The connectivity checks it carried that say they are from the controlling end (ICE-CONTROLLING), and those of
@@ -580,6 +584,14 @@ private:
         if (c.stream && hangUp.exchange(false)) return c.stream->disconnectFromHost();
         if (c.stream && garbage.exchange(false)) return write(c, udp, QByteArray::fromHex("c0ffee00c0ffee00c0ffee00"));
         if (c.stream && channelNoise) write(c, udp, QByteArray::fromHex("4abc0005") + "noise" + QByteArray(3, '\0'));
+        if (const int code = madeUpChallenge; type == 0x0004 && !refused && c.back && code) {
+            QByteArray made;
+            attribute(made, 0x0009, QByteArray::fromHex("0000") + (code == 438 ? QByteArray::fromHex("0426") + "Stale Nonce" : QByteArray::fromHex("0401") + "Unauthorized"));
+            if (madeUpRealm) attribute(made, 0x0014, "a realm made up on the way");
+            if (madeUpNonce) attribute(made, 0x0015, "a nonce made up on the way");
+            ++challengesMadeUp;
+            write(c, udp, message(type | 0x0110, id, made));
+        }
         write(c, udp, answer);
     }
 

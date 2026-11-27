@@ -27,7 +27,9 @@
 #include <thread>
 
 #ifdef __linux__
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #endif
 
@@ -3899,7 +3901,9 @@ private slots:
     void recordingLandsWherePlayedAfterADropout() {
         // The device held up for 120 ms (a busy computer) catches up at once, block after block, faster than sound is
         // made ahead for it: the output runs dry and the timeline stands still while the device goes on. A click played
-        // after that is recorded where it was played, not later by what ran dry.
+        // after that is recorded where it was played, not later by what ran dry. (The playback makes nothing more
+        // until the device has taken more than the most that can be made ahead of it, so it runs dry however the
+        // computer's other work lets each thread run: nightly 27 Nov, where under a parallel run it did not.)
         audiodev::setLoopbackOptions({256, 512, 0});
         audiodev::Engine e;
         audiodev::DeviceSettings s;
@@ -3915,7 +3919,15 @@ private slots:
         std::atomic<bool> held{false};
         const int out = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) {
             const int64_t p = clicker.render(o, ch, n);
-            if (p >= 1200 && !held.exchange(true)) audiodev::loopbackStall(120);  // (a quarter of the way to the click)
+            if (p >= 1200 && !held.exchange(true)) {  // (a quarter of the way to the click)
+                const int64_t from = audiodev::loopbackCounts().frames;
+                audiodev::loopbackStall(120);
+                // (the most made ahead is 100 ms, and a block being mixed)
+                QElapsedTimer w;
+                w.start();
+                while (audiodev::loopbackCounts().frames < from + 4800 + 2048 && w.elapsed() < 5000)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             return p;
         });
         auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
@@ -3932,6 +3944,315 @@ private slots:
         QVERIFY2(st.underruns > 0, "the device's catching up did not run the output dry");
         QCOMPARE(take.click(), clicker.clickAt);
         audiodev::setLoopbackOptions({});
+    }
+
+    void takesLandWherePlayedOnABusyDevice() {
+        // ADR and voiceover takes on a busy computer (macOS CI, 23 and 25 Nov: an ADR take one and two device buffers
+        // early). The loopback's callbacks now and then run a buffer late or take two buffers at once, and the playback
+        // is slow to make its first blocks (as a mixer opening its files), so the device runs its ring dry just after
+        // the playback starts. An ADR take, as the ADR panel makes it: the program already on the device and paused
+        // (sending what is not the timeline), the take's input added, then the program playing from well into the
+        // timeline. A voiceover: its input added, then its playback from the start. 50 of each land within a sample of
+        // where their clicks were played. Seeded: the same callbacks every run.
+        audiodev::LoopbackOptions busy{256, 512, 0};
+        busy.seed = 18;
+        busy.lateEvery = 5;
+        busy.doubleEvery = 7;
+        audiodev::setLoopbackOptions(busy);
+        auto putBack = qScopeGuard([] { audiodev::setLoopbackOptions({}); });
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        struct Playback {
+            int64_t start = 0, clickAt = 0;
+            int slowMs = 0;
+            std::atomic<bool> playing{true};
+            std::atomic<int64_t> pos{0};
+            std::atomic<int> calls{0};
+            int64_t render(float* out, int channels, int frames) {
+                std::fill(out, out + size_t(frames) * size_t(channels), 0.0f);
+                if (!playing.load()) return -1;  // (paused: nothing of the timeline)
+                const int call = calls.fetch_add(1);
+                if ((call == 0 || call == 1) && slowMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(slowMs));
+                const int64_t p = start + pos.fetch_add(frames);
+                if (clickAt >= p && clickAt < p + frames) out[size_t(clickAt - p) * size_t(channels)] = 0.8f;
+                return p;
+            }
+        };
+        struct PlacedTake {
+            explicit PlacedTake(int64_t start) : aligner(start, true) {}
+            std::mutex m;
+            std::vector<float> got;
+            audiodev::TakeAligner aligner;
+            void add(const float* in, int channels, int frames, int64_t sample) {
+                std::lock_guard<std::mutex> lock(m);
+                const audiodev::TakeAligner::Step st = aligner.next(sample, frames);
+                got.resize(got.size() + size_t(st.silence), 0.0f);
+                for (int i = st.skip; i < frames; ++i) got.push_back(in[size_t(i) * size_t(channels)]);
+            }
+            size_t size() {
+                std::lock_guard<std::mutex> lock(m);
+                return got.size();
+            }
+            int64_t click() {
+                std::lock_guard<std::mutex> lock(m);
+                return audiodev::findClick(got.data(), int64_t(got.size()));
+            }
+        };
+        uint32_t dice = 2611;
+        QStringList off;
+        for (int n = 0; n < 100; ++n) {
+            dice = dice * 1664525u + 1013904223u;
+            Playback play;
+            play.start = n % 2 ? 0 : 96000 + int64_t(dice % 4800);  // (ADR: two seconds and a little in)
+            play.clickAt = play.start + 2400 + int64_t((dice >> 12) % 2400);
+            play.slowMs = int((dice >> 20) % 16);
+            PlacedTake take(play.start);
+            const bool adr = n % 2 == 0;
+            int out = -1;
+            if (adr) {
+                play.playing = false;
+                out = e.addOutput(&play, 48000, 2, [&](float* o, int ch, int k) { return play.render(o, ch, k); });
+                QThread::msleep(30 + (dice >> 8) % 30);
+            }
+            const int in = e.addInput(&play, 48000, [&](const float* i, int ch, int k, int64_t at) { take.add(i, ch, k, at); });
+            auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
+            if (adr) play.playing = true;
+            else out = e.addOutput(&play, 48000, 2, [&](float* o, int ch, int k) { return play.render(o, ch, k); });
+            auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
+            QVERIFY(in >= 0 && out >= 0);
+            QElapsedTimer t;
+            t.start();
+            while (take.size() < size_t(play.clickAt - play.start + 2400) && t.elapsed() < 5000) QThread::msleep(5);
+            e.removeInput(in);
+            e.removeOutput(out);
+            const int64_t at = take.click(), want = play.clickAt - play.start;
+            if (std::llabs(at - want) > 1) off << QStringLiteral("%1 %2: %3, not %4").arg(adr ? "ADR" : "voiceover").arg(n).arg(at).arg(want);
+        }
+        QVERIFY2(off.isEmpty(), qPrintable(off.join("; ")));
+    }
+
+    void feedCountsWhatTheDeviceTook() {
+        // What a feed has played is what the device has taken of it, not what was mixed ahead of the device (nightly
+        // 25 Nov: 20 to 100 ms ahead): within a buffer of the loopback's own count of the frames with sound it took,
+        // all the way through, and every frame pushed once it is all played.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        auto putBack = qScopeGuard([] { audiodev::setLoopbackOptions({}); });
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        audiodev::Feed f(e);
+        std::string why;
+        QVERIFY2(f.open(48000, 2, 0.25, &why), why.c_str());
+        QThread::msleep(100);
+        const int64_t base = audiodev::loopbackCounts().sounding;
+        std::vector<float> level(size_t(48000) * 2, 0.5f);
+        int64_t sent = 0, worst = 0, checks = 0;
+        QElapsedTimer t;
+        t.start();
+        while ((sent < 48000 || f.queued() > 0) && t.elapsed() < 10000) {
+            if (sent < 48000) sent += f.push(level.data() + size_t(sent) * 2, int(48000 - sent));
+            const int64_t before = audiodev::loopbackCounts().sounding - base;
+            const int64_t played = f.played();
+            const int64_t after = audiodev::loopbackCounts().sounding - base;
+            // (between the device's counts read just before and just after, a buffer either way)
+            const int64_t miss = played < before ? before - played : played > after ? played - after : 0;
+            worst = std::max(worst, miss);
+            if (played > 0 && played < 48000) ++checks;
+            QThread::msleep(3);
+        }
+        QCOMPARE(sent, int64_t(48000));
+        QVERIFY2(worst <= 256, qPrintable(QString::number(worst)));
+        QVERIFY2(checks > 20, qPrintable(QString::number(checks)));
+        QTRY_COMPARE(f.played(), int64_t(48000));
+        QTRY_COMPARE(audiodev::loopbackCounts().sounding - base, int64_t(48000));
+        f.close();
+    }
+
+    void childStartedFromTheFeedThreadAtNormalPriority() {
+        // A program started from the engine's feed thread (which is put ahead of other programs) runs at the program's
+        // normal priority, not the thread's (nightly 25 Nov: inherited by children).
+#ifndef Q_OS_LINUX
+        QSKIP("A child's nice value is read with nice(1): on Linux only");
+#else
+        audiodev::setLoopbackOptions({256, 256, 0});
+        auto putBack = qScopeGuard([] { audiodev::setLoopbackOptions({}); });
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QTemporaryDir dir;
+        const std::string file = (dir.path() + "/nice.txt").toStdString();
+        std::atomic<int> feedNice{100}, started{0};
+        std::unique_ptr<ipc::Process> child;
+        const int out = e.addOutput(&file, 48000, 2, [&](float* o, int ch, int n) {
+            std::fill(o, o + size_t(n) * size_t(ch), 0.0f);
+            if (int was = 0; started.compare_exchange_strong(was, 1)) {
+                errno = 0;
+                feedNice = getpriority(PRIO_PROCESS, id_t(syscall(SYS_gettid)));
+                std::string err;
+                child = ipc::Process::spawn("/bin/sh", {"-c", "nice > \"$0\"", file}, &err);
+                started = child ? 2 : 3;
+            }
+            return int64_t(-1);
+        });
+        auto unhook = qScopeGuard([&] { e.removeOutput(out); });
+        QVERIFY(out >= 0);
+        QTRY_VERIFY2(started.load() >= 2, qPrintable(QString::number(started.load())));
+        QCOMPARE(started.load(), 2);
+        QTRY_VERIFY(child && !child->alive());
+        e.removeOutput(out);
+        QFile f(QString::fromStdString(file));
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const int childNice = QString::fromLatin1(f.readAll()).trimmed().toInt();
+        errno = 0;
+        const int normal = getpriority(PRIO_PROCESS, id_t(getpid()));
+        QCOMPARE(childNice, normal);
+        // (where the system lets the feed thread go ahead of others, it did, and its priority is back after)
+        if (feedNice.load() < normal) qInfo("The feed thread ran at nice %d, its child at %d", feedNice.load(), childNice);
+        else qInfo("The feed thread could not be put ahead here (nice %d): its child's priority is the program's either way", feedNice.load());
+#endif
+    }
+
+    void standInWhileTheDeviceIsAway() {
+        // The device chosen by name goes away while a take records through it: the take has what the device brought and
+        // nothing after (the input is told, and the stand-in's sound is not the take's); the host's default stands in
+        // for it; and once the device is back and nothing plays through the stand-in, it is taken up again by the
+        // next client, within the retry's interval of three seconds.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        auto putBack = qScopeGuard([] { audiodev::setLoopbackOptions({}); });
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.output = s.input = "loopback";
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QVERIFY(!e.status().standIn);
+        TonePump tone;
+        std::atomic<bool> told{false};
+        std::atomic<int64_t> frames{0}, framesWhenTold{-1}, afterTold{0};
+        const int listener = e.addLostListener([&](const std::string&) {
+            framesWhenTold = frames.load();
+            told = true;
+        });
+        auto unhookListener = qScopeGuard([&] { e.removeLostListener(listener); });
+        int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        const int in = e.addInput(&tone, 48000, [&](const float*, int, int n, int64_t) {
+            if (told.load()) afterTold += n;  // (a take stops taking blocks once told)
+            else frames += n;
+        });
+        auto unhookIn = qScopeGuard([&] { e.removeInput(in); });
+        QVERIFY(out >= 0 && in >= 0);
+        QTRY_VERIFY(frames.load() > 9600);
+        audiodev::LoopbackOptions away{256, 256, 0};
+        away.away = true;
+        audiodev::setLoopbackOptions(away);
+        QTRY_VERIFY_WITH_TIMEOUT(told.load(), 2000);
+        QCOMPARE(frames.load(), framesWhenTold.load());
+        QCOMPARE(frames.load() % 256, int64_t(0));  // (whole blocks, to the last the device brought)
+        // The playback comes back to the engine (as PlaybackController does when told): the host's default stands in.
+        e.removeOutput(out);
+        out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        QVERIFY(out >= 0);
+        QVERIFY(e.isOpen());
+        audiodev::EngineStatus st = e.status();
+        QVERIFY(st.standIn);
+        QCOMPARE(st.device, std::string("Loopback"));
+        QCOMPARE(e.settings().output, std::string("loopback"));  // (still the device chosen)
+        QTRY_VERIFY(afterTold.load() > 0);  // (the stand-in's inputs come in, and are not counted as the device's)
+        QCOMPARE(frames.load(), framesWhenTold.load());
+        // Back, with nothing playing or recording through the stand-in: the next client takes the device up again
+        // within the retry's interval.
+        e.removeInput(in);
+        e.removeOutput(out);
+        audiodev::setLoopbackOptions({256, 256, 0});
+        QElapsedTimer back;
+        back.start();
+        bool chosen = false;
+        while (!chosen && back.elapsed() < 6000) {
+            const int probe = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+            QVERIFY(probe >= 0);
+            chosen = !e.status().standIn;
+            e.removeOutput(probe);
+            if (!chosen) QThread::msleep(100);
+        }
+        QVERIFY2(chosen, "the device back was not taken up");
+        qInfo("the device was taken up again %lld ms after it came back", (long long)back.elapsed());
+        QVERIFY2(back.elapsed() <= 3000 + 500, qPrintable(QString::number(back.elapsed())));
+        QVERIFY(e.isOpen());
+    }
+
+    void standInAskedForAgainOnItsOwnThread() {
+        // Nightly 27 Nov: with the device chosen still away, starting playback through the stand-in does not ask for
+        // the device again (that closed the stand-in, had the host list its devices and opened the stand-in once more,
+        // on the window's thread at each Play). The device is asked for again on a thread of the engine's own, only
+        // while nothing plays or records through the stand-in, less often after each try that does not find it; and
+        // once it is back it is taken up when playback stops, with no client coming to it.
+        audiodev::LoopbackOptions away{256, 256, 0};
+        away.away = true;
+        audiodev::setLoopbackOptions(away);
+        auto putBack = qScopeGuard([] { audiodev::setLoopbackOptions({}); });
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.output = s.input = "loopback";
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QVERIFY(e.status().standIn);
+        // From here each open takes 300 ms, as a system listing its devices first does.
+        away.openMs = 300;
+        audiodev::setLoopbackOptions(away);
+        // Nothing playing: the device is asked for again once three seconds have passed, on the engine's thread, and
+        // the stand-in opens again.
+        QElapsedTimer waited;
+        waited.start();
+        while (e.status().standInRetries < 1 && waited.elapsed() < 8000) QThread::msleep(50);
+        QCOMPARE(e.status().standInRetries, int64_t(1));
+        QVERIFY(waited.elapsed() >= 2500);
+        QVERIFY(e.status().standIn);
+        // Three and a half seconds after that try, playback starts at once: nothing is asked for on its way.
+        QElapsedTimer sinceTry;
+        sinceTry.start();
+        while (sinceTry.elapsed() < 3500) QThread::msleep(50);
+        TonePump tone;
+        QElapsedTimer starting;
+        starting.start();
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        const qint64 took = starting.elapsed();
+        QVERIFY(out >= 0);
+        QVERIFY2(took < 250, qPrintable(QString::number(took)));
+        QVERIFY(e.status().standIn);
+        // While it plays the stand-in stays, past the time the next try was due (six seconds after the first, which
+        // did not find the device), even with the device back.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        while (sinceTry.elapsed() < 7500) QThread::msleep(50);
+        QCOMPARE(e.status().standInRetries, int64_t(1));
+        QVERIFY(e.status().standIn);
+        // Playback stops: the device back is taken up with nothing else asked of the engine.
+        e.removeOutput(out);
+        QElapsedTimer stopped;
+        stopped.start();
+        while (e.status().standIn && stopped.elapsed() < 6000) QThread::msleep(50);
+        QVERIFY2(!e.status().standIn, "the device back was not taken up");
+        QVERIFY2(stopped.elapsed() <= 3000, qPrintable(QString::number(stopped.elapsed())));
+        QCOMPARE(e.status().standInRetries, int64_t(2));
+        QCOMPARE(e.settings().output, std::string("loopback"));
+        QVERIFY(e.isOpen());
     }
 
     void loopbackFollowsRateChanges() {
@@ -4067,7 +4388,7 @@ private slots:
         }
         QCOMPARE(sent, int64_t(44100));
         QCOMPARE(f.queued(), int64_t(0));
-        QCOMPARE(f.played(), int64_t(44100));
+        QTRY_COMPARE(f.played(), int64_t(44100));  // (as the device takes it, a cushion after it was mixed)
         QThread::msleep(100);
         const std::vector<float> got = heard.take();
         double energy = 0;

@@ -31,6 +31,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <tuple>
@@ -47,6 +48,7 @@
 #include <openssl/rand.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include <juice/juice.h>
 #include <rtc/rtc.hpp>
 
 #include "core/ReviewPage.h"
@@ -758,6 +760,45 @@ Planes420 shrink(const Planes420& p, int w, int h) {
     return out;
 }
 
+// A UDP port held for viewers to share: libjuice's socket on it, which the viewers' connections then share, made
+// before any connection of libdatachannel's, so with Windows' sockets started for it here (a connection starts them
+// otherwise). Asked of libjuice itself, not through libdatachannel's listener, whose stop can be passed over (its flag
+// of having stopped is never set to false first, so it holds whatever was in its memory): let go, the socket is closed
+// before the destructor returns, unless a viewer's connection still shares it. Throws when the port cannot be had.
+class HeldUdpPort {
+public:
+    HeldUdpPort(uint16_t port, const std::optional<std::string>& at) : port_(port) {
+#ifdef Q_OS_WIN
+        WSADATA data;
+        winsock_ = WSAStartup(MAKEWORD(2, 2), &data) == 0;
+#endif
+        if (juice_mux_listen(at ? at->c_str() : nullptr, port, &HeldUdpPort::unknown, nullptr) < 0) {
+            release();
+            throw std::runtime_error("Cannot listen on UDP port " + std::to_string(port));
+        }
+    }
+    ~HeldUdpPort() {
+        juice_mux_listen(nullptr, port_, nullptr, nullptr);
+        release();
+    }
+    HeldUdpPort(const HeldUdpPort&) = delete;
+    HeldUdpPort& operator=(const HeldUdpPort&) = delete;
+
+private:
+    // (a check from no viewer's connection: left unanswered)
+    static void unknown(const juice_mux_binding_request_t*, void*) {}
+    void release() {
+#ifdef Q_OS_WIN
+        if (winsock_) WSACleanup();
+        winsock_ = false;
+#endif
+    }
+    uint16_t port_;
+#ifdef Q_OS_WIN
+    bool winsock_ = false;
+#endif
+};
+
 }  // namespace
 
 struct BrowserReviewBackend::Impl {
@@ -787,6 +828,12 @@ struct BrowserReviewBackend::Impl {
     std::atomic<int64_t> expires{0};
     // (the web server's thread) Once the link has ended: when its viewers were told so (and let go a second later).
     std::optional<Clock::time_point> endedAt;
+
+    // The viewers' shared UDP port (the page's own number), held from when the review opens until it closes, so that
+    // no other socket is given that number before the first viewer comes (a browser's own WebRTC, say, where the system
+    // hands ports out one after another), which would leave every viewer unable to join. (None when each viewer has a
+    // port of its own: through a relay Montage reaches, or only through the relay.)
+    std::unique_ptr<HeldUdpPort> sharedPort;
 
     // The web server's thread, its loop and the object queued work runs on.
     std::thread http;
@@ -2187,6 +2234,7 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         d.freeEncoders();
+        d.sharedPort.reset();
         return false;
     };
     std::string why = checkStreamSettings(d.settings);
@@ -2295,6 +2343,14 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
     }
     // (burnt-in text at HDR reference white, 203 nits: PQ's 58 %, HLG's 75 %)
     d.hdrWhite = uint16_t(std::lround(64 + 876 * (d.eotf == Eotf::Hlg ? 0.75 : 0.5806)));
+    if (!d.settings.relayOnly && !d.relayInUse && port > 0) {
+        const bool any = d.host == QHostAddress::Any || d.host == QHostAddress::AnyIPv6 || d.host == QHostAddress::AnyIPv4;
+        try {
+            d.sharedPort = std::make_unique<HeldUdpPort>(uint16_t(port), any ? std::nullopt : std::optional<std::string>(d.host.toString().toStdString()));
+        } catch (const std::exception&) {
+            return fail("Cannot listen on UDP port " + std::to_string(port) + ", where the viewers' pictures and sound go: another program has it");
+        }
+    }
     d.audioChannels = audioChannels;
     d.audioRate = audioRate > 0 ? audioRate : 48000;
     if (audioChannels > 0 && !d.openSound(&why)) return fail(why);
@@ -2388,6 +2444,7 @@ void BrowserReviewBackend::close() {
     }
     retired.clear();
     bridging.clear();
+    d.sharedPort.reset();
     d.freeEncoders();
 }
 

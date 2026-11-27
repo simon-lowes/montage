@@ -356,7 +356,7 @@ jobs:
           MONTAGE_GPU_LOG: "1"
         run: |
           # Every GPU test must run on both: a skip (no device, no shader compiler) fails the step.
-          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuDepthAndObjectMasks gpuYcbcrPlanes gpuHardwareFrames gpuHardwareFramesImportedOnce gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl ofxSharedTextures gpuOfxTextures gpuTextureBudget gpuMasksAndStepsFromThePicture gpuTransformMotionBlur openFxHandlesForEveryKindAndAfterAHostEnds openFxHandlesIntoTheCompositorsTextures"
+          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuDepthAndObjectMasks gpuYcbcrPlanes gpuHardwareFrames gpuHardwareFramesImportedOnce gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer gpuAdjustmentLayersInTransitions ofxControlsAndOpenGl ofxSharedTextures gpuOfxTextures gpuTextureBudget gpuMasksAndStepsFromThePicture gpuTransformMotionBlur gpuSourceStageAndMaskedColour openFxHandlesForEveryKindAndAfterAHostEnds openFxHandlesIntoTheCompositorsTextures"
           for backend in opengl vulkan; do
             echo "::group::$backend"
             MONTAGE_GPU=$backend xvfb-run -a build/tests/test_render $tests -o "$RUNNER_TEMP/$backend.txt,txt" -o -,txt || failed=1
@@ -435,6 +435,10 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: scripts/wayland-hdr-check.sh ~/weston build/tests/test_app "$RUNNER_TEMP/wayland-hdr"
+      # (tests/repro: Mesa's black blending under llvmpipe and Weston's dropped colour transformation, each asserted as
+      # seen, so that a fixed Mesa or Weston is noticed)
+      - name: The faults the HDR checks work round, as their reproducers show them
+        run: scripts/hdr-reproducers.sh ~/weston "$RUNNER_TEMP/wayland-hdr/reproducers"
       - name: Weston's logs
         if: failure()
         uses: actions/upload-artifact@v4

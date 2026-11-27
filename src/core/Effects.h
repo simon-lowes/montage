@@ -6,6 +6,7 @@
 // expose it everywhere.
 #pragma once
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,6 +38,9 @@ struct ParamInfo {
     // Default colour for Color params.
     double defG = 0, defB = 0;
     bool keyframeable = true;
+    // A setting added later whose effects in projects saved before it (with none stored) render not as `def` but as
+    // this: what the Inspector shows for them.
+    std::optional<double> missing;
 };
 
 // Dynamic: an editable list whose entries depend on the effect's other

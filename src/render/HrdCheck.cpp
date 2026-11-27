@@ -1320,6 +1320,15 @@ void checkMpeg2Sequence(const std::vector<Mpeg2Picture>& pics, const std::vector
     bool cbr = true;
     for (const Mpeg2Picture& p : pics) cbr = cbr && p.vbvDelay >= 0;
     r.cbr = cbr;
+    // (a sequence states the delay in every picture or in none: one that mixes them is said at its first change, and
+    // checked as a variable rate)
+    for (size_t k = 1; k < pics.size(); ++k)
+        if ((pics[k].vbvDelay >= 0) != (pics[0].vbvDelay >= 0)) {
+            addIssue(r, int64_t(k), shown[k], "mixed",
+                     pics[k].vbvDelay < 0 ? "its vbv_delay is 0xFFFF in a sequence whose pictures before it state theirs"
+                                          : "it states its vbv_delay in a sequence whose pictures before it have 0xFFFF");
+            break;
+        }
     // Removal times one picture's display apart, in decoding order (a field picture half a frame; a repeated field half again).
     const size_t n = pics.size();
     std::vector<double> removal(n);

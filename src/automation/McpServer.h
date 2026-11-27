@@ -33,9 +33,11 @@ namespace montage {
 // montage_render names none) is written. A path it both reads and writes counts as written. Background calls wait
 // on these, so two never write one file at once. (project and farm are left out: many calls share them, and a call
 // that changes a project runs alone.) montage_production's folder is written when it makes one. A path given after
-// protocol names ("file:", "md5:file:"), as FFmpeg takes them, is the file they reach.
+// protocol names ("file:", "md5:file:"), as FFmpeg takes them, is the file they reach. `writtenAs`: the texts of the
+// paths written, as given, so each way they can be taken is checked (Qt takes "ab:/../x" as the folder "ab:"'s
+// parent's x, FFmpeg as /x).
 struct McpCallPaths {
-    QStringList writes, reads;
+    QStringList writes, reads, writtenAs;
 };
 McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& arguments, bool readOnly);
 // Whether two such paths are one file, or one lies inside the other (a file in a folder another call writes).

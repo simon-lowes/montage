@@ -37,14 +37,20 @@ struct JxsHeader {
     int cpih = 0;                // colour transform (1: the reversible one, so R′G′B′ coded)
     int fq = -1;                 // fractional bits (Fq; 0: coded losslessly; -1: not read)
     int decompV = 0;             // vertical decompositions (Nly): a precinct is 2^decompV lines
+    int decompH = 0;             // horizontal decompositions (Nlx)
     std::vector<uint8_t> componentTable;  // the CDT marker segment as it is (ST 2124's JPEGXSComponentTable)
     size_t headerBytes = 0;      // bytes before the first slice (SOC to the first SLH)
+    size_t pihAt = 0;            // where the picture header's marker is (its Lcod 4 bytes after it)
     int sliceLines() const { return hsl << decompV; }
     bool lossless() const { return fq == 0; }
     bool alpha() const { return components == 4; }  // (a fourth component: alpha, at the first's size)
 };
 // False when `data` does not start with a JPEG XS codestream's header.
 bool readJxsHeader(const uint8_t* data, size_t size, JxsHeader& out);
+// What SVT-JPEG-XS's decoder itself reads of a codestream's header (its image configuration): the picture's width,
+// height and depth, its components and each one's sampling factors (from its plane's size), into those fields of
+// `out` (the others are left as they are). False without the library, or when it cannot read the codestream.
+bool jxsLibraryReading(const uint8_t* data, size_t size, JxsHeader& out, std::string* error = nullptr);
 // Whether a codestream with this header is one decoded here: three components (or four, the last alpha; not a Bayer
 // pattern's), each side at most 16,384 samples and
 // 64 million pixels in all (past 10K: a header asking for more is refused before anything is set aside for it).
@@ -83,6 +89,7 @@ struct JxsEncodeSettings {
     bool slices = false;                       // say where each slice ends (RFC 9134's slice packetisation)
     bool alpha = false;                        // a fourth component, alpha (R′G′B′ with it is coded without the colour transform)
     bool lossless = false;                     // each picture exactly as it was (bpp unused; not with `slices`)
+    int decompV = -1, decompH = -1;            // the wavelet's vertical and horizontal decompositions (-1: SVT's, 2 and 5)
     int threads = 0;                           // 0: as SVT chooses
 };
 // Codes pictures at a constant number of bytes each.
@@ -106,7 +113,8 @@ private:
     std::unique_ptr<State> s_;
 };
 
-// Decodes codestreams (each whole); a codestream of another size or format starts the decoder again.
+// Decodes codestreams (each whole); a codestream of another size or format starts the decoder again (one whose header
+// differs only in its length, as lossless pictures' do, does not).
 class JxsDecoder {
 public:
     JxsDecoder();
@@ -121,6 +129,8 @@ public:
     // height, 2 at a quarter (the picture's own width and height say what came). From the next codestream on.
     void setProxy(int level);
     int proxy() const;
+    // The times the library's decoder has been set up (each start, and each start again).
+    int decodersMade() const;
     void close();
 
 private:
@@ -176,6 +186,8 @@ public:
     bool codestream(int64_t n, std::vector<uint8_t>& out, std::string* error = nullptr);
     bool picture(int64_t n, JxsPicture& out, std::string* error = nullptr);
     bool frame(int64_t n, AVFrame* into, std::string* error = nullptr);
+    // Its decoder's JxsDecoder::decodersMade.
+    int decodersMade() const;
 
 private:
     struct State;

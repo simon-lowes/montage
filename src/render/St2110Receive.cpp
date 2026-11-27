@@ -603,6 +603,10 @@ void Input::receive(Stream* s, int path) {
     }
 }
 
+bool jxsCodestreamMatches(const JxsHeader& h, const VideoFormat& v, int height) {
+    return h.width == v.width && h.height == height && h.depth == v.depth && h.components == 3;
+}
+
 // ST 2110-22's decoding, on a thread of the stream's own: each codestream decoded to the stream's sampling and depth,
 // an interlaced frame's two fields woven into one.
 void Input::decodeCoded(Stream* st) {
@@ -627,11 +631,12 @@ void Input::decodeCoded(Stream* st) {
         const int proxy = proxy_;
         s.decoder->setProxy(proxy);
         auto sized = [&](int got, int full) { return std::abs(got - (full >> proxy)) <= (proxy ? 1 : 0); };
-        // (a codestream of another size or depth than the SDP's, or a field where a frame belongs, is not decoded at all)
+        // (a codestream of another size or depth than the SDP's, one with alpha, or a field where a frame belongs, is
+        // not decoded at all)
         JxsHeader h;
-        const bool ok = (c.field != 0) == interlaced && readJxsHeader(cs.data(), cs.size(), h) && h.width == video_.width && h.height == height &&
-                        h.depth == video_.depth && s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && sized(pic.width, video_.width) &&
-                        sized(pic.height, height) && pic.depth == video_.depth && pic.sampling == want;
+        const bool ok = (c.field != 0) == interlaced && readJxsHeader(cs.data(), cs.size(), h) && jxsCodestreamMatches(h, video_, height) &&
+                        s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && sized(pic.width, video_.width) &&
+                        sized(pic.height, height) && pic.depth == video_.depth && pic.sampling == want && !pic.alpha;
         if (interlaced && ok && c.field == 1) {
             s.firstField = rasterOf(pic);
             s.haveFirst = true;

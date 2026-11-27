@@ -10,6 +10,7 @@
 #include "Processing.h"
 #include "ShapeRaster.h"
 #include "media/HwAccel.h"
+#include "core/Preferences.h"
 
 namespace montage::gpu {
 
@@ -360,6 +361,9 @@ private:
     bool readPicture(QRhiTexture* from, QRhiResourceUpdateBatch*& u, Image& picture);
     void callBack(const std::function<void()>& fn);  // (on the GPU's thread: fn run by the thread waiting in serve())
     void endFrame(bool drawn);
+    // The work recorded so far submitted and waited for, mid-frame (on FFmpeg's Vulkan device, holding its queues'
+    // lock, as FFmpeg's decoders submit to the same queues).
+    void finishWork();
     bool recover();  // (the device lost: everything made again, on FFmpeg's device again when shared, else on a new one)
 
     std::thread thread_;
@@ -711,7 +715,7 @@ bool Device::create() {
             params.format = glFormat_;
             // Its textures shared with the OpenFX plug-ins' context (render/OfxGl.h): made sharing with that one where
             // it exists already (on its own, as before, where the two cannot share), and offered to it otherwise.
-            const bool share = qgetenv("MONTAGE_GPU_SHARE").toLower() != "off";
+            const bool share = prefs::toggle(QStringLiteral("playback/gpuShare"));
             params.shareContext = share ? ofx::gl::context() : nullptr;
             rhi_ = QRhi::create(QRhi::OpenGLES2, &params, flags);
             if (!rhi_ && params.shareContext) {
@@ -851,18 +855,18 @@ bool Device::create() {
         splats_ = noSplats.empty();
         noSplats_ = noSplats;
     }
-    // The texture budget: MONTAGE_GPU_MEMORY megabytes, or half the card's memory where the device tells it (the rest
-    // is the decoders', the display's and other programs'), never under 256 MB.
+    // The texture budget: the Texture budget setting's megabytes (MONTAGE_GPU_MEMORY's when set), or half the card's
+    // memory where the device tells it (the rest is the decoders', the display's and other programs'), never under 256 MB.
     {
-        bool set = false;
-        const int megabytes = qEnvironmentVariableIntValue("MONTAGE_GPU_MEMORY", &set);
+        const int megabytes = prefs::whole(QStringLiteral("playback/gpuMemoryMb"));
+        const bool set = megabytes > 0;
         const size_t card = set && megabytes > 0 ? 0 : cardMemory();
         ownBudget_ = set && megabytes > 0 ? size_t(megabytes) << 20 : card > 0 ? std::max(size_t(256) << 20, card / 2) : 0;
         if (logFallbacks()) {
             if (ownBudget_ == 0) std::fprintf(stderr, "montage gpu: no texture budget (the device does not say how much memory it has)\n");
             else if (card > 0)
                 std::fprintf(stderr, "montage gpu: texture budget %zu MB (half the device's %zu MB)\n", size_t(ownBudget_ >> 20), card >> 20);
-            else std::fprintf(stderr, "montage gpu: texture budget %zu MB (MONTAGE_GPU_MEMORY)\n", size_t(ownBudget_ >> 20));
+            else std::fprintf(stderr, "montage gpu: texture budget %zu MB (set)\n", size_t(ownBudget_ >> 20));
         }
     }
     // Hardware frames: the decoders of the devices whose frames map into this one keep them in the device's memory.
@@ -1332,6 +1336,18 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         if (l.input && l.input->is1D) textures.push_back({4, table});
         return true;
     };
+    // The frame's source stage (gpucolor.frag's 27) on its straight colour `from`, w by h (or, `raw`, on mode 0's 16-bit
+    // RGBA): what it makes, straight, or null.
+    auto sourceStage = [&](QRhiTexture* from, bool raw, int w, int h) -> QRhiTexture* {
+        QRhiTexture* to = texture(T::RGBA32F, w, h, true);
+        if (!to) return nullptr;
+        float q[64] = {};
+        std::copy_n(l.sourceUniforms->data(), std::min<size_t>(64, l.sourceUniforms->size()), q);
+        q[0] = 27, q[4] = raw ? 1 : 0;
+        pass(colorPs_, to, u, {{raw ? 2 : 1, from}}, uniforms(u, q));
+        u = rhi_->nextResourceUpdateBatch();
+        return to;
+    };
     if (l.canvas) {
         if (!canvas) return nullptr;
         cur = canvas;
@@ -1382,7 +1398,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             u->uploadTexture(planes[i], QRhiTextureUploadEntry(0, 0, d));
         }
         // (A 1D input transform's table would take the chroma's binding: it goes through 26.)
-        const bool sized = W == yc.width && H == yc.height && !(l.input && l.input->is1D);
+        // (Nor a source stage, which comes between.)
+        const bool sized = W == yc.width && H == yc.height && !(l.input && l.input->is1D) && !l.sourceUniforms;
         QRhiTexture* made = texture(T::RGBA32F, yc.width, yc.height, true);
         if (!made) return nullptr;
         p[0] = 24;
@@ -1416,6 +1433,11 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             };
             if (W != yc.width && !(made = resample(made, yc.width, W, true))) return nullptr;
             if (H != yc.height && !(made = resample(made, yc.height, H, false))) return nullptr;
+            if (l.sourceUniforms) {
+                QRhiTexture* staged = sourceStage(made, false, W, H);
+                release(made);
+                if (!(made = staged)) return nullptr;
+            }
             cur = texture(T::RGBA32F, W, H, true);
             if (!cur) return nullptr;
             std::fill(p, p + 64, 0.0f);
@@ -1434,13 +1456,17 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         QRhiTextureSubresourceUploadDescription d(l.frame->px.data(), quint32(size_t(w) * h * 8));
         d.setDataStride(quint32(w) * 8);
         u->uploadTexture(raw, QRhiTextureUploadEntry(0, 0, d));
-        p[0] = 0;  // unpack
-        std::vector<std::pair<int, QRhiTexture*>> textures = {{2, raw}};
+        // (through its source stage first, if any: unpacked straight by it, then taken in as 24's are, 26)
+        QRhiTexture* staged = l.sourceUniforms ? sourceStage(raw, true, w, h) : nullptr;
+        if (l.sourceUniforms && !staged) return nullptr;
+        p[0] = staged ? 26 : 0;  // unpack
+        std::vector<std::pair<int, QRhiTexture*>> textures = {{staged ? 1 : 2, staged ? staged : raw}};
         if (!inputLut(p, textures)) return nullptr;
         QRhiBuffer* ub = uniforms(u, p);
         pass(colorPs_, cur, u, textures, ub);
         u = rhi_->nextResourceUpdateBatch();
         release(raw);
+        if (staged) release(staged);
     } else if (l.shapes) {
         // A Shape layer's paints, each pixel from its tile's commands in the table (render/ShapeRaster).
         const ShapeRaster& sr = *l.shapes;
@@ -1644,7 +1670,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                     QRhiResourceUpdateBatch* rb = rhi_->nextResourceUpdateBatch();
                     rb->readBackTexture({made}, &read);
                     cb_->resourceUpdate(rb);
-                    rhi_->finish();
+                    finishWork();
                     const size_t n = size_t(made->pixelSize().width()) * size_t(made->pixelSize().height());
                     flags.clear();
                     if (size_t(read.data.size()) >= n * 16) {
@@ -2043,7 +2069,7 @@ QRhiTexture* Device::splatLayer(const SplatLayer& s, QRhiResourceUpdateBatch*& u
     for (size_t k = 0; k < batches; ++k) {
         // (each batch's uploads go into the buffers the one before read: that one's work is waited for first, as a
         // backend may copy an upload into a buffer when it is recorded, Metal's among them)
-        if (k > 0) rhi_->finish();
+        if (k > 0) finishWork();
         const size_t part = s.points ? batches - 1 - k : k;
         const size_t from = starts[part], nb = starts[part + 1] - from;
         size_t E = 0;
@@ -2183,7 +2209,7 @@ bool Device::readPicture(QRhiTexture* from, QRhiResourceUpdateBatch*& u, Image& 
     u->readBackTexture({from}, &read);
     cb_->resourceUpdate(u);
     u = rhi_->nextResourceUpdateBatch();
-    rhi_->finish();
+    finishWork();
     const size_t n = size_t(size.width()) * size_t(size.height());
     picture.width = size.width(), picture.height = size.height();
     picture.px.resize(n * 4);
@@ -2230,6 +2256,12 @@ bool Device::external(const TextureStep* step, const std::vector<QRhiTexture*>& 
     ++textureSteps;
     if (logFallbacks()) std::fprintf(stderr, "montage gpu: %s drawn from and into the compositor's textures\n", step->name.c_str());
     return true;
+}
+
+void Device::finishWork() {
+    std::unique_lock<std::recursive_mutex> queues;
+    if (shared_ && backend_ == QRhi::Vulkan) queues = std::unique_lock(vulkanQueueMutex());
+    rhi_->finish();
 }
 
 void Device::endFrame(bool drawn) {

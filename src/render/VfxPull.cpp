@@ -1,16 +1,20 @@
 #include "VfxPull.h"
 #include "VfxShots.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QString>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 #include "Amf.h"
+#include "ClipAnalysis.h"
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "Fdl.h"
@@ -18,9 +22,11 @@
 #include "VideoFx.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "core/History.h"
 #include "core/Interpretation.h"
 #include "media/DepthMap.h"
 #include "media/VideoDepth.h"
+#include "media/CameraSolve.h"
 #include "media/DeepImage.h"
 #include "media/Exr.h"
 #include "media/Image.h"
@@ -95,11 +101,36 @@ struct PullLayers {
     bool sourceLayers = false;
     std::vector<std::pair<const Effect*, std::string>> mattes;
     std::vector<std::string>* names = nullptr;  // the layers written, from the first frame
+    // The plate's header (VfxPullOptions::plateMetadata): the same on every frame, and what changes from frame to frame.
+    bool metadata = false;
+    std::map<std::string, std::string> header;
+    double timecode = -1;  // the source's start timecode (seconds), -1 = none
+    Rational timecodeRate{0, 1};
+    bool dropFrame = false;
+    bool clipNegative = false, clipOver = false;
 
     bool operator()(FrameTime f, int W, int H, std::vector<ExrOutLayer>& layers, std::map<std::string, std::string>& attributes,
                     std::string& error) const {
         const MediaItem& m = *media;
         const double sec = double(first + f) / mediaFps;
+        if (metadata) {
+            for (const auto& [k, v] : header) attributes[k] = v;
+            attributes["imageCounter"] = std::to_string(first + f);
+            if (timecode >= 0 && timecodeRate.valid()) {
+                // (the time of day, past midnight round again)
+                const long long perDay = (long long)std::llround(timecodeRate.toDouble() * 86400);
+                long long n = (long long)std::llround((timecode + sec) * timecodeRate.toDouble());
+                if (perDay > 0) n = ((n % perDay) + perDay) % perDay;
+                attributes["timeCode"] = formatTimecode(FrameTime(n), timecodeRate, dropFrame);
+            }
+        }
+        if ((clipNegative || clipOver) && !layers.empty()) {
+            // (the picture only: the layers copied beside it are data as often as colour)
+            for (float& v : layers[0].data) {
+                if (clipNegative && !(v >= 0)) v = 0;  // (NaNs too)
+                if (clipOver && v > 1) v = 1;
+            }
+        }
         const std::string file = exrFrameFile(m.path, sec);
         std::vector<std::string> listed;  // (as readExrInfo lists them: a Cryptomatte once, by its name)
         auto note = [&](const std::string& n) {
@@ -169,6 +200,64 @@ struct PullLayers {
         return true;
     }
 };
+
+// The number a metadata value starts with ("35mm" 35, "T2.8" 2.8, "f/4" 4), printed for a float attribute; "" when
+// it has none.
+std::string leadingNumber(const std::string& v) {
+    size_t i = 0;
+    while (i < v.size() && !(std::isdigit((unsigned char)v[i]) || ((v[i] == '.' || v[i] == '-') && i + 1 < v.size() && std::isdigit((unsigned char)v[i + 1]))))
+        ++i;
+    if (i == v.size()) return {};
+    char* end = nullptr;
+    const double d = std::strtod(v.c_str() + i, &end);
+    if (end == v.c_str() + i || !std::isfinite(d)) return {};
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.9g", d);
+    return buf;
+}
+
+std::string rationalText(Rational r) { return std::to_string(r.num) + "/" + std::to_string(r.den); }
+
+// The plate's header from what Montage knows of its source (VfxPullOptions::plateMetadata).
+void plateHeader(const Project& p, const Sequence& seq, const MediaItem& m, const std::string& shot, PullLayers& pl) {
+    auto meta = [&](const char* key) {
+        const auto it = m.metadata.find(key);
+        return it == m.metadata.end() ? std::string() : it->second;
+    };
+    auto put = [&](const char* attr, const std::string& v) {
+        if (!v.empty()) pl.header[attr] = v;
+    };
+    put("cameraMake", meta("camera_make"));
+    put("cameraModel", meta("camera").empty() ? meta("device") : meta("camera"));
+    put("cameraSerialNumber", meta("camera_serial"));
+    put("lensMake", meta("lens_make"));
+    put("lensModel", meta("lens"));
+    put("lensSerialNumber", meta("lens_serial"));
+    put("nominalFocalLength", leadingNumber(meta("focal_length")));
+    put("tStop", leadingNumber(meta("t_stop")));
+    put("focus", leadingNumber(meta("focus_distance")));
+    put("shutterAngle", leadingNumber(meta("shutter_angle")));
+    put("isoSpeed", leadingNumber(meta("iso")));
+    put("reelName", meta("tape").empty() ? meta("reel") : meta("tape"));
+    if (m.fps.valid()) {
+        put("framesPerSecond", rationalText(m.fps));
+        put("captureRate", rationalText(m.fps));
+    }
+    // When it was recorded, as OpenEXR writes dates ("2026:10:01 14:30:00", the time where it was recorded, with
+    // utcOffset the seconds UTC was ahead of it when the media says), from the ISO form media carry.
+    if (const QDateTime when = QDateTime::fromString(QString::fromStdString(m.created), Qt::ISODate); when.isValid()) {
+        put("capDate", when.toString(QStringLiteral("yyyy:MM:dd HH:mm:ss")).toStdString());
+        if (when.timeSpec() == Qt::UTC || when.timeSpec() == Qt::OffsetFromUTC) put("utcOffset", std::to_string(-when.offsetFromUtc()));
+    }
+    std::string comments = "Montage VFX pull: shot " + shot + " of " + seq.name;
+    if (!p.name.empty()) comments += " in " + p.name;
+    put("comments", comments);
+    if (m.timecode >= 0 && m.fps.valid()) {
+        pl.timecode = m.timecode;
+        pl.timecodeRate = m.fps;
+        pl.dropFrame = meta("timecode_drop") == "1";
+    }
+}
 
 }  // namespace
 
@@ -246,8 +335,16 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         const int64_t cutFirst = int64_t(std::floor(std::min(a, b) / seqFps * mf + 1e-6));
         const int64_t cutLast = std::max<int64_t>(cutFirst, int64_t(std::ceil(std::max(a, b) / seqFps * mf - 1e-6)) - 1);
         const int64_t total = m.duration > 0 ? int64_t(std::floor(m.duration * mf + 1e-6)) : cutLast + 1;
-        const int head = int(std::min<int64_t>(o.handles, cutFirst));
-        const int tail = int(std::clamp<int64_t>(total - 1 - cutLast, 0, o.handles));
+        // (scaled: by the speed at each end of the footage the cut uses, its start's unless the clip plays backwards)
+        int64_t headWant = std::max(0, o.handles), tailWant = headWant;
+        if (o.scaleHandles) {
+            const double atStart = std::fabs(c.speedAt(0)), atEnd = std::fabs(c.speedAt(double(c.duration)));
+            auto scaled = [&](double speed) { return int64_t(std::ceil(double(std::max(0, o.handles)) * std::max(speed, 0.0) - 1e-6)); };
+            headWant = scaled(c.reverse ? atEnd : atStart);
+            tailWant = scaled(c.reverse ? atStart : atEnd);
+        }
+        const int head = int(std::min<int64_t>(headWant, cutFirst));
+        const int tail = int(std::clamp<int64_t>(total - 1 - cutLast, 0, tailWant));
         const int64_t first = cutFirst - head, frames = (cutLast + tail) - first + 1;
         // A sequence at the footage's size and rate holding just those frames, untouched.
         // (a DPX in the footage's own colour space, so log stays log; an EXR in linear light).
@@ -332,9 +429,16 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         };
         if (o.format == "exr") {
             st.exrCompression = o.compression;
-            if (o.sourceLayers || o.mattes) {
-                if (!exrAvailable()) return fail("Layers and mattes in OpenEXR pulls need Montage built with the OpenEXR library");
+            if ((o.sourceLayers || o.mattes) && !exrAvailable())
+                return fail("Layers and mattes in OpenEXR pulls need Montage built with the OpenEXR library");
+            if ((o.clipNegative || o.clipOver) && !exrAvailable())
+                return fail("Clipping OpenEXR pulls' values needs Montage built with the OpenEXR library");
+            if (exrAvailable() && (o.sourceLayers || o.mattes || o.plateMetadata || o.clipNegative || o.clipOver)) {
                 PullLayers pl;
+                pl.metadata = o.plateMetadata;
+                if (o.plateMetadata) plateHeader(p, seq, m, name, pl);
+                pl.clipNegative = o.clipNegative;
+                pl.clipOver = o.clipOver;
                 pl.project = &p;
                 pl.seq = &seq;
                 pl.clip = &c;
@@ -434,11 +538,23 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
                 shot.overscanHeight = maps.overscanHeight;
             }
         }
+        NukeScriptExtras extras;
+        extras.retime = vfxRetime(seq, c, vfxShotRecord(shot));
+        if (CameraSolve solve; o.camera && clipCameraSolve(c, solve) && solve.fps > 0 && std::fabs(solve.fps - mf) < 1e-3 * mf) {
+            // The solve's frames are at its media times: numbered as the plate numbers the same frames of the footage.
+            const int number = shot.firstFrame + int(std::llround(solve.start * mf) - first);
+            shot.chan = QDir(QString::fromStdString(shot.folder)).filePath(QString::fromStdString(name) + QStringLiteral(".chan")).toStdString();
+            if (!writeNukeChan(solve, shot.chan, number, &why)) return fail(name + ": " + why);
+            QFile f(QString::fromStdString(shot.chan));
+            if (!f.open(QIODevice::ReadOnly)) return fail("Cannot read " + shot.chan);
+            extras.chanPath = shot.chan;
+            extras.chanText = f.readAll().toStdString();
+        }
         if (o.scripts) {
             const std::string returns = o.returns.empty() ? QDir(QString::fromStdString(o.folder)).filePath(QStringLiteral("returns")).toStdString() : o.returns;
             VfxShotRecord r = vfxShotRecord(shot);
             shot.script = QDir(QString::fromStdString(shot.folder)).filePath(QString::fromStdString(name) + QStringLiteral(".nk")).toStdString();
-            const std::string nk = nukeScript(r, vfxVersionPath(returns, o.returnsPattern, r, 1, o.format));
+            const std::string nk = nukeScript(r, vfxVersionPath(returns, o.returnsPattern, r, 1, o.format), extras);
             QFile f(QString::fromStdString(shot.script));
             if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(nk.data(), qint64(nk.size())) != qint64(nk.size()))
                 return fail("Cannot write " + shot.script);

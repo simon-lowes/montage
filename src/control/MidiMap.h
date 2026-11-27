@@ -90,6 +90,13 @@ private:
         bool heldFine = false;
         int64_t heldAt = -1;  // (when it arrived: -1 not known)
         bool heldQuiet = false;  // (it came after a pause)
+        // A fine half that went out at once, as a parameter that sends its coarse half first has it (its order
+        // learnt), and the coarse half held straight after it: when a pause follows them, they were a pair sent fine
+        // half first, and go out as one (the order learnt wrong, and learnt anew when the fine half came after a pause).
+        int soloFine = -1;
+        bool soloQuiet = false;
+        int heldAfter = -1;  // (the held coarse half's fine half, sent at once before it; -1 none)
+        bool heldAfterQuiet = false;
         // A pause in data entry since its last half: a parameter chosen, a flush, or more than kPairUs between halves.
         bool quiet = true;
         int64_t lastAt = -1;  // when its last data entry half came (-1 not known)
@@ -98,7 +105,8 @@ private:
         int pending = 0;
         Channel();
     };
-    void release(int ch, const std::function<void(const Event&)>& out);
+    // `pausing`: released for a pause in data entry (time passed, a flush, a parameter chosen), not for another half.
+    void release(int ch, const std::function<void(const Event&)>& out, bool pausing = false);
     void pause(int ch);  // a pause in the channel's data entry: a pair alone before it shows its parameter's order
     Channel ch_[16];
     std::set<std::tuple<int, bool, int>> fine_;  // (channel, rpn, parameter) seen sending data entry's fine half

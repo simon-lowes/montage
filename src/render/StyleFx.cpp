@@ -270,7 +270,10 @@ void halftone(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const double angle = e.p("angle", t, 45) * kDeg;
     const bool colour = e.p("mode", t, 0) > 0.5;
     const Image src = img;
-    // Dots on a grid turned by `angle`; each dot's area is the ink the cell's tone needs.
+    // Dots on a grid turned by `angle`; each dot's area is the ink the cell's tone needs. A dark cell's dot is wider
+    // than the cell and reaches into its neighbours (drawn there round, not cut off at the cell's edge): a pixel is
+    // inked by the most of the dots of its cell and the eight round it that reach it.
+    const double reach = cell * std::sqrt(1 / M_PI) + 0.5;  // (the widest dot's soft edge)
     auto dot = [&](double x, double y, double ang, int channel) {
         const double c = std::cos(ang), s = std::sin(ang);
         // (a place within 1/1000 of a cell of the screen's lines is taken as on them, so a GPU's rounding cannot move a
@@ -280,15 +283,22 @@ void halftone(const Effect& e, FrameTime t, Image& img, double pixelScale) {
             return std::fabs(w - k) < 1e-3 ? k : w;
         };
         const double u = onLine((x * c + y * s) / cell), v = onLine((-x * s + y * c) / cell);
-        const double cu = std::floor(u) + 0.5, cv = std::floor(v) + 0.5;
-        const double px = (cu * c - cv * s) * cell, py = (cu * s + cv * c) * cell;
-        float at[4];
-        sample(src, px, py, at, Edge::Clamp);
-        const float a = at[3] > 0 ? at[3] : 1;
-        const float tone = std::clamp(channel < 0 ? lumaOf(at) / a : at[channel] / a, 0.0f, 1.0f);
-        const double r = cell * std::sqrt((1 - tone) / M_PI);
-        const double d = std::hypot(u - cu, v - cv) * cell;
-        return smoothstep(float(r + 0.5), float(r - 0.5), float(d));  // 1 inside the dot
+        float most = 0;
+        // (its own cell first, then the neighbours whose widest dot could reach it)
+        static constexpr int kAround[9][2] = {{0, 0}, {-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}};
+        for (const auto& o : kAround) {
+            const double cu = std::floor(u) + o[0] + 0.5, cv = std::floor(v) + o[1] + 0.5;
+            const double d = std::hypot(u - cu, v - cv) * cell;
+            if ((o[0] != 0 || o[1] != 0) && !(d < reach)) continue;
+            const double px = (cu * c - cv * s) * cell, py = (cu * s + cv * c) * cell;
+            float at[4];
+            sample(src, px, py, at, Edge::Clamp);
+            const float a = at[3] > 0 ? at[3] : 1;
+            const float tone = std::clamp(channel < 0 ? lumaOf(at) / a : at[channel] / a, 0.0f, 1.0f);
+            const double r = cell * std::sqrt((1 - tone) / M_PI);
+            most = std::max(most, smoothstep(float(r + 0.5), float(r - 0.5), float(d)));  // 1 inside the dot
+        }
+        return most;
     };
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y)

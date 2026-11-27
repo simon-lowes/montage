@@ -45,7 +45,8 @@ signals:
 
 private:
     EncodeFolderJobs(QWidget* window, EditorState* state);
-    EncodeFolderScan* scanFor(const QString& folder) const;
+    // The scan of a folder, by its input folder, preset and output folder (two may share an input or an output).
+    EncodeFolderScan* scanFor(const EncodeFolder& folder) const;
     QString titleFor(const QString& path) const;
     QPointer<QWidget> window_;
     QPointer<EditorState> state_;
@@ -54,7 +55,8 @@ private:
     std::vector<EncodeFolder> folders_;
     std::vector<std::unique_ptr<EncodeFolderScan>> scans_;
     struct Pending {
-        QString folder, file, output;
+        EncodeFolder folder;
+        QString file, output;
     };
     std::map<QString, Pending> pending_;  // by task id
     int started_ = 0;

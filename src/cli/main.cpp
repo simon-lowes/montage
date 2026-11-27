@@ -155,8 +155,9 @@ int usage() {
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
                  "  montage-cli otio <project.montage> [-o out.otio]\n"
-                 "  montage-cli aaf <project.montage> -o <out.aaf> [--no-picture]   (Pro Tools, Fairlight, Media Composer: audio as\n"
-                 "      WAVs in \"<out> Media\", video tracks linked to the original files)\n"
+                 "  montage-cli aaf <project.montage> -o <out.aaf> [--no-picture] [--bake-automation]   (Pro Tools, Fairlight, Media\n"
+                 "      Composer: audio as WAVs in \"<out> Media\", video tracks linked to the original files; --bake-automation\n"
+                 "      plays each track's volume and its automation into its clips' gain)\n"
                  "      [--avid-media [--drive DIR] [--codec dnxhr_sq] [--handles 30] [--bake]]   (for Media Composer: the media as\n"
                  "      MXF OP-Atom in DIR's \"Avid MediaFiles/MXF/<n>\", the AAF linked to it)\n"
                  "  montage-cli xml <project.montage> [-o out.xml]       (Final Cut Pro 7 XML)\n"
@@ -1274,6 +1275,7 @@ int cmdAaf(const std::vector<std::string>& args) {
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
         else if (args[i] == "--no-picture") options.picture = false;
+        else if (args[i] == "--bake-automation") options.bakeAutomation = true;
         else if (args[i] == "--avid-media") options.avid.enabled = true;
         else if (args[i] == "--drive" && i + 1 < args.size()) options.avid.drive = args[++i], mediaOption = true;
         else if (args[i] == "--codec" && i + 1 < args.size()) options.avid.codec = args[++i], mediaOption = true;
@@ -1311,6 +1313,7 @@ int cmdAaf(const std::vector<std::string>& args) {
     if (!r.mediaFolder.empty()) std::printf("Media in %s\n", r.mediaFolder.c_str());
     std::printf("Wrote %s: %d audio tracks, %d clips, %d crossfades, %zu media files; %d video tracks, %d clips, %d dissolves\n",
                 out.c_str(), r.audioTracks, r.clips, r.transitions, r.mediaFiles.size(), r.videoTracks, r.videoClips, r.videoTransitions);
+    if (r.trackLanes) std::printf("%d track volume or pan lanes\n", r.trackLanes);
     return 0;
 }
 

@@ -34,19 +34,28 @@ uint64_t title3dSolidsDrawn();
 
 // A 3D title at time t (clip frames) as triangles in the 3D layers' scene seen through its own camera (the frame at
 // z = 0 about its middle, a unit a sequence pixel, y up, the camera on +z): its letters' faces (cut into triangles,
-// the outline's corners among theirs) and sides, each corner coloured as the title paints it there (linear light; a
-// track's picture is not taken), in one material lit by the scene. False when nothing of it shows, or for a title seen
-// through a camera in a file.
+// the outline's corners among theirs) and sides, each corner coloured as the title paints it there (linear light; at
+// a track's picture, its colour there), with uvs across the title's box as its own drawing maps a picture, in one
+// material, and one more for each track's picture it shows (given `pictures`), that picture as its texture
+// (premultiplied and display-referred, as the title is drawn with it). Each corner also has the title's own light:
+// how its own drawing lights it. Seen through a camera in a file, its triangles and that camera are in the file's
+// scene (its units). False when nothing of it shows, or for a title to be seen through a camera its file lacks.
 struct Title3DMesh {
     PosedTriangles triangles;
-    std::shared_ptr<const Model> model;  // its material
+    std::shared_ptr<const Model> model;  // its materials
     std::vector<int> letterOf;           // each triangle's letter solid (in the title's order)
     std::vector<char> onFace;            // each triangle: 1 on its letter's front face
     double opacity = 1;
     // The title's own camera in that space (its lens, at the picture's middle; scale 1: sequence pixels), through which
     // it is drawn alone.
     ModelCamera camera;
+    // Its own light, for ModelScene::ownLight: 6 a corner (the factor and highlight its own drawing lights it with
+    // there, then keep and the colour added, display-referred), the way towards the light and its share of ambient.
+    std::vector<float> ownLight;
+    std::array<double, 3> toLight{0, 0, 1};
+    float ambient = 0;
 };
-bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, FrameTime duration, double fps, Title3DMesh& out);
+bool title3dMesh(const Effect& g, double t, double seqWidth, double seqHeight, FrameTime duration, double fps, Title3DMesh& out,
+                 const Title3DPictures* pictures = nullptr);
 
 }  // namespace montage

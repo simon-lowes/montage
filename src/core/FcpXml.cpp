@@ -1233,8 +1233,10 @@ struct FcpxWriter {
         if (sound && sound != &c) from.push_back(sound);
         for (const Clip* f : from) {
             const Carried& k = carried(*f);
+            // (a split edit's audioStart and audioDuration, kept by an earlier import, are not written back: the sound
+            // is its own clip, written as it is now)
             for (const auto& [name, value] : k.attrs)
-                if (!attrsWritten.count(name) && (minor >= 15 || name != "flags")) {
+                if (!attrsWritten.count(name) && (minor >= 15 || name != "flags") && name != "audioStart" && name != "audioDuration") {
                     w.writeAttribute(name, value);
                     attrsWritten.insert(name);
                 }
@@ -1655,6 +1657,8 @@ struct FcpxReader {
             }
             element(e, offset, vTrack, aTrack, last, dissolve);
         }
+        for (CaptionTrack& t : b->sequence().captionTracks)
+            if (untidyCaptions.erase(t.id)) normalizeCaptions(t.captions);
     }
 
     // Builds the sequence of a compound clip (`<sequence>`) or multicam clip (`<multicam>`) once, and the media item
@@ -2048,8 +2052,11 @@ struct FcpxReader {
         }
         cap.text = blocks.join('\n').toStdString();
         track->captions.push_back(std::move(cap));
-        normalizeCaptions(track->captions);
+        // (put in order and trimmed once its storyline is read, not after each caption: a long caption file is read
+        // in time in proportion to its captions)
+        untidyCaptions.insert(track->id);
     }
+    std::set<Id> untidyCaptions;  // the caption tracks given captions since they were last put in order
 
     // What a clip element holds that Montage does not use, kept with its clip (Clip::foreign["fcpxml"]) to be written
     // back: its other attributes (1.15's flags among them), its elements (filters, masks, metadata...) and the effect
@@ -2057,7 +2064,8 @@ struct FcpxReader {
     void carry(const QDomElement& e, Id id, const std::string& name, int blend) {
         Clip* c = id ? edit::clipById(b->sequence(), id) : nullptr;
         if (!c) return;
-        static const QStringList knownAttrs = {"ref", "lane", "offset", "name", "start", "duration", "enabled", "srcEnable", "audioRole", "format"};
+        static const QStringList knownAttrs = {"ref",     "lane",      "offset",    "name",   "start",      "duration",
+                                               "enabled", "srcEnable", "audioRole", "format", "audioStart", "audioDuration"};
         static const QStringList knownElements = {"timeMap", "adjust-transform", "adjust-crop", "adjust-blend", "adjust-volume", "adjust-panner",
                                                   "adjust-conform", "adjust-natural-motion-blur", "mc-source", "text", "text-style-def",
                                                   "marker", "chapter-marker"};
@@ -2120,17 +2128,25 @@ struct FcpxReader {
         QDomElement seenSource;  // a multicam clip's angle shown (its picture's adjustments)
         bool reverse = false;
         const double speed = speedOf(e, reverse);
+        // A split edit (a J or L cut): the sound's own part of the clip, from audioStart (in the clip's own time) for
+        // audioDuration, where it differs from the picture's.
+        const double audioStart = e.hasAttribute("audioStart") ? parseFcpTime(e.attribute("audioStart")) : start;
+        const double audioDur = e.hasAttribute("audioDuration") ? parseFcpTime(e.attribute("audioDuration")) : dur;
+        const double audioAt = at + (audioStart - start) / std::max(0.01, speed);
         auto place = [&](Id mid, double origin, TrackKind kind, int track) -> Clip* {
+            const bool sound = kind == TrackKind::Audio;
+            const double cAt = sound ? audioAt : at, cDur = sound ? audioDur : dur, cStart = sound ? audioStart : start;
+            const FrameTime cS0 = sound ? frames(audioAt) : s0, cLen = sound ? frames(audioDur) : len;
             // Sound edited to the sample (times between frames): whole frames round it, the silent parts of its first
             // and last frames its head and tail.
             // (Within half a sample of a frame, on it.)
             const double near = 0.5 * fps / 48000;
-            const double from = at * fps, to = (at + dur) * fps, first = std::floor(from + near), last = std::ceil(to - near);
-            const bool sampled = kind == TrackKind::Audio && dur > 0 && (from - first > near || last - to > near);
+            const double from = cAt * fps, to = (cAt + cDur) * fps, first = std::floor(from + near), last = std::ceil(to - near);
+            const bool sampled = sound && cDur > 0 && (from - first > near || last - to > near);
             const double head = sampled ? from - first : 0, tail = sampled ? last - to : 0;
-            const double in = (start - origin) * fps - (reverse ? tail : head) * speed;
+            const double in = (cStart - origin) * fps - (reverse ? tail : head) * speed;
             Clip* c = sampled ? b->addClip(kind, track, mid, FrameTime(first), FrameTime(last - first), in, name)
-                              : b->addClip(kind, track, mid, s0, len, (start - origin) * fps, name);
+                              : b->addClip(kind, track, mid, cS0, cLen, (cStart - origin) * fps, name);
             if (c) {
                 c->speed = speed;
                 c->reverse = reverse;

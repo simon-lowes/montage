@@ -24,6 +24,7 @@
 #include "Compositor.h"
 #include "core/History.h"
 #include "render/ExportScaler.h"
+#include "core/Preferences.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -448,7 +449,7 @@ std::string vmafModelFor(const QualityPicture& p, const CompareOptions& o) {
     const std::string builtIn = uhd ? "hdr_vmaf_v1.1.8_3d0h_2160" : "hdr_vmaf_v1.1.8_3d0h";
     if (vmafModelBuiltIn(builtIn)) return builtIn;
     QString dir = QString::fromStdString(o.vmafModelDir);
-    if (dir.isEmpty()) dir = qEnvironmentVariable("MONTAGE_VMAF_MODELS");
+    if (dir.isEmpty()) dir = prefs::text(QStringLiteral("models/vmaf"));
     if (dir.isEmpty() && QCoreApplication::instance()) dir = QCoreApplication::applicationDirPath() + "/vmaf-models";
     const QString name = QStringLiteral("hdr_vmaf_v1.1.8/hdr_vmaf_v1.1.8_%1.json").arg(uhd ? "3d0h_2160" : "3d0h");
     for (const QString& candidate : {dir + "/" + name, dir + "/" + QFileInfo(name).fileName()})

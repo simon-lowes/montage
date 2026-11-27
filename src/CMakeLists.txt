@@ -79,6 +79,7 @@ add_library(montage_engine STATIC
   core/Production.h core/Production.cpp
   core/GraphicsTemplate.h core/GraphicsTemplate.cpp
   core/MidiMaps.h core/MidiMaps.cpp
+  core/Preferences.h core/Preferences.cpp
   core/Storyboard.h core/Storyboard.cpp
   automation/ScriptHost.h automation/ScriptHost.cpp
   automation/PythonHost.h automation/PythonHost.cpp
@@ -256,6 +257,7 @@ add_library(montage_engine STATIC
   render/Av1FilmGrain.h render/Av1FilmGrain.cpp
   render/Av1Headers.h render/Av1Headers.cpp
   render/Av1GrainExport.h render/Av1GrainExport.cpp
+  render/CodingRegions.h render/CodingRegions.cpp
   render/ProjectManager.h render/ProjectManager.cpp
   render/AutoBroll.h render/AutoBroll.cpp
   render/AutoMix.h render/AutoMix.cpp
@@ -583,7 +585,8 @@ if(MONTAGE_WITH_OPENSSL)
 endif()
 if(MONTAGE_HAVE_WEBRTC)
   message(STATUS "libdatachannel: live review in a browser enabled")
-  target_link_libraries(montage_engine PRIVATE datachannel OpenSSL::SSL OpenSSL::Crypto)
+  # (and libjuice, the ICE library it brings, whose own header the browser review's held UDP port uses)
+  target_link_libraries(montage_engine PRIVATE datachannel LibJuice::LibJuice OpenSSL::SSL OpenSSL::Crypto)
   target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_WEBRTC)
 endif()
 if(MONTAGE_WITH_OCIO)

@@ -138,12 +138,16 @@ struct SolvedSceneMesh {
     // to the scene's, row vectors as USD writes them (its first three rows the axes, the fourth where it is). Empty:
     // it stands still, its positions in the scene's space.
     std::vector<std::pair<double, std::array<double, 16>>> motion;
+    // Its points and normals in its own space by time code, where they change over the range (written as their time
+    // samples, `positions` and `normals` their defaults; empty: those throughout).
+    std::vector<std::pair<double, std::vector<float>>> pointSamples, normalSamples;
 };
 // The camera, its points and the models placed in its scene as a USD scene (USDA): a camera moving through time codes
 // 0, 1, 2... (one a frame, at the footage's frame rate; a 36 mm wide film back), the points as a point cloud and each
 // model, 3D layer's card and 3D title as a mesh with a plain material (a card with its uvs as primvars:st), a card's
 // picture as its UsdPreviewSurface's texture, a title's colours as its display colour (primvars:displayColor, read by
-// its material through a UsdPrimvarReader_float3) and a card's motion as its transform's time samples. Turned as writeNukeChan turns a scene
+// its material through a UsdPrimvarReader_float3), a card's or a title's motion as its transform's time samples and a
+// title's changing shape as its points' and normals' time samples. Turned as writeNukeChan turns a scene
 // with no ground. To a .usdz path, a USDZ package: the layer first, then the pictures (each aligned to 64 bytes;
 // false if that is more than a package holds: 4 GiB); to a .usda path, the pictures beside it as <name>_Card_N.png.
 bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::vector<SolvedSceneMesh>& models = {},

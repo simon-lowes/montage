@@ -115,7 +115,9 @@ private:
     bool startLive(CaptureSettings& cs);  // false with error_ set
     void endLive();
     // Markers placed on the growing clip (on any clip of the recording's media) made chapters of the live package,
-    // each once.
+    // each once (the same marker on two clips of it, as a split leaves, is one chapter). A marker moved or renamed
+    // moves or renames its chapter: the package's chapter list is written whole each time. One taken off leaves its
+    // chapter.
     void markersToChapters();
 
     EditorState* state_;
@@ -156,7 +158,13 @@ private:
     QDoubleSpinBox* liveBreak_;
     QPushButton* liveChapter_;
     int liveChapters_ = 0;
-    std::set<std::tuple<Id, FrameTime, std::string>> liveMarkers_;  // (clip, marker's time, name: made chapters)
+    // The markers made chapters: each at its place in the recording, with its name, its chapter's title and key.
+    struct LiveMark {
+        double at = 0;  // (seconds into the recording)
+        std::string name, title, key;
+    };
+    std::vector<LiveMark> liveMarks_;
+    int liveMarkKeys_ = 0;
     QPushButton* record_;
     QLabel* status_;
     QTimer* tick_;

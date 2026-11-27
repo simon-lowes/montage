@@ -5,7 +5,8 @@
 //   usd_readback <scene.usda|.usdc|.usdz> <out-dir> <time code>...
 //
 // For each mesh at each time code: "xform <name> <time> <16 numbers>", its transform to the world (row vectors, as
-// USD writes a matrix4d). For each mesh with a picture on its UsdPreviewSurface's diffuse colour, once:
+// USD writes a matrix4d), and "points <name> <time> <count> <x y z>...", its points there in the world. For each mesh
+// with a picture on its UsdPreviewSurface's diffuse colour, once:
 // "picture <name> <width> <height> <channels> <file>", the picture's texels as tinyusdz decoded them, written raw
 // (8 bits a channel: an 8-bit picture it gives as floats is put back to its bytes).
 #include <cmath>
@@ -93,6 +94,14 @@ int main(int argc, char** argv) {
             std::printf("xform %s %.17g", mesh.prim_name.c_str(), tc);
             for (int r = 0; r < 4; ++r)
                 for (int c = 0; c < 4; ++c) std::printf(" %.17g", m->m[r][c]);
+            std::printf("\n");
+            // Its points there, through that matrix into the world.
+            std::printf("points %s %.17g %zu", mesh.prim_name.c_str(), tc, size_t(mesh.points.size()));
+            for (size_t i = 0; i < size_t(mesh.points.size()); ++i) {
+                const auto& q = mesh.points[i];
+                for (int c = 0; c < 3; ++c)
+                    std::printf(" %.9g", double(q[0]) * m->m[0][c] + double(q[1]) * m->m[1][c] + double(q[2]) * m->m[2][c] + m->m[3][c]);
+            }
             std::printf("\n");
             // Its picture, once.
             if (written.count(mesh.prim_name) || mesh.material_id < 0 || size_t(mesh.material_id) >= scene.materials.size()) continue;

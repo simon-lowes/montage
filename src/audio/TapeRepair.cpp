@@ -633,6 +633,75 @@ bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, doubl
     return finish(true);
 }
 
+namespace {
+
+// The left and right channels' spectra of the 4096-sample Hann frames at from + f * 2048 (f = 0, every, 2 * every, ...
+// below frames), added up: the cross-spectrum and each channel's power, k = 0..N/2 (the rest is their mirror). Both
+// channels go through one complex FFT (the left as the real part, the right as the imaginary) and are parted by the
+// spectrum's symmetry; the frames are taken in runs of 16 across the cores and the runs' sums added in order, so the
+// result is the same however many cores there are.
+void azimuthSpectra(const AudioBuffer& in, size_t from, size_t frames, size_t every, std::vector<cd>& slr, std::vector<double>& sll,
+                    std::vector<double>& srr) {
+    constexpr size_t N = 4096, H = N / 2 + 1, kRun = 16;
+    static const std::vector<double> w = hann(N);
+    static const std::vector<cd> twiddle = [] {
+        std::vector<cd> t(N / 2);
+        for (size_t k = 0; k < N / 2; ++k) t[k] = std::polar(1.0, -2 * M_PI * double(k) / double(N));
+        return t;
+    }();
+    const size_t nch = size_t(std::max(1, in.channels)), taken = (frames + every - 1) / every, runs = (taken + kRun - 1) / kRun;
+    if (gAsBefore) {
+        // (as Montage first did it: an FFT for each channel, the frames one after another)
+        slr.assign(N, 0.0), sll.assign(N, 0.0), srr.assign(N, 0.0);
+        std::vector<cd> bl(N), br(N);
+        for (size_t f = 0; f < frames; f += every) {
+            const size_t at = from + f * (N / 2);
+            for (size_t i = 0; i < N; ++i) {
+                bl[i] = in.samples[(at + i) * nch] * w[i];
+                br[i] = in.samples[(at + i) * nch + 1] * w[i];
+            }
+            fft(bl, false);
+            fft(br, false);
+            for (size_t k = 0; k < N; ++k) {
+                slr[k] += bl[k] * std::conj(br[k]);
+                sll[k] += std::norm(bl[k]);
+                srr[k] += std::norm(br[k]);
+            }
+        }
+        return;
+    }
+    std::vector<double> sums(runs * H * 4, 0.0);  // (per run: the cross-spectrum's real and imaginary parts, then each power)
+    acrossCores(runs, [&](size_t r0, size_t r1) {
+        std::vector<cd> z(N);
+        for (size_t r = r0; r < r1; ++r) {
+            double* lrRe = sums.data() + r * H * 4;
+            double *lrIm = lrRe + H, *ll = lrIm + H, *rr = ll + H;
+            for (size_t t = r * kRun; t < std::min(taken, (r + 1) * kRun); ++t) {
+                const float* x = in.samples.data() + (from + t * every * (N / 2)) * nch;
+                for (size_t i = 0; i < N; ++i) z[i] = {double(x[i * nch]) * w[i], double(x[i * nch + 1]) * w[i]};
+                fftQuick(z, twiddle, N);
+                for (size_t k = 0; k < H; ++k) {
+                    // (Z[k] = L[k] + i R[k], and conj(Z[N - k]) = L[k] - i R[k] for real channels)
+                    const cd a = z[k % N], b = std::conj(z[(N - k) % N]);
+                    const double lr = 0.5 * (a.real() + b.real()), li = 0.5 * (a.imag() + b.imag());
+                    const double rr0 = 0.5 * (a.imag() - b.imag()), ri = -0.5 * (a.real() - b.real());
+                    lrRe[k] += lr * rr0 + li * ri, lrIm[k] += li * rr0 - lr * ri;
+                    ll[k] += lr * lr + li * li, rr[k] += rr0 * rr0 + ri * ri;
+                }
+            }
+        }
+    });
+    slr.assign(N, 0.0), sll.assign(N, 0.0), srr.assign(N, 0.0);
+    for (size_t r = 0; r < runs; ++r) {
+        const double* lrRe = sums.data() + r * H * 4;
+        const double *lrIm = lrRe + H, *ll = lrIm + H, *rr = ll + H;
+        for (size_t k = 0; k < H; ++k) slr[k] += cd(lrRe[k], lrIm[k]), sll[k] += ll[k], srr[k] += rr[k];
+    }
+    for (size_t k = H; k < N; ++k) slr[k] = std::conj(slr[N - k]), sll[k] = sll[N - k], srr[k] = srr[N - k];
+}
+
+}  // namespace
+
 Azimuth measureAzimuth(const AudioBuffer& in, int64_t from, int64_t to) {
     Azimuth a;
     const size_t nch = size_t(std::max(1, in.channels));
@@ -641,24 +710,10 @@ Azimuth measureAzimuth(const AudioBuffer& in, int64_t from, int64_t to) {
     from = std::clamp<int64_t>(from, 0, n), to = to < 0 ? n : std::clamp<int64_t>(to, from, n);
     constexpr size_t N = 4096;
     if (to - from < int64_t(N)) return a;
-    const std::vector<double> w = hann(N);
-    std::vector<cd> slr(N, 0.0), bl(N), br(N);
-    std::vector<double> sll(N, 0.0), srr(N, 0.0);
+    std::vector<cd> slr;
+    std::vector<double> sll, srr;
     const size_t frames = size_t((to - from - int64_t(N)) / int64_t(N / 2)) + 1, every = std::max<size_t>(1, frames / 1500);
-    for (size_t f = 0; f < frames; f += every) {
-        const size_t at = size_t(from) + f * (N / 2);
-        for (size_t i = 0; i < N; ++i) {
-            bl[i] = in.samples[(at + i) * nch] * w[i];
-            br[i] = in.samples[(at + i) * nch + 1] * w[i];
-        }
-        fft(bl, false);
-        fft(br, false);
-        for (size_t k = 0; k < N; ++k) {
-            slr[k] += bl[k] * std::conj(br[k]);
-            sll[k] += std::norm(bl[k]);
-            srr[k] += std::norm(br[k]);
-        }
-    }
+    azimuthSpectra(in, size_t(from), frames, every, slr, sll, srr);
     // Whole samples: the generalised cross-correlation's peak (phase transform), at -D for a right channel D behind.
     std::vector<cd> g(N);
     double coh = 0, cohWeight = 0;
@@ -715,12 +770,20 @@ bool correctAzimuth(const AudioBuffer& in, AudioBuffer& out, bool adaptive, bool
     const int64_t hop = std::max<int64_t>(1, in.sampleRate / 2), win = int64_t(in.sampleRate) * 2;
     std::vector<double> at, d;
     if (adaptive) {
-        for (int64_t c = 0; c < n; c += hop) {
-            if (cancelled(cancel)) return false;
-            const Azimuth here = measureAzimuth(in, c - win / 2, c + win / 2);
-            at.push_back(double(c));
-            d.push_back(here.coherence > 0.3 && std::fabs(here.delay - whole.delay) < 8 ? here.delay : whole.delay);
-        }
+        // (each half second's on a core of its own)
+        const size_t count = size_t((n + hop - 1) / hop);
+        at.resize(count), d.resize(count);
+        auto each = [&](size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1 && !cancelled(cancel); ++i) {
+                const int64_t c = int64_t(i) * hop;
+                const Azimuth here = measureAzimuth(in, c - win / 2, c + win / 2);
+                at[i] = double(c);
+                d[i] = here.coherence > 0.3 && std::fabs(here.delay - whole.delay) < 8 ? here.delay : whole.delay;
+            }
+        };
+        if (gAsBefore) each(0, count);
+        else acrossCores(count, each);
+        if (cancelled(cancel)) return false;
         std::vector<double> steady(d.size());
         for (size_t i = 0; i < d.size(); ++i) {
             std::vector<double> five;
@@ -739,11 +802,23 @@ bool correctAzimuth(const AudioBuffer& in, AudioBuffer& out, bool adaptive, bool
     const double sign = polarity && whole.inverted ? -1.0 : 1.0;
     if (!adaptive && std::fabs(whole.delay) < 1e-4 && sign > 0) return true;
     const SincTable& sinc = sincTable();
-    for (int64_t o = 0; o < n; ++o) {
-        if ((o & 0xffff) == 0 && cancelled(cancel)) return false;
-        out.samples[size_t(o) * nch + 1] = float(sign * sinc.read(in.samples.data(), nch, 1, n, double(o) + delayAt(o)));
-    }
-    return true;
+    // (in bands of 4096 samples across the cores)
+    constexpr int64_t kBand = 1 << 12;
+    std::atomic<bool> stop{false};
+    const size_t bands = size_t((n + kBand - 1) / kBand);
+    auto band = [&](size_t b0, size_t b1) {
+        for (size_t b = b0; b < b1; ++b) {
+            if (stop || cancelled(cancel)) {
+                stop = true;
+                return;
+            }
+            for (int64_t o = int64_t(b) * kBand; o < std::min(n, int64_t(b + 1) * kBand); ++o)
+                out.samples[size_t(o) * nch + 1] = float(sign * sinc.read(in.samples.data(), nch, 1, n, double(o) + delayAt(o)));
+        }
+    };
+    if (gAsBefore) band(0, bands);
+    else acrossCores(bands, band);
+    return !stop;
 }
 
 std::vector<std::pair<int64_t, int64_t>> soundRegions(const AudioBuffer& in, double thresholdDb, double minSilence, double padBefore,

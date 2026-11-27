@@ -128,6 +128,14 @@ struct ModelScene {
     // in `groundCasters` (indices into it), those whose shadows fall on this ground.
     std::shared_ptr<const ModelShadowWorld> shadowWorld;
     std::vector<int> groundCasters;
+    // Lit as a 3D title lights itself (render/Title3D.h), in place of the materials' shading and the lights': 6 a
+    // vertex of the triangles (the factor and highlight, then keep and the colour added; display-referred), each pixel
+    // min(1, base x factor + highlight) with base its material's base colour texture's colour (straight) x keep +
+    // added, made linear as BT.1886 has it. Light `ownLightShadows` (an index into lights, -1: none) adds nothing
+    // itself, but where its shadows fall they take away the factor's share above `ownAmbient` and the highlight.
+    std::vector<float> ownLight;
+    float ownAmbient = 0;
+    int ownLightShadows = -1;
 };
 
 struct ModelRenderOptions {

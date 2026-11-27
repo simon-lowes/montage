@@ -51,6 +51,12 @@ struct Status {
     bool reports = false;       // the sound is lined up by the sender's reports (else by arrival)
     int64_t packets = 0, lost = 0, dropped = 0;  // RTP packets taken, missing by their numbers, dropped as too far behind
     int keyframesAsked = 0;
+    // What the feed holds, against its caps: the bytes waiting to be read now and the most there have been (pictures
+    // dropped past 64 MB, sound past 68 MB); the most of the pictures held before the feed began (16 MB, from the
+    // last keyframe) and of its sound (500 packets); and the most entries kept at once to time it by (the sender's
+    // reports and the sound's arrivals: of each tenth or fifth of a second of the last 15 s, both streams' together).
+    int64_t queuedBytes = 0, mostQueuedBytes = 0, mostHeldBytes = 0;
+    int mostHeldSound = 0, mostTimingKept = 0;
     int refused = 0;            // requests answered 401
     bool ended = false;         // the sender ended the feed (DELETE), or its connection closed
 };

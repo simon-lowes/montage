@@ -498,6 +498,13 @@ struct LivePackager::State {
     std::deque<std::pair<double, CcTriplet>> cc;
     bool ccSeen = false;
     std::vector<std::unique_ptr<Rendition>> captions;
+    // Each AdaptationSet's id in the MPD, given the first time its rendition is listed and kept: players match sets
+    // by id from one update of the manifest to the next, so a sound stream that turns up late must not move them.
+    std::map<std::string, int> dashSetIds;
+    int setIdFor(const std::string& rendition) {
+        auto [it, added] = dashSetIds.try_emplace(rendition, int(dashSetIds.size()) + 1);
+        return it->second;
+    }
     std::set<std::string> ccIds;  // (the services and channels seen, by CcCaptionStream::id)
     bool announceDue = false;     // a rendition joined: the multivariant playlist and the MPD again once it has a part
 
@@ -532,9 +539,14 @@ struct LivePackager::State {
         std::string title;
         double at = -1;
         int64_t picture = -1;
+        std::string key;
     };
     std::vector<ChapterAsked> chaptersAsked;
-    std::vector<std::pair<double, std::string>> chapterList;
+    struct Chapter {
+        double at = 0;
+        std::string title, key;
+    };
+    std::vector<Chapter> chapterList;
     double encodedEnd = 0;  // (the pictures encoded so far, seconds)
 
     ~State() {
@@ -992,9 +1004,8 @@ struct LivePackager::State {
             if (parts) t += " availabilityTimeOffset=\"" + fmt("%.3f", segSeconds - partSeconds) + "\" availabilityTimeComplete=\"false\"";
             return t + "/>\n";
         };
-        int id = 1;
         if (!video.empty()) {
-            x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\" startWithSAP=\"1\" "
+            x += "<AdaptationSet id=\"" + std::to_string(setIdFor("(the pictures)")) + "\" contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\" startWithSAP=\"1\" "
                  "frameRate=\"" + std::to_string(fps.num) + "/" + std::to_string(fps.den) + "\">\n";
             // (ad cues: SCTE 35 messages in emsg boxes, before the chunk they come in)
             x += std::string("<InbandEventStream schemeIdUri=\"") + kScte35Scheme + "\" value=\"1\"/>\n";
@@ -1004,7 +1015,7 @@ struct LivePackager::State {
             x += "</AdaptationSet>\n";
         }
         for (const auto& a : audio) {
-            x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"audio\" mimeType=\"audio/mp4\" lang=\"" + xmlEscape(a->language) +
+            x += "<AdaptationSet id=\"" + std::to_string(setIdFor(a->name)) + "\" contentType=\"audio\" mimeType=\"audio/mp4\" lang=\"" + xmlEscape(a->language) +
                  "\" segmentAlignment=\"true\">\n<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"" + (a->track == 0 ? "main" : "alternate") +
                  "\"/>\n<Label>" + xmlEscape(a->label) + "</Label>\n";
             x += "<Representation id=\"" + a->name + "\" bandwidth=\"" + std::to_string(a->enc ? a->enc->bit_rate : set.audioBitrate * 4) + "\" codecs=\"" + a->codecs +
@@ -1017,7 +1028,7 @@ struct LivePackager::State {
         }
         for (const auto& c : captions) {
             // (IMSC 1 text in fragmented MP4, a TTML document a segment, made at each segment's end)
-            x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"text\" mimeType=\"application/mp4\" lang=\"" + xmlEscape(c->language) +
+            x += "<AdaptationSet id=\"" + std::to_string(setIdFor(c->name)) + "\" contentType=\"text\" mimeType=\"application/mp4\" lang=\"" + xmlEscape(c->language) +
                  "\" segmentAlignment=\"true\">\n<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"caption\"/>\n<Label>" + xmlEscape(c->label) +
                  "</Label>\n<Representation id=\"" + c->name + "\" bandwidth=\"2000\" codecs=\"stpp.ttml.im1t\">\n<SegmentTemplate timescale=\"1000\" duration=\"" +
                  std::to_string(std::llround(segSeconds * 1000)) + "\" startNumber=\"1\" initialization=\"" + c->name + "/init.mp4\" media=\"" +
@@ -1236,9 +1247,9 @@ struct LivePackager::State {
         const int64_t edge = std::llround(encodedEnd * av_q2d(fps));
         for (size_t i = 0; i < chapterList.size(); ++i) {
             Caption c;
-            c.start = std::llround(chapterList[i].first * av_q2d(fps));
-            c.end = i + 1 < chapterList.size() ? std::llround(chapterList[i + 1].first * av_q2d(fps)) : std::max(edge, c.start + 1);
-            c.text = chapterList[i].second;
+            c.start = std::llround(chapterList[i].at * av_q2d(fps));
+            c.end = i + 1 < chapterList.size() ? std::llround(chapterList[i + 1].at * av_q2d(fps)) : std::max(edge, c.start + 1);
+            c.text = chapterList[i].title;
             if (c.end > c.start) cues.push_back(std::move(c));
         }
         return writeAtomically(folder + "/chapters.vtt", captionsToVtt(cues, Rational{fps.num, fps.den})) || fail("Cannot write " + folder + "/chapters.vtt");
@@ -1531,9 +1542,13 @@ struct LivePackager::State {
                 // (one at a time already packaged, as a marker placed on the recording behind it, keeps its time:
                 // the list is written whole each time)
                 const int64_t frame = c.at >= 0 ? std::max<int64_t>(0, std::llround(c.at * rate) - firstPicture) : frameOf(c.at, c.picture, &late);
-                chapterList.push_back({seconds(frame), c.title});
+                // (one given before by its key: moved and titled anew)
+                auto was = c.key.empty() ? chapterList.end()
+                                         : std::find_if(chapterList.begin(), chapterList.end(), [&](const Chapter& k) { return k.key == c.key; });
+                if (was != chapterList.end()) was->at = seconds(frame), was->title = c.title;
+                else chapterList.push_back({seconds(frame), c.title, c.key});
             }
-            std::stable_sort(chapterList.begin(), chapterList.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            std::stable_sort(chapterList.begin(), chapterList.end(), [](const Chapter& a, const Chapter& b) { return a.at < b.at; });
             if (chapterList.size() > 1000) chapterList.erase(chapterList.begin(), chapterList.begin() + ptrdiff_t(chapterList.size() - 1000));
             writeChapters();
             std::lock_guard lock(m);
@@ -1977,10 +1992,10 @@ void LivePackager::cueFromFeed(const std::vector<uint8_t>& section, double feedZ
     s_->asked.push_back({lc, -1, true});
 }
 
-void LivePackager::chapter(const std::string& title, double at) {
+void LivePackager::chapter(const std::string& title, double at, const std::string& key) {
     std::lock_guard lock(s_->m);
     if (!s_->st.running || s_->stopping || s_->chaptersAsked.size() >= 256) return;
-    s_->chaptersAsked.push_back({title, at, -1});
+    s_->chaptersAsked.push_back({title, at, -1, key});
 }
 
 void LivePackager::finish() {
@@ -2155,6 +2170,11 @@ struct LiveOrigin::State {
     QEventLoop* loop = nullptr;
     int port = 0;
     std::atomic<int64_t> heldBytes{0};  // (bytes handed to connections that their clients have not taken yet)
+    std::atomic<int> keptNow{0};
+    std::atomic<int64_t> letGo{0};      // (connections let go by the 512 kept)
+    std::atomic<int64_t> failed{0};     // (connections ended by an error of their own; the last one's text, under m)
+    std::string lastError;
+    int sendBuffer = 0;
 
     // A connection's one request (each answered, then closed). Kept until its socket is gone.
     struct Request {
@@ -2490,6 +2510,7 @@ struct LiveOrigin::State {
                 if (stuck) {
                     drop(*stuck);
                     --kept;
+                    ++letGo;
                 }
             }
             if (!socket->setSocketDescriptor(fd) || open >= 256 || kept >= 512) {
@@ -2497,10 +2518,11 @@ struct LiveOrigin::State {
                 socket->deleteLater();
                 return;
             }
+            if (sendBuffer > 0) socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, sendBuffer);
 #ifdef Q_OS_WIN
             // (Windows otherwise takes many megabytes into a connection's send buffer whether or not its client reads
             // them, so a client that reads nothing still seemed to take what it was sent)
-            socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, 1 << 20);
+            else socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, 1 << 20);
 #endif
             auto r = std::make_unique<Request>();
             r->socket = socket;
@@ -2515,6 +2537,14 @@ struct LiveOrigin::State {
                 raw->moved = Clock::now();
                 // (a file or a growing segment: its next piece as soon as there is room for it)
                 if (!raw->done && (raw->sending || raw->streaming)) attempt(*raw);
+            });
+            QObject::connect(socket, &QAbstractSocket::errorOccurred, &server, [this, raw](QAbstractSocket::SocketError e) {
+                if (raw->gone) return;
+                ++failed;
+                const std::string text = raw->socket->errorString().toStdString() + " (" + std::to_string(int(e)) + "), " +
+                                         std::to_string(raw->socket->bytesToWrite()) + " bytes still to send" + (raw->done ? ", answered" : "");
+                std::lock_guard lock(m);
+                lastError = text;
             });
             QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
             // (the request goes with its socket)
@@ -2541,9 +2571,11 @@ struct LiveOrigin::State {
             for (Request* r : waiting) attempt(*r);
             for (Request* r : slow) drop(*r);
             int64_t held = 0;
+            int keptCount = 0;
             for (auto& r : requests)
-                if (!r->gone && r->socket) held += r->socket->bytesToWrite();
+                if (!r->gone && r->socket) held += r->socket->bytesToWrite(), ++keptCount;
             heldBytes.store(held);
+            keptNow.store(keptCount);
         });
         tick.start(10);
         {
@@ -2596,6 +2628,19 @@ bool LiveOrigin::start(const std::string& folder, int port, std::function<bool(c
 int LiveOrigin::port() const { return s_->port; }
 
 int64_t LiveOrigin::bytesWaiting() const { return s_->heldBytes.load(); }
+
+int LiveOrigin::connectionsKept() const { return s_->keptNow.load(); }
+
+int64_t LiveOrigin::connectionsLetGo() const { return s_->letGo.load(); }
+
+int64_t LiveOrigin::connectionsFailed() const { return s_->failed.load(); }
+
+std::string LiveOrigin::lastConnectionError() const {
+    std::lock_guard lock(s_->m);
+    return s_->lastError;
+}
+
+void LiveOrigin::setSendBuffer(int bytes) { s_->sendBuffer = std::max(0, bytes); }
 
 void LiveOrigin::stop() {
     if (!s_->thread.joinable()) return;

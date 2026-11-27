@@ -16,6 +16,7 @@
 #include "Interpretation.h"
 #include "Production.h"
 #include "ProjectIO.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -452,7 +453,7 @@ edit::Result fillGraphicsFromTable(Project& p, Sequence& s, Id clip, const std::
 // ---- The library -----------------------------------------------------------------------------------------------------
 
 std::string graphicsTemplatesDirectory() {
-    if (const char* env = std::getenv("MONTAGE_TEMPLATES_DIR"); env && *env) return env;
+    if (const QString chosen = prefs::text(QStringLiteral("libraries/templates")); !chosen.isEmpty()) return chosen.toStdString();
     return (QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/Graphics Templates")).toStdString();
 }
 

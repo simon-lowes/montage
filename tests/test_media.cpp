@@ -41,6 +41,7 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QDateTime>
+#include <QFontDatabase>
 #include <QFile>
 #include <QFloat16>
 #include <random>
@@ -183,6 +184,7 @@
 #include "render/AutoBroll.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
+#include "render/TemporalFx.h"
 #include "render/DialogueMatch.h"
 #include "render/RoomTone.h"
 #include "audio/Ltc.h"
@@ -1602,6 +1604,7 @@ public:
     int burstReads = 0, laterBurstReads = 0;
     bool recordWithoutRoll = false;
     int64_t heldUp = -1;  // a picture its output sends a frame and a half late (held up on its way)
+    int64_t moves = 0;     // how often the tape was moved, cued, rolled or stopped (its picture runs on between)
 
     double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * fps * std::chrono::duration<double>(now - at).count(); }
     void move(double frame, double sp) {
@@ -1610,6 +1613,7 @@ public:
         pos = frame;
         speed = sp;
         at = now;
+        ++moves;
     }
     bool servoLocked(Clock::time_point now = Clock::now()) const {
         return servoLockAfter >= 0 && speed == 1 && std::chrono::duration<double>(now - rolledAt).count() >= servoLockAfter;
@@ -1639,16 +1643,18 @@ public:
                 video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), o.data(), size_t(W) * 2);
                 pics.push_back(std::move(o));
             }
-            int64_t sent = -1;
+            int64_t sent = -1, sentRun = -1;
             while (!stop_) {
-                int64_t f;
+                int64_t f, run;
                 {
                     std::lock_guard lock(m);
                     f = speed == 1 ? int64_t(std::floor(frameNow() + 1e-9)) : -1;
+                    run = moves;
                 }
                 // (every frame played sent, as a deck's output never skips one: those this thread was held up past
-                // go at once, each with its own time)
-                for (int64_t g = sent >= 0 && f > sent && f - sent <= 5 ? sent + 1 : f; f >= 0 && f != sent && g <= f; ++g) {
+                // go at once, each with its own time, however long it was held up on a busy machine; a cue or a roll
+                // starts the picture afresh)
+                for (int64_t g = sent >= 0 && run == sentRun && f > sent ? sent + 1 : f; f >= 0 && f != sent && g <= f; ++g) {
                     bool hold = false;
                     {
                         std::lock_guard lock(m);
@@ -1662,7 +1668,7 @@ public:
                     if (stamp) v.metadata += "<montage_timecode value=\"" + formatTimecode(g, 25, false) + "\"/>";
                     tx->sendVideo(v);
                 }
-                if (f >= 0) sent = f;
+                if (f >= 0) sent = f, sentRun = run;
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         });
@@ -2535,6 +2541,95 @@ private slots:
         QCOMPARE(hdrStatedPeakNits(whole.masteringMaxNits, whole.maxCll), 4000.0);
     }
 
+    // Phase 18 #11: a PQ feed recorded (ST 2110-20 with its ST 2108-1 HDR metadata, to ProRes in QuickTime and in
+    // MXF): the file states the feed's mastering display (its primaries, white and luminance range) and its light
+    // levels (MaxCLL and MaxFALL), as a reader finds them in the file's header, beside its PQ transfer.
+    void captureHdrMetadataRecorded() {
+        namespace st = st2110;
+        for (const char* file : {"capture-hdr.mov", "capture-hdr.mxf"}) {
+            int ports[3];
+            {
+                st::Receiver probe[3];
+                for (int i = 0; i < 3; ++i) {
+                    QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                    ports[i] = probe[i].port();
+                }
+            }
+            st::SenderOptions o;
+            o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+            o.ttl = 1;
+            const int W = 320, H = 180;
+            st::VideoFormat v;
+            v.width = W, v.height = H, v.fps = {25, 1};
+            v.colorimetry = "BT2100", v.tcs = "PQ";
+            st::Sender tx;
+            std::string err;
+            QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+            output::Signal stated;
+            stated.eotf = output::Eotf::Pq, stated.hdrMetadata = true, stated.masteringP3 = true, stated.masteringPeak = 1000, stated.masteringMin = 0.0050;
+            stated.maxCll = 1200, stated.maxFall = 350;
+            tx.setFrameAnc({st::hdrMetadataPacket(stated)});
+            st::Raster raster(W, H, st::Sampling::Ycc422, 10);
+            for (int y = 0; y < H; ++y) {
+                uint16_t* d = raster.row(y);
+                for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = uint16_t(300 + x);
+            }
+            std::atomic<bool> stop{false};
+            std::thread sending([&] {
+                const std::vector<float> sound(size_t(1920) * 2, 0.0f);
+                for (int t = 0; !stop && t < 25 * 30; ++t) {
+                    const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                    if (!tx.send(raster, sound.data(), 1920, &tc, {}, &stop)) break;
+                }
+            });
+            CaptureSettings cs;
+            cs.video.device = "st2110";
+            cs.video.url = tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc();
+            cs.path = path(file);
+            cs.codec = "prores_proxy";
+            cs.seconds = 1;
+            Recorder rec;
+            QVERIFY2(rec.start(cs, &err), err.c_str());
+            const bool ended = rec.wait(20);
+            stop = true;
+            sending.join();
+            tx.close();
+            QVERIFY2(ended, file);
+            QVERIFY2(rec.status().error.empty(), rec.status().error.c_str());
+            // The file's header, as FFmpeg's demuxers read it.
+            AVFormatContext* f = nullptr;
+            QVERIFY(avformat_open_input(&f, cs.path.c_str(), nullptr, nullptr) >= 0);
+            std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> held(f, [](AVFormatContext* x) { avformat_close_input(&x); });
+            QVERIFY(avformat_find_stream_info(f, nullptr) >= 0);
+            const int vi = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            QVERIFY(vi >= 0);
+            const AVCodecParameters* par = f->streams[vi]->codecpar;
+            QVERIFY2(par->color_trc == AVCOL_TRC_SMPTE2084 && par->color_primaries == AVCOL_PRI_BT2020, file);
+            const AVPacketSideData* md = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+            QVERIFY2(md && md->size >= sizeof(AVMasteringDisplayMetadata), file);
+            const auto* m = reinterpret_cast<const AVMasteringDisplayMetadata*>(md->data);
+            QVERIFY2(m->has_luminance && m->has_primaries, file);
+            QVERIFY2(std::fabs(av_q2d(m->max_luminance) - 1000) < 0.01 && std::fabs(av_q2d(m->min_luminance) - 0.005) < 0.0002,
+                     qPrintable(QStringLiteral("%1: %2 to %3 nits").arg(file).arg(av_q2d(m->min_luminance)).arg(av_q2d(m->max_luminance))));
+            // (P3's primaries, red, green and blue, and D65's white)
+            const double want[4][2] = {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}, {0.3127, 0.3290}};
+            for (int c = 0; c < 4; ++c)
+                for (int k = 0; k < 2; ++k) {
+                    const double got = av_q2d(c < 3 ? m->display_primaries[c][k] : m->white_point[k]);
+                    QVERIFY2(std::fabs(got - want[c][k]) < 0.001, qPrintable(QStringLiteral("%1: %2 %3 is %4").arg(file).arg(c).arg(k).arg(got)));
+                }
+            const AVPacketSideData* cl = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+            if (QString(file).endsWith(".mxf") && !cl) {
+                // (FFmpeg's MXF muxer writes the mastering display only: MXF's descriptor has no light levels of its own)
+                qInfo("%s: no light levels (as MXF has none)", file);
+                continue;
+            }
+            QVERIFY2(cl && cl->size >= sizeof(AVContentLightMetadata), file);
+            const auto* l = reinterpret_cast<const AVContentLightMetadata*>(cl->data);
+            QVERIFY2(l->MaxCLL == 1200 && l->MaxFALL == 350, qPrintable(QStringLiteral("%1: %2 %3").arg(file).arg(l->MaxCLL).arg(l->MaxFALL)));
+        }
+    }
+
     // ST 2110-31 recorded: AES3 subframes carrying a payload that is not PCM (an ST 337 burst's preambles and counted
     // words) are in the file bit for bit, as the 24-bit sound they were sent as, beside the picture.
     void captureAes3BitExact() {
@@ -3027,6 +3122,84 @@ private slots:
                                     .arg(inOrder).arg(status.dropped).arg(status.repeated).arg(skipped)));
         }
 #endif
+    }
+
+    // The 27 November macOS run: a recording of a set length whose last slots come empty (the feed's pictures lost,
+    // or its sender behind) is filled with the last picture repeated, and the status counts those pictures too. Before,
+    // it counted a picture only when one that came was written, so the repeats that ended the recording went uncounted.
+    // Its sound ends with the pictures, at the set length, not at the slot of the picture that came after the gap.
+    void captureCountsPicturesRepeatedAtTheEnd() {
+        namespace st = st2110;
+        int ports[3];
+        {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        // (the video packets of ten pictures in a row lost, from when 44 have been recorded)
+        std::atomic<bool> losing{false};
+        st::SenderOptions o;
+        // (each stream to a loopback port, its ancillary data's too: left at its multicast address, a send fails where
+        // there is no route for multicast, as on macOS runners, and the sender stops before any picture goes)
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.ttl = 1;
+        o.drop = [&losing](int stream, int, uint64_t) { return stream == 0 && losing.load(); };
+        const int W = 320, H = 180, spf = 1920;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        st::Raster grey(W, H, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < H; ++y) {
+            uint16_t* d = grey.row(y);
+            for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = 500;
+        }
+        std::string url;
+        for (const auto& [name, text] : {std::pair{"video", tx.sdpVideo()}, {"audio", tx.sdpAudio()}}) {
+            const std::string file = path(QStringLiteral("st2110-repeated-%1.sdp").arg(QLatin1String(name)).toStdString().c_str());
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(text.c_str());
+            url += (url.empty() ? "" : ";") + file;
+        }
+        CaptureSettings cs;
+        cs.video.device = "st2110";
+        cs.video.url = url;
+        cs.path = path("capture-st2110-repeated.mov");
+        cs.seconds = 2;
+        Recorder rec;
+        std::atomic<bool> stop{false}, sendFailed{false};
+        std::thread sending([&] {
+            int lostFrom = -1;
+            for (int t = 0; !stop && t < 25 * 30; ++t) {
+                if (lostFrom < 0 && rec.status().frames >= 44) lostFrom = t;
+                losing = lostFrom >= 0 && t < lostFrom + 10;
+                std::vector<float> sound(size_t(spf) * 2, 0.0f);
+                if (!tx.send(grey, sound.data(), spf, nullptr, {}, &stop)) {
+                    sendFailed = !stop;
+                    break;
+                }
+            }
+        });
+        auto stopSending = qScopeGuard([&] {
+            stop = true;
+            sending.join();
+            tx.close();
+        });
+        QVERIFY2(rec.start(cs, &err), err.c_str());
+        QVERIFY(rec.wait(20));
+        QVERIFY2(!sendFailed, "The test's sender stopped: a send failed");
+        const CaptureStatus status = rec.status();
+        QVERIFY2(status.error.empty(), status.error.c_str());
+        QVERIFY2(status.repeated >= 3, std::to_string(status.repeated).c_str());
+        QCOMPARE(status.frames, int64_t(50));
+        QVERIFY(std::fabs(status.seconds - 2.0) < 1e-9);
+        MediaItem m;
+        QVERIFY(probeMedia(cs.path, m, &err));
+        QVERIFY2(std::fabs(m.duration - 2.0) < 0.05, std::to_string(m.duration).c_str());
     }
 
     // ST 2110-22 (JPEG XS, a packet of each slice its own) recorded with its -41 fast metadata stream: the items each
@@ -6748,6 +6921,106 @@ private slots:
         QCOMPARE(shown, 20);
         QCOMPARE(withGrain, 20);
         QCOMPARE(int(seeds.size()), 20);
+    }
+
+    // Phase 18 #11 (CI only: SVT-JPEG-XS is built in CI, not here). montage_render's jpeg_xs_lossless, by itself: a
+    // sequence rendered to JPEG XS losslessly, each picture stated as lossless (Fq 0) and the same as the sequence's
+    // own picture coded losslessly here; asked of another codec, refused.
+    void jpegXsLosslessOverMcp() {
+        if (!jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 192, s.height = 108, s.fps = {25, 1};
+        Clip c = makeGeneratorClip(p, "color", 10);
+        c.generator.params["color.r"] = 0.7, c.generator.params["color.g"] = 0.35, c.generator.params["color.b"] = 0.2;
+        s.videoTracks[0].clips.push_back(c);
+        const QString project = QString::fromStdString(path("jxs-lossless.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& extra) {
+            QJsonObject args{{"project", project}};
+            for (auto it = extra.begin(); it != extra.end(); ++it) args[it.key()] = it.value();
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"output", QString::fromStdString(path("jxs-lossless.mov"))}, {"preset", "ProRes 422 HQ"}, {"jpeg_xs_lossless", true}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("jpeg_xs"), qPrintable(text(r)));
+        const QString out = QString::fromStdString(path("jxs-lossless.jxs"));
+        r = call({{"output", out}, {"video_codec", "jpeg_xs"}, {"jpeg_xs_sampling", "444"}, {"jpeg_xs_depth", 12}, {"jpeg_xs_lossless", true}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        JxsReader reader;
+        std::string err;
+        QVERIFY2(reader.open(out.toStdString(), &err), err.c_str());
+        QCOMPARE(reader.info().frames, int64_t(10));
+        QVERIFY(reader.info().header.lossless() && reader.info().header.depth == 12 && reader.info().sampling == JxsSampling::Ycc444);
+        // Lossless: decoded, coded losslessly again and decoded, the same picture.
+        JxsPicture back, again;
+        QVERIFY2(reader.picture(4, back, &err), err.c_str());
+        JxsEncodeSettings es;
+        es.width = back.width, es.height = back.height, es.depth = back.depth, es.sampling = back.sampling, es.lossless = true;
+        JxsEncoder enc;
+        QVERIFY2(enc.open(es, &err), err.c_str());
+        std::vector<uint8_t> cs;
+        QVERIFY2(enc.encode(back, cs, nullptr, &err), err.c_str());
+        JxsDecoder dec;
+        QVERIFY2(dec.decode(cs.data(), cs.size(), again, &err), err.c_str());
+        QVERIFY(again == back);
+        // And a lossy render of the same is a constant rate, stated so (Fq 8).
+        const QString lossy = QString::fromStdString(path("jxs-lossy.jxs"));
+        r = call({{"output", lossy}, {"video_codec", "jpeg_xs"}, {"jpeg_xs_sampling", "444"}, {"jpeg_xs_depth", 12}, {"jpeg_xs_bpp", 3}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        JxsReader lr;
+        QVERIFY2(lr.open(lossy.toStdString(), &err), err.c_str());
+        QVERIFY(!lr.info().header.lossless());
+    }
+
+    // Phase 18 #11 (CI only). montage_render's jpeg_xs_alpha, by itself: a title over nothing rendered to JPEG XS
+    // with alpha and read back, its alpha where the title is and clear around it; asked of another codec, refused.
+    void jpegXsAlphaOverMcp() {
+        if (!jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 192, s.height = 108, s.fps = {25, 1};
+        // (a solid square in the middle of a clear frame: a colour clip scaled to a third of the picture)
+        Clip c = makeGeneratorClip(p, "color", 6);
+        c.generator.params["color.r"] = 0.2, c.generator.params["color.g"] = 0.8, c.generator.params["color.b"] = 0.3;
+        c.motion.params["scale"] = Param(33.3);
+        s.videoTracks[0].clips.push_back(c);
+        const QString project = QString::fromStdString(path("jxs-alpha.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& extra) {
+            QJsonObject args{{"project", project}};
+            for (auto it = extra.begin(); it != extra.end(); ++it) args[it.key()] = it.value();
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"output", QString::fromStdString(path("jxs-alpha.mov"))}, {"preset", "ProRes 4444 (alpha)"}, {"jpeg_xs_alpha", true}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("jpeg_xs"), qPrintable(text(r)));
+        const QString out = QString::fromStdString(path("jxs-alpha.mxf"));
+        r = call({{"output", out}, {"video_codec", "jpeg_xs"}, {"jpeg_xs_sampling", "444"}, {"jpeg_xs_depth", 10}, {"jpeg_xs_alpha", true}, {"jpeg_xs_bpp", 8}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        JxsReader reader;
+        std::string err;
+        QVERIFY2(reader.open(out.toStdString(), &err), err.c_str());
+        QVERIFY(reader.info().alpha && reader.info().header.alpha());
+        JxsPicture pic;
+        QVERIFY2(reader.picture(2, pic, &err), err.c_str());
+        QVERIFY(pic.alpha);
+        const int top = (1 << pic.depth) - 1;
+        auto alphaAt = [&](int x, int y) { return int(pic.planes[3][size_t(y) * size_t(pic.width) + size_t(x)]); };
+        QVERIFY2(alphaAt(pic.width / 2, pic.height / 2) > top - 16, qPrintable(QString::number(alphaAt(pic.width / 2, pic.height / 2))));
+        QVERIFY2(alphaAt(4, 4) < 16 && alphaAt(pic.width - 5, pic.height - 5) < 16, qPrintable(QString("%1 %2").arg(alphaAt(4, 4)).arg(alphaAt(pic.width - 5, pic.height - 5))));
     }
 
     void namedGrainProfiles() {
@@ -13953,6 +14226,231 @@ private slots:
         QVERIFY(res.value("isError").toBool());  // (no clips)
     }
 
+    void vfxPullsCarryWhatThePlateKnows() {
+        if (!exrAvailable()) QSKIP("Needs the OpenEXR library");
+        // The footage: 4 s at 25 fps, grey, recorded on a camera and lens the media's metadata names, from 01:00:00:00.
+        const std::string footage = path("known-plate.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 64;
+            gs.height = 36;
+            gs.fps = Rational{25, 1};
+            Clip c = makeGeneratorClip(gen, "color", 100);
+            c.generator.params["color.r"] = Param(0.5);
+            c.generator.params["color.g"] = Param(0.5);
+            c.generator.params["color.b"] = Param(0.5);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.path = footage;
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        p.name = "Heist";
+        Sequence& s = *p.active();
+        s.name = "Reel 1";
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, footage);
+        m.metadata["camera_make"] = "Acme";
+        m.metadata["camera"] = "Acme C1";
+        m.metadata["camera_serial"] = "C1-0042";
+        m.metadata["lens_make"] = "Lensco";
+        m.metadata["lens"] = "Prime 35";
+        m.metadata["focal_length"] = "35mm";
+        m.metadata["t_stop"] = "T2.8";
+        m.metadata["focus_distance"] = "3.5";
+        m.metadata["shutter_angle"] = "172.8";
+        m.metadata["tape"] = "A001C003";
+        m.created = "2026-10-01T14:30:00+02:00";
+        m.timecode = 3600;
+        p.media.push_back(m);
+        // A shot at 400 %: source frames 40-59 for its five frames of the cut.
+        Clip a = makeClip(p, m, TrackKind::Video, s);
+        a.name = "Fast";
+        a.sourceIn = 40;
+        a.duration = 5;
+        a.speed = 4;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, a);
+        // A shot ramping from 100 % to 300 %, with the camera that filmed it solved over the footage it uses.
+        Clip b = makeClip(p, m, TrackKind::Video, s);
+        b.name = "Ramp";
+        b.sourceIn = 10;
+        b.start = 10;
+        b.duration = 10;
+        Param& sp = b.timing.params["speed"];
+        sp.addKey(0, 100);
+        sp.addKey(10, 300);
+        QVERIFY(b.ramped());
+        CameraSolve solve;
+        solve.width = 64, solve.height = 36, solve.focal = 50, solve.fps = 25, solve.start = 10 / 25.0, solve.oriented = true;
+        for (int i = 0; i < 20; ++i) {
+            SolvedCamera sc;
+            sc.valid = true;
+            sc.C = {0.1 * i, 1.6 - 0.01 * i, 4 + 0.05 * i};
+            solve.cameras.push_back(sc);
+        }
+        Effect track = makeEffect(p, "camera_track");
+        track.strings["solve"] = cameraSolveToString(solve);
+        b.effects.push_back(track);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, b);
+        auto file = [&](const VfxShot& sh, int n) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, ".%04d.exr", n);
+            return sh.folder + "/" + sh.name + buf;
+        };
+        // Without scaling, 8 source frames of handles either side; scaled by the speed, 32.
+        VfxPullOptions o;
+        o.folder = path("known-pulls");
+        o.scripts = true;
+        std::vector<VfxShot> shots;
+        std::string err;
+        QVERIFY2(exportVfxPulls(p, s, {a.id}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.size(), size_t(1));
+        QVERIFY(shots[0].headHandle == 8 && shots[0].tailHandle == 8);
+        o.folder = path("known-pulls-scaled");
+        o.scaleHandles = true;
+        QVERIFY2(exportVfxPulls(p, s, {a.id, b.id}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.size(), size_t(2));
+        const VfxShot fast = shots[0], ramp = shots[1];
+        QCOMPARE(fast.headHandle, 32);
+        QCOMPARE(fast.tailHandle, 32);
+        QCOMPARE(fast.firstFrame, 1001 - 32);
+        QCOMPARE(fast.cutOut, 1020);
+        QCOMPARE(fast.lastFrame, 1020 + 32);
+        QVERIFY(QFileInfo::exists(QString::fromStdString(file(fast, 969))));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(file(fast, 968))));
+        // The ramp's ends: 100 % at its head (8 frames), 300 % at its tail (24), as far as the footage goes (10 before it).
+        QCOMPARE(ramp.headHandle, 8);
+        QCOMPARE(ramp.tailHandle, 24);
+        // Every frame's header: the camera, lens and reel as strings, the lens's numbers as floats, the rate as a
+        // rational, the frame's number in the source and its timecode rising a frame at a time.
+        for (int n = 1001; n <= 1004; ++n) {
+            std::map<std::string, ExrAttribute> h;
+            QVERIFY2(readExrAttributes(file(fast, n), h, &err), err.c_str());
+            auto text = [&](const char* k) { return h.count(k) ? h[k].type + " " + h[k].text : std::string("missing"); };
+            QCOMPARE(text("cameraMake"), std::string("string Acme"));
+            QCOMPARE(text("cameraModel"), std::string("string Acme C1"));
+            QCOMPARE(text("cameraSerialNumber"), std::string("string C1-0042"));
+            QCOMPARE(text("lensMake"), std::string("string Lensco"));
+            QCOMPARE(text("lensModel"), std::string("string Prime 35"));
+            QCOMPARE(text("reelName"), std::string("string A001C003"));
+            QCOMPARE(text("capDate"), std::string("string 2026:10:01 14:30:00"));
+            QCOMPARE(h["utcOffset"].type, std::string("float"));
+            QCOMPARE(h["utcOffset"].number, -7200.0);
+            for (const auto& [k, v] : std::map<std::string, double>{{"nominalFocalLength", 35}, {"tStop", 2.8}, {"focus", 3.5}, {"shutterAngle", 172.8}}) {
+                QCOMPARE(h[k].type, std::string("float"));
+                QVERIFY2(std::fabs(h[k].number - v) < 1e-5, k.c_str());
+            }
+            QCOMPARE(text("framesPerSecond"), std::string("rational 25/1"));
+            QCOMPARE(text("captureRate"), std::string("rational 25/1"));
+            QCOMPARE(text("imageCounter"), std::string("int ") + std::to_string(40 + n - 1001));
+            char tc[16];
+            std::snprintf(tc, sizeof tc, "01:00:01:%02d", 15 + n - 1001);  // (source frame 40 is a second and 15 frames in)
+            QCOMPARE(text("timeCode"), std::string("timecode ") + tc);
+            QVERIFY(h["comments"].text.find("Fast") != std::string::npos && h["comments"].text.find("Heist") != std::string::npos);
+            QCOMPARE(text("colorInteropID").substr(0, 7), std::string("string "));  // (as before)
+        }
+        // The ramp's retime in its script: a TimeWarp whose curve maps each frame of the cut, from 1001, to the plate
+        // frame Montage shows there.
+        QFile nk(QString::fromStdString(ramp.script));
+        QVERIFY(nk.open(QIODevice::ReadOnly));
+        const QString script = QString::fromUtf8(nk.readAll());
+        nk.close();
+        const QRegularExpression lookupRe(QStringLiteral("TimeWarp \\{\\n lookup \\{\\{curve ([^}]*)\\}\\}"));
+        const QRegularExpressionMatch lookup = lookupRe.match(script);
+        QVERIFY2(lookup.hasMatch(), qPrintable(script));
+        const QStringList keys = lookup.captured(1).split(' ', Qt::SkipEmptyParts);
+        QCOMPARE(keys.size(), 2 * 10);
+        const Clip* placed = edit::clipById(s, b.id);
+        for (int k = 0; k < 10; ++k) {
+            QCOMPARE(keys[2 * k], QStringLiteral("x%1").arg(1001 + k));
+            // (the source frame shown, counted in the plate's numbers from the plate's first frame)
+            const double want = ramp.firstFrame + (placed->sourceFrameAt(placed->start + k) - ramp.sourceIn * 25);
+            QVERIFY2(std::fabs(keys[2 * k + 1].toDouble() - want) < 1e-6, qPrintable(keys[2 * k + 1] + " " + QString::number(want, 'f', 6)));
+        }
+        // The solve beside the ramp's plate as .chan: the camera at each plate frame, numbered from the frame its first
+        // solved frame (source frame 10) has in the plate, which the script reads into a camera.
+        QVERIFY(!ramp.chan.empty());
+        QVERIFY(fast.chan.empty());
+        QFile chan(QString::fromStdString(ramp.chan));
+        QVERIFY(chan.open(QIODevice::ReadOnly));
+        const QStringList lines = QString::fromUtf8(chan.readAll()).split('\n', Qt::SkipEmptyParts);
+        chan.close();
+        QCOMPARE(lines.size(), 20);
+        for (int i = 0; i < 20; ++i) {
+            const QStringList v = lines[i].split(' ', Qt::SkipEmptyParts);
+            QCOMPARE(v.size(), 8);
+            QCOMPARE(v[0].toInt(), ramp.cutIn + i);
+            QVERIFY(std::fabs(v[1].toDouble() - solve.cameras[size_t(i)].C.x) < 1e-6);
+            QVERIFY(std::fabs(v[2].toDouble() - solve.cameras[size_t(i)].C.y) < 1e-6);
+            QVERIFY(std::fabs(v[3].toDouble() - solve.cameras[size_t(i)].C.z) < 1e-6);
+        }
+        QCOMPARE(lines[0].split(' ').at(0).toInt(), 1001);
+        QVERIFY(script.contains("Camera2 {") && script.contains("translate {{curve x1001 0 x1002 0.1"));
+        // The shot list's OpenTimelineIO carries the retimes as time effects: a linear time warp at 400 %, and the ramp.
+        recordVfxShots(s, shots);
+        const QJsonObject otio = QJsonDocument::fromJson(QByteArray::fromStdString(vfxShotListOtio(s))).object();
+        const QJsonArray clips = otio.value("tracks").toObject().value("children").toArray().at(0).toObject().value("children").toArray();
+        QJsonObject fastEffect, rampEffect;
+        for (const QJsonValue& v : clips) {
+            const QJsonObject c = v.toObject();
+            if (c.value("name").toString() == "Fast") fastEffect = c.value("effects").toArray().at(0).toObject();
+            if (c.value("name").toString() == "Ramp") rampEffect = c.value("effects").toArray().at(0).toObject();
+        }
+        QCOMPARE(fastEffect.value("OTIO_SCHEMA").toString(), QString("LinearTimeWarp.1"));
+        QCOMPARE(fastEffect.value("time_scalar").toDouble(), 4.0);
+        QCOMPARE(rampEffect.value("OTIO_SCHEMA").toString(), QString("TimeEffect.1"));
+        const QJsonArray rampLookup = rampEffect.value("metadata").toObject().value("montage").toObject().value("retime").toArray();
+        QCOMPARE(rampLookup.size(), 10);
+        QVERIFY(std::fabs(rampLookup.at(9).toArray().at(1).toDouble() - keys[19].toDouble()) < 1e-6);
+        // Float values: a frame with values below 0 and over 1 keeps them, and clipped has none (graded in linear
+        // light from frames in linear light, so the plate is the footage's values as they are).
+        s.workingSpace = "linear-rec709";
+        const QString dir = QString::fromStdString(path("hot"));
+        QDir().mkpath(dir);
+        for (int n = 1; n <= 3; ++n) {
+            ExrOutLayer l;
+            l.channels = {"R", "G", "B"};
+            for (int i = 0; i < 16 * 8; ++i) l.data.insert(l.data.end(), {-0.25f, 1.5f, 0.5f});
+            QVERIFY2(writeExr((dir + QStringLiteral("/hot.%1.exr").arg(n, 4, 10, QLatin1Char('0'))).toStdString(), 16, 8, {l}, "zip", {}, &err), err.c_str());
+        }
+        ImageSequence frames;
+        QVERIFY(detectImageSequence((dir + "/hot.0001.exr").toStdString(), frames));
+        frames.fps = Rational{25, 1};
+        MediaItem hot = probeOrFail(p, imageSequencePath(frames));
+        hot.colorOverride = "linear-rec709";
+        p.media.push_back(hot);
+        Clip h = makeClip(p, hot, TrackKind::Video, s);
+        h.start = 40;
+        h.duration = 3;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, h);
+        auto extremes = [&](const VfxShot& sh) {
+            int w = 0, ht = 0;
+            std::vector<float> rgba;
+            std::pair<float, float> mm{1e9f, -1e9f};
+            if (!readExrLayer(file(sh, 1001), "", w, ht, rgba, &err)) return mm;
+            for (size_t i = 0; i < rgba.size(); i += 4)
+                for (size_t k = 0; k < 3; ++k) mm = {std::min(mm.first, rgba[i + k]), std::max(mm.second, rgba[i + k])};
+            return mm;
+        };
+        VfxPullOptions kept;
+        kept.folder = path("hot-kept");
+        kept.handles = 0;
+        QVERIFY2(exportVfxPulls(p, s, {h.id}, kept, &shots, nullptr, nullptr, &err), err.c_str());
+        const auto wide = extremes(shots.at(0));
+        QVERIFY2(wide.first < -0.2f && wide.second > 1.4f, qPrintable(QString("%1 %2").arg(wide.first).arg(wide.second)));
+        VfxPullOptions clipped = kept;
+        clipped.folder = path("hot-clipped");
+        clipped.clipNegative = clipped.clipOver = true;
+        QVERIFY2(exportVfxPulls(p, s, {h.id}, clipped, &shots, nullptr, nullptr, &err), err.c_str());
+        const auto narrow = extremes(shots.at(0));
+        QVERIFY2(narrow.first >= 0 && narrow.second <= 1, qPrintable(QString("%1 %2").arg(narrow.first).arg(narrow.second)));
+        QVERIFY(narrow.second > 0.99f);
+    }
+
     void bt2446OverMcp() {
         // An HDR master with an SDR still in it and a grey shot: the still brought into HDR by BT.2446 Method C, an SDR
         // trim target and an SDR render made with Method A.
@@ -18596,10 +19094,13 @@ private slots:
         QCOMPARE(dc[1].toObject().value("type").toString(), QString("transition"));
         const QJsonObject g = dc[2].toObject();
         QCOMPARE(g.value("type").toString(), QString("gain"));
+        // Its gain from 0 dB at the clip's start (5 frames in) to -12 dB 30 frames on, with points between where AAF's
+        // amplitude, linear between points, would stray from the straight line in dB.
         const QJsonArray pts = g.value("params").toObject().value("points").toArray();
-        QCOMPARE(pts.size(), 2);
-        QVERIFY(std::fabs(pts[1].toArray()[1].toDouble() - std::pow(10.0, -12.0 / 20)) < 1e-4);
-        QVERIFY(std::fabs(pts[1].toArray()[0].toDouble() - 35.0 / 65) < 1e-6);  // 30 frames in, plus the 5 it starts early
+        QVERIFY(pts.size() >= 2);
+        QVERIFY(std::fabs(pts[0].toArray()[0].toDouble() - 5.0 / 65) < 1e-6 && std::fabs(pts[0].toArray()[1].toDouble() - 1) < 1e-4);
+        QVERIFY(std::fabs(pts.last().toArray()[1].toDouble() - std::pow(10.0, -12.0 / 20)) < 1e-4);
+        QVERIFY(std::fabs(pts.last().toArray()[0].toDouble() - 35.0 / 65) < 1e-6);  // 30 frames in, plus the 5 it starts early
         const QJsonObject clip = g.value("inputs").toArray()[0].toObject();
         QVERIFY(clip.value("file").toString().endsWith("jfk.wav"));
         QCOMPARE(clip.value("fade_out").toInt(), 12);
@@ -18609,6 +19110,295 @@ private slots:
         QVERIFY(music[1].toObject().value("inputs").toArray()[0].toObject().value("file").toString().endsWith("tone-stereo%20L.wav"));
         QVERIFY(tr[2].toObject().value("components").toArray()[1].toObject().value("inputs").toArray()[0].toObject()
                     .value("file").toString().endsWith("tone-stereo%20R.wav"));
+    }
+
+    void aafCarriesPanAutomationAndRamps() {
+        // A steady mono sound (half scale, 6 s at 48 kHz) and a 6 s movie at 25 fps.
+        const int rate = 48000;
+        const std::string steady = path("steady-mono.wav");
+        {
+            QFile f(QString::fromStdString(steady));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int frames = rate * 6;
+            QByteArray data;
+            QDataStream out(&data, QIODevice::WriteOnly);
+            out.setByteOrder(QDataStream::LittleEndian);
+            out.writeRawData("RIFF", 4);
+            out << quint32(36 + frames * 2);
+            out.writeRawData("WAVEfmt ", 8);
+            out << quint32(16) << quint16(1) << quint16(1) << quint32(rate) << quint32(rate * 2) << quint16(2) << quint16(16);
+            out.writeRawData("data", 4);
+            out << quint32(frames * 2);
+            for (int i = 0; i < frames; ++i) out << qint16(16384);
+            f.write(data);
+        }
+        std::string err;
+        const std::string movieFile = path("ramp-movie.mp4");
+        {
+            Project src = makeDefaultProject();
+            Sequence& ss = *src.active();
+            ss.fps = {25, 1};
+            ss.width = 160, ss.height = 120;
+            edit::overwrite(src, ss, {TrackKind::Video, 0}, makeGeneratorClip(src, "color", 150));
+            ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+            st.path = movieFile;
+            st.preset = "ultrafast";
+            QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        s.width = 160, s.height = 120;
+        s.name = "Mix Handover";
+        const MediaItem sound = probeOrFail(p, steady);
+        p.media.push_back(sound);
+        const MediaItem movie = probeOrFail(p, movieFile);
+        p.media.push_back(movie);
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        s.audioTracks.resize(2);
+        auto place = [&](int track, FrameTime at, double in, FrameTime len) {
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = sound.id;
+            c.name = sound.name;
+            c.start = at;
+            c.duration = len;
+            c.sourceIn = in;
+            c.audio = makeEffect(p, "volume");
+            s.audioTracks[size_t(track)].clips.push_back(c);
+            return c.id;
+        };
+        const Id a = place(0, 0, 0, 100), b = place(1, 20, 50, 60);
+        Track& dialogue = s.audioTracks[0];
+        Track& effects = s.audioTracks[1];
+        dialogue.name = "Dialogue";
+        effects.name = "Effects";
+        // The dialogue clip's gain keyed with easings and a straight run, its pan moving then held; the track's
+        // volume and pan riding as automation lanes.
+        Param gain;
+        gain.addKey(0, 0.0, Interp::SineInOut);
+        gain.addKey(30, -9.0);
+        gain.addKey(60, -3.0, Interp::ExpoOut);
+        gain.addKey(90, -15.0);
+        Param pan;
+        pan.addKey(0, -0.5);
+        pan.addKey(40, 0.7, Interp::Hold);
+        pan.addKey(70, 0.2);
+        edit::clipById(s, a)->audio.params["gain_db"] = gain;
+        edit::clipById(s, a)->audio.params["pan"] = pan;
+        dialogue.volumeDb = -2;
+        dialogue.volumeAuto.addKey(0, -2.0);
+        dialogue.volumeAuto.addKey(50, -8.0, Interp::SineIn);
+        dialogue.volumeAuto.addKey(100, -1.0);
+        dialogue.panAuto.addKey(10, -0.2);
+        dialogue.panAuto.addKey(80, 0.4);
+        // The effects clip at -4 dB, its pan held left then right; the track's fader at -6 dB and panned right.
+        Param held;
+        held.addKey(0, -0.3, Interp::Hold);
+        held.addKey(30, 0.3, Interp::Hold);
+        edit::clipById(s, b)->audio.params["gain_db"] = Param(-4.0);
+        edit::clipById(s, b)->audio.params["pan"] = held;
+        effects.volumeDb = -6;
+        effects.pan = 0.25;
+        // The picture: a speed ramp from normal speed (eased) to double and down to half.
+        {
+            Clip v;
+            v.id = p.newId();
+            v.mediaId = movie.id;
+            v.name = movie.name;
+            v.start = 10;
+            v.duration = 80;
+            v.sourceIn = 10;
+            v.timing = makeEffect(p, "time");
+            Param speed;
+            speed.addKey(0, 100, Interp::SineInOut);
+            speed.addKey(40, 200);
+            speed.addKey(80, 50);
+            v.timing.params["speed"] = speed;
+            s.videoTracks.resize(1);
+            s.videoTracks[0].name = "Picture";
+            s.videoTracks[0].clips = {v};
+        }
+        const Clip ramp = s.videoTracks[0].clips[0];
+        QVERIFY(ramp.ramped());
+
+        const std::string aaf = path("Mix Handover.aaf");
+        AafExportResult r;
+        QVERIFY2(exportAaf(p, s, aaf, &r, {}, nullptr, &err), err.c_str());
+        QCOMPARE(r.audioTracks, 2);
+        QCOMPARE(r.videoClips, 1);
+        QCOMPARE(r.trackLanes, 4);  // the dialogue's volume and pan lanes, the effects fader and pan
+        QVERIFY(r.curves > 0);
+        QVERIFY(std::none_of(r.warnings.begin(), r.warnings.end(), [](const std::string& w) { return w.find("constant speed") != std::string::npos; }));
+        QVERIFY(std::any_of(r.warnings.begin(), r.warnings.end(), [](const std::string& w) { return w.find("written as points along the curve") != std::string::npos; }));
+
+        // Read back by Montage's import: every level within 0.01 dB and every pan within a thousandth at each frame,
+        // a key within a frame of each key, the held pan held, and the ramp showing the same source frame within one.
+        const auto read = [&](const std::string& file, Project& in) -> const Sequence* {
+            const ImportResult ir = importAaf(in, file, [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+            if (!ir.ok || !ir.offline.empty()) return nullptr;
+            return in.findSequence(ir.sequence);
+        };
+        const auto near = [](const Param& keyed, const Param& back, double within) {
+            for (const Keyframe& k : keyed.keys)
+                if (std::none_of(back.keys.begin(), back.keys.end(), [&](const Keyframe& b) { return std::fabs(b.time() - k.time()) <= within; }))
+                    return false;
+            return true;
+        };
+        Project in = makeDefaultProject();
+        const Sequence* rs = read(aaf, in);
+        QVERIFY(rs);
+        QCOMPARE(rs->audioTracks.size(), size_t(2));
+        const Track& rd = rs->audioTracks[0];
+        const Track& re = rs->audioTracks[1];
+        QCOMPARE(rd.name, std::string("Dialogue"));
+        QVERIFY(rd.clips.size() == 1 && re.clips.size() == 1);
+        const Clip& ra = rd.clips[0];
+        const Clip& rb = re.clips[0];
+        QVERIFY(ra.start == 0 && ra.duration == 100 && rb.start == 20 && rb.duration == 60);
+        const Param& rg = ra.audio.params.at("gain_db");
+        const Param& rp = ra.audio.params.at("pan");
+        double worstDb = 0, worstPan = 0;
+        for (int f = 0; f <= 100; ++f) {
+            worstDb = std::max(worstDb, std::fabs(rg.atTime(f) - gain.atTime(f)));
+            worstPan = std::max(worstPan, std::fabs(rp.atTime(f) - pan.atTime(f)));
+            worstDb = std::max(worstDb, std::fabs(trackVolumeAt(rd, f) - trackVolumeAt(dialogue, f)));
+            worstPan = std::max(worstPan, std::fabs(trackPanAt(rd, f) - trackPanAt(dialogue, f)));
+        }
+        QVERIFY2(worstDb < 0.01 && worstPan < 0.001, qPrintable(QString("%1 dB, pan %2").arg(worstDb).arg(worstPan)));
+        QVERIFY(near(gain, rg, 1) && near(pan, rp, 1) && near(dialogue.volumeAuto, rd.volumeAuto, 1) && near(dialogue.panAuto, rd.panAuto, 1));
+        QVERIFY(std::fabs(rb.audio.p("gain_db", 0) + 4) < 0.01);
+        const Param& rh = rb.audio.params.at("pan");
+        QVERIFY(rh.keys.size() == 2 && rh.keys[0].interp == Interp::Hold && rh.keys[0].t == 0 && rh.keys[1].t == 30);
+        QVERIFY(std::fabs(rh.atTime(29) + 0.3) < 0.001 && std::fabs(rh.atTime(30) - 0.3) < 0.001);
+        QVERIFY(!re.volumeAuto.animated() && std::fabs(re.volumeDb + 6) < 0.01 && std::fabs(re.pan - 0.25) < 0.001);
+        QCOMPARE(rs->videoTracks.size(), size_t(1));
+        QCOMPARE(rs->videoTracks[0].clips.size(), size_t(1));
+        const Clip& rr = rs->videoTracks[0].clips[0];
+        QVERIFY(rr.ramped() && rr.start == ramp.start && rr.duration == ramp.duration);
+        double worstFrame = 0;
+        for (int f = 0; f < ramp.duration; ++f) worstFrame = std::max(worstFrame, std::fabs(rr.sourceAt(f) - ramp.sourceAt(f)));
+        QVERIFY2(worstFrame < 1, qPrintable(QString::number(worstFrame)));
+
+        // The mix as Montage plays the project, and as it plays the AAF read back: within 0.05 dB every 10 ms.
+        const auto mixOf = [](const Project& pp, const Sequence& ss) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(rate) * 4 * 2);
+            mixer.mix(pp, ss, 0, rate * 4, out.data());
+            return out;
+        };
+        const auto worstMix = [](const std::vector<float>& x, const std::vector<float>& y) {
+            double worst = 0;
+            for (size_t i = 0; i + 1 < x.size(); i += 480 * 2)
+                for (size_t ch = 0; ch < 2; ++ch)
+                    if (std::fabs(x[i + ch]) > 1e-3) worst = std::max(worst, std::fabs(20 * std::log10(std::fabs(double(y[i + ch])) / std::fabs(double(x[i + ch])))));
+            return worst;
+        };
+        const std::vector<float> heard = mixOf(p, s);
+        QVERIFY(std::any_of(heard.begin(), heard.end(), [](float v) { return std::fabs(v) > 0.05f; }));
+        // (a mono file handed over at its own level: once it was decoded as two channels at -3 dB and one written)
+        const std::vector<float> backMix = mixOf(in, *rs);
+        const double asLanes = worstMix(heard, backMix);
+        QVERIFY2(asLanes < 0.05, qPrintable(QString("%1 dB").arg(asLanes)));
+
+        // With the automation baked: the tracks' volume in the clips' gain, the tracks left at 0 dB, the mix the same.
+        {
+            AafExportOptions bake;
+            bake.bakeAutomation = true;
+            const std::string baked = path("Mix Handover baked.aaf");
+            AafExportResult br;
+            QVERIFY2(exportAaf(p, s, baked, &br, {}, nullptr, &err, bake), err.c_str());
+            QCOMPARE(br.trackLanes, 2);  // the pans only
+            Project bin = makeDefaultProject();
+            const Sequence* bs = read(baked, bin);
+            QVERIFY(bs && bs->audioTracks.size() == 2);
+            for (const Track& t : bs->audioTracks) QVERIFY(!t.volumeAuto.animated() && std::fabs(t.volumeDb) < 1e-6);
+            const double asGain = worstMix(heard, mixOf(bin, *bs));
+            QVERIFY2(asGain < 0.05, qPrintable(QString("%1 dB").arg(asGain)));
+        }
+        // Through MCP, baking chosen.
+        {
+            const QString project = QString::fromStdString(path("handover.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_export_timeline"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"format", "aaf"}, {"picture", false},
+                                                                                   {"bake_automation", true}, {"output", QString::fromStdString(path("handover.aaf"))}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            QCOMPARE(res.value("structuredContent").toObject().value("track_lanes").toInt(), 2);
+        }
+
+        // An independent reader (pyaaf2), when there is one: each lane where the export put it, with its interpolation.
+        const QByteArray python = qgetenv("MONTAGE_TEST_PYAAF2");
+        if (python.isEmpty()) return;
+        QProcess py;
+        py.start(QString::fromLocal8Bit(python), {"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/aaf_check.py"), QString::fromStdString(aaf)});
+        QVERIFY(py.waitForFinished(60000));
+        QVERIFY2(py.exitCode() == 0, py.readAllStandardError().constData());
+        const QJsonObject j = QJsonDocument::fromJson(py.readAllStandardOutput()).object();
+        QJsonObject tracks;
+        for (const QJsonValue t : j.value("tracks").toArray()) tracks[t.toObject().value("name").toString()] = t;
+        QVERIFY(tracks.contains("Dialogue") && tracks.contains("Effects") && tracks.contains("Picture"));
+        const auto only = [](const QJsonObject& track) { return track.value("components").toArray(); };
+        const auto parameter = [](const QJsonObject& op, const char* name) { return op.value("parameters").toObject().value(name).toObject(); };
+        // A varying lane's value at a frame of its operation, as AAF interpolates it.
+        const auto valueAt = [](const QJsonObject& lane, double length, double frame) {
+            const QJsonArray pts = lane.value("points").toArray();
+            const bool constant = lane.value("interpolation_name").toString() == "ConstantInterp";
+            double v = pts[0].toArray()[1].toDouble();
+            for (int i = 0; i + 1 < pts.size(); ++i) {
+                const double t0 = pts[i].toArray()[0].toDouble() * length, t1 = pts[i + 1].toArray()[0].toDouble() * length;
+                if (frame < t0) break;
+                const double v0 = pts[i].toArray()[1].toDouble(), v1 = pts[i + 1].toArray()[1].toDouble();
+                v = frame >= t1 ? v1 : constant ? v0 : v0 + (v1 - v0) * (frame - t0) / std::max(1e-12, t1 - t0);
+            }
+            return v;
+        };
+        // The dialogue track: its volume lane, then its pan lane, over its clip's pan, over its gain.
+        const QJsonArray dc = only(tracks["Dialogue"].toObject());
+        QCOMPARE(dc.size(), 1);
+        const QJsonObject volume = dc[0].toObject();
+        QCOMPARE(volume.value("op").toString(), QString("Audio Gain"));
+        const QJsonObject volumeLane = parameter(volume, "Amplitude");
+        QCOMPARE(volumeLane.value("interpolation_name").toString(), QString("LinearInterp"));
+        const QJsonObject trackPan = volume.value("inputs").toArray()[0].toObject();
+        QCOMPARE(trackPan.value("op").toString(), QString("Audio Pan"));
+        const QJsonObject clipPan = trackPan.value("inputs").toArray()[0].toObject();
+        QCOMPARE(clipPan.value("op").toString(), QString("Audio Pan"));
+        const QJsonObject clipGain = clipPan.value("inputs").toArray()[0].toObject();
+        QCOMPARE(clipGain.value("op").toString(), QString("Audio Gain"));
+        QVERIFY(clipGain.value("inputs").toArray()[0].toObject().value("file").toString().endsWith("steady-mono.wav"));
+        double laneDb = 0, lanePan = 0;
+        for (int f = 0; f <= 100; ++f) {
+            laneDb = std::max(laneDb, std::fabs(20 * std::log10(valueAt(volumeLane, 100, f)) - trackVolumeAt(dialogue, f)));
+            laneDb = std::max(laneDb, std::fabs(20 * std::log10(valueAt(parameter(clipGain, "Amplitude"), 100, f)) - gain.atTime(f)));
+            lanePan = std::max(lanePan, std::fabs(valueAt(parameter(trackPan, "Pan"), 100, f) * 2 - 1 - trackPanAt(dialogue, f)));
+            lanePan = std::max(lanePan, std::fabs(valueAt(parameter(clipPan, "Pan"), 100, f) * 2 - 1 - pan.atTime(f)));
+        }
+        QVERIFY2(laneDb < 0.01 && lanePan < 0.001, qPrintable(QString("%1 dB, pan %2").arg(laneDb).arg(lanePan)));
+        // The effects track: its fader and pan as constants, its clip's pan held.
+        const QJsonObject fader = only(tracks["Effects"].toObject())[0].toObject();
+        QVERIFY(std::fabs(parameter(fader, "Amplitude").value("constant").toDouble() - std::pow(10.0, -6.0 / 20)) < 1e-4);
+        const QJsonObject faderPan = fader.value("inputs").toArray()[0].toObject();
+        QVERIFY(std::fabs(parameter(faderPan, "Pan").value("constant").toDouble() - 0.625) < 1e-4);
+        const QJsonObject heldPan = faderPan.value("inputs").toArray()[1].toObject();  // (after the filler)
+        QCOMPARE(parameter(heldPan, "Pan").value("interpolation_name").toString(), QString("ConstantInterp"));
+        QCOMPARE(parameter(heldPan, "Pan").value("points").toArray().size(), 2);
+        // The picture: Motion Control with its speed varying, linear between points, as the ramp plays.
+        const QJsonArray pc = only(tracks["Picture"].toObject());
+        const QJsonObject motion = pc[1].toObject();  // (after the filler)
+        QCOMPARE(motion.value("op").toString(), QString("Motion Control"));
+        const QJsonObject ratio = parameter(motion, "Speed Ratio");
+        QCOMPARE(ratio.value("interpolation_name").toString(), QString("LinearInterp"));
+        QVERIFY(ratio.value("points").toArray().size() > 3);
+        double laneSpeed = 0;
+        for (int f = 0; f < 80; ++f) laneSpeed = std::max(laneSpeed, std::fabs(valueAt(ratio, 80, f) - ramp.speedAt(f)));
+        QVERIFY2(laneSpeed < 0.01, qPrintable(QString::number(laneSpeed)));
     }
 
     void sharedProjectsOverMcp() {
@@ -21833,6 +22623,41 @@ if __name__ == '__main__':
         const Image sharp = renderSequenceFrame(p, s, 20, {});
         c.effects.push_back(mb);
         QVERIFY(renderSequenceFrame(p, s, 20, off).px == sharp.px);
+        // Footage played very fast reads no more than six source frames either side, however far the shutter reaches,
+        // and the path carries the last step on past them: at 1200 % a 720 degree shutter spans 24 source frames and
+        // the bar, moving steadily, is still smeared twelve times as long as at its own speed.
+        const std::vector<int> far = motionBlurOffsets(0.3, -500, 500);
+        QCOMPARE(far.size(), size_t(2 * kMotionBlurReach));
+        QCOMPARE(far.front(), -kMotionBlurReach);
+        QCOMPARE(far.back(), kMotionBlurReach);
+        QCOMPARE(motionBlurOffsets(0, -0.25, 0.25), (std::vector<int>{-1, 1}));
+        QCOMPARE(motionBlurOffsets(0, 1e300 * 1e300, 0).size(), size_t(2));
+        mb.params["follow_edit"] = Param(1.0);
+        c.speed = 12;
+        c.duration = 3;
+        const double faster = smear(2);
+        qInfo("footage motion blur at 1200 %%: %.2f px", faster);
+        QVERIFY2(std::abs(faster / normal - 12) < 1.2, qPrintable(QString::number(faster / normal)));
+        // A project with a clip at a speed no control offers opens with it at 10000 times its own, so nothing the
+        // speed is multiplied by runs out of range, and Motion Blur on it renders.
+        const std::string fastPath = path("too-fast.montage");
+        QVERIFY(saveProject(p, fastPath));
+        QFile f(QString::fromStdString(fastPath));
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+        f.close();
+        QString text = QString::fromUtf8(doc.toJson());
+        QVERIFY(text.contains("\"speed\": 12"));
+        text.replace("\"speed\": 12", "\"speed\": 1e300");
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        f.write(text.toUtf8());
+        f.close();
+        Project crafted;
+        std::string loadErr;
+        QVERIFY2(loadProject(fastPath, crafted, &loadErr), loadErr.c_str());
+        Sequence& cs = *crafted.active();
+        QCOMPARE(cs.videoTracks[0].clips.at(0).speed, 1e4);
+        QVERIFY(!renderSequenceFrame(crafted, cs, 1, {}).empty());
     }
 
     void motionBlurAndFocusInProjectsSavedBefore() {
@@ -24085,6 +24910,329 @@ if ui["pressed"] == "add":
         QCOMPARE(res.passedOver, 4);
         QCOMPARE(res.copied, 1);
         QCOMPARE(bytesOf(second[1]), bytesOf(path("whole-1.png")));
+    }
+
+    void consolidateForFinishing() {
+        if (!exrAvailable()) QSKIP("Needs the OpenEXR library");
+        // Sources: 80 frames at 25 fps (256 x 144, as small as DNxHR goes) of a changing picture as ProRes, DNxHR, H.264
+        // (a key frame every 10 frames) and an OpenEXR sequence numbered from 1001, and a sound.
+        const int W = 256, H = 144;
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = W, gs.height = H, gs.fps = Rational{25, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 80);
+        ramp.generator.params["color.r"].addKey(0, 0.05);
+        ramp.generator.params["color.r"].addKey(79, 0.95);
+        ramp.generator.params["color.g"].addKey(0, 0.8);
+        ramp.generator.params["color.g"].addKey(79, 0.2);
+        ramp.generator.params["color.b"] = Param(0.4);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        std::string err;
+        auto source = [&](const char* name, const char* codec, const char* profile, int gop) {
+            ExportSettings st;
+            st.path = path(name);
+            st.videoCodec = codec;
+            st.profile = profile;
+            st.gop = gop;
+            st.audioCodec = "none";
+            return exportSequence(gen, gs, st, nullptr, nullptr, &err);
+        };
+        QVERIFY2(source("pmf-prores.mov", "prores_ks", "", 0), err.c_str());
+        QVERIFY2(source("pmf-dnx.mov", "dnxhd", "dnxhr_hq", 0), err.c_str());
+        QVERIFY2(source("pmf-h264.mp4", "libx264", "", 10), err.c_str());
+        const QString plates = QString::fromStdString(path("pmf-plate"));
+        QDir().mkpath(plates);
+        for (int n = 0; n < 80; ++n) {
+            ExrOutLayer l{"", {"R", "G", "B"}, std::vector<float>(size_t(W) * H * 3)};
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    for (int ch = 0; ch < 3; ++ch) l.data[(size_t(y) * W + x) * 3 + ch] = 0.01f * float(n) + 0.002f * float(x) + 0.1f * float(ch);
+            QVERIFY2(writeExr((plates + QStringLiteral("/plate.%1.exr").arg(1001 + n)).toStdString(), W, H, {l}, "zip", {}, &err), err.c_str());
+        }
+        writeWav(path("pmf-sound.wav"), 48000, 3.2, 0.2f, 0.2f);
+        ImageSequence plateFrames;
+        plateFrames.pattern = (plates + "/plate.%04d.exr").toStdString();
+        plateFrames.first = 1001, plateFrames.last = 1080, plateFrames.fps = Rational{25, 1};
+
+        Project p = makeDefaultProject();
+        p.name = "Finish";
+        Sequence& s = *p.active();
+        s.name = "Cut";
+        s.width = W, s.height = H, s.fps = Rational{25, 1};
+        MediaItem pro = probeOrFail(p, path("pmf-prores.mov")), dnx = probeOrFail(p, path("pmf-dnx.mov")), avc = probeOrFail(p, path("pmf-h264.mp4")),
+                  exr = probeOrFail(p, imageSequencePath(plateFrames)), snd = probeOrFail(p, path("pmf-sound.wav"));
+        exr.colorOverride = "linear-rec709";  // (the plates are in linear light, some of their values over 1)
+        for (const MediaItem* m : {&pro, &dnx, &avc, &exr, &snd}) p.media.push_back(*m);
+        auto place = [&](Sequence& seq, const MediaItem& m, int track, FrameTime start, double in, FrameTime duration, double speed = 1) {
+            Clip c = makeClip(p, m, TrackKind::Video, seq);
+            c.start = start, c.sourceIn = in, c.duration = duration, c.speed = speed;
+            while (int(seq.videoTracks.size()) <= track) seq.videoTracks.push_back(Track{});
+            edit::overwrite(p, seq, {TrackKind::Video, track}, c);
+            return c.id;
+        };
+        // The cut: each source in turn, a ProRes shot at 200 %, a DNxHR shot hidden under an opaque ProRes one above,
+        // an H.264 shot disabled, and the sound under the first two seconds.
+        place(s, pro, 0, 0, 20, 10);
+        place(s, dnx, 0, 10, 30, 10);
+        place(s, avc, 0, 20, 25, 10);
+        place(s, exr, 0, 30, 15, 10);
+        place(s, pro, 0, 40, 40, 5, 2.0);
+        place(s, dnx, 0, 50, 0, 10);
+        place(s, pro, 1, 50, 55, 10);
+        const Id disabled = place(s, avc, 0, 60, 60, 5);
+        edit::clipById(s, disabled)->enabled = false;
+        {
+            Clip c = makeClip(p, snd, TrackKind::Audio, s);
+            c.duration = 50;
+            edit::overwrite(p, s, {TrackKind::Audio, 0}, c);
+        }
+        const Id cutId = s.id;
+        // A sequence each of the ProRes and the H.264 shots alone, and one of the ProRes shot inverted.
+        Sequence proOnly = makeSequence(p, "ProRes", W, H, Rational{25, 1});
+        place(proOnly, pro, 0, 0, 20, 10);
+        Sequence avcOnly = makeSequence(p, "H264", W, H, Rational{25, 1});
+        place(avcOnly, avc, 0, 0, 25, 10);
+        Sequence graded = makeSequence(p, "Graded", W, H, Rational{25, 1});
+        const Id gradedClip = place(graded, pro, 0, 0, 20, 10);
+        edit::clipById(graded, gradedClip)->effects.push_back(makeEffect("invert", p.newId()));
+        const Id proId = proOnly.id, avcId = avcOnly.id, gradedId = graded.id;
+        p.sequences.push_back(proOnly), p.sequences.push_back(avcOnly), p.sequences.push_back(graded);
+        auto frame = [](const Project& pr, Id seq, FrameTime f) {
+            RenderOptions ro;
+            ro.highQuality = true;  // (as an export decodes, which the copies were made by)
+            return renderProgramFrame(pr, *pr.findSequence(seq), f, ro);
+        };
+        auto worst = [](const Image& a, const Image& b) {
+            if (a.px.size() != b.px.size() || a.px.empty()) return 1e9f;
+            float w = 0;
+            for (size_t i = 0; i < a.px.size(); ++i) w = std::max(w, std::fabs(a.px[i] - b.px[i]));
+            return w;
+        };
+        const std::vector<std::pair<Id, std::string>> hidden = hiddenClips(p, *p.findSequence(cutId));
+        QCOMPARE(hidden.size(), size_t(2));
+
+        // To OpenEXR sequences with 12-frame handles, named by a pattern, the clips nothing shows left out.
+        ConsolidateOptions o;
+        o.folder = path("pmf-frames");
+        o.name = "Frames";
+        o.sequences = {cutId};
+        o.output = "frames";
+        o.frames = "exr";
+        o.handleUnit = "frames";
+        o.handleFrames = 12;
+        o.namePattern = "{sequence}_{shot}_{clip}.{frame}";
+        o.leaveOutHidden = true;
+        ConsolidateResult res;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.leftOut.size(), size_t(2));
+        const QString leftOut = QString::fromStdString(res.leftOut[0] + "\n" + res.leftOut[1]);
+        QVERIFY2(leftOut.contains("(disabled)") && leftOut.contains("(hidden under pmf-prores.mov)"), qPrintable(leftOut));
+        Project frames;
+        QVERIFY2(loadProject(res.projectPath, frames, &err), err.c_str());
+        // Each source's used frames and 12 either side, numbered as the source's frames: ProRes 20-65 (its three
+        // shots), DNxHR 30-40 (the hidden shot gone), H.264 25-35, the plates 15-25 (as 1016-1026).
+        struct Expect {
+            Id media;
+            const char* name;
+            int first, last;
+        };
+        for (const Expect& e : {Expect{pro.id, "Cut_010_pmf-prores", 8, 76}, Expect{dnx.id, "Cut_020_pmf-dnx", 18, 51},
+                                Expect{avc.id, "Cut_030_pmf-h264", 13, 46}, Expect{exr.id, "Cut_040_plate", 1004, 1037}}) {
+            const MediaItem* m = frames.findMedia(e.media);
+            QVERIFY(m);
+            ImageSequence got;
+            QVERIFY2(parseImageSequencePath(m->path, got), m->path.c_str());
+            QCOMPARE(QFileInfo(QString::fromStdString(got.pattern)).fileName(), QString(e.name) + ".%04d.exr");
+            QCOMPARE(QFileInfo(QFileInfo(QString::fromStdString(got.pattern)).path()).fileName(), QString(e.name));
+            QCOMPARE(got.first, e.first);
+            QCOMPARE(got.last, e.last);
+            QVERIFY(!QFileInfo::exists(QString::fromStdString(imageSequenceFrame(got, e.last + 1))));
+            // Each frame is the source's decode in its linear light (as an export of it alone makes it), within 1/1023.
+            const ColorSpace* light = findColorSpace(m->colorSpace);
+            QVERIFY2(light && light->transfer == Transfer::Linear, m->colorSpace.c_str());
+            for (int n = e.first; n <= e.last; n += 11) {
+                int w = 0, h = 0;
+                std::vector<float> out, want;
+                QVERIFY2(readExrLayer(imageSequenceFrame(got, n), "", w, h, out, &err), err.c_str());
+                QCOMPARE(w, W);
+                if (e.media == exr.id) {
+                    QVERIFY(readExrLayer(imageSequenceFrame(plateFrames, n), "", w, h, want, &err));
+                } else {
+                    Project one = makeDefaultProject();
+                    Sequence& os = *one.active();
+                    os.width = W, os.height = H, os.fps = Rational{25, 1};
+                    MediaItem src = *p.findMedia(e.media);
+                    one.media.push_back(src);
+                    Clip c = makeClip(one, src, TrackKind::Video, os);
+                    c.sourceIn = n, c.duration = 1;
+                    edit::overwrite(one, os, {TrackKind::Video, 0}, c);
+                    RenderOptions ro;
+                    ro.highQuality = true;
+                    Image img = renderProgramFrame(one, os, 0, ro);
+                    convertColor(img, sequenceColorSpace(os), *light, std::clamp(os.hdrPeakNits, 100.0, 10000.0));
+                    want.assign(img.px.begin(), img.px.end());
+                }
+                QCOMPARE(out.size(), want.size());
+                float d = 0;
+                for (size_t i = 0; i < out.size(); ++i)
+                    if (i % 4 != 3) d = std::max(d, std::fabs(out[i] - want[i]));
+                QVERIFY2(d <= 1.0f / 1023, qPrintable(QStringLiteral("%1 frame %2: %3").arg(e.name).arg(n).arg(d)));
+            }
+        }
+        // The sound is copied whole; the new cut renders as the old, frame for frame, within 1/255.
+        QVERIFY(frames.findMedia(snd.id) && QString::fromStdString(frames.findMedia(snd.id)->path).endsWith("Media/pmf-sound.wav"));
+        for (FrameTime f = 0; f < 65; ++f) {
+            const float d = worst(frame(frames, cutId, f), frame(p, cutId, f));
+            QVERIFY2(d <= 1.0f / 255, qPrintable(QStringLiteral("frame %1: %2").arg(f).arg(d)));
+        }
+
+        // Trimmed in its own format: the ProRes shot's packets are its source's, byte for byte, and no frame is coded.
+        auto packets = [](const std::string& file) {
+            std::vector<QByteArray> out;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            AVPacket* pkt = av_packet_alloc();
+            while (v >= 0 && av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == v) out.emplace_back(reinterpret_cast<const char*>(pkt->data), pkt->size);
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            return out;
+        };
+        o = ConsolidateOptions{};
+        o.folder = path("pmf-trimmed");
+        o.sequences = {proId};
+        o.output = "trimmed";
+        o.handleUnit = "frames";
+        o.handleFrames = 12;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.trimmed, 1);
+        QCOMPARE(res.framesCoded, 0);
+        QCOMPARE(res.framesCopied, 34);
+        Project trimmed;
+        QVERIFY2(loadProject(res.projectPath, trimmed, &err), err.c_str());
+        const std::vector<QByteArray> was = packets(path("pmf-prores.mov")), now = packets(trimmed.findMedia(pro.id)->path);
+        QCOMPARE(now.size(), size_t(34));
+        for (size_t i = 0; i < now.size(); ++i) QVERIFY2(now[i] == was.at(8 + i), qPrintable(QStringLiteral("packet %1").arg(i)));
+        for (FrameTime f = 0; f < 10; ++f) QCOMPARE(worst(frame(trimmed, proId, f), frame(p, proId, f)), 0.0f);
+        // The H.264 shot: only the GOPs at its ends are coded again (frames 13-19 and 40-46), those between copied.
+        o.folder = path("pmf-trimmed-h264");
+        o.sequences = {avcId};
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.framesCopied + res.framesCoded, 34);
+        QVERIFY2(res.framesCopied >= 20 && res.framesCoded <= 14,
+                 qPrintable(QStringLiteral("%1 copied, %2 coded").arg(res.framesCopied).arg(res.framesCoded)));
+        QVERIFY2(loadProject(res.projectPath, trimmed, &err), err.c_str());
+        QVERIFY(QString::fromStdString(trimmed.findMedia(avc.id)->path).endsWith("pmf-h264_trim.mov"));
+        for (FrameTime f = 0; f < 10; ++f) {
+            const float d = worst(frame(trimmed, avcId, f), frame(p, avcId, f));
+            QVERIFY2(d <= 1.0f / 255, qPrintable(QStringLiteral("frame %1: %2").arg(f).arg(d)));
+        }
+
+        // Baked: the inverted shot rendered in with its handles; the new clip plays it plainly, as the sequence showed it.
+        o = ConsolidateOptions{};
+        o.folder = path("pmf-baked");
+        o.sequences = {gradedId};
+        o.bake = true;
+        o.handleUnit = "frames";
+        o.handleFrames = 12;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.baked, 1);
+        Project baked;
+        QVERIFY2(loadProject(res.projectPath, baked, &err), err.c_str());
+        const Clip& plain = baked.findSequence(gradedId)->videoTracks[0].clips.at(0);
+        QVERIFY(plain.effects.empty());
+        QCOMPARE(plain.sourceIn, 12.0);
+        QVERIFY(!baked.findMedia(pro.id));  // (nothing else uses the ProRes source)
+        const MediaItem* bakedMedia = baked.findMedia(plain.mediaId);
+        QVERIFY(bakedMedia && std::llround(bakedMedia->duration * 25) == 34);
+        for (FrameTime f = 0; f < 10; ++f) {
+            const float d = worst(frame(baked, gradedId, f), frame(p, gradedId, f));
+            QVERIFY2(d <= 1.0f / 255, qPrintable(QStringLiteral("frame %1: %2").arg(f).arg(d)));
+        }
+
+        // Presets: a facility's "Finish" (DPX, 8-frame handles) and the project's, which sets 12 frames: the project's
+        // value wins, the facility's DPX stays, and the compare view lists the one difference.
+        const QString facility = QString::fromStdString(path("pmf-facility"));
+        const QByteArray hadFacility = qgetenv("MONTAGE_FACILITY_PRESETS");
+        qputenv("MONTAGE_FACILITY_PRESETS", facility.toUtf8());
+        auto putBack = qScopeGuard([&] {
+            if (hadFacility.isNull()) qunsetenv("MONTAGE_FACILITY_PRESETS");
+            else qputenv("MONTAGE_FACILITY_PRESETS", hadFacility);
+        });
+        QVERIFY2(writePreset(facility.toStdString(), "Finish", R"({"output":"frames","frames":"dpx","handleUnit":"frames","handleFrames":8})", &err),
+                 err.c_str());
+        QVERIFY(!writePreset(facility.toStdString(), "a/b", "{}", &err));
+        p.consolidatePresets["Finish"] = R"({"handleFrames":12})";
+        const ConsolidatePresets presets = loadConsolidatePresets(p, path("pmf-no-user"));
+        QCOMPARE(presets.names(), std::vector<std::string>{"Finish"});
+        ConsolidateOptions fromPreset;
+        std::map<std::string, PresetLevel> from;
+        QVERIFY2(resolvePreset(presets, "Finish", fromPreset, &from, &err), err.c_str());
+        QCOMPARE(fromPreset.handleFrames, 12);
+        QCOMPARE(fromPreset.frames, std::string("dpx"));
+        QCOMPARE(fromPreset.output, std::string("frames"));
+        QVERIFY(from["handleFrames"] == PresetLevel::Project && from["frames"] == PresetLevel::Facility);
+        const std::vector<PresetDifference> diff = comparePreset(presets, "Finish", PresetLevel::Project);
+        QCOMPARE(diff.size(), size_t(1));
+        QCOMPARE(diff[0].key, std::string("handleFrames"));
+        QCOMPARE(diff[0].value, std::string("12"));
+        QCOMPARE(diff[0].wider, std::string("8"));
+        QCOMPARE(diff[0].widerLevel, std::string("facility"));
+        QVERIFY(!resolvePreset(presets, "Missing", fromPreset, nullptr, &err));
+        // The choices go through JSON and back unchanged.
+        ConsolidateOptions round;
+        QVERIFY(applyConsolidateChoices(consolidateChoicesJson(o), round, &err));
+        QCOMPARE(consolidateChoicesJson(round), consolidateChoicesJson(o));
+        // Kept with the project; a project saved before there were presets opens with none.
+        QVERIFY(saveProject(p, path("pmf-presets.montage")));
+        Project back;
+        QVERIFY(loadProject(path("pmf-presets.montage"), back));
+        QCOMPARE(back.consolidatePresets, p.consolidatePresets);
+        Project old;
+        QVERIFY2(loadProject(MONTAGE_TEST_DATA_DIR "/projects/blur-and-focus-before-24-nov.montage", old, &err), err.c_str());
+        QVERIFY(old.consolidatePresets.empty());
+
+        // A job cut short half-way and taken up again ends with the same files as one that ran through.
+        auto listing = [](const std::string& folder) {
+            QStringList out;
+            QDirIterator it(QString::fromStdString(folder) + "/Media", QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext()) {
+                const QString f = it.next();
+                QFile file(f);
+                if (!file.open(QIODevice::ReadOnly)) return QStringList{"unreadable " + f};
+                out << f.mid(int(folder.size())) + " " + QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha1).toHex();
+            }
+            out.sort();
+            return out;
+        };
+        o = ConsolidateOptions{};
+        o.sequences = {cutId};
+        o.output = "frames";
+        o.handleUnit = "frames";
+        o.handleFrames = 2;
+        o.folder = path("pmf-through");
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        const QStringList through = listing(o.folder);
+        QVERIFY(through.size() > 20);
+        std::atomic<bool> stop{false};
+        std::vector<std::string> began;
+        o.folder = path("pmf-resumed");
+        o.began = [&](const std::string& f) {
+            began.push_back(f);
+            if (began.size() == 3) stop = true;  // (stopped once the third file is begun)
+        };
+        QVERIFY(!consolidateProject(p, o, &res, {}, &stop, &err));
+        QCOMPARE(began.size(), size_t(3));
+        o.replace = began;
+        o.began = {};
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(listing(o.folder), through);
+        for (const char* d : {"pmf-frames", "pmf-trimmed", "pmf-trimmed-h264", "pmf-baked", "pmf-facility", "pmf-through", "pmf-resumed", "pmf-plate"})
+            QDir(QString::fromStdString(path(d))).removeRecursively();
     }
 
     void smartRendering() {
@@ -26679,6 +27827,81 @@ private slots:
             if (differing <= 4) ++same;
         }
         QVERIFY2(same >= copied, qPrintable(QStringLiteral("%1 of %2").arg(same).arg(copied)));
+    }
+
+    // Nightly 27 Nov: MPEG-2 footage at a constant rate (every vbv_delay set) exported at a variable rate with smart
+    // rendering on. Its GOPs are not copied, since the parts encoded beside them would say 0xFFFF in the same
+    // sequence: every picture of the export says 0xFFFF, and its buffer check holds. And the buffer check says so when
+    // one sequence mixes the two: the constant footage's pictures, then the variable one's, with no sequence end
+    // between them.
+    void mpeg2ConstantFootageInAVariableExport() {
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg to make the files with");
+        auto footage = [&](const std::string& file, const QStringList& rate) {
+            QProcess pr;
+            pr.start(ffmpeg, QStringList{"-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25,noise=alls=10:allf=t",
+                                         "-frames:v", "60", "-c:v", "mpeg2video", "-pix_fmt", "yuv420p", "-g", "12", "-bf", "2", "-field_order",
+                                         "progressive", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"} +
+                                 rate + QStringList{QString::fromStdString(file)});
+            return pr.waitForFinished(300000) && pr.exitCode() == 0;
+        };
+        const QStringList constant{"-b:v", "20M", "-minrate", "20M", "-maxrate", "20M", "-bufsize", "14548992", "-rc_init_occupancy", "14548992",
+                                   "-flags", "+cgop", "-sc_threshold", "1000000000"};
+        const QStringList variable{"-b:v", "6M", "-maxrate", "12M", "-bufsize", "9781248"};
+        const std::string cbrFile = path("mpeg2-cbr-into-vbr.mov");
+        QVERIFY(footage(cbrFile, constant));
+        const HrdReport in = checkHrd(cbrFile);
+        QVERIFY2(in.checked && in.cbr && in.conforms(), in.summary().c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, cbrFile);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 5, 55, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings ex;
+        ex.videoCodec = "mpeg2video";
+        ex.audioCodec = "none";
+        ex.pixFmt = "yuv420p";
+        ex.gop = 12;
+        ex.videoBitrate = 15000000;
+        ex.hrd = "vbr";
+        ex.vbvMaxrate = 20000000;
+        ex.path = path("mpeg2-cbr-into-vbr-out.mov");
+        std::string err;
+        int copied = -1;
+        HrdReport after;
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied, nullptr, nullptr, &after), err.c_str());
+        QCOMPARE(copied, 0);
+        int pictures = 0, delays = 0;
+        for (const CodedPacket& c : codedPackets(ex.path)) {
+            const uint8_t* d = reinterpret_cast<const uint8_t*>(c.data.constData());
+            const size_t n = size_t(c.data.size());
+            for (size_t i = 0; i + 8 <= n; ++i) {
+                if (d[i] || d[i + 1] || d[i + 2] != 1 || d[i + 3] != 0x00) continue;
+                const uint32_t v = uint32_t(d[i + 4]) << 24 | uint32_t(d[i + 5]) << 16 | uint32_t(d[i + 6]) << 8 | d[i + 7];
+                ++pictures;
+                delays += ((v >> 3) & 0xffff) != 0xffff;
+            }
+        }
+        QCOMPARE(pictures, 50);
+        QCOMPARE(delays, 0);
+        const HrdReport r = checkHrd(ex.path);
+        QVERIFY2(r.checked && !r.cbr && r.conforms(), (r.summary() + " " + (r.issues.empty() ? std::string() : r.issues.front().text)).c_str());
+        // One sequence with both: the constant footage's elementary stream (its sequence end taken off, where the
+        // encoder wrote one), then a variable one's. The check finds the change where the variable pictures begin.
+        const std::string cbrStream = path("mpeg2-mixed-a.m2v"), vbrStream = path("mpeg2-mixed-b.m2v"), joined = path("mpeg2-mixed-one-sequence.m2v");
+        QVERIFY(footage(cbrStream, constant) && footage(vbrStream, variable));
+        QFile a(QString::fromStdString(cbrStream)), b(QString::fromStdString(vbrStream)), j(QString::fromStdString(joined));
+        QVERIFY(a.open(QIODevice::ReadOnly) && b.open(QIODevice::ReadOnly) && j.open(QIODevice::WriteOnly));
+        QByteArray first = a.readAll();
+        if (first.endsWith(QByteArray::fromHex("000001b7"))) first.chop(4);
+        QVERIFY(j.write(first) == first.size() && j.write(b.readAll()) > 0);
+        a.close(), b.close(), j.close();
+        const HrdReport mixed = checkHrd(joined);
+        QVERIFY2(mixed.checked && !mixed.conforms(), mixed.summary().c_str());
+        bool said = false;
+        for (const HrdIssue& i : mixed.issues) said = said || (i.kind == "mixed" && i.frame == 60);
+        QVERIFY2(said, mixed.issues.empty() ? mixed.summary().c_str() : (mixed.issues.front().kind + ": " + mixed.issues.front().text).c_str());
     }
 
     void mpeg2MixedRateJoin() {
@@ -33699,7 +34922,7 @@ private slots:
 
     // A textured still moved by known jitter every frame: a shaky "camera".
     // Returns the jitter (sequence pixels) per frame.
-    std::vector<Point2> writeShakyVideo(const std::string& file, int frames) {
+    std::vector<Point2> writeShakyVideo(const std::string& file, int frames, Rational fps = {25, 1}) {
         QImage tex(480, 270, QImage::Format_RGB32);
         tex.fill(QColor(90, 90, 90));
         {
@@ -33715,7 +34938,7 @@ private slots:
         Sequence& s = *p.active();
         s.width = 320;
         s.height = 180;
-        s.fps = {25, 1};
+        s.fps = fps;
         MediaItem m = probeOrFail(p, png.toStdString());
         p.media.push_back(m);
         Clip c = makeClip(p, m, TrackKind::Video, s);
@@ -34269,7 +35492,7 @@ private slots:
         QVERIFY2(half > repaired && half < skewed, qPrintable(QString("%1 %2 %3").arg(skewed).arg(half).arg(repaired)));
     }
 
-    // The camera's motion measured up to a point is kept (every 50 frames) and taken up from there: a run stopped at
+    // The camera's motion measured up to a point is kept (every 50 frames at first) and taken up from there: a run stopped at
     // two thirds and taken up from what it kept measures only the frames after it, and comes out as one whole run's.
     void cameraMotionTakenUp() {
         const std::string video = path("shaky-long.mp4");
@@ -34302,6 +35525,33 @@ private slots:
         const CameraMotion other = analyzeCameraMotion(video, 0.2, frames / 25.0, {}, nullptr, &err, &fromText);
         QCOMPARE(cameraMotionFramesMeasured() - before, long(other.steps.size() - 1));
         QVERIFY(other.start == 0.2);
+        // (nightly 27 Nov) Footage at 30000/1001 from an in point between round times is taken up the same way, from
+        // what it kept as text now and from the text as earlier builds wrote it (the rate and start to nine digits).
+        const std::string ntsc = path("shaky-ntsc.mp4");
+        writeShakyVideo(ntsc, frames, {30000, 1001});
+        const double in = 7.0 / 30, out = in + 100 * 1001 / 30000.0;
+        const CameraMotion ntscWhole = analyzeCameraMotion(ntsc, in, out, {}, nullptr, &err);
+        QCOMPARE(int(ntscWhole.steps.size()), 100);
+        cancel = false, keptTimes = 0;
+        QVERIFY(analyzeCameraMotion(ntsc, in, out, [&](double f) { cancel = cancel || f >= 0.6; }, &cancel, &err, nullptr,
+                                    [&](const CameraMotion& so) { kept = so, ++keptTimes; })
+                    .steps.empty());
+        QCOMPARE(keptTimes, 1);
+        const std::string keptText = cameraMotionToString(kept);
+        QStringList earlier = QString::fromStdString(keptText).split(' ');
+        earlier[1] = QString::number(kept.fps, 'g', 9), earlier[2] = QString::number(kept.start, 'g', 9);
+        QVERIFY(earlier.join(' ').toStdString() != keptText);
+        for (const std::string& text : {keptText, earlier.join(' ').toStdString()}) {
+            QVERIFY(cameraMotionFromString(text, fromText));
+            before = cameraMotionFramesMeasured();
+            const CameraMotion again = analyzeCameraMotion(ntsc, in, out, {}, nullptr, &err, &fromText);
+            QCOMPARE(cameraMotionFramesMeasured() - before, long(100 - 51));
+            QCOMPARE(cameraMotionToString(again), cameraMotionToString(ntscWhole));
+        }
+        // A round rate and start are written as they always were.
+        CameraMotion round;
+        round.fps = 25, round.start = 0.2;
+        QCOMPARE(cameraMotionToString(round), std::string("v1 25 0.2 0"));
     }
 
     void trackingAndStabilization() {
@@ -42190,6 +43440,70 @@ private slots:
             QVERIFY(drawn > 20);
             QCOMPARE(same, 0.0);
         }
+        // ---- The same project with a second card that has a depth of field of its own too (as such a build wrote
+        // one: focused at half its distance, f/2 throughout). Opened, each card keeps its own, the camera's lens stays
+        // off, the second card is blurred by its own lens and the first card's half is as it was with the second
+        // sharp.
+        {
+            QFile fixture(QString(MONTAGE_TEST_DATA_DIR) + "/projects/card-lens-before-10-nov.montage");
+            QVERIFY(fixture.open(QIODevice::ReadOnly));
+            QJsonObject doc = QJsonDocument::fromJson(fixture.readAll()).object();
+            QJsonArray sequences = doc.value("sequences").toArray();
+            QJsonObject seq = sequences[0].toObject();
+            QJsonArray video = seq.value("video").toArray();
+            QJsonObject track = video[2].toObject();
+            QJsonArray clips = track.value("clips").toArray();
+            QJsonObject card = clips[0].toObject();
+            QJsonArray effects = card.value("effects").toArray();
+            QJsonObject lens3d = effects[0].toObject();
+            QCOMPARE(lens3d.value("type").toString(), QString("layer_3d"));
+            QJsonObject params = lens3d.value("params").toObject();
+            params["depth_of_field"] = 1;
+            params["focus_distance"] = params.value("pos_z").toDouble() / -2;
+            params["fstop"] = 2.0;
+            lens3d["params"] = params;
+            effects[0] = lens3d;
+            card["effects"] = effects;
+            clips[0] = card;
+            track["clips"] = clips;
+            video[2] = track;
+            seq["video"] = video;
+            sequences[0] = seq;
+            doc["sequences"] = sequences;
+            Project opened;
+            std::string err;
+            QVERIFY2(projectFromJson(QJsonDocument(doc).toJson().toStdString(), opened, &err), err.c_str());
+            Sequence& os = *opened.active();
+            QVERIFY(os.videoTracks.size() >= 3);
+            const Effect& first = os.videoTracks[0].clips[0].effects[0];
+            const Effect& second = os.videoTracks[2].clips[0].effects[0];
+            QVERIFY(first.p("depth_of_field", 0, 0) == 1.0 && second.p("depth_of_field", 0, 0) == 1.0);
+            QCOMPARE(first.params.at("fstop").keys.size(), size_t(2));
+            QVERIFY(second.p("fstop", 0, 0) == 2.0 && second.params.at("fstop").keys.empty());
+            QVERIFY(std::fabs(second.p("focus_distance", 0, 0) - 507.455168378114 / 2) < 1e-9);
+            QVERIFY(os.videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+            // Against the same with the second card's lens off: its half blurred, the first card's half the same.
+            Project secondSharp = opened;
+            secondSharp.active()->videoTracks[2].clips[0].effects[0].params["depth_of_field"] = 0.0;
+            auto differs = [&](FrameTime t, bool right) {
+                const Image a = renderSequenceFrame(opened, os, t, o), b = renderSequenceFrame(secondSharp, *secondSharp.active(), t, o);
+                double sum = 0;
+                for (int y = 0; y < a.height; ++y)
+                    for (int x = right ? a.width * 5 / 8 : 0; x < (right ? a.width : a.width * 3 / 8); ++x) sum += std::fabs(double(a.at(x, y)[3]) - b.at(x, y)[3]);
+                return sum;
+            };
+            const double secondBlur = differs(0, true), firstSame = differs(0, false);
+            qInfo("a second card's own lens kept: blur %.2f on its half, %.4f on the first card's", secondBlur, firstSame);
+            QVERIFY(secondBlur > 20);
+            QCOMPARE(firstSame, 0.0);
+            QVERIFY(std::fabs(differs(9, true) - secondBlur) <= 1e-6 * secondBlur);  // (f/2 throughout: the same at the last frame)
+            // Saved now and opened again, it is the same.
+            Project again;
+            QVERIFY2(projectFromJson(projectToJson(opened), again, &err), err.c_str());
+            QVERIFY(again.active()->videoTracks[2].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
+            QVERIFY(again.active()->videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
+            QVERIFY(again.active()->videoTracks[1].clips[0].generator.p("dof", 0, 0) <= 0.5);
+        }
 
         // ---- A moving card in a solved scene's USD and USDZ exports: its picture byte for byte and its transform at
         // each frame (to 1e-6), read back by Montage and by tinyusdz.
@@ -42482,6 +43796,9 @@ private slots:
             g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.9), g.params["side_color.b"] = Param(0.3);
             sceneByDefault = sceneByDefault && g.p("in_scene", 0) == 1.0;
             g.params["in_scene"] = Param(inScene ? 1.0 : 0.0);
+            // (lit as a 3D layer is, as projects saved before Lit as Drawn Alone have it, so its light and the card's
+            // are the same light: titlesInTheSceneLitAsAlone has the title lit as it lights itself)
+            g.params["own_light"] = Param(0.0);
             return c;
         };
         ModelCamera front;
@@ -42607,10 +43924,323 @@ private slots:
         }
     }
 
+    void titlesInTheSceneLitAsAlone() {
+        // In the 3D layers' scene a 3D title is lit as its own drawing lights it (Lit as Drawn Alone, on for a new
+        // title): with a card far behind it whose own light is off, the turned title's pixels (faces and sides, away
+        // from its edges and from where its colour changes) are within 1/255 of the title drawn out of the scene; and
+        // a face filled with a test chart from a track shows it, mapped as the title maps it out of the scene, within
+        // 1/255 there too. A title with the setting off (as projects saved before it have it) is lit otherwise.
+        const int W = 320, H = 180;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        RenderOptions o;
+        Clip back;
+        back.id = p.newId();
+        back.duration = 10;
+        back.generator = makeEffect(p, "color");
+        back.generator.params["color.r"] = 0.1, back.generator.params["color.g"] = 0.1, back.generator.params["color.b"] = 0.3;
+        {
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 0.0;
+            back.effects.push_back(e);
+            ModelCamera cam;
+            std::string err;
+            QVERIFY2(effectCamera(p, s, back, back.effects[0], 0, 1, cam, &err), err.c_str());
+            back.effects[0].params["pos_z"] = cam.C[2] - 3000;
+        }
+        auto title = [&](const char* text, double rotX, double rotY) {
+            Clip c = makeGeneratorClip(p, "title3d", 10);
+            Effect& g = c.generator;
+            g.strings["text"] = text;
+            g.strings["font"] = "DejaVu Sans";
+            g.params["size"] = Param(90.0), g.params["depth"] = Param(24.0);
+            g.params["rot_x"] = Param(rotX), g.params["rot_y"] = Param(rotY);
+            g.params["light_angle"] = Param(-50.0), g.params["light_height"] = Param(30.0);
+            g.params["color.r"] = Param(0.9), g.params["color.g"] = Param(0.5), g.params["color.b"] = Param(0.2);
+            g.params["side_color.r"] = Param(0.3), g.params["side_color.g"] = Param(0.6), g.params["side_color.b"] = Param(0.9);
+            g.params["shadows"] = Param(0.0);  // (its own drawing casts none on itself)
+            return c;
+        };
+        // Where the title alone is whole and its colour even (each of the 5 x 5 pixels about it opaque and within
+        // 2/255 of it), from its render with nothing else.
+        auto evenAt = [&](const Image& alone) {
+            std::vector<char> even(size_t(W) * size_t(H), 0);
+            for (int y = 2; y < H - 2; ++y)
+                for (int x = 2; x < W - 2; ++x) {
+                    bool ok = true;
+                    for (int dy = -2; dy <= 2 && ok; ++dy)
+                        for (int dx = -2; dx <= 2 && ok; ++dx) {
+                            const float* q = alone.at(x + dx, y + dy);
+                            ok = q[3] >= 1 - 1e-6f;
+                            for (int k = 0; k < 3 && ok; ++k) ok = std::fabs(q[k] - alone.at(x, y)[k]) <= 2.0f / 255;
+                        }
+                    even[size_t(y) * size_t(W) + size_t(x)] = ok;
+                }
+            return even;
+        };
+        auto compare = [&](const char* what, const Image& in, const Image& out, const std::vector<char>& even, int& n) {
+            float worst = 0;
+            int wx = 0, wy = 0;
+            n = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    if (!even[size_t(y) * size_t(W) + size_t(x)]) continue;
+                    ++n;
+                    for (int k = 0; k < 3; ++k)
+                        if (std::fabs(in.at(x, y)[k] - out.at(x, y)[k]) > worst) worst = std::fabs(in.at(x, y)[k] - out.at(x, y)[k]), wx = x, wy = y;
+                }
+            qInfo("%s: %d px compared, %.3f/255 apart at worst (%d, %d: %.3f %.3f %.3f against %.3f %.3f %.3f)", what, n, worst * 255, wx, wy,
+                  in.at(wx, wy)[0], in.at(wx, wy)[1], in.at(wx, wy)[2], out.at(wx, wy)[0], out.at(wx, wy)[1], out.at(wx, wy)[2]);
+            return worst;
+        };
+
+        // ---- Turned and lit from the side, its faces and sides in and out of the scene.
+        {
+            Clip t = title("Hi", 15, 35);
+            s.videoTracks[1].clips = {t};
+            const std::vector<char> even = evenAt(renderSequenceFrame(p, s, 3, o));
+            s.videoTracks[0].clips = {back};
+            QVERIFY(title3dInScene(s, s.videoTracks[1].clips[0], 3));
+            QCOMPARE(s.videoTracks[1].clips[0].generator.p("own_light", 3), 1.0);
+            const Image in = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips[0].generator.params["in_scene"] = Param(0.0);
+            const Image out = renderSequenceFrame(p, s, 3, o);
+            int n = 0;
+            QVERIFY(compare("lit as alone", in, out, even, n) <= 1.0f / 255);
+            QVERIFY(n > 1500);
+            // (both its faces and its sides compared: pixels of the face's colour and of the sides')
+            int faces = 0, sides = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (even[size_t(y) * size_t(W) + size_t(x)]) (out.at(x, y)[0] > out.at(x, y)[2] ? faces : sides) += 1;
+            QVERIFY2(faces > 300 && sides > 100, qPrintable(QString("%1 %2").arg(faces).arg(sides)));
+            // Its light read as a 3D layer's (off, as projects saved before it have it) lights it otherwise.
+            s.videoTracks[1].clips[0].generator.params["in_scene"] = Param(1.0);
+            s.videoTracks[1].clips[0].generator.params["own_light"] = Param(0.0);
+            QVERIFY(compare("lit as a 3D layer", renderSequenceFrame(p, s, 3, o), out, even, n) > 4.0f / 255);
+            for (Track& k : s.videoTracks) k.clips.clear();
+        }
+
+        // ---- A face filled with a test chart from the bottom track, square on: as the title shows it out of the scene.
+        {
+            Clip chart = makeGeneratorClip(p, "bars", 10);
+            Clip t = title("HI", 0, 0);
+            t.generator.params["face_fill"] = Param(2.0);
+            t.generator.params["face_track"] = Param(1.0);
+            s.videoTracks[0].clips = {chart};
+            s.videoTracks[2].clips = {t};
+            const std::vector<char> even = evenAt([&] {
+                Sequence alone = s;
+                alone.videoTracks[0].clips.clear();
+                alone.videoTracks[2].clips[0].generator.params["face_fill"] = Param(0.0);
+                return renderSequenceFrame(p, alone, 3, o);
+            }());
+            const Image outFlat = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[1].clips = {back};
+            QVERIFY(title3dInScene(s, s.videoTracks[2].clips[0], 3));
+            const Image in = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[2].clips[0].generator.params["in_scene"] = Param(0.0);
+            const Image out = renderSequenceFrame(p, s, 3, o);
+            // (the chart's edges as the face shows it left out: where the picture out of the scene changes)
+            const std::vector<char> chartEven = evenAt(out);
+            std::vector<char> both(even.size());
+            int colours = 0;
+            std::set<int> seen;
+            for (size_t i = 0; i < both.size(); ++i) {
+                both[i] = even[i] && chartEven[i];
+                if (both[i]) {
+                    const float* q = out.at(int(i % size_t(W)), int(i / size_t(W)));
+                    seen.insert(int(q[0] * 4) * 100 + int(q[1] * 4) * 10 + int(q[2] * 4));
+                }
+            }
+            colours = int(seen.size());
+            int n = 0;
+            QVERIFY(compare("a face showing a chart", in, out, both, n) <= 1.0f / 255);
+            QVERIFY2(n > 800 && colours >= 4, qPrintable(QString("%1 px, %2 colours").arg(n).arg(colours)));
+            QVERIFY(compare("the same out of the scene with no card", out, outFlat, both, n) <= 1.0f / 255);
+            for (Track& k : s.videoTracks) k.clips.clear();
+        }
+    }
+
+    void titleInTheSceneInProjectsSavedBefore() {
+        // A project as a build before 27 November wrote it (the fixture): a card far behind, seen through the scene's
+        // Camera clip, and a turned 3D title standing in their scene with no Lit as Drawn Alone setting. Opened, the
+        // setting is not there, and its frames render byte for byte as they do with it set off by hand (the title lit
+        // by its light read as a 3D layer's, as it was); with it on, the title looks different. Saved again and opened,
+        // it renders the same.
+        const QString fixturePath = QString(MONTAGE_TEST_DATA_DIR) + "/projects/title-in-scene-before-27-nov.montage";
+        Project opened;
+        std::string err;
+        QVERIFY2(loadProject(fixturePath.toStdString(), opened, &err), err.c_str());
+        Sequence& os = *opened.active();
+        QCOMPARE(int(os.videoTracks.size()), 3);
+        const Clip& title = os.videoTracks[2].clips.at(0);
+        QCOMPARE(title.generator.type, std::string("title3d"));
+        QVERIFY(title.generator.params.count("in_scene") && !title.generator.params.count("own_light"));
+        QVERIFY(title3dInScene(os, title, 4));
+        Project off = opened, on = opened;
+        off.active()->videoTracks[2].clips[0].generator.params["own_light"] = Param(0.0);
+        on.active()->videoTracks[2].clips[0].generator.params["own_light"] = Param(1.0);
+        RenderOptions o;
+        for (FrameTime t : {FrameTime(0), FrameTime(4), FrameTime(9)}) {
+            const Image a = renderSequenceFrame(opened, os, t, o), b = renderSequenceFrame(off, *off.active(), t, o);
+            QVERIFY2(a.px == b.px, qPrintable(QString("frame %1").arg(t)));
+        }
+        QVERIFY(renderSequenceFrame(on, *on.active(), 4, o).px != renderSequenceFrame(opened, os, 4, o).px);
+        Project again;
+        QVERIFY2(projectFromJson(projectToJson(opened), again, &err), err.c_str());
+        QVERIFY(renderSequenceFrame(again, *again.active(), 4, o).px == renderSequenceFrame(opened, os, 4, o).px);
+        QVERIFY(makeEffect(again, "title3d").p("own_light", 0) > 0.5);  // (on for a new title)
+    }
+
+    void titleInTheSceneThroughAFileCamera() {
+        // A 3D title seen through the camera in a USD scene (8 units down +z, a 50 mm lens on a 16:9 film back) stands
+        // in that file's scene with a card seen through the same file's camera: its letters are where the file's camera
+        // sees them, in front of the card 1 unit behind them, and their shadow on the lit card falls where a ray-traced
+        // reference puts it (every pixel the render shadows and the reference does not, or the other way, within 1 px
+        // of one the reference shadows and one it lights). Through a camera the file lacks, or with the card through
+        // its own camera, the title is not in the scene.
+        const int W = 320, H = 180;
+        const std::string file = MONTAGE_TEST_DATA_DIR "/models/camera.usda";
+        const double f = 50 * H / 20.25;  // (the lens in pixels across the picture's height)
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        RenderOptions o;
+        Clip card;
+        card.id = p.newId();
+        card.duration = 10;
+        card.generator = makeEffect(p, "color");
+        card.generator.params["color.r"] = 1.0, card.generator.params["color.g"] = 1.0, card.generator.params["color.b"] = 1.0;
+        {
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 2.0;
+            e.strings["camera_file"] = file;
+            e.params["width"] = 6.0;
+            e.params["pos_z"] = -1.0;
+            e.params["lit"] = 1.0, e.params["shadows"] = 1.0, e.params["ambient"] = 30.0;
+            e.params["light_angle"] = -20.0, e.params["light_height"] = 20.0;
+            card.effects.push_back(e);
+        }
+        Clip title = makeGeneratorClip(p, "title3d", 10);
+        {
+            Effect& g = title.generator;
+            g.strings["text"] = "I";
+            g.strings["font"] = "DejaVu Sans";
+            g.strings["camera_file"] = file;
+            g.params["units"] = Param(f / 8);
+            g.params["size"] = Param(100.0), g.params["depth"] = Param(20.0);
+            g.params["rot_x"] = Param(0.0), g.params["rot_y"] = Param(0.0);
+            g.params["light_angle"] = Param(-20.0), g.params["light_height"] = Param(20.0);
+            g.params["color.r"] = Param(0.2), g.params["color.g"] = Param(0.9), g.params["color.b"] = Param(0.3);
+            g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.9), g.params["side_color.b"] = Param(0.3);
+            g.params["in_scene"] = Param(1.0);
+            g.params["shadows"] = Param(1.0);
+        }
+        s.videoTracks[0].clips = {card};
+        s.videoTracks[1].clips = {title};
+        QVERIFY(title3dInScene(s, s.videoTracks[1].clips[0], 3));
+        // Its triangles and camera are the file's scene's: the camera the card is seen through, the letters in front of
+        // the card.
+        ModelCamera cam;
+        std::string err;
+        QVERIFY2(effectCamera(p, s, card, card.effects[0], 3, 1, cam, &err), err.c_str());
+        Title3DMesh mesh;
+        QVERIFY(title3dMesh(title.generator, 3, W, H, 10, 25, mesh));
+        for (int k = 0; k < 9; ++k) QVERIFY2(std::fabs(mesh.camera.R[size_t(k)] - cam.R[size_t(k)]) < 1e-9, qPrintable(QString::number(k)));
+        for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(mesh.camera.C[size_t(k)] - cam.C[size_t(k)]) < 1e-9);
+        for (int k = 0; k < 6; ++k)
+            QVERIFY2(std::fabs(mesh.camera.screen[size_t(k)] - cam.screen[size_t(k)]) < 1e-6,
+                     qPrintable(QString("%1: %2 %3").arg(k).arg(mesh.camera.screen[size_t(k)]).arg(cam.screen[size_t(k)])));
+        std::array<double, 3> lo, hi;
+        QVERIFY(modelBounds(mesh.triangles, lo, hi));
+        const double planeZ = -1;
+        QVERIFY2(lo[2] > planeZ + 0.1 && hi[2] < 1, qPrintable(QString("%1 %2").arg(lo[2]).arg(hi[2])));
+        const Image shaded = renderSequenceFrame(p, s, 3, o);
+        // (the letter's face, not the card behind it, in the middle)
+        const float* mid = shaded.at(W / 2, H / 2);
+        QVERIFY2(mid[1] > mid[0] + 0.2f, qPrintable(QString("%1 %2 %3").arg(mid[0]).arg(mid[1]).arg(mid[2])));
+        s.videoTracks[1].clips[0].generator.params["shadows"] = Param(0.0);
+        const Image unshaded = renderSequenceFrame(p, s, 3, o);
+        const PosedTriangles& T = mesh.triangles;
+        auto hits = [&](const std::array<double, 3>& o0, const std::array<double, 3>& d) {
+            for (size_t i = 0; i + 2 < T.indices.size(); i += 3) {
+                std::array<double, 3> v[3];
+                for (int k = 0; k < 3; ++k)
+                    for (int j = 0; j < 3; ++j) v[k][size_t(j)] = T.positions[T.indices[i + size_t(k)] * 3 + size_t(j)];
+                const std::array<double, 3> e1{v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]}, e2{v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]};
+                const std::array<double, 3> pv{d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+                const double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+                if (std::fabs(det) < 1e-12) continue;
+                const std::array<double, 3> tv{o0[0] - v[0][0], o0[1] - v[0][1], o0[2] - v[0][2]};
+                const double u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) / det;
+                if (u < 0 || u > 1) continue;
+                const std::array<double, 3> qv{tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]};
+                const double w = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) / det;
+                if (w < 0 || u + w > 1) continue;
+                if ((e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) / det > 1e-9) return true;
+            }
+            return false;
+        };
+        const ModelLight light = settingsLight(card.effects[0], 3, {0, 0, planeZ}, 6);
+        const std::array<double, 3> toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+        // Each pixel: -1 the title itself (or off the card, or at its edge), 1 shadowed, 0 lit, by the reference.
+        std::vector<int> ref(size_t(W) * size_t(H), 0);
+        const double unit = 6.0 / W, halfW = 3.0 - 3 * unit, halfH = 6.0 * H / W / 2 - 3 * unit;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const std::array<double, 3> d = cam.ray(x + 0.5, y + 0.5);
+                int& r = ref[size_t(y) * W + size_t(x)];
+                if (hits(cam.C, d) || !(d[2] < 0)) {
+                    r = -1;
+                    continue;
+                }
+                const double k = (planeZ - cam.C[2]) / d[2];
+                const std::array<double, 3> P{cam.C[0] + d[0] * k, cam.C[1] + d[1] * k, planeZ};
+                if (std::fabs(P[0]) > halfW || std::fabs(P[1]) > halfH) {
+                    r = -1;
+                    continue;
+                }
+                r = hits(P, toLight) ? 1 : 0;
+            }
+        int shadowed = 0, wrong = 0, far = 0;
+        auto near = [&](int x, int y, int want) {
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int X = x + dx, Y = y + dy;
+                    if (X >= 0 && Y >= 0 && X < W && Y < H && ref[size_t(Y) * W + size_t(X)] == want) return true;
+                }
+            return false;
+        };
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const int r = ref[size_t(y) * W + size_t(x)];
+                if (r < 0 || near(x, y, -1)) continue;
+                const bool ours = unshaded.at(x, y)[0] - shaded.at(x, y)[0] > 0.05f;
+                shadowed += r == 1;
+                if (ours != (r == 1)) {
+                    ++wrong;
+                    if (!(near(x, y, 0) && near(x, y, 1))) ++far;
+                }
+            }
+        qInfo("a letter's shadow on a card in a file's scene: %d px in the reference's shadow, %d differ at its edge, %d further", shadowed, wrong, far);
+        QVERIFY(shadowed > 300);
+        QCOMPARE(far, 0);
+        // Not in the scene: through a camera the file lacks (its own camera then), or with the card through its own.
+        s.videoTracks[1].clips[0].generator.params["camera_index"] = Param(2.0);
+        QVERIFY(!title3dInScene(s, s.videoTracks[1].clips[0], 3));
+        s.videoTracks[1].clips[0].generator.params["camera_index"] = Param(1.0);
+        s.videoTracks[0].clips[0].effects[0].params["camera"] = 0.0;
+        QVERIFY(!title3dInScene(s, s.videoTracks[1].clips[0], 3));
+    }
+
     void titlesInTheSceneShadowEachOther() {
         // In the 3D layers' scene, a letter's shadow on the next letter and a 3D model's shadow on a letter fall where a
-        // ray-traced reference puts them: a pixel of a letter's face (seen square on and facing the light) is in shadow
-        // where the ray from its point towards the light meets one of the casters' triangles (the title's from
+        // ray-traced reference puts them: a pixel of a letter's face (seen square on and facing the title's own light)
+        // is in shadow where the ray from its point towards the light meets one of the casters' triangles (the title's from
         // title3dMesh, the model's from modelClipScene, as the scene has them). Every face pixel the render shadows and
         // the reference does not (or the other way) is within 1 px of one the reference shadows and one it lights.
         const int W = 320, H = 180;
@@ -42744,7 +44374,7 @@ private slots:
             e.params["camera"] = 0.0;
             e.params["pos_z"] = -3000.0;
             back.effects.push_back(e);
-            Clip ii = title("II", -35, 10);
+            Clip ii = title("II", -80, 50);
             const int k = addTextAnimator(ii.generator);
             const std::string pre = "ta" + std::to_string(k) + ".";
             ii.generator.params[pre + "end"] = Param(50.0);
@@ -42765,8 +44395,9 @@ private slots:
                     (mesh.letterOf[i] == 0 ? z0 : z1) = std::max(mesh.letterOf[i] == 0 ? z0 : z1, z);
                 }
             QVERIFY2(z0 > z1 + 50, qPrintable(QString("%1 %2").arg(z0).arg(z1)));
-            const ModelLight light = settingsLight(ii.generator, 3, {0, 0, 0}, 1);
-            const V toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+            // (its own light, as it lights itself: Lit as Drawn Alone)
+            QCOMPARE(ii.generator.p("own_light", 3), 1.0);
+            const V toLight = mesh.toLight;
             QVERIFY(toLight[2] > 0.2);
             compare("a letter's shadow on the next", shaded, unshaded, mesh, 1, trianglesOf(mesh.triangles), {}, toLight);
             for (Track& t : s.videoTracks) t.clips.clear();
@@ -42775,9 +44406,10 @@ private slots:
         // ---- A box (a 3D model, seen through its own camera) up and to the left of an "I", between it and the light,
         // out of the letter's way as the camera sees it: its shadow on the letter's face.
         {
-            Clip one = title("I", -60, 15);
-            const ModelLight light = settingsLight(one.generator, 3, {0, 0, 0}, 1);
-            const V toLight{-light.direction[0], -light.direction[1], -light.direction[2]};
+            Clip one = title("I", -73, 29);
+            Title3DMesh lit;
+            QVERIFY(title3dMesh(one.generator, 3, W, H, 10, 25, lit));
+            const V toLight = lit.toLight;
             QVERIFY(toLight[2] > 0.2);
             Clip box = makeGeneratorClip(p, "model3d", 10);
             Effect& b = box.generator;
@@ -42821,12 +44453,12 @@ private slots:
 
     void titles3DInASolvedScenesUsd() {
         // A 3D title over footage with a solved camera, written to the solved scene's USD as a mesh, placed by its own
-        // camera: the middle of its faces at the median depth of the solve's points in front of the solved camera at
-        // its first frame, the title in proportion (every distance between its corners the same multiple of the one in
-        // its own space), and, through a solved camera with its own lens, every corner where its own camera shows it
-        // (within 1e-3 px); square on, through its clip's transform and another lens, its faces' corners. Its colours
-        // corner by corner are its display colour, which its material reads; Montage's USD reader reads its
-        // triangles back.
+        // camera at each of the solve's frames: the middle of its faces at the median depth of the solve's points in
+        // front of the solved camera, the title in proportion (every distance between its corners the same multiple of
+        // the one in its own space), and every corner, of its faces and its sides, where its own camera and its clip's
+        // transform show it (within 1e-3 px), through the same lens and through another, mirrored or not, turning or
+        // with a letter rolling. Its front faces point toward the camera. Its colours corner by corner are its display
+        // colour, which its material reads; Montage's USD reader and tinyusdz read it back.
         const int W = 320, H = 180;
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -42889,17 +44521,82 @@ private slots:
             u = cam.screen[0] * q[0] / q[2] + cam.screen[1] * q[1] / q[2] + cam.screen[2];
             v = cam.screen[3] * q[0] / q[2] + cam.screen[4] * q[1] / q[2] + cam.screen[5];
         };
-        auto solvedCamera = [&](const CameraSolve& solve) {
+        auto solvedCameraAt = [&](const CameraSolve& solve, size_t f) {
             ModelCamera c;
-            std::copy(solve.cameras[0].R.begin(), solve.cameras[0].R.end(), c.R.begin());
-            c.C = {solve.cameras[0].C.x, solve.cameras[0].C.y, solve.cameras[0].C.z};
+            std::copy(solve.cameras[f].R.begin(), solve.cameras[f].R.end(), c.R.begin());
+            c.C = {solve.cameras[f].C.x, solve.cameras[f].C.y, solve.cameras[f].C.z};
             c.screen = {solve.focal, 0, W / 2.0, 0, solve.focal, H / 2.0};
             return c;
         };
         auto at = [](const std::vector<float>& v, size_t i) { return std::array<double, 3>{v[i * 3], v[i * 3 + 1], v[i * 3 + 2]}; };
         auto ownAt = [&](size_t i) { return at(own.triangles.positions, own.triangles.indices[i]); };
+        // Corner v of the exported mesh in the scene at its sample f: its points there (or throughout) through its
+        // transform there (row vectors).
+        auto sceneAt = [&](const SolvedSceneMesh& mesh, size_t f, size_t v) {
+            const std::array<double, 3> q = at(mesh.pointSamples.empty() ? mesh.positions : mesh.pointSamples.at(f).second, v);
+            const std::array<double, 16>& M = mesh.motion.at(f).second;
+            return std::array<double, 3>{q[0] * M[0] + q[1] * M[4] + q[2] * M[8] + M[12], q[0] * M[1] + q[1] * M[5] + q[2] * M[9] + M[13],
+                                         q[0] * M[2] + q[1] * M[6] + q[2] * M[10] + M[14]};
+        };
+        // How far the exported corners are, at every sample, from where the title's own camera and its clip's
+        // transform show them at that frame through the solved camera there (faces and sides apart).
+        auto offAtEveryFrame = [&](const CameraSolve& solve, const SolvedSceneMesh& mesh, const Clip& t, double& faces, double& sides) {
+            faces = sides = 0;
+            if (mesh.motion.size() != 10) return false;
+            for (size_t f = 0; f < 10; ++f) {
+                if (mesh.motion[f].first != double(f)) return false;
+                Title3DMesh here;
+                if (!title3dMesh(t.generator, double(f), W, H, 10, 25, here) || here.triangles.indices.size() != mesh.indices.size()) return false;
+                const ModelCamera cam = solvedCameraAt(solve, f);
+                for (size_t i = 0; i < mesh.indices.size(); ++i) {
+                    double u0, v0, z0, u1, v1, z1, x, y;
+                    picture(here.camera, at(here.triangles.positions, here.triangles.indices[i]), u0, v0, z0);
+                    if (!clipFrameToSequence(p, s, s.videoTracks[1].clips[0], FrameTime(f), u0 / W, v0 / H, x, y)) return false;
+                    picture(cam, sceneAt(mesh, f, i), u1, v1, z1);
+                    if (!(z1 > 0)) return false;
+                    double& worst = here.onFace.at(i / 3) ? faces : sides;
+                    worst = std::max(worst, std::hypot(u1 - x, v1 - y));
+                }
+            }
+            return true;
+        };
 
-        // ---- Through a solved camera with the title's own lens: every corner where its own camera shows it.
+        // Whether each exported triangle's corners are its own three (as the title alone has them), the last two
+        // swapped exactly where that keeps them running round their normals: where the title's own triangle runs
+        // against its corners' normals (a font whose outlines run the other way leaves some: CFF's, macOS's), or, seen
+        // mirrored, where it runs with them. Slivers with next to no area may go either way. Empty when so; `turned`
+        // counts the swapped.
+        auto turnedByNormals = [&](const SolvedSceneMesh& mesh, const Title3DMesh& alone, bool mirrored, int& turned) -> QString {
+            turned = 0;
+            if (mesh.indices.size() != alone.triangles.indices.size()) return QStringLiteral("triangles differ");
+            const std::vector<float>& ap = alone.triangles.positions;
+            const std::vector<float>& an = alone.triangles.normals;
+            for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+                const bool swapped = mesh.indices[t + 1] == uint32_t(t + 2);
+                if (mesh.indices[t] != uint32_t(t) || mesh.indices[t + 1] != uint32_t(swapped ? t + 2 : t + 1) ||
+                    mesh.indices[t + 2] != uint32_t(swapped ? t + 1 : t + 2))
+                    return QStringLiteral("triangle %1: %2 %3 %4").arg(t / 3).arg(mesh.indices[t]).arg(mesh.indices[t + 1]).arg(mesh.indices[t + 2]);
+                turned += swapped;
+                const std::array<double, 3> a = at(ap, alone.triangles.indices[t]), b = at(ap, alone.triangles.indices[t + 1]),
+                                            c = at(ap, alone.triangles.indices[t + 2]);
+                const double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+                const double g[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                const double area = std::hypot(g[0], g[1], g[2]);
+                if (area <= 1e-4 * std::hypot(e1[0], e1[1], e1[2]) * std::hypot(e2[0], e2[1], e2[2])) continue;
+                double d = 0;
+                for (size_t k = 0; k < 3; ++k) {
+                    const std::array<double, 3> N = at(an, alone.triangles.indices[t + k]);
+                    d += g[0] * N[0] + g[1] * N[1] + g[2] * N[2];
+                }
+                if (std::abs(d) <= 1e-6 * area) continue;
+                if (swapped != (mirrored ? d > 0 : d < 0))
+                    return QStringLiteral("triangle %1 %2 against normals that turn it %3").arg(t / 3).arg(swapped ? "swapped" : "kept").arg(d);
+            }
+            return {};
+        };
+
+        // ---- Through a solved camera with the title's own lens: every corner where its own camera shows it, at every
+        // frame of the moving camera, the title's place its transform's time samples alone.
         const CameraSolve solve = solveWith(lens);
         SolvedSceneMesh m;
         QVERIFY(placed(solve, title, m));
@@ -42907,26 +44604,72 @@ private slots:
         QCOMPARE(m.positions.size(), m.indices.size() * 3);
         QCOMPARE(m.colors.size(), m.positions.size());
         QCOMPARE(m.name, std::string("Hello"));
-        const ModelCamera sc = solvedCamera(solve);
+        QCOMPARE(m.motion.size(), size_t(10));
+        QVERIFY(m.pointSamples.empty() && m.normalSamples.empty());
+        {
+            int turned = 0;
+            const QString wrong = turnedByNormals(m, own, false, turned);
+            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+            qInfo("a 3D title in a solved scene: %d of its %d triangles turned to run round their normals", turned, int(m.indices.size() / 3));
+        }
         double worst = 0, lo = 1e300, hi = 0;
         for (size_t i = 0; i < m.indices.size(); ++i) {
-            double u0, v0, z0, u1, v1, z1;
-            picture(own.camera, ownAt(i), u0, v0, z0);
-            picture(sc, at(m.positions, m.indices[i]), u1, v1, z1);
-            QVERIFY(z1 > 0);
-            worst = std::max(worst, std::hypot(u1 - u0, v1 - v0));
             // (in proportion: distances to the first corner)
-            const std::array<double, 3> a = ownAt(0), b = ownAt(i), A = at(m.positions, m.indices[0]), B = at(m.positions, m.indices[i]);
+            const std::array<double, 3> a = ownAt(0), b = ownAt(i), A = sceneAt(m, 0, 0), B = sceneAt(m, 0, i);
             const double d0 = std::hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]), d1 = std::hypot(B[0] - A[0], B[1] - A[1], B[2] - A[2]);
             if (d0 > 1) lo = std::min(lo, d1 / d0), hi = std::max(hi, d1 / d0);
             for (size_t k = 0; k < 3; ++k) QCOMPARE(m.colors[i * 3 + k], own.triangles.colors[own.triangles.indices[i] * 4 + k]);
+        }
+        {
+            double faces, sides;
+            QVERIFY(offAtEveryFrame(solve, m, title, faces, sides));
+            worst = std::max(faces, sides);
         }
         qInfo("a 3D title in a solved scene: its corners %.2g px from where its own camera shows them, %.6g to %.6g scene units a pixel of its own",
               worst, lo, hi);
         QVERIFY(worst < 1e-3);
         QVERIFY(hi - lo < 1e-6 * hi);
+        // Its front faces point toward the solved camera, by the turn of their corners.
+        auto facesToward = [&](const SolvedSceneMesh& mesh, const Title3DMesh& alone, const ModelCamera& cam, size_t f) {
+            int toward = 0, away = 0;
+            for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+                if (!alone.onFace.at(t / 3)) continue;
+                const std::array<double, 3> A = sceneAt(mesh, f, mesh.indices[t]), B = sceneAt(mesh, f, mesh.indices[t + 1]), C = sceneAt(mesh, f, mesh.indices[t + 2]);
+                const double e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]}, e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+                const double n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                // (a sliver with next to no area, as a font's straight runs of points leave, turns neither way)
+                if (std::hypot(n[0], n[1], n[2]) <= 1e-4 * std::hypot(e1[0], e1[1], e1[2]) * std::hypot(e2[0], e2[1], e2[2])) continue;
+                const double d = n[0] * (cam.C[0] - A[0]) + n[1] * (cam.C[1] - A[1]) + n[2] * (cam.C[2] - A[2]);
+                (d > 0 ? toward : away) += 1;
+            }
+            return std::pair<int, int>{toward, away};
+        };
+        {
+            const auto [toward, away] = facesToward(m, own, solvedCameraAt(solve, 0), 0);
+            QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1 toward, %2 away").arg(toward).arg(away)));
+        }
+        // So do they in a font whose outlines run the other way round (CFF's, as macOS's fonts have: CI's macOS job
+        // found some of them turned away), where one is installed.
+        for (const char* cff : {"Inter", "Loma"}) {
+            if (!QFontDatabase::hasFamily(QString::fromLatin1(cff))) continue;
+            Clip other = title;
+            other.generator.strings["font"] = cff;
+            Title3DMesh alone;
+            SolvedSceneMesh om;
+            QVERIFY(title3dMesh(other.generator, 0, W, H, 10, 25, alone));
+            QVERIFY(placed(solve, other, om));
+            const auto [toward, away] = facesToward(om, alone, solvedCameraAt(solve, 0), 0);
+            QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1: %2 toward, %3 away").arg(cff).arg(toward).arg(away)));
+            int turned = 0;
+            const QString wrong = turnedByNormals(om, alone, false, turned);
+            QVERIFY2(wrong.isEmpty(), qPrintable(QString("%1: %2").arg(cff, wrong)));
+            qInfo("%s: %d of its %d triangles turned to run round their normals", cff, turned, int(om.indices.size() / 3));
+            s.videoTracks[1].clips = {title};
+            break;
+        }
         // The middle of its faces at the points' median depth in front of the solved camera: as far in front of it as
         // that middle is in front of its own camera, times the scale it was placed at.
+        const ModelCamera sc = solvedCameraAt(solve, 0);
         {
             std::vector<double> depths;
             for (const SolvedPoint& pt : solve.points) {
@@ -42947,7 +44690,8 @@ private slots:
             qInfo("its middle %.6g in front of the solved camera, the points' median %.6g", ownDepth * lo, median);
             QVERIFY(std::fabs(ownDepth * lo - median) < 1e-5 * median);
         }
-        // Written to USD: the mesh with its display colour, read by its material, and its triangles read back.
+        // Written to USD: the mesh with its display colour, read by its material, its transform's time samples, and
+        // its triangles read back.
         {
             const std::string file = (dir.path() + "/titled.usda").toStdString();
             std::string err;
@@ -42958,6 +44702,8 @@ private slots:
             QVERIFY(prim && prim->attribute("primvars:displayColor") && prim->attribute("points"));
             QCOMPARE(prim->attribute("primvars:displayColor")->value.numbers.size(), m.colors.size());
             QCOMPARE(prim->attribute("points")->value.numbers.size(), m.positions.size());
+            QVERIFY(!prim->attribute("points")->animated());
+            QVERIFY(prim->attribute("xformOp:transform") && prim->attribute("xformOp:transform")->samples.size() == 10);
             const auto* reader = stage.prim("/Solve/Looks/Title_1/Colours");
             QVERIFY(reader && reader->attribute("inputs:varname") && reader->attribute("inputs:varname")->value.text(0) == "displayColor");
             Model model;
@@ -42967,35 +44713,174 @@ private slots:
         }
 
         // ---- The title square on, through its clip's transform (scaled to half and moved 40 px right, 20 up) and a
-        // solved camera with a lens half as long: every corner of its faces where the picture shows it (the sides,
-        // further back, as near as the other lens shows them).
+        // solved camera with a lens half as long: every corner, of its faces and its sides, where the picture shows it.
+        Clip moved = title;
+        moved.generator.params["rot_x"] = Param(0.0), moved.generator.params["rot_y"] = Param(0.0);
+        moved.motion.params["scale"] = Param(50.0);
+        moved.motion.params["pos_x"] = Param(40.0), moved.motion.params["pos_y"] = Param(-20.0);
+        const CameraSolve half = solveWith(lens / 2);
         {
-            Clip moved = title;
-            moved.generator.params["rot_x"] = Param(0.0), moved.generator.params["rot_y"] = Param(0.0);
-            moved.motion.params["scale"] = Param(50.0);
-            moved.motion.params["pos_x"] = Param(40.0), moved.motion.params["pos_y"] = Param(-20.0);
             Title3DMesh square;
             QVERIFY(title3dMesh(moved.generator, 0, W, H, 10, 25, square));
-            const CameraSolve half = solveWith(lens / 2);
             SolvedSceneMesh mm;
             QVERIFY(placed(half, moved, mm));
             QCOMPARE(mm.indices.size(), square.triangles.indices.size());
-            const ModelCamera hc = solvedCamera(half);
+            QCOMPARE(mm.pointSamples.size(), mm.normalSamples.size());
+            QVERIFY(mm.pointSamples.empty() || mm.pointSamples.size() == 10);
             double faces = 0, sides = 0;
-            int onFaces = 0;
-            for (size_t i = 0; i < mm.indices.size(); ++i) {
-                double u0, v0, z0, u1, v1, z1, x, y;
-                picture(square.camera, at(square.triangles.positions, square.triangles.indices[i]), u0, v0, z0);
-                QVERIFY(clipFrameToSequence(p, s, s.videoTracks[1].clips[0], 0, u0 / W, v0 / H, x, y));
-                picture(hc, at(mm.positions, mm.indices[i]), u1, v1, z1);
-                double& worstHere = square.onFace.at(i / 3) ? faces : sides;
-                worstHere = std::max(worstHere, std::hypot(u1 - x, v1 - y));
-                onFaces += square.onFace[i / 3];
-            }
+            QVERIFY(offAtEveryFrame(half, mm, moved, faces, sides));
             qInfo("through its transform and half the lens: its faces' corners %.2g px off, its sides' %.2g", faces, sides);
-            QVERIFY(onFaces > 30);
             QVERIFY(faces < 1e-3);
-            QVERIFY(sides < 5);
+            QVERIFY(sides < 1e-3);
+        }
+
+        // ---- Mirrored (flipped across), through half the lens and the 50 % scale: its corners where the picture shows
+        // them and its faces still toward the camera, its triangles turned round. In DejaVu Sans and in a font whose
+        // outlines run the other way round (CFF's) where one is installed: a font that lacks DejaVu Sans (macOS's) draws
+        // the title in another, with curves, so slivers among its faces.
+        for (const char* font : {"DejaVu Sans", "Inter", "Loma"}) {
+            if (std::string(font) != "DejaVu Sans" && !QFontDatabase::hasFamily(QString::fromLatin1(font))) continue;
+            const bool cff = std::string(font) != "DejaVu Sans";
+            Clip mirrored = moved;
+            mirrored.generator.strings["font"] = font;
+            mirrored.generator.params["rot_y"] = Param(20.0);
+            mirrored.motion.params["flip_h"] = Param(1.0);
+            Title3DMesh alone;
+            QVERIFY(title3dMesh(mirrored.generator, 0, W, H, 10, 25, alone));
+            SolvedSceneMesh mm;
+            QVERIFY(placed(half, mirrored, mm));
+            double faces = 0, sides = 0;
+            QVERIFY(offAtEveryFrame(half, mm, mirrored, faces, sides));
+            qInfo("mirrored, %s: its faces' corners %.2g px off, its sides' %.2g", font, faces, sides);
+            QVERIFY(faces < 1e-3 && sides < 1e-3);
+            int turned = 0;
+            const QString wrong = turnedByNormals(mm, alone, true, turned);
+            QVERIFY2(wrong.isEmpty(), qPrintable(QString("%1: %2").arg(font, wrong)));
+            QVERIFY2(turned > int(mm.indices.size() / 6), qPrintable(QString("%1: %2").arg(font).arg(turned)));
+            const auto [toward, away] = facesToward(mm, alone, solvedCameraAt(half, 0), 0);
+            QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1: %2 toward, %3 away").arg(font).arg(toward).arg(away)));
+            // (its normals follow: every front face's corner's normal toward the camera too, slivers' as well, as a
+            // normal is the face's own and not its corners' turn; the turn above leaves slivers out)
+            int faceCorners = 0, normalsToward = 0;
+            for (size_t i = 0; i < mm.indices.size(); ++i)
+                if (alone.onFace.at(i / 3)) {
+                    const std::array<double, 3> N = at(mm.pointSamples.empty() ? mm.normals : mm.normalSamples[0].second, i);
+                    const std::array<double, 16>& M = mm.motion[0].second;
+                    const double n[3] = {N[0] * M[0] + N[1] * M[4] + N[2] * M[8], N[0] * M[1] + N[1] * M[5] + N[2] * M[9], N[0] * M[2] + N[1] * M[6] + N[2] * M[10]};
+                    const std::array<double, 3> X = sceneAt(mm, 0, i);
+                    const ModelCamera cam = solvedCameraAt(half, 0);
+                    ++faceCorners;
+                    normalsToward += n[0] * (cam.C[0] - X[0]) + n[1] * (cam.C[1] - X[1]) + n[2] * (cam.C[2] - X[2]) > 0;
+                }
+            qInfo("mirrored, %s: %d of its %d triangles turned, %d front faces toward the camera by their turn and %d slivers, "
+                  "%d of %d front corners' normals toward it",
+                  font, turned, int(mm.indices.size() / 3), toward, faceCorners / 3 - toward, normalsToward, faceCorners);
+            QVERIFY(faceCorners >= toward * 3);
+            QCOMPARE(normalsToward, faceCorners);
+            if (cff) break;
+        }
+
+        // ---- A title turning a quarter over its ten frames, through the title's own lens: its transform's time
+        // samples carry it (its points the same at every frame), every corner at each frame within 1e-3 px of where its
+        // camera puts it, as Montage's USD reader and tinyusdz read it back.
+        {
+            Clip turning = title;
+            Param turn;
+            turn.addKey(0, 0.0);
+            turn.addKey(9, 90.0);
+            turning.generator.params["rot_y"] = turn;
+            SolvedSceneMesh mt;
+            QVERIFY(placed(solve, turning, mt));
+            QVERIFY(mt.pointSamples.empty());
+            double faces = 0, sides = 0;
+            QVERIFY(offAtEveryFrame(solve, mt, turning, faces, sides));
+            qInfo("turning: its corners %.2g px off at worst over its ten frames", std::max(faces, sides));
+            QVERIFY(faces < 1e-3 && sides < 1e-3);
+            // (and a letter of it rolling: its points written at every frame, still exact)
+            Clip rolling = title;
+            rolling.generator.strings["text"] = "HiH";
+            const int k = addTextAnimator(rolling.generator);
+            const std::string pre = "ta" + std::to_string(k) + ".";
+            rolling.generator.params[pre + "start"] = Param(34.0), rolling.generator.params[pre + "end"] = Param(66.0);
+            // (rolled at every frame, so its letter is a solid of its own throughout: a frame whose triangles differ
+            // from the first's is held from the one before)
+            Param roll;
+            roll.addKey(0, 10.0);
+            roll.addKey(9, 100.0);
+            rolling.generator.params[pre + "rotation"] = roll;
+            SolvedSceneMesh mr;
+            QVERIFY(placed(solve, rolling, mr));
+            QCOMPARE(mr.pointSamples.size(), size_t(10));
+            QVERIFY(offAtEveryFrame(solve, mr, rolling, faces, sides));
+            qInfo("a letter rolling: its corners %.2g px off at worst", std::max(faces, sides));
+            QVERIFY(faces < 1e-3 && sides < 1e-3);
+            // Read back from USD at each frame.
+            const QByteArray tinyusdz = qgetenv("MONTAGE_TEST_TINYUSDZ");
+            if (tinyusdz.isEmpty()) qInfo("MONTAGE_TEST_TINYUSDZ is not set: tinyusdz's read-back is left out");
+            for (const SolvedSceneMesh* mesh : {&mt, &mr}) {
+                const Clip& t = mesh == &mt ? turning : rolling;
+                const std::string file = (dir.path() + (mesh == &mt ? "/turning.usda" : "/rolling.usda")).toStdString();
+                std::string err;
+                QVERIFY2(writeSolveUsda(solve, file, {*mesh}, &err), err.c_str());
+                // Where the picture shows each corner at frame f, and the nearest of them to a point read back.
+                auto nearest = [&](size_t f, const std::array<double, 3>& X) {
+                    Title3DMesh here;
+                    if (!title3dMesh(t.generator, double(f), W, H, 10, 25, here)) return 1e300;
+                    const ModelCamera cam = solvedCameraAt(solve, f);
+                    double u1, v1, z1, best = 1e300;
+                    picture(cam, X, u1, v1, z1);
+                    if (!(z1 > 0)) return 1e300;
+                    for (size_t i = 0; i < here.triangles.indices.size(); ++i) {
+                        double u0, v0, z0;
+                        picture(here.camera, at(here.triangles.positions, here.triangles.indices[i]), u0, v0, z0);
+                        best = std::min(best, std::hypot(u1 - u0, v1 - v0));
+                    }
+                    return best;
+                };
+                usd::Stage stage;
+                QVERIFY2(usd::openStage(file, stage, &err), err.c_str());
+                const auto* prim = stage.prim("/Solve/Models/Title_1");
+                QVERIFY(prim && prim->attribute("points") && prim->attribute("xformOp:transform"));
+                QCOMPARE(prim->attribute("points")->animated(), mesh == &mr);
+                double off = 0;
+                for (size_t f = 0; f < 10; f += 3) {
+                    const usd::Value M = prim->attribute("xformOp:transform")->at(double(f)), P = prim->attribute("points")->at(double(f));
+                    QCOMPARE(P.numbers.size(), mesh->positions.size());
+                    for (size_t i = 0; i + 2 < P.numbers.size(); i += 3) {
+                        const double q[3] = {P.numbers[i], P.numbers[i + 1], P.numbers[i + 2]};
+                        std::array<double, 3> X;
+                        for (size_t c = 0; c < 3; ++c) X[c] = q[0] * M.number(c) + q[1] * M.number(4 + c) + q[2] * M.number(8 + c) + M.number(12 + c);
+                        off = std::max(off, nearest(f, X));
+                    }
+                }
+                qInfo("%s read back by Montage: %.2g px off", file.c_str(), off);
+                QVERIFY(off < 1e-3);
+                if (tinyusdz.isEmpty()) continue;
+                // (written again in its plain colour: tinyusdz's render scene takes a surface's diffuse colour from a
+                // texture only, not from the primvar reader its corners' colours come through, and refuses the file)
+                SolvedSceneMesh plain = *mesh;
+                plain.colors.clear();
+                QVERIFY2(writeSolveUsda(solve, file, {plain}, &err), err.c_str());
+                QProcess run;
+                run.start(QString::fromLocal8Bit(tinyusdz), {QString::fromStdString(file), dir.path(), "0", "3", "6", "9"});
+                QVERIFY(run.waitForFinished(120000));
+                const QString said = QString::fromLocal8Bit(run.readAllStandardOutput());
+                QVERIFY2(run.exitCode() == 0, qPrintable(said + QString::fromLocal8Bit(run.readAllStandardError())));
+                int frames = 0;
+                off = 0;
+                for (const QString& line : said.split('\n', Qt::SkipEmptyParts)) {
+                    const QStringList w = line.split(' ', Qt::SkipEmptyParts);
+                    if (w.size() < 4 || w[0] != "points" || w[1] != "Title_1") continue;
+                    const size_t f = size_t(w[2].toInt()), n = size_t(w[3].toInt());
+                    QVERIFY(n > 30 && size_t(w.size()) == 4 + n * 3);
+                    for (size_t i = 0; i < n; ++i)
+                        off = std::max(off, nearest(f, {w[int(4 + i * 3)].toDouble(), w[int(5 + i * 3)].toDouble(), w[int(6 + i * 3)].toDouble()}));
+                    ++frames;
+                }
+                qInfo("%s read back by tinyusdz: %.2g px off", file.c_str(), off);
+                QCOMPARE(frames, 4);
+                QVERIFY(off < 1e-3);
+            }
         }
         for (Track& t : s.videoTracks) t.clips.clear();
     }
@@ -44203,6 +46088,20 @@ private slots:
             QVERIFY(!same("text set round its path, unbent", drawn(unbent[0]), paint({{all, white}})));
             const std::optional<SvgTextLayout> back = parseSvgTextLayout(svgTextTitle(texts[0]).s("svg_text"));
             QVERIFY(back && back->stretch && !back->vertical);
+            // (nightly 27 Nov) However large a letter is bent, it is made of at most kMostBentPoints: four letters at
+            // the largest size a title takes, stretched to a thousand times their width, are each drawn twice (once
+            // to measure, once to draw) from no more than that.
+            const std::vector<SvgText> huge = textsOf(write(
+                "stretch-huge.svg", std::string("<defs><path id=\"ring\" d=\"M 100 40 A 60 60 0 0 1 100 160 A 60 60 0 0 1 100 40 Z\"/></defs>"
+                                                "<text font-size=\"1000\" textLength=\"3000000\" lengthAdjust=\"spacingAndGlyphs\" ") + look +
+                                        "><textPath xlink:href=\"#ring\" method=\"stretch\">HEMN</textPath></text>"));
+            QCOMPARE(int(huge.size()), 1);
+            QVERIFY(huge[0].layout.stretch && huge[0].layout.adjustGlyphs);
+            const long bentBefore = svgBentPoints();
+            QVERIFY(!drawn(huge[0]).empty());
+            const long bent = svgBentPoints() - bentBefore;
+            qInfo("four letters stretched a thousand times: %ld points bent", bent);
+            QVERIFY2(bent > 0 && bent <= 8 * (kMostBentPoints + 64), qPrintable(QString::number(bent)));
         }
         // writing-mode vertical-rl: set top to bottom from y 20, x 100 the column's middle. Latin letters (mixed
         // orientation, the default) turned a quarter clockwise, each moving the pen down by its advance and its middle
@@ -45062,6 +46961,36 @@ private slots:
             for (int i = 0; i < 20000; ++i) at.push_back({1000.0f + float(i) * 0.001f, 0, 0});
             f.neighbourDistance = 0.0004f, f.neighbours = 1;
             QCOMPARE(countOf(splatKeep(cloudOf(at), f)), size_t(0));
+            // (nightly 27 Nov) Nor do splats more than 2^30 cells from the lowest share one: one at the origin and
+            // 120,000 in a line at x 700,000, as far apart as floats there can be (1/16), all go at a distance of 0.001.
+            at.clear();
+            at.push_back({0, 0, 0});
+            for (int i = 0; i < 120000; ++i) at.push_back({700000.0f + float(i) * 0.0625f, 0, 0});
+            f.neighbourDistance = 0.001f, f.neighbours = 1;
+            QCOMPARE(countOf(splatKeep(cloudOf(at), f)), size_t(0));
+            // Far out, where a float's steps are wider than the distance, splats of the same value on that axis are
+            // still near each other and others are not: what is kept is again what measuring every pair says, for
+            // crowds at 1e20 and -1e30 sharing a value, a line at 700,000 and a crowd at the origin.
+            at.clear();
+            for (int i = 0; i < 300; ++i) at.push_back({1e20f, float(rnd() * 0.002), float(rnd() * 0.002)});
+            for (int i = 0; i < 300; ++i) at.push_back({float(rnd() * 0.004), -1e30f, 5e15f + float(int(rnd() * 3)) * 1e9f});
+            for (int i = 0; i < 300; ++i) at.push_back({700000.0f + float(int(rnd() * 400)) * 0.0625f, float(rnd() * 0.002), 0});
+            for (int i = 0; i < 300; ++i) at.push_back({float(rnd() * 0.004), float(rnd() * 0.004), float(rnd() * 0.004)});
+            const SplatCloud far = cloudOf(at);
+            for (const float dist : {0.001f, 0.003f})
+                for (const int need : {1, 4}) {
+                    std::vector<uint8_t> measured(at.size(), 0);
+                    for (size_t i = 0; i < at.size(); ++i) {
+                        int found = 0;
+                        for (size_t j = 0; j < at.size(); ++j) {
+                            const double dx = double(at[j][0]) - at[i][0], dy = double(at[j][1]) - at[i][1], dz = double(at[j][2]) - at[i][2];
+                            if (j != i && dx * dx + dy * dy + dz * dz <= double(dist) * double(dist)) ++found;
+                        }
+                        measured[i] = found >= need;
+                    }
+                    f.neighbourDistance = dist, f.neighbours = need;
+                    QVERIFY2(splatKeep(far, f) == measured, qPrintable(QString("far: distance %1, %2 neighbours").arg(dist).arg(need)));
+                }
         }
         {
             SplatFilter f;
@@ -45346,6 +47275,42 @@ private slots:
             err.clear();
             QVERIFY(!loadSplats(path("splat_zeros.gltf"), none, &err));
             QVERIFY2(err.find("larger than Montage can load") != std::string::npos, err.c_str());
+        }
+        {
+            // Zeros are counted each time they are read: one accessor with no buffer view serving the position, scale,
+            // colour and every harmonic, under eight nodes that show the same mesh, is refused, though each accessor
+            // alone is within the limit. With a thousand splats under one node, the same file is read.
+            auto shared = [&](int count, int nodes) {
+                QJsonObject attrs{{"POSITION", 0}, {"KHR_gaussian_splatting:ROTATION", 1}, {"KHR_gaussian_splatting:SCALE", 0},
+                                  {"KHR_gaussian_splatting:OPACITY", 2}, {"KHR_gaussian_splatting:SH_DEGREE_0_COEF_0", 0}};
+                for (int d = 1; d <= 3; ++d)
+                    for (int k = 0; k < 2 * d + 1; ++k) attrs[QString("KHR_gaussian_splatting:SH_DEGREE_%1_COEF_%2").arg(d).arg(k)] = 0;
+                QJsonArray nodeList, roots;
+                for (int i = 0; i < nodes; ++i) nodeList.append(QJsonObject{{"mesh", 0}}), roots.append(i);
+                return QJsonObject{
+                    {"asset", QJsonObject{{"version", "2.0"}}},
+                    {"extensionsUsed", QJsonArray{"KHR_gaussian_splatting"}},
+                    {"accessors", QJsonArray{QJsonObject{{"componentType", 5126}, {"count", count}, {"type", "VEC3"}},
+                                             QJsonObject{{"componentType", 5126}, {"count", count}, {"type", "VEC4"}},
+                                             QJsonObject{{"componentType", 5126}, {"count", count}, {"type", "SCALAR"}}}},
+                    {"meshes", QJsonArray{QJsonObject{{"primitives", QJsonArray{QJsonObject{
+                                   {"mode", 0}, {"attributes", attrs},
+                                   {"extensions", QJsonObject{{"KHR_gaussian_splatting", QJsonObject{{"kernel", "ellipse"}, {"colorSpace", "srgb_rec709_display"}}}}}}}}}}},
+                    {"nodes", nodeList},
+                    {"scenes", QJsonArray{QJsonObject{{"nodes", roots}}}},
+                    {"scene", 0}};
+            };
+            QVERIFY(writeJson("splat_shared.gltf", shared(1 << 21, 8)));
+            QVERIFY(QFileInfo(QString::fromStdString(path("splat_shared.gltf"))).size() < 8 * 1024);
+            SplatCloud none;
+            err.clear();
+            QVERIFY(!loadSplats(path("splat_shared.gltf"), none, &err));
+            QVERIFY2(err.find("larger than Montage can load") != std::string::npos, err.c_str());
+            QCOMPARE(none.count, size_t(0));
+            QVERIFY(writeJson("splat_shared.gltf", shared(1000, 1)));
+            QVERIFY2(loadSplats(path("splat_shared.gltf"), none, &err), err.c_str());
+            QCOMPARE(none.count, size_t(1000));
+            QCOMPARE(none.shDegree, 3);
         }
         {
             // A file in linear light: blended as it is, then brought to display values. One opaque splat of linear 0.2
@@ -46223,15 +48188,17 @@ private slots:
         QVERIFY(std::find(c.actions.begin(), c.actions.end(), "c2pa.opened") != c.actions.end());
         QVERIFY(c.json.find("parentOf") != std::string::npos && c.json.find("Camera original") != std::string::npos);
 
-        // A format that cannot hold them: refused, the file untouched and nothing left beside it.
+        // A format that cannot hold them: signed beside it (cut.c2pa), the file untouched.
         const std::string mkv = path("cut.mkv");
         QVERIFY(QFile::copy(MONTAGE_TEST_DATA_DIR "/jfk.wav", QString::fromStdString(mkv)));
-        QVERIFY(!signContentCredentials(mkv, {}, {certs, key, {}}, {}, &err) && err.find(".mkv") != std::string::npos);
+        QVERIFY2(signContentCredentials(mkv, {}, {certs, key, {}}, {}, &err), err.c_str());
         auto bytes = [](const std::string& f) {
             QFile in(QString::fromStdString(f));
             return in.open(QIODevice::ReadOnly) ? in.readAll() : QByteArray();
         };
         QCOMPARE(bytes(mkv), bytes(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(path("cut.c2pa"))));
+        QVERIFY2(readContentCredentials(mkv, c, &err) && c.present && c.beside && c.state == "Valid", c.state.c_str());
         // A refused signer: the file untouched, no copy left beside it.
         const QByteArray before = bytes(camera);
         QVERIFY(!signContentCredentials(camera, {}, {MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem", key, {}}, {}, &err));
@@ -46246,13 +48213,17 @@ private slots:
         }
         const bool readBroken = readContentCredentials(broken, c, &err);
         QVERIFY(!(readBroken && c.present));
-        // Numbered frames cannot be signed: one file is.
+        // Numbered frames are signed beside them, as the export names them; a GIF is not signed.
         ExportSettings frames;
         frames.path = path("frame.png");
         frames.videoCodec = "png";
+        QVERIFY(exportCarriesCredentials(frames));
+        QCOMPARE(exportSignedPath(frames), path("frame_%06d.png"));
+        frames.videoCodec = "gif", frames.path = path("cut.gif");
         QVERIFY(!exportCarriesCredentials(frames));
         frames.videoCodec = "libx264", frames.path = path("cut.mp4");
         QVERIFY(exportCarriesCredentials(frames));
+        QCOMPARE(exportSignedPath(frames), path("cut.mp4"));
         // Changed after signing: invalid.
         const std::string changed = path("changed.wav");
         QVERIFY(QFile::copy(QString::fromStdString(camera), QString::fromStdString(changed)));
@@ -46303,8 +48274,10 @@ private slots:
                                                 {"credentials", QJsonObject{{"certificate", MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem"}, {"key", QString::fromStdString(key)}}}});
         QVERIFY2(r.value("isError").toBool() && !QFileInfo::exists(out), QJsonDocument(r).toJson().constData());
         QVERIFY(call("montage_render", {{"project", project}, {"output", out}, {"credentials", "yes"}}).value("isError").toBool());
+        // MKV is signed beside the file.
         r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("signed.mkv"))}, {"credentials", signer}});
-        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("cannot go in"));
+        QVERIFY2(!QJsonDocument(r).toJson().contains("cannot go in"), QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("isError").toBool() || hasCredentialSidecar(path("signed.mkv")));
         r = call("montage_render", {{"project", project}, {"output", out}, {"preset", "Audio - WAV 24-bit"}, {"credentials", signer}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonObject written = r.value("structuredContent").toObject().value("credentials").toObject();
@@ -46322,6 +48295,174 @@ private slots:
         const QByteArray store = QJsonDocument(read.value("manifest_store").toObject()).toJson();
         QVERIFY2(store.contains("Camera original") && store.contains("componentOf"), store.left(4000).constData());
         QVERIFY(!call("montage_read_credentials", {{"path", MONTAGE_TEST_DATA_DIR "/jfk.wav"}}).value("structuredContent").toObject().value("present").toBool());
+    }
+
+    void credentialsBesideAndThroughTheJob() {
+        // Where a manifest beside a file goes, and what it binds: a file's own name, a sequence's name before its number,
+        // a package folder's name beside the folder; the frames in order of number, a package's files in order of name.
+        QCOMPARE(credentialSidecarPath("/x/cut.mxf"), std::string("/x/cut.c2pa"));
+        QCOMPARE(credentialSidecarPath("/x/seq/shot.%04d.exr"), std::string("/x/seq/shot.c2pa"));
+        const QString seqDir = QString::fromStdString(path("beside/seq")), pkg = QString::fromStdString(path("beside/PKG"));
+        QDir().mkpath(seqDir);
+        QDir().mkpath(pkg + "/sub");
+        auto write = [](const QString& f, const QByteArray& data) {
+            QFile out(f);
+            return out.open(QIODevice::WriteOnly) && out.write(data) == data.size();
+        };
+        for (int n : {1003, 1001, 1002}) QVERIFY(write(seqDir + QStringLiteral("/shot.%1.exr").arg(n), QByteArray::number(n)));
+        QVERIFY(write(pkg + "/b.mxf", "b") && write(pkg + "/a.xml", "a") && write(pkg + "/sub/c.mxf", "c") && write(pkg + "/old.c2pa", "x"));
+        const std::vector<std::string> frames = credentialBoundFiles((seqDir + "/shot.%04d.exr").toStdString());
+        QCOMPARE(frames.size(), size_t(3));
+        QVERIFY(QString::fromStdString(frames[0]).endsWith("shot.1001.exr") && QString::fromStdString(frames[2]).endsWith("shot.1003.exr"));
+        ImageSequence seq;
+        seq.pattern = (seqDir + "/shot.%04d.exr").toStdString();
+        seq.first = 1001, seq.last = 1003;
+        QCOMPARE(credentialBoundFiles(imageSequencePath(seq)), frames);
+        QCOMPARE(credentialSidecarPath(imageSequencePath(seq)), (seqDir + "/shot.c2pa").toStdString());
+        QCOMPARE(credentialSidecarPath(pkg.toStdString()), path("beside/PKG.c2pa"));
+        const std::vector<std::string> files = credentialBoundFiles(pkg.toStdString());
+        QCOMPARE(files.size(), size_t(3));  // (the old manifest is not bound)
+        QVERIFY(QString::fromStdString(files[0]).endsWith("PKG/a.xml") && QString::fromStdString(files[1]).endsWith("PKG/b.mxf") &&
+                QString::fromStdString(files[2]).endsWith("PKG/sub/c.mxf"));
+        QVERIFY(!hasCredentialSidecar(pkg.toStdString()));
+        // Numbered frames are signed as the export names them.
+        ExportSettings st;
+        st.videoCodec = "exr";
+        st.path = path("beside/plate.exr");
+        QCOMPARE(exportSignedPath(st), path("beside/plate_%06d.exr"));
+        st.path = path("beside/plate.%04d.exr");
+        QCOMPARE(exportSignedPath(st), st.path);
+        QVERIFY(exportCarriesCredentials(st));
+        // A copy's manifest: its parent opened and transcoded, the parent's assertions naming people redacted.
+        const std::string store = R"({"active_manifest":"urn:c2pa:cam","manifests":{"urn:c2pa:cam":{"assertions":[
+            {"label":"c2pa.actions.v2"},{"label":"stds.schema-org.CreativeWork"},{"label":"cawg.identity"}]}}})";
+        const std::vector<std::string> people = personAssertions(store);
+        QCOMPARE(people.size(), size_t(2));
+        QCOMPARE(people[0], std::string("self#jumbf=/c2pa/urn:c2pa:cam/c2pa.assertions/stds.schema-org.CreativeWork"));
+        CredentialOptions copy;
+        copy.parent = "/x/cam.mp4";
+        copy.parentDescription = "The part used, cut by Montage";
+        const QJsonObject def = QJsonDocument::fromJson(QByteArray::fromStdString(credentialManifestJson("/x/cut.mxf", {}, copy, "parent", people))).object();
+        QCOMPARE(def.value("format").toString(), QString("application/mxf"));
+        // (its actions begin by opening the parent, as a manifest's must begin with created or opened)
+        const QJsonArray actions = def.value("assertions").toArray()[0].toObject().value("data").toObject().value("actions").toArray();
+        QCOMPARE(actions.size(), 2);
+        const QJsonObject first = actions[0].toObject(), then = actions[1].toObject();
+        QCOMPARE(first.value("action").toString(), QString("c2pa.opened"));
+        QCOMPARE(first.value("parameters").toObject().value("ingredientIds").toArray()[0].toString(), QString("parent"));
+        QCOMPARE(then.value("action").toString(), QString("c2pa.transcoded"));
+        QCOMPARE(then.value("description").toString(), QString("The part used, cut by Montage"));
+        QCOMPARE(def.value("redactions").toArray().size(), 2);
+        // Said in the Media bin's tooltip.
+        CredentialSummary said;
+        said.present = true, said.state = "Valid", said.issuer = "Montage tests", said.through = "cam.mp4", said.beside = true;
+        QCOMPARE(credentialsLabel(said), std::string("Signed by Montage tests (valid); kept through a copy of cam.mp4; in a manifest beside the file"));
+        // With no signer a copy is left as it was.
+        std::string err;
+        QVERIFY(keepCredentialsThroughCopy(frames[0], frames[1], {}, "copy", &err));
+
+        const std::string certs = MONTAGE_TEST_DATA_DIR "/c2pa/chain.pem", key = MONTAGE_TEST_DATA_DIR "/c2pa/signer.key";
+        QDir(QString::fromStdString(path("beside"))).removeRecursively();
+        if (!contentCredentialsAvailable()) QSKIP("Built without the C2PA library (scripts/build-c2pa.sh) for the rest");
+        QDir().mkpath(QString::fromStdString(path("beside")));
+        auto flip = [](const std::string& f, qint64 at) {
+            QFile io(QString::fromStdString(f));
+            if (!io.open(QIODevice::ReadWrite) || !io.seek(at)) return false;
+            char ch = 0;
+            if (!io.getChar(&ch) || !io.seek(at)) return false;
+            return io.putChar(char(ch ^ 0x5a));
+        };
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 256, gs.height = 144, gs.fps = Rational{25, 1};  // (as small as DNxHR goes)
+        Clip ramp = makeGeneratorClip(gen, "color", 25);
+        ramp.generator.params["color.r"].addKey(0, 0.1);
+        ramp.generator.params["color.r"].addKey(24, 0.9);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        auto render = [&](const Project& pr, const Sequence& sq, const std::string& file, const char* codec, const char* profile, bool redact = false) {
+            ExportSettings e;
+            e.path = file;
+            e.videoCodec = codec;
+            e.profile = profile;
+            e.audioCodec = "none";
+            e.credentialCertificate = certs, e.credentialKey = key, e.credentialRedact = redact;
+            return exportSequence(pr, sq, e, nullptr, nullptr, &err);
+        };
+        // An MXF export: a manifest beside it that the reader finds valid, and invalid once a byte of it changes.
+        const std::string mxf = path("beside/cut.mxf");
+        QVERIFY2(render(gen, gs, mxf, "dnxhd", "dnxhr_sq"), err.c_str());
+        CredentialSummary c;
+        QVERIFY2(readContentCredentials(mxf, c, &err), err.c_str());
+        QVERIFY2(c.present && c.beside && c.state == "Valid", c.state.c_str());
+        QVERIFY(flip(mxf, QFileInfo(QString::fromStdString(mxf)).size() / 2));
+        QVERIFY2(readContentCredentials(mxf, c, &err), err.c_str());
+        QCOMPARE(c.state, std::string("Invalid"));
+        // An OpenEXR sequence export: one manifest beside its frames, invalid once a byte of one frame changes.
+        const std::string plates = path("beside/exr/plate.%04d.exr");
+        QDir().mkpath(QString::fromStdString(path("beside/exr")));
+        QVERIFY2(render(gen, gs, plates, "exr", ""), err.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(path("beside/exr/plate.c2pa"))));
+        QVERIFY2(readContentCredentials(plates, c, &err) && c.present && c.state == "Valid", c.state.c_str());
+        const std::vector<std::string> written = credentialBoundFiles(plates);
+        QCOMPARE(written.size(), size_t(25));
+        QVERIFY(flip(written[12], QFileInfo(QString::fromStdString(written[12])).size() - 10));
+        QVERIFY2(readContentCredentials(plates, c, &err), err.c_str());
+        QCOMPARE(c.state, std::string("Invalid"));
+
+        // A signed camera file consolidated (a trimmed copy), then exported: the camera's credentials are the parent of
+        // the copy's, and the copy's an ingredient of the export's.
+        const std::string cam = path("beside/cam.mp4");
+        {
+            ExportSettings e;
+            e.path = cam, e.videoCodec = "libx264", e.audioCodec = "none";
+            QVERIFY2(exportSequence(gen, gs, e, nullptr, nullptr, &err), err.c_str());
+            CredentialOptions original;
+            original.title = "Camera original";
+            QVERIFY2(signContentCredentials(cam, {}, {certs, key, {}}, original, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 128, s.height = 72, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, cam);
+        p.media.push_back(m);
+        Clip shot = makeClip(p, m, TrackKind::Video, s);
+        shot.sourceIn = 5, shot.duration = 10;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, shot);
+        ConsolidateOptions o;
+        o.folder = path("beside/consolidated");
+        o.output = "movie";
+        o.codec = "libx264";
+        o.handleUnit = "none";
+        o.credentialCertificate = certs, o.credentialKey = key;
+        ConsolidateResult res;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        Project after;
+        QVERIFY(loadProject(res.projectPath, after));
+        const std::string trimmed = after.findMedia(m.id)->path;
+        QVERIFY2(readContentCredentials(trimmed, c, &err) && c.present && c.state == "Valid", c.state.c_str());
+        QCOMPARE(c.through, std::string("cam.mp4"));
+        QVERIFY(credentialsLabel(c).find("kept through a copy of cam.mp4") != std::string::npos);
+        const std::string delivered = path("beside/final.mp4");
+        QVERIFY2(render(after, *after.active(), delivered, "libx264", ""), err.c_str());
+        QVERIFY2(readContentCredentials(delivered, c, &err) && c.present && c.state == "Valid", c.state.c_str());
+        // (the export's manifest, the copy's and the camera's)
+        const QJsonObject manifests = QJsonDocument::fromJson(QByteArray::fromStdString(c.json)).object().value("manifests").toObject();
+        QVERIFY2(manifests.size() >= 3, c.json.c_str());
+        bool chain = false;
+        for (auto it = manifests.begin(); it != manifests.end(); ++it)
+            for (const QJsonValue& v : it.value().toObject().value("ingredients").toArray())
+                chain |= v.toObject().value("title").toString() == "cam.mp4" && v.toObject().value("relationship").toString() == "parentOf" &&
+                         v.toObject().contains("active_manifest");
+        QVERIFY2(chain, c.json.c_str());
+        // A proxy carries them too.
+        ProxyOptions po;
+        po.credentialCertificate = certs, po.credentialKey = key;
+        QVERIFY2(createProxy(cam, path("beside/cam_proxy.mp4"), po, {}, nullptr, &err), err.c_str());
+        QVERIFY2(readContentCredentials(path("beside/cam_proxy.mp4"), c, &err) && c.present && c.through == "cam.mp4", c.json.c_str());
+        // Redacted, the export is still valid.
+        QVERIFY2(render(after, *after.active(), path("beside/redacted.mp4"), "libx264", "", true), err.c_str());
+        QVERIFY2(readContentCredentials(path("beside/redacted.mp4"), c, &err) && c.present && c.state == "Valid", c.state.c_str());
+        QDir(QString::fromStdString(path("beside"))).removeRecursively();
     }
 
     void voiceConversion() {
@@ -50752,6 +52893,67 @@ private slots:
             qInfo("Wow and flutter cancelled at %.0f %%: stopped %.1f ms later", when * 100, took);
             QVERIFY2(took < 1000, qPrintable(QString::number(took)));
         }
+    }
+
+    // Phase 18 #12. The whole tape repair of the test tape (wow and flutter taken out, then the azimuth followed over
+    // time and put right, the right channel 0.37 samples late) takes at most half the time it took at the end of
+    // Phase 17, and gives the same sound to within 1e-6 and the same delay to within 1e-9.
+    void tapeRepairInHalfTheTime() {
+        constexpr int sr = 48000;
+        const double chords[4][3] = {{200, 300, 450}, {250, 375, 560}, {220, 330, 440}, {275, 350, 420}};
+        auto music = [&](double tau) {
+            double v = 0.3 * std::sin(2 * M_PI * 1000 * tau);
+            const auto& chord = chords[size_t(std::max(0.0, tau) / 0.5) % 4];
+            for (double f : chord) v += 0.06 * std::sin(2 * M_PI * f * tau) + 0.03 * std::sin(2 * M_PI * 2 * f * tau);
+            return v;
+        };
+        auto tauAt = [](double t) {
+            return t + 0.003 / (2 * M_PI * 0.8) * (1 - std::cos(2 * M_PI * 0.8 * t)) + 0.0005 / (2 * M_PI * 12) * (1 - std::cos(2 * M_PI * 12 * t));
+        };
+        const size_t n = size_t(20 * sr);
+        AudioBuffer tape;
+        tape.sampleRate = sr, tape.channels = 2;
+        tape.samples.resize(n * 2);
+        for (size_t i = 0; i < n; ++i) {
+            tape.samples[i * 2] = float(music(tauAt(double(i) / sr)));
+            tape.samples[i * 2 + 1] = float(music(tauAt((double(i) - 0.37) / sr)));
+        }
+        struct Back {
+            ~Back() { tapeRepairAsBefore(false); }
+        } back;
+        // (before: as Phase 17 left it, wow and flutter already the quick way and the azimuth as Montage first did it;
+        // each way is timed three times and its best time kept, the two ways taken in turn)
+        auto repair = [&](bool before, AudioBuffer& out, double& delay) {
+            AudioBuffer steadied;
+            QElapsedTimer clock;
+            clock.start();
+            bool ok = removeWowFlutter(tape, steadied, 1, 1);
+            tapeRepairAsBefore(before);
+            ok = ok && correctAzimuth(steadied, out, true, true, nullptr, &delay);
+            const double took = clock.nsecsElapsed() / 1e6;
+            tapeRepairAsBefore(false);
+            return ok ? took : -1.0;
+        };
+        AudioBuffer before, now;
+        double delayBefore = 0, delayNow = 0, slow = 1e18, quick = 1e18;
+        for (int go = 0; go < 3; ++go) {
+            const double s = repair(true, before, delayBefore), q = repair(false, now, delayNow);
+            QVERIFY(s >= 0 && q >= 0);
+            slow = std::min(slow, s), quick = std::min(quick, q);
+        }
+        qInfo("Tape repair of 20 s of stereo (wow and flutter, then azimuth over time): %.0f ms as before, %.0f ms now (%.1f times as fast, %u cores)",
+              slow, quick, slow / std::max(quick, 1e-3), std::thread::hardware_concurrency());
+        QVERIFY2(std::fabs(delayNow - 0.37) < 0.02, qPrintable(QString::number(delayNow)));
+        QVERIFY2(std::fabs(delayNow - delayBefore) < 1e-9, qPrintable(QString::number(delayNow - delayBefore)));
+        QCOMPARE(now.samples.size(), before.samples.size());
+        double worst = 0;
+        for (size_t i = 0; i < now.samples.size(); ++i) worst = std::max(worst, double(std::fabs(now.samples[i] - before.samples[i])));
+        QVERIFY2(worst <= 1e-6, qPrintable(QString::number(worst)));
+        QVERIFY2(quick * 2 <= slow, qPrintable(QStringLiteral("%1 ms against %2 ms, on %3 cores").arg(quick).arg(slow).arg(std::thread::hardware_concurrency())));
+        // Cancelled, the azimuth's correction stops and says so.
+        std::atomic<bool> cancel{true};
+        AudioBuffer stopped;
+        QVERIFY(!correctAzimuth(now, stopped, true, true, &cancel));
     }
 
     void tapeAndArchiveRepair() {

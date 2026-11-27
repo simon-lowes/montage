@@ -1,5 +1,6 @@
 #include "OfxRemote.h"
 
+#include <QCoreApplication>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include "core/ProjectIO.h"
 #include "render/ColorSpace.h"
 #include "render/OfxGl.h"
+#include "core/Preferences.h"
 
 namespace montage::ofx::remote {
 
@@ -205,10 +207,9 @@ void notePicture(const PluginDesc& d, bool handle, const std::string& why) {
 // Whether the user turned handles off (MONTAGE_GPU_HANDLES=0), the first reason given when they did.
 bool handlesTurnedOff(std::string& why) {
     // (asked for unless turned off: CI's guest showed the path working on 24 November 2026, where both sides share)
-    const char* v = std::getenv("MONTAGE_GPU_HANDLES");
-    const std::string asked = v ? v : "";
-    if (asked != "0" && asked != "off") return false;
-    why = "handles are turned off (MONTAGE_GPU_HANDLES=0)";
+    if (prefs::toggle(QStringLiteral("playback/gpuHandles"))) return false;
+    const QString by = prefs::overriddenBy(QStringLiteral("playback/gpuHandles"));
+    why = by.isEmpty() ? "handles are turned off (Preferences, Playback)" : "handles are turned off (" + by.toStdString() + ")";
     return true;
 }
 
@@ -239,9 +240,14 @@ bool asksForHandle(const Host& host, std::string& why) {
     return asksForHandlesNow(why);
 }
 
-// The texture this thread's render is to go into (renderInto), and whether a handle was copied into it.
+// The texture this thread's render is to go into (renderInto), and whether a handle was copied into it; and the
+// texture its clip effect's picture comes from, where it was not read back (renderInto's `from`).
 thread_local unsigned tInto = 0;
 thread_local bool tInPlace = false;
+thread_local unsigned tFrom = 0;
+// The renders failed in this thread's outermost HostFailuresScope (by what they were), and why.
+thread_local std::map<std::string, std::string>* tFailures = nullptr;
+thread_local int tFailureScopes = 0;
 
 // The picture a host shares, read from the texture it is imported as (or copied from it into `into`, then not read): its descriptors are at `post`, sent before the
 // reply. Its descriptors and its fence are waited for `waitMs` at most (what is left of the render's own wait, so a
@@ -287,6 +293,36 @@ bool takeHandle(const Host& host, int post, const wire::PictureHandle& ph, int w
     return ran && ok;
 }
 
+// A clip effect's picture in, texture `from` (w x h, RGBA float, top row first), given to the host as a DMA-BUF: copied
+// into a 16-bit float texture on the GPU, exported with a fence for that copy, its descriptors sent to the host's
+// socket `post` and described in `ph`. False, with why.
+bool sendInput(unsigned from, int w, int h, const std::string& post, wire::PictureHandle& ph, std::string& why) {
+    gl::DmaBuf buf;
+    bool shared = false;
+    const bool ran = gl::run([&] {
+        const unsigned half = gl::makeTexture(w, h, true);
+        if (!half) {
+            why = "no texture could be made for the picture in";
+            return;
+        }
+        if (gl::copy(from, half, w, h)) shared = gl::exportDmaBuf(half, w, h, buf, &why);
+        else why = "the picture in could not be copied for sharing";
+        gl::destroyTexture(half);  // (the DMA-BUF keeps its memory)
+    });
+    if (!ran) why = "OpenGL for plugins is not running";
+    if (shared && !gl::sendDmaBuf(post, buf)) {
+        shared = false;
+        why = "the picture in's descriptors could not be sent to the plug-in host";
+    }
+    if (shared) {
+        ph = wire::PictureHandle{};
+        ph.kind = 1, ph.fourcc = buf.fourcc, ph.stride = buf.stride, ph.offset = buf.offset, ph.modifier = buf.modifier;
+        ph.width = w, ph.height = h, ph.fence = buf.fence >= 0 ? 1 : 0;
+    }
+    gl::closeDmaBuf(buf);
+    return shared;
+}
+
 }  // namespace
 
 bool isolated() { return plugins::isolating(); }
@@ -299,18 +335,27 @@ bool asksForHandles(std::string* why) {
     return false;
 }
 
+bool sendsInputHandles(std::string* why) {
+    if (!asksForHandles(why)) return false;
+    std::string no;
+    if (gl::exportsDmaBuf(&no)) return true;
+    if (why) *why = "Montage shares no pictures from the GPU's memory: " + no;
+    return false;
+}
+
 bool renderInto(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
-                const Image* b, unsigned into, const FrameFetch* fetch, std::string* error, const ColorSpace* working, bool* inPlace) {
+                const Image* b, unsigned into, const FrameFetch* fetch, std::string* error, const ColorSpace* working, bool* inPlace,
+                unsigned from) {
     if (inPlace) *inPlace = false;
     if (!into || w <= 0 || h <= 0) {
         if (error) *error = "no texture to render into";
         return false;
     }
     struct Into {
-        const unsigned was = tInto;
-        explicit Into(unsigned texture) { tInto = texture, tInPlace = false; }
-        ~Into() { tInto = was; }
-    } scope(into);
+        const unsigned was = tInto, wasFrom = tFrom;
+        Into(unsigned texture, unsigned in) { tInto = texture, tInPlace = false, tFrom = in; }
+        ~Into() { tInto = was, tFrom = wasFrom; }
+    } scope(into, a ? 0u : from);
     Image out;
     if (!render(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working)) return false;
     if (tInPlace) {
@@ -361,8 +406,20 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
 
 bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
             const Image* b, Image& out, const FrameFetch* fetch, std::string* error, const ColorSpace* working) {
+    // (failed already in this frame's HostFailuresScope: not asked again)
+    std::string failedKey;
+    if (tFailures) {
+        char at[64];
+        std::snprintf(at, sizeof at, "%.17g %.17g", t, progress);
+        failedKey = std::to_string(int(kind)) + " " + std::to_string(e.id) + " " + at + " " + d.id;
+        if (const auto it = tFailures->find(failedKey); it != tFailures->end()) {
+            if (error) *error = it->second;
+            return false;
+        }
+    }
     std::string why;
     if (renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, &why, working)) return true;
+    if (tFailures) (*tFailures)[failedKey] = why;
     // An export's picture would go on without the effect, and the export would say it went well: the export is told
     // and stops, naming the plug-in. Whatever the reason: bypassed since it failed in playback, failed now, or its
     // host would not start. (One the user turned off after it failed is left out knowingly, as an audio plug-in is.)
@@ -385,8 +442,22 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
     // times, are not copied into it)
     struct Into {
         const unsigned texture = std::exchange(tInto, 0u);
-        ~Into() { tInto = texture; }
+        const unsigned from = std::exchange(tFrom, 0u);  // (likewise the texture its picture in comes from)
+        ~Into() { tInto = texture, tFrom = from; }
     } into;
+    // The picture in from that texture, read back where the host does not take it as a handle (once, and counted).
+    Image readIn;
+    auto readBack = [&]() -> const Image* {
+        if (readIn.empty() && into.from && w > 0 && h > 0) {
+            gl::run([&] { gl::readTexture(into.from, w, h, true, readIn); });
+            if (!readIn.empty()) {
+                std::lock_guard lock(gPicturesM);
+                ++gPictures.inputReadBacks;
+            }
+        }
+        return readIn.empty() ? nullptr : &readIn;
+    };
+    if (kind != Kind::Effect && !a && into.from) a = readBack();
     const std::string key = keyFor(e, d);
     std::string err;
     std::unique_ptr<Link> link = takeLink(key, d.id, &err);
@@ -409,7 +480,6 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
         giveBack(key, std::move(link));
         return false;
     }
-    if (a) std::memcpy(link->at(0), a->px.data(), slot);
     if (b) std::memcpy(link->at(slot), b->px.data(), slot);
     if (withMask) std::memcpy(link->at(size_t(images) * slot), mask->data(), maskBytes);
     const std::string msg = effectToJsonString(baked(e, t)) + std::string(1, '\0') + descriptionsToJson({d}) + std::string(1, '\0') +
@@ -431,12 +501,27 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
         link->post = gl::openDmaBufPost(link->postName, &viaMemory);
         asked = link->post >= 0;
     }
+    // The picture in: as a handle the host asks for (InputPicture), where its picture back is asked for as one and
+    // Montage shares from the GPU's memory; else in the arena, read back first where it came as a texture.
+    std::string noInputHandle;
+    const bool inputByHandle = !a && into.from && asked && gl::exportsDmaBuf(&noInputHandle);
+    if (!a && into.from && !inputByHandle) {
+        if (!(a = readBack())) {
+            if (error) *error = d.label + ": the compositor's picture could not be read back for it";
+            giveBack(key, std::move(link));
+            return false;
+        }
+        std::lock_guard lock(gPicturesM);
+        gPictures.lastInput = "read back for its plug-in host: " + (asked ? "Montage shares no pictures from the GPU's memory: " + noInputHandle : viaMemory);
+    }
+    if (a) std::memcpy(link->at(0), a->px.data(), slot);
     if (sendPayload(c, *link->host, asked ? msg + std::string(1, '\0') + link->postName : msg, timeout, &r)) {
         const InputResolver& inputs = currentInputs();
         uint32_t flags = hd->flags & wire::kPayloadInBlob;
         if (fetch && *fetch) flags |= wire::kHasFetch;
         if (inputs) flags |= wire::kHasInputs;
         if (withMask) flags |= wire::kHasMask;
+        if (inputByHandle) flags |= wire::kInputHandle;
         if (asked) {
             flags |= wire::kWantsHandle;
             std::lock_guard lock(gPicturesM);
@@ -458,6 +543,34 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
             const int32_t what = int32_t(ch.h->resultI);
             const double at = ch.h->resultD;
             const std::string connection(wire::payload(ch.base()), size_t(std::min<uint64_t>(ch.h->payloadBytes, wire::kPayload)));
+            ch.h->resultFlags = 0;
+            if (what == wire::InputPicture) {
+                // The picture in, as a handle to the host's socket `connection` where it names one; else (or where
+                // it cannot be shared) read back into the arena's first slot, why said.
+                ch.h->status = 0;
+                if (!inputByHandle) return;
+                wire::PictureHandle ph{};
+                std::string why = connection.empty() ? "its plug-in host takes no picture from the GPU's memory" : std::string();
+                if (!connection.empty() && sendInput(into.from, w, h, connection, ph, why)) {
+                    std::memcpy(wire::payload(ch.base()), &ph, sizeof ph);
+                    ch.h->payloadBytes = sizeof ph;
+                    ch.h->resultFlags = wire::kPictureHandle;
+                    ch.h->argI = int64_t(QCoreApplication::applicationPid());
+                    ch.h->status = 1;
+                    std::lock_guard lock(gPicturesM);
+                    ++gPictures.inputHandles;
+                    gPictures.lastInput = "given to its plug-in host as a DMA-BUF";
+                    return;
+                }
+                const Image* in = readBack();
+                if (!in) return;
+                std::memcpy(link->at(0), in->px.data(), slot);
+                ch.h->argI = 0, ch.h->argI2 = w, ch.h->argI3 = h;
+                ch.h->status = 1;
+                std::lock_guard lock(gPicturesM);
+                gPictures.lastInput = "read back for its plug-in host: " + why;
+                return;
+            }
             Image pic;
             bool ok = false;
             if (what == wire::FetchFrame && fetch && *fetch) ok = (*fetch)(at, pic);
@@ -504,7 +617,7 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
                 gHandlesOff = why.empty() ? std::string("a handle could not be taken") : why;
             }
             // (by renderInHost, so a failure is told to the export once, by the render() that asked)
-            return renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
+            return renderInHost(kind, e, d, t, progress, scale, w, h, a ? a : readBack(), b, out, fetch, error, working);
         }
         if (asked) {
             viaMemory.assign(wire::payload(c.base()), size_t(std::min<uint64_t>(hd->payloadBytes, wire::kPayload)));
@@ -541,7 +654,7 @@ bool renderInHost(Kind kind, const Effect& e, const PluginDesc& d, double t, dou
         }
         if (logsPictures()) std::fprintf(stderr, "montage gpu: %s: pictures come through shared memory from now on\n", why.c_str());
         link.reset();
-        if (!hung) return renderInHost(kind, e, d, t, progress, scale, w, h, a, b, out, fetch, error, working);
+        if (!hung) return renderInHost(kind, e, d, t, progress, scale, w, h, a ? a : readBack(), b, out, fetch, error, working);
     }
     if (error) *error = d.label + " " + how;
     return false;
@@ -897,3 +1010,17 @@ void Controls::focus(bool gained, const Effect& e, double t, const View& v) {
 }
 
 }  // namespace montage::ofx::remote
+
+namespace montage::ofx {
+
+HostFailuresScope::HostFailuresScope() {
+    if (remote::tFailureScopes++ == 0) remote::tFailures = new std::map<std::string, std::string>;
+}
+HostFailuresScope::~HostFailuresScope() {
+    if (--remote::tFailureScopes == 0) {
+        delete remote::tFailures;
+        remote::tFailures = nullptr;
+    }
+}
+
+}  // namespace montage::ofx

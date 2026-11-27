@@ -105,8 +105,22 @@ bool readExrChannels(const std::string& file, int& width, int& height, std::vect
 
 std::vector<std::string> exrCompressions();  // the names writeExr takes
 std::string exrCompressionLabel(const std::string& name);
+// `attributes` named as OpenEXR's standard ones (ImfStandardAttributes.h) are written with their own types: floats for
+// nominalFocalLength, tStop, focus, shutterAngle, expTime, aperture, isoSpeed and the like (from "35", "2.8"...), an
+// int imageCounter, rationals framesPerSecond and captureRate ("24000/1001" or "25"), and timeCode as a time code
+// ("HH:MM:SS:FF", ';' before the frames when drop frame); one that does not parse is left out. Others are strings.
 bool writeExr(const std::string& file, int width, int height, const std::vector<ExrOutLayer>& layers, const std::string& compression,
               const std::map<std::string, std::string>& attributes = {}, std::string* error = nullptr);
+
+// A header attribute read back: OpenEXR's name for its type ("string", "float", "int", "rational", "timecode"...), its
+// value as text (a rational "24000/1001", a time code "01:00:00:00" with ';' before the frames when drop frame, a
+// number as printed) and, for numbers and rationals, as a number. Types Montage does not read have only their type.
+struct ExrAttribute {
+    std::string type, text;
+    double number = 0;
+};
+// The first part's header attributes, by name.
+bool readExrAttributes(const std::string& file, std::map<std::string, ExrAttribute>& out, std::string* error = nullptr);
 
 // ---- ACES image container (SMPTE ST 2065-4) -------------------------------------------------------------------------
 

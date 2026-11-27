@@ -46,16 +46,17 @@ EncodeFolderJobs::EncodeFolderJobs(QWidget* window, EditorState* state) : QObjec
     connect(jobs, &DialogJobs::taskDone, this, [this](const QString& id, const QString& kind, const QJsonObject& input, const QJsonObject& result) {
         if (kind != QLatin1String("encode-folder")) return;
         pending_.erase(id);
-        // (A job taken up again after a restart is known by what it was given.)
+        // (A job taken up again after a restart is known by what it was given: its folder, preset and output.)
         const QString file = input.value("file").toString();
-        if (EncodeFolderScan* scan = scanFor(input.value("folder").toString())) scan->markDone(QFileInfo(file).fileName(), result.value("output").toString());
+        const EncodeFolder folder{input.value("folder").toString(), input.value("preset").toString(), QFileInfo(input.value("output").toString()).absolutePath()};
+        if (EncodeFolderScan* scan = scanFor(folder)) scan->markDone(QFileInfo(file).fileName(), result.value("output").toString());
         emit encoded(file, result.value("output").toString());
     });
     connect(jobs, &DialogJobs::finished, this, [this](const QString& id, bool ok, const QString& text) {
         const auto it = pending_.find(id);
         if (ok || it == pending_.end()) return;
         if (EncodeFolderScan* scan = scanFor(it->second.folder)) scan->letGo(it->second.file);
-        emit failed(QDir(it->second.folder).filePath(it->second.file), text);
+        emit failed(QDir(it->second.folder.input).filePath(it->second.file), text);
         pending_.erase(it);
     });
     timer_ = new QTimer(this);
@@ -79,9 +80,10 @@ void EncodeFolderJobs::reloadFolders() {
     else timer_->start();
 }
 
-EncodeFolderScan* EncodeFolderJobs::scanFor(const QString& folder) const {
+EncodeFolderScan* EncodeFolderJobs::scanFor(const EncodeFolder& folder) const {
     for (const auto& s : scans_)
-        if (QDir(s->folder().input) == QDir(folder)) return s.get();
+        if (QDir(s->folder().input) == QDir(folder.input) && s->folder().preset == folder.preset && QDir(s->folder().output) == QDir(folder.output))
+            return s.get();
     return nullptr;
 }
 
@@ -95,23 +97,34 @@ int EncodeFolderJobs::scan() {
     for (const auto& s : scans_)
         for (const QString& name : s->ready(now)) {
             const QString path = QDir(s->folder().input).filePath(name);
-            // One already running for it (taken up again after a restart): left to finish, and known by its id.
+            // One already running for it (taken up again after a restart): left to finish, and known by its id. It is
+            // this folder's when it was given this file, preset and output folder (another folder may watch the same
+            // input with another preset).
             const QString title = titleFor(path);
-            const QString output = s->outputFor(name);
-            QString running;
-            for (const DialogJobs::TaskInfo& t : jobs->tasks())
-                if (t.kind == QLatin1String("encode-folder") && t.title == title) running = t.id;
+            QString running, output;
+            std::vector<QString> busy;
+            for (const DialogJobs::TaskInfo& t : jobs->tasks()) {
+                if (t.kind != QLatin1String("encode-folder")) continue;
+                const QJsonObject& given = t.input;
+                const QString out = given.value("output").toString();
+                if (QFileInfo(given.value("file").toString()) == QFileInfo(path) && given.value("preset").toString() == s->folder().preset &&
+                    QDir(QFileInfo(out).absolutePath()) == QDir(s->folder().output))
+                    running = t.id, output = out;
+                else
+                    busy.push_back(out);
+            }
             if (!running.isEmpty()) {
-                pending_[running] = {s->folder().input, name, output};
+                pending_[running] = {s->folder(), name, output};
                 continue;
             }
+            output = s->outputFor(name, busy);
             const QJsonObject input{{"file", path}, {"folder", s->folder().input}, {"preset", s->folder().preset}, {"output", output}};
             const QString id = jobs->startOn(Project(), state_, QStringLiteral("encode-folder"), title, input);
             if (id.isEmpty()) {
                 s->letGo(name);
                 continue;
             }
-            pending_[id] = {s->folder().input, name, output};
+            pending_[id] = {s->folder(), name, output};
             ++started_;
             ++began;
         }

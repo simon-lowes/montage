@@ -2548,6 +2548,35 @@ private slots:
             QCOMPARE(events[4].value, 6 << 7 | 1);
             QCOMPARE(events[5].value, 7 << 7 | 0);
             QVERIFY(!decoder.holding());
+            // Nightly 27 Nov: a controller that sends the fine half first, its order learnt wrongly from a lone coarse
+            // half and a lone fine half 1 ms apart (a pair alone, coarse half first). Its next pair, (7, 20) sent as
+            // fine 20 then coarse 7, gives (6, 20) at once, as for a coarse step that did not change, and then (7, 20)
+            // when the pause after it shows that the two halves were one pair, not (7, 0); the order is learnt anew
+            // from that pair, so the pair after it, (8, 30), comes once, whole, and nothing is left held.
+            decoder.reset();
+            events = timed({{{0xB1, 99, 3}, 0}, {{0xB1, 98, 4}, 100}, {{0xB1, 6, 6}, 200}, {{0xB1, 38, 10}, 1200},
+                            {{0xB1, 38, 20}, 20000}, {{0xB1, 6, 7}, 20500}, {{0xB1, 38, 30}, 40000}, {{0xB1, 6, 8}, 40500}});
+            QCOMPARE(events.size(), size_t(5));
+            QVERIFY(events[0].value == 6 && events[0].resolution == 128);
+            QCOMPARE(events[1].value, 6 << 7 | 10);
+            QCOMPARE(events[2].value, 6 << 7 | 20);
+            QCOMPARE(events[3].value, 7 << 7 | 20);
+            QCOMPARE(events[4].value, 8 << 7 | 30);
+            QVERIFY(rest().empty() && !decoder.holding());
+            // (the same pair with no time given, the caller's flush the pause after it: it ends on (7, 20) too)
+            decoder.reset();
+            events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 6, 6, 0xB1, 38, 10});
+            QCOMPARE(events.size(), size_t(2));
+            QVERIFY(rest().empty());
+            events = decode({0xB1, 38, 20, 0xB1, 6, 7});
+            QCOMPARE(events.size(), size_t(1));
+            QCOMPARE(events[0].value, 6 << 7 | 20);
+            events = rest();
+            QCOMPARE(events.size(), size_t(1));
+            QCOMPARE(events[0].value, 7 << 7 | 20);
+            events = decode({0xB1, 38, 30, 0xB1, 6, 8});
+            QVERIFY(events.size() == 1 && events[0].value == (8 << 7 | 30));
+            QVERIFY(rest().empty() && !decoder.holding());
             decoder = saved;
         }
         // A coarse half alone, from a parameter that sends fine halves: its fine half is 0 (MIDI 1.0).
@@ -3976,6 +4005,41 @@ private slots:
             QCOMPARE(again[i].captions.size(), streams[i].captions.size());
             for (size_t j = 0; j < again[i].captions.size(); ++j) QCOMPARE(again[i].captions[j].text, streams[i].captions[j].text);
         }
+    }
+
+    void cc708RowKeptToItsColumns() {
+        // Nightly 27 Nov: a 708 service that never ends its row (60,000 characters into a window of 32 columns, as a
+        // broken or hostile live feed might send). The row stops at the window's last column, as a viewer would see
+        // it, so each change to what is on screen stays small and the feed is read in one pass, not in a time that
+        // grows with the square of the row.
+        const Rational fps{30, 1};
+        std::vector<std::pair<double, CcTriplet>> triplets;
+        int sequence = 0;
+        auto packet = [&](double at, const std::vector<uint8_t>& svc) {
+            std::vector<uint8_t> pk{0, uint8_t((1 << 5) | svc.size())};
+            pk.insert(pk.end(), svc.begin(), svc.end());
+            if (pk.size() % 2) pk.push_back(0);
+            pk[0] = uint8_t(((sequence++ & 3) << 6) | (pk.size() / 2));
+            for (size_t i = 0; i < pk.size(); i += 2) triplets.push_back({at, {uint8_t(i ? 0xFE : 0xFF), pk[i], pk[i + 1]}});
+        };
+        // (a two-row window of 32 columns, shown at once; then 30 characters a packet, a packet a frame)
+        packet(0, {0x98, 0x38, 0x80 | 90, 50, (7 << 4) | 1, 31, 0x09});
+        std::string sent;
+        for (int f = 1; sent.size() < 60000; ++f) {
+            std::vector<uint8_t> svc;
+            for (int k = 0; k < 30; ++k) svc.push_back(uint8_t('a' + (sent.size() + svc.size()) % 26));
+            sent.append(svc.begin(), svc.end());
+            packet(f / 30.0, svc);
+        }
+        std::vector<Caption> out;
+        std::string error;
+        QElapsedTimer t;
+        t.start();
+        QVERIFY2(captionsFrom708(triplets, fps, out, &error, nullptr, 1, true), error.c_str());
+        qInfo("%zu characters read in %lld ms", sent.size(), (long long)t.elapsed());
+        QVERIFY(!out.empty());
+        QCOMPARE(out.back().text, sent.substr(0, 32));
+        for (const Caption& c : out) QVERIFY2(c.text.size() <= 32, c.text.c_str());
     }
 
     void teletextSubtitlePages() {
@@ -12742,6 +12806,100 @@ private slots:
         const Param& held = p.findSequence(r10.sequence)->videoTracks.at(1).clips.at(0).motion.params.at("scale");
         QVERIFY(std::fabs(held.at(19) - 100) < 1e-6);
         QVERIFY(std::fabs(held.at(20) - 150) < 1e-6);
+    }
+
+    // Nightly 27 Nov: FCPXML's split edits and long caption files. A clip whose sound runs on past its picture (an L
+    // cut, audioDuration) and one whose sound starts before it (a J cut, audioStart) import with their sound where it
+    // is heard; written out and read back, the sound stays there, and a trim of the sound is kept rather than the
+    // file's split values written back. Twenty thousand captions, given out of order, are read in order and trimmed
+    // to the next one's start, in time that grows with their number, not with its square.
+    void fcpxmlSplitEditsAndManyCaptions() {
+        auto t = [](int frames) { return QStringLiteral("%1/25s").arg(frames); };
+        auto fileWith = [&](int count) {
+            QString captions;
+            for (int i = count - 1; i >= 0; --i)
+                captions += QStringLiteral("<caption lane=\"1\" offset=\"%1\" duration=\"%2\" role=\"iTT?captionFormat=ITT.en\"><text>Line %3</text></caption>\n")
+                                .arg(t(i * 4), t(6))
+                                .arg(i);
+            const QString xml =
+                QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<fcpxml version=\"1.11\"><resources>"
+                               "<format id=\"r1\" name=\"FFVideoFormat1080p25\" frameDuration=\"1/25s\" width=\"1920\" height=\"1080\"/>"
+                               "<asset id=\"r2\" name=\"talk\" start=\"0s\" duration=\"120s\" hasVideo=\"1\" hasAudio=\"1\" format=\"r1\" audioSources=\"1\" "
+                               "audioChannels=\"2\" audioRate=\"48000\"><media-rep kind=\"original-media\" src=\"file:///nonexistent/talk.mov\"/></asset>"
+                               "</resources><library><event name=\"Tests\"><project name=\"Split\">"
+                               "<sequence format=\"r1\" duration=\"%1\" tcStart=\"0s\" tcFormat=\"NDF\" audioLayout=\"stereo\" audioRate=\"48k\"><spine>"
+                               "<asset-clip ref=\"r2\" offset=\"0s\" name=\"Leaves\" start=\"0s\" duration=\"10s\" audioDuration=\"12s\"/>"
+                               "<gap name=\"Gap\" offset=\"10s\" start=\"0s\" duration=\"5s\"/>"
+                               "<asset-clip ref=\"r2\" offset=\"15s\" name=\"Arrives\" start=\"20s\" duration=\"10s\" audioStart=\"18s\" audioDuration=\"12s\"/>"
+                               "<gap name=\"Gap\" offset=\"25s\" start=\"0s\" duration=\"%2\">%3</gap>"
+                               "</spine></sequence></project></event></library></fcpxml>")
+                    .arg(t(625 + count * 4 + 25), t(count * 4 + 25), captions);
+            return xml.toStdString();
+        };
+        // (read in time that grows with the captions, not with their square: ten times the captions take well under
+        // thirty times as long, where the square would take a hundred times)
+        const int count = 20000;
+        const std::string fewer = fileWith(count / 10), xml = fileWith(count);
+        Project few = makeDefaultProject();
+        QElapsedTimer took;
+        took.start();
+        QVERIFY(importXmlTimeline(few, fewer).ok);
+        const qint64 fewMs = took.elapsed();
+        Project p = makeDefaultProject();
+        took.restart();
+        ImportResult r = importXmlTimeline(p, xml);
+        const qint64 ms = took.elapsed();
+        QVERIFY2(r.ok, r.error.c_str());
+        Sequence* s = p.findSequence(r.sequence);
+        QVERIFY(s);
+        QVERIFY2(ms < 30 * fewMs + 500, qPrintable(QStringLiteral("%1 ms for %2 captions, %3 ms for %4").arg(ms).arg(count).arg(fewMs).arg(count / 10)));
+        // The captions: all of them, in order, each ending where the next starts.
+        QCOMPARE(s->captionTracks.size(), size_t(1));
+        const std::vector<Caption>& caps = s->captionTracks[0].captions;
+        QCOMPARE(int(caps.size()), count);
+        for (int i = 0; i < count; ++i) {
+            QCOMPARE(caps[size_t(i)].start, FrameTime(625 + i * 4));
+            QCOMPARE(caps[size_t(i)].end, FrameTime(625 + i * 4 + (i + 1 < count ? 4 : 6)));
+        }
+        QCOMPARE(caps.front().text, std::string("Line 0"));
+        // The sound where it is heard: the L cut's for two seconds after its picture, the J cut's from two before.
+        auto clipNamed = [](const Track& track, const std::string& name) -> const Clip* {
+            for (const Clip& c : track.clips)
+                if (c.name == name) return &c;
+            return nullptr;
+        };
+        auto check = [&](const Sequence& seq, FrameTime leavesSound) {
+            const Clip* lv = clipNamed(seq.videoTracks.at(0), "Leaves");
+            const Clip* av = clipNamed(seq.videoTracks.at(0), "Arrives");
+            // (read back, the sound may be a clip connected below the storyline's: on any audio track)
+            const Clip *la = nullptr, *aa = nullptr;
+            for (const Track& track : seq.audioTracks) {
+                if (!la) la = clipNamed(track, "Leaves");
+                if (!aa) aa = clipNamed(track, "Arrives");
+            }
+            if (!lv || !av || !la || !aa) return QStringLiteral("a clip is missing");
+            if (lv->start != 0 || lv->duration != 250) return QStringLiteral("the L cut's picture at %1 for %2").arg(lv->start).arg(lv->duration);
+            if (la->start != 0 || la->duration != leavesSound || std::fabs(la->sourceIn) > 1e-6)
+                return QStringLiteral("the L cut's sound at %1 for %2").arg(la->start).arg(la->duration);
+            if (av->start != 375 || av->duration != 250 || std::fabs(av->sourceIn - 500) > 1e-6)
+                return QStringLiteral("the J cut's picture at %1 for %2").arg(av->start).arg(av->duration);
+            if (aa->start != 325 || aa->duration != 300 || std::fabs(aa->sourceIn - 450) > 1e-6)
+                return QStringLiteral("the J cut's sound at %1 for %2 from %3").arg(aa->start).arg(aa->duration).arg(aa->sourceIn);
+            return QString();
+        };
+        QString why = check(*s, 300);
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // The L cut's sound trimmed by a second, then written out and read back: the trim kept, and no split values
+        // written back.
+        for (Clip& c : s->audioTracks.at(0).clips)
+            if (c.name == "Leaves") c.duration = 275;
+        const std::string out = exportFcpXml(p, *s);
+        QVERIFY(out.find("audioStart") == std::string::npos && out.find("audioDuration") == std::string::npos);
+        Project back = makeDefaultProject();
+        ImportResult again = importXmlTimeline(back, out);
+        QVERIFY2(again.ok, again.error.c_str());
+        why = check(*back.findSequence(again.sequence), 275);
+        QVERIFY2(why.isEmpty(), qPrintable(why));
     }
 
     void fcpxml115CarriedThrough() {

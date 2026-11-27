@@ -85,6 +85,13 @@ private:
     QSpinBox* quality_ = nullptr;
     QCheckBox* filmGrain_ = nullptr;  // AV1: each shot's grain carried as film grain parameters (render/Av1GrainExport.h)
     QComboBox* filmGrainProfile_ = nullptr;  // which grain: each shot's measured, or a profile saved by name
+    // Regions Coded Finer (render/CodingRegions.h; H.264, HEVC and VP9): faces, the clips' masks, a box, at a strength.
+    QCheckBox* regions_ = nullptr;
+    QCheckBox* regionFaces_ = nullptr;
+    QCheckBox* regionMasks_ = nullptr;
+    QCheckBox* regionBox_ = nullptr;
+    QDoubleSpinBox* regionBoxEdges_[4] = {};  // left, top, width, height: percent of the frame
+    QSpinBox* regionStrength_ = nullptr;      // percent
     // A stated HRD (H.264, H.265): none, a constant or a variable rate, with the buffer's rate and size (render/HrdCheck.h).
     QComboBox* hrd_ = nullptr;
     QSpinBox* hrdRate_ = nullptr;    // kbit/s
@@ -100,7 +107,7 @@ private:
     QComboBox* pngCompression_ = nullptr;  // PNG frames: how hard the compressor works (always lossless)
     QComboBox* pngBits_ = nullptr;         // and 8 or 16 bits a channel
     QComboBox* jxlQuality_ = nullptr;      // JPEG XL frames: lossless or a distance
-    QComboBox* jpegXsRate_ = nullptr;      // JPEG XS: bits a pixel (0: the preset's)
+    QComboBox* jpegXsRate_ = nullptr;      // JPEG XS: bits a pixel (0: the preset's; -1: lossless)
     QComboBox* jxlDepth_ = nullptr;        // and their depth (the preset's, 8 or 16-bit, half or float)
     QCheckBox* jxlPremultiplied_ = nullptr;  // and alpha written premultiplied
     QCheckBox* smart_ = nullptr;
@@ -145,6 +152,7 @@ private:
     QCheckBox* credentials_ = nullptr;
     QPushButton* credentialIdentity_ = nullptr;
     QCheckBox* aiTraining_ = nullptr;
+    QCheckBox* redactCredentials_ = nullptr;
     void chooseSigningIdentity();
     void showSigningIdentity();
     QPushButton* queueButton_ = nullptr;

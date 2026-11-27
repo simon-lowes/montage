@@ -134,6 +134,7 @@ extern "C" {
 #include "render/LutExport.h"
 #include "render/Crosstalk.h"
 #include "render/GrainMatch.h"
+#include "render/Av1GrainExport.h"
 #include "render/LutToGrade.h"
 #include "media/LtcTimecode.h"
 #include "media/TextReader.h"
@@ -155,6 +156,8 @@ extern "C" {
 #include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
+#include "PreferencesDialog.h"
+#include "core/Preferences.h"
 #include "CaptureDialog.h"
 #include "Multiviewer.h"
 #include "media/Capture.h"
@@ -316,7 +319,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     // The agent link comes back on if it was on when Montage last closed.
     connect(liveLink_, &LiveLink::applied, this, [this](const QString& label) { statusBar()->showMessage(label, 5000); });
-    if (appSettings().value(QStringLiteral("agentLink/enabled"), false).toBool()) setAgentLink(true);
+    if (prefs::toggle(QStringLiteral("agentLink/enabled"))) setAgentLink(true);
 
     syncTimer_.setSingleShot(true);
     syncTimer_.setInterval(0);
@@ -677,11 +680,11 @@ void MainWindow::buildPanels() {
         surface_->setCommand(QString::fromLatin1(name), [this, name] {
             if (QAction* a = findChild<QAction*>(QString::fromLatin1(name))) a->trigger();
         });
-    osc_->setFeedbackPort(quint16(appSettings().value(QStringLiteral("osc/feedbackPort"), 0).toInt()));
-    osc_->setToolsAllowed(appSettings().value(QStringLiteral("osc/tools"), false).toBool());
-    if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool()) {
+    osc_->setFeedbackPort(quint16(prefs::whole(QStringLiteral("osc/feedbackPort"))));
+    osc_->setToolsAllowed(prefs::toggle(QStringLiteral("osc/tools")));
+    if (prefs::toggle(QStringLiteral("osc/enabled"))) {
         QString err;
-        if (!osc_->start(quint16(appSettings().value(QStringLiteral("osc/port"), 9100).toInt()), appSettings().value(QStringLiteral("osc/network"), false).toBool(), &err))
+        if (!osc_->start(quint16(prefs::whole(QStringLiteral("osc/port"))), prefs::toggle(QStringLiteral("osc/network")), &err))
             QTimer::singleShot(0, this, [this, err] { state_->message(tr("OSC: %1").arg(err), 8000); });  // (once the window is up)
     }
     surface_->setProtocol(appSettings().value(QStringLiteral("controlSurface/protocol")).toString() == QLatin1String("hui")
@@ -1385,6 +1388,7 @@ void MainWindow::applyHdrViewer() {
         m->setHdrViewer(on);
         if (hdrWired_) continue;
         // Asked for and not possible here (an SDR display, no GPU device): said once, in the status bar.
+        connect(m->viewer(), &ViewerWidget::hdrChanged, this, &MainWindow::updateHdrShownAs);
         connect(m->viewer(), &ViewerWidget::hdrChanged, this, [this, m] {
             if (hdrMessageShown_ || !m->viewer()->hdrViewer() || m->viewer()->hdrStatus().isEmpty()) return;
             hdrMessageShown_ = true;
@@ -1392,6 +1396,19 @@ void MainWindow::applyHdrViewer() {
         });
     }
     hdrWired_ = true;
+    updateHdrShownAs();
+}
+
+void MainWindow::updateHdrShownAs() {
+    QAction* shownAs = findChild<QAction*>(QStringLiteral("hdrShownAs"));
+    if (!shownAs) return;
+    // The monitor showing HDR (the Program monitor first), else what the Program monitor says.
+    QString text;
+    for (MonitorPanel* m : {programPanel_, sourcePanel_})
+        if (m && text.isEmpty() && m->viewer()->hdrShowing()) text = m->viewer()->hdrShownAs();
+    if (text.isEmpty() && programPanel_) text = programPanel_->viewer()->hdrShownAs();
+    shownAs->setText(text);
+    shownAs->setVisible(!text.isEmpty());
 }
 
 void MainWindow::buildMenus() {
@@ -1723,6 +1740,10 @@ void MainWindow::buildMenus() {
         add(editM, QT_TR_NOOP("MIDI &Map…"), QKeySequence(), [this] { midiLearn_->openDialog(this); })
             ->setObjectName(QStringLiteral("midiMap"));
     }
+    editM->addSeparator();
+    QAction* preferences = add(editM, QT_TR_NOOP("Pre&ferences…"), QKeySequence::Preferences, [this] { PreferencesDialog::open(this); });
+    preferences->setObjectName(QStringLiteral("preferences"));
+    preferences->setMenuRole(QAction::PreferencesRole);  // (the application menu's on macOS)
 
     // ---- Clip
     QMenu* clipM = menuIn(menuBar(), QT_TR_NOOP("&Clip"));
@@ -1780,6 +1801,7 @@ void MainWindow::buildMenus() {
         rebuildLutAsGrade(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("lutToGrade"));
     add(clipM, QT_TR_NOOP("Measure &Grain"), QKeySequence(), [this] { measureGrainAsPreset(); })->setObjectName(QStringLiteral("measureGrain"));
+    add(clipM, QT_TR_NOOP("Save Grain Profile…"), QKeySequence(), [this] { saveGrainProfile(); })->setObjectName(QStringLiteral("saveGrainProfile"));
     add(clipM, QT_TR_NOOP("Import CDL…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import CDL"), QString(), tr("ASC CDL (*.cdl *.cc *.ccc);;All files (*)"));
         if (!path.isEmpty()) importCdl(path);
@@ -2286,10 +2308,10 @@ void MainWindow::buildMenus() {
     }
     {
         // Premiere's "insert and overwrite sequences as nests or individual clips".
-        state_->setSequencesAsClips(appSettings().value("editing/sequencesAsClips", false).toBool());
+        state_->setSequencesAsClips(prefs::toggle(QStringLiteral("editing/sequencesAsClips")));
         QAction* a = add(clipM, QT_TR_NOOP("Insert Sequences as Clips"), QKeySequence(), [this](bool on) {
             state_->setSequencesAsClips(on);
-            appSettings().setValue("editing/sequencesAsClips", on);
+            prefs::set(QStringLiteral("editing/sequencesAsClips"), on);
         });
         a->setObjectName(QStringLiteral("sequencesAsClips"));
         a->setCheckable(true);
@@ -2754,13 +2776,12 @@ void MainWindow::buildMenus() {
     // ---- Playback
     QMenu* play = menuIn(menuBar(), QT_TR_NOOP("&Playback"));
     {
-        // Hardware decoding (on by default; MONTAGE_HWACCEL=off overrides the saved choice).
-        const bool hw = qEnvironmentVariable("MONTAGE_HWACCEL") != "off" &&
-                        appSettings().value("playback/hardwareDecoding", true).toBool();
+        // Hardware decoding (on by default; MONTAGE_HWACCEL=off overrides the saved choice: Preferences, Playback).
+        const bool hw = prefs::toggle(QStringLiteral("playback/hardwareDecoding"));
         setHwDecodeMode(hw ? HwDecodeMode::Auto : HwDecodeMode::Off);
         QAction* a = add(play, QT_TR_NOOP("&Hardware Decoding"), QKeySequence(), [this](bool on) {
             setHwDecodeMode(on ? HwDecodeMode::Auto : HwDecodeMode::Off);
-            appSettings().setValue("playback/hardwareDecoding", on);
+            prefs::set(QStringLiteral("playback/hardwareDecoding"), on);
             MediaPool::instance().clear();  // reopen decoders with the new setting
             syncProgram();
             program_->seek(state_->playhead());
@@ -2778,10 +2799,10 @@ void MainWindow::buildMenus() {
         // launch that ended while the GPU was being set up or drawing its first frame (a driver crash takes Montage with
         // it) leaves it off the next time.
         std::string why;
-        bool wantGpu = appSettings().value("playback/gpuRendering", true).toBool();
+        bool wantGpu = prefs::toggle(QStringLiteral("playback/gpuRendering"));
         if (wantGpu && appSettings().value("playback/gpuStarting", false).toBool()) {
             wantGpu = false;
-            appSettings().setValue("playback/gpuRendering", false);
+            prefs::set(QStringLiteral("playback/gpuRendering"), false);
             appSettings().remove("playback/gpuStarting");
             why = tr("turned off because Montage closed while starting it last time; turn it on again in the Playback menu").toStdString();
             QTimer::singleShot(0, this, [this, why] {
@@ -2810,13 +2831,29 @@ void MainWindow::buildMenus() {
             }
             describe({});
             program_->setGpuRendering(on);
-            appSettings().setValue("playback/gpuRendering", on);
+            prefs::set(QStringLiteral("playback/gpuRendering"), on);
             statusBar()->showMessage(on ? tr("GPU rendering on (%1): layers, transforms and colour effects draw on the GPU")
                                               .arg(QString::fromStdString(gpu::deviceName()))
                                         : tr("GPU rendering off: frames render on the CPU"),
                                      5000);
         });
         play->addSeparator();
+    }
+    {
+        // Grain as Decoded: what an AV1 export carrying the grain as parameters shows once decoded (turned off by an
+        // edit, as it shows the sequence as it was).
+        QAction* grain = add(play, QT_TR_NOOP("Grain as Decoded"), QKeySequence(), [this](bool on) { showGrainAsDecoded(on); });
+        grain->setObjectName(QStringLiteral("grainAsDecoded"));
+        grain->setCheckable(true);
+        grain->setToolTip(tr("The Program monitor shows each shot cleaned of its grain with the grain put back from AV1 film grain "
+                             "parameters, as a player's decoder puts it back (paused frames at full resolution)"));
+        for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched})
+            connect(state_, sig, this, [this] {
+                if (program_->grainAsDecoded()) {
+                    showGrainAsDecoded(false);
+                    state_->message(tr("Grain as Decoded is off: the sequence changed"), 5000);
+                }
+            });
     }
     trimView_ = add(play, QT_TR_NOOP("Two-Up Trim View"), QKeySequence(), [](bool on) { appSettings().setValue("playback/twoUpTrim", on); });
     trimView_->setObjectName(QStringLiteral("twoUpTrim"));
@@ -2856,17 +2893,22 @@ void MainWindow::buildMenus() {
         });
     // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
     hdrViewer_ = add(play, QT_TR_NOOP("HDR Viewer"), QKeySequence(), [this](bool on) {
-        appSettings().setValue("playback/hdrViewer", on);
+        prefs::set(QStringLiteral("playback/hdrViewer"), on);
         hdrMessageShown_ = false;
         applyHdrViewer();
     });
     hdrViewer_->setObjectName(QStringLiteral("hdrViewer"));
     hdrViewer_->setCheckable(true);
     hdrViewer_->setEnabled(hdrViewerBuilt());
-    hdrViewer_->setChecked(hdrViewerBuilt() && appSettings().value("playback/hdrViewer", true).toBool());
+    hdrViewer_->setChecked(hdrViewerBuilt() && prefs::toggle(QStringLiteral("playback/hdrViewer")));
     hdrViewer_->setToolTip(hdrViewerBuilt() ? tr("Show HDR sequences as HDR on an HDR display (macOS EDR, Windows with HDR switched on) "
                                                  "instead of tone mapped to SDR")
                                             : tr("This build has no HDR viewer (it needs Qt 6.7 or later)"));
+    // (under it, while it is on: what the monitors show HDR pictures as, from the HDR surface's description)
+    QAction* shownAs = play->addAction(QString());
+    shownAs->setObjectName(QStringLiteral("hdrShownAs"));
+    shownAs->setEnabled(false);
+    shownAs->setVisible(false);
     // Video output: the Program picture alone, full screen here or on another display.
     QAction* fullScreen = add(play, QT_TR_NOOP("Full Screen Program"), QKeySequence("Ctrl+Shift+F"), [this] {
         if (cleanFeed_ && cleanFeed_->isVisible()) hideCleanFeed();
@@ -3245,7 +3287,7 @@ void MainWindow::buildMenus() {
         // Provider libraries beside the program or in Montage's data folder are registered first.
         initInference();  // (the provider libraries, and the choice saved here, as the command line takes them too)
         InferenceMode saved = InferenceMode::Auto;
-        parseInferenceMode(appSettings().value(QStringLiteral("ai/inference"), "auto").toString().toStdString(), saved);
+        parseInferenceMode(prefs::text(QStringLiteral("ai/inference")).toStdString(), saved);
         QMenu* runOn = menuIn(toolsM, QT_TR_NOOP("AI Models Run On"));
         runOn->setObjectName(QStringLiteral("aiRunOn"));
         auto* modes = new QActionGroup(this);
@@ -3258,7 +3300,7 @@ void MainWindow::buildMenus() {
             const InferenceMode m = mode;
             QAction* a = runOn->addAction(label, this, [this, m] {
                 setInferenceMode(m);
-                appSettings().setValue(QStringLiteral("ai/inference"), QString::fromLatin1(inferenceModeName(m)));
+                prefs::set(QStringLiteral("ai/inference"), QString::fromLatin1(inferenceModeName(m)));
                 statusBar()->showMessage(tr("AI models opened from now on run %1").arg(m == InferenceMode::Cpu ? tr("on the processor")
                                                                                           : m == InferenceMode::Efficient ? tr("on an NPU when there is one")
                                                                                                                           : tr("on the GPU when there is one")),
@@ -4470,6 +4512,11 @@ void MainWindow::vfxPullDialog() {
     handles->setValue(appSettings().value("vfx/handles", 8).toInt());
     handles->setSuffix(tr(" frames"));
     form->addRow(tr("Handles:"), handles);
+    auto* scaleHandles = new QCheckBox(tr("Scale the handles by each shot's speed"), &dlg);
+    scaleHandles->setObjectName(QStringLiteral("vfxScaleHandles"));
+    scaleHandles->setToolTip(tr("A shot at 400 % with 8 handles pulls 32 source frames either side"));
+    scaleHandles->setChecked(appSettings().value("vfx/scaleHandles", false).toBool());
+    form->addRow(scaleHandles);
     auto* cutIn = new QSpinBox(&dlg);
     cutIn->setRange(0, 100000);
     cutIn->setValue(1001);
@@ -4491,17 +4538,30 @@ void MainWindow::vfxPullDialog() {
     auto* mattes = new QCheckBox(tr("Add the clips' masks as mattes"), &dlg);
     mattes->setObjectName(QStringLiteral("vfxMattes"));
     mattes->setChecked(appSettings().value("vfx/mattes", false).toBool());
+    auto* clipNegative = new QCheckBox(tr("Clip values below 0"), &dlg);
+    clipNegative->setObjectName(QStringLiteral("vfxClipNegative"));
+    clipNegative->setChecked(appSettings().value("vfx/clipNegative", false).toBool());
+    auto* clipOver = new QCheckBox(tr("Clip values over 1"), &dlg);
+    clipOver->setObjectName(QStringLiteral("vfxClipOver"));
+    clipOver->setChecked(appSettings().value("vfx/clipOver", false).toBool());
     if (exrAvailable()) {
         for (const std::string& c : exrCompressions()) compression->addItem(QString::fromStdString(exrCompressionLabel(c)), QString::fromStdString(c));
         compression->setCurrentIndex(std::max(0, compression->findData(appSettings().value("vfx/compression", "zip").toString())));
         form->addRow(tr("OpenEXR compression:"), compression);
         form->addRow(sourceLayers);
         form->addRow(mattes);
+        auto* clipping = new QHBoxLayout;
+        clipping->addWidget(clipNegative);
+        clipping->addWidget(clipOver);
+        clipping->addStretch();
+        form->addRow(clipping);
         auto update = [=] {
             const bool exr = format->currentData().toString() == QLatin1String("exr");
             compression->setEnabled(exr);
             sourceLayers->setEnabled(exr);
             mattes->setEnabled(exr);
+            clipNegative->setEnabled(exr);
+            clipOver->setEnabled(exr);
         };
         connect(format, &QComboBox::currentIndexChanged, &dlg, update);
         update();
@@ -4509,6 +4569,8 @@ void MainWindow::vfxPullDialog() {
         compression->hide();
         sourceLayers->hide();
         mattes->hide();
+        clipNegative->hide();
+        clipOver->hide();
     }
     // The shots' names, and a compositing script each writing its first version where the returns are looked for.
     auto* names = new QLineEdit(&dlg);
@@ -4543,7 +4605,13 @@ void MainWindow::vfxPullDialog() {
         if (o.compression == "zip") o.compression.clear();  // (FFmpeg's writer, unless layers are wanted)
         o.sourceLayers = sourceLayers->isChecked();
         o.mattes = mattes->isChecked();
+        appSettings().setValue("vfx/clipNegative", clipNegative->isChecked());
+        appSettings().setValue("vfx/clipOver", clipOver->isChecked());
+        o.clipNegative = clipNegative->isChecked();
+        o.clipOver = clipOver->isChecked();
     }
+    o.scaleHandles = scaleHandles->isChecked();
+    appSettings().setValue("vfx/scaleHandles", o.scaleHandles);
     o.folder = folder.toStdString();
     o.format = format->currentData().toString().toStdString();
     o.handles = handles->value();
@@ -4564,6 +4632,7 @@ void MainWindow::vfxPullDialog() {
                               {"colorSpace", QString::fromStdString(o.colorSpace)}, {"amf", o.amf}, {"fdl", o.fdl},
                               {"compression", QString::fromStdString(o.compression)}, {"sourceLayers", o.sourceLayers}, {"mattes", o.mattes},
                               {"stMaps", o.stMaps}, {"namePattern", QString::fromStdString(o.namePattern)}, {"scripts", o.scripts},
+                              {"scaleHandles", o.scaleHandles}, {"clipNegative", o.clipNegative}, {"clipOver", o.clipOver},
                               {"returns", QString::fromStdString(o.returns)}, {"returnsPattern", QString::fromStdString(o.returnsPattern)}};
     const TaskOutcome r = dialogJobs_->run(state_, QStringLiteral("vfx-pull"), tr("Pulling shots..."),
                                            QJsonObject{{"sequence", QString::number(s->id)}, {"clips", ids}, {"options", options}}, this);
@@ -5894,7 +5963,7 @@ bool MainWindow::setAgentLink(bool on) {
     const bool ok = on ? liveLink_->start(0, &err) : (liveLink_->stop(), true);
     if (!ok) statusBar()->showMessage(tr("The agent link could not start: %1").arg(err), 8000);
     const bool running = liveLink_->running();
-    appSettings().setValue(QStringLiteral("agentLink/enabled"), running);
+    prefs::set(QStringLiteral("agentLink/enabled"), running);
     if (agentLinkAction_) agentLinkAction_->setChecked(running);
     if (ok && on) statusBar()->showMessage(tr("AI agents can now edit this project (montage-cli mcp --live, or %1)").arg(liveLink_->url()), 8000);
     return ok;
@@ -6396,25 +6465,119 @@ bool MainWindow::rebuildLutAsGrade(const QString& residualPath, Id lutEffect) {
     return true;
 }
 
-QString MainWindow::measureGrainAsPreset() {
+bool MainWindow::measureCommandClipGrain(GrainProfile& profile, std::string& clipName) {
     const Clip* c = clipForCommand();
     const Sequence* seq = state_->sequence();
     if (!c || !seq || c->isGenerator()) {
         state_->message(tr("Select a clip of footage under the playhead to measure its grain"), 5000);
-        return {};
+        return false;
     }
     const Project project = state_->project();
     const Sequence copy = *seq;
     const Clip clip = *c;
+    clipName = clip.name;
+    return runWithProgress(this, state_, tr("Measuring the grain of %1…").arg(QString::fromStdString(clip.name)),
+                           [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
+                               const WorkingSpaceScope scope(&sequenceColorSpace(copy));
+                               return measureClipGrain(project, copy, clip, {}, profile, error, progress, cancel);
+                           });
+}
+
+bool MainWindow::saveGrainProfile(QString name, int where) {
+    if (!clipForCommand() || clipForCommand()->isGenerator()) {
+        state_->message(tr("Select a clip of footage under the playhead to measure its grain"), 5000);
+        return false;
+    }
+    if (name.isEmpty() || where < 0) {
+        // Asked for: the name, and where it is kept.
+        QDialog dlg(this);
+        dlg.setWindowTitle(tr("Save Grain Profile"));
+        auto* form = new QFormLayout(&dlg);
+        auto* nameEdit = new QLineEdit(tr("Grain of %1").arg(QString::fromStdString(clipForCommand()->name)), &dlg);
+        nameEdit->setObjectName(QStringLiteral("grainProfileName"));
+        auto* whereBox = new QComboBox(&dlg);
+        whereBox->setObjectName(QStringLiteral("grainProfileWhere"));
+        whereBox->addItem(tr("This project"), 0);
+        whereBox->addItem(tr("This project and my library"), 1);
+        whereBox->setCurrentIndex(1);
+        form->addRow(tr("Name:"), nameEdit);
+        form->addRow(tr("Keep in:"), whereBox);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dlg);
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        form->addRow(buttons);
+        if (dlg.exec() != QDialog::Accepted) return false;
+        name = nameEdit->text().trimmed();
+        where = whereBox->currentData().toInt();
+    }
+    const std::string key = name.toStdString();
+    if (std::string why; !checkGrainProfileName(key, &why)) {
+        state_->message(QString::fromStdString(why), 5000);
+        return false;
+    }
     GrainProfile profile;
-    if (!runWithProgress(this, state_, tr("Measuring the grain of %1…").arg(QString::fromStdString(clip.name)),
-                         [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
-                             const WorkingSpaceScope scope(&sequenceColorSpace(copy));
-                             return measureClipGrain(project, copy, clip, {}, profile, error, progress, cancel);
-                         }))
-        return {};
+    std::string clipName;
+    if (!measureCommandClipGrain(profile, clipName)) return false;
+    // Kept as montage_grain's save_as keeps it: in the library too when asked, and in the project (one undo step).
+    if (where == 1)
+        if (std::string why; !saveUserGrainProfile(key, profile, &why)) {
+            state_->message(tr("Could not save the profile: %1").arg(QString::fromStdString(why)));
+            return false;
+        }
+    const std::string text = grainProfileText(profile);
+    if (!state_->apply(tr("Save Grain Profile"), [&](Project& p, Sequence&) {
+            p.grainProfiles[key] = text;
+            return edit::Result{};
+        }))
+        return false;
+    state_->message(where == 1 ? tr("Saved the grain of %1 as the profile %2, in this project and your library")
+                                     .arg(QString::fromStdString(clipName), name)
+                               : tr("Saved the grain of %1 as the profile %2 in this project").arg(QString::fromStdString(clipName), name),
+                    10000);
+    return true;
+}
+
+bool MainWindow::showGrainAsDecoded(bool on, const std::string& filmGrain) {
+    QAction* action = findChild<QAction*>(QStringLiteral("grainAsDecoded"));
+    auto checked = [&](bool v) {
+        if (!action) return;
+        const QSignalBlocker quiet(action);
+        action->setChecked(v);
+    };
+    if (!on) {
+        program_->setGrainAsDecoded(nullptr);
+        checked(false);
+        return true;
+    }
+    const Sequence* seq = state_->sequence();
+    if (!seq || seq->duration() <= 0) {
+        checked(false);
+        state_->message(tr("Grain as Decoded needs a sequence with something in it"), 5000);
+        return false;
+    }
+    const Project project = state_->project();
+    const Sequence copy = *seq;
+    auto grain = std::make_shared<GrainAsDecoded>();
+    if (!runWithProgress(this, state_, tr("Measuring each shot's grain…"), [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
+            const WorkingSpaceScope scope(&sequenceColorSpace(copy));
+            return grain->prepare(project, copy, filmGrain, cancel, error, progress);
+        })) {
+        checked(false);
+        return false;
+    }
+    const auto withGrain = std::count_if(grain->shots().begin(), grain->shots().end(), [](const Av1GrainShot& sh) { return sh.grain.apply; });
+    program_->setGrainAsDecoded(grain);
+    checked(true);
+    state_->message(tr("Grain as Decoded: %1 of %2 shots carry grain as parameters").arg(withGrain).arg(grain->shots().size()), 8000);
+    return true;
+}
+
+QString MainWindow::measureGrainAsPreset() {
+    GrainProfile profile;
+    std::string clipName;
+    if (!measureCommandClipGrain(profile, clipName)) return {};
     EffectPreset preset;
-    preset.name = tr("Grain of %1").arg(QString::fromStdString(clip.name)).toStdString();
+    preset.name = tr("Grain of %1").arg(QString::fromStdString(clipName)).toStdString();
     preset.video = true;
     Effect e = makeEffect("grain_match", 0);
     e.strings["profile"] = grainProfileText(profile);
@@ -6428,7 +6591,7 @@ QString MainWindow::measureGrainAsPreset() {
     }
     effects_->reload();
     state_->message(tr("Measured the grain of %1 (about %2 px, colours alike by %3): saved as the preset %4 in the Effects panel's Presets")
-                        .arg(QString::fromStdString(clip.name), QString::number(grainSize(profile), 'f', 1),
+                        .arg(QString::fromStdString(clipName), QString::number(grainSize(profile), 'f', 1),
                              QString::number((profile.correlation[0] + profile.correlation[1] + profile.correlation[2]) / 3, 'f', 2),
                              QString::fromStdString(preset.name)),
                     10000);
@@ -6471,8 +6634,24 @@ bool MainWindow::runProjectManager(const ConsolidateOptions& o) {
     if (!ok) return false;
     QString text = tr("Copied the project to %1: %n file(s) copied", nullptr, res.copied).arg(QString::fromStdString(res.projectPath));
     if (res.trimmed) text += tr(", %n consolidated", nullptr, res.trimmed);
+    if (res.framesCopied) text += tr(" (%n frame(s) copied without coding again)", nullptr, res.framesCopied);
+    if (res.baked) text += tr(", %n clip(s) baked", nullptr, res.baked);
+    if (!res.leftOut.empty()) text += tr(", %n clip(s) nothing shows left out", nullptr, int(res.leftOut.size()));
     if (!res.missing.empty()) text += tr(", %n missing", nullptr, int(res.missing.size()));
     statusBar()->showMessage(text, 10000);
+    // The clips left out, each with why, where someone can read them through.
+    if (!res.leftOut.empty() && isVisible()) {
+        QStringList lines;
+        for (const std::string& l : res.leftOut) lines << QString::fromStdString(l);
+        auto* box = new QMessageBox(QMessageBox::Information, tr("Project Manager"),
+                                    tr("%n clip(s) nothing shows were left out of the new project.", nullptr, int(res.leftOut.size())),
+                                    QMessageBox::Ok, this);
+        box->setDetailedText(lines.join(QLatin1Char('\n')));
+        box->setAttribute(Qt::WA_DeleteOnClose);
+        box->setObjectName(QStringLiteral("projectManagerLeftOut"));
+        box->setModal(false);
+        box->show();
+    }
     return true;
 }
 
@@ -9628,7 +9807,7 @@ QDialog* MainWindow::controlSurfaceDialog() {
     auto* oscPort = new QSpinBox(oscBox);
     oscPort->setObjectName(QStringLiteral("oscPort"));
     oscPort->setRange(1024, 65535);
-    oscPort->setValue(appSettings().value(QStringLiteral("osc/port"), 9100).toInt());
+    oscPort->setValue(prefs::whole(QStringLiteral("osc/port")));
     auto* oscFeedback = new QSpinBox(oscBox);
     oscFeedback->setObjectName(QStringLiteral("oscFeedbackPort"));
     oscFeedback->setRange(0, 65535);
@@ -9637,7 +9816,7 @@ QDialog* MainWindow::controlSurfaceDialog() {
     oscFeedback->setToolTip(tr("Playing, timecode, loop and tools' answers are sent to this port on the computer the messages come from"));
     auto* oscNetwork = new QCheckBox(tr("Accept messages from other computers"), oscBox);
     oscNetwork->setObjectName(QStringLiteral("oscNetwork"));
-    oscNetwork->setChecked(appSettings().value(QStringLiteral("osc/network"), false).toBool());
+    oscNetwork->setChecked(prefs::toggle(QStringLiteral("osc/network")));
     oscNetwork->setToolTip(tr("Otherwise only this computer can send. Anyone on the network could then play, edit with menu "
                               "commands and, if allowed, run agent tools"));
     auto* oscTools = new QCheckBox(tr("Allow agent tools (/montage/tool/...)"), oscBox);
@@ -9663,8 +9842,8 @@ QDialog* MainWindow::controlSurfaceDialog() {
     };
     showOsc();
     auto applyOsc = [this, oscOn, oscPort, oscNetwork, oscStatus, oscFeedback, showOsc] {
-        appSettings().setValue(QStringLiteral("osc/port"), oscPort->value());
-        appSettings().setValue(QStringLiteral("osc/network"), oscNetwork->isChecked());
+        prefs::set(QStringLiteral("osc/port"), oscPort->value());
+        prefs::set(QStringLiteral("osc/network"), oscNetwork->isChecked());
         QString err;
         if (oscOn->isChecked() && oscFeedback->value() == oscPort->value()) err = tr("The feedback port must differ from the port listened on.");
         if (!oscOn->isChecked()) osc_->stop();
@@ -9675,7 +9854,7 @@ QDialog* MainWindow::controlSurfaceDialog() {
             oscOn->setChecked(false);
             osc_->stop();
         }
-        appSettings().setValue(QStringLiteral("osc/enabled"), oscOn->isChecked());
+        prefs::set(QStringLiteral("osc/enabled"), oscOn->isChecked());
         showOsc();
         if (!err.isEmpty()) oscStatus->setText(err);
     };
@@ -9689,12 +9868,12 @@ QDialog* MainWindow::controlSurfaceDialog() {
     connect(oscFeedback, &QSpinBox::valueChanged, dlg, [this, oscPort, oscStatus, showOsc](int port) {
         if (port != 0 && port == oscPort->value()) return oscStatus->setText(tr("The feedback port must differ from the port listened on."));
         osc_->setFeedbackPort(quint16(port));
-        appSettings().setValue(QStringLiteral("osc/feedbackPort"), port);
+        prefs::set(QStringLiteral("osc/feedbackPort"), port);
         showOsc();
     });
     connect(oscTools, &QCheckBox::toggled, dlg, [this](bool on) {
         osc_->setToolsAllowed(on);
-        appSettings().setValue(QStringLiteral("osc/tools"), on);
+        prefs::set(QStringLiteral("osc/tools"), on);
     });
     connect(oscAddresses, &QPushButton::clicked, dlg, [this, dlg] {
         // Every address, to copy into Companion's buttons.

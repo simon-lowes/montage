@@ -3,8 +3,12 @@
 // mono 24-bit WAV files, one per channel of each source, written to a
 // "<name> Media" folder beside it. Clip positions and source offsets carry
 // over exactly, crossfades become AAF transitions (with their handles),
-// fades the clips' fade properties, and clip gain and its keyframes
-// "Audio Gain" operations. Clips that change speed or play backwards, and
+// fades the clips' fade properties, clip gain and its keyframes "Audio Gain" operations, a mono clip's pan
+// and its keyframes "Audio Pan" operations, and each track's volume and pan (its fader and automation lanes) the same
+// operations over the track's sequence. Keys are held (AAF's constant interpolation) or linear between points; a
+// curve AAF cannot hold (smooth, Bezier, the easings, and gain, which AAF interpolates in amplitude, between keys far
+// apart in level) gets points between its keys, close enough that it plays as it did. A speed ramp on a video clip is
+// Motion Control with a varying speed ratio. Sound clips that change speed or play backwards, and
 // nested sequences, are rendered to their own files first. The video tracks
 // come too, linked to the original picture files where they are (a master
 // clip and file mob each, with a CDCI descriptor and the file's URL): source
@@ -41,6 +45,9 @@ struct AafAvidMedia {
 struct AafExportOptions {
     bool picture = true;  // the video tracks too, linked to the original files
     AafAvidMedia avid;
+    // The tracks' volume automation (and faders) folded into each clip's gain, for applications that read only clip
+    // gain; left off, each track's volume and pan are written over its sequence.
+    bool bakeAutomation = false;
 };
 
 struct AafExportResult {
@@ -50,6 +57,8 @@ struct AafExportResult {
     int videoTracks = 0;
     int videoClips = 0;
     int videoTransitions = 0;  // dissolves
+    int curves = 0;            // lanes with curves AAF cannot hold, written as points along them
+    int trackLanes = 0;        // track volume and pan written over tracks' sequences
     std::vector<std::string> mediaFiles;
     std::string mediaFolder;  // with Avid media: the numbered folder it went to
     std::vector<std::string> warnings;

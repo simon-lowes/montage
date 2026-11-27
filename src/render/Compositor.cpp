@@ -814,9 +814,13 @@ struct ClipSource {
     // Or, when asked to leave it (`deferFrame`), a Shape layer's paints for the GPU to draw (render/ShapeRaster) ...
     std::shared_ptr<const ShapeRaster> shapes;
     std::shared_ptr<const gpu::SplatLayer> splats;  // ... or a splat clip's capture, worked out for the GPU to sort and blend ...
-    // ... or the decoded frame and the space it is in: nothing ran on it yet.
+    // ... or the decoded frame and the space it is in: nothing ran on it yet but its source stage, if it has one: Film
+    // Negative and Faded Colour Restore, their settings measured from the frame on the CPU, drawn by the GPU (the
+    // uniforms of gpucolor.frag's 27, in the picture's own curve) and the same on the CPU (for a model's view).
     Frame16Ptr frame;
     const ColorSpace* frameSpace = nullptr;
+    std::shared_ptr<const std::vector<float>> sourceUniforms;
+    std::function<void(Image&)> sourceStage;
     // The frame's adaptive HDR metadata (render/AdaptiveHdr.h) when it changes how the frame enters the sequence.
     const AdaptiveHdr* adaptive = nullptr;
     const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
@@ -1207,6 +1211,51 @@ Title3DPictures title3dPictures(const Project& p, const Sequence& seq, const Cli
 namespace {
 
 // False when the clip has no picture.
+// Faded Colour Restore's levels: the frame's own (`here`, through the clip's Film Negative if any) with those of the
+// shot's frames either side, measured small, as clipSource restores the print by them (and the GPU's source stage).
+FadeLevels shotFadeLevels(const Sequence& seq, const Clip& c, const MediaItem* m, const std::string& path, const Effect* fade,
+                          const Effect* negative, FrameTime lt, double sec, int w, int h, Transfer ownCurve, const FadeLevels& here) {
+    std::vector<FadeLevels> levels = {here};
+    const int r = std::clamp(int(std::lround(fade->p("frames", lt, 12))), 0, 24);
+    if (m->kind == MediaKind::Video && m->fps.valid() && r > 0) {
+        const double mf = m->fps.toDouble(), sf = seq.fpsValue();
+        const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
+        // (Within the clip: a reel scanned as one file and cut into shots keeps each shot's own levels.)
+        const double a0 = c.sourceFrameAt(c.start) / sf * mf, a1 = c.sourceFrameAt(c.start + std::max<FrameTime>(0, c.duration - 1)) / sf * mf;
+        const int64_t first = int64_t(std::floor(std::min(a0, a1) + 1e-6)), last = int64_t(std::floor(std::max(a0, a1) + 1e-6));
+        // Measured small (the levels need no more), as the frame is made: through the negative, if any.
+        const int sw = std::min(w, 480), sh = std::max(1, int(std::lround(double(h) * sw / std::max(1, w))));
+        std::ostringstream id;
+        id.imbue(std::locale::classic());
+        id << path << '@' << sw << 'x' << sh << "#fade";
+        if (negative)
+            for (const char* k : {"scan", "base_from", "base_r", "base_g", "base_b", "gamma", "exposure"}) id << ':' << negative->p(k, lt);
+        const std::string key = id.str();
+        for (int k = -r; k <= r; ++k) {
+            const int64_t i = base + k;
+            if (k == 0 || i < first || i > last) continue;
+            TileStats st;
+            if (!cachedTileStats(key + '#' + std::to_string(i), st, [&](TileStats& made) {
+                    const double at = (double(i) + 0.25) / mf;
+                    if (at < 0 || at >= m->duration) return false;
+                    Frame16Ptr nf = MediaPool::instance().videoFrame(path, at, sw, sh, false);
+                    if (!nf) return false;
+                    Image f = toImage(*nf);
+                    if (negative) applyFilmNegative(*negative, lt, f, ownCurve);
+                    const FadeLevels l = fadeLevels(f);
+                    for (int c3 = 0; c3 < 3; ++c3) made.mean.insert(made.mean.end(), {l.lo[c3], l.mid[c3], l.hi[c3]});
+                    return true;
+                }) ||
+                st.mean.size() != 9)
+                continue;
+            FadeLevels f;
+            for (int c3 = 0; c3 < 3; ++c3) f.lo[c3] = st.mean[size_t(c3) * 3], f.mid[c3] = st.mean[size_t(c3) * 3 + 1], f.hi[c3] = st.mean[size_t(c3) * 3 + 2];
+            levels.push_back(f);
+        }
+    }
+    return meanFadeLevels(levels);
+}
+
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
                 bool deferFrame, ClipSource& out) {
     // (for OpenFX plugins whose further inputs are connected: the pictures there, made on demand)
@@ -1422,7 +1471,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
                 leave = !fetchesFrames && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
                         !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
-                        !enabledEffect(seq, c, "fade_restore") && !enabledEffect(seq, c, "film_negative") && !enabledEffect(seq, c, "perf_lock") &&
+                        !enabledEffect(seq, c, "perf_lock") && (gpuTransfer(pictureColorSpace(*m, path)) >= 0 || (!enabledEffect(seq, c, "fade_restore") && !enabledEffect(seq, c, "film_negative"))) &&
                         !enabledEffect(seq, c, "frame_repair") && !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") &&
                         !enabledEffect(seq, c, "lip_sync") && !upscale && !vr && !sourceStageLooks(c, lt, pictureColorSpace(*m, path), *m);
             }
@@ -1467,6 +1516,34 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (leave && !f->half) {  // (half floats: the CPU keeps them)
                 out.frame = f;
                 out.frameSpace = &pictureColorSpace(*m, path);
+                // The source stage: Film Negative, its base found in the frame, then Faded Colour Restore by the levels
+                // of the frame through it and of the shot's frames around it, as below; for the GPU as the settings it
+                // runs them by, in the frame's own curve (one the GPU has: else the CPU makes the source). (Measured on
+                // the frame's pixels as the CPU has them, and on fadeLevels' samples of them alone.)
+                const Effect* negative = enabledEffect(seq, c, "film_negative");
+                const Effect* fade = enabledEffect(seq, c, "fade_restore");
+                if (negative || fade) {
+                    const Transfer ownCurve = out.frameSpace->transfer;
+                    Image picture;
+                    if (fade || filmBaseFound(*negative, lt)) picture = toImage(*f);
+                    std::optional<NegativeSettings> ns;
+                    if (negative) ns = filmNegativeSettings(*negative, lt, picture, ownCurve);
+                    FadeLevels levels;
+                    const double strength = fade ? fade->p("strength", lt, 100) / 100 : 0;
+                    if (fade) {
+                        Image samples = fadeSamples(picture);
+                        if (ns) invertNegative(samples, *ns, ownCurve);
+                        levels = shotFadeLevels(seq, c, m, path, fade, negative, lt, sec, w, h, ownCurve, fadeLevels(samples));
+                    }
+                    auto stage = [ns, fade = fade != nullptr, levels, strength, ownCurve](Image& img) {
+                        if (ns) invertNegative(img, *ns, ownCurve);
+                        if (fade) restoreFade(img, levels, strength);
+                    };
+                    auto q = std::make_shared<std::vector<float>>(64, 0.0f);
+                    sourceStageUniforms(ns ? &*ns : nullptr, fade ? &levels : nullptr, strength, gpuTransfer(*out.frameSpace), q->data());
+                    out.sourceUniforms = std::move(q);
+                    out.sourceStage = stage;
+                }
                 return true;
             }
             src = toImage(*f);
@@ -1643,17 +1720,19 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     const double here = c.sourceAt(local);
                     from = (c.sourceAt(local - open / 2) - here) * perSeq, to = (c.sourceAt(local + open / 2) - here) * perSeq;
                     if (from > to) std::swap(from, to);  // (played backwards)
+                    // (A path past kMotionBlurSpan source frames either side is cut to it.)
+                    if (!std::isfinite(from) || !std::isfinite(to)) from = to = 0;
+                    from = std::clamp(from, -kMotionBlurSpan, kMotionBlurSpan), to = std::clamp(to, -kMotionBlurSpan, kMotionBlurSpan);
                 }
                 const double at = follow && between ? std::clamp(sec * mf - double(base), 0.0, 1.0) : 0.0;
                 if (open > 0 && to - from > 1e-9) {
                     const Image self = decoded.empty() ? src : decoded;
-                    // The frames it runs over: as far as the shutter reaches, at least one either side.
-                    const int k0 = std::min(-1, int(std::floor(at + from))), k1 = std::max(1, int(std::ceil(at + to)));
+                    // The frames it runs over: as far as the shutter reaches, at least one either side, and no more
+                    // than kMotionBlurReach (past them the path carries the last step on).
+                    const std::vector<int> offsets = motionBlurOffsets(at, from, to);
+                    const int k0 = offsets.front();
                     std::map<int64_t, Image> frames;
                     std::map<int64_t, bool> have;
-                    std::vector<int> offsets;
-                    for (int k = k0; k <= k1; ++k)
-                        if (k != 0) offsets.push_back(k);
                     const std::vector<MotionFn> motion = chainedMotion(key, base, offsets, [&](int64_t i) -> const Image* {
                         if (i == base) return &self;
                         auto h = have.find(i);
@@ -1701,47 +1780,9 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             const Effect* negative = enabledEffect(seq, c, "film_negative");
             const Transfer ownCurve = pictureColorSpace(*m, path).transfer;
             if (negative) applyFilmNegative(*negative, lt, src, ownCurve);
-            if (const Effect* fade = enabledEffect(seq, c, "fade_restore")) {
-                std::vector<FadeLevels> levels = {fadeLevels(src)};
-                const int r = std::clamp(int(std::lround(fade->p("frames", lt, 12))), 0, 24);
-                if (m->kind == MediaKind::Video && m->fps.valid() && r > 0) {
-                    const double mf = m->fps.toDouble(), sf = seq.fpsValue();
-                    const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
-                    // (Within the clip: a reel scanned as one file and cut into shots keeps each shot's own levels.)
-                    const double a0 = c.sourceFrameAt(c.start) / sf * mf, a1 = c.sourceFrameAt(c.start + std::max<FrameTime>(0, c.duration - 1)) / sf * mf;
-                    const int64_t first = int64_t(std::floor(std::min(a0, a1) + 1e-6)), last = int64_t(std::floor(std::max(a0, a1) + 1e-6));
-                    // Measured small (the levels need no more), as the frame is made: through the negative, if any.
-                    const int sw = std::min(w, 480), sh = std::max(1, int(std::lround(double(h) * sw / std::max(1, w))));
-                    std::ostringstream id;
-                    id.imbue(std::locale::classic());
-                    id << path << '@' << sw << 'x' << sh << "#fade";
-                    if (negative)
-                        for (const char* k : {"scan", "base_from", "base_r", "base_g", "base_b", "gamma", "exposure"}) id << ':' << negative->p(k, lt);
-                    const std::string key = id.str();
-                    for (int k = -r; k <= r; ++k) {
-                        const int64_t i = base + k;
-                        if (k == 0 || i < first || i > last) continue;
-                        TileStats st;
-                        if (!cachedTileStats(key + '#' + std::to_string(i), st, [&](TileStats& made) {
-                                const double at = (double(i) + 0.25) / mf;
-                                if (at < 0 || at >= m->duration) return false;
-                                Frame16Ptr nf = MediaPool::instance().videoFrame(path, at, sw, sh, false);
-                                if (!nf) return false;
-                                Image f = toImage(*nf);
-                                if (negative) applyFilmNegative(*negative, lt, f, ownCurve);
-                                const FadeLevels l = fadeLevels(f);
-                                for (int c3 = 0; c3 < 3; ++c3) made.mean.insert(made.mean.end(), {l.lo[c3], l.mid[c3], l.hi[c3]});
-                                return true;
-                            }) ||
-                            st.mean.size() != 9)
-                            continue;
-                        FadeLevels f;
-                        for (int c3 = 0; c3 < 3; ++c3) f.lo[c3] = st.mean[size_t(c3) * 3], f.mid[c3] = st.mean[size_t(c3) * 3 + 1], f.hi[c3] = st.mean[size_t(c3) * 3 + 2];
-                        levels.push_back(f);
-                    }
-                }
-                restoreFade(src, meanFadeLevels(levels), fade->p("strength", lt, 100) / 100);
-            }
+            if (const Effect* fade = enabledEffect(seq, c, "fade_restore"))
+                restoreFade(src, shotFadeLevels(seq, c, m, path, fade, negative, lt, sec, w, h, ownCurve, fadeLevels(src)),
+                            fade->p("strength", lt, 100) / 100);
             if (upscale) {
                 Image big;
                 src = cachedSuperScale(src, outW, outH, ss->p("strength", lt, 100) / 100, big) ? std::move(big)
@@ -1810,6 +1851,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     Image& src = cs.src;
     if (cs.frame) {  // (left as decoded)
         src = toImage(*cs.frame);
+        if (cs.sourceStage) cs.sourceStage(src);
         cs.displayReferred = inputTransform(src, *cs.frameSpace, cs.adaptive, seq);
         cs.frame.reset();
     }
@@ -2610,7 +2652,8 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         std::vector<float> depth;
         Geometry g;
         if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
-        Image layer = renderTitle3DInScene(p, seq, c, t, W, H, double(W) / seq.width, &depth);
+        const Title3DPictures pictures = title3dPictures(p, seq, c, t, o, W, H);
+        Image layer = renderTitle3DInScene(p, seq, c, t, W, H, double(W) / seq.width, &depth, &pictures);
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         // (into Rec.709 as a model's picture is, straight then premultiplied again, then into the working space)
         parallelRows(layer.height, [&](int y0, int y1) {
@@ -3219,11 +3262,15 @@ bool runOnSource(const Effect& e) {
            e.type == "stereo_3d" || e.type == "dirt_removal" || e.type == "dust_spots" || e.type == "lip_sync";
 }
 
+// Film Negative and Faded Colour Restore: run at the source, before the input transform (clipSource: on the CPU's
+// picture, or as the GPU's source stage), so the effect chain leaves them alone on either path.
+bool ranAtSourceStage(const Effect& e) { return e.type == "film_negative" || e.type == "fade_restore"; }
+
 // Why a clip's effects keep it on the CPU: the first the GPU has no form for, by name.
 std::string cpuEffectReason(const Clip& c, FrameTime lt) {
     for (const Effect& e : c.effects) {
         std::vector<gpu::ColorOp> ops;
-        if (e.enabled && !runOnSource(e) && !gpuColorOps(e, lt, ops, 0, 0, 1)) {
+        if (e.enabled && !runOnSource(e) && !ranAtSourceStage(e) && !gpuColorOps(e, lt, ops, 0, 0, 1)) {
             // (an OpenFX effect by its plug-in's name)
             if (ofx::PluginDesc d; e.type == "ofx" && ofx::Registry::instance().lookUp(e, d) && !d.label.empty()) return "its effect " + d.label;
             const EffectInfo* info = findEffectInfo(e.type);
@@ -3249,7 +3296,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     const FrameTime lt = t - c.start;
     {
         std::vector<gpu::ColorOp> unused;
-        if (!gpuChainOps(seq, c, lt, [](const Effect& e) { return runOnSource(e) || e.type == "aces_gamut_compress"; }, unused, 0, 0, 1))
+        if (!gpuChainOps(seq, c, lt, [](const Effect& e) { return runOnSource(e) || ranAtSourceStage(e) || e.type == "aces_gamut_compress"; }, unused, 0, 0, 1))
             return cpu(cpuEffectReason(c, lt));
     }
     const int SW = seq.width, SH = seq.height;
@@ -3270,6 +3317,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         if (modelPicture.empty()) {
             if (cs.frame) {
                 modelPicture = toImage(*cs.frame);
+                if (cs.sourceStage) cs.sourceStage(modelPicture);
                 inputTransform(modelPicture, *cs.frameSpace, cs.adaptive, seq);
             } else {
                 modelPicture = cs.src;
@@ -3327,6 +3375,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         w = W, h = H;
     } else if (cs.frame) {
         out.frame = cs.frame;
+        out.sourceUniforms = cs.sourceUniforms;
         out.input = cs.adaptive ? adaptiveConversionLut(*cs.frameSpace, *cs.adaptive, sequenceColorSpace(seq), seq.hdrPeakNits)
                                 : conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
         w = cs.frame->width, h = cs.frame->height;
@@ -3344,7 +3393,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     // drawn at the picture's size, as finishClipLayer's effects see it, at the time the source was made for.
     const double pixelScale = effectPixelScale(c, cs.lt, cs.g.sx, cs.mw, w);
     auto ranAlready = [&](const Effect& e) {
-        return runOnSource(e) || &e == cs.sourceCdl || &e == cs.sourceRgc ||
+        return runOnSource(e) || ranAtSourceStage(e) || &e == cs.sourceCdl || &e == cs.sourceRgc ||
                std::find(cs.sourceLooks.begin(), cs.sourceLooks.end(), &e) != cs.sourceLooks.end();
     };
     // (An OpenFX plug-in drawn there takes the clip's other frames as clipLayer gives them.)
@@ -3721,6 +3770,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
 
 QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
     ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
+    ofx::HostFailuresScope failures;  // (a plug-in that failed on the GPU's try is not rendered again on the CPU)
     QImage q;
     if (o.gpu && o.depth == 0 && gpuProgramFrame(p, seq, t, o, nullptr, &q)) return q;
     RenderOptions cpu = o;
@@ -3733,6 +3783,7 @@ QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime 
 
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
     ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
+    ofx::HostFailuresScope failures;  // (a plug-in that failed on the GPU's try is not rendered again on the CPU)
     if (o.gpu && o.depth == 0) {
         Image img;
         if (gpuProgramFrame(p, seq, t, o, &img, nullptr)) return img;
@@ -5701,6 +5752,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
 }
 
 void setModelStandInsForTesting(ModelStandIns standIns) { gStandIns = std::move(standIns); }
+std::shared_ptr<const std::vector<FaceBox>> facesInPicture(const Image& shown) { return facesIn(shown); }
 
 uint64_t transformLayerDraws() { return gTransformDraws.load(); }
 

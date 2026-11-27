@@ -9,6 +9,7 @@
 #include <algorithm>
 
 #include "ScriptHost.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -438,7 +439,7 @@ QString usablePython(const QString& exe) {
 QString pythonInterpreter() {
     static const QString found = [] {
         // (One named is the one used: not another behind the user's back when it is not usable.)
-        const QString env = qEnvironmentVariable("MONTAGE_PYTHON");
+        const QString env = prefs::text(QStringLiteral("programs/python"));
         if (!env.isEmpty()) return usablePython(QFileInfo(env).isAbsolute() ? env : QStandardPaths::findExecutable(env));
         QStringList names{QStringLiteral("python3"), QStringLiteral("python")};
 #ifdef Q_OS_WIN

@@ -11,6 +11,7 @@
 
 #include "media/HwAccel.h"
 #include "media/HwVulkan.h"
+#include "core/Preferences.h"
 
 #if QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>) && defined(MONTAGE_HW_VULKAN)
 #define MONTAGE_GPU_HW_VULKAN 1
@@ -64,7 +65,7 @@ QSize planeSize(const YcbcrPlanes& yc, int i, int w, int h) {
     return i ? QSize((w + (1 << yc.log2ChromaW) - 1) >> yc.log2ChromaW, (h + (1 << yc.log2ChromaH) - 1) >> yc.log2ChromaH) : QSize(w, h);
 }
 
-bool shareWanted() { return qgetenv("MONTAGE_GPU_SHARE").toLower() != "off"; }
+bool shareWanted() { return prefs::toggle(QStringLiteral("playback/gpuShare")); }
 
 #ifdef MONTAGE_GPU_HW_VULKAN
 bool hasExtension(const AVVulkanDeviceContext* vk, const char* name) {

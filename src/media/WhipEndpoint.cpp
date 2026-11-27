@@ -312,6 +312,7 @@ using output::PassphraseGate;
 
 constexpr qsizetype kMaxHeader = 16 * 1024, kMaxBody = 256 * 1024;
 constexpr int kMaxConnections = 32, kMaxFromOneAddress = 8;
+constexpr int kRequestWaitMs = 5000;  // how long a connection may take to send its request
 constexpr size_t kHeldBytes = size_t(16) << 20;     // pictures kept before the feed begins (from the last keyframe)
 constexpr size_t kQueuedBytes = size_t(64) << 20;   // packets waiting to be read: past this, pictures are dropped
 constexpr double kReportsWait = 3.0;                // seconds the sender's reports are waited for before arrival lines the sound up
@@ -488,6 +489,14 @@ struct Feed {
     std::deque<std::vector<uint8_t>> out;
     size_t outBytes = 0;
     int64_t packets = 0, lost = 0, dropped = 0;
+    // (the most each holds, for status())
+    size_t mostOut = 0, mostHeld = 0, mostHeldSound = 0, mostTiming = 0;
+    void noteMost() {
+        mostOut = std::max(mostOut, outBytes);
+        mostHeld = std::max(mostHeld, video.heldBytes);
+        mostHeldSound = std::max(mostHeldSound, audio.held.size());
+        mostTiming = std::max(mostTiming, video.origins.size() + audio.origins.size() + audio.came.size() + gaps.size());
+    }
     std::atomic<int> keyframesAsked{0};
     double askedAt = 0;
     // The pictures' RTP times as handed on: moved to stay beside the sound by the sender's reports.
@@ -717,22 +726,31 @@ struct Feed {
         const double now = secondsNow();
         bool ask = false;
         ++packets;
+        const int64_t ts = s.unwrap(r.ts);
         if (s.numbered) {
             const int16_t step = int16_t(r.seq - s.lastSeq);
-            // (a jump of more than a few seconds' packets is the sender starting its numbers afresh, not a loss)
-            if (step > 1 && step <= 3000) {
-                lost += step - 1;
-                ask = isVideo;
+            // A jump of a few seconds' packets is a loss. A longer one is a loss too where the RTP time moved on with
+            // it by more than a second under the same SSRC (a stall: Wi-Fi gone for seconds), and otherwise the
+            // sender starting its numbers afresh. Either way the pictures after it need a keyframe: a browser sends
+            // none unasked.
+            const bool jumped = step > 3000 || step < -3000;
+            const bool stalled = jumped && s.seen && r.ssrc == s.ssrc && ts - s.lastExt > int64_t(s.clock);
+            if ((step > 1 && step <= 3000) || stalled) {
+                lost += (stalled ? int64_t(uint16_t(r.seq - s.lastSeq)) : int64_t(step)) - 1;
                 if (isVideo && holding && !started) heldLost = true;
             }
-            if (step > 0 || step < -3000) s.lastSeq = r.seq;
+            if ((step > 1 || jumped) && isVideo) ask = true;
+            if (step > 0 || jumped) s.lastSeq = r.seq;
         } else {
             s.numbered = true;
             s.lastSeq = r.seq;
         }
-        const int64_t ts = s.unwrap(r.ts);
         trace("packet %c ts %lld bytes %zu came %.6f", isVideo ? 'V' : 'A', (long long)ts, n, now);
-        if (!isVideo) note(s.came, now, now - double(ts) / s.clock, 0.2);
+        if (!isVideo) {
+            note(s.came, now, now - double(ts) / s.clock, 0.2);
+            // (only the last kTimingKept seconds' are looked at: a sender that never reports does not grow the list)
+            while (s.came.size() > 1 && s.came.front().first < now - kTimingKept) s.came.pop_front();
+        }
         if (!s.seen || ts > s.lastExt) s.lastExt = ts, s.lastTs = r.ts;
         s.seen = true;
         s.ssrc = r.ssrc;
@@ -776,6 +794,7 @@ struct Feed {
             }
             tryStart(now);
         }
+        noteMost();
         // (a keyframe is asked for once a second at most)
         if (ask && now - askedAt < 1.0) ask = false;
         if (ask) askedAt = now, ++keyframesAsked;
@@ -813,6 +832,7 @@ struct Feed {
                             }
                         placePictures();
                         if (!started) tryStart(now);
+                        noteMost();
                     }
                 }
             }
@@ -930,13 +950,36 @@ struct Endpoint::Impl {
 
     void accept(HttpServer& server, qintptr fd) {
         auto* c = new QSslSocket(&server);
-        // (32 connections at most, and 8 from any one address, so one sender cannot hold every slot)
-        bool full = !c->setSocketDescriptor(fd) || server.findChildren<QSslSocket*>().size() > kMaxConnections;
+        // (32 connections at most, and 8 from any one address, so one sender cannot hold every slot; an IPv6 address
+        // counted by its /64, which a sender can move about in)
+        bool full = !c->setSocketDescriptor(fd);
         if (!full) {
-            int same = 0;
+            // The others still connected, by where they come from, oldest first.
+            std::map<QString, std::vector<QSslSocket*>> from;
+            int others = 0;
             for (QSslSocket* o : server.findChildren<QSslSocket*>())
-                if (o != c && o->peerAddress().isEqual(c->peerAddress(), QHostAddress::TolerantConversion)) ++same;
+                if (o != c && o->state() != QAbstractSocket::UnconnectedState) {
+                    from[guesser(o->peerAddress())].push_back(o);
+                    ++others;
+                }
+            const auto mine = from.find(guesser(c->peerAddress()));
+            const int same = mine == from.end() ? 0 : int(mine->second.size());
             full = same >= kMaxFromOneAddress;
+            // Every slot held (nightly 27 Nov: four senders' silent connections kept every other sender out for as
+            // long as they waited): the oldest connection that has sent no request yet, from where most of them come
+            // from, gives its place up to one from where fewer do. (Not to one from where as many come from, less
+            // one: a sender cannot take another's last slot, or its own back.)
+            if (!full && others >= kMaxConnections) {
+                full = true;
+                const auto most = std::max_element(from.begin(), from.end(), [](const auto& x, const auto& y) { return x.second.size() < y.second.size(); });
+                if (most != from.end() && int(most->second.size()) > same + 1)
+                    for (QSslSocket* o : most->second)
+                        if (!o->property("answered").toBool()) {
+                            o->abort();
+                            full = false;
+                            break;
+                        }
+            }
         }
         if (full) {
             if (c->socketDescriptor() == -1) {
@@ -954,12 +997,14 @@ struct Endpoint::Impl {
         QObject::connect(c, &QAbstractSocket::disconnected, c, &QObject::deleteLater);
         QObject::connect(c, &QAbstractSocket::readyRead, c, [this, c] { read(c); });
         QObject::connect(c, &QAbstractSocket::errorOccurred, c, [c] { c->abort(); });
+        // (a slot is held 5 s for a request, and over HTTPS 5 s for the handshake before that: what sends nothing, or
+        // no token, gives its place up soon)
         auto* idle = new QTimer(c);
         idle->setSingleShot(true);
         QObject::connect(idle, &QTimer::timeout, c, [c] { c->abort(); });
-        idle->start(https ? 5000 : 20000);
+        idle->start(kRequestWaitMs);
         if (https) {
-            QObject::connect(c, &QSslSocket::encrypted, idle, [idle] { idle->start(20000); });
+            QObject::connect(c, &QSslSocket::encrypted, idle, [idle] { idle->start(kRequestWaitMs); });
             QSslConfiguration conf = QSslConfiguration::defaultConfiguration();
             conf.setLocalCertificate(certificate);
             conf.setPrivateKey(key);
@@ -1543,6 +1588,11 @@ Status Endpoint::status() const {
         st.lost = feed->lost;
         st.dropped = feed->dropped;
         st.keyframesAsked = feed->keyframesAsked;
+        st.queuedBytes = int64_t(feed->outBytes);
+        st.mostQueuedBytes = int64_t(feed->mostOut);
+        st.mostHeldBytes = int64_t(feed->mostHeld);
+        st.mostHeldSound = int(feed->mostHeldSound);
+        st.mostTimingKept = int(feed->mostTiming);
     }
     return st;
 }

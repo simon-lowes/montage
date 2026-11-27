@@ -1,5 +1,6 @@
 // Montage — export dialog.
 #include "ExportDialog.h"
+#include "FittedScroll.h"
 #include "Language.h"
 #include "Settings.h"
 
@@ -32,6 +33,7 @@
 
 #include "EditorState.h"
 #include "render/Av1GrainExport.h"
+#include "render/CodingRegions.h"
 #include "RenderQueue.h"
 #include "core/AudioDescription.h"
 #include "core/Surround.h"
@@ -461,6 +463,64 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     grainRow->addWidget(filmGrainProfile_, 1);
     form->addRow(QString(), grainRow);
     connect(filmGrain_, &QCheckBox::toggled, this, [this] { updateControls(); });
+    {
+        // Regions coded finer: faces found in the picture, the clips' masks as they are tracked, and a box, given more
+        // of the bits (the encoder's regions of interest), as remembered from the last export.
+        regions_ = new QCheckBox(tr("Code regions finer"), form_);
+        regions_->setObjectName(QStringLiteral("exportRegions"));
+        regions_->setToolTip(tr("Parts of the picture given more of the bits than the rest, each frame's passed to the encoder: "
+                                "H.264, HEVC and VP9 (VP9 then codes in its real-time mode)"));
+        regionFaces_ = new QCheckBox(tr("Faces"), form_);
+        regionFaces_->setObjectName(QStringLiteral("exportRegionFaces"));
+        regionFaces_->setToolTip(tr("Each face found in the picture, a little larger than the face"));
+        regionMasks_ = new QCheckBox(tr("Clip masks"), form_);
+        regionMasks_->setObjectName(QStringLiteral("exportRegionMasks"));
+        regionMasks_->setToolTip(tr("The bounds of every clip's effect masks, as their keys and trackers move them"));
+        regionBox_ = new QCheckBox(tr("Box"), form_);
+        regionBox_->setObjectName(QStringLiteral("exportRegionBox"));
+        regionBox_->setToolTip(tr("A rectangle of the frame: its left, top, width and height in percent of the frame"));
+        regionStrength_ = new QSpinBox(form_);
+        regionStrength_->setObjectName(QStringLiteral("exportRegionStrength"));
+        regionStrength_->setRange(5, 100);
+        regionStrength_->setSuffix(QStringLiteral(" %"));
+        regionStrength_->setToolTip(tr("How much finer than the rest: at 100 %, a fifth of the encoder's quantiser range"));
+        const char* edgeNames[4] = {"exportRegionLeft", "exportRegionTop", "exportRegionWidth", "exportRegionHeight"};
+        for (int i = 0; i < 4; ++i) {
+            regionBoxEdges_[i] = new QDoubleSpinBox(form_);
+            regionBoxEdges_[i]->setObjectName(QLatin1String(edgeNames[i]));
+            regionBoxEdges_[i]->setRange(i < 2 ? 0 : 1, 100);
+            regionBoxEdges_[i]->setDecimals(1);
+            regionBoxEdges_[i]->setSuffix(QStringLiteral(" %"));
+        }
+        std::vector<CodingRegion> was;
+        codingRegionsFromJson(appSettings().value("export/regions").toString().toStdString(), was);
+        double strength = 0.5;
+        CodingRegion box;
+        box.w = box.h = 0.5, box.x = box.y = 0.25;
+        for (const CodingRegion& r : was) {
+            strength = r.strength;
+            if (r.kind == "faces") regionFaces_->setChecked(true);
+            if (r.kind == "mask") regionMasks_->setChecked(true);
+            if (r.kind == "box") regionBox_->setChecked(true), box = r;
+        }
+        regionStrength_->setValue(int(std::lround(strength * 100)));
+        const double edges[4] = {box.x, box.y, box.w, box.h};
+        for (int i = 0; i < 4; ++i) regionBoxEdges_[i]->setValue(edges[i] * 100);
+        regions_->setChecked(appSettings().value("export/regionsOn", false).toBool());
+        auto* row = new QHBoxLayout;
+        row->addWidget(regions_);
+        row->addWidget(regionStrength_);
+        row->addWidget(regionFaces_);
+        row->addWidget(regionMasks_);
+        row->addStretch(1);
+        form->addRow(QString(), row);
+        auto* boxRow = new QHBoxLayout;
+        boxRow->addWidget(regionBox_);
+        for (QDoubleSpinBox* e : regionBoxEdges_) boxRow->addWidget(e);
+        boxRow->addStretch(1);
+        form->addRow(QString(), boxRow);
+        for (QCheckBox* b : {regions_, regionFaces_, regionMasks_, regionBox_}) connect(b, &QCheckBox::toggled, this, [this] { updateControls(); });
+    }
     adaptiveHdr_ = new QCheckBox(tr("Adaptive HDR metadata (ST 2094-50, any display's headroom)"), form_);
     adaptiveHdr_->setObjectName(QStringLiteral("exportAdaptiveHdr"));
     adaptiveHdr_->setToolTip(tr("Each scene's reference white, headroom and the gain curve to its SDR rendition (the sequence's SDR trim, "
@@ -526,8 +586,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     jpegXsRate_->setObjectName(QStringLiteral("exportJpegXsRate"));
     jpegXsRate_->addItem(tr("The preset's"), 0.0);
     for (double bpp : {2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0}) jpegXsRate_->addItem(tr("%1 bits a pixel").arg(bpp), bpp);
+    // (each picture exactly as it was, as many bytes as it takes)
+    jpegXsRate_->addItem(tr("Lossless"), -1.0);
     jpegXsRate_->setCurrentIndex(std::max(0, jpegXsRate_->findData(appSettings().value("export/jpegXsBpp", 0.0).toDouble())));
-    jpegXsRate_->setToolTip(tr("JPEG XS's rate: each picture the same number of bytes, its width times its height times this, over 8"));
+    jpegXsRate_->setToolTip(tr("JPEG XS's rate: each picture the same number of bytes, its width times its height times this, over 8; or lossless, each picture as many bytes as it takes"));
     if (jpegXsAvailable()) form->addRow(tr("JPEG XS:"), jpegXsRate_);
     else jpegXsRate_->hide();
     // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
@@ -710,6 +772,11 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         aiTraining_->setToolTip(tr("Unticked, its credentials ask that it not be used to train AI models (CAWG training and mining)"));
         aiTraining_->setChecked(appSettings().value("export/allowAiTraining", false).toBool());
         form->addRow(QString(), aiTraining_);
+        redactCredentials_ = new QCheckBox(tr("Leave out the names of people in the sources' credentials"), form_);
+        redactCredentials_->setObjectName(QStringLiteral("exportRedactCredentials"));
+        redactCredentials_->setToolTip(tr("The sources' assertions that name their authors or signers are redacted from the new credentials"));
+        redactCredentials_->setChecked(appSettings().value("export/redactCredentials", false).toBool());
+        form->addRow(QString(), redactCredentials_);
         connect(credentials_, &QCheckBox::toggled, this, [this] { updateControls(); });
         connect(credentialIdentity_, &QPushButton::clicked, this, [this] { chooseSigningIdentity(); });
         showSigningIdentity();
@@ -739,11 +806,12 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     connect(buttons, &QDialogButtonBox::rejected, this, &ExportDialog::reject);
 
     auto* layout = new QVBoxLayout(this);
-    layout->addWidget(form_);
+    auto* scroll = new FittedScroll(form_, this);
+    scroll->setObjectName(QStringLiteral("exportRows"));
+    layout->addWidget(scroll, 1);
     layout->addSpacing(4);
     layout->addWidget(progress_);
     layout->addWidget(eta_);
-    layout->addStretch(1);
     layout->addWidget(buttons);
 
     // Restore the last preset; the path is derived from it in presetChanged().
@@ -976,6 +1044,13 @@ void ExportDialog::updateControls() {
     // (with a rate change or Content Credentials too: the parameters go in after the one and before the other)
     filmGrain_->setEnabled(video && (p->settings.videoCodec == "libsvtav1" || p->settings.videoCodec == "libaom-av1" || p->settings.videoCodec == "librav1e"));
     filmGrainProfile_->setEnabled(filmGrain_->isEnabled() && filmGrain_->isChecked());
+    regions_->setEnabled(video && encoderTakesRegions(p->settings.videoCodec));
+    {
+        const bool on = regions_->isEnabled() && regions_->isChecked();
+        for (QCheckBox* b : {regionFaces_, regionMasks_, regionBox_}) b->setEnabled(on);
+        for (QDoubleSpinBox* e : regionBoxEdges_) e->setEnabled(on && regionBox_->isChecked());
+        regionStrength_->setEnabled(on);
+    }
     {
         // HDR10+ is HDR10's: PQ output only.
         const Sequence* sq = state_ ? state_->sequence() : nullptr;
@@ -1080,7 +1155,7 @@ void ExportDialog::updateControls() {
         const bool can = contentCredentialsAvailable() && p && exportCarriesCredentials(would);
         credentials_->setEnabled(can);
         credentials_->setToolTip(!contentCredentialsAvailable() ? tr("This build of Montage cannot sign (no C2PA library)")
-                                 : !can ? tr("Content Credentials cannot go in %1 exports: a single MP4, MOV, WAV, MP3, JPEG, PNG or TIFF file can hold them").arg(ext.toUpper())
+                                 : !can ? tr("Content Credentials cannot go in %1 exports").arg(ext.toUpper())
                                         : tr("A signed record in the file of who made it, with what, and each AI model that "
                                              "generated or changed it, with the credentials its sources carried; checked at "
                                              "contentcredentials.org/verify. Like Premiere's Content Credentials."));
@@ -1089,6 +1164,7 @@ void ExportDialog::updateControls() {
                                                                 : tr("Sign with Content Credentials (not possible here: exported unsigned)"));
         credentialIdentity_->setEnabled(can);
         aiTraining_->setEnabled(can && credentials_->isChecked());
+        redactCredentials_->setEnabled(can && credentials_->isChecked());
     }
     const QString vc = p ? QString::fromStdString(p->settings.videoCodec) : QString();
     const bool intra = vc == "prores_ks" || vc == "dnxhd";
@@ -1307,6 +1383,26 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     if (!s.filmGrain.empty() && !resolveFilmGrainSetting(state_->project(), s.filmGrain)) s.filmGrain = "measure";
     settings.setValue("export/filmGrain", filmGrain_->isChecked());
     settings.setValue("export/filmGrainProfile", filmGrainProfile_->currentData().toString());
+    {
+        std::vector<CodingRegion> regions;
+        const double strength = regionStrength_->value() / 100.0;
+        auto with = [&](const char* kind) {
+            CodingRegion r;
+            r.kind = kind, r.strength = strength;
+            return r;
+        };
+        if (regionFaces_->isChecked()) regions.push_back(with("faces"));
+        if (regionMasks_->isChecked()) regions.push_back(with("mask"));
+        if (regionBox_->isChecked()) {
+            CodingRegion r = with("box");
+            r.x = regionBoxEdges_[0]->value() / 100, r.y = regionBoxEdges_[1]->value() / 100;
+            r.w = std::min(regionBoxEdges_[2]->value() / 100, 1 - r.x), r.h = std::min(regionBoxEdges_[3]->value() / 100, 1 - r.y);
+            if (r.w > 0 && r.h > 0) regions.push_back(r);
+        }
+        if (regions_->isEnabled() && regions_->isChecked()) s.regions = regions;
+        settings.setValue("export/regionsOn", regions_->isChecked());
+        settings.setValue("export/regions", QString::fromStdString(codingRegionsToJson(regions)));
+    }
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
     s.adaptiveHdr = adaptiveHdr_->isEnabled() && adaptiveHdr_->isChecked();
@@ -1330,6 +1426,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     }
     if (jpegXsRate_->isEnabled()) {
         if (const double bpp = jpegXsRate_->currentData().toDouble(); bpp > 0) s.jpegXsBpp = bpp;
+        else if (bpp < 0) s.jpegXsLossless = true;
         settings.setValue("export/jpegXsBpp", jpegXsRate_->currentData());
     }
     if (jxlPremultiplied_->isEnabled()) {
@@ -1459,9 +1556,11 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.credentialCertificate = signer.certificatePath;
         s.credentialKey = signer.keyPath;
         s.credentialAllowAiTraining = aiTraining_->isChecked();
+        s.credentialRedact = redactCredentials_->isChecked();
     }
     settings.setValue("export/credentials", credentials_->isChecked());
     settings.setValue("export/allowAiTraining", aiTraining_->isChecked());
+    settings.setValue("export/redactCredentials", redactCredentials_->isChecked());
     if (rangeIsInOut()) {
         s.in = in;
         s.out = out;

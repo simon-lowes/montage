@@ -529,12 +529,29 @@ std::string vfxShotListOtio(const Sequence& s) {
                               {"script", QString::fromStdString(r.script)},
                               {"versions", versions}};
         const double length = c ? double(c->duration) : double(r.cutOut - r.cutIn + 1) * rate / fr;
+        // The cut's retime as a time effect: a constant speed as OpenTimelineIO's linear time warp (plate frames a frame
+        // of the cut), a ramp as a time effect of its own; either with every frame's plate frame in Montage's metadata.
+        QJsonArray effects;
+        if (Clip plate; vfxPlateClip(s, r, plate))
+            if (const std::vector<std::pair<int, double>> retime = vfxRetime(s, plate, r); !retime.empty()) {
+                QJsonArray lookup;
+                for (const auto& [out, in] : retime) lookup.append(QJsonArray{out, in});
+                const QJsonObject meta{{"montage", QJsonObject{{"retime", lookup}}}};
+                if (!plate.ramped())
+                    effects.append(QJsonObject{{"OTIO_SCHEMA", "LinearTimeWarp.1"},
+                                               {"name", "Retime"},
+                                               {"effect_name", "LinearTimeWarp"},
+                                               {"time_scalar", (plate.reverse ? -1.0 : 1.0) * plate.speed * fr / rate},
+                                               {"metadata", meta}});
+                else
+                    effects.append(QJsonObject{{"OTIO_SCHEMA", "TimeEffect.1"}, {"name", "Retime"}, {"effect_name", "TimeRemap"}, {"metadata", meta}});
+            }
         children.append(QJsonObject{{"OTIO_SCHEMA", "Clip.2"},
                                     {"name", QString::fromStdString(r.name)},
                                     {"source_range", range(r.cutIn, double(r.cutOut - r.cutIn + 1), fr)},
                                     {"media_references", QJsonObject{{"DEFAULT_MEDIA", ref}}},
                                     {"active_media_reference_key", "DEFAULT_MEDIA"},
-                                    {"effects", QJsonArray()},
+                                    {"effects", effects},
                                     {"markers", QJsonArray()},
                                     {"metadata", QJsonObject{{"montage", QJsonObject{{"vfx", vfx}}}}},
                                     {"enabled", true}});
@@ -553,7 +570,52 @@ std::string vfxShotListOtio(const Sequence& s) {
     return QJsonDocument(root).toJson(QJsonDocument::Indented).toStdString();
 }
 
-std::string nukeScript(const VfxShotRecord& r, const std::string& writePath) {
+bool vfxPlateClip(const Sequence& s, const VfxShotRecord& r, Clip& out) {
+    const Clip* c = edit::clipById(s, r.clip);
+    if (!c) return false;
+    out = *c;
+    if (r.plateMedia && c->mediaId != r.plateMedia)
+        for (const Take& take : c->takes)
+            if (take.mediaId == r.plateMedia) {
+                out.mediaId = take.mediaId;
+                out.sourceIn += take.offset;
+                break;
+            }
+    return true;
+}
+
+std::vector<std::pair<int, double>> vfxRetime(const Sequence& s, const Clip& plate, const VfxShotRecord& r) {
+    const double seqFps = s.fpsValue(), mf = r.fps.valid() ? r.fps.toDouble() : seqFps;
+    if (!plate.ramped() && !plate.reverse && std::fabs(plate.speed - 1) < 1e-9 && std::fabs(mf - seqFps) < 1e-9) return {};
+    std::vector<std::pair<int, double>> out;
+    out.reserve(size_t(std::max<FrameTime>(0, plate.duration)));
+    for (FrameTime k = 0; k < plate.duration; ++k)
+        out.emplace_back(r.cutIn + int(k), double(r.cutIn) + (plate.sourceAt(double(k)) - r.cutSource) * mf / seqFps);
+    return out;
+}
+
+namespace {
+
+// A number for a script, as short as it is exact to a millionth.
+std::string nkNumber(double v) {
+    char buf[40];
+    std::snprintf(buf, sizeof buf, "%.6f", v);
+    std::string t = buf;
+    while (t.size() > 1 && t.back() == '0') t.pop_back();
+    if (!t.empty() && t.back() == '.') t.pop_back();
+    return t == "-0" ? "0" : t;
+}
+
+// A Nuke animation curve of (frame, value) keys.
+std::string nkCurve(const std::vector<std::pair<int, double>>& keys) {
+    std::string c = "{curve";
+    for (const auto& [x, y] : keys) c += " x" + std::to_string(x) + " " + nkNumber(y);
+    return c + "}";
+}
+
+}  // namespace
+
+std::string nukeScript(const VfxShotRecord& r, const std::string& writePath, const NukeScriptExtras& extras) {
     const ColorSpace* space = findColorSpace(r.colorSpace);
     const std::string spaceName = space ? space->label : r.colorSpace.empty() ? std::string("the footage's own") : r.colorSpace;
     const QString plate = QString::fromStdString(r.plate);
@@ -572,8 +634,40 @@ std::string nukeScript(const VfxShotRecord& r, const std::string& writePath) {
     nk += "Read {\n inputs 0\n file_type " + type + "\n file " + tclQuoted(r.plate) + "\n format " + tclQuoted(format) + "\n first " + first +
           "\n last " + last + "\n origfirst " + first + "\n origlast " + last + "\n origset true\n raw true\n name Plate\n label " +
           tclQuoted(spaceName) + "\n xpos 0\n ypos 0\n}\n";
+    if (!extras.retime.empty()) nk += "set Nplate [stack 0]\n";  // (for the retime's own branch off it)
     nk += "Write {\n file " + tclQuoted(writePath) + "\n file_type " + type + "\n raw true\n create_directories true\n first " + first +
           "\n last " + last + "\n use_limit true\n name Return\n xpos 0\n ypos 120\n}\n";
+    if (!extras.retime.empty()) {
+        // The cut's retime, off the plate: for looking at the shot as the cut plays it.
+        nk += "push $Nplate\n";
+        nk += "TimeWarp {\n lookup {" + nkCurve(extras.retime) + "}\n time \"\"\n filter none\n name Retime\n label " +
+              tclQuoted("The cut's retime (frames " + std::to_string(extras.retime.front().first) + "-" +
+                        std::to_string(extras.retime.back().first) + ")") +
+              "\n xpos 160\n ypos 120\n}\n";
+    }
+    if (!extras.chanText.empty()) {
+        // The camera solve, its keys as the .chan beside the plate has them: translate, rotate (ZXY, degrees) and the
+        // vertical field of view, as a focal length through a film back of the plate's shape.
+        std::vector<std::pair<int, double>> keys[7];
+        for (const QString& line : QString::fromStdString(extras.chanText).split('\n', Qt::SkipEmptyParts)) {
+            const QStringList v = line.simplified().split(' ');
+            if (v.size() < 8) continue;
+            bool ok = true;
+            const int frame = v[0].toInt(&ok);
+            if (!ok) continue;
+            for (int k = 0; k < 7 && ok; ++k) keys[k].emplace_back(frame, v[k + 1].toDouble(&ok));
+        }
+        if (!keys[0].empty()) {
+            const double haperture = 36, vaperture = r.width > 0 && r.height > 0 ? haperture * r.height / r.width : 24;
+            std::vector<std::pair<int, double>> focal;
+            for (const auto& [x, vfov] : keys[6]) focal.emplace_back(x, vaperture / (2 * std::tan(vfov * 3.14159265358979323846 / 360)));
+            nk += "Camera2 {\n inputs 0\n rot_order ZXY\n translate {" + nkCurve(keys[0]) + " " + nkCurve(keys[1]) + " " + nkCurve(keys[2]) +
+                  "}\n rotate {" + nkCurve(keys[3]) + " " + nkCurve(keys[4]) + " " + nkCurve(keys[5]) + "}\n focal {" + nkCurve(focal) +
+                  "}\n haperture " + nkNumber(haperture) + "\n vaperture " + nkNumber(vaperture) + "\n name Solve\n label " +
+                  tclQuoted(extras.chanPath.empty() ? std::string("Camera solve") : QFileInfo(QString::fromStdString(extras.chanPath)).fileName().toStdString()) +
+                  "\n xpos 320\n ypos 0\n}\n";
+        }
+    }
     std::string about = "Shot " + r.name + "\nFrames " + first + "-" + last + ", the cut " + std::to_string(r.cutIn) + "-" + std::to_string(r.cutOut) +
                         "\nColour: " + spaceName + " (read and written raw)";
     if (!r.amf.empty()) about += "\nACES Metadata File: " + r.amf;

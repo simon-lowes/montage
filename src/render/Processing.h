@@ -12,6 +12,7 @@
 #include "core/Model.h"
 #include "media/Image.h"
 #include "render/ColorSpace.h"
+#include "render/FilmScan.h"
 #include "render/VideoDenoise.h"
 
 namespace montage {
@@ -32,6 +33,13 @@ EffectDomain effectDomain(const std::string& type);
 // picture's own curve `transfer`. Steady on Perforations: the frame moved so its perforations sit where they were on the
 // reference frame. Both run where the clip's source frame is read, the lock first.
 void applyFilmNegative(const Effect& e, FrameTime t, Image& img, Transfer transfer);
+// Its settings at t: the film base found in `img` (the frame it runs on), unless set by hand or none is found there.
+NegativeSettings filmNegativeSettings(const Effect& e, FrameTime t, const Image& img, Transfer transfer);
+// Whether its base is found in the frame (else it is set by hand, and the frame is not needed).
+bool filmBaseFound(const Effect& e, FrameTime t);
+// A transfer function as the GPU's shaders know it (the display curves it composites in: gpufilter.frag's and
+// gpucolor.frag's numbers, the Transfer's own), or -1.
+int gpuTransfer(const ColorSpace& space);
 void applyPerfLock(const Effect& e, FrameTime t, Image& img);
 // Dirt Removal and Dust Spot Removal (render/Restoration.h), which need the source frames either side, followed along the
 // motion (either may be missing): run where the clip's source frame is read, through the effect's mask if it has one. Dirt

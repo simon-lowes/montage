@@ -159,8 +159,9 @@ public:
     // cancel to the splice: the event ended); splice_null and those it cannot read are passed over.
     void cueFromFeed(const std::vector<uint8_t>& section, double feedZero, double at);
     // A chapter from here (at < 0: the next picture recorded; else seconds into the recording) to the next: the
-    // package's chapters.vtt (named in the multivariant playlist).
-    void chapter(const std::string& title, double at = -1);
+    // package's chapters.vtt (named in the multivariant playlist). With a key a chapter was given before: that
+    // chapter moved here and titled so (the list is written whole again).
+    void chapter(const std::string& title, double at = -1, const std::string& key = {});
     // The feed ended: what was queued is encoded, the last segment finished, the playlists ended (EXT-X-ENDLIST) and
     // the MPD given its duration. Waits for that.
     void finish();
@@ -206,6 +207,17 @@ public:
     // The bytes handed to connections that their clients have not taken yet (as of the last hundredth of a second):
     // what clients that do not read can make the origin hold.
     int64_t bytesWaiting() const;
+    // The connections kept (as of the last hundredth of a second), and how many the 512 kept have let go to make room.
+    int connectionsKept() const;
+    int64_t connectionsLetGo() const;
+    // The connections that ended in an error of their own (the system's: reset, refused a write), and the last one's
+    // text with what was still to be sent on it.
+    int64_t connectionsFailed() const;
+    std::string lastConnectionError() const;
+    // Each connection's send buffer in the system, in bytes, from the next start (0, the default: the system's own,
+    // which grows with the connection; 1 MB under Windows). Small, an answer a client does not read waits in the
+    // origin and not in the system: for tests of what such clients make the origin hold.
+    void setSendBuffer(int bytes);
     void stop();
 
     struct State;

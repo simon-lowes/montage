@@ -68,8 +68,26 @@ Result setVfxStatus(Sequence& s, const std::string& shot, int status, const std:
 std::string vfxShotListCsv(const Sequence& s);
 std::string vfxShotListOtio(const Sequence& s);
 
+// The cut's retime of a shot: for each frame of its clip, numbered from the shot's cut in, the plate frame Montage
+// shows there (between two where the speed falls between frames). Empty when the clip plays its footage as it runs
+// (forwards, at 100 %, at the sequence's rate). `plate`: the clip as it plays the plate (a version's take moved back
+// to it: vfxPlateClip).
+std::vector<std::pair<int, double>> vfxRetime(const Sequence& s, const Clip& plate, const VfxShotRecord& r);
+// The shot's clip playing its plate (a version shown on it set back to the plate's take); false when the clip is gone.
+bool vfxPlateClip(const Sequence& s, const VfxShotRecord& r, Clip& out);
+
+// What a shot's script can carry beyond its plate.
+struct NukeScriptExtras {
+    // vfxRetime: a TimeWarp node beside the plate whose lookup maps each frame of the cut to the plate frame shown
+    // there, to see the shot as the cut plays it (the return is written at the plate's own frames).
+    std::vector<std::pair<int, double>> retime;
+    // The shot's camera solve as Nuke's .chan (writeNukeChan's lines, in the plate's frame numbers) and where it is:
+    // read into a camera, its keys written into the script.
+    std::string chanPath, chanText;
+};
+
 // A Nuke script for the shot: its plate read untouched (raw, its colour space noted) over its frame range and written,
 // raw too, to `writePath` (frames as "####").
-std::string nukeScript(const VfxShotRecord& r, const std::string& writePath);
+std::string nukeScript(const VfxShotRecord& r, const std::string& writePath, const NukeScriptExtras& extras = {});
 
 }  // namespace montage

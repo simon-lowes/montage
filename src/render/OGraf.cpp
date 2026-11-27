@@ -1,6 +1,7 @@
 #include "OGraf.h"
 
 #include "HeadlessBrowser.h"
+#include "core/Preferences.h"
 
 #include <QByteArray>
 #include <QCryptographicHash>
@@ -199,7 +200,7 @@ std::string ografDefaultData(const OGrafGraphic& g) {
 }
 
 std::string ografBrowser() {
-    const QString env = qEnvironmentVariable("MONTAGE_CHROMIUM");
+    const QString env = prefs::text(QStringLiteral("programs/browser"));
     if (!env.isEmpty()) return QFileInfo(env).isExecutable() ? env.toStdString() : std::string();
     QStringList candidates;
 #if defined(Q_OS_MACOS)
@@ -450,7 +451,7 @@ namespace {
 // Every file of a graphic's folder by size and time (an edited graphic renders again), looked at once every two
 // seconds at most (frames ask for it one after another).
 QString cacheBase() {
-    const QString base = qEnvironmentVariable("MONTAGE_OGRAF_CACHE");
+    const QString base = prefs::text(QStringLiteral("media/graphicsCache"));
     return base.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation) + "/montage/ograf" : base;
 }
 
@@ -521,7 +522,7 @@ constexpr qint64 kRetryAfterMs = 120000;
 // half done by a crash go after a day.
 void pruneCache(const QString& keep) {
     const QDir base(cacheBase());
-    const qint64 limit = qEnvironmentVariableIntValue("MONTAGE_OGRAF_CACHE_MB") > 0 ? qEnvironmentVariableIntValue("MONTAGE_OGRAF_CACHE_MB") : 2048;
+    const qint64 limit = prefs::whole(QStringLiteral("media/graphicsCacheMb"));
     struct Entry {
         QString path;
         qint64 bytes = 0, when = 0;

@@ -1333,6 +1333,19 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
                     o << (i ? ", " : "") << f3(mesh.normals[i], km * mesh.normals[i + 1], km * mesh.normals[i + 2], true);
                 o << "] (\n                interpolation = \"vertex\"\n            )\n";
             }
+            // (its shape where it changes, in its own space as its transform has it)
+            auto samples = [&](const char* type, const std::vector<std::pair<double, std::vector<float>>>& by) {
+                if (by.empty()) return;
+                o << "            " << type << ".timeSamples = {\n";
+                for (const auto& [tc, v] : by) {
+                    o << "                " << formatNumber(tc) << ": [";
+                    for (size_t i = 0; i + 2 < v.size(); i += 3) o << (i ? ", " : "") << f3(v[i], km * v[i + 1], km * v[i + 2], true);
+                    o << "],\n";
+                }
+                o << "            }\n";
+            };
+            samples("point3f[] points", mesh.pointSamples);
+            if (!mesh.normals.empty() && mesh.normals.size() == mesh.positions.size()) samples("normal3f[] normals", mesh.normalSamples);
             if (!mesh.motion.empty()) {
                 o << "            matrix4d xformOp:transform.timeSamples = {\n";
                 for (const auto& [tc, m] : mesh.motion) {

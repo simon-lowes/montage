@@ -33,6 +33,7 @@ class Engine;
 }
 
 class RenderWorker;
+class GrainAsDecoded;
 class SoundOut;
 class MixerDevice;
 namespace output {
@@ -77,6 +78,10 @@ public:
     void setTrimTarget(const std::string& id);
     // The scopes read the working space's values of a sequence graded scene-referred (rendered when paused).
     void setScopesReadWorking(bool on);
+    // Grain as Decoded (render/Av1GrainExport.h): the sequence shown cleaned of its grain with its AV1 grain parameters
+    // put back as a decoder puts them back (paused frames at full resolution; others as they are); null: off.
+    void setGrainAsDecoded(std::shared_ptr<const GrainAsDecoded> g);
+    const std::shared_ptr<const GrainAsDecoded>& grainAsDecoded() const { return grain_; }
     // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
     void setHdrOutput(bool on);
     bool hdrOutput() const { return hdrOutput_; }
@@ -248,6 +253,7 @@ private:
     StereoView stereoView_ = StereoView::Left;
     std::string trimTarget_;
     bool scopesWorking_ = false;
+    std::shared_ptr<const GrainAsDecoded> grain_;
     bool hdrOutput_ = false;
     std::shared_ptr<const Lut3D> hdrCalibration_;
     double hdrWhite_ = 203;

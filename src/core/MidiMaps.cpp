@@ -1,4 +1,5 @@
 #include "MidiMaps.h"
+#include "core/Preferences.h"
 
 #include <algorithm>
 
@@ -102,7 +103,7 @@ bool fromJson(const QJsonObject& o, Map& out, QString* error, QStringList* skipp
 }
 
 QString folder() {
-    const QString env = qEnvironmentVariable("MONTAGE_MIDI_MAPS");
+    const QString env = prefs::text(QStringLiteral("libraries/midiMaps"));
     if (!env.isEmpty()) return env;
     return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/MIDI Maps");
 }

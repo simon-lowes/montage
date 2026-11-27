@@ -22,6 +22,9 @@ struct VfxPullOptions {
     std::string folder;          // a folder per shot is made in it
     std::string format = "exr";  // exr, dpx or tiff
     int handles = 8;             // frames either side, as far as the footage goes
+    // The handles in source frames as they are (off), or scaled by the shot's speed at each end (Time Remapping's
+    // there for a ramp), so a shot at 400 % with 8 handles pulls 32 source frames either side.
+    bool scaleHandles = false;
     int cutIn = 1001;            // the frame number of the first frame of the cut
     std::string colorSpace;      // EXR: "" = Linear Rec.709; others: "" = the footage's own (graded scene-referred: the working space's)
     bool amf = true;             // an ACES Metadata File beside each shot's frames (render/Amf.h): their space, the grade's looks
@@ -47,6 +50,18 @@ struct VfxPullOptions {
     // Off: the plates without any motion blur through a shutter (the transforms', Motion Blur's, titles'), to be
     // blurred where they are composited.
     bool motionBlur = true;
+    // OpenEXR, with the OpenEXR library: each frame's header carries OpenEXR's standard attributes for what Montage
+    // knows of the source: its timeCode and framesPerSecond (and captureRate), the reel or tape as reelName, the frame's
+    // number in the source as imageCounter, the camera, lens, focal length, T-stop, focus and shutter angle from the
+    // media's metadata where it has them (camera_make, camera or device, camera_serial, lens_make, lens, lens_serial,
+    // focal_length, t_stop, focus_distance, shutter_angle, iso), when it was recorded as capDate, and the project and
+    // shot in comments. Numbers are float attributes.
+    bool plateMetadata = true;
+    // OpenEXR: the picture's values below 0 and over 1 kept (as rendered), or clipped to 0 and to 1.
+    bool clipNegative = false, clipOver = false;
+    // A shot whose clip has a camera solve (3D Camera Tracker): its camera as Nuke's .chan beside the plate
+    // (<shot>.chan), its frames moved to the plate's numbering, read into a camera by the shot's script.
+    bool camera = true;
 };
 
 struct VfxShot;
@@ -78,6 +93,7 @@ struct VfxShot {
     Rational fps{24, 1};
     double cutSource = 0;               // the cut's first frame in the footage (sequence frames, as Clip::sourceIn)
     std::string script;                 // its compositing script, when written
+    std::string chan;                   // its camera solve as Nuke's .chan, when written
 };
 
 // The name a pattern gives a clip of the cut as a shot (VfxPullOptions::namePattern), made safe for files; {shot}

@@ -10,6 +10,7 @@
 
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "core/Preferences.h"
 
 namespace montage {
 
@@ -118,8 +119,8 @@ const ModelPack& lensDatabasePack() {
 
 std::vector<std::string> lensDatabaseFolders() {
     std::vector<std::string> out;
-    if (const char* env = std::getenv("MONTAGE_LENS_DB"); env && *env) {
-        out.push_back(env);
+    if (const QString chosen = prefs::text(QStringLiteral("libraries/lenses")); !chosen.isEmpty()) {
+        out.push_back(chosen.toStdString());
         return out;
     }
     out.push_back(lensDatabasePack().directory());
@@ -137,11 +138,11 @@ std::shared_ptr<const lens::Database> lensDatabase() {
     std::lock_guard lock(dbMutex());
     // (Looked for again while there is none: it may have been fetched since.)
     if (loaded()) return loaded();
-    const char* env = std::getenv("MONTAGE_LENS_DB");
+    const bool chosen = !prefs::text(QStringLiteral("libraries/lenses")).isEmpty();
     std::shared_ptr<lens::Database> found;
     for (const std::string& dir : lensDatabaseFolders()) {
         // (Not a download cut short.)
-        if (!(env && *env) && dir == lensDatabasePack().directory() && !lensDatabasePack().installed()) continue;
+        if (!chosen && dir == lensDatabasePack().directory() && !lensDatabasePack().installed()) continue;
         auto db = std::make_shared<lens::Database>();
         if (db->addDirectory(dir) > 0 && !db->empty()) {
             found = db;
@@ -166,8 +167,8 @@ bool lensfunDatabaseFound() {
 }
 
 std::string userLensFolder() {
-    if (const QString env = qEnvironmentVariable("MONTAGE_USER_LENSES"); !env.isEmpty()) return env.toStdString();
-    if (const char* env = std::getenv("MONTAGE_LENS_DB"); env && *env) return {};
+    if (const QString own = prefs::text(QStringLiteral("libraries/userLenses")); !own.isEmpty()) return own.toStdString();
+    if (!prefs::overriddenBy(QStringLiteral("libraries/lenses")).isEmpty()) return {};
     const QString data = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     return data.isEmpty() ? std::string() : (data + "/lenses").toStdString();
 }

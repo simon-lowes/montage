@@ -122,6 +122,7 @@ bool readJxsHeader(const uint8_t* data, size_t size, JxsHeader& out) {
         const size_t n = len - 2;
         if (marker == 0xFF12) {
             if (n < 24) return false;
+            out.pihAt = at;
             out.lcod = be32(d);
             out.ppih = be16(d + 4);
             out.plev = be16(d + 6);
@@ -133,6 +134,7 @@ bool readJxsHeader(const uint8_t* data, size_t size, JxsHeader& out) {
             out.fq = d[20] >> 4;
             out.cpih = d[21] & 0x0F;
             out.decompV = d[22] & 0x0F;
+            out.decompH = d[22] >> 4;
             pih = true;
         } else if (marker == 0xFF13) {
             if (!pih) return false;
@@ -226,6 +228,23 @@ std::string jpegXsVersion() {
     return "SVT-JPEG-XS " + std::to_string(SVT_JPEGXS_API_VER_MAJOR) + "." + std::to_string(SVT_JPEGXS_API_VER_MINOR);
 }
 
+bool jxsLibraryReading(const uint8_t* data, size_t size, JxsHeader& out, std::string* error) {
+    quietSvt();
+    svt_jpeg_xs_image_config_t config{};
+    uint32_t n = 0;
+    if (!data || size == 0) return fail(error, "No codestream");
+    if (const SvtJxsErrorType_t e = svt_jpeg_xs_decoder_get_single_frame_size(data, size, &config, &n, 0); e != SvtJxsErrorNone)
+        return fail(error, "SVT-JPEG-XS cannot read this codestream (" + svtError(e) + ")");
+    out.width = int(config.width), out.height = int(config.height), out.depth = config.bit_depth;
+    out.components = config.components_num;
+    for (int c = 0; c < 4; ++c) out.sx[c] = out.sy[c] = 0;
+    for (int c = 0; c < config.components_num && c < 4; ++c) {
+        out.sx[c] = config.components[c].width ? int(config.width / config.components[c].width) : 0;
+        out.sy[c] = config.components[c].height ? int(config.height / config.components[c].height) : 0;
+    }
+    return true;
+}
+
 struct JxsEncoder::State {
     JxsEncodeSettings s;
     svt_jpeg_xs_encoder_api_t api{};
@@ -270,6 +289,8 @@ bool JxsEncoder::open(const JxsEncodeSettings& s, std::string* error) {
     st.api.bpp_numerator = uint32_t(s.bppNum);
     st.api.bpp_denominator = uint32_t(s.bppDen);
     st.api.slice_height = uint32_t(std::max(s.sliceHeight, 4));
+    if (s.decompV >= 0) st.api.ndecomp_v = uint32_t(s.decompV);
+    if (s.decompH >= 0) st.api.ndecomp_h = uint32_t(s.decompH);
     // A budget for each slice, so each is as long in every picture: RFC 9134's slice packetisation then sends as many
     // packets each frame.
     st.api.rate_control_mode = 2;
@@ -342,6 +363,7 @@ struct JxsDecoder::State {
     svt_jpeg_xs_image_config_t config{};
     bool open = false;
     int proxy = 0, openProxy = 0;  // (asked for, and the one the decoder was set up with)
+    int made = 0;
     JxsHeader header;
     std::vector<uint8_t> headerBytes;
     std::vector<uint8_t> planes[4];
@@ -358,6 +380,7 @@ void JxsDecoder::close() {
 
 void JxsDecoder::setProxy(int level) { s_->proxy = std::clamp(level, 0, 2); }
 int JxsDecoder::proxy() const { return s_->proxy; }
+int JxsDecoder::decodersMade() const { return s_->made; }
 
 bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::string* error, JxsSampling sampling444) {
     State& st = *s_;
@@ -366,10 +389,12 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
     if (!readJxsHeader(data, size, h)) return fail(error, "Not a JPEG XS codestream");
     // (a header may name 65,535 x 65,535: checked before the library or any plane is set up for it)
     if (!jxsPictureFits(h, error)) return false;
-    // (the decoder is set up for one header: another one, even of another rate alone, starts it again; so does each
-    // lossless picture that states a length of its own)
-    const bool same = st.open && st.openProxy == st.proxy && st.headerBytes.size() == h.headerBytes &&
-                      std::equal(data, data + h.headerBytes, st.headerBytes.begin());
+    // (the decoder is set up for one header: another one, even of another rate alone, starts it again. A header that
+    // differs only in the codestream's length, Lcod, as each lossless picture's does, is the same to the library,
+    // which reads each picture's length and fractional bits from that picture)
+    bool same = st.open && st.openProxy == st.proxy && st.headerBytes.size() == h.headerBytes && st.header.pihAt == h.pihAt;
+    for (size_t i = 0; same && i < h.headerBytes; ++i)
+        if ((i < h.pihAt + 4 || i >= h.pihAt + 8) && data[i] != st.headerBytes[i]) same = false;
     if (!same) {
         close();
         std::memset(&st.api, 0, sizeof st.api);
@@ -383,6 +408,7 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
             e != SvtJxsErrorNone)
             return fail(error, "SVT-JPEG-XS cannot decode this codestream (" + svtError(e) + ")");
         st.open = true;
+        ++st.made;
         st.header = h;
         st.headerBytes.assign(data, data + h.headerBytes);
         if (st.config.components_num != 3 && st.config.components_num != 4) {
@@ -447,6 +473,9 @@ bool JxsDecoder::decode(const uint8_t* data, size_t size, JxsPicture& out, std::
 #else
 
 bool jpegXsAvailable() { return false; }
+bool jxsLibraryReading(const uint8_t*, size_t, JxsHeader&, std::string* error) {
+    return fail(error, "This build of Montage has no JPEG XS (SVT-JPEG-XS)");
+}
 std::string jpegXsVersion() { return {}; }
 
 struct JxsEncoder::State {
@@ -469,6 +498,7 @@ JxsDecoder::~JxsDecoder() = default;
 void JxsDecoder::close() {}
 void JxsDecoder::setProxy(int level) { s_->proxy = std::clamp(level, 0, 2); }
 int JxsDecoder::proxy() const { return s_->proxy; }
+int JxsDecoder::decodersMade() const { return 0; }
 bool JxsDecoder::decode(const uint8_t*, size_t, JxsPicture&, std::string* error, JxsSampling) {
     return fail(error, "This build of Montage has no JPEG XS (SVT-JPEG-XS)");
 }
@@ -764,6 +794,8 @@ bool JxsReader::picture(int64_t n, JxsPicture& out, std::string* error) {
     if (!codestream(n, st.bytes, error)) return false;
     return st.decoder.decode(st.bytes.data(), st.bytes.size(), out, error, st.info.sampling == JxsSampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444);
 }
+
+int JxsReader::decodersMade() const { return s_->decoder.decodersMade(); }
 
 bool JxsReader::frame(int64_t n, AVFrame* into, std::string* error) {
     JxsPicture p;

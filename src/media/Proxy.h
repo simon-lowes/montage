@@ -28,6 +28,9 @@ struct ProxyOptions {
     ProxyFormat format = ProxyFormat::H264;
     int maxWidth = 960;  // at most this wide; 0 = half the source's width, -1 = a quarter
     bool sound = false;  // with the file's sound (AAC in .mp4, PCM in .mov)
+    // A source with Content Credentials: the proxy signed with this certificate and key (PEM), the source's
+    // credentials as its parent (media/ContentCredentials.h). Empty: the proxy is not signed.
+    std::string credentialCertificate, credentialKey;
 };
 const char* proxyFormatName(ProxyFormat f);  // "h264", "prores_proxy", "dnxhr_lb", "hevc10", "apv"
 bool parseProxyFormat(const std::string& name, ProxyFormat& out);

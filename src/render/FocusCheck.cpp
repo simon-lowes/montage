@@ -402,8 +402,9 @@ double noiseBetweenFrames(const float* luma, const float* prev, const float* nex
     const GrayImage cur = grayOf(luma, w, h);
     const NoiseGrid g = noiseGrid(w, h);
     std::vector<double> tiles;
+    const size_t n = size_t(w) * size_t(h);
     for (const float* other : {prev, next}) {
-        if (!other) continue;
+        if (!other || std::equal(luma, luma + n, other)) continue;  // (a repeat of the frame says nothing of its noise)
         const GrayImage nb = grayOf(other, w, h);
         FlowField fwd, back;
         flowsBetween(cur, nb, fwd, back);
@@ -418,6 +419,7 @@ struct FocusRun::Picture {
     GrayImage gray;
     std::vector<double> tiles;  // the noise between it and its neighbours so far, the lower in each tile (-1 none)
     bool still = false;
+    int repeats = 0;  // how many times it came again straight after (the same picture: a frame rate's repeated frames)
 };
 
 FocusMeasure FocusRun::measure(const Picture& p) const {
@@ -433,7 +435,22 @@ std::vector<FocusMeasure> FocusRun::add(std::vector<float> luma, int w, int h, b
     next->gray.px.resize(size_t(next->gray.width) * size_t(next->gray.height), 0.0f);
     if (pending_) {
         Picture& a = *pending_;
-        if (!cut && !still && !a.still && a.gray.width == w && a.gray.height == h && w >= 16 && h >= 16) {
+        const bool beside = !cut && !still && !a.still && a.gray.width == w && a.gray.height == h && w >= 16 && h >= 16;
+        if (beside && a.gray.px == next->gray.px) {
+            // The same picture again (24 frames a second in 25, 50 or 60): nothing changes between the two, so they say
+            // nothing of the grain, and both are measured against the pictures either side of the repeats. Repeated
+            // more often than any frame rate repeats a frame (kMostRepeats), it is a picture that does not move, and
+            // the noise between its frames is none, as it always was.
+            if (++a.repeats == kMostRepeats + 1) {
+                FlowField ab, ba;
+                flowsBetween(a.gray, next->gray, ab, ba);
+                std::vector<double> t;
+                tileNoise(a.gray, next->gray, ab, ba, noiseGrid(w, h), t, threads_);
+                foldTiles(a.tiles, t);
+            }
+            return out;
+        }
+        if (beside) {
             // (one pair of flows serves both: the picture before against this one, and this one against it)
             FlowField ab, ba;
             flowsBetween(a.gray, next->gray, ab, ba);
@@ -444,7 +461,7 @@ std::vector<FocusMeasure> FocusRun::add(std::vector<float> luma, int w, int h, b
             tileNoise(next->gray, a.gray, ba, ab, g, t, threads_);
             foldTiles(next->tiles, t);
         }
-        out.push_back(measure(a));
+        out.assign(size_t(a.repeats) + 1, measure(a));
     }
     pending_ = std::move(next);
     return out;
@@ -452,7 +469,7 @@ std::vector<FocusMeasure> FocusRun::add(std::vector<float> luma, int w, int h, b
 
 std::vector<FocusMeasure> FocusRun::finish() {
     std::vector<FocusMeasure> out;
-    if (pending_) out.push_back(measure(*pending_));
+    if (pending_) out.assign(size_t(pending_->repeats) + 1, measure(*pending_));
     pending_.reset();
     return out;
 }

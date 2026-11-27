@@ -1005,7 +1005,10 @@ McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOn
             const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
             for (const QJsonValue& v : list)
                 if (v.isObject() && depth < 8) walk(v.toObject(), depth + 1);
-                else if (k && v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << oneNameFor(v.toString());
+                else if (k && v.isString() && !v.toString().isEmpty()) {
+                    (k == 2 ? out.writes : out.reads) << oneNameFor(v.toString());
+                    if (k == 2) out.writtenAs << v.toString();
+                }
         }
     };
     walk(a, 0);
@@ -1017,8 +1020,9 @@ McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOn
     }
     // (a read-only tool that makes its folder a production when asked writes it then)
     if (tool == QLatin1String("montage_production") && a.value("create").toBool() && !a.value("folder").toString().isEmpty())
-        out.writes << oneNameFor(a.value("folder").toString());
+        out.writes << oneNameFor(a.value("folder").toString()), out.writtenAs << a.value("folder").toString();
     out.writes.removeDuplicates();
+    out.writtenAs.removeDuplicates();
     out.reads.removeDuplicates();
     for (const QString& w : out.writes) out.reads.removeAll(w);
     return out;
@@ -1073,6 +1077,10 @@ QString mcpOwnFileNamed(const QString& tool, const QJsonObject& arguments, const
     };
     // What the call is known to write: there, or a folder that holds one of them.
     for (const QString& w : paths.writes)
+        if (const char* what = named(w, true)) return QStringLiteral("%1 is where Montage keeps %2: a tool does not write there").arg(w, QLatin1String(what));
+    // (and each as written, in every way it can be taken: "ab:/../x" is /x to FFmpeg but a folder's x to the tool's
+    // own files, which may hold one of them)
+    for (const QString& w : paths.writtenAs)
         if (const char* what = named(w, true)) return QStringLiteral("%1 is where Montage keeps %2: a tool does not write there").arg(w, QLatin1String(what));
     // And every other text in the arguments, whatever its key: a tool may write to an argument this server does not
     // know as a path. Only a DKDM and a server's certificate are read from there, by montage_make_kdm.
@@ -7814,32 +7822,83 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_consolidate", "Copy the project and its media",
-        "Copy the project to a folder with the media it uses (Premiere's Project Manager): collect copies each used file "
-        "whole; with trim, only the parts of videos the sequences use are transcoded (plus handles) and the clips point at "
-        "the new files. Media nothing uses is left out unless keep_unused. Returns the new project's path.",
+        "Copy the project to a folder with the media it uses: collect copies each used file whole; with trim, only the "
+        "parts of videos the sequences use are transcoded (plus handles) and the clips point at the new files. For "
+        "finishing, output says what becomes of each used file: whole, trimmed (its used part in its own format, cut "
+        "without coding again where the format allows), movie (transcoded to codec) or frames (image sequences); handles "
+        "in seconds, frames or a timecode duration, none or the whole file; names from a pattern; clips nothing shows "
+        "left out and listed; grades, effects and speed baked in. A preset (the project's, the user's library's or the "
+        "facility's) gives the choices the call does not. Media nothing uses is left out unless keep_unused. Returns the "
+        "new project's path.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},"name":{"type":"string"},
             "sequences":{"type":"string","enum":["all","active"],"default":"all"},"trim":{"type":"boolean","default":false},
+            "preset":{"type":"string","description":"A Consolidate preset's name; the arguments given override it"},
+            "output":{"type":"string","enum":["whole","trimmed","movie","frames"]},
             "handles":{"type":"number","default":1,"description":"Seconds kept either side, when trimming"},
-            "codec":{"type":"string","enum":["prores","h264"],"default":"prores"},"keep_unused":{"type":"boolean","default":false}},
+            "handle_unit":{"type":"string","enum":["seconds","frames","timecode","none","whole"],"default":"seconds"},
+            "handle_frames":{"type":"integer","minimum":0},"handle_timecode":{"type":"string","description":"A duration, as 00:00:00:12"},
+            "codec":{"type":"string","enum":["prores","dnxhr","h264","hevc","ffv1","own"],"default":"prores"},
+            "frames":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
+            "color_space":{"type":"string","description":"\"\" each file's own, \"working\" the working space, or a colour space id"},
+            "name_pattern":{"type":"string","description":"{sequence} {shot} {clip} {reel} {tape} {scene} {take} {frame}"},
+            "folder_depth":{"type":"integer","minimum":0,"default":0},"leave_out_hidden":{"type":"boolean","default":false},
+            "bake":{"type":"boolean","default":false},"trim_sound":{"type":"boolean","default":false},
+            "keep_unused":{"type":"boolean","default":false},
+            "credentials":{"type":"object","description":"Copies made from sources with Content Credentials signed with them as their parent","properties":{"certificate":{"type":"string"},"key":{"type":"string"}},"required":["certificate","key"]}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             ConsolidateOptions o;
+            if (a.contains("preset")) {
+                std::string err;
+                if (!resolvePreset(loadConsolidatePresets(l.project, userPresetFolder()), str(a, "preset").toStdString(), o, nullptr, &err))
+                    return fail(QString::fromStdString(err));
+            }
             o.folder = absolute(need(a, "folder")).toStdString();
             o.name = str(a, "name", QFileInfo(l.path).completeBaseName()).toStdString();
             if (str(a, "sequences", "all") == "active") o.sequences = {l.project.activeSequence};
-            o.trim = a.value("trim").toBool();
-            o.handles = std::max(0.0, a.value("handles").toDouble(1));
-            o.codec = str(a, "codec", "prores") == "h264" ? "libx264" : "prores_ks";
-            o.keepUnused = a.value("keep_unused").toBool();
+            if (a.contains("trim")) o.trim = a.value("trim").toBool();
+            if (a.contains("output")) o.output = str(a, "output").toStdString();
+            if (a.contains("handles")) o.handles = std::max(0.0, a.value("handles").toDouble(1));
+            if (a.contains("handle_unit")) o.handleUnit = str(a, "handle_unit").toStdString();
+            if (a.contains("handle_frames")) o.handleFrames = std::max(0, a.value("handle_frames").toInt());
+            if (a.contains("handle_timecode")) o.handleTimecode = str(a, "handle_timecode").toStdString();
+            if (a.contains("codec")) {
+                static const std::map<QString, std::string> codecs{{"prores", "prores_ks"}, {"dnxhr", "dnxhd"}, {"h264", "libx264"},
+                                                                    {"hevc", "libx265"},    {"ffv1", "ffv1"},  {"own", ""}};
+                const auto it = codecs.find(str(a, "codec"));
+                if (it == codecs.end()) return fail(QStringLiteral("codec is prores, dnxhr, h264, hevc, ffv1 or own"));
+                o.codec = it->second;
+            }
+            if (a.contains("frames")) o.frames = str(a, "frames").toStdString();
+            if (a.contains("color_space")) o.colorSpace = str(a, "color_space").toStdString();
+            if (a.contains("name_pattern")) o.namePattern = str(a, "name_pattern").toStdString();
+            if (a.contains("folder_depth")) o.folderDepth = std::max(0, a.value("folder_depth").toInt());
+            if (a.contains("leave_out_hidden")) o.leaveOutHidden = a.value("leave_out_hidden").toBool();
+            if (a.contains("bake")) o.bake = a.value("bake").toBool();
+            if (a.contains("trim_sound")) o.trimSound = a.value("trim_sound").toBool();
+            if (a.contains("keep_unused")) o.keepUnused = a.value("keep_unused").toBool();
+            if (a.value("credentials").isObject()) {
+                const QJsonObject c = a.value("credentials").toObject();
+                o.credentialCertificate = absolute(need(c, "certificate")).toStdString();
+                o.credentialKey = absolute(need(c, "key")).toStdString();
+            }
             ConsolidateResult res;
             std::string err;
             if (!consolidateProject(l.project, o, &res, [this](double f) { progress(f, "Copying"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             QString text = QStringLiteral("Wrote %1: %2 file(s) copied, %3 consolidated, %4 MB")
                                .arg(QString::fromStdString(res.projectPath)).arg(res.copied).arg(res.trimmed).arg(double(res.bytes) / 1e6, 0, 'f', 1);
+            if (res.framesCopied || res.framesCoded)
+                text += QStringLiteral(" (%1 frame(s) copied, %2 coded)").arg(res.framesCopied).arg(res.framesCoded);
+            if (res.baked) text += QStringLiteral(", %1 clip(s) baked").arg(res.baked);
             for (const std::string& m : res.missing) text += QStringLiteral("\nMissing: ") + QString::fromStdString(m);
-            return ok(text);
+            for (const std::string& c : res.leftOut) text += QStringLiteral("\nLeft out: ") + QString::fromStdString(c);
+            QJsonArray leftOut;
+            for (const std::string& c : res.leftOut) leftOut.append(QString::fromStdString(c));
+            return ok(text, QJsonObject{{"project", QString::fromStdString(res.projectPath)}, {"copied", res.copied}, {"trimmed", res.trimmed},
+                                        {"framesCopied", res.framesCopied}, {"framesCoded", res.framesCoded}, {"baked", res.baked},
+                                        {"leftOut", leftOut}});
         });
 
     add("montage_transcribe", "Transcribe",
@@ -13816,7 +13875,10 @@ void McpServer::Impl::addTools() {
             "color_space":{"type":"string","description":"Deliver in this display space (rec709, srgb, rec2100pq, rec2100hlg...) instead of the sequence's; an HDR sequence delivered in SDR is tone mapped"},
             "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"An HDR sequence delivered in SDR: \"\" Montage's roll-off, or ITU-R BT.2446 Method A or C (a sequence graded scene-referred goes through its output transform instead)"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
-            "film_grain":{"type":"string","description":"AV1 exports: carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned, or the name it was saved under (the project's, else the user's library's): that grain for every shot; \"off\" (the default): none"},
+            "film_grain":{"type":"string","description":"AV1 exports, and streaming packages whose rungs are all AV1 (each rung's parameters fitted again at its size): carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned, or the name it was saved under (the project's, else the user's library's): that grain for every shot; \"off\" (the default): none"},
+            "regions":{"type":"array","description":"Regions coded finer (H.264, HEVC and VP9): parts of the picture given more of the bits, each frame's passed to the encoder as regions of interest. Each is {kind: \"box\" (x, y, w, h: fractions of the frame, from its top left), \"mask\" (the masks of clip `clip`, or of every clip with masks; `effect` for one effect's mask, as tracked) or \"faces\" (each face found), strength: 0 to 1, default 0.5 (at 1, a fifth of the encoder's quantiser range finer)}; where they overlap the stronger wins. VP9 with regions codes in its real-time mode, as libvpx takes them only there. In a streaming package, boxes and masks go to its H.264 and HEVC rungs, each at its own size",
+                "items":{"type":"object","properties":{"kind":{"type":"string","enum":["box","mask","faces"]},"strength":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"w":{"type":"number"},"h":{"type":"number"},"clip":{"type":"integer"},"effect":{"type":"integer"}}}},
+            "region_report":{"type":"boolean","default":false,"description":"With regions: the export made again without them and both measured against a lossless render: luma PSNR inside and outside the regions, VMAF of the whole picture, and both sizes"},
             "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
@@ -13838,10 +13900,11 @@ void McpServer::Impl::addTools() {
             "as11":{"type":"object","additionalProperties":{"type":["string","number","boolean"]},"description":"AS-11 metadata by the names AS-11 gives them: core (SeriesTitle, ProgrammeTitle, EpisodeTitleNumber, ShimName, ShimVersion, AudioTrackLayout, PrimaryAudioLanguage, ClosedCaptionsPresent/Type/Language) and UK DPP (ProductionNumber, Synopsis, Originator, CopyrightYear, Distributor, PSEPass, SecondaryAudioLanguage, LineUpStart, IdentClockStart, CompletionDate, ContactEmail, ContactTelephoneNumber...). Unset ones come from the sequence: its name, languages, captions; line-up and clock from markers named Line-up and Clock, parts from markers with a duration named Part ..."},
             "anc_captions":{"type":"string","enum":["none","cea708","teletext","both"],"default":"none","description":"In a broadcast MXF delivery: the caption track as ancillary data (ST 436): CEA-708 caption packets (with 608) and/or OP-47 teletext subtitles"},
             "teletext_page":{"type":"integer","default":888,"description":"The teletext subtitle page (100 to 899)"},
-            "credentials":{"type":"object","description":"Sign it with Content Credentials (C2PA, as Premiere does): a signed record in the file that Montage made it, each AI model that generated or changed what is in the range, and the credentials its sources carried. MP4, MOV, WAV, MP3, JPEG, PNG and TIFF",
+            "credentials":{"type":"object","description":"Sign it with Content Credentials (C2PA): a signed record in the file that Montage made it, each AI model that generated or changed what is in the range, and the credentials its sources carried. In MP4, MOV, WAV, MP3, JPEG, PNG and TIFF files; beside other files and numbered frames (name.c2pa)",
                 "properties":{"certificate":{"type":"string","description":"The signing certificate chain (PEM, the signing certificate first; issued by a certificate authority, for digital signatures with e-mail protection or document signing use)"},
                     "key":{"type":"string","description":"Its private key (PEM)"},
-                    "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"}},"required":["certificate","key"]},
+                    "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"},
+                    "redact":{"type":"boolean","default":false,"description":"Leave out of them the sources' assertions that name people"}},"required":["certificate","key"]},
             "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph","mv"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), one picture, or mv: spatial video (both eyes coded as MV-HEVC in a MOV or MP4, for Vision Pro; needs the libx265 codec, 8-bit SDR)"},
             "spatial_baseline_mm":{"type":"number","default":64,"description":"Spatial video: the distance between the cameras' lenses (mm)"},
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
@@ -14130,6 +14193,22 @@ void McpServer::Impl::addTools() {
             st.hdr10Plus = a.value("hdr10plus").toBool();
             st.filmGrain = str(a, "film_grain", "").toStdString();
             if (std::string e; !resolveFilmGrainSetting(l.project, st.filmGrain, &e)) throw ArgError{QString::fromStdString(e)};
+            if (a.contains("regions")) {
+                const QJsonValue rv = a.value("regions");
+                if (!rv.isArray()) throw ArgError{"\"regions\" is a list of boxes, masks and faces"};
+                if (std::string e; !codingRegionsFromJson(QJsonDocument(rv.toArray()).toJson(QJsonDocument::Compact).toStdString(), st.regions, &e))
+                    throw ArgError{QString::fromStdString(e)};
+                if (!st.regions.empty() && a.contains("farm")) throw ArgError{"Regions coded finer are made here, not on a render farm"};
+            }
+            const bool regionReport = a.value("region_report").toBool() && !st.regions.empty();
+            std::vector<std::vector<CodedRegion>> regionsGiven;
+            if (regionReport)
+                st.regionsGiven = [&regionsGiven](FrameTime f, const std::vector<CodedRegion>& g) {
+                    if (f >= 0) {
+                        if (regionsGiven.size() <= size_t(f)) regionsGiven.resize(size_t(f) + 1);
+                        regionsGiven[size_t(f)] = g;
+                    }
+                };
             st.adaptiveHdr = a.value("adaptive_hdr").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
@@ -14188,14 +14267,15 @@ void McpServer::Impl::addTools() {
             if (stems != "none" && stems != "tracks" && stems != "buses" && stems != "roles")
                 throw ArgError{"\"stems\" must be none, tracks, buses or roles"};
             if (a.contains("credentials") && !a.value("credentials").isObject())
-                throw ArgError{"\"credentials\" is an object: {certificate, key, allow_ai_training}"};
+                throw ArgError{"\"credentials\" is an object: {certificate, key, allow_ai_training, redact}"};
             if (a.value("credentials").isObject()) {
                 const QJsonObject c = a.value("credentials").toObject();
                 st.credentialCertificate = absolute(need(c, "certificate")).toStdString();
                 st.credentialKey = absolute(need(c, "key")).toStdString();
                 st.credentialAllowAiTraining = c.value("allow_ai_training").toBool();
+                st.credentialRedact = c.value("redact").toBool();
                 if (!contentCredentialsAvailable()) throw ArgError{"This build of Montage cannot sign with Content Credentials (no C2PA library)"};
-                if (!exportCarriesCredentials(st)) throw ArgError{"Content Credentials cannot go in this kind of export (a single mp4, mov, wav, mp3, jpg, png or tif file can hold them)"};
+                if (!exportCarriesCredentials(st)) throw ArgError{"Content Credentials cannot go in a GIF"};
                 std::string why;
                 if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
             }
@@ -14239,6 +14319,10 @@ void McpServer::Impl::addTools() {
                 ss.audioBitrate = so.value("audio_bitrate").toInteger(128000);
                 if (ss.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
                 ss.startDate = str(so, "start_date").toStdString();
+                // (grain carried as parameters on AV1 rungs; boxes and masks coded finer on H.264 and HEVC rungs)
+                ss.filmGrain = st.filmGrain;
+                ss.regions = st.regions;
+                if (regionReport) throw ArgError{"\"region_report\" is for a file, not a streaming package"};
                 const std::string codec = str(so, "codec", "libx264").toStdString();
                 for (const QJsonValue& v : so.value("ladder").toArray()) {
                     const QJsonObject r = v.toObject();
@@ -14281,6 +14365,18 @@ void McpServer::Impl::addTools() {
                     o["per_shot"] = rungs;
                     o["ladder_report"] = QString::fromStdString(res.ladderReport);
                 }
+                if (!res.grain.empty()) {
+                    // (each rung's grain: the frames given it and the bytes its parameters added)
+                    QJsonArray rungs;
+                    for (const StreamingResult::RungGrain& g : res.grain) {
+                        rungs.append(QJsonObject{{"rendition", QString::fromStdString(g.rendition)}, {"frames_with_grain", double(g.framesWithGrain)},
+                                                 {"bytes_added", double(g.bytesAdded)}});
+                        text += QStringLiteral("\n%1: grain carried as parameters on %2 frames (%3 bytes)")
+                                    .arg(QString::fromStdString(g.rendition)).arg(g.framesWithGrain).arg(g.bytesAdded);
+                    }
+                    o["grain"] = rungs;
+                    for (const std::string& n : res.grainNotes) text += QStringLiteral("\n") + QString::fromStdString(n);
+                }
                 for (const std::string& w : res.warnings) text += QStringLiteral("\n") + QString::fromStdString(w);
                 return ok(text, o);
             }
@@ -14318,6 +14414,22 @@ void McpServer::Impl::addTools() {
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
             // Smart rendering: pictures of untouched footage copied from the source, not encoded again.
             o["copied_frames"] = copiedFrames;
+            if (regionReport) {
+                // (the same export made again without its regions, both measured inside and outside them)
+                RegionReport rr;
+                if (!regionCodingReport(l.project, s, st, regionsGiven, rr, cancelFlag(), &err)) return fail(QString::fromStdString(err));
+                o["regions"] = QJsonObject{{"bytes", double(rr.bytes)},
+                                           {"bytes_without", double(rr.bytesWithout)},
+                                           {"psnr_inside", rr.psnrInside},
+                                           {"psnr_outside", rr.psnrOutside},
+                                           {"psnr_inside_without", rr.psnrInsideWithout},
+                                           {"psnr_outside_without", rr.psnrOutsideWithout},
+                                           {"vmaf", rr.vmaf},
+                                           {"vmaf_without", rr.vmafWithout},
+                                           {"frames_with_regions", double(rr.framesWithRegions)},
+                                           {"inside_share", rr.insideShare}};
+                text += QStringLiteral("\n") + QString::fromStdString(rr.summary());
+            }
             if (copiedFrames > 0) text += QStringLiteral("\n%1 frame%2 copied from the source as coded (smart rendering)").arg(copiedFrames).arg(copiedFrames == 1 ? "" : "s");
             if (hrd.checked || !hrd.error.empty()) {
                 // (checked after a long-GOP smart render or a stated HRD; a file that does not keep it is kept, warned about)
@@ -15742,7 +15854,12 @@ void McpServer::Impl::addTools() {
             "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true},
             "fdl":{"type":"boolean","default":true},
             "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false},
-            "st_maps":{"type":"boolean","default":false}},
+            "st_maps":{"type":"boolean","default":false},
+            "scale_handles":{"type":"boolean","default":false,"description":"Handles scaled by each shot's speed at its ends (400 % with 8 handles: 32 source frames)"},
+            "plate_metadata":{"type":"boolean","default":true,"description":"OpenEXR: the source's timecode, reel, camera, lens and frame numbers in OpenEXR's standard header attributes"},
+            "clip_negative":{"type":"boolean","default":false,"description":"OpenEXR: values below 0 clipped to 0"},
+            "clip_over":{"type":"boolean","default":false,"description":"OpenEXR: values over 1 clipped to 1"},
+            "camera":{"type":"boolean","default":true,"description":"A solved shot's camera as Nuke's .chan beside its plate, read by its script"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -15757,6 +15874,11 @@ void McpServer::Impl::addTools() {
             o.sourceLayers = a.value("source_layers").toBool();
             o.mattes = a.value("mattes").toBool();
             o.stMaps = a.value("st_maps").toBool();
+            o.scaleHandles = a.value("scale_handles").toBool();
+            o.plateMetadata = a.value("plate_metadata").toBool(true);
+            o.clipNegative = a.value("clip_negative").toBool();
+            o.clipOver = a.value("clip_over").toBool();
+            o.camera = a.value("camera").toBool(true);
             o.namePattern = str(a, "name_pattern").toStdString();
             o.scripts = a.value("scripts").toBool();
             // (the sequence's returns folder and naming kept unless others are given)
@@ -15781,6 +15903,7 @@ void McpServer::Impl::addTools() {
                                {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}};
                 if (!s.fdl.empty()) sh["fdl"] = QString::fromStdString(s.fdl);
                 if (!s.script.empty()) sh["script"] = QString::fromStdString(s.script);
+                if (!s.chan.empty()) sh["camera"] = QString::fromStdString(s.chan);
                 if (!s.undistortMap.empty()) {
                     sh["undistort_map"] = QString::fromStdString(s.undistortMap);
                     sh["redistort_map"] = QString::fromStdString(s.redistortMap);
@@ -16097,12 +16220,14 @@ void McpServer::Impl::addTools() {
     add("montage_export_timeline", "Export the timeline",
         "Write the active sequence as an EDL, OpenTimelineIO, Final Cut Pro 7 XML (Premiere, Resolve), FCPXML (Final Cut "
         "Pro) or AAF (Pro Tools, Fairlight, Media Composer: the audio tracks linked to mono WAVs written to a \"<name> "
-        "Media\" folder beside it, with crossfades, fades and clip gain; the video tracks linked to the original files, "
-        "with dissolves and constant speed, unless picture is false). With avid_media, an AAF for Media Composer with the "
+        "Media\" folder beside it, with crossfades, fades, clip gain and pan with their keys, and each track's volume and pan "
+        "with its automation, or with bake_automation the track's volume played into its clips' gain; the video tracks "
+        "linked to the original files, with dissolves, constant speed and speed ramps, unless picture is false). With avid_media, an AAF for Media Composer with the "
         "cut's media written as it keeps its own: MXF OP-Atom (DNxHD or DNxHR picture at the sequence's size and rate, mono "
         "PCM sound) in a new numbered folder of \"Avid MediaFiles/MXF\" on the drive, so the sequence opens linked.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml","aaf"]},
             "output":{"type":"string"},"picture":{"type":"boolean","description":"AAF: include the video tracks (default true)"},
+            "bake_automation":{"type":"boolean","description":"AAF: each track's volume and its automation played into its clips' gain (default false: written as the track's own)"},
             "fcpxml_version":{"type":"string","enum":["1.15","1.10"],"description":"FCPXML: the version written (default 1.15)"},
             "avid_media":{"type":"object","description":"AAF: write the media for Media Composer","properties":{
                 "drive":{"type":"string","description":"Where \"Avid MediaFiles\" goes (default: the AAF's folder)"},
@@ -16120,6 +16245,8 @@ void McpServer::Impl::addTools() {
                 AafExportOptions o;
                 const QJsonValue pv = a.value("picture");
                 o.picture = pv.isString() ? pv.toString().compare("false", Qt::CaseInsensitive) != 0 && pv.toString() != "0" : pv.toBool(true);
+                const QJsonValue bv = a.value("bake_automation");
+                o.bakeAutomation = bv.isString() ? bv.toString().compare("true", Qt::CaseInsensitive) == 0 || bv.toString() == "1" : bv.toBool(false);
                 if (a.contains("avid_media")) {
                     if (!a.value("avid_media").isObject()) throw ArgError{"avid_media must be an object"};
                     const QJsonObject av = a.value("avid_media").toObject();
@@ -16149,7 +16276,7 @@ void McpServer::Impl::addTools() {
                 for (const std::string& w : r.warnings) warnings.append(QString::fromStdString(w));
                 QJsonObject res{{"output", out}, {"audio_tracks", r.audioTracks}, {"clips", r.clips},
                                 {"crossfades", r.transitions}, {"video_tracks", r.videoTracks}, {"video_clips", r.videoClips},
-                                {"dissolves", r.videoTransitions}, {"media", files}, {"warnings", warnings}};
+                                {"dissolves", r.videoTransitions}, {"track_lanes", r.trackLanes}, {"media", files}, {"warnings", warnings}};
                 if (o.avid.enabled) res["media_folder"] = QString::fromStdString(r.mediaFolder);
                 return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 %6 files; %7 video tracks, %8 clips, %9 dissolves")
                               .arg(out).arg(r.audioTracks).arg(r.clips).arg(r.transitions).arg(files.size())

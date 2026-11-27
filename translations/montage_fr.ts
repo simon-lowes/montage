@@ -6672,6 +6672,10 @@
         <source>Samples (0: Auto)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Lit as Drawn Alone (in the 3D layers&apos; scene)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -12988,10 +12992,6 @@ The certificate must be issued by a certificate authority (not signed by itself)
         <translation type="unfinished">Cette construction de Montage ne peut pas signer (pas de bibliothèque C2PA)</translation>
     </message>
     <message>
-        <source>Content Credentials cannot go in %1 exports: a single MP4, MOV, WAV, MP3, JPEG, PNG or TIFF file can hold them</source>
-        <translation type="unfinished">Les pouvoirs de contenu ne peuvent pas être utilisés dans les exportations %1 : un seul fichier MP4, MOV, WAV, MP3, JPEG, PNG ou TIFF peut les contenir</translation>
-    </message>
-    <message>
         <source>A signed record in the file of who made it, with what, and each AI model that generated or changed it, with the credentials its sources carried; checked at contentcredentials.org/verify. Like Premiere&apos;s Content Credentials.</source>
         <translation type="unfinished">Un enregistrement signé dans le fichier de qui l&apos;a fait, avec quoi, et chaque modèle d&apos;IA qui l&apos;a généré ou modifié, avec les pouvoirs que ses sources portaient; vérifié à contentcredentials.org/verify. Comme les pouvoirs de contenu de Premiere.</translation>
     </message>
@@ -13255,10 +13255,6 @@ Do you want to replace it?</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>JPEG XS&apos;s rate: each picture the same number of bytes, its width times its height times this, over 8</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>JPEG XS:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -13420,6 +13416,58 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>, no more than %1 kbit/s with its decoder model stated</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS&apos;s rate: each picture the same number of bytes, its width times its height times this, over 8; or lossless, each picture as many bytes as it takes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Leave out the names of people in the sources&apos; credentials</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The sources&apos; assertions that name their authors or signers are redacted from the new credentials</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Content Credentials cannot go in %1 exports</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Code regions finer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Parts of the picture given more of the bits than the rest, each frame&apos;s passed to the encoder: H.264, HEVC and VP9 (VP9 then codes in its real-time mode)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Faces</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each face found in the picture, a little larger than the face</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip masks</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The bounds of every clip&apos;s effect masks, as their keys and trackers move them</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Box</source>
+        <translation type="unfinished">Boîte</translation>
+    </message>
+    <message>
+        <source>A rectangle of the frame: its left, top, width and height in percent of the frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How much finer than the rest: at 100 %, a fifth of the encoder&apos;s quantiser range</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -24117,6 +24165,114 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <source>FCPXML 1.15 (*.fcpxml);;FCPXML 1.10 (*.fcpxml)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Pre&amp;ferences…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scale the handles by each shot&apos;s speed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A shot at 400 % with 8 handles pulls 32 source frames either side</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip values below 0</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip values over 1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source> (%n frame(s) copied without coding again)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>, %n clip(s) baked</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>, %n clip(s) nothing shows left out</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Project Manager</source>
+        <translation type="unfinished">Gestionnaire de projet</translation>
+    </message>
+    <message numerus="yes">
+        <source>%n clip(s) nothing shows were left out of the new project.</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Save Grain Profile…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain as Decoded</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Program monitor shows each shot cleaned of its grain with the grain put back from AV1 film grain parameters, as a player&apos;s decoder puts it back (paused frames at full resolution)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain as Decoded is off: the sequence changed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save Grain Profile</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This project and my library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep in:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not save the profile: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Saved the grain of %1 as the profile %2, in this project and your library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Saved the grain of %1 as the profile %2 in this project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain as Decoded needs a sequence with something in it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Measuring each shot&apos;s grain…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain as Decoded: %1 of %2 shots carry grain as parameters</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -28117,6 +28273,616 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     </message>
 </context>
 <context>
+    <name>montage::Preferences</name>
+    <message>
+        <source>General</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Media</source>
+        <translation type="unfinished">Médias</translation>
+    </message>
+    <message>
+        <source>Playback</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sound</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Editing</source>
+        <translation type="unfinished">Édition</translation>
+    </message>
+    <message>
+        <source>Programs</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Libraries</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Models</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Network</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Language</source>
+        <translation type="unfinished">Langue</translation>
+    </message>
+    <message>
+        <source>The language Montage&apos;s menus and windows are in; the system&apos;s own unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High contrast</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colours with more contrast between text, controls and their backgrounds.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Text size</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How much larger than the system&apos;s own the text is drawn.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>times</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Background jobs at once</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How many background jobs (renders, analyses, transcriptions) run side by side.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Growing files looked at every</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How often media that is still being recorded is looked at again for what was added; 0 to look only when asked.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ms</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Numbered stills as one clip</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Imported stills numbered one after another come in as a single clip.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Layered still images</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How a layered image file comes in: merged into one picture, as a layer on a track each, or as a sequence of its layers.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Merged</source>
+        <translation type="unfinished">Fusionné</translation>
+    </message>
+    <message>
+        <source>A track for each layer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A sequence of the layers</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Copy library sounds into the project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A sound added from the sound library is copied into a Sounds folder beside the saved project.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Depth analysis folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Where the depth of analysed video is kept; Montage&apos;s cache folder unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Depth analysis kept</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How much depth analysis is kept: the analyses unchanged longest go first.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>GB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Browser graphics folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Where rendered browser graphics are kept; Montage&apos;s cache folder unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Browser graphics kept</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How much of the rendered browser graphics is kept: the oldest renders go first.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Deep images held</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How much memory deep images are held in while they are composited.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Render on the GPU</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frames are composited on the graphics card when it can; otherwise on the processor.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Texture budget</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The graphics card memory the GPU compositor keeps its textures in; 0 for half the card&apos;s memory.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Share the GPU with effects</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plug-in effects that draw on the graphics card share its frames with the compositor instead of copying them.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pass frames to isolated effects on the GPU</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A plug-in effect running in its own process is handed frames on the graphics card rather than copied through memory.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hardware decoding</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Video is decoded by the graphics card where it can.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR viewer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The viewer shows HDR pictures in HDR on a display that can show them.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Latch writes from the start</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In Latch, automation is written from where playback starts, not from the first touch.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fold trim into the automation</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>When a pass in Trim ends, its trim is folded into the automation under it.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plug-ins run</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Which plug-ins share a process: a fault in one stops only the plug-ins beside it.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each plug-in in its own process</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each instance in its own process</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each maker&apos;s in their own process</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>All in one process</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Inside Montage</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Blocks a plug-in may miss</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How many blocks of sound in a row an isolated plug-in may be late with before it is restarted.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Silence a stopped plug-in</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>While an isolated plug-in restarts, its track is silent instead of passing its sound through.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plug-in wait in exports</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How long an export waits for an isolated plug-in&apos;s block before the export fails.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plug-in memory limit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The memory an isolated plug-in&apos;s process may use before it is stopped; 0 for no limit.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plug-in restarts</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How often an isolated plug-in that stopped is started again before it is left off.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sequences go in as one clip</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A sequence dropped into another goes in as one clip rather than as its own clips.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Image editor</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The program Edit in Another Application opens stills in; asked for the first time when none is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Python</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Python 3 scripts run with; python3 on the path unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Browser for graphics</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The program browser graphics are drawn in; Chrome, Chromium or Edge where installed unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lens database</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The folder of lens profiles lenses are corrected from; the downloaded or installed one unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Your lenses</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Where the lenses you calibrate are kept; Montage&apos;s data folder unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sound library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The sound library&apos;s catalogue file; one in Montage&apos;s data folder unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Graphics templates</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The folder graphics templates are kept in.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scripts</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The folder scripts are kept in.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI maps</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The folder MIDI controller maps are kept in.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Grain profiles</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The file film grain profiles are kept in.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Models folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Where downloaded models are kept; Montage&apos;s data folder unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Speech models</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Where the speech recognition models transcripts are made with are kept.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Speech models downloaded from</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The address speech recognition models are downloaded from, for a copy kept nearer; empty for their own.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Quality models</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The folder the HDR picture quality model is looked for in; one beside Montage unless one is chosen.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Models run on</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Where models run: the fastest device, the one that uses least power, or the processor.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The fastest device</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The most efficient device</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The processor</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Agent link</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Assistants on this computer may drive Montage through its agent link.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OSC control</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Montage listens for OSC messages.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OSC port</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The port OSC messages are listened for on.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OSC from other computers</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OSC messages are taken from other computers, not only this one.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OSC feedback port</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The port Montage&apos;s state is sent back to; 0 to send none.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OSC may run tools</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OSC messages may run the agent tools, which can change the project.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OMT discovery server</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The server network video sources are found through; found on the local network unless one is named.</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>montage::PreferencesDialog</name>
+    <message>
+        <source>Preferences</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Search the settings</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No setting has those words in its name or description.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Restore</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Use the default again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Used from when Montage next starts.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save to File…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Read from File…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Restore All</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save Settings</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Montage settings (*.json)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Read Settings</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>These were passed over (locked here, or not Montage&apos;s settings): %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Use every setting&apos;s default again?</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The system&apos;s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Montage&apos;s own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The one Montage finds</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose…</source>
+        <translation type="unfinished">Choisir…</translation>
+    </message>
+    <message>
+        <source>Choose a Folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose a File</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the system&apos;s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the one Montage finds</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Default: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Overridden by %1 in the environment: that is used, whatever is set here.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Locked by the facility&apos;s settings file %1, so it cannot be changed here.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Default: on</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Default: off</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>montage::ProductionPanel</name>
     <message>
         <source>No production open (File › Production › Open Production)</source>
@@ -28260,6 +29026,198 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     <message>
         <source>Copy Project</source>
         <translation type="unfinished">Copier le projet</translation>
+    </message>
+    <message>
+        <source>Save…</source>
+        <translation type="unfinished">Enregistrer…</translation>
+    </message>
+    <message>
+        <source>Save Preset</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Preset name:</source>
+        <translation type="unfinished">Nom du préréglage:</translation>
+    </message>
+    <message>
+        <source>Save Consolidate Preset</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The project could not be changed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In the project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In my library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Compare…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>What this preset sets differently from the presets of the same name it overrides</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Compare Preset</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Preset:</source>
+        <translation type="unfinished">Préréglage:</translation>
+    </message>
+    <message>
+        <source>For finishing: the parts used, in their own formats</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>For finishing: the parts used, as image sequences</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cut without coding again where the format allows; other formats are transcoded to ProRes 422 HQ</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Seconds</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frames</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Timecode</source>
+        <translation type="unfinished">Code horaire</translation>
+    </message>
+    <message>
+        <source>None</source>
+        <translation type="unfinished">Aucune</translation>
+    </message>
+    <message>
+        <source>The whole file</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> frames</source>
+        <translation type="unfinished"> cadres</translation>
+    </message>
+    <message>
+        <source>DNxHR HQ (.mov)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>H.265 (.mp4)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>FFV1, lossless (.mkv)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each file&apos;s own, where it is one of these</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OpenEXR (half float)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>DPX (10-bit)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>TIFF (16-bit)</source>
+        <translation type="unfinished">TIFF (16 bits)</translation>
+    </message>
+    <message>
+        <source>Image sequences:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each file&apos;s own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The working space</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour space:</source>
+        <translation type="unfinished">Espace de couleur:</translation>
+    </message>
+    <message>
+        <source>Each source&apos;s own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A pattern of {sequence}, {shot}, {clip}, {reel}, {tape}, {scene}, {take} and, for image sequences, {frame}</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Names:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How many of each source&apos;s folders are kept above it in the new Media folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Source folders kept:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Leave out clips nothing shows (disabled, or hidden under clips above)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Bake in grades, effects and speed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sound: only the parts used, as WAV</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>facility</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 (%2)</source>
+        <translation type="unfinished">%1 (%2)</translation>
+    </message>
+    <message>
+        <source>There is no preset called %1.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The %1 preset %2 sets nothing differently from the levels above it.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The %1 preset %2 sets:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1: %2 (the %3 gives %4)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>nothing</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -33929,6 +34887,34 @@ so the jump in the picture morphs across instead of cutting</source>
     <message>
         <source>This display does not show HDR</source>
         <translation type="unfinished">Cet écran ne montre pas HDR</translation>
+    </message>
+    <message>
+        <source>HLG</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PQ (converted from HLG)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PQ</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR</source>
+        <translation type="unfinished">HDR</translation>
+    </message>
+    <message>
+        <source>SDR</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>SDR: this display does not take HDR</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>SDR: %1</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

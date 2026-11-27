@@ -6,9 +6,10 @@
 // One duplex stream at a time, kept by the Engine: playback (each PlaybackController) adds outputs to it, recordings
 // (Record Voiceover, ADR, talkback) add inputs. Each client works at its own sample rate (the sequence's); where the
 // device runs at another, its sound is resampled both ways. Every input block comes with the timeline sample it
-// belongs at: the sample the clock's playback was sending out in that block, less the round trip (the device's
-// reported input and output latencies, or a loopback measured where the user ran one), so a recording lands where
-// what was heard was played. Xruns (the device's own reports, or a callback too late) are counted.
+// belongs at: the sample the clock's playback had sent out a round trip of the device's frames before it (the device's
+// reported input and output latencies, or a loopback measured where the user ran one), counted in the device's own
+// frames from what each callback took, not from when the callbacks ran, so a recording lands where what was heard was
+// played. Xruns (the device's own reports, or a callback too late) are counted.
 //
 // The device's callback only copies: sound is mixed a few blocks ahead on the engine's feed thread and waits in a ring,
 // and what the inputs bring is handed on from a ring by the same thread. The callback takes no lock, allocates nothing
@@ -150,6 +151,14 @@ struct LoopbackOptions {
     int unreported = 0;                         // more frames of round trip it does not report
     bool unplugged = false;                     // gone (as a device unplugged): the one open is lost, none opens
     int openMs = 0;                             // how long an open takes (as a system listing its devices first)
+    // Callbacks as a busy computer has them, chosen by `seed` (0 none; the same seed, the same callbacks): about one in
+    // `lateEvery` run a buffer late (and the next made up at once after it), about one in `doubleEvery` taking two
+    // buffers at once (its round trip then never less than two buffers).
+    uint32_t seed = 0;
+    int lateEvery = 0, doubleEvery = 0;
+    // The device named ("loopback") gone, as an interface unplugged while the computer's own sound stays: the one open
+    // by that name is lost and none opens by it, while the host's default (no device named) still opens.
+    bool away = false;
 };
 void setLoopbackOptions(const LoopbackOptions& o);
 LoopbackOptions loopbackOptions();
@@ -158,6 +167,12 @@ LoopbackOptions loopbackOptions();
 // (an overload).
 void loopbackChangeRate(int rate, int reportedOutput = -1);
 void loopbackStall(int ms);
+// The loopback open now: the frames its outputs have taken, and of them those with sound on the first output (its own
+// count, for checking what Montage counts as played); zero with none open.
+struct LoopbackCounts {
+    int64_t frames = 0, sounding = 0;
+};
+LoopbackCounts loopbackCounts();
 
 // JACK: the library that would be loaded (MONTAGE_JACK_LIBRARY, PipeWire's, then the system's), "" when none loads.
 std::string jackLibrary();
@@ -180,6 +195,7 @@ struct EngineStatus {
     int cushion = 0;         // frames mixed ahead of the device
     int64_t resamplers = 0;  // resamplers built since the engine began (on the feed thread, never in the callback)
     bool standIn = false;    // the device named is gone: the host's own choice plays until it is back
+    int64_t standInRetries = 0;  // times the device named was asked for again while the host's own choice stood in
     int rateChanges = 0;    // times the device's rate changed while open
     std::vector<std::string> ports;
     std::string clock;
@@ -216,6 +232,9 @@ public:
     // The seconds of an output heard so far: what it has sent less the output latency (the picture's clock); -1 when
     // it is not running.
     double heardSeconds(int id) const;
+    // The frames of an output's own (at its rate) that the device has taken: what it has played, not what has been
+    // mixed ahead of it; -1 when it is not running.
+    int64_t takenFrames(int id) const;
 
     // An input: every block of the device's inputs (all of them, interleaved, at `rate`), with the timeline sample its
     // first frame belongs at: the output of `clockOwner`'s sent out beside it less the round trip (-1 when that plays
@@ -273,9 +292,11 @@ public:
     int channels() const { return channels_; }
     int64_t room() const;                              // frames that can be pushed now
     int64_t push(const float* interleaved, int frames);  // as many as there is room for; the frames taken
-    int64_t queued() const;                            // pushed and not yet played
-    int64_t played() const;                            // frames played since open
-    int64_t starved() const;                           // frames the device asked for while something was owed
+    int64_t queued() const;                            // pushed and not yet mixed for the device
+    // Frames played since open, and frames the device found missing while something was owed: both as the device took
+    // them, not as they were mixed ahead of it.
+    int64_t played() const;
+    int64_t starved() const;
     void clear();                                      // what is queued let go
 
     struct Ring;

@@ -1410,8 +1410,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 o.vctx->bit_rate = 0;
             }
             av_dict_set(&opts, "row-mt", "1", 0);
-            av_dict_set(&opts, "deadline", s.preset.empty() ? "good" : s.preset.c_str(), 0);
-            av_dict_set(&opts, "cpu-used", "4", 0);
+            if (!s.regions.empty()) {
+                // (libvpx takes VP9's regions in its real-time mode only, at speed 5 or more, its own adaptive
+                // quantisation off)
+                av_dict_set(&opts, "deadline", "realtime", 0);
+                av_dict_set(&opts, "cpu-used", "5", 0);
+                av_dict_set(&opts, "aq-mode", "0", 0);
+            } else {
+                av_dict_set(&opts, "deadline", s.preset.empty() ? "good" : s.preset.c_str(), 0);
+                av_dict_set(&opts, "cpu-used", "4", 0);
+            }
         } else if (c == "libaom-av1" && (s.hrd == "cbr" || s.hrd == "vbr")) {
             // libaom with a stated HRD: AV1's decoder model in its sequence header (timing and decoder model info,
             // each operating point's buffer delays) and in every frame header (its removal time), at the rate asked:
@@ -1936,8 +1944,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering of long-GOP video (render/LongGopCopy.h): planned before the header, which carries the copied
     // sources' parameter sets. Only where nothing would change the source's pictures for the whole export, as below.
     std::unique_ptr<LongGopCopier> longGop;
-    if (wantVideo && s.smartRender && o.vctx && !o.spatial && !av2Out && !o.prores && !floatFrames && W == seq.width && H == seq.height && !seq.stereo3d && !s.useProxies &&
-        !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && !s.alpha && !wantHdr10 && !wantAdaptive && sameColorSpace(outSpace, seqSpace) &&
+    if (wantVideo && s.smartRender && s.regions.empty() && o.vctx && !o.spatial && !av2Out && !o.prores && !floatFrames && W == seq.width && H == seq.height &&
+        !seq.stereo3d && !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && !s.alpha && !wantHdr10 && !wantAdaptive && sameColorSpace(outSpace, seqSpace) &&
         !trim && !sceneReferredWorking(seq) && !conv.active() && s.profile != "avci100") {
         LongGopEncoder lge;
         lge.preset = s.preset;
@@ -2417,6 +2425,24 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         std::memcpy(sd->data, cc.data(), cc.size());
         return true;
     };
+    // Regions coded finer: each frame's rectangles as the encoder's regions of interest (faces found in the frame as
+    // delivered).
+    auto attachRegions = [&](FrameTime f, FrameTime rel, const Image* shown) {
+        if (s.regions.empty()) return true;
+        av_frame_remove_side_data(o.vframe, AV_FRAME_DATA_REGIONS_OF_INTEREST);
+        const std::vector<CodedRegion> given = codedRegionsAt(p, seq, s.regions, f, W, H, shown);
+        if (s.regionsGiven && s.pass != 1) s.regionsGiven(rel, given);
+        if (given.empty()) return true;
+        AVFrameSideData* sd = av_frame_new_side_data(o.vframe, AV_FRAME_DATA_REGIONS_OF_INTEREST, given.size() * sizeof(AVRegionOfInterest));
+        if (!sd) return false;
+        auto* r = reinterpret_cast<AVRegionOfInterest*>(sd->data);
+        for (size_t i = 0; i < given.size(); ++i) {
+            r[i].self_size = sizeof(AVRegionOfInterest);
+            r[i].top = given[i].top, r[i].bottom = given[i].bottom, r[i].left = given[i].left, r[i].right = given[i].right;
+            r[i].qoffset = av_make_q(int(std::lround(given[i].qoffset * 10000)), 10000);
+        }
+        return true;
+    };
     const bool burns = (s.burnInCaptions && captions) || s.burnIn.any();
     const bool packedEyes = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
     // At another rate, captions and burn-ins go on the delivered frames (so an in-between does not ghost them, the
@@ -2754,7 +2780,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             }
             o.vframe->pts = f - din;
             if (interlacedOut) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
-            if (!attach608(f - din)) return fail("Out of memory");
+            if (!attach608(f - din) || !attachRegions(f, f - din, &img)) return fail("Out of memory");
             if (longGop) {
                 if (!longGop->encode(o.vframe, f - din, &longGopError)) return fail(longGopError);
             } else {
@@ -3016,9 +3042,18 @@ bool containerCarriesStreams(const std::string& path) {
 }
 
 bool exportCarriesCredentials(const ExportSettings& s) {
-    // One file of a kind that holds them (not numbered frames, nor a GIF).
-    static const std::set<std::string> frames{"png", "tiff", "exr", "dpx", "jxl", "gif"};
-    return contentCredentialsFormat(s.path) && !frames.count(s.videoCodec);
+    // In a file of a kind that holds them; beside any other file and beside numbered frames (media/ContentCredentials.h);
+    // not a GIF.
+    return !s.path.empty() && s.videoCodec != "gif";
+}
+
+std::string exportSignedPath(const ExportSettings& s) {
+    // (numbered frames as exportImpl names them: the path's own number, or one put before the extension)
+    if (!exportIsImageSequence(s) || s.path.find('%') != std::string::npos) return s.path;
+    std::string out = s.path;
+    const size_t slash = out.find_last_of("/\\"), dot = out.find_last_of('.');
+    out.insert(dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : out.size(), "_%06d");
+    return out;
 }
 
 namespace {
@@ -3269,6 +3304,7 @@ bool exportInTwoPasses(const Project& p, const Sequence& seq, const ExportSettin
     first.credentialKey.clear();
     first.smartRender = false;
     first.hdr10Plus = first.adaptiveHdr = false;  // (measured for the second)
+    first.regionsGiven = {};                      // (told once, by the second)
     struct Remove {
         QStringList files;
         ~Remove() {
@@ -3340,6 +3376,24 @@ namespace {
 bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                         const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                         LightLevels* light, bool* keptUnsigned) {
+    if (!s.regions.empty()) {
+        // (regions coded finer: refused before anything is rendered where the encoder cannot take them)
+        std::string why;
+        if (!checkCodingRegions(s.regions, &why)) {
+        } else if (!encoderTakesRegions(s.videoCodec)) {
+            why = "Regions coded finer go to H.264 (x264), HEVC (x265) or VP9 only";
+        } else if (s.interlaced) {
+            why = "Regions coded finer cannot be coded interlaced";
+        } else if (!s.rateChange.empty()) {
+            why = "Regions coded finer cannot go with a frame rate change";
+        } else if (!s.mxfDelivery.empty() || s.profile == "avci100") {
+            why = "Regions coded finer cannot go in this kind of file";
+        }
+        if (!why.empty()) {
+            if (error) *error = why;
+            return false;
+        }
+    }
     if (s.twoPass && s.pass == 0) return exportInTwoPasses(p, seq, s, progress, cancel, error, encoderUsed, smartRendered, light, keptUnsigned);
     if (!s.mxfDelivery.empty()) {
         if (keptUnsigned) *keptUnsigned = false;
@@ -3437,8 +3491,9 @@ bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSetti
         CredentialOptions o;
         o.allowAiTraining = s.credentialAllowAiTraining;
         o.sources = made.sources;
+        o.redact = s.credentialRedact;
         std::string why;
-        if (!signContentCredentials(s.path, made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
+        if (!signContentCredentials(exportSignedPath(s), made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
             // The render is kept (it may have taken hours), unsigned, and said to be: it can be signed again later.
             if (error) *error = "Could not sign it with Content Credentials (" + why + "); the export is kept, unsigned, at " + s.path;
             if (keptUnsigned) *keptUnsigned = true;

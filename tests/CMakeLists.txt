@@ -26,6 +26,11 @@ if(MONTAGE_HAVE_WEBRTC AND TARGET juice)
   target_link_libraries(test_render PRIVATE juice)
   target_compile_definitions(test_render PRIVATE MONTAGE_TEST_TURN)
 endif()
+if(MONTAGE_HAVE_WEBRTC AND TARGET datachannel)
+  # libdatachannel as a WHIP sender of the test's own, which writes its RTP and RTCP by hand
+  target_link_libraries(test_render PRIVATE datachannel)
+  target_compile_definitions(test_render PRIVATE MONTAGE_TEST_RTC)
+endif()
 # (The DCP tests alone take minutes on a slow container: 317 s in the nightly build's in October 2026.) Qt 6.4's
 # watchdog stops a run 300 s after it starts, whichever function it is in, so the run is given as long as ctest gives it.
 # (In CI in November 2026 the run took 641 s on Linux, with the browser review tests through a relay, and 614 s on macOS.)
@@ -109,9 +114,13 @@ if(MONTAGE_BUILD_APP)
   montage_copy_runtime(test_app)
   montage_test_command(test_app command)
   add_test(NAME test_app COMMAND ${command})
+  # A function that hangs is stopped by Qt's watchdog after its default 300 s, which names it in the log before ctest's
+  # own limit would stop the whole run without saying where (aHungFunctionIsNamed). (The longest function took 62 s
+  # here in November 2026, a minute of wall-clock time by design; the longest that works the processor, 36 s.)
   set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 900)  # (414 s on a macOS runner in November 2026)
-  add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe montage-pluginhost)
+  add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe montage-pluginhost montage-cli)
   target_compile_definitions(test_app PRIVATE
+    MONTAGE_CLI="$<TARGET_FILE:montage-cli>"
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
     MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
     MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"

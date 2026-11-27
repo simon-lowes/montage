@@ -52,13 +52,15 @@ inline int freeTcpPort() {
 }
 
 // A port free for TCP and for UDP alike: a review serves its page over TCP and its media over UDP on the same number,
-// and a TCP port the system hands out can be one some other program (a browser's own WebRTC) holds for UDP.
+// and a TCP port the system hands out can be one some other program (a browser's own WebRTC) holds for UDP. Each UDP
+// try shares the port with no one, as the review's own socket does not: a shared bind (Qt's default on Windows, or the
+// address reuse its default asks for on macOS and Linux) succeeds beside a socket that would keep the review's out.
 inline int freeReviewPort() {
     for (int tries = 0; tries < 50; ++tries) {
         const int port = freeTcpPort();
         const auto udpFree = [port](const QHostAddress& at) {
             QUdpSocket udp;
-            return udp.bind(at, quint16(port));
+            return udp.bind(at, quint16(port), QAbstractSocket::DontShareAddress);
         };
         if (udpFree(QHostAddress::AnyIPv4) && udpFree(QHostAddress::LocalHost)) return port;
     }
