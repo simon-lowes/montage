@@ -48,6 +48,7 @@
 #include <openssl/rand.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include <juice/juice.h>
 #include <rtc/rtc.hpp>
 
 #include "core/ReviewPage.h"
@@ -759,40 +760,43 @@ Planes420 shrink(const Planes420& p, int w, int h) {
     return out;
 }
 
-// A UDP port held for viewers to share: libjuice's socket on it, made before any connection of libdatachannel's, so
-// with Windows' sockets started for it here (a connection starts them otherwise). Throws when the port cannot be had.
+// A UDP port held for viewers to share: libjuice's socket on it, which the viewers' connections then share, made
+// before any connection of libdatachannel's, so with Windows' sockets started for it here (a connection starts them
+// otherwise). Asked of libjuice itself, not through libdatachannel's listener, whose stop can be passed over (its flag
+// of having stopped is never set to false first, so it holds whatever was in its memory): let go, the socket is closed
+// before the destructor returns, unless a viewer's connection still shares it. Throws when the port cannot be had.
 class HeldUdpPort {
 public:
-    HeldUdpPort(uint16_t port, std::optional<std::string> at) {
+    HeldUdpPort(uint16_t port, const std::optional<std::string>& at) : port_(port) {
 #ifdef Q_OS_WIN
         WSADATA data;
         winsock_ = WSAStartup(MAKEWORD(2, 2), &data) == 0;
 #endif
-        try {
-            listener_.emplace(port, std::move(at));
-        } catch (...) {
+        if (juice_mux_listen(at ? at->c_str() : nullptr, port, &HeldUdpPort::unknown, nullptr) < 0) {
             release();
-            throw;
+            throw std::runtime_error("Cannot listen on UDP port " + std::to_string(port));
         }
     }
     ~HeldUdpPort() {
-        listener_.reset();
+        juice_mux_listen(nullptr, port_, nullptr, nullptr);
         release();
     }
     HeldUdpPort(const HeldUdpPort&) = delete;
     HeldUdpPort& operator=(const HeldUdpPort&) = delete;
 
 private:
+    // (a check from no viewer's connection: left unanswered)
+    static void unknown(const juice_mux_binding_request_t*, void*) {}
     void release() {
 #ifdef Q_OS_WIN
         if (winsock_) WSACleanup();
         winsock_ = false;
 #endif
     }
+    uint16_t port_;
 #ifdef Q_OS_WIN
     bool winsock_ = false;
 #endif
-    std::optional<rtc::IceUdpMuxListener> listener_;
 };
 
 }  // namespace
