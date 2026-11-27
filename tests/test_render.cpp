@@ -37124,12 +37124,19 @@ colorspaces:
         // so 224 of the 512 kept are requests the origin holds by its own rule, for a segment still being made, with
         // nothing yet to send: 289 connections at most hold answers, 113 MB.
         constexpr int kHeldOpen = 224;
+        // The origin answers each client on its one thread, which waits on all of its connections at once each time,
+        // and on macOS with 600 that is slow: 3c576f5 took some 16 s for the 600 asked one after another (4 s here
+        // and on Windows). So there eight are asked before the first of them is waited for, and the thread answers
+        // them together. Asked so, the order the answers were taken in is not the clients' own, so the 88 to be let
+        // go are asked first and then left a third of a second, which makes theirs the oldest by far.
+        constexpr int kAhead = 7;
 #else
         const int sendBuffer = 8 << 10;
         // (just under the 256 KB an answer is held whole in, and so as far past what the systems take as can be:
         // Windows takes one of the origin's 64 KB pieces whole, whatever the connection's buffer)
         const int size = 250000;
         constexpr int kHeldOpen = 0;
+        constexpr int kAhead = 0;
 #endif
 
         {
@@ -37169,7 +37176,38 @@ colorspaces:
                 .arg(i).arg(origin.connectionsKept()).arg(origin.connectionsLetGo()).arg(origin.bytesWaiting())
                 .arg(origin.connectionsFailed()).arg(QString::fromStdString(origin.lastConnectionError())).arg(memory);
         };
+        // (where the time goes, said if the clients take too long and in the run's line: connecting, waiting for the
+        // answers, and the longest wait)
+        qint64 connecting = 0, waiting = 0, longest = 0, firstFile = -1;  // (the first two in ns)
+        int longestFor = -1;
+        QElapsedTimer phase;
+        // (whether client j's answer has come, waiting for it if not: a byte of it is taken, and then no more)
+        const auto answered = [&](int j) {
+            QTcpSocket& c = *clients[size_t(j)];
+            if (c.bytesAvailable() > 0) return true;
+            phase.start();
+            const bool came = c.waitForReadyRead(5000);
+            const qint64 took = phase.nsecsElapsed();
+            waiting += took;
+            if (took / 1000000 > longest) longest = took / 1000000, longestFor = j;
+            return came;
+        };
+        // (the first client whose answer is yet to be waited for, and every one's up to `last` waited for: false,
+        // naming the client in `failed`, if one is not answered)
+        int nextAnswer = 0, failed = -1;
+        const auto answeredTo = [&](int last) {
+            for (; nextAnswer <= last; ++nextAnswer)
+                if (!answered(nextAnswer)) return failed = nextAnswer, false;
+            return true;
+        };
+        // (the first client asking for the file to be kept: those before it are let go)
+        constexpr int kLine = kHeldOpen + kClients - kKept;
         for (int i = 0; i < kClients; ++i) {
+            if (i == kHeldOpen) firstFile = began.elapsed();
+            if (kAhead > 0 && i == kLine) {
+                if (!answeredTo(i - 1)) QFAIL(qPrintable(notAnswered(failed)));
+                QThread::msleep(333);
+            }
             auto s = std::make_unique<QTcpSocket>();
             s->setReadBufferSize(1);  // (a byte of the answer taken, to know it was sent, and nothing more)
             // (bound first, so its system buffer is small from the start: the window it offers is settled as it
@@ -37177,6 +37215,7 @@ colorspaces:
             // that would let the buffer grow from 4,096 bytes again, to 526,720 (CI, a37afd4))
             QVERIFY2(s->bind(QHostAddress::LocalHost, 0), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
             s->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 4096);
+            phase.start();
             s->connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
             QVERIFY2(s->waitForConnected(5000), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
 #ifndef Q_OS_MACOS
@@ -37184,15 +37223,22 @@ colorspaces:
 #endif
             s->write(i < kHeldOpen ? "GET /live.m4s HTTP/1.1\r\nHost: x\r\n\r\n" : "GET /seg_3.m4s HTTP/1.1\r\nHost: x\r\n\r\n");
             QVERIFY(s->waitForBytesWritten(5000) || s->bytesToWrite() == 0);
-            if (!s->waitForReadyRead(5000)) QFAIL(qPrintable(notAnswered(i)));
-            // (the origin's thread sees what its system took of the answer before the next client comes)
-            QThread::msleep(4);
+            connecting += phase.nsecsElapsed();
+            clients.push_back(std::move(s));
+            // (the answer kAhead clients back waited for, so that many are asked at once; with none, this client's
+            // own, and a moment for the origin's thread to see what its system took of it before the next comes)
+            if (!answeredTo(i - kAhead)) QFAIL(qPrintable(notAnswered(failed)));
+            if (kAhead == 0) QThread::msleep(4);
             mostKept = std::max(mostKept, origin.connectionsKept());
             mostWaiting = std::max(mostWaiting, origin.bytesWaiting());
-            clients.push_back(std::move(s));
         }
+        if (!answeredTo(kClients - 1)) QFAIL(qPrintable(notAnswered(failed)));
+        const qint64 cameIn = began.elapsed();
+        const QString phases = QString("%1 ms for the 600 to come, the first asking for the file at %2 ms; %3 ms connecting and asking, "
+                                       "%4 ms waiting for answers, the longest %5 ms (client %6), %7 asked at once")
+                                   .arg(cameIn).arg(firstFile).arg(connecting / 1000000).arg(waiting / 1000000).arg(longest).arg(longestFor).arg(kAhead + 1);
         // (all within the 20 s an unread answer is kept for)
-        QVERIFY2(began.elapsed() < 15000, qPrintable(QString::number(began.elapsed())));
+        QVERIFY2(cameIn < 15000, qPrintable(phases));
         QElapsedTimer t;
         t.start();
         while (t.elapsed() < 3000 && (origin.connectionsKept() != kKept || origin.connectionsLetGo() != kClients - kKept)) QTest::qWait(20);
@@ -37250,7 +37296,7 @@ colorspaces:
         // for a few by the line, as a system can take a little more of an answer a moment later, which makes that
         // client's taking newer than the next one's (here on Linux, one run in four had client 84 answered and 88
         // closed).
-        constexpr int kByTheLine = 16, kLine = kHeldOpen + kClients - kKept;
+        constexpr int kByTheLine = 16;
         int closed = 0, whole = 0;
         QString byTheLine;
         for (int i = 0; i < kClients; ++i) {
@@ -37269,8 +37315,8 @@ colorspaces:
             ++(all ? whole : closed);
             if (all != (i >= kLine)) byTheLine += QString(" %1 %2").arg(i).arg(all ? "answered" : "closed");
         }
-        qInfo("%d closed and %d answered whole, %d kept for a segment being made, in %lld ms;%s", closed, whole, kHeldOpen,
-              (long long)began.elapsed(), byTheLine.isEmpty() ? " the first 88 closed" : qPrintable(" by the line:" + byTheLine));
+        qInfo("%d closed and %d answered whole, %d kept for a segment being made, in %lld ms (%s);%s", closed, whole, kHeldOpen,
+              (long long)began.elapsed(), qPrintable(phases), byTheLine.isEmpty() ? " the first 88 closed" : qPrintable(" by the line:" + byTheLine));
         QCOMPARE(closed, kClients - kKept);
         QCOMPARE(whole, kKept - kHeldOpen);
     }
