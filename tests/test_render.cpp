@@ -22099,6 +22099,30 @@ colorspaces:
             QVERIFY2(lengths.size() > 10, qPrintable(QString::number(lengths.size())));
             QCOMPARE(r.decodersMade(), 1);
         }
+        // Nightly 27 Nov: a lossless picture is not held to the lossy rate the settings also carry (5 bits a pixel, as
+        // the Export dialog's lossless leaves them): the encoder's room for a picture is the library's lossless worst
+        // case, and noise, which takes far more than 5 bits a pixel, comes back exactly.
+        {
+            montage::JxsEncodeSettings es;
+            es.width = w, es.height = h, es.depth = 10, es.sampling = JxsSampling::Ycc422, es.lossless = true;
+            es.bppNum = 5000, es.bppDen = 1000;
+            montage::JxsEncoder enc;
+            std::string why;
+            QVERIFY2(enc.open(es, &why), why.c_str());
+            const uint32_t lossyBytes = uint32_t(w * h * 5 / 8);
+            QVERIFY2(enc.bytesPerPicture() > 2 * lossyBytes, qPrintable(QString::number(enc.bytesPerPicture())));
+            montage::JxsPicture noise(w, h, 10, JxsSampling::Ycc422);
+            uint32_t seed = 12345;
+            for (int c = 0; c < noise.planeCount(); ++c)
+                for (uint16_t& v : noise.planes[c]) v = uint16_t(((seed = seed * 1664525u + 1013904223u) >> 16) & 1023);
+            std::vector<uint8_t> cs;
+            QVERIFY2(enc.encode(noise, cs, nullptr, &why), why.c_str());
+            QVERIFY2(cs.size() > lossyBytes && cs.size() <= enc.bytesPerPicture(), qPrintable(QString("%1 of %2").arg(cs.size()).arg(enc.bytesPerPicture())));
+            montage::JxsDecoder dec;
+            montage::JxsPicture back;
+            QVERIFY2(dec.decode(cs.data(), cs.size(), back, &why), why.c_str());
+            QVERIFY(back == noise);
+        }
     }
 
     // Phase 17 #9 (CI only: SVT-JPEG-XS is built in CI, not here). Lossless JPEG XS at 10 and 12 bits, and alpha as a
