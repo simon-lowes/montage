@@ -45952,6 +45952,20 @@ private slots:
             QVERIFY(!same("text set round its path, unbent", drawn(unbent[0]), paint({{all, white}})));
             const std::optional<SvgTextLayout> back = parseSvgTextLayout(svgTextTitle(texts[0]).s("svg_text"));
             QVERIFY(back && back->stretch && !back->vertical);
+            // (nightly 27 Nov) However large a letter is bent, it is made of at most kMostBentPoints: four letters at
+            // the largest size a title takes, stretched to a thousand times their width, are each drawn twice (once
+            // to measure, once to draw) from no more than that.
+            const std::vector<SvgText> huge = textsOf(write(
+                "stretch-huge.svg", std::string("<defs><path id=\"ring\" d=\"M 100 40 A 60 60 0 0 1 100 160 A 60 60 0 0 1 100 40 Z\"/></defs>"
+                                                "<text font-size=\"1000\" textLength=\"3000000\" lengthAdjust=\"spacingAndGlyphs\" ") + look +
+                                        "><textPath xlink:href=\"#ring\" method=\"stretch\">HEMN</textPath></text>"));
+            QCOMPARE(int(huge.size()), 1);
+            QVERIFY(huge[0].layout.stretch && huge[0].layout.adjustGlyphs);
+            const long bentBefore = svgBentPoints();
+            QVERIFY(!drawn(huge[0]).empty());
+            const long bent = svgBentPoints() - bentBefore;
+            qInfo("four letters stretched a thousand times: %ld points bent", bent);
+            QVERIFY2(bent > 0 && bent <= 8 * (kMostBentPoints + 64), qPrintable(QString::number(bent)));
         }
         // writing-mode vertical-rl: set top to bottom from y 20, x 100 the column's middle. Latin letters (mixed
         // orientation, the default) turned a quarter clockwise, each moving the pen down by its advance and its middle

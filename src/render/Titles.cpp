@@ -248,6 +248,7 @@ struct FrameLayouts {
 };
 thread_local FrameLayouts* tFrameLayouts = nullptr;
 std::atomic<long> gTitleLayouts{0};
+std::atomic<long> gSvgBent{0};
 
 std::vector<LineLayout> layoutText(const QStringList& lines, const std::vector<CharStyle>& styles, const Effect& g, double t,
                                    double px, double defaultSize) {
@@ -1203,26 +1204,38 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                     return textTo.map(pt + a.y() * QPointF(-std::sin(ang), std::cos(ang)));
                 };
                 // A letter's outline bent: flattened finely (to 1/512 of a frame pixel), its edges cut to half a frame
-                // pixel or less, and each point bent.
+                // pixel or less, and each point bent; a letter that long in the path's terms (drawn huge, or through
+                // a tiny transform) is cut more coarsely, to kMostBentPoints in all.
                 const double fine = 256 * k;
                 svgBend = [fine, k, bendPoint = svgBendPoint](const QTransform& toPath, const QPainterPath& glyph) {
                     QPainterPath out;
                     out.setFillRule(Qt::WindingFill);
-                    const double most = 0.5 / k;  // the longest edge bent as a line, in the path's terms
-                    for (const QPolygonF& poly : glyph.toSubpathPolygons(toPath * QTransform::fromScale(fine, fine))) {
+                    const QList<QPolygonF> polys = glyph.toSubpathPolygons(toPath * QTransform::fromScale(fine, fine));
+                    double length = 0;
+                    qsizetype corners = 0;
+                    for (const QPolygonF& poly : polys)
+                        for (qsizetype i = 1; i < poly.size(); ++i) length += QLineF(poly[i - 1], poly[i]).length() / fine, ++corners;
+                    if (corners >= kMostBentPoints) return out;  // (a letter of more corners than that is not drawn)
+                    // the longest edge bent as a line, in the path's terms
+                    const double most = std::max(0.5 / k, length / double(kMostBentPoints - corners));
+                    long made = 0;
+                    for (const QPolygonF& poly : polys) {
                         if (poly.size() < 2) continue;
                         QPolygonF bent;
                         QPointF prev = poly[0] / fine;
                         bent << bendPoint(prev);
                         for (int i = 1; i < poly.size(); ++i) {
                             const QPointF cur = poly[i] / fine;
-                            const int cuts = std::min(4096, int(std::ceil(QLineF(prev, cur).length() / most)));
+                            const double over = QLineF(prev, cur).length() / most;
+                            const int cuts = over >= 1 ? (over < 4096 ? int(std::ceil(over)) : 4096) : 1;
                             for (int c = 1; c <= cuts; ++c) bent << bendPoint(prev + (cur - prev) * (double(c) / cuts));
                             prev = cur;
                         }
+                        made += bent.size();
                         out.addPolygon(bent);
                         out.closeSubpath();
                     }
+                    gSvgBent += made;
                     return out;
                 };
             }
@@ -1975,6 +1988,7 @@ Image drawScene(const Effect& g, double t, const TitleScene& s, int w, int h, do
 }  // namespace
 
 long titleLayoutsMade() { return gTitleLayouts.load(); }
+long svgBentPoints() { return gSvgBent.load(); }
 
 Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path,
                   const TitleLayerFn& layer) {

@@ -182,6 +182,10 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, Fram
 // How many times a styled title's text has been laid out so far (tests: with Motion Blur a frame's text is laid out
 // once, not at every time through the shutter, unless its text or its letters' styles change between them).
 long titleLayoutsMade();
+// How many points an SVG's letters bent along their path (method="stretch") have been made of so far (tests: each
+// letter is held to kMostBentPoints, however large it is drawn in the path's terms).
+long svgBentPoints();
+constexpr int kMostBentPoints = 1 << 16;
 // One render at a time between frames, without motion blur.
 Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {},
                     const TitleLayerFn& layer = {});
