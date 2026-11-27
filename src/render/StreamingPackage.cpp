@@ -167,34 +167,6 @@ int64_t mdatPayload(const uint8_t* d, size_t n) {
 
 // Bits a second at the peak, as HLS defines it (the busiest run of whole segments lasting half to one and a half times
 // the target duration, so a short segment at a split cannot inflate it), from each segment's bytes and seconds.
-// The level an H.264 or HEVC encoder's headers (Annex B, as x264 and x265 give them) state: H.264's level_idc from its
-// SPS, HEVC's general_level_idc from its VPS. 0 if there is none.
-int headerLevel(const std::vector<uint8_t>& h, bool hevc) {
-    for (size_t i = 0; i + 3 < h.size(); ++i) {
-        if (!(h[i] == 0 && h[i + 1] == 0 && h[i + 2] == 1)) continue;
-        const size_t at = i + 3;
-        const int type = hevc ? (h[at] >> 1) & 0x3f : h[at] & 0x1f;
-        if (type != (hevc ? 32 : 7)) continue;
-        // (its bytes without emulation prevention, as far as the level)
-        std::vector<uint8_t> rbsp;
-        int zeros = 0;
-        for (size_t j = at; j < h.size() && rbsp.size() < 32; ++j) {
-            if (zeros >= 2 && h[j] == 3) {
-                zeros = 0;
-                continue;
-            }
-            if (zeros >= 2 && h[j] <= 2) break;  // (the next start code)
-            zeros = h[j] == 0 ? zeros + 1 : 0;
-            rbsp.push_back(h[j]);
-        }
-        // (H.264: the NAL header, profile_idc, the constraint flags, level_idc; HEVC: the NAL header's two bytes, four
-        // of the VPS's own, then profile_tier_level's eleven before general_level_idc)
-        const size_t pos = hevc ? 17 : 3;
-        return pos < rbsp.size() ? rbsp[pos] : 0;
-    }
-    return 0;
-}
-
 int64_t peakRate(const std::vector<std::pair<double, double>>& segs) {
     double longest = 0;
     for (const auto& s : segs) longest = std::max(longest, s.second);
@@ -624,7 +596,6 @@ struct VideoOut {
     // rendition's parameters for its decoders, what it delivers scored on every frame, each shot as delivered, and,
     // filling the rung's rate, each shot's trial points until every shot has them.
     std::vector<uint8_t> header;
-    int level = 0;  // (set per shot: the level the rendition's headers state, H.264's and HEVC's, which every shot's encoder keeps)
     std::unique_ptr<AVCodecParameters, void (*)(AVCodecParameters*)> par{nullptr, [](AVCodecParameters* q) { avcodec_parameters_free(&q); }};
     std::unique_ptr<VmafMeter> meter;
     std::unique_ptr<VmafMeter> ownMeter;  // (the same at the rung's own size, where that is not the display's)
@@ -1210,9 +1181,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
     // A rung's encoder, at the rung's bit rate, or (`crf` at or above 0, set per shot) at that constant quality. SVT-AV1
     // will not start a keyframe on request in bit-rate mode, so an AV1 rung is given a new encoder for each segment
     // instead (the same settings, so the same sequence header).
-    // Set per shot, `spanBits` and `spanFrames` are what the encoder may spend over the frames it codes (a shot's, or
-    // for AV1 a segment's of it): its buffer model is set so it cannot spend more.
-    auto openEncoder = [&](VideoOut& v, double crf, std::string* why, int64_t spanBits = 0, FrameTime spanFrames = 0) -> bool {
+    auto openEncoder = [&](VideoOut& v, double crf, std::string* why) -> bool {
         const StreamingRung& r = v.rung;
         const AVCodec* codec = avcodec_find_encoder_by_name(r.codec.c_str());
         avcodec_free_context(&v.enc);
@@ -1234,22 +1203,6 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             // (x264's and x265's VBV, SVT-AV1's maximum rate).
             e->bit_rate = 0;
             e->rc_max_rate = r.bitrate * 3 / 2;
-            // (SVT-AV1 is not given it: held to a segment's share by its maximum rate, its capped CRF spent the
-            // window unevenly, a shot's frames scoring apart from its trial's, and chose differently run to run; its
-            // shots are measured and encoded again, coarser, where one comes out past its cap)
-            if (spanBits > 0 && spanFrames > 0 && r.codec != "libsvtav1") {
-                // The span's cap given to the encoder itself: a buffer of a sixth of the cap (at most half a second at
-                // the rung's rate), half full at the start, so what the span spends is at most half the buffer and its
-                // rate over the span; that rate set so the two make 95 % of the cap (x264's and x265's VBV).
-                const double seconds = double(spanFrames) * frameSeconds;
-                const int64_t buffer = std::max<int64_t>(8000, std::min<int64_t>(r.bitrate / 2, spanBits / 6));
-                const double rate = (0.95 * double(spanBits) - 0.5 * double(buffer)) / seconds;
-                e->rc_max_rate = std::clamp<int64_t>(int64_t(rate), 8000, r.bitrate * 3 / 2);
-                e->rc_buffer_size = int(std::min<int64_t>(INT32_MAX, buffer));
-                e->rc_initial_buffer_occupancy = int(buffer / 2);
-                // (x264 and x265 choose their level by the buffer model too: kept at the rendition's, so the headers stay its)
-                if (r.codec == "libx264" && v.level > 0) e->level = v.level;
-            }
             char buf[32];
             std::snprintf(buf, sizeof buf, r.codec == "libsvtav1" ? "%.0f" : "%.2f", crf);
             av_dict_set(&opts, "crf", buf, 0);
@@ -1258,7 +1211,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             // (SVT-AV1 4 refuses a peak rate outside its constant-quality mode, so an AV1 rung's peak is left to its VBR)
             if (r.codec != "libsvtav1") e->rc_max_rate = r.bitrate * 3 / 2;
         }
-        if (!(perShot && spanBits > 0 && spanFrames > 0)) e->rc_buffer_size = int(std::min<int64_t>(INT32_MAX, r.bitrate * 2));
+        e->rc_buffer_size = int(std::min<int64_t>(INT32_MAX, r.bitrate * 2));
         e->gop_size = int(longest * 2 + 1);  // (keyframes only where forced)
         e->keyint_min = 1;
         e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -1282,12 +1235,6 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             std::string params = "log-level=error:scenecut=0:open-gop=0";
             // (set per shot, each shot's encoder writes the same headers: without the SEI naming its options, CRF among them)
             if (perShot) params += ":info=0";
-            if (perShot && spanBits > 0 && v.level > 0) {
-                char lv[32];
-                // (as ten times the level, a whole number x265 reads the same in any locale: general_level_idc is thirty times it)
-                std::snprintf(lv, sizeof lv, ":level-idc=%d", v.level / 3);
-                params += lv;
-            }
             if (pq) {
                 params += ":hdr10=1";  // (parameter sets in the sample entry only, as hvc1 says)
                 if (mastering && mastering->size >= sizeof(AVMasteringDisplayMetadata)) {
@@ -1424,7 +1371,6 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         v->range = range;
         if (s.perShot) {
             v->header.assign(e->extradata, e->extradata + e->extradata_size);
-            if (r.codec == "libx264" || r.codec == "libx265") v->level = headerLevel(v->header, r.codec == "libx265");
             v->par = std::move(par);
             avcodec_free_context(&v->enc);
             // (what it delivers, scored on every frame at the display size)
@@ -1579,10 +1525,9 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         };
 
         // A shot's encoder at a CRF: its headers are the rendition's.
-        // (given the cap of the span it is to encode: `spanBits` over `spanFrames`)
-        auto openShotEncoder = [&](VideoOut& t, const VideoOut& v, double crf, int64_t spanBits, FrameTime spanFrames) -> bool {
+        auto openShotEncoder = [&](VideoOut& t, const VideoOut& v, double crf) -> bool {
             std::string why;
-            if (!openEncoder(t, crf, &why, spanBits, spanFrames)) return fail(why);
+            if (!openEncoder(t, crf, &why)) return fail(why);
             if (v.header != std::vector<uint8_t>(t.enc->extradata, t.enc->extradata + t.enc->extradata_size))
                 return fail("The " + v.rung.codec + " encoder changed its headers between shots");
             return true;
@@ -1606,17 +1551,13 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             };
             std::vector<std::unique_ptr<Try>> tries;
             std::string why;
-            // The cap of the span an encoder is opened for: the whole shot for x264 and x265 (SVT-AV1 is not given it).
-            const int64_t shotCap = capOf(v, shot);
-            auto spanFrom = [&](FrameTime f) -> FrameTime { return isAv1(v) ? 0 : n - f; };
-            auto spanCap = [&](FrameTime f) { return int64_t(double(shotCap) * double(spanFrom(f)) / double(std::max<FrameTime>(1, n))); };
             for (const double crf : crfs) {
                 auto t = std::make_unique<Try>();
-                t->enc.rung = v.rung, t->enc.width = v.width, t->enc.height = v.height, t->enc.level = v.level;
+                t->enc.rung = v.rung, t->enc.width = v.width, t->enc.height = v.height;
                 t->enc.pkt = av_packet_alloc();
                 t->trial.crf = crf;
                 if (!t->enc.pkt) return fail("Out of memory");
-                if (!openShotEncoder(t->enc, v, crf, spanCap(0), spanFrom(0))) return false;
+                if (!openShotEncoder(t->enc, v, crf)) return false;
                 if (score && (!t->dec.open(v.par.get(), displayW, displayH, &why) ||
                               !t->meter.open(vmafModel, std::max(1, cores / int(crfs.size())), &why, trialEvery)))
                     return fail(why);
@@ -1646,7 +1587,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                 if (start && f > 0 && isAv1(v))
                     for (auto& t : tries) {
                         avcodec_send_frame(t->enc.enc, nullptr);
-                        if (!drain(*t) || !openShotEncoder(t->enc, v, t->trial.crf, spanCap(f), spanFrom(f))) return false;
+                        if (!drain(*t) || !openShotEncoder(t->enc, v, t->trial.crf)) return false;
                     }
                 const AVFrame* src = fr.src[size_t(f)];
                 if (av_frame_make_writable(v.frame) < 0) return fail("Out of memory");
@@ -1777,17 +1718,12 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         // Why a shot's setting is short of what was asked: "floor" at the lowest CRF allowed, "cap" where the next
         // better setting tried is past the shot's cap (or even the coarsest is), "" where neither held it back.
         auto stoppedAt = [&](const VideoOut& v, const std::vector<ShotTrialPoint>& pts, const ShotTrialPoint& got, int64_t cap) -> std::string {
-            // (x264 and x265 holding a shot to its cap, a setting they held comes out near the cap, not past it: within
-            // 30 %; SVT-AV1, not given it, past it)
-            const bool told = !isAv1(v);
-            auto held = [&](const ShotTrialPoint& q) { return q.bits > cap || (told && double(q.bits) >= 0.7 * double(cap)); };
             if (got.bits > cap) return "cap";
             if (s.vmafTarget > 0 && got.vmaf >= s.vmafTarget) return "";
-            if (held(got)) return "cap";
             const ShotTrialPoint* better = nullptr;
             for (const ShotTrialPoint& q : pts)
                 if (q.crf < got.crf - 0.1 && (!better || q.crf > better->crf)) better = &q;
-            if (better && held(*better)) return "cap";
+            if (better && better->bits > cap) return "cap";
             if (got.crf <= floorOf(v) + 0.1) return "floor";
             return "";
         };
