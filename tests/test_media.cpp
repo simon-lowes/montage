@@ -47070,6 +47070,42 @@ private slots:
             QVERIFY2(err.find("larger than Montage can load") != std::string::npos, err.c_str());
         }
         {
+            // Zeros are counted each time they are read: one accessor with no buffer view serving the position, scale,
+            // colour and every harmonic, under eight nodes that show the same mesh, is refused, though each accessor
+            // alone is within the limit. With a thousand splats under one node, the same file is read.
+            auto shared = [&](int count, int nodes) {
+                QJsonObject attrs{{"POSITION", 0}, {"KHR_gaussian_splatting:ROTATION", 1}, {"KHR_gaussian_splatting:SCALE", 0},
+                                  {"KHR_gaussian_splatting:OPACITY", 2}, {"KHR_gaussian_splatting:SH_DEGREE_0_COEF_0", 0}};
+                for (int d = 1; d <= 3; ++d)
+                    for (int k = 0; k < 2 * d + 1; ++k) attrs[QString("KHR_gaussian_splatting:SH_DEGREE_%1_COEF_%2").arg(d).arg(k)] = 0;
+                QJsonArray nodeList, roots;
+                for (int i = 0; i < nodes; ++i) nodeList.append(QJsonObject{{"mesh", 0}}), roots.append(i);
+                return QJsonObject{
+                    {"asset", QJsonObject{{"version", "2.0"}}},
+                    {"extensionsUsed", QJsonArray{"KHR_gaussian_splatting"}},
+                    {"accessors", QJsonArray{QJsonObject{{"componentType", 5126}, {"count", count}, {"type", "VEC3"}},
+                                             QJsonObject{{"componentType", 5126}, {"count", count}, {"type", "VEC4"}},
+                                             QJsonObject{{"componentType", 5126}, {"count", count}, {"type", "SCALAR"}}}},
+                    {"meshes", QJsonArray{QJsonObject{{"primitives", QJsonArray{QJsonObject{
+                                   {"mode", 0}, {"attributes", attrs},
+                                   {"extensions", QJsonObject{{"KHR_gaussian_splatting", QJsonObject{{"kernel", "ellipse"}, {"colorSpace", "srgb_rec709_display"}}}}}}}}}}},
+                    {"nodes", nodeList},
+                    {"scenes", QJsonArray{QJsonObject{{"nodes", roots}}}},
+                    {"scene", 0}};
+            };
+            QVERIFY(writeJson("splat_shared.gltf", shared(1 << 21, 8)));
+            QVERIFY(QFileInfo(QString::fromStdString(path("splat_shared.gltf"))).size() < 8 * 1024);
+            SplatCloud none;
+            err.clear();
+            QVERIFY(!loadSplats(path("splat_shared.gltf"), none, &err));
+            QVERIFY2(err.find("larger than Montage can load") != std::string::npos, err.c_str());
+            QCOMPARE(none.count, size_t(0));
+            QVERIFY(writeJson("splat_shared.gltf", shared(1000, 1)));
+            QVERIFY2(loadSplats(path("splat_shared.gltf"), none, &err), err.c_str());
+            QCOMPARE(none.count, size_t(1000));
+            QCOMPARE(none.shDegree, 3);
+        }
+        {
             // A file in linear light: blended as it is, then brought to display values. One opaque splat of linear 0.2
             // shows as sRGB 0.2's code value under its coverage.
             SplatCloud one;
