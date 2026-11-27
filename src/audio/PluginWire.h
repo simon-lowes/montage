@@ -62,7 +62,11 @@ enum Command : uint32_t {
 
 // What the host's reply is (replyKind).
 enum ReplyKind : uint32_t { Final = 0, Callback = 1 };
-enum CallbackKind : int32_t { FetchFrame = 1, ResolveInput = 2 };
+// (InputPicture: a clip effect's picture in, not put in the arena (kInputHandle), asked for by the host: the payload
+// names a socket of the host's for a DMA-BUF's descriptors, or is empty for the arena. Montage's answer: resultFlags
+// kPictureHandle, a PictureHandle in the payload and Montage's process in argI, the descriptors sent first; else the
+// picture in the arena at argI, argI2 x argI3, as the other answers are.)
+enum CallbackKind : int32_t { FetchFrame = 1, ResolveInput = 2, InputPicture = 3 };
 
 // Bits of `flags`.
 enum : uint32_t {
@@ -73,6 +77,7 @@ enum : uint32_t {
     kHasInputs = 16,     // (OpenFX) and connected inputs
     kHasMask = 32,       // (OpenFX) the effect's own mask follows the pictures in the arena
     kWantsHandle = 64,   // (OpenFX) Montage takes the picture back as a GPU buffer's handle, where the host shares one
+    kInputHandle = 128,  // (OpenFX) a clip effect's picture in is not in the arena: asked for (InputPicture), as a handle
 };
 
 // Bits of `resultFlags` (Attach; kEdited: an overlay's Pen or Key set parameters; kControlFailed: the overlay said it

@@ -2948,16 +2948,22 @@ bool hostedTexture(remote::Kind kind, const Effect& e, double t, double progress
     if (d.generator() || d.transition() != transition)
         return fail(d.label + (transition ? " is not a transition" : d.transition() ? " is a transition, not a clip effect" : " is a generator, not a clip effect"));
     std::vector<Image> read(sides.size());
-    for (size_t i = 0; i < sides.size(); ++i) {
+    // (a clip effect's picture in given to its host as a handle where it takes one: read back by renderInto otherwise,
+    // and counted here too)
+    const bool asHandle = !transition && remote::sendsInputHandles();
+    const remote::PictureStats was = remote::pictureStats();
+    for (size_t i = 0; i < sides.size() && !asHandle; ++i) {
         const GlPicture side = sides[i];
         if (!gl::run([&] { gl::readTexture(side.texture, side.width, side.height, true, read[i]); }) || read[i].empty())
             return fail(d.label + ": the compositor's picture could not be read back for it");
         ++gGpuReadBacks;
     }
     bool inPlace = false;
-    if (!remote::renderInto(kind, e, d, t, progress, scale, into.width, into.height, &read[0], transition ? &read[1] : nullptr, into.texture, fetch,
-                            error, working, &inPlace))
-        return false;
+    const bool rendered = remote::renderInto(kind, e, d, t, progress, scale, into.width, into.height, asHandle ? nullptr : &read[0],
+                                             transition ? &read[1] : nullptr, into.texture, fetch, error, working, &inPlace,
+                                             asHandle ? sides[0].texture : 0u);
+    if (asHandle) gGpuReadBacks += int(remote::pictureStats().inputReadBacks - was.inputReadBacks);
+    if (!rendered) return false;
     if (inPlace) ++gGpuTextureRenders;
     return true;
 }

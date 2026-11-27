@@ -613,20 +613,21 @@ void describeHandle(const ofx::gl::DmaBuf& buf, int w, int h, wire::PictureHandl
 // descriptors go to Montage's socket `post` (render/OfxGl.h, render/OfxRemote.h). False where it cannot be: `why`
 // says why, and the picture is rendered as usual and goes through shared memory; or, `failed`, the plug-in failed
 // (`error`).
-bool renderToHandle(const Effect& e, double t, const Image& in, double scale, const ofx::FrameFetch& fetch, const ColorSpace* space,
-                    const std::string& post, wire::PictureHandle& handle, std::string& why, bool& failed, std::string& error) {
+// (From `in`, or where it came as a handle the texture `given`, w x h, which is left alone.)
+bool renderToHandle(const Effect& e, double t, const Image& in, unsigned given, int w, int h, double scale, const ofx::FrameFetch& fetch,
+                    const ColorSpace* space, const std::string& post, wire::PictureHandle& handle, std::string& why, bool& failed,
+                    std::string& error) {
     failed = false;
     if (post.empty()) {
         why = "Montage named no socket for the picture's descriptors";
         return false;
     }
     if (!ofx::gl::exportsDmaBuf(&why) || !ofx::rendersTextures(e, &why)) return false;
-    const int w = in.width, h = in.height;
-    unsigned from = 0, to = 0;
+    unsigned from = given, to = 0;
     ofx::gl::run([&] {
-        from = ofx::gl::makeTexture(w, h);
+        if (!given) from = ofx::gl::makeTexture(w, h);
         to = ofx::gl::makeTexture(w, h, true);
-        if (from) ofx::gl::writeTexture(from, in);
+        if (from && !given) ofx::gl::writeTexture(from, in);
     });
     ofx::gl::DmaBuf buf;
     bool shared = false;
@@ -643,12 +644,86 @@ bool renderToHandle(const Effect& e, double t, const Image& in, double scale, co
     }
     // (The DMA-BUF keeps the picture's memory; Montage has its own descriptors for it now.)
     ofx::gl::run([&] {
-        ofx::gl::destroyTexture(from);
+        if (!given) ofx::gl::destroyTexture(from);
         ofx::gl::destroyTexture(to);
     });
     if (shared) describeHandle(buf, w, h, handle);
     ofx::gl::closeDmaBuf(buf);
     return shared;
+}
+
+// A clip effect's picture in, where Montage did not put it in the arena (wire::kInputHandle): asked for as a DMA-BUF,
+// to a socket of this host's, and imported into a float texture of its own (`texture`, w x h, top row first); or,
+// where this host takes none or the one that came cannot be taken, asked for again through the arena (`img`). False
+// when neither came; `why` says why it is not a texture.
+bool askInput(OfxChannel& o, int w, int h, unsigned& texture, Image& img, std::string& why) {
+    texture = 0;
+    auto ask = [&](const std::string& post) {
+        wire::Header* hd = o.chan.h;
+        hd->resultI = wire::InputPicture;
+        hd->resultD = 0;
+        const size_t n = std::min(post.size(), wire::kPayload);
+        std::memcpy(o.chan.payload(), post.data(), n);
+        hd->payloadBytes = n;
+        o.chan.reply(wire::Callback);
+        o.chan.next();
+        return hd->command == wire::CallbackReply && hd->status;
+    };
+    std::lock_guard lock(o.questions);
+    wire::Header* hd = o.chan.h;
+    if (ofx::gl::importsDmaBuf(&why)) {
+        const std::string name = ipc::uniqueName("i");
+        const int post = ofx::gl::openDmaBufPost(name, &why);
+        if (post >= 0 && ask(name)) {
+            if (hd->resultFlags & wire::kPictureHandle) {
+                wire::PictureHandle ph{};
+                if (hd->payloadBytes >= sizeof ph) std::memcpy(&ph, o.chan.payload(), sizeof ph);
+                ofx::gl::DmaBuf buf;
+                const long long from = hd->argI;
+                why = "Montage's picture in is not one this host takes";
+                if (ph.kind == 1 && ph.width == w && ph.height == h && ofx::gl::receiveDmaBuf(post, from, ph.fence != 0, 2000, buf, &why)) {
+                    buf.fourcc = ph.fourcc, buf.stride = ph.stride, buf.offset = ph.offset, buf.modifier = ph.modifier;
+                    buf.width = w, buf.height = h;
+                    if (ofx::gl::dmaBufFits(buf, &why) && ofx::gl::awaitDrawn(buf, &why, 2000))
+                        ofx::gl::run([&] {
+                            const unsigned shared = ofx::gl::importDmaBuf(buf, &why);
+                            if (!shared) return;
+                            texture = ofx::gl::makeTexture(w, h);
+                            if (texture && !ofx::gl::copy(shared, texture, w, h)) {
+                                ofx::gl::destroyTexture(texture);
+                                texture = 0;
+                                why = "Montage's picture in could not be copied";
+                            }
+                            ofx::gl::destroyTexture(shared);
+                        });
+                }
+                ofx::gl::closeDmaBuf(buf);
+                ofx::gl::closeDmaBufPost(post);
+                if (texture) return true;
+            } else {
+                ofx::gl::closeDmaBufPost(post);
+                // (written into the arena after all: Montage could not share it)
+                const size_t off = size_t(hd->argI);
+                if (o.mapArena() && int(hd->argI2) == w && int(hd->argI3) == h && off + size_t(w) * size_t(h) * 16 <= o.arena->size()) {
+                    img = Image(w, h, Image::Uninitialized{});
+                    std::memcpy(img.px.data(), o.at(off), size_t(w) * size_t(h) * 16);
+                    why = "Montage could not share its picture in from the GPU's memory";
+                    return true;
+                }
+                return false;
+            }
+        } else if (post >= 0) {
+            ofx::gl::closeDmaBufPost(post);
+            return false;
+        }
+    }
+    // Through the arena.
+    if (!ask({}) || !o.mapArena()) return false;
+    const size_t off = size_t(hd->argI);
+    if (int(hd->argI2) != w || int(hd->argI3) != h || off + size_t(w) * size_t(h) * 16 > o.arena->size()) return false;
+    img = Image(w, h, Image::Uninitialized{});
+    std::memcpy(img.px.data(), o.at(off), size_t(w) * size_t(h) * 16);
+    return true;
 }
 
 // A transition's picture likewise, drawn from its two sides' textures where the plug-in renders with OpenGL.
@@ -952,14 +1027,23 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
                     [&](const std::string& connection, double at, Image& img) { return ask(*o, wire::ResolveInput, at, connection, img); });
             ofx::OwnMaskScope ownMask((flags & wire::kHasMask) ? &mask : nullptr);
             if (kind == 0) {
-                out = picture(0);
+                // The picture in: in the arena, or asked of Montage, as a texture where it shares one.
+                unsigned given = 0;
+                std::string notGiven;
+                bool came = true;
+                if (flags & wire::kInputHandle) came = askInput(*o, w, hh, given, out, notGiven);
+                else out = picture(0);
                 // Shared from the GPU's memory where Montage asks and it can be; else rendered as ever, and why said.
                 bool failed = false;
-                if ((flags & wire::kWantsHandle) && !(flags & wire::kHasMask))
-                    handled = renderToHandle(e, t, out, scale, fetch, space, post, handle, noHandle, failed, error);
+                if (!came) error = "Montage's picture in did not come through";
+                else if ((flags & wire::kWantsHandle) && !(flags & wire::kHasMask))
+                    handled = renderToHandle(e, t, out, given, w, hh, scale, fetch, space, post, handle, noHandle, failed, error);
                 // (one whose OpenGL render failed renders as ever, and that is why its picture was not drawn there)
                 if (failed) noHandle = "its OpenGL render failed: " + error;
-                ok = handled || ofx::applyEffect(e, t, out, scale, fetch, &error, space);
+                // (on the CPU from a picture in that came as a texture: read from it here)
+                if (came && !handled && given) ofx::gl::run([&] { ofx::gl::readTexture(given, w, hh, true, out); });
+                if (given) ofx::gl::run([&] { ofx::gl::destroyTexture(given); });
+                ok = came && (handled || ofx::applyEffect(e, t, out, scale, fetch, &error, space));
             } else if (kind == 1) {
                 const Image from = (empties & 1) ? Image() : picture(0);
                 const Image to = (empties & 2) ? Image() : picture(1);

@@ -32036,7 +32036,14 @@ colorspaces:
         if (!handles) QVERIFY2(why.find("renders in a plug-in host, and its pictures come through shared memory") != std::string::npos, why.c_str());
         QCOMPARE(ofx::rendersTextures(tr, nullptr, true), handles);
         QVERIFY(!ofx::rendersTextures(tr) && !ofx::rendersTextures(e, nullptr, true));  // (each as what it is)
-        // The effect: its source read back for the host, its picture copied into `out` where it came as a handle.
+        // The effect's picture is given to the host as a DMA-BUF too where Montage shares one (in CI's guest), else read
+        // back for it, and why said.
+        std::string noInput;
+        const bool inputHandles = ofx::remote::sendsInputHandles(&noInput);
+        if (expected) QVERIFY2(inputHandles, noInput.c_str());
+        if (!inputHandles) qInfo("pictures in read back for plug-in hosts: %s", noInput.c_str());
+        // The effect: its source given as a handle or read back for the host, its picture copied into `out` where it
+        // came as a handle.
         auto rendered = [&](const char* what, const std::function<bool()>& render, const ofx::GlPicture& into, const Image& want, int sides) {
             const ofx::remote::PictureStats before = ofx::remote::pictureStats();
             const int readBacks = ofx::gpuReadBacks(), direct = ofx::gpuTextureRenders();
@@ -32051,7 +32058,8 @@ colorspaces:
             if (now.handles + now.sharedMemory != before.handles + before.sharedMemory + 1) return text;
             return QString();
         };
-        QString wrong = rendered("the effect", [&] { return ofx::applyEffectTexture(e, 0, in, out, 1.0, {}, &err); }, out, cpu, 1);
+        const long givenBefore = ofx::remote::pictureStats().inputHandles;
+        QString wrong = rendered("the effect", [&] { return ofx::applyEffectTexture(e, 0, in, out, 1.0, {}, &err); }, out, cpu, inputHandles ? 0 : 1);
         QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
         wrong = rendered("the transition", [&] { return ofx::applyTransitionTexture(tr, 3, 0.25, in, to, mix, 1.0, &err); }, mix, mixed, 2);
         QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
@@ -32099,8 +32107,49 @@ colorspaces:
         const gpu::Stats after = gpu::stats();
         QVERIFY2(after.gpuFrames == before.gpuFrames + 1, after.lastFallback.c_str());
         QCOMPARE(after.textureSteps - before.textureSteps, 1L);
+        QCOMPARE(ofx::remote::pictureStats().inputHandles - givenBefore, inputHandles ? 1L : 0L);
+        if (inputHandles) QCOMPARE(QString::fromStdString(ofx::remote::pictureStats().lastInput), QString("given to its plug-in host as a DMA-BUF"));
         QCOMPARE(after.cpuLayers - before.cpuLayers, 0L);
         if (expected) QCOMPARE(ofx::remote::pictureStats().inPlace, copied + 1);
+        // A hundred pictures in, each carrying its number in every row (so a torn one has rows of two numbers), through
+        // the host from texture to texture: none stale or torn against the effect in Montage's own process, and where
+        // both sides share, none read back nor through shared memory either way (counted).
+        {
+            auto numberedIn = [&](int n) {
+                Image img(W, H);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        float* px = img.at(x, y);
+                        px[0] = float(x) / W, px[1] = float(n) / 128, px[2] = float(y) / H, px[3] = 1;
+                    }
+                return img;
+            };
+            std::vector<Image> want(100);
+            host(plugins::Isolation::InProcess);
+            for (int n = 0; n < 100; ++n) {
+                want[size_t(n)] = numberedIn(n);
+                QVERIFY2(ofx::applyEffect(e, n, want[size_t(n)], 1.0, {}, &err), err.c_str());
+            }
+            host(plugins::Isolation::PerPlugin);
+            QVERIFY(worst(want[10], want[11]) > 1.0f / 256);  // (the number shows)
+            const ofx::GlPicture into = texture(nullptr);
+            const ofx::remote::PictureStats before = ofx::remote::pictureStats();
+            const int readBacks = ofx::gpuReadBacks();
+            for (int n = 0; n < 100; ++n) {
+                const Image pic = numberedIn(n);
+                const ofx::GlPicture from = texture(&pic);
+                QVERIFY2(ofx::applyEffectTexture(e, n, from, into, 1.0, {}, &err), err.c_str());
+                const float off = worst(pixels(into), want[size_t(n)]);
+                QVERIFY2(off <= 1.0f / 1023, qPrintable(QString("picture %1 is off by %2 (stale or torn)").arg(n).arg(off)));
+            }
+            const ofx::remote::PictureStats after = ofx::remote::pictureStats();
+            qInfo("a hundred pictures in: %ld as handles, %ld read back (%s); back: %ld as handles, %ld through shared memory",
+                  after.inputHandles - before.inputHandles, after.inputReadBacks - before.inputReadBacks, after.lastInput.c_str(),
+                  after.handles - before.handles, after.sharedMemory - before.sharedMemory);
+            QCOMPARE(ofx::gpuReadBacks() - readBacks, inputHandles ? 0 : 100);
+            QCOMPARE(after.inputHandles - before.inputHandles, inputHandles ? 100L : 0L);
+            if (expected) QCOMPARE(after.handles - before.handles, 100L);
+        }
         QVERIFY2(worst(cpuFrame, gpuFrame) <= 1.0f / 1023, qPrintable(QString::number(worst(cpuFrame, gpuFrame))));
     }
 
@@ -32140,6 +32189,7 @@ colorspaces:
                 else qunsetenv("MONTAGE_GPU_HANDLES");
                 ofx::setGpuRendering(gpu);
                 ofx::remote::resetPictureStats();
+        const int readBacksBefore = ofx::gpuReadBacks();
             }
         } asking;
         plugins::setHostExecutable(MONTAGE_PLUGIN_HOST);
@@ -32147,6 +32197,8 @@ colorspaces:
             ofx::remote::releaseIdle();
             plugins::HostingSettings s = asking.hosting;
             s.isolation = how;
+        // (and its picture in, the layer under it, went to the host as a handle: nothing read back)
+        QCOMPARE(ofx::gpuReadBacks() - readBacksBefore, inputHandles ? 0 : 1);
             plugins::setHosting(s);
             plugins::clearHostFailures();
         };
