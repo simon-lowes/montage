@@ -6474,6 +6474,44 @@ colorspaces:
             for (int x = 0; x < 160; ++x) mean += ht.at(x, y)[0], extreme += ht.at(x, y)[0] < 0.05f || ht.at(x, y)[0] > 0.95f;
         mean /= 160 * 90;
         QVERIFY2(std::fabs(mean - 0.5) < 0.06 && extreme > 160 * 90 * 0.7, qPrintable(QString("%1 %2").arg(mean).arg(extreme)));
+        // A dark cell's dot is wider than its cell and is drawn round into the next one, not cut off at the cell's
+        // edge: black on the left half, white on the right, 16 px cells square on. Every pixel of the white cells is
+        // inked as the nearest black cell's dot (radius 16 sqrt(1/pi), a 1 px soft edge) covers it; the grey picture's
+        // pixels are each their own cell's dot alone.
+        {
+            Image half = solid(64, 32, 1, 1, 1);
+            for (int y = 0; y < 32; ++y)
+                for (int x = 0; x < 32; ++x) half.at(x, y)[0] = half.at(x, y)[1] = half.at(x, y)[2] = 0;
+            applyVideoEffect(fx("halftone", {{"dot_size", 16.0}, {"angle", 0.0}}), 0, half, 1);
+            auto smooth = [](double e0, double e1, double x) {
+                const double t = std::clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+                return t * t * (3 - 2 * t);
+            };
+            const double r = 16 * std::sqrt(1 / M_PI);
+            double worst = 0;
+            int reached = 0;
+            for (int y = 0; y < 32; ++y)
+                for (int x = 32; x < 64; ++x) {
+                    const double cy = y < 16 ? 8 : 24, d = std::hypot(x + 0.5 - 24, y + 0.5 - cy);
+                    const double want = 1 - smooth(r + 0.5, r - 0.5, d);
+                    worst = std::max(worst, std::fabs(half.at(x, y)[0] - want));
+                    reached += half.at(x, y)[0] < 0.5f;
+                }
+            QVERIFY2(worst < 1e-5 && reached > 8, qPrintable(QString("worst %1, %2 px reached").arg(worst).arg(reached)));
+            QVERIFY(half.at(32, 8)[0] < 0.01f && half.at(32, 0)[0] > 0.99f);  // (round, not a square cut)
+            double own = 0;
+            const double rg = 10 * std::sqrt(0.5 / M_PI);
+            for (int y = 0; y < 90; ++y)
+                for (int x = 0; x < 160; ++x) {
+                    // (the default 45 degrees: the cell's centre nearest the pixel on the turned grid)
+                    const double c = std::cos(M_PI / 4), sn = std::sin(M_PI / 4), X = x + 0.5, Y = y + 0.5;
+                    const double u = (X * c + Y * sn) / 10, v = (-X * sn + Y * c) / 10;
+                    const double du = u - std::floor(u) - 0.5, dv = v - std::floor(v) - 0.5;
+                    if (std::fabs(du) > 0.49 || std::fabs(dv) > 0.49) continue;  // (clear of the screen's lines)
+                    own = std::max(own, std::fabs(ht.at(x, y)[0] - (1 - smooth(rg + 0.5, rg - 0.5, std::hypot(du, dv) * 10))));
+                }
+            QVERIFY2(own < 1e-4, qPrintable(QString::number(own)));
+        }
         // Duotone: black to the shadow colour, white to the highlight colour.
         Image dt = step;
         e = fx("duotone", {{"shadows.r", 0.0}, {"shadows.g", 0.0}, {"shadows.b", 1.0}, {"highlights.r", 1.0}, {"highlights.g", 1.0}, {"highlights.b", 0.0}});

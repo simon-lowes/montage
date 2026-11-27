@@ -324,7 +324,8 @@ float smoothstepFx(float a, float b, float x) {
     const float u = clamp((x - a) / (b - a), 0.0, 1.0);
     return u * u * (3.0 - 2.0 * u);
 }
-// Halftone's dot: 1 inside it, for the cell round (x, y) on the grid turned by (c, s).
+// Halftone's dot: 1 inside it, for the cell round (x, y) on the grid turned by (c, s), and the most of the eight round
+// it whose dots reach (x, y) (a dark cell's dot is wider than the cell: drawn into its neighbours round, as on the CPU).
 // (a place within 1/1000 of a cell of the screen's lines is taken as on them, as on the CPU: at 45 degrees -x * s + y * c is
 // exactly 0 on the diagonal, which fused multiply-adds turn into a tiny value either side of it, and with it the cell)
 float onScreenLine(float u) {
@@ -334,13 +335,21 @@ float onScreenLine(float u) {
 float halftoneDot(ivec2 size, float x, float y, float c, float s, int channel) {
     const float cell = p[1].x;
     const float u = onScreenLine((x * c + y * s) / cell), v = onScreenLine((-x * s + y * c) / cell);
-    const float cu = floor(u) + 0.5, cv = floor(v) + 0.5;
-    const vec4 at = sampleEdge(size, (cu * c - cv * s) * cell, (cu * s + cv * c) * cell, 1);
-    const float a = at.a > 0.0 ? at.a : 1.0;
-    const float tone = clamp((channel < 0 ? lumaOf(at) : at[channel]) / a, 0.0, 1.0);
-    const float r = cell * sqrt((1.0 - tone) / 3.14159265358979);
-    const float d = length(vec2(u - cu, v - cv)) * cell;
-    return smoothstepFx(r + 0.5, r - 0.5, d);
+    const float reach = cell * sqrt(1.0 / 3.14159265358979) + 0.5;  // (the widest dot's soft edge)
+    float most = 0.0;
+    for (int k = 0; k < 9; ++k) {
+        // (its own cell first, then the neighbours whose widest dot could reach it)
+        const int o = k == 0 ? 4 : (k <= 4 ? k - 1 : k);
+        const float cu = floor(u) + float(o % 3 - 1) + 0.5, cv = floor(v) + float(o / 3 - 1) + 0.5;
+        const float d = length(vec2(u - cu, v - cv)) * cell;
+        if (k > 0 && !(d < reach)) continue;
+        const vec4 at = sampleEdge(size, (cu * c - cv * s) * cell, (cu * s + cv * c) * cell, 1);
+        const float a = at.a > 0.0 ? at.a : 1.0;
+        const float tone = clamp((channel < 0 ? lumaOf(at) : at[channel]) / a, 0.0, 1.0);
+        const float r = cell * sqrt((1.0 - tone) / 3.14159265358979);
+        most = max(most, smoothstepFx(r + 0.5, r - 0.5, d));
+    }
+    return most;
 }
 
 // The table's i-th texel, its rows read as one run.
