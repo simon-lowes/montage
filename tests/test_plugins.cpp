@@ -4184,6 +4184,66 @@ private slots:
         QVERIFY(e.isOpen());
     }
 
+    void standInAskedForAgainOnItsOwnThread() {
+        // Nightly 27 Nov: with the device chosen still away, starting playback through the stand-in does not ask for
+        // the device again (that closed the stand-in, had the host list its devices and opened the stand-in once more,
+        // on the window's thread at each Play). The device is asked for again on a thread of the engine's own, only
+        // while nothing plays or records through the stand-in, less often after each try that does not find it; and
+        // once it is back it is taken up when playback stops, with no client coming to it.
+        audiodev::LoopbackOptions away{256, 256, 0};
+        away.away = true;
+        audiodev::setLoopbackOptions(away);
+        auto putBack = qScopeGuard([] { audiodev::setLoopbackOptions({}); });
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.output = s.input = "loopback";
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QVERIFY(e.status().standIn);
+        // From here each open takes 300 ms, as a system listing its devices first does.
+        away.openMs = 300;
+        audiodev::setLoopbackOptions(away);
+        // Nothing playing: the device is asked for again once three seconds have passed, on the engine's thread, and
+        // the stand-in opens again.
+        QElapsedTimer waited;
+        waited.start();
+        while (e.status().standInRetries < 1 && waited.elapsed() < 8000) QThread::msleep(50);
+        QCOMPARE(e.status().standInRetries, int64_t(1));
+        QVERIFY(waited.elapsed() >= 2500);
+        QVERIFY(e.status().standIn);
+        // Three and a half seconds after that try, playback starts at once: nothing is asked for on its way.
+        QElapsedTimer sinceTry;
+        sinceTry.start();
+        while (sinceTry.elapsed() < 3500) QThread::msleep(50);
+        TonePump tone;
+        QElapsedTimer starting;
+        starting.start();
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        const qint64 took = starting.elapsed();
+        QVERIFY(out >= 0);
+        QVERIFY2(took < 250, qPrintable(QString::number(took)));
+        QVERIFY(e.status().standIn);
+        // While it plays the stand-in stays, past the time the next try was due (six seconds after the first, which
+        // did not find the device), even with the device back.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        while (sinceTry.elapsed() < 7500) QThread::msleep(50);
+        QCOMPARE(e.status().standInRetries, int64_t(1));
+        QVERIFY(e.status().standIn);
+        // Playback stops: the device back is taken up with nothing else asked of the engine.
+        e.removeOutput(out);
+        QElapsedTimer stopped;
+        stopped.start();
+        while (e.status().standIn && stopped.elapsed() < 6000) QThread::msleep(50);
+        QVERIFY2(!e.status().standIn, "the device back was not taken up");
+        QVERIFY2(stopped.elapsed() <= 3000, qPrintable(QString::number(stopped.elapsed())));
+        QCOMPARE(e.status().standInRetries, int64_t(2));
+        QCOMPARE(e.settings().output, std::string("loopback"));
+        QVERIFY(e.isOpen());
+    }
+
     void loopbackFollowsRateChanges() {
         // The device's rate changed mid-session (as a server's is): Montage follows it, resampling its 48 kHz both ways,
         // and recordings still land where they were played.

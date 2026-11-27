@@ -195,6 +195,7 @@ struct EngineStatus {
     int cushion = 0;         // frames mixed ahead of the device
     int64_t resamplers = 0;  // resamplers built since the engine began (on the feed thread, never in the callback)
     bool standIn = false;    // the device named is gone: the host's own choice plays until it is back
+    int64_t standInRetries = 0;  // times the device named was asked for again while the host's own choice stood in
     int rateChanges = 0;    // times the device's rate changed while open
     std::vector<std::string> ports;
     std::string clock;

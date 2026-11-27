@@ -765,6 +765,11 @@ struct Engine::Impl {
     DeviceSettings opened;  // what the stream was opened with (the settings, or what stood in for a device that is gone)
     bool standIn = false;
     std::chrono::steady_clock::time_point standInTried;  // when the device chosen was last asked for, with a stand-in open
+    // How long a stand-in that nothing plays or records through waits before the device chosen is asked for again:
+    // three seconds, twice as long after each try that does not find it (to half a minute), three seconds again once
+    // a client has let go of it (as when playback stops).
+    std::chrono::seconds retryEvery{3};
+    int64_t standInRetries = 0;
     std::string error;
     int preferredRate = 48000, wantOutputs = 2;
     std::vector<std::string> outputNames;
@@ -806,6 +811,25 @@ struct Engine::Impl {
     std::thread::id feederId;
     std::atomic<bool> quit{false};
     std::atomic<uint64_t> pass{0};  // odd while a pass is under way
+
+    // The device chosen asked for again, while a stand-in is open, on a thread of its own (nightly 27 Nov: it was
+    // asked for by the next output or input to start, on the window's thread at each Play, which closed the stand-in,
+    // had the host list its devices again and opened the stand-in once more: the window stood still and the sound
+    // started late). It never waits for openM: a caller that holds it goes first.
+    std::thread retrier;
+    std::mutex retryM;
+    std::condition_variable retryCv;
+    std::atomic<bool> standInNow{false};
+    std::atomic<bool> clientLeft{false};  // an output or input let go since the retry thread last looked
+    void retryLoop();
+    void setStandIn(bool on) {
+        standIn = on;
+        {
+            std::lock_guard<std::mutex> l(retryM);
+            standInNow = on;
+        }
+        if (on) retryCv.notify_all();
+    }
     std::vector<float> mix, heard;
     std::vector<uint8_t> dryFrames;
     std::vector<std::pair<int, int>> heardRuns;
@@ -813,10 +837,16 @@ struct Engine::Impl {
     Impl() {
         clients.set(std::make_shared<const Clients>());
         feeder = std::thread([this] { feed(); });
+        retrier = std::thread([this] { retryLoop(); });
     }
     ~Impl() {
-        quit = true;
+        {
+            std::lock_guard<std::mutex> l(retryM);
+            quit = true;
+        }
+        retryCv.notify_all();
         wake->post();
+        if (retrier.joinable()) retrier.join();
         if (feeder.joinable()) feeder.join();
     }
 
@@ -1153,21 +1183,47 @@ bool Engine::Impl::openWith(const DeviceSettings& s, std::string* why) {
 // (nightly 25 Nov: once a stand-in was open nothing asked for the device chosen again, PortAudio lists devices again
 // only with no stream open, and the scrub retry only ran with none open: a device plugged back in was not used until
 // another was chosen and then it) A stand-in that nothing plays or records through is closed and the device chosen
-// asked for again, when a client comes to it, no more often than every few seconds (an open that does not find its
-// device has PortAudio list every device again): back, it is used from then on; not, the stand-in opens again.
+// asked for again, by the retry thread, no more often than retryEvery (an open that does not find its device has
+// PortAudio list every device again): back, it is used from then on; not, the stand-in opens again. (One that a
+// client plays or records through is left as it is: closing it would break the sound off.)
 void Engine::Impl::retryChosenLocked() {
-    if (!standIn || !stream || std::chrono::steady_clock::now() - standInTried < std::chrono::seconds(3)) return;
+    if (!standIn || !stream) return;
+    if (clientLeft.exchange(false)) retryEvery = std::chrono::seconds(3);
+    if (std::chrono::steady_clock::now() - standInTried < retryEvery) return;
     {
         std::lock_guard<std::mutex> l(m);
         if (!outputs.empty() || !inputs.empty()) return;
     }
+    ++standInRetries;
+    const std::chrono::seconds every = retryEvery;
     openLocked(nullptr);
+    if (standIn) retryEvery = std::min(every * 2, std::chrono::seconds(30));
+}
+
+void Engine::Impl::retryLoop() {
+    std::unique_lock<std::mutex> l(retryM);
+    while (!quit.load()) {
+        if (!standInNow.load()) {
+            retryCv.wait(l, [this] { return quit.load() || standInNow.load(); });
+            continue;
+        }
+        if (retryCv.wait_for(l, std::chrono::milliseconds(250), [this] { return quit.load(); })) break;
+        l.unlock();
+        {
+            std::unique_lock<std::recursive_mutex> lock(openM, std::try_to_lock);
+            if (lock.owns_lock()) {
+                reapLocked();
+                retryChosenLocked();
+            }
+        }
+        l.lock();
+    }
 }
 
 bool Engine::Impl::openLocked(std::string* why) {
     closeLocked();
     lost = false;
-    standIn = false;
+    setStandIn(false);
     if (settings.host == Host::Qt) return false;
     std::string err;
     if (openWith(settings, &err)) {
@@ -1182,8 +1238,9 @@ bool Engine::Impl::openLocked(std::string* why) {
         alt.input.clear();
         std::string altErr;
         if (openWith(alt, &altErr)) {
-            standIn = true;
             standInTried = std::chrono::steady_clock::now();
+            retryEvery = std::chrono::seconds(3);
+            setStandIn(true);
             error = err;
             return true;
         }
@@ -1304,7 +1361,6 @@ int Engine::addOutput(const void* owner, int rate, int channels, Render render, 
         if (error) *error = "No audio device is chosen";
         return -1;
     }
-    d_->retryChosenLocked();
     auto c = std::make_shared<OutputClient>();
     c->owner = owner;
     c->rate = rate > 0 ? rate : 48000;
@@ -1339,7 +1395,10 @@ void Engine::removeOutput(int id) {
             }
         if (gone) d_->publishLocked();
     }
-    if (gone) d_->settle();
+    if (gone) {
+        d_->clientLeft = true;
+        d_->settle();
+    }
 }
 
 double Engine::heardSeconds(int id) const {
@@ -1384,7 +1443,6 @@ int Engine::addInput(const void* clockOwner, int rate, Tap tap, std::string* err
         if (error) *error = "No audio device is chosen";
         return -1;
     }
-    d_->retryChosenLocked();
     if (!d_->stream && !d_->openLocked(error)) return -1;
     if (d_->stream->inputs() <= 0) {
         if (error) *error = "The audio device was opened with no inputs";
@@ -1413,7 +1471,10 @@ void Engine::removeInput(int id) {
             }
         if (gone) d_->publishLocked();
     }
-    if (gone) d_->settle();
+    if (gone) {
+        d_->clientLeft = true;
+        d_->settle();
+    }
 }
 
 int Engine::addLostListener(std::function<void(const std::string&)> told) {
@@ -1465,6 +1526,7 @@ EngineStatus Engine::status() const {
     Stream& st = *d_->stream;
     s.open = true;
     s.standIn = d_->standIn;
+    s.standInRetries = d_->standInRetries;
     s.device = st.device();
     s.rate = st.sampleRate();
     s.buffer = st.bufferFrames();
