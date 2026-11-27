@@ -2548,6 +2548,35 @@ private slots:
             QCOMPARE(events[4].value, 6 << 7 | 1);
             QCOMPARE(events[5].value, 7 << 7 | 0);
             QVERIFY(!decoder.holding());
+            // Nightly 27 Nov: a controller that sends the fine half first, its order learnt wrongly from a lone coarse
+            // half and a lone fine half 1 ms apart (a pair alone, coarse half first). Its next pair, (7, 20) sent as
+            // fine 20 then coarse 7, gives (6, 20) at once, as for a coarse step that did not change, and then (7, 20)
+            // when the pause after it shows that the two halves were one pair, not (7, 0); the order is learnt anew
+            // from that pair, so the pair after it, (8, 30), comes once, whole, and nothing is left held.
+            decoder.reset();
+            events = timed({{{0xB1, 99, 3}, 0}, {{0xB1, 98, 4}, 100}, {{0xB1, 6, 6}, 200}, {{0xB1, 38, 10}, 1200},
+                            {{0xB1, 38, 20}, 20000}, {{0xB1, 6, 7}, 20500}, {{0xB1, 38, 30}, 40000}, {{0xB1, 6, 8}, 40500}});
+            QCOMPARE(events.size(), size_t(5));
+            QVERIFY(events[0].value == 6 && events[0].resolution == 128);
+            QCOMPARE(events[1].value, 6 << 7 | 10);
+            QCOMPARE(events[2].value, 6 << 7 | 20);
+            QCOMPARE(events[3].value, 7 << 7 | 20);
+            QCOMPARE(events[4].value, 8 << 7 | 30);
+            QVERIFY(rest().empty() && !decoder.holding());
+            // (the same pair with no time given, the caller's flush the pause after it: it ends on (7, 20) too)
+            decoder.reset();
+            events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 6, 6, 0xB1, 38, 10});
+            QCOMPARE(events.size(), size_t(2));
+            QVERIFY(rest().empty());
+            events = decode({0xB1, 38, 20, 0xB1, 6, 7});
+            QCOMPARE(events.size(), size_t(1));
+            QCOMPARE(events[0].value, 6 << 7 | 20);
+            events = rest();
+            QCOMPARE(events.size(), size_t(1));
+            QCOMPARE(events[0].value, 7 << 7 | 20);
+            events = decode({0xB1, 38, 30, 0xB1, 6, 8});
+            QVERIFY(events.size() == 1 && events[0].value == (8 << 7 | 30));
+            QVERIFY(rest().empty() && !decoder.holding());
             decoder = saved;
         }
         // A coarse half alone, from a parameter that sends fine halves: its fine half is 0 (MIDI 1.0).
