@@ -733,14 +733,14 @@ struct Feed {
             // it by more than a second under the same SSRC (a stall: Wi-Fi gone for seconds), and otherwise the
             // sender starting its numbers afresh. Either way the pictures after it need a keyframe: a browser sends
             // none unasked.
-            const bool far = step > 3000 || step < -3000;
-            const bool stalled = far && s.seen && r.ssrc == s.ssrc && ts - s.lastExt > int64_t(s.clock);
+            const bool jumped = step > 3000 || step < -3000;
+            const bool stalled = jumped && s.seen && r.ssrc == s.ssrc && ts - s.lastExt > int64_t(s.clock);
             if ((step > 1 && step <= 3000) || stalled) {
                 lost += (stalled ? int64_t(uint16_t(r.seq - s.lastSeq)) : int64_t(step)) - 1;
                 if (isVideo && holding && !started) heldLost = true;
             }
-            if ((step > 1 || far) && isVideo) ask = true;
-            if (step > 0 || far) s.lastSeq = r.seq;
+            if ((step > 1 || jumped) && isVideo) ask = true;
+            if (step > 0 || jumped) s.lastSeq = r.seq;
         } else {
             s.numbered = true;
             s.lastSeq = r.seq;
