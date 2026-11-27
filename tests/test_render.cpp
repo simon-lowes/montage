@@ -32007,11 +32007,29 @@ colorspaces:
                 quick.exportTimeoutMs = 2000;
                 plugins::setHosting(quick);
                 pid_t stopped = 0;
+                // (a stop is delivered to a host's threads in their own time, and its thread asking for the frame spins
+                // for the answer before it sleeps: in a slow guest it took the answer and rendered before the stop
+                // landed. So every thread is seen stopped before the frame is given.)
+                auto allStopped = [](pid_t pid) {
+                    const QDir tasks(QStringLiteral("/proc/%1/task").arg(pid));
+                    const QStringList ids = tasks.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+                    if (ids.isEmpty()) return false;
+                    for (const QString& id : ids) {
+                        QFile stat(tasks.filePath(id + "/stat"));
+                        if (!stat.open(QIODevice::ReadOnly)) return false;
+                        const QByteArray line = stat.readAll();
+                        const int close = line.lastIndexOf(')');  // (the state follows the name, which may hold spaces)
+                        if (close < 0 || close + 2 >= line.size() || (line[close + 2] != 'T' && line[close + 2] != 't')) return false;
+                    }
+                    return true;
+                };
                 const ofx::FrameFetch stopping = [&](double, Image& out) {
                     if (!stopped)
                         for (const plugins::HostInfo& running : plugins::runningHosts())
-                            if (running.key.find("temporal") != std::string::npos && running.pid > 0 && ::kill(pid_t(running.pid), SIGSTOP) == 0)
+                            if (running.key.find("temporal") != std::string::npos && running.pid > 0 && ::kill(pid_t(running.pid), SIGSTOP) == 0) {
                                 stopped = pid_t(running.pid);
+                                for (int i = 0; i < 2000 && !allStopped(stopped); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
                     out = numbered(8);
                     return true;
                 };
