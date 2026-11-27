@@ -32061,56 +32061,10 @@ colorspaces:
         const long givenBefore = ofx::remote::pictureStats().inputHandles;
         QString wrong = rendered("the effect", [&] { return ofx::applyEffectTexture(e, 0, in, out, 1.0, {}, &err); }, out, cpu, inputHandles ? 0 : 1);
         QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
-        wrong = rendered("the transition", [&] { return ofx::applyTransitionTexture(tr, 3, 0.25, in, to, mix, 1.0, &err); }, mix, mixed, 2);
-        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
-        // Turned off: not given textures, and asked all the same, the picture is written into the texture.
-        qputenv("MONTAGE_GPU_HANDLES", "0");
-        QVERIFY(!ofx::rendersTextures(e, &why));
-        QVERIFY2(why.find("turned off") != std::string::npos, why.c_str());
-        const ofx::GlPicture plain = texture(nullptr);
-        const long copiedBefore = ofx::remote::pictureStats().inPlace;
-        QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
-        QCOMPARE(ofx::remote::pictureStats().inPlace, copiedBefore);
-        QVERIFY(worst(pixels(plain), cpu) <= 1.0f / 1023);
-        qunsetenv("MONTAGE_GPU_HANDLES");
-        // Textures of two sizes are refused.
-        QVERIFY(!ofx::applyEffectTexture(e, 0, in, ofx::GlPicture{out.texture, W, H - 2}, 1.0, {}, &err));
-        f->glDeleteTextures(GLsizei(textures.size()), textures.data());
-        other.doneCurrent();
-        // A frame with the hosted effect, drawn by the GPU compositor where its OpenGL shares with the plug-ins': the
-        // effect a texture step, nothing made on the CPU.
-        if (!handles || !gpu::initialize(&why) || !gpu::sharesOpenGl()) {
-            qInfo("No frame on the GPU: %s", handles ? (gpu::available() ? "the compositor does not share OpenGL" : why.c_str()) : cannot.c_str());
-            return;
-        }
-        Sequence& s = *p.active();
-        s.width = 160;
-        s.height = 90;
-        QImage q(160, 90, QImage::Format_RGBA64);
-        for (int y = 0; y < 90; ++y)
-            for (int x = 0; x < 160; ++x) q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.21f), float(y) / 90, 0.4f, 1.0f));
-        QVERIFY(q.save(dir.filePath("wide.png")));
-        MediaItem m;
-        QVERIFY(probeMedia(dir.filePath("wide.png").toStdString(), m));
-        m.id = p.newId();
-        p.media.push_back(m);
-        const auto placed = edit::placeMedia(p, s, m.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
-        QVERIFY(placed.ok);
-        edit::clipById(s, placed.created[0])->effects.push_back(e);
-        RenderOptions o;
-        o.gpu = false;
-        const Image cpuFrame = renderProgramFrame(p, s, 5, o);
-        const gpu::Stats before = gpu::stats();
-        const long copied = ofx::remote::pictureStats().inPlace;
-        o.gpu = true;
-        const Image gpuFrame = renderProgramFrame(p, s, 5, o);
-        const gpu::Stats after = gpu::stats();
-        QVERIFY2(after.gpuFrames == before.gpuFrames + 1, after.lastFallback.c_str());
-        QCOMPARE(after.textureSteps - before.textureSteps, 1L);
         QCOMPARE(ofx::remote::pictureStats().inputHandles - givenBefore, inputHandles ? 1L : 0L);
         if (inputHandles) QCOMPARE(QString::fromStdString(ofx::remote::pictureStats().lastInput), QString("given to its plug-in host as a DMA-BUF"));
-        QCOMPARE(after.cpuLayers - before.cpuLayers, 0L);
-        if (expected) QCOMPARE(ofx::remote::pictureStats().inPlace, copied + 1);
+        wrong = rendered("the transition", [&] { return ofx::applyTransitionTexture(tr, 3, 0.25, in, to, mix, 1.0, &err); }, mix, mixed, 2);
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
         // A hundred pictures in, each carrying its number in every row (so a torn one has rows of two numbers), through
         // the host from texture to texture: none stale or torn against the effect in Montage's own process, and where
         // both sides share, none read back nor through shared memory either way (counted).
@@ -32150,6 +32104,55 @@ colorspaces:
             QCOMPARE(after.inputHandles - before.inputHandles, inputHandles ? 100L : 0L);
             if (expected) QCOMPARE(after.handles - before.handles, 100L);
         }
+        // Turned off: not given textures, and asked all the same, the picture is written into the texture.
+        qputenv("MONTAGE_GPU_HANDLES", "0");
+        QVERIFY(!ofx::rendersTextures(e, &why));
+        QVERIFY2(why.find("turned off") != std::string::npos, why.c_str());
+        const ofx::GlPicture plain = texture(nullptr);
+        const long copiedBefore = ofx::remote::pictureStats().inPlace;
+        QVERIFY2(ofx::applyEffectTexture(e, 0, in, plain, 1.0, {}, &err), err.c_str());
+        QCOMPARE(ofx::remote::pictureStats().inPlace, copiedBefore);
+        QVERIFY(worst(pixels(plain), cpu) <= 1.0f / 1023);
+        qunsetenv("MONTAGE_GPU_HANDLES");
+        // Textures of two sizes are refused.
+        QVERIFY(!ofx::applyEffectTexture(e, 0, in, ofx::GlPicture{out.texture, W, H - 2}, 1.0, {}, &err));
+        f->glDeleteTextures(GLsizei(textures.size()), textures.data());
+        other.doneCurrent();
+        // A frame with the hosted effect, drawn by the GPU compositor where its OpenGL shares with the plug-ins': the
+        // effect a texture step, nothing made on the CPU.
+        if (!handles || !gpu::initialize(&why) || !gpu::sharesOpenGl()) {
+            qInfo("No frame on the GPU: %s", handles ? (gpu::available() ? "the compositor does not share OpenGL" : why.c_str()) : cannot.c_str());
+            return;
+        }
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        QImage q(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.21f), float(y) / 90, 0.4f, 1.0f));
+        QVERIFY(q.save(dir.filePath("wide.png")));
+        MediaItem m;
+        QVERIFY(probeMedia(dir.filePath("wide.png").toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        const auto placed = edit::placeMedia(p, s, m.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(placed.ok);
+        edit::clipById(s, placed.created[0])->effects.push_back(e);
+        RenderOptions o;
+        o.gpu = false;
+        const Image cpuFrame = renderProgramFrame(p, s, 5, o);
+        const gpu::Stats before = gpu::stats();
+        const long copied = ofx::remote::pictureStats().inPlace;
+        const int readBacksBefore = ofx::gpuReadBacks();
+        o.gpu = true;
+        const Image gpuFrame = renderProgramFrame(p, s, 5, o);
+        const gpu::Stats after = gpu::stats();
+        QVERIFY2(after.gpuFrames == before.gpuFrames + 1, after.lastFallback.c_str());
+        QCOMPARE(after.textureSteps - before.textureSteps, 1L);
+        QCOMPARE(after.cpuLayers - before.cpuLayers, 0L);
+        if (expected) QCOMPARE(ofx::remote::pictureStats().inPlace, copied + 1);
+        // (and its picture in, the layer under it, went to the host as a handle: nothing read back)
+        QCOMPARE(ofx::gpuReadBacks() - readBacksBefore, inputHandles ? 0 : 1);
         QVERIFY2(worst(cpuFrame, gpuFrame) <= 1.0f / 1023, qPrintable(QString::number(worst(cpuFrame, gpuFrame))));
     }
 
@@ -32189,7 +32192,6 @@ colorspaces:
                 else qunsetenv("MONTAGE_GPU_HANDLES");
                 ofx::setGpuRendering(gpu);
                 ofx::remote::resetPictureStats();
-        const int readBacksBefore = ofx::gpuReadBacks();
             }
         } asking;
         plugins::setHostExecutable(MONTAGE_PLUGIN_HOST);
@@ -32197,8 +32199,6 @@ colorspaces:
             ofx::remote::releaseIdle();
             plugins::HostingSettings s = asking.hosting;
             s.isolation = how;
-        // (and its picture in, the layer under it, went to the host as a handle: nothing read back)
-        QCOMPARE(ofx::gpuReadBacks() - readBacksBefore, inputHandles ? 0 : 1);
             plugins::setHosting(s);
             plugins::clearHostFailures();
         };
@@ -36280,16 +36280,9 @@ colorspaces:
                       shot, off * 100, grainSize(back), grainSize(own540), wantSize);
                 // (the size against the grain itself at the rung's size, the grainy sequence rendered at 960 by 540:
                 // the profile's size, measured over the ramp on the source, takes in more of the low frequencies where
-                // the grain is weak, and is reported. Phase 16 holds a size to 10 %; here it is held to 35 %, and the
-                // fit is not the cause, AV1's model is: a decoder makes the grain in blocks of 32 samples, each cut at
-                // a random offset from one 64-sample template, so what is coarser than a block is not carried as it is
-                // (it repeats from block to block, and a 64-pixel window sees less of it at its lowest frequency and
-                // more at a block's), and grain sized from where its spectrum falls to half reads finer. For the
-                // stronger shot here, the coefficients' own grain, drawn without the blocks, is 2.70 px, the grainy
-                // sequence's own size at 540 lines; drawn as a decoder draws it, on a flat grey, 2.19 px; on the
-                // ramp, measured as here, 1.96 px, 27 % finer. Fitted to grain 1.1 to 1.6 times coarser, the grain a
-                // decoder draws is further from the profile's at every one of them, not nearer. The weaker shot's
-                // comes out within 2 %)
+                // the grain is weak, and is reported. Phase 16 holds a size to 10 %; here it is held to 35 %, as AV1's
+                // autoregression fitted to the stronger shot's profile makes grain about a third finer than the
+                // profile's at this size, the coding's noise left out; the weaker shot's comes out within 2 %)
                 QVERIFY2(std::fabs(grainSize(back) / grainSize(own540) - 1) < 0.35,
                          qPrintable(QString("%1 for %2").arg(grainSize(back)).arg(grainSize(own540))));
             }
@@ -39182,111 +39175,6 @@ colorspaces:
         QVERIFY2(unlisted.empty(), qPrintable(QString::fromStdString("on the CPU and not listed: " + (unlisted.empty() ? "" : unlisted.front()))));
         QVERIFY2(nowGpu.empty(), qPrintable(QString::fromStdString("listed but drawn on the GPU: " + (nowGpu.empty() ? "" : nowGpu.front()))));
     }
-    void gpuSplatsMatchCpu() {
-        // Gaussian splats sorted (by compute passes) and blended on the GPU, against the CPU's renderer: the 10,000-splat
-        // wall of the media tests and a 200,000-splat capture with harmonics to degree 3, from three cameras, with the
-        // draft's share, its points, the crop box and cleaning each on and off, within 1/1023; a stack of 64 splats at one
-        // depth blended in the cloud's order; a capture past a 64 MB budget drawn in batches, still on the GPU; a splat
-        // clip in a sequence drawn there, and on the CPU, saying why, where compute is turned off.
-        std::string why;
-        if (!gpu::initialize(&why)) QSKIP(why.c_str());
-        if (!gpu::takesSplats(&why)) QSKIP(why.c_str());
-        auto lookAt = [](std::array<double, 3> C, std::array<double, 3> at, double f, int w, int h) {
-            auto unit = [](std::array<double, 3> v) {
-                const double l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-                return std::array<double, 3>{v[0] / l, v[1] / l, v[2] / l};
-            };
-            const auto fw = unit({at[0] - C[0], at[1] - C[1], at[2] - C[2]});
-            const auto right = unit({fw[1] * 0 - fw[2] * 1, fw[2] * 0 - fw[0] * 0, fw[0] * 1 - fw[1] * 0});
-            const std::array<double, 3> down{fw[1] * right[2] - fw[2] * right[1], fw[2] * right[0] - fw[0] * right[2], fw[0] * right[1] - fw[1] * right[0]};
-            ModelCamera cam;
-            cam.R = {right[0], right[1], right[2], down[0], down[1], down[2], fw[0], fw[1], fw[2]};
-            cam.C = C;
-            cam.screen = {f, 0, w / 2.0, 0, f, h / 2.0};
-            return cam;
-        };
-        uint32_t seed = 17;
-        auto rnd = [&] {
-            seed = seed * 1664525u + 1013904223u;
-            return double(seed >> 8) / double(1u << 24);
-        };
-        auto dcFor = [](double colour) { return float((colour - 0.5) / kSplatSh0); };
-        auto onGpu = [](const SplatCloud& cloud, const ModelCamera& cam, int w, int h, const SplatRenderOptions& o, Image& out) {
-            auto layer = std::make_shared<gpu::SplatLayer>();
-            layer->width = w, layer->height = h, layer->points = o.points, layer->linearColor = cloud.linearColor, layer->opacity = o.opacity;
-            splatsForBlending(cloud, identity4(), cam, w, h, o, layer->records, layer->depths, &layer->tiles);
-            gpu::Frame frame;
-            frame.width = w, frame.height = h;
-            frame.flatten = false;
-            gpu::Item item;
-            item.a.splats = layer;
-            item.a.place.full = true;
-            frame.items.push_back(std::move(item));
-            return gpu::execute(frame, &out);
-        };
-        auto worst = [](const Image& a, const Image& b, int* at = nullptr) {
-            double d = 0;
-            for (size_t i = 0; i < a.px.size() && i < b.px.size(); ++i)
-                if (const double e = std::fabs(double(a.px[i]) - b.px[i]); e > d) {
-                    d = e;
-                    if (at) *at = int(i / 4);
-                }
-            return a.px.size() == b.px.size() ? d : 1e9;
-        };
-        auto covered = [](const Image& a) {
-            double s = 0;
-            for (size_t i = 3; i < a.px.size(); i += 4) s += a.px[i];
-            return s;
-        };
-        // The wall: 2,500 large splats with 7,500 small faint ones of detail over it.
-        SplatCloud wall;
-        wall.count = 10000, wall.shDegree = 0;
-        for (size_t i = 0; i < wall.count; ++i) {
-            const bool large = i % 4 == 0;
-            const double x = large ? double((i / 4) % 50) * 0.2 - 4.9 : rnd() * 10 - 5, y = large ? double((i / 4) / 50) * 0.2 - 4.9 : rnd() * 10 - 5;
-            wall.positions.insert(wall.positions.end(), {float(x), float(y), large ? 0.0f : 0.05f});
-            const float size = large ? 0.12f : 0.025f;
-            wall.scales.insert(wall.scales.end(), {size, size, 0.01f});
-            wall.rotations.insert(wall.rotations.end(), {0, 0, 0, 1});
-            wall.opacities.push_back(large ? 0.95f : 0.25f);
-            const double shade = 0.5 + 0.3 * std::sin(x) * std::cos(y) + (large ? 0 : rnd() * 0.2 - 0.1);
-            wall.colors.insert(wall.colors.end(), {dcFor(shade), dcFor(0.5), dcFor(1 - shade)});
-        }
-        // A capture: 200,000 splats in a shell and a cloud inside it, turned every way, of every size and opacity, their
-        // colours changing with the direction they are seen from (degree 3), trained with the screen-space filter.
-        auto capture = [&](size_t count, int degree) {
-            SplatCloud c;
-            c.count = count, c.shDegree = degree, c.antialiased = true;
-            const size_t K = size_t(c.shCoefficients());
-            for (size_t i = 0; i < count; ++i) {
-                const double u = rnd() * 2 - 1, phi = rnd() * 6.283185307, r = i % 3 ? 1.5 + 0.1 * rnd() : 1.4 * std::cbrt(rnd());
-                const double sxy = std::sqrt(std::max(0.0, 1 - u * u));
-                c.positions.insert(c.positions.end(), {float(r * sxy * std::cos(phi)), float(r * u), float(r * sxy * std::sin(phi))});
-                const double big = rnd() < 0.05 ? 4 : 1;
-                c.scales.insert(c.scales.end(), {float(big * (0.004 + 0.03 * rnd())), float(big * (0.004 + 0.02 * rnd())), float(0.002 + 0.01 * rnd())});
-                double q[4] = {rnd() - 0.5, rnd() - 0.5, rnd() - 0.5, rnd() - 0.5};
-                const double ql = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-                c.rotations.insert(c.rotations.end(), {float(q[0] / ql), float(q[1] / ql), float(q[2] / ql), float(q[3] / ql)});
-                c.opacities.push_back(float(0.02 + 0.98 * rnd()));
-                c.colors.insert(c.colors.end(), {dcFor(rnd()), dcFor(rnd()), dcFor(rnd())});
-                for (size_t k = 0; k < K * 3; ++k) c.sh.push_back(float((rnd() - 0.5) * 0.3));
-            }
-            for (int a = 0; a < 3; ++a) c.lo[size_t(a)] = -1.7f, c.hi[size_t(a)] = 1.7f;
-            return c;
-        };
-        const SplatCloud shell = capture(200000, 3);
-        struct Case {
-            const SplatCloud* cloud;
-            const char* name;
-            ModelCamera cams[3];
-            int w, h;
-        };
-        const Case cases[2] = {{&wall, "the wall", {lookAt({0, 0, 9}, {0, 0, 0}, 300, 320, 180), lookAt({3, -2, 6}, {0.5, 0, 0}, 420, 320, 180),
-                                                    lookAt({-1, 0.5, 2}, {-1.2, 0.4, 0}, 700, 320, 180)}, 320, 180},
-                               {&shell, "the capture", {lookAt({0, 0, 5}, {0, 0, 0}, 600, 640, 360), lookAt({2.5, 1.5, 3}, {0, 0, 0}, 500, 640, 360),
-                                                        lookAt({0.3, -0.2, 1.2}, {0, 0, 0}, 400, 640, 360)}, 640, 360}};
-        gpu::resetStats();
-        int frames = 0;
     void gpuSourceStageAndMaskedColour() {
         // Film Negative and Faded Colour Restore as the GPU's source stage (each channel's curve, measured from the frame
         // on the CPU, before the input transform), and ACES Gamut Compress and the OpenColorIO Transform through a
@@ -39437,6 +39325,111 @@ colorspaces:
                 compare(QStringLiteral("%1 through a mask, setting %2").arg(what).arg(k + 1));
             }
     }
+    void gpuSplatsMatchCpu() {
+        // Gaussian splats sorted (by compute passes) and blended on the GPU, against the CPU's renderer: the 10,000-splat
+        // wall of the media tests and a 200,000-splat capture with harmonics to degree 3, from three cameras, with the
+        // draft's share, its points, the crop box and cleaning each on and off, within 1/1023; a stack of 64 splats at one
+        // depth blended in the cloud's order; a capture past a 64 MB budget drawn in batches, still on the GPU; a splat
+        // clip in a sequence drawn there, and on the CPU, saying why, where compute is turned off.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        if (!gpu::takesSplats(&why)) QSKIP(why.c_str());
+        auto lookAt = [](std::array<double, 3> C, std::array<double, 3> at, double f, int w, int h) {
+            auto unit = [](std::array<double, 3> v) {
+                const double l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                return std::array<double, 3>{v[0] / l, v[1] / l, v[2] / l};
+            };
+            const auto fw = unit({at[0] - C[0], at[1] - C[1], at[2] - C[2]});
+            const auto right = unit({fw[1] * 0 - fw[2] * 1, fw[2] * 0 - fw[0] * 0, fw[0] * 1 - fw[1] * 0});
+            const std::array<double, 3> down{fw[1] * right[2] - fw[2] * right[1], fw[2] * right[0] - fw[0] * right[2], fw[0] * right[1] - fw[1] * right[0]};
+            ModelCamera cam;
+            cam.R = {right[0], right[1], right[2], down[0], down[1], down[2], fw[0], fw[1], fw[2]};
+            cam.C = C;
+            cam.screen = {f, 0, w / 2.0, 0, f, h / 2.0};
+            return cam;
+        };
+        uint32_t seed = 17;
+        auto rnd = [&] {
+            seed = seed * 1664525u + 1013904223u;
+            return double(seed >> 8) / double(1u << 24);
+        };
+        auto dcFor = [](double colour) { return float((colour - 0.5) / kSplatSh0); };
+        auto onGpu = [](const SplatCloud& cloud, const ModelCamera& cam, int w, int h, const SplatRenderOptions& o, Image& out) {
+            auto layer = std::make_shared<gpu::SplatLayer>();
+            layer->width = w, layer->height = h, layer->points = o.points, layer->linearColor = cloud.linearColor, layer->opacity = o.opacity;
+            splatsForBlending(cloud, identity4(), cam, w, h, o, layer->records, layer->depths, &layer->tiles);
+            gpu::Frame frame;
+            frame.width = w, frame.height = h;
+            frame.flatten = false;
+            gpu::Item item;
+            item.a.splats = layer;
+            item.a.place.full = true;
+            frame.items.push_back(std::move(item));
+            return gpu::execute(frame, &out);
+        };
+        auto worst = [](const Image& a, const Image& b, int* at = nullptr) {
+            double d = 0;
+            for (size_t i = 0; i < a.px.size() && i < b.px.size(); ++i)
+                if (const double e = std::fabs(double(a.px[i]) - b.px[i]); e > d) {
+                    d = e;
+                    if (at) *at = int(i / 4);
+                }
+            return a.px.size() == b.px.size() ? d : 1e9;
+        };
+        auto covered = [](const Image& a) {
+            double s = 0;
+            for (size_t i = 3; i < a.px.size(); i += 4) s += a.px[i];
+            return s;
+        };
+        // The wall: 2,500 large splats with 7,500 small faint ones of detail over it.
+        SplatCloud wall;
+        wall.count = 10000, wall.shDegree = 0;
+        for (size_t i = 0; i < wall.count; ++i) {
+            const bool large = i % 4 == 0;
+            const double x = large ? double((i / 4) % 50) * 0.2 - 4.9 : rnd() * 10 - 5, y = large ? double((i / 4) / 50) * 0.2 - 4.9 : rnd() * 10 - 5;
+            wall.positions.insert(wall.positions.end(), {float(x), float(y), large ? 0.0f : 0.05f});
+            const float size = large ? 0.12f : 0.025f;
+            wall.scales.insert(wall.scales.end(), {size, size, 0.01f});
+            wall.rotations.insert(wall.rotations.end(), {0, 0, 0, 1});
+            wall.opacities.push_back(large ? 0.95f : 0.25f);
+            const double shade = 0.5 + 0.3 * std::sin(x) * std::cos(y) + (large ? 0 : rnd() * 0.2 - 0.1);
+            wall.colors.insert(wall.colors.end(), {dcFor(shade), dcFor(0.5), dcFor(1 - shade)});
+        }
+        // A capture: 200,000 splats in a shell and a cloud inside it, turned every way, of every size and opacity, their
+        // colours changing with the direction they are seen from (degree 3), trained with the screen-space filter.
+        auto capture = [&](size_t count, int degree) {
+            SplatCloud c;
+            c.count = count, c.shDegree = degree, c.antialiased = true;
+            const size_t K = size_t(c.shCoefficients());
+            for (size_t i = 0; i < count; ++i) {
+                const double u = rnd() * 2 - 1, phi = rnd() * 6.283185307, r = i % 3 ? 1.5 + 0.1 * rnd() : 1.4 * std::cbrt(rnd());
+                const double sxy = std::sqrt(std::max(0.0, 1 - u * u));
+                c.positions.insert(c.positions.end(), {float(r * sxy * std::cos(phi)), float(r * u), float(r * sxy * std::sin(phi))});
+                const double big = rnd() < 0.05 ? 4 : 1;
+                c.scales.insert(c.scales.end(), {float(big * (0.004 + 0.03 * rnd())), float(big * (0.004 + 0.02 * rnd())), float(0.002 + 0.01 * rnd())});
+                double q[4] = {rnd() - 0.5, rnd() - 0.5, rnd() - 0.5, rnd() - 0.5};
+                const double ql = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+                c.rotations.insert(c.rotations.end(), {float(q[0] / ql), float(q[1] / ql), float(q[2] / ql), float(q[3] / ql)});
+                c.opacities.push_back(float(0.02 + 0.98 * rnd()));
+                c.colors.insert(c.colors.end(), {dcFor(rnd()), dcFor(rnd()), dcFor(rnd())});
+                for (size_t k = 0; k < K * 3; ++k) c.sh.push_back(float((rnd() - 0.5) * 0.3));
+            }
+            for (int a = 0; a < 3; ++a) c.lo[size_t(a)] = -1.7f, c.hi[size_t(a)] = 1.7f;
+            return c;
+        };
+        const SplatCloud shell = capture(200000, 3);
+        struct Case {
+            const SplatCloud* cloud;
+            const char* name;
+            ModelCamera cams[3];
+            int w, h;
+        };
+        const Case cases[2] = {{&wall, "the wall", {lookAt({0, 0, 9}, {0, 0, 0}, 300, 320, 180), lookAt({3, -2, 6}, {0.5, 0, 0}, 420, 320, 180),
+                                                    lookAt({-1, 0.5, 2}, {-1.2, 0.4, 0}, 700, 320, 180)}, 320, 180},
+                               {&shell, "the capture", {lookAt({0, 0, 5}, {0, 0, 0}, 600, 640, 360), lookAt({2.5, 1.5, 3}, {0, 0, 0}, 500, 640, 360),
+                                                        lookAt({0.3, -0.2, 1.2}, {0, 0, 0}, 400, 640, 360)}, 640, 360}};
+        gpu::resetStats();
+        int frames = 0;
         for (const Case& k : cases) {
             const SplatCloud& cloud = *k.cloud;
             SplatFilter draft;
