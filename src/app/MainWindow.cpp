@@ -1387,6 +1387,7 @@ void MainWindow::applyHdrViewer() {
         m->setHdrViewer(on);
         if (hdrWired_) continue;
         // Asked for and not possible here (an SDR display, no GPU device): said once, in the status bar.
+        connect(m->viewer(), &ViewerWidget::hdrChanged, this, &MainWindow::updateHdrShownAs);
         connect(m->viewer(), &ViewerWidget::hdrChanged, this, [this, m] {
             if (hdrMessageShown_ || !m->viewer()->hdrViewer() || m->viewer()->hdrStatus().isEmpty()) return;
             hdrMessageShown_ = true;
@@ -1394,6 +1395,19 @@ void MainWindow::applyHdrViewer() {
         });
     }
     hdrWired_ = true;
+    updateHdrShownAs();
+}
+
+void MainWindow::updateHdrShownAs() {
+    QAction* shownAs = findChild<QAction*>(QStringLiteral("hdrShownAs"));
+    if (!shownAs) return;
+    // The monitor showing HDR (the Program monitor first), else what the Program monitor says.
+    QString text;
+    for (MonitorPanel* m : {programPanel_, sourcePanel_})
+        if (m && text.isEmpty() && m->viewer()->hdrShowing()) text = m->viewer()->hdrShownAs();
+    if (text.isEmpty() && programPanel_) text = programPanel_->viewer()->hdrShownAs();
+    shownAs->setText(text);
+    shownAs->setVisible(!text.isEmpty());
 }
 
 void MainWindow::buildMenus() {
@@ -2872,6 +2886,11 @@ void MainWindow::buildMenus() {
     hdrViewer_->setToolTip(hdrViewerBuilt() ? tr("Show HDR sequences as HDR on an HDR display (macOS EDR, Windows with HDR switched on) "
                                                  "instead of tone mapped to SDR")
                                             : tr("This build has no HDR viewer (it needs Qt 6.7 or later)"));
+    // (under it, while it is on: what the monitors show HDR pictures as, from the HDR surface's description)
+    QAction* shownAs = play->addAction(QString());
+    shownAs->setObjectName(QStringLiteral("hdrShownAs"));
+    shownAs->setEnabled(false);
+    shownAs->setVisible(false);
     // Video output: the Program picture alone, full screen here or on another display.
     QAction* fullScreen = add(play, QT_TR_NOOP("Full Screen Program"), QKeySequence("Ctrl+Shift+F"), [this] {
         if (cleanFeed_ && cleanFeed_->isVisible()) hideCleanFeed();

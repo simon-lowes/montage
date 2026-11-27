@@ -25557,6 +25557,42 @@ print("added " + ui["name"])
         QCOMPARE(hdrHeadroomFromDescription(0, 1000, 1000), 1.0);
     }
 
+    // Phase 18 #14: the words the HDR Viewer's menu shows for what the monitors show: the transfer the HDR surface is
+    // described with (PQ, HLG, or PQ for an HLG picture where the compositor takes no HLG), HDR where nothing is
+    // described, SDR with the reason when HDR does not show, and nothing while the viewer is off. Then the menu's line,
+    // which follows the Program monitor and is hidden while the viewer is off.
+    void hdrShownAsWords() {
+        const QString display = QStringLiteral("This display does not show HDR");
+        QCOMPARE(hdrShownAsText(true, true, Transfer::Pq, Transfer::Pq, {}), QString("PQ"));
+        QCOMPARE(hdrShownAsText(true, true, Transfer::Hlg, Transfer::Hlg, {}), QString("HLG"));
+        QCOMPARE(hdrShownAsText(true, true, Transfer::Pq, Transfer::Hlg, {}), QString("PQ (converted from HLG)"));
+        QCOMPARE(hdrShownAsText(true, true, Transfer::Linear, Transfer::Pq, {}), QString("HDR"));
+        QCOMPARE(hdrShownAsText(true, false, Transfer::Linear, Transfer::Pq, display), QString("SDR: this display does not take HDR"));
+        QCOMPARE(hdrShownAsText(true, false, Transfer::Linear, Transfer::Pq, QStringLiteral("There is no GPU device")),
+                 QString("SDR: there is no GPU device"));
+        QCOMPARE(hdrShownAsText(true, false, Transfer::Pq, Transfer::Pq, {}), QString("SDR"));
+        QCOMPARE(hdrShownAsText(false, false, Transfer::Linear, Transfer::Pq, display), QString());
+        auto* shownAs = win_->findChild<QAction*>("hdrShownAs");
+        auto* toggle = win_->findChild<QAction*>("hdrViewer");
+        QVERIFY(shownAs);
+        QVERIFY(toggle);
+        QVERIFY(!shownAs->isEnabled());
+        MonitorPanel* program = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        const bool was = toggle->isChecked();
+        auto putBack = qScopeGuard([&] {
+            if (toggle->isChecked() != was) toggle->trigger();
+        });
+        if (toggle->isChecked()) toggle->trigger();
+        QTRY_VERIFY(!shownAs->isVisible());
+        if (!hdrViewerBuilt()) return;
+        toggle->trigger();
+        QTRY_COMPARE(shownAs->text(), program->viewer()->hdrShownAs());
+        QVERIFY(!shownAs->text().isEmpty() && shownAs->isVisible());
+    }
+
     void hdrViewerOnWayland() {
         // Under Weston (scripts/wayland-hdr-check.sh, in CI): headless, its GL renderer, colour management on with a
         // BT.2100 PQ output (reference white 203 nits, peak 1000; MONTAGE_TEST_WESTON_CM=true), on with an SDR output
@@ -25654,6 +25690,7 @@ print("added " + ui["name"])
             QTRY_VERIFY(!viewer.hdrStatus().isEmpty());
             QVERIFY(!viewer.hdrShowing());
             QCOMPARE(viewer.hdrStatus(), QStringLiteral("This compositor does not take HDR pictures (it has no Wayland colour management)"));
+            QCOMPARE(viewer.hdrShownAs(), QStringLiteral("SDR: this compositor does not take HDR pictures (it has no Wayland colour management)"));
             QCOMPARE(viewer.hdrHeadroom(), 1.0);
             return;
         }
@@ -25665,6 +25702,8 @@ print("added " + ui["name"])
             qInfo().noquote() << "An SDR output was told from an HDR one in" << took << "ms";
             QVERIFY(!viewer.hdrShowing());
             QCOMPARE(viewer.hdrStatus(), QStringLiteral("This display does not show HDR"));
+            // (what the HDR Viewer's menu says: the last of PQ, HLG and SDR, the PQ run having shown the first two)
+            QCOMPARE(viewer.hdrShownAs(), QStringLiteral("SDR: this display does not take HDR"));
             QCOMPARE(viewer.hdrHeadroom(), 1.0);
             QVERIFY2(took < 1500, qPrintable(QString::number(took)));
             return;
@@ -25693,6 +25732,7 @@ print("added " + ui["name"])
         auto described = [&] { return viewer.hdrSurface() ? viewer.hdrSurface()->describedTransfer() : Transfer::Linear; };
         auto drawn = [&] { return viewer.hdrSurface() ? viewer.hdrSurface()->framesDrawn() : -1; };
         QTRY_VERIFY2_WITH_TIMEOUT(described() == Transfer::Pq, qPrintable(viewer.hdrStatus()), 10000);
+        QCOMPARE(viewer.hdrShownAs(), QStringLiteral("PQ"));  // (what the HDR Viewer's menu says)
         for (int i = 0; i < 3; ++i) {
             const int before = drawn();
             viewer.setHdrPicture(ramp);
@@ -25806,6 +25846,8 @@ print("added " + ui["name"])
                                   10000);
         QTRY_VERIFY2_WITH_TIMEOUT(described() == hlgDescribed, qPrintable(viewer.hdrStatus()), 10000);
         QCOMPARE(viewer.hdrSurface(), surface);  // (the same surface, still showing)
+        // (the HDR Viewer's menu: HLG where Weston takes it, else the HLG picture shown as PQ)
+        QCOMPARE(viewer.hdrShownAs(), hlgDescribed == Transfer::Hlg ? QStringLiteral("HLG") : QStringLiteral("PQ (converted from HLG)"));
         if (!throughQt) {
             // Described anew (Montage's binding): taken off the screen with what was set (a commit with no buffer)
             // and mapped again by the next frame, after which the surface is on its output again.
@@ -25821,6 +25863,9 @@ print("added " + ui["name"])
             const QString hlgBars = bars(QStringLiteral("hlg.png"));
             QVERIFY2(hlgBars.isEmpty(), qPrintable(hlgBars));
         }
+        // Then an SDR picture: the HDR Viewer's menu says SDR.
+        viewer.setHdrPicture(nullptr);
+        QTRY_COMPARE(viewer.hdrShownAs(), QStringLiteral("SDR"));
 #endif
     }
 

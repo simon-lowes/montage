@@ -28,6 +28,11 @@ class PlaybackController;
 struct Peaks;
 class HdrSurface;
 
+// The words for what the HDR viewer shows (ViewerWidget::hdrShownAs): whether it is asked for and showing, the
+// transfer its surface is described with (Transfer::Linear where nothing is described, as on macOS and Windows), the
+// picture's own transfer and why HDR does not show.
+QString hdrShownAsText(bool wanted, bool showing, montage::Transfer described, montage::Transfer picture, const QString& why);
+
 // Letterboxed frame display with optional safe-area guides.
 class ViewerWidget : public QWidget {
     Q_OBJECT
@@ -117,6 +122,11 @@ public:
     // The nits the HDR viewer shows SDR white at, where the system says; else BT.2408's 203.
     double hdrSdrWhiteNits() const;  // the display's peak over its SDR white, 1 when not showing HDR
     QString hdrStatus() const { return hdrStatus_; }  // why HDR is not showing, when asked for
+    // What the HDR viewer shows its picture as, for the HDR Viewer's menu: on Wayland, from the surface's description,
+    // "PQ", "HLG" or "PQ (converted from HLG)" (an HLG picture where the compositor takes no HLG); elsewhere "HDR";
+    // when it cannot, "SDR: " and why ("SDR: this display does not take HDR"), and "SDR" for an SDR picture; "" while
+    // it is not asked for.
+    QString hdrShownAs() const;
     // The viewer's drawing without the picture (its area transparent), as the HDR surface draws it over the picture.
     QImage overlayImage();
     HdrSurface* hdrSurface() const;

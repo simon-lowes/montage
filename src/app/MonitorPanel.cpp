@@ -489,6 +489,28 @@ bool ViewerWidget::hdrShowing() const {
 #endif
 }
 
+QString hdrShownAsText(bool wanted, bool showing, Transfer described, Transfer picture, const QString& why) {
+    if (!wanted) return {};
+    if (showing) {
+        if (described == Transfer::Hlg) return ViewerWidget::tr("HLG");
+        if (described == Transfer::Pq)
+            return picture == Transfer::Hlg ? ViewerWidget::tr("PQ (converted from HLG)") : ViewerWidget::tr("PQ");
+        return ViewerWidget::tr("HDR");
+    }
+    // (an SDR picture: no reason; the display's own refusal said as the menu says it; any other reason as it is)
+    if (why.isEmpty()) return ViewerWidget::tr("SDR");
+    if (why == ViewerWidget::tr("This display does not show HDR")) return ViewerWidget::tr("SDR: this display does not take HDR");
+    return ViewerWidget::tr("SDR: %1").arg(why.left(1).toLower() + why.mid(1));
+}
+
+QString ViewerWidget::hdrShownAs() const {
+    Transfer described = Transfer::Linear;
+#ifdef MONTAGE_HDR_VIEWER
+    if (surface_) described = surface_->describedTransfer();
+#endif
+    return hdrShownAsText(hdrWanted_, hdrShowing(), described, hdrPicture_ ? hdrPicture_->transfer : Transfer::Pq, hdrStatus_);
+}
+
 double ViewerWidget::hdrSdrWhiteNits() const {
 #ifdef MONTAGE_HDR_VIEWER
     if (surface_ && surface_->sdrWhiteNits() > 0) return surface_->sdrWhiteNits();

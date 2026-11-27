@@ -831,6 +831,7 @@ private:
     bool hdrMessageShown_ = false;  // why HDR is not showing, said once a toggle
     bool hdrWired_ = false;
     void applyHdrViewer();
+    void updateHdrShownAs();  // the Playback menu's line under HDR Viewer: what the monitors show HDR as
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;
     QString workspace_ = QStringLiteral("Editing");
