@@ -114,6 +114,9 @@ public:
     // registries it browses for is handed to it), and how many it has read there this run (null and 0 without one).
     QThread* mdnsThread() const;
     int mdnsDatagrams() const;
+    // Datagrams for the Node let go on that thread this run because as many as the Node takes at once were already
+    // waiting for it (a flood, or the Node's thread held up).
+    int mdnsDropped() const;
 
     // Ids, kept from one run to the next (made from the host name and label).
     QUuid nodeId() const { return nodeId_; }

@@ -28,6 +28,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <memory>
 #include <tuple>
 
 namespace montage::nmos {
@@ -1513,6 +1514,10 @@ Node::Response Node::handle(const QByteArray& method, const QString& rawPath, co
 namespace {
 
 constexpr quint16 kMdnsPort = 5353;
+// (nightly 27 Nov: every datagram for the Node was handed to its thread with no limit, and each one-shot query
+// answered there: a flood on the links, or the Node's thread held up, grew the queue without end)
+constexpr int kMdnsWaiting = 64;        // datagrams handed to the Node and not yet taken, at most
+constexpr int kUnicastPerSecond = 16;   // one-shot (legacy unicast) queries answered a second, at most
 constexpr quint16 kTypeA = 1, kTypePtr = 12, kTypeTxt = 16, kTypeSrv = 33, kTypeAny = 255;
 
 void putName(QByteArray& b, const QString& name) {
@@ -1711,6 +1716,11 @@ struct Node::Mdns {
     QUdpSocket* socket = nullptr;  // (used on `thread` alone, once started)
     int run = 0;                   // (this start's: what an earlier one heard is not taken)
     std::atomic<int> datagrams{0};
+    std::atomic<int> dropped{0};
+    // (handed to the Node and not yet taken: kept by each datagram handed, so that one taken after a restart still counts)
+    std::shared_ptr<std::atomic<int>> waiting = std::make_shared<std::atomic<int>>(0);
+    QElapsedTimer unicastSecond;  // (the second one-shot answers are counted in)
+    int unicastAnswers = 0;
     QString instance, host;        // "<label>-<port>._nmos-node._tcp.local", "montage-<id>.local"
     QHostAddress address;
     int port = 0;
@@ -1754,6 +1764,7 @@ struct Node::Mdns {
 
 QThread* Node::mdnsThread() const { return mdns_ ? mdns_->thread : nullptr; }
 int Node::mdnsDatagrams() const { return mdns_ ? mdns_->datagrams.load() : 0; }
+int Node::mdnsDropped() const { return mdns_ ? mdns_->dropped.load() : 0; }
 
 void Node::mdnsSend(const QByteArray& message, const QHostAddress& to, quint16 port) {
     if (!mdns_ || !mdns_->socket || !mdns_->io) return;
@@ -1836,18 +1847,27 @@ void Node::startMdns() {
     const QString instance = m.instance.toLower(), host = m.host.toLower();
     const auto links = m.links;
     std::atomic<int>* datagrams = &m.datagrams;
+    std::atomic<int>* dropped = &m.dropped;
+    const std::shared_ptr<std::atomic<int>> waiting = m.waiting;
     QUdpSocket* s = m.socket;
     const QPointer<Node> node(this);
     const int run = m.run;
-    connect(s, &QUdpSocket::readyRead, m.io, [s, instance, host, links, datagrams, node, run] {
+    connect(s, &QUdpSocket::readyRead, m.io, [s, instance, host, links, datagrams, dropped, waiting, node, run] {
         while (s->hasPendingDatagrams()) {
             const QNetworkDatagram d = s->receiveDatagram(9000);
             if (!Mdns::onLink(links, d.senderAddress())) continue;  // (from off the local links: not heard)
             datagrams->fetch_add(1);
             MdnsHeard heard;
             if (!parseMdns(d.data(), instance, host, heard)) continue;
+            // (as many waiting for the Node as it takes: this one let go, as a busy network loses some anyway)
+            if (waiting->load() >= kMdnsWaiting) {
+                dropped->fetch_add(1);
+                continue;
+            }
             heard.from = d.senderAddress(), heard.port = quint16(d.senderPort());
-            QMetaObject::invokeMethod(node.data(), [node, run, heard = std::move(heard)] {
+            waiting->fetch_add(1);
+            QMetaObject::invokeMethod(node.data(), [node, run, waiting, heard = std::move(heard)] {
+                waiting->fetch_sub(1);
                 if (node) node->mdnsHeard(run, heard);
             }, Qt::QueuedConnection);
         }
@@ -1893,6 +1913,13 @@ void Node::mdnsHeard(int run, const MdnsHeard& heard) {
                 });
             }
         } else {
+            // (no more than kUnicastPerSecond of these a second: a querier on the links can ask from any port, and
+            // each is answered straight back)
+            if (!md.unicastSecond.isValid() || md.unicastSecond.elapsed() >= 1000) {
+                md.unicastSecond.start();
+                md.unicastAnswers = 0;
+            }
+            if (++md.unicastAnswers > kUnicastPerSecond) return;
             const QString service = QStringLiteral("_nmos-node._tcp.local");
             QByteArray srv;
             put16(srv, 0), put16(srv, 0), put16(srv, quint16(md.port));

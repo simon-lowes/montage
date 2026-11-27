@@ -22619,6 +22619,33 @@ colorspaces:
         QVERIFY2(read >= 100, qPrintable(QString::number(read)));  // (multicast loopback may drop a few)
         registry.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), group, 5353);
         QCOMPARE(answers(500), 1);
+        // Nightly 27 Nov: with this thread held for a second, 300 one-shot queries for the Node (from a port not 5353,
+        // each to be answered straight back): no more than 64 wait for the Node (other traffic on the links is counted
+        // as read too), the rest are let go on the multicast DNS thread, and no more than 16 a second are answered.
+        // A one-shot query once that second is over is still answered.
+        const auto oneShotAnswers = [&](int ms) {
+            int n = 0;
+            QElapsedTimer w;
+            w.start();
+            while (w.elapsed() < ms) {
+                QTest::qWait(20);
+                while (asker.hasPendingDatagrams())
+                    if (asker.receiveDatagram().data().contains(name)) ++n;
+            }
+            return n;
+        };
+        QTest::qWait(1100);
+        while (asker.hasPendingDatagrams()) asker.receiveDatagram();
+        const int readBefore = announced.mdnsDatagrams(), droppedBefore = announced.mdnsDropped();
+        for (int i = 0; i < 300; ++i) asker.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), group, 5353);
+        QThread::msleep(1000);
+        const int flood = announced.mdnsDatagrams() - readBefore, let = announced.mdnsDropped() - droppedBefore;
+        QVERIFY2(flood >= 100, qPrintable(QString::number(flood)));  // (multicast loopback may drop a few)
+        QVERIFY2(let > 0 && flood - let <= 64 + 16, qPrintable(QStringLiteral("%1 read, %2 let go").arg(flood).arg(let)));
+        const int answered = oneShotAnswers(1500);
+        QVERIFY2(answered >= 1 && answered <= 16, qPrintable(QString::number(answered)));
+        asker.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), group, 5353);
+        QCOMPARE(oneShotAnswers(500), 1);
         announced.stop();
         QVERIFY(!announced.mdnsThread());
     }
