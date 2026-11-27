@@ -5,8 +5,9 @@
 #     and writes gl_FragColor writes zero (why Weston 16's blending in its shaders shows every window black, and why
 #     scripts/wayland-hdr-check.sh hides GL_EXT_shader_framebuffer_fetch_non_coherent from Weston);
 #   - tests/repro/weston-dropped-transformation.c: under Weston (scripts/build-weston.sh) with colour management on and
-#     a BT.2100 PQ output, a shown surface described anew is not drawn until it is mapped again (why app/WaylandColor
-#     maps the HDR surface again when its description changes).
+#     a BT.2100 PQ output, a shown surface described anew is not drawn until it is mapped again: the screen keeps its
+#     old picture, and Weston's paint node log says the window was skipped (why app/WaylandColor maps the HDR surface
+#     again when its description changes).
 # Each is built here with the system's compiler (EGL and GLES 2 for the first; libwayland-client, and wayland-scanner
 # with the prefix's wayland-protocols, for the second) and its output kept in the work directory.
 #
@@ -85,7 +86,7 @@ if [ "$client" != 0 ]; then
 else
   # The middle of each step's screenshot, as a fraction of white (8 or 16 bits a sample, as Weston wrote it).
   verdict=0
-  python3 -I - "$work/shots" << 'EOF' || verdict=$?
+  python3 -I - "$work/shots" "$work/weston.log" << 'EOF' || verdict=$?
 import glob, os, struct, sys, zlib
 
 def middle(path):
@@ -133,16 +134,32 @@ for step in ('step-1', 'step-2', 'step-2-later', 'step-3'):
         sys.exit(2)
     seen[step] = max(middle(shots[-1]))
     print(f'{step}: the middle at {seen[step]:.3f} of white')
-shown = lambda s: seen[s] > 0.2
-dark = lambda s: seen[s] < 0.05
-if not (shown('step-1') and shown('step-3')):
-    print('The surface was not shown when first described, or when mapped again: not the fault described', file=sys.stderr)
+# Step 1 shows a dark grey (0x40) and steps 2 and 3 a light grey (0xc0), so a surface drawn at step 2 shows the light
+# grey there, and one left out keeps step 1's dark grey (or black, where nothing was drawn before).
+light = lambda s: abs(seen[s] - seen['step-3']) < 0.05
+if not (0.1 < seen['step-1'] < seen['step-3'] - 0.2):
+    print('The surface was not shown dark when first described, and light when mapped again: not the fault described',
+          file=sys.stderr)
     sys.exit(2)
-if dark('step-2') and dark('step-2-later'):
-    print("Weston's fault is seen: the surface described anew is not drawn until it is mapped again")
+# And Weston's own account (its gl-renderer-paint-nodes scope): the reproducer's window left out of a repaint because
+# its colour transformation was not there.
+skipped, node = 0, ''
+for line in open(sys.argv[2], errors='replace'):
+    if 'Paint node' in line:
+        node = line
+    elif 'skipped repaint: shader config failure' in line and "Weston's dropped transformation" in node:
+        skipped += 1
+print(f"Weston left the window out of {skipped} repaint(s): shader config failure")
+if not light('step-2') and not light('step-2-later') and skipped:
+    print("Weston's fault is seen: the surface described anew is not drawn until it is mapped again "
+          f"(the screen kept {seen['step-2']:.3f} where the new picture is {seen['step-3']:.3f})")
     sys.exit(0)
-print("Weston's fault is no longer seen: a surface described anew is drawn (see tests/repro/weston-dropped-transformation.c)", file=sys.stderr)
-sys.exit(1)
+if light('step-2') and light('step-2-later') and not skipped:
+    print("Weston's fault is no longer seen: a surface described anew is drawn (see tests/repro/weston-dropped-transformation.c)",
+          file=sys.stderr)
+    sys.exit(1)
+print("The screenshots and Weston's log disagree about whether the surface described anew was drawn", file=sys.stderr)
+sys.exit(2)
 EOF
   if [ "$verdict" != 0 ]; then
     grep -E 'image_description|set_image_description|paint node|color' "$work/weston.log" | tail -60 >&2 || true

@@ -1,5 +1,6 @@
 /* A reproducer for a Weston fault: a mapped surface whose image description changes (color-management-v1) is left out
- * of every repaint until Weston next rebuilds its list of views, so what is beneath it shows instead.
+ * of every repaint until Weston next rebuilds its list of views, so the screen goes on showing what was there before
+ * (the surface's old picture, or what is beneath it) instead of its new picture.
  *
  * Weston 16.0.2, its GL renderer, colour management on. When a commit changes a surface's image description,
  * weston_surface_set_color_profile() (libweston/compositor.c) finalises each of the surface's paint nodes' colour
@@ -12,10 +13,14 @@
  * Read in Weston 16.0.2's source (and seen in Montage's CI under it, Phase 17).
  *
  * What this client does, under a Weston with colour management on (Montage's CI drives its output as BT.2100 PQ):
- *   1. a fullscreen surface described as PQ with BT.2020 primaries and a MaxCLL of 1000, a grey buffer: shown;
- *   2. the same surface described anew (MaxCLL 400) with a new buffer of the same grey, committed together: the
- *      surface is not drawn (the screenshot is black where it is), and still not a second later;
- *   3. no buffer, then the buffer again: shown.
+ *   1. a fullscreen surface described as PQ with BT.2020 primaries and a MaxCLL of 1000, a dark grey buffer: shown;
+ *   2. the same surface described anew (MaxCLL 400) with a new buffer of a light grey, committed together: the
+ *      surface is not drawn ("skipped repaint: shader config failure" in the gl-renderer-paint-nodes log scope), so
+ *      the screen keeps what it showed before (step 1's dark grey, left in the output's shadow framebuffer; black
+ *      where nothing was drawn before), and still a second later;
+ *   3. no buffer, then the light grey buffer again: shown.
+ * (The two greys differ so that the screenshots tell a surface not drawn from one drawn: with one grey for both, as
+ * the first version of this file had, the picture left from step 1 looked the same as the new one.)
  * After each step it waits for the frame to be shown and runs the command in $SCREENSHOOTER from the directory
  * step-1, step-2, step-2-later and step-3 under the directory it is given; scripts/hdr-reproducers.sh then reads each
  * screenshot's middle.
@@ -274,7 +279,7 @@ int main(int argc, char** argv) {
     }
     cm = wp_color_manager_v1_get_surface(app.manager, app.surface);
     if (!(first = describe(&app, 1000)) || !(second = describe(&app, 400))) return 2;
-    if (!(a = greyBuffer(&app, 0x80)) || !(b = greyBuffer(&app, 0x80))) {
+    if (!(a = greyBuffer(&app, 0x40)) || !(b = greyBuffer(&app, 0xc0))) {
         fprintf(stderr, "No shared memory buffer\n");
         return 2;
     }
@@ -287,7 +292,7 @@ int main(int argc, char** argv) {
     commitAndWait(&app);
     ok = screenshot(argv[1], "step-1") && ok;
 
-    /* 2. Described anew, with a new buffer in the same commit. */
+    /* 2. Described anew, with a new buffer (another grey) in the same commit. */
     wp_color_management_surface_v1_set_image_description(cm, second, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
     wl_surface_attach(app.surface, b, 0, 0);
     wl_surface_damage_buffer(app.surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -299,7 +304,7 @@ int main(int argc, char** argv) {
     pause_for(&app, 1.0);
     ok = screenshot(argv[1], "step-2-later") && ok;
 
-    /* 3. No buffer, then the buffer again: mapped anew, with a transformation made for its new view. */
+    /* 3. No buffer, then the new buffer again: mapped anew, with a transformation made for its new view. */
     wl_surface_attach(app.surface, NULL, 0, 0);
     wl_surface_commit(app.surface);
     wl_display_roundtrip(app.display);
