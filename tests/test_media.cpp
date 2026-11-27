@@ -184,6 +184,7 @@
 #include "render/AutoBroll.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
+#include "render/TemporalFx.h"
 #include "render/DialogueMatch.h"
 #include "render/RoomTone.h"
 #include "audio/Ltc.h"
@@ -22544,6 +22545,41 @@ if __name__ == '__main__':
         const Image sharp = renderSequenceFrame(p, s, 20, {});
         c.effects.push_back(mb);
         QVERIFY(renderSequenceFrame(p, s, 20, off).px == sharp.px);
+        // Footage played very fast reads no more than six source frames either side, however far the shutter reaches,
+        // and the path carries the last step on past them: at 1200 % a 720 degree shutter spans 24 source frames and
+        // the bar, moving steadily, is still smeared twelve times as long as at its own speed.
+        const std::vector<int> far = motionBlurOffsets(0.3, -500, 500);
+        QCOMPARE(far.size(), size_t(2 * kMotionBlurReach));
+        QCOMPARE(far.front(), -kMotionBlurReach);
+        QCOMPARE(far.back(), kMotionBlurReach);
+        QCOMPARE(motionBlurOffsets(0, -0.25, 0.25), (std::vector<int>{-1, 1}));
+        QCOMPARE(motionBlurOffsets(0, 1e300 * 1e300, 0).size(), size_t(2));
+        mb.params["follow_edit"] = Param(1.0);
+        c.speed = 12;
+        c.duration = 3;
+        const double faster = smear(2);
+        qInfo("footage motion blur at 1200 %%: %.2f px", faster);
+        QVERIFY2(std::abs(faster / normal - 12) < 1.2, qPrintable(QString::number(faster / normal)));
+        // A project with a clip at a speed no control offers opens with it at 10000 times its own, so nothing the
+        // speed is multiplied by runs out of range, and Motion Blur on it renders.
+        const std::string fastPath = path("too-fast.montage");
+        QVERIFY(saveProject(p, fastPath));
+        QFile f(QString::fromStdString(fastPath));
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+        f.close();
+        QString text = QString::fromUtf8(doc.toJson());
+        QVERIFY(text.contains("\"speed\": 12"));
+        text.replace("\"speed\": 12", "\"speed\": 1e300");
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        f.write(text.toUtf8());
+        f.close();
+        Project crafted;
+        std::string loadErr;
+        QVERIFY2(loadProject(fastPath, crafted, &loadErr), loadErr.c_str());
+        Sequence& cs = *crafted.active();
+        QCOMPARE(cs.videoTracks[0].clips.at(0).speed, 1e4);
+        QVERIFY(!renderSequenceFrame(crafted, cs, 1, {}).empty());
     }
 
     void motionBlurAndFocusInProjectsSavedBefore() {

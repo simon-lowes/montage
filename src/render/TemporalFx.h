@@ -25,6 +25,15 @@ Image motionBlur(const Image& src, const MotionFn& back, const MotionFn& fwd, do
 // none carries the step before it on. Left as it is where the path is under half a pixel long.
 Image motionBlurPath(const Image& src, const std::map<int, MotionFn>& flows, double at, double from, double to);
 
+// The most source frames either side Motion Blur reads (each is held while the frame is made): past them the path
+// carries the last step on, so footage played very fast keeps its long blur without every frame it passes being read.
+constexpr int kMotionBlurReach = 6;
+// The longest path, in source frames either side, that a shutter is blurred over (longer is cut to it).
+constexpr double kMotionBlurSpan = 64;
+// The source frames (offsets from frame 0, which is not among them) read for a shutter from `from` to `to` source
+// frames either side of `at`: as far as the shutter reaches, at least one either side, at most kMotionBlurReach.
+std::vector<int> motionBlurOffsets(double at, double from, double to);
+
 // While one lives (on this thread), every motion blur through a shutter (a clip's transform's, Motion Blur's, titles'
 // letters', the warps') is left off: an export for a VFX pull, whose plates are to be blurred where they are composited.
 class MotionBlurOffScope {

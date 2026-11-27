@@ -1643,17 +1643,19 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     const double here = c.sourceAt(local);
                     from = (c.sourceAt(local - open / 2) - here) * perSeq, to = (c.sourceAt(local + open / 2) - here) * perSeq;
                     if (from > to) std::swap(from, to);  // (played backwards)
+                    // (A path past kMotionBlurSpan source frames either side is cut to it.)
+                    if (!std::isfinite(from) || !std::isfinite(to)) from = to = 0;
+                    from = std::clamp(from, -kMotionBlurSpan, kMotionBlurSpan), to = std::clamp(to, -kMotionBlurSpan, kMotionBlurSpan);
                 }
                 const double at = follow && between ? std::clamp(sec * mf - double(base), 0.0, 1.0) : 0.0;
                 if (open > 0 && to - from > 1e-9) {
                     const Image self = decoded.empty() ? src : decoded;
-                    // The frames it runs over: as far as the shutter reaches, at least one either side.
-                    const int k0 = std::min(-1, int(std::floor(at + from))), k1 = std::max(1, int(std::ceil(at + to)));
+                    // The frames it runs over: as far as the shutter reaches, at least one either side, and no more
+                    // than kMotionBlurReach (past them the path carries the last step on).
+                    const std::vector<int> offsets = motionBlurOffsets(at, from, to);
+                    const int k0 = offsets.front();
                     std::map<int64_t, Image> frames;
                     std::map<int64_t, bool> have;
-                    std::vector<int> offsets;
-                    for (int k = k0; k <= k1; ++k)
-                        if (k != 0) offsets.push_back(k);
                     const std::vector<MotionFn> motion = chainedMotion(key, base, offsets, [&](int64_t i) -> const Image* {
                         if (i == base) return &self;
                         auto h = have.find(i);

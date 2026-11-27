@@ -472,6 +472,7 @@ Clip clipFromJson(const QJsonObject& o) {
     c.tail = std::clamp(o.value("tail").toDouble(0), 0.0, 0.999999);
     c.speed = o.value("speed").toDouble(1.0);
     if (!(c.speed > 0)) c.speed = 1.0;
+    c.speed = std::clamp(c.speed, 1e-4, 1e4);  // (far past what the speed controls offer, 1 % to 10000 %)
     c.reverse = o.value("reverse").toBool(false);
     c.enabled = o.value("enabled").toBool(true);
     c.linkGroup = Id(i64(o.value("link")));
