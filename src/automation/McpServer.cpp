@@ -1005,7 +1005,10 @@ McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOn
             const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
             for (const QJsonValue& v : list)
                 if (v.isObject() && depth < 8) walk(v.toObject(), depth + 1);
-                else if (k && v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << oneNameFor(v.toString());
+                else if (k && v.isString() && !v.toString().isEmpty()) {
+                    (k == 2 ? out.writes : out.reads) << oneNameFor(v.toString());
+                    if (k == 2) out.writtenAs << v.toString();
+                }
         }
     };
     walk(a, 0);
@@ -1017,8 +1020,9 @@ McpCallPaths mcpCallPaths(const QString& tool, const QJsonObject& a, bool readOn
     }
     // (a read-only tool that makes its folder a production when asked writes it then)
     if (tool == QLatin1String("montage_production") && a.value("create").toBool() && !a.value("folder").toString().isEmpty())
-        out.writes << oneNameFor(a.value("folder").toString());
+        out.writes << oneNameFor(a.value("folder").toString()), out.writtenAs << a.value("folder").toString();
     out.writes.removeDuplicates();
+    out.writtenAs.removeDuplicates();
     out.reads.removeDuplicates();
     for (const QString& w : out.writes) out.reads.removeAll(w);
     return out;
@@ -1073,6 +1077,10 @@ QString mcpOwnFileNamed(const QString& tool, const QJsonObject& arguments, const
     };
     // What the call is known to write: there, or a folder that holds one of them.
     for (const QString& w : paths.writes)
+        if (const char* what = named(w, true)) return QStringLiteral("%1 is where Montage keeps %2: a tool does not write there").arg(w, QLatin1String(what));
+    // (and each as written, in every way it can be taken: "ab:/../x" is /x to FFmpeg but a folder's x to the tool's
+    // own files, which may hold one of them)
+    for (const QString& w : paths.writtenAs)
         if (const char* what = named(w, true)) return QStringLiteral("%1 is where Montage keeps %2: a tool does not write there").arg(w, QLatin1String(what));
     // And every other text in the arguments, whatever its key: a tool may write to an argument this server does not
     // know as a path. Only a DKDM and a server's certificate are read from there, by montage_make_kdm.

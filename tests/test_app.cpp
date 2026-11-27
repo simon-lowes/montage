@@ -12799,6 +12799,76 @@ private slots:
         }
     }
 
+    // Nightly 27 Nov: the app's own tools (answered by the window, not the engine) pass the same guard as the
+    // engine's, and a folder written as "ab:/../x" is refused when, taken as written, it holds one of Montage's own
+    // folders.
+    void mcpOwnFilesGuardedForTheAppsOwnTools() {
+        const QString folder = dir_.filePath("ownguard");
+        const QString home = folder + "/home", dkdms = home + "/Montage/dkdm";
+        QVERIFY(QDir().mkpath(dkdms) && QDir().mkpath(folder + "/takes"));
+        const QByteArray envBefore = qgetenv("MONTAGE_DCP_DKDMS");
+        const bool hadEnv = qEnvironmentVariableIsSet("MONTAGE_DCP_DKDMS");
+        auto restore = qScopeGuard([&] { hadEnv ? qputenv("MONTAGE_DCP_DKDMS", envBefore) : qunsetenv("MONTAGE_DCP_DKDMS"); });
+        qputenv("MONTAGE_DCP_DKDMS", QFile::encodeName(dkdms));
+        // From home, "ab:/../Montage" is home's Montage folder to the tool's own writers (it holds the DKDMs) and
+        // /Montage to FFmpeg. A VFX pull into it, its shots named "dkdm", is refused, and nothing is written; a
+        // folder beside it is not refused.
+        {
+            const QString cwdWas = QDir::currentPath();
+            auto back = qScopeGuard([&] { QDir::setCurrent(cwdWas); });
+#ifdef Q_OS_WIN
+            QVERIFY(QDir::setCurrent(home));  // (Windows takes no ":" in a name, so no "ab:" folder can be made there)
+#else
+            QVERIFY(QDir::setCurrent(home) && QDir().mkpath(home + "/ab:"));
+#endif
+            const QJsonObject pull{{"folder", "ab:/../Montage"}, {"name_pattern", "dkdm"}};
+            QVERIFY(mcpOwnFileNamed("montage_vfx_pull", pull, mcpCallPaths("montage_vfx_pull", pull, false)).contains("where Montage keeps"));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_vfx_pull"}, {"arguments", pull}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+            QVERIFY(QDir(dkdms).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty());
+            const QJsonObject beside{{"folder", "ab:/../Plates"}, {"name_pattern", "dkdm"}};
+            QVERIFY(mcpOwnFileNamed("montage_vfx_pull", beside, mcpCallPaths("montage_vfx_pull", beside, false)).isEmpty());
+        }
+        // A stand-in for one of the app's own tools: given a folder inside the DKDMs, a folder that holds them, or an
+        // address naming them after "file:", it is refused before it runs; given a folder elsewhere, it runs.
+        LiveLink link(state());
+        int ran = 0;
+        link.addAppTool(R"json({"name":"montage_stand_in","inputSchema":{"type":"object"}})json", [&](const QJsonObject&, QJsonObject&, bool& isError) {
+            isError = false;
+            ++ran;
+            return QStringLiteral("ran");
+        });
+        auto call = [](LiveLink& through, const QString& tool, const QJsonObject& args) {
+            QByteArray answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
+            through.handle(QJsonDocument(m).toJson(QJsonDocument::Compact), [&](QByteArray a) { answer = a; });
+            QElapsedTimer waited;
+            waited.start();
+            while (answer.isEmpty() && waited.elapsed() < 10000) QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+            return QJsonDocument::fromJson(answer).object().value("result").toObject();
+        };
+        for (const QJsonObject& args : {QJsonObject{{"action", "record"}, {"folder", dkdms + "/take"}},
+                                        QJsonObject{{"action", "live"}, {"live", QJsonObject{{"folder", home + "/Montage"}}}},
+                                        QJsonObject{{"action", "start"}, {"address", "file:" + dkdms + "/review.ts"}}}) {
+            const QJsonObject r = call(link, "montage_stand_in", args);
+            QVERIFY2(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("where Montage keeps"), QJsonDocument(r).toJson().constData());
+        }
+        QCOMPARE(ran, 0);
+        const QJsonObject fine = call(link, "montage_stand_in", {{"action", "record"}, {"folder", folder + "/takes"}});
+        QVERIFY2(!fine.value("isError").toBool(), QJsonDocument(fine).toJson().constData());
+        QCOMPARE(ran, 1);
+        // The window's own Capture and Remote Review tools, through its link: refused the same way, before they run.
+        QVERIFY(win_->liveLink());
+        const QJsonObject capture = call(*win_->liveLink(), "montage_capture", {{"action", "record"}, {"folder", dkdms}});
+        QVERIFY2(capture.value("isError").toBool() && QJsonDocument(capture).toJson().contains("where Montage keeps"), QJsonDocument(capture).toJson().constData());
+        const QJsonObject review = call(*win_->liveLink(), "montage_remote_review", {{"action", "start"}, {"address", "file:" + dkdms + "/review.ts"}});
+        QVERIFY2(review.value("isError").toBool() && QJsonDocument(review).toJson().contains("where Montage keeps"), QJsonDocument(review).toJson().constData());
+        QVERIFY(QDir(dkdms).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty());
+    }
+
     // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
     void kdmsForScreensFromAnFlm() {
         if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");

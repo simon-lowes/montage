@@ -486,6 +486,11 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
     }
     for (const auto& [tool, run] : appTools_)
         if (tool.value("name").toString() == name) {
+            // (the app's own tools pass the server's guard too: none is given a path where Montage keeps what only it
+            // writes, and none writes into a folder that holds one)
+            const bool readOnly = tool.value("annotations").toObject().value("readOnlyHint").toBool(false);
+            if (const QString why = mcpOwnFileNamed(name, args, mcpCallPaths(name, args, readOnly)); !why.isEmpty())
+                return give(toolResult(why, {}, true));
             QJsonObject structured;
             bool isError = false;
             const QString text = run(args, structured, isError);
