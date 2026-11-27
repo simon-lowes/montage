@@ -28479,17 +28479,34 @@ colorspaces:
             QVERIFY(ours.size() >= 3);
             const std::vector<montage::testcapture::Packet> packets = montage::testcapture::readPcap(dir.path() + "/review.pcap", &why);
             QVERIFY2(!packets.empty(), (why + " " + capture.said().toStdString()).c_str());
+            // A port's number names a UDP socket and a TCP one apart, and another program's socket may have the number
+            // of one of Montage's: the test's own connection to Chrome, a browser's to the review's page, or one of
+            // coturn's ports at the relay. So over TCP or TLS the bridge's own port is the one of Montage's numbers that
+            // connects to the relay, and it is Montage's over TCP alone; Montage's other ports are its over UDP alone.
+            std::set<uint16_t> overTcp;
+            if (transport != "udp")
+                for (const auto& k : packets)
+                    if (k.loopback && k.protocol == 6 && ours.count(k.from) && k.to == uint16_t(turnPort)) overTcp.insert(k.from);
             int toRelay = 0, elsewhere = 0;
+            std::map<std::tuple<int, uint16_t, uint16_t>, int> where;
             for (const auto& k : packets) {
-                // (a browser's own connection to the review's page, from a TCP port that happens to share a number
-                // with one of Montage's UDP ports, is not Montage's)
-                if (!k.loopback || !ours.count(k.from) || k.to == uint16_t(rig.port())) continue;
+                if (!k.loopback || !ours.count(k.from) || k.protocol != (overTcp.count(k.from) ? 6 : 17)) continue;
                 if (k.to == uint16_t(turnPort)) toRelay += k.protocol == (transport == "udp" ? 17 : 6);
-                else if (!ours.count(k.to)) ++elsewhere;
+                else if (!ours.count(k.to)) {
+                    ++elsewhere;
+                    ++where[{k.protocol, k.from, k.to}];
+                }
             }
             qInfo("Captured: %zu packets, %d from Montage to the relay over %s, %d from Montage elsewhere", packets.size(), toRelay, qPrintable(transport), elsewhere);
             QVERIFY(toRelay > 40);
-            QCOMPARE(elsewhere, 0);
+            // (for a failure's message: Montage's ports, and each way the packets that went elsewhere took)
+            std::string went = "Montage's ports:";
+            for (uint16_t p : ours) went += " " + std::to_string(p) + (overTcp.count(p) ? "/tcp" : "/udp");
+            went += "; the relay's " + std::to_string(turnPort) + ", the page's " + std::to_string(rig.port()) + "; elsewhere:";
+            for (const auto& [way, n] : where)
+                went += " " + std::to_string(n) + (std::get<0>(way) == 6 ? " over TCP" : " over UDP") + " from " + std::to_string(std::get<1>(way)) + " to " +
+                        std::to_string(std::get<2>(way));
+            QVERIFY2(elsewhere == 0, went.c_str());
         }
     }
 
