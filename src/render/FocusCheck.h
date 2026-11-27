@@ -50,7 +50,7 @@ FocusMeasure measureFocus(const float* luma, int w, int h, int threads = 0, doub
 // may be null; each w x h) brought onto it along the optical flow, bicubically: tile by tile the robust spread of the
 // difference (the interpolation's own smoothing of the noise allowed for), the lower of the two neighbours' in each
 // tile, the median tile's. Points whose forward and backward motion disagree by half a pixel or more are left out.
-// Negative where nothing is left to measure.
+// Negative where nothing is left to measure. A neighbour that is the same picture (a repeated frame) is left out.
 double noiseBetweenFrames(const float* luma, const float* prev, const float* next, int w, int h, int threads = 0);
 
 // A run of pictures measured in order, each once its next is known, with the noise between it and its neighbours.
@@ -60,9 +60,13 @@ public:
     explicit FocusRun(int threads = 0) : threads_(threads) {}
     // Adds the next picture (w x h luma); `cut`: it starts a new run; `still`: a still picture, measured on itself alone
     // (set against neither neighbour). Returns the measures of the pictures now done, in the order they were added (each
-    // picture's once, one call later than it was added, or at finish).
+    // picture's once, one call later than it was added, or at finish). The same picture repeated straight after (a
+    // frame rate's repeated frames) is measured against the different pictures either side of its repeats, so its
+    // measures all come back once the next different one is added; repeated more than kMostRepeats times, it is a
+    // picture that does not move, and there is no noise between its frames.
     std::vector<FocusMeasure> add(std::vector<float> luma, int w, int h, bool cut, bool still = false);
     std::vector<FocusMeasure> finish();
+    static constexpr int kMostRepeats = 9;  // (24 frames a second in 240 repeats each nine times)
 
 private:
     struct Picture;

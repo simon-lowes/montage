@@ -10829,6 +10829,25 @@ colorspaces:
             QCOMPARE(noiseBetweenFrames(b.data(), nullptr, nullptr, W, H), -1.0);
             // The same on one thread and on eight.
             QCOMPARE(noiseBetweenFrames(b.data(), a.data(), c.data(), W, H, 1), noiseBetweenFrames(b.data(), a.data(), c.data(), W, H, 8));
+            // (nightly 27 Nov) A neighbour that is the same frame again says nothing of the grain: it is left out.
+            QCOMPARE(noiseBetweenFrames(b.data(), b.data(), c.data(), W, H), one);
+            QCOMPARE(noiseBetweenFrames(b.data(), b.data(), b.data(), W, H), -1.0);
+        }
+        // Grainy footage at 24 frames a second in 60, each frame shown three times then twice: every frame's grain is
+        // what is measured between it and the different frames either side of its repeats, within a tenth, not none.
+        {
+            FocusRun run;
+            std::vector<FocusMeasure> got;
+            int shown = 0;
+            for (int f = 0; f < 10; ++f) {
+                const std::vector<float> v = grainy(f, 0, 0.008);
+                for (int k = 0; k < (f % 2 ? 2 : 3); ++k, ++shown)
+                    for (const FocusMeasure& m : run.add(v, W, H, shown == 0)) got.push_back(m);
+            }
+            for (const FocusMeasure& m : run.finish()) got.push_back(m);
+            QCOMPARE(got.size(), size_t(shown));
+            for (const FocusMeasure& m : got)
+                QVERIFY2(m.noiseBetweenFrames && m.noise > 0.0072 && m.noise < 0.0088, qPrintable(QStringLiteral("noise %1").arg(m.noise)));
         }
 
         // Through the dailies check: the two angles as image sequences; and through Quality Check, a still of the dark
@@ -10895,6 +10914,10 @@ colorspaces:
         qInfo("%s", qPrintable(got));
         QCOMPARE(shots.size(), size_t(3));
         QCOMPARE(shots[0].noiseBetween, int64_t(50));
+        // (nightly 27 Nov) The dark angle's frames shown twice (24 a second in 25) have their grain measured against the
+        // frames either side, as every other frame has.
+        for (const FocusMeasure& m : shots[0].frames)
+            QVERIFY2(m.noise > 0.0072 && m.noise < 0.0088, qPrintable(QStringLiteral("noise %1").arg(m.noise)));
         QCOMPARE(shots[1].noiseBetween, int64_t(0));
         QCOMPARE(shots[2].noiseBetween, int64_t(20));
         QVERIFY2(found.size() == 1 && found[0].kind == FocusFinding::SoftAngle && found[0].start == 50 && found[0].end == 100, qPrintable(got));
