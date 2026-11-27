@@ -6522,8 +6522,24 @@ bool MainWindow::runProjectManager(const ConsolidateOptions& o) {
     if (!ok) return false;
     QString text = tr("Copied the project to %1: %n file(s) copied", nullptr, res.copied).arg(QString::fromStdString(res.projectPath));
     if (res.trimmed) text += tr(", %n consolidated", nullptr, res.trimmed);
+    if (res.framesCopied) text += tr(" (%n frame(s) copied without coding again)", nullptr, res.framesCopied);
+    if (res.baked) text += tr(", %n clip(s) baked", nullptr, res.baked);
+    if (!res.leftOut.empty()) text += tr(", %n clip(s) nothing shows left out", nullptr, int(res.leftOut.size()));
     if (!res.missing.empty()) text += tr(", %n missing", nullptr, int(res.missing.size()));
     statusBar()->showMessage(text, 10000);
+    // The clips left out, each with why, where someone can read them through.
+    if (!res.leftOut.empty() && isVisible()) {
+        QStringList lines;
+        for (const std::string& l : res.leftOut) lines << QString::fromStdString(l);
+        auto* box = new QMessageBox(QMessageBox::Information, tr("Project Manager"),
+                                    tr("%n clip(s) nothing shows were left out of the new project.", nullptr, int(res.leftOut.size())),
+                                    QMessageBox::Ok, this);
+        box->setDetailedText(lines.join(QLatin1Char('\n')));
+        box->setAttribute(Qt::WA_DeleteOnClose);
+        box->setObjectName(QStringLiteral("projectManagerLeftOut"));
+        box->setModal(false);
+        box->show();
+    }
     return true;
 }
 

@@ -7814,32 +7814,83 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_consolidate", "Copy the project and its media",
-        "Copy the project to a folder with the media it uses (Premiere's Project Manager): collect copies each used file "
-        "whole; with trim, only the parts of videos the sequences use are transcoded (plus handles) and the clips point at "
-        "the new files. Media nothing uses is left out unless keep_unused. Returns the new project's path.",
+        "Copy the project to a folder with the media it uses: collect copies each used file whole; with trim, only the "
+        "parts of videos the sequences use are transcoded (plus handles) and the clips point at the new files. For "
+        "finishing, output says what becomes of each used file: whole, trimmed (its used part in its own format, cut "
+        "without coding again where the format allows), movie (transcoded to codec) or frames (image sequences); handles "
+        "in seconds, frames or a timecode duration, none or the whole file; names from a pattern; clips nothing shows "
+        "left out and listed; grades, effects and speed baked in. A preset (the project's, the user's library's or the "
+        "facility's) gives the choices the call does not. Media nothing uses is left out unless keep_unused. Returns the "
+        "new project's path.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},"name":{"type":"string"},
             "sequences":{"type":"string","enum":["all","active"],"default":"all"},"trim":{"type":"boolean","default":false},
+            "preset":{"type":"string","description":"A Consolidate preset's name; the arguments given override it"},
+            "output":{"type":"string","enum":["whole","trimmed","movie","frames"]},
             "handles":{"type":"number","default":1,"description":"Seconds kept either side, when trimming"},
-            "codec":{"type":"string","enum":["prores","h264"],"default":"prores"},"keep_unused":{"type":"boolean","default":false}},
+            "handle_unit":{"type":"string","enum":["seconds","frames","timecode","none","whole"],"default":"seconds"},
+            "handle_frames":{"type":"integer","minimum":0},"handle_timecode":{"type":"string","description":"A duration, as 00:00:00:12"},
+            "codec":{"type":"string","enum":["prores","dnxhr","h264","hevc","ffv1","own"],"default":"prores"},
+            "frames":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
+            "color_space":{"type":"string","description":"\"\" each file's own, \"working\" the working space, or a colour space id"},
+            "name_pattern":{"type":"string","description":"{sequence} {shot} {clip} {reel} {tape} {scene} {take} {frame}"},
+            "folder_depth":{"type":"integer","minimum":0,"default":0},"leave_out_hidden":{"type":"boolean","default":false},
+            "bake":{"type":"boolean","default":false},"trim_sound":{"type":"boolean","default":false},
+            "keep_unused":{"type":"boolean","default":false},
+            "credentials":{"type":"object","description":"Copies made from sources with Content Credentials signed with them as their parent","properties":{"certificate":{"type":"string"},"key":{"type":"string"}},"required":["certificate","key"]}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             ConsolidateOptions o;
+            if (a.contains("preset")) {
+                std::string err;
+                if (!resolvePreset(loadConsolidatePresets(l.project, userPresetFolder()), str(a, "preset").toStdString(), o, nullptr, &err))
+                    return fail(QString::fromStdString(err));
+            }
             o.folder = absolute(need(a, "folder")).toStdString();
             o.name = str(a, "name", QFileInfo(l.path).completeBaseName()).toStdString();
             if (str(a, "sequences", "all") == "active") o.sequences = {l.project.activeSequence};
-            o.trim = a.value("trim").toBool();
-            o.handles = std::max(0.0, a.value("handles").toDouble(1));
-            o.codec = str(a, "codec", "prores") == "h264" ? "libx264" : "prores_ks";
-            o.keepUnused = a.value("keep_unused").toBool();
+            if (a.contains("trim")) o.trim = a.value("trim").toBool();
+            if (a.contains("output")) o.output = str(a, "output").toStdString();
+            if (a.contains("handles")) o.handles = std::max(0.0, a.value("handles").toDouble(1));
+            if (a.contains("handle_unit")) o.handleUnit = str(a, "handle_unit").toStdString();
+            if (a.contains("handle_frames")) o.handleFrames = std::max(0, a.value("handle_frames").toInt());
+            if (a.contains("handle_timecode")) o.handleTimecode = str(a, "handle_timecode").toStdString();
+            if (a.contains("codec")) {
+                static const std::map<QString, std::string> codecs{{"prores", "prores_ks"}, {"dnxhr", "dnxhd"}, {"h264", "libx264"},
+                                                                    {"hevc", "libx265"},    {"ffv1", "ffv1"},  {"own", ""}};
+                const auto it = codecs.find(str(a, "codec"));
+                if (it == codecs.end()) return fail(QStringLiteral("codec is prores, dnxhr, h264, hevc, ffv1 or own"));
+                o.codec = it->second;
+            }
+            if (a.contains("frames")) o.frames = str(a, "frames").toStdString();
+            if (a.contains("color_space")) o.colorSpace = str(a, "color_space").toStdString();
+            if (a.contains("name_pattern")) o.namePattern = str(a, "name_pattern").toStdString();
+            if (a.contains("folder_depth")) o.folderDepth = std::max(0, a.value("folder_depth").toInt());
+            if (a.contains("leave_out_hidden")) o.leaveOutHidden = a.value("leave_out_hidden").toBool();
+            if (a.contains("bake")) o.bake = a.value("bake").toBool();
+            if (a.contains("trim_sound")) o.trimSound = a.value("trim_sound").toBool();
+            if (a.contains("keep_unused")) o.keepUnused = a.value("keep_unused").toBool();
+            if (a.value("credentials").isObject()) {
+                const QJsonObject c = a.value("credentials").toObject();
+                o.credentialCertificate = absolute(need(c, "certificate")).toStdString();
+                o.credentialKey = absolute(need(c, "key")).toStdString();
+            }
             ConsolidateResult res;
             std::string err;
             if (!consolidateProject(l.project, o, &res, [this](double f) { progress(f, "Copying"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             QString text = QStringLiteral("Wrote %1: %2 file(s) copied, %3 consolidated, %4 MB")
                                .arg(QString::fromStdString(res.projectPath)).arg(res.copied).arg(res.trimmed).arg(double(res.bytes) / 1e6, 0, 'f', 1);
+            if (res.framesCopied || res.framesCoded)
+                text += QStringLiteral(" (%1 frame(s) copied, %2 coded)").arg(res.framesCopied).arg(res.framesCoded);
+            if (res.baked) text += QStringLiteral(", %1 clip(s) baked").arg(res.baked);
             for (const std::string& m : res.missing) text += QStringLiteral("\nMissing: ") + QString::fromStdString(m);
-            return ok(text);
+            for (const std::string& c : res.leftOut) text += QStringLiteral("\nLeft out: ") + QString::fromStdString(c);
+            QJsonArray leftOut;
+            for (const std::string& c : res.leftOut) leftOut.append(QString::fromStdString(c));
+            return ok(text, QJsonObject{{"project", QString::fromStdString(res.projectPath)}, {"copied", res.copied}, {"trimmed", res.trimmed},
+                                        {"framesCopied", res.framesCopied}, {"framesCoded", res.framesCoded}, {"baked", res.baked},
+                                        {"leftOut", leftOut}});
         });
 
     add("montage_transcribe", "Transcribe",

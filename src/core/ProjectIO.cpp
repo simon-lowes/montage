@@ -1515,6 +1515,12 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         for (const auto& [name, text] : p.grainProfiles) profiles.insert(qs(name), qs(text));
         root["grainProfiles"] = profiles;
     }
+    if (!p.consolidatePresets.empty()) {
+        QJsonObject presets;
+        for (const auto& [name, json] : p.consolidatePresets)
+            presets.insert(qs(name), QJsonDocument::fromJson(QByteArray::fromStdString(json)).object());
+        root["consolidatePresets"] = presets;
+    }
     if (!p.script.text.empty()) {
         QJsonArray lines;
         for (const auto& line : p.script.readings) {
@@ -1707,6 +1713,13 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         const QJsonObject profiles = root.value("grainProfiles").toObject();
         for (auto it = profiles.begin(); it != profiles.end(); ++it)
             if (!it.key().trimmed().isEmpty() && !it.value().toString().isEmpty()) p.grainProfiles[it.key().toStdString()] = ss(it.value());
+    }
+    {
+        // (projects before Phase 18 have none)
+        const QJsonObject presets = root.value("consolidatePresets").toObject();
+        for (auto it = presets.begin(); it != presets.end(); ++it)
+            if (!it.key().trimmed().isEmpty() && it.value().isObject())
+                p.consolidatePresets[it.key().toStdString()] = QJsonDocument(it.value().toObject()).toJson(QJsonDocument::Compact).toStdString();
     }
     for (const auto& w : root.value("fillerWords").toArray())
         if (!w.toString().trimmed().isEmpty()) p.fillerWords.push_back(ss(w));

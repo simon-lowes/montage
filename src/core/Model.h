@@ -887,6 +887,9 @@ struct Project {
     // Grain profiles saved by name (Measure Grain's), each its text (render/GrainMatch.h grainProfileText): what an
     // export's film grain setting may name (render/Av1GrainExport.h)
     std::map<std::string, std::string> grainProfiles;
+    // The project's own Consolidate presets (render/ProjectManager.h): by name, each its choices as JSON, over the
+    // user's and the facility's.
+    std::map<std::string, std::string> consolidatePresets;
     ProjectScript script;  // the screenplay and its lined coverage (core/ScriptCut.h)
     // The version this project and a copy of it both started from (core/ProjectMerge.h), as project file JSON; null =
     // none. A copy made for someone keeps it, so the two can be merged later. Shared: undo snapshots copy the pointer.
