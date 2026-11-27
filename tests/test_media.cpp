@@ -3130,10 +3130,10 @@ private slots:
     // Its sound ends with the pictures, at the set length, not at the slot of the picture that came after the gap.
     void captureCountsPicturesRepeatedAtTheEnd() {
         namespace st = st2110;
-        int ports[2];
+        int ports[3];
         {
-            st::Receiver probe[2];
-            for (int i = 0; i < 2; ++i) {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
                 QVERIFY(probe[i].open({"127.0.0.1", 0}));
                 ports[i] = probe[i].port();
             }
@@ -3141,7 +3141,9 @@ private slots:
         // (the video packets of ten pictures in a row lost, from when 44 have been recorded)
         std::atomic<bool> losing{false};
         st::SenderOptions o;
-        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]};
+        // (each stream to a loopback port, its ancillary data's too: left at its multicast address, a send fails where
+        // there is no route for multicast, as on macOS runners, and the sender stops before any picture goes)
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
         o.ttl = 1;
         o.drop = [&losing](int stream, int, uint64_t) { return stream == 0 && losing.load(); };
         const int W = 320, H = 180, spf = 1920;
@@ -3169,14 +3171,17 @@ private slots:
         cs.path = path("capture-st2110-repeated.mov");
         cs.seconds = 2;
         Recorder rec;
-        std::atomic<bool> stop{false};
+        std::atomic<bool> stop{false}, sendFailed{false};
         std::thread sending([&] {
             int lostFrom = -1;
             for (int t = 0; !stop && t < 25 * 30; ++t) {
                 if (lostFrom < 0 && rec.status().frames >= 44) lostFrom = t;
                 losing = lostFrom >= 0 && t < lostFrom + 10;
                 std::vector<float> sound(size_t(spf) * 2, 0.0f);
-                if (!tx.send(grey, sound.data(), spf, nullptr, {}, &stop)) break;
+                if (!tx.send(grey, sound.data(), spf, nullptr, {}, &stop)) {
+                    sendFailed = !stop;
+                    break;
+                }
             }
         });
         auto stopSending = qScopeGuard([&] {
@@ -3186,6 +3191,7 @@ private slots:
         });
         QVERIFY2(rec.start(cs, &err), err.c_str());
         QVERIFY(rec.wait(20));
+        QVERIFY2(!sendFailed, "The test's sender stopped: a send failed");
         const CaptureStatus status = rec.status();
         QVERIFY2(status.error.empty(), status.error.c_str());
         QVERIFY2(status.repeated >= 3, std::to_string(status.repeated).c_str());
