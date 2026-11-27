@@ -11589,6 +11589,51 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void inspectorShowsWhatOldProjectsRender() {
+        // (nightly 27 Nov) Settings added later are off in projects saved before them, where the effect has none
+        // stored: Motion Blur's Follow Speed Changes and a 3D layer's Focus Distance 0 Focuses on the Scene show off
+        // there, as they render, and a click turns them on. A new effect shows them on, as it renders.
+        state()->newProject();
+        Id clip = 0, blur = 0, card = 0, newBlur = 0;
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+            Clip c = makeGeneratorClip(p, "color", 60);
+            Effect mb = makeEffect(p, "motion_blur");
+            mb.params.erase("follow_edit");
+            Effect l3 = makeEffect(p, "layer_3d");
+            l3.params.erase("focus_scene");
+            const Effect fresh = makeEffect(p, "motion_blur");
+            blur = mb.id, card = l3.id, newBlur = fresh.id;
+            c.effects = {mb, l3, fresh};
+            clip = c.id;
+            return edit::overwrite(p, s, V1, c);
+        }));
+        state()->setSelection({clip}, false);
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        auto box = [&](Id effect, const char* name) {
+            return inspector->findChild<QCheckBox*>(QStringLiteral("param_%1_%2").arg(effect).arg(QLatin1String(name)));
+        };
+        QTRY_VERIFY(box(blur, "follow_edit") && box(card, "focus_scene") && box(newBlur, "follow_edit"));
+        QVERIFY(!box(blur, "follow_edit")->isChecked());
+        QVERIFY(!box(card, "focus_scene")->isChecked());
+        QVERIFY(box(newBlur, "follow_edit")->isChecked());
+        box(blur, "follow_edit")->click();
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->effects[0].p("follow_edit", 0, 0), 1.0);
+        QApplication::processEvents();
+        QTRY_VERIFY(box(blur, "follow_edit") && box(blur, "follow_edit")->isChecked());
+        box(card, "focus_scene")->click();
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects[1].p("focus_scene", 0, 0), 1.0);
+        // Each such setting says what projects before it render: the 3D title's too.
+        for (const auto& [type, name] : std::vector<std::pair<std::string, std::string>>{
+                 {"motion_blur", "follow_edit"}, {"layer_3d", "focus_scene"}, {"title3d", "in_scene"}, {"title3d", "own_light"}, {"title3d", "shadows"}}) {
+            const EffectInfo* info = findEffectInfo(type);
+            QVERIFY(info);
+            const auto it = std::find_if(info->params.begin(), info->params.end(), [&](const ParamInfo& pi) { return pi.name == name; });
+            QVERIFY2(it != info->params.end() && it->def == 1 && it->missing == 0.0, (type + " " + name).c_str());
+        }
+        state()->newProject();
+    }
+
     void speedWithMaintainedPitch() {
         state()->newProject();
         const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});

@@ -2554,8 +2554,9 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         if (!target.clip && target.owner)
             if (const auto live = state_->liveParameter(target.owner, target.effect, n)) return *live;
         Effect* e = target.resolve(const_cast<Sequence&>(*s));
-        // A parameter not stored yet (e.g. an unused mask) shows its default.
-        double def = n == pi.name ? pi.def : 0;
+        // A parameter not stored yet (e.g. an unused mask) shows its default; one added since the project was saved,
+        // what the project renders it as.
+        double def = n == pi.name ? pi.missing.value_or(pi.def) : 0;
         if (pi.kind == ParamKind::Color) def = n == pi.name + ".g" ? pi.defG : n == pi.name + ".b" ? pi.defB : pi.def;
         return e ? e->p(n, target.time(), def) : 0;
     };

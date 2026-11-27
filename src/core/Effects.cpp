@@ -42,6 +42,12 @@ ParamInfo boolean(std::string name, std::string label, bool def = false) {
     return p;
 }
 
+// A setting added later: `missing` is what effects saved before it, with none stored, render as.
+ParamInfo since(ParamInfo p, double missing) {
+    p.missing = missing;
+    return p;
+}
+
 ParamInfo choice(std::string name, std::string label, std::vector<std::string> choices, int def = 0) {
     ParamInfo p = num(std::move(name), std::move(label), 0, double(choices.size() - 1), def, 1);
     p.kind = ParamKind::Choice;
@@ -740,7 +746,7 @@ std::vector<EffectInfo> buildCatalog() {
                   boolean("depth_of_field", "Depth of Field (through the scene's camera: the Camera clip's)", false),
                   num("focus_distance", "Focus Distance (0: the scene's middle depth)", 0, 10000000, 0, 0.01),
                   // (off in projects saved before it: Focus Distance 0 is the card's own middle there)
-                  boolean("focus_scene", "Focus Distance 0 Focuses on the Scene", true),
+                  since(boolean("focus_scene", "Focus Distance 0 Focuses on the Scene", true), 0),
                   num("fstop", "F-Stop", 0.7, 64, 2.8, 0.1),
                   num("units_m", "Scene Units a Metre (0: 1000 for its own or the scene's camera, else 1)", 0, 1000000, 0, 0.001)},
                  {str("camera_file", "Take The Camera From (USD, glTF)", StringKind::File)}});
@@ -1083,7 +1089,7 @@ std::vector<EffectInfo> buildCatalog() {
                      {num("shutter", "Shutter Angle (°)", 0, 720, 180, 1),
                       // (measured in the sequence's time, through the clip's speed and Time Remapping; read as off in
                       // projects saved before it, which blurred over the shutter in source frames)
-                      boolean("follow_edit", "Follow Speed Changes and Time Remapping", true)},
+                      since(boolean("follow_edit", "Follow Speed Changes and Time Remapping", true), 0)},
                      {}});
         c.push_back({"deflicker", "Deflicker", EffectCategory::VideoFilter, "Repair",
                      {num("frames", "Frames Either Side", 1, 12, 3, 1), choice("area", "Even Out", {"Whole Frame", "Each Area (16 x 9)"}, 1),
@@ -1399,11 +1405,11 @@ std::vector<EffectInfo> buildCatalog() {
                                // With cards or models seen through their own camera or the scene's on screen: drawn
                                // in their scene, by depth with them, lit as they are and shadowing them (off in
                                // projects saved before it: there the title floats over them as it did).
-                               boolean("in_scene", "Stand in the 3D Layers' Scene", true),
+                               since(boolean("in_scene", "Stand in the 3D Layers' Scene", true), 0),
                                // In that scene, lit as its own drawing lights it (off in projects saved before it:
                                // there its light is read as a 3D layer's).
-                               boolean("own_light", "Lit as Drawn Alone (in the 3D layers' scene)", true),
-                               boolean("shadows", "Cast Shadows (in the 3D layers' scene)", true),
+                               since(boolean("own_light", "Lit as Drawn Alone (in the 3D layers' scene)", true), 0),
+                               since(boolean("shadows", "Cast Shadows (in the 3D layers' scene)", true), 0),
                            },
                            {str("text", "Text", StringKind::MultilineText, "3D Title"),
                             str("font", "Font", StringKind::Font, "Sans Serif"),
