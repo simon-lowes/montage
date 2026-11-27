@@ -26233,6 +26233,10 @@ print("added " + ui["name"])
             QString said;
             bool right = false;
             for (int attempt = 0; attempt < 6 && !right; ++attempt) {  // (until the viewer has painted and Weston repainted)
+                // (a frame asked for each time: on 3c7eb7a, with Qt describing the surface, Qt committed a new ARGB
+                // buffer it had not drawn into once the pointer entered the window, and the viewer, asked for nothing
+                // more, drew no frame after it, so Weston showed black; Weston's log had no skipped paint node)
+                viewer.update();
                 QTest::qWait(500);
                 const QImage sdrShot = screenshot(QStringLiteral("sdr.png"));
                 QVERIFY2(!sdrShot.isNull(), qPrintable(noShot));
