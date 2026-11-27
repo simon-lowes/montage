@@ -1,5 +1,12 @@
 # Montage
 
+> **TL;DR:** Montage is a free, open-source video editor for professional work (GPL-3.0-or-later).
+> It covers editing, colour grading, sound mixing, visual effects, captions and final delivery in one app.
+> Its AI tools run on your own computer. No account, subscription or cloud is needed.
+> It is built for editors, colourists and sound mixers, and for anyone moving over from a commercial editor.
+> All of its professional depth is always there. A simpler view, when it arrives, will be an optional switch on top, never a cut-down version.
+> It runs on macOS and Windows, and builds from source on Linux.
+
 A professional non-linear video editor written in **C++20** with **Qt 6** and **FFmpeg**.
 
 It covers editing, colour, audio, captions, multicam, interchange and delivery in one application,
