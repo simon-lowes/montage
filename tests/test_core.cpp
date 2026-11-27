@@ -12812,37 +12812,47 @@ private slots:
     // cut, audioDuration) and one whose sound starts before it (a J cut, audioStart) import with their sound where it
     // is heard; written out and read back, the sound stays there, and a trim of the sound is kept rather than the
     // file's split values written back. Twenty thousand captions, given out of order, are read in order and trimmed
-    // to the next one's start, in a few seconds at most.
+    // to the next one's start, in time that grows with their number, not with its square.
     void fcpxmlSplitEditsAndManyCaptions() {
         auto t = [](int frames) { return QStringLiteral("%1/25s").arg(frames); };
-        QString captions;
+        auto fileWith = [&](int count) {
+            QString captions;
+            for (int i = count - 1; i >= 0; --i)
+                captions += QStringLiteral("<caption lane=\"1\" offset=\"%1\" duration=\"%2\" role=\"iTT?captionFormat=ITT.en\"><text>Line %3</text></caption>\n")
+                                .arg(t(i * 4), t(6))
+                                .arg(i);
+            const QString xml =
+                QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<fcpxml version=\"1.11\"><resources>"
+                               "<format id=\"r1\" name=\"FFVideoFormat1080p25\" frameDuration=\"1/25s\" width=\"1920\" height=\"1080\"/>"
+                               "<asset id=\"r2\" name=\"talk\" start=\"0s\" duration=\"120s\" hasVideo=\"1\" hasAudio=\"1\" format=\"r1\" audioSources=\"1\" "
+                               "audioChannels=\"2\" audioRate=\"48000\"><media-rep kind=\"original-media\" src=\"file:///nonexistent/talk.mov\"/></asset>"
+                               "</resources><library><event name=\"Tests\"><project name=\"Split\">"
+                               "<sequence format=\"r1\" duration=\"%1\" tcStart=\"0s\" tcFormat=\"NDF\" audioLayout=\"stereo\" audioRate=\"48k\"><spine>"
+                               "<asset-clip ref=\"r2\" offset=\"0s\" name=\"Leaves\" start=\"0s\" duration=\"10s\" audioDuration=\"12s\"/>"
+                               "<gap name=\"Gap\" offset=\"10s\" start=\"0s\" duration=\"5s\"/>"
+                               "<asset-clip ref=\"r2\" offset=\"15s\" name=\"Arrives\" start=\"20s\" duration=\"10s\" audioStart=\"18s\" audioDuration=\"12s\"/>"
+                               "<gap name=\"Gap\" offset=\"25s\" start=\"0s\" duration=\"%2\">%3</gap>"
+                               "</spine></sequence></project></event></library></fcpxml>")
+                    .arg(t(625 + count * 4 + 25), t(count * 4 + 25), captions);
+            return xml.toStdString();
+        };
+        // (read in time that grows with the captions, not with their square: ten times the captions take well under
+        // thirty times as long, where the square would take a hundred times)
         const int count = 20000;
-        for (int i = count - 1; i >= 0; --i)
-            captions += QStringLiteral("<caption lane=\"1\" offset=\"%1\" duration=\"%2\" role=\"iTT?captionFormat=ITT.en\"><text>Line %3</text></caption>\n")
-                            .arg(t(i * 4), t(6))
-                            .arg(i);
-        const QString xml =
-            QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<fcpxml version=\"1.11\"><resources>"
-                           "<format id=\"r1\" name=\"FFVideoFormat1080p25\" frameDuration=\"1/25s\" width=\"1920\" height=\"1080\"/>"
-                           "<asset id=\"r2\" name=\"talk\" start=\"0s\" duration=\"120s\" hasVideo=\"1\" hasAudio=\"1\" format=\"r1\" audioSources=\"1\" "
-                           "audioChannels=\"2\" audioRate=\"48000\"><media-rep kind=\"original-media\" src=\"file:///nonexistent/talk.mov\"/></asset>"
-                           "</resources><library><event name=\"Tests\"><project name=\"Split\">"
-                           "<sequence format=\"r1\" duration=\"%1\" tcStart=\"0s\" tcFormat=\"NDF\" audioLayout=\"stereo\" audioRate=\"48k\"><spine>"
-                           "<asset-clip ref=\"r2\" offset=\"0s\" name=\"Leaves\" start=\"0s\" duration=\"10s\" audioDuration=\"12s\"/>"
-                           "<gap name=\"Gap\" offset=\"10s\" start=\"0s\" duration=\"5s\"/>"
-                           "<asset-clip ref=\"r2\" offset=\"15s\" name=\"Arrives\" start=\"20s\" duration=\"10s\" audioStart=\"18s\" audioDuration=\"12s\"/>"
-                           "<gap name=\"Gap\" offset=\"25s\" start=\"0s\" duration=\"%2\">%3</gap>"
-                           "</spine></sequence></project></event></library></fcpxml>")
-                .arg(t(625 + count * 4 + 25), t(count * 4 + 25), captions);
-        Project p = makeDefaultProject();
+        const std::string fewer = fileWith(count / 10), xml = fileWith(count);
+        Project few = makeDefaultProject();
         QElapsedTimer took;
         took.start();
-        ImportResult r = importXmlTimeline(p, xml.toStdString());
+        QVERIFY(importXmlTimeline(few, fewer).ok);
+        const qint64 fewMs = took.elapsed();
+        Project p = makeDefaultProject();
+        took.restart();
+        ImportResult r = importXmlTimeline(p, xml);
         const qint64 ms = took.elapsed();
         QVERIFY2(r.ok, r.error.c_str());
         Sequence* s = p.findSequence(r.sequence);
         QVERIFY(s);
-        QVERIFY2(ms < 10000, qPrintable(QStringLiteral("%1 ms to read the file").arg(ms)));
+        QVERIFY2(ms < 30 * fewMs + 500, qPrintable(QStringLiteral("%1 ms for %2 captions, %3 ms for %4").arg(ms).arg(count).arg(fewMs).arg(count / 10)));
         // The captions: all of them, in order, each ending where the next starts.
         QCOMPARE(s->captionTracks.size(), size_t(1));
         const std::vector<Caption>& caps = s->captionTracks[0].captions;
