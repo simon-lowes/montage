@@ -945,8 +945,8 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
     // through the same lens with no transform the title is in proportion. Its place at each frame is its transform's
     // time samples (the turn, scale and move that best carry its first frame's corners to that frame's); where that
     // leaves a corner more than 1e-4 px from where the picture shows it (its letters animate, or another lens bends
-    // it), its points and normals are written at every frame too. A mirrored transform turns its triangles round, so
-    // its faces stay outward.
+    // it), its points and normals are written at every frame too. Its triangles are turned to run round their normals,
+    // so its faces stay outward (a mirrored transform turns them all round).
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
         for (const Clip& c : seq.videoTracks[ti].clips) {
             if (!c.enabled || !c.isGenerator() || c.generator.type != "title3d" || !c.generator.s("camera_file").empty()) continue;
@@ -1105,8 +1105,20 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
                     sum[a] += col;
                 }
             }
-            if (f0.mirrored)
-                for (size_t i = 0; i + 2 < m.indices.size(); i += 3) std::swap(m.indices[i + 1], m.indices[i + 2]);
+            // Each triangle turned so its corners run round its normals (outward) at the first frame: a mirrored
+            // transform turns them all, and a font whose outlines run the other way (CFF's, macOS's) some of them.
+            // (a triangle with no area keeps the mirroring's turn)
+            for (size_t i = 0; i + 2 < m.indices.size(); i += 3) {
+                const double* a = &P[i * 3];
+                const double* b = &P[(i + 1) * 3];
+                const double* c = &P[(i + 2) * 3];
+                const double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+                const double g[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                double d = 0;
+                for (size_t k = 0; k < 3; ++k)
+                    for (int ax = 0; ax < 3; ++ax) d += g[ax] * f0.N[(i + k) * 3 + size_t(ax)];
+                if (d < 0 || (d == 0 && f0.mirrored)) std::swap(m.indices[i + 1], m.indices[i + 2]);
+            }
             m.color = {float(sum[0] / double(nv)), float(sum[1] / double(nv)), float(sum[2] / double(nv)), float(std::clamp(first.opacity, 0.0, 1.0))};
             if (!(pp > 0)) continue;
             // Each frame's transform: the rotation (Horn's, through the quaternion of the largest eigenvalue), scale and

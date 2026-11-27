@@ -41,6 +41,7 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QDateTime>
+#include <QFontDatabase>
 #include <QFile>
 #include <QFloat16>
 #include <random>
@@ -44381,6 +44382,8 @@ private slots:
                 const std::array<double, 3> A = sceneAt(mesh, f, mesh.indices[t]), B = sceneAt(mesh, f, mesh.indices[t + 1]), C = sceneAt(mesh, f, mesh.indices[t + 2]);
                 const double e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]}, e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
                 const double n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                // (a sliver with next to no area, as a font's straight runs of points leave, turns neither way)
+                if (std::hypot(n[0], n[1], n[2]) <= 1e-4 * std::hypot(e1[0], e1[1], e1[2]) * std::hypot(e2[0], e2[1], e2[2])) continue;
                 const double d = n[0] * (cam.C[0] - A[0]) + n[1] * (cam.C[1] - A[1]) + n[2] * (cam.C[2] - A[2]);
                 (d > 0 ? toward : away) += 1;
             }
@@ -44389,6 +44392,21 @@ private slots:
         {
             const auto [toward, away] = facesToward(m, own, solvedCameraAt(solve, 0), 0);
             QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1 toward, %2 away").arg(toward).arg(away)));
+        }
+        // So do they in a font whose outlines run the other way round (CFF's, as macOS's fonts have: CI's macOS job
+        // found some of them turned away), where one is installed.
+        for (const char* cff : {"Inter", "Loma"}) {
+            if (!QFontDatabase::hasFamily(QString::fromLatin1(cff))) continue;
+            Clip other = title;
+            other.generator.strings["font"] = cff;
+            Title3DMesh alone;
+            SolvedSceneMesh om;
+            QVERIFY(title3dMesh(other.generator, 0, W, H, 10, 25, alone));
+            QVERIFY(placed(solve, other, om));
+            const auto [toward, away] = facesToward(om, alone, solvedCameraAt(solve, 0), 0);
+            QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1: %2 toward, %3 away").arg(cff).arg(toward).arg(away)));
+            s.videoTracks[1].clips = {title};
+            break;
         }
         // The middle of its faces at the points' median depth in front of the solved camera: as far in front of it as
         // that middle is in front of its own camera, times the scale it was placed at.
@@ -44564,6 +44582,11 @@ private slots:
                 qInfo("%s read back by Montage: %.2g px off", file.c_str(), off);
                 QVERIFY(off < 1e-3);
                 if (tinyusdz.isEmpty()) continue;
+                // (written again in its plain colour: tinyusdz's render scene takes a surface's diffuse colour from a
+                // texture only, not from the primvar reader its corners' colours come through, and refuses the file)
+                SolvedSceneMesh plain = *mesh;
+                plain.colors.clear();
+                QVERIFY2(writeSolveUsda(solve, file, {plain}, &err), err.c_str());
                 QProcess run;
                 run.start(QString::fromLocal8Bit(tinyusdz), {QString::fromStdString(file), dir.path(), "0", "3", "6", "9"});
                 QVERIFY(run.waitForFinished(120000));
