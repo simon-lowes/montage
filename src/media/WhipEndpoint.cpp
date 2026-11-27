@@ -945,13 +945,36 @@ struct Endpoint::Impl {
 
     void accept(HttpServer& server, qintptr fd) {
         auto* c = new QSslSocket(&server);
-        // (32 connections at most, and 8 from any one address, so one sender cannot hold every slot)
-        bool full = !c->setSocketDescriptor(fd) || server.findChildren<QSslSocket*>().size() > kMaxConnections;
+        // (32 connections at most, and 8 from any one address, so one sender cannot hold every slot; an IPv6 address
+        // counted by its /64, which a sender can move about in)
+        bool full = !c->setSocketDescriptor(fd);
         if (!full) {
-            int same = 0;
+            // The others still connected, by where they come from, oldest first.
+            std::map<QString, std::vector<QSslSocket*>> from;
+            int others = 0;
             for (QSslSocket* o : server.findChildren<QSslSocket*>())
-                if (o != c && o->peerAddress().isEqual(c->peerAddress(), QHostAddress::TolerantConversion)) ++same;
+                if (o != c && o->state() != QAbstractSocket::UnconnectedState) {
+                    from[guesser(o->peerAddress())].push_back(o);
+                    ++others;
+                }
+            const auto mine = from.find(guesser(c->peerAddress()));
+            const int same = mine == from.end() ? 0 : int(mine->second.size());
             full = same >= kMaxFromOneAddress;
+            // Every slot held (nightly 27 Nov: four senders' silent connections kept every other sender out for as
+            // long as they waited): the oldest connection that has sent no request yet, from where most of them come
+            // from, gives its place up to one from where fewer do. (Not to one from where as many come from, less
+            // one: a sender cannot take another's last slot, or its own back.)
+            if (!full && others >= kMaxConnections) {
+                full = true;
+                const auto most = std::max_element(from.begin(), from.end(), [](const auto& x, const auto& y) { return x.second.size() < y.second.size(); });
+                if (most != from.end() && int(most->second.size()) > same + 1)
+                    for (QSslSocket* o : most->second)
+                        if (!o->property("answered").toBool()) {
+                            o->abort();
+                            full = false;
+                            break;
+                        }
+            }
         }
         if (full) {
             if (c->socketDescriptor() == -1) {

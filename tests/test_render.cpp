@@ -29371,6 +29371,72 @@ colorspaces:
         QVERIFY2(peak > 0.05f, std::to_string(peak).c_str());
     }
 
+    // Nightly 27 Nov: four senders that each hold eight silent connections (every one of the 32 slots) do not keep a
+    // fifth sender out: the oldest silent connection of one of them gives its place up, and the fifth sender's request
+    // is answered. A ninth connection from one of the four is still refused, and takes no one's place. (Linux only:
+    // there every 127.x.y.z address is the loopback's, so each sender can have its own.)
+    void whipSlotsSharedOut() {
+#ifndef Q_OS_LINUX
+        QSKIP("Senders from several loopback addresses are tried on Linux only");
+#else
+        std::string why;
+        if (!whip::available(&why)) QSKIP(why.c_str());
+        whip::Endpoint e;
+        whip::Settings st;
+        st.token = "a-token-made-up-for-this-test";
+        QVERIFY2(e.start(st, &why), why.c_str());
+        std::vector<std::unique_ptr<QTcpSocket>> silent;
+        auto connectFrom = [&](const QString& address) {
+            auto s = std::make_unique<QTcpSocket>();
+            if (!s->bind(QHostAddress(address))) return std::unique_ptr<QTcpSocket>();
+            s->connectToHost(QHostAddress::LocalHost, quint16(e.port()));
+            if (!s->waitForConnected(2000)) return std::unique_ptr<QTcpSocket>();
+            return s;
+        };
+        for (int sender = 2; sender <= 5; ++sender)
+            for (int k = 0; k < 8; ++k) {
+                auto s = connectFrom(QStringLiteral("127.0.0.%1").arg(sender));
+                QVERIFY(s);
+                silent.push_back(std::move(s));
+            }
+        // (the endpoint has taken all 32 by the time a 33rd comes)
+        QElapsedTimer settle;
+        settle.start();
+        while (settle.elapsed() < 300) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        auto stillOpen = [&] {
+            int n = 0;
+            for (const auto& s : silent) {
+                s->waitForReadyRead(1);
+                if (s->state() == QAbstractSocket::ConnectedState) ++n;
+            }
+            return n;
+        };
+        QCOMPARE(stillOpen(), 32);
+        // A ninth from the first sender: closed at once, and the others stay.
+        auto ninth = connectFrom(QStringLiteral("127.0.0.2"));
+        QVERIFY(ninth);
+        QElapsedTimer w;
+        w.start();
+        while (w.elapsed() < 2000 && ninth->state() == QAbstractSocket::ConnectedState) ninth->waitForReadyRead(50);
+        QCOMPARE(ninth->state(), QAbstractSocket::UnconnectedState);
+        QCOMPARE(stillOpen(), 32);
+        // A fifth sender: answered, and one silent connection has given its place up.
+        auto fifth = connectFrom(QStringLiteral("127.0.0.6"));
+        QVERIFY(fifth);
+        fifth->write("OPTIONS /whip HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        QByteArray got;
+        w.restart();
+        while (w.elapsed() < 3000 && !got.contains("\r\n")) {
+            fifth->waitForReadyRead(100);
+            got += fifth->readAll();
+        }
+        QVERIFY2(got.startsWith("HTTP/1.1 "), got.constData());
+        w.restart();
+        while (w.elapsed() < 1000 && stillOpen() > 31) {}
+        QCOMPARE(stillOpen(), 31);
+#endif
+    }
+
     // The 25 November nightly: a connection to the WHIP endpoint that sends no request (so no token) gives its slot
     // up after 5 s, not 20.
     void whipSlotsHeldBriefly() {
