@@ -29259,10 +29259,19 @@ print("added " + ui["name"])
         loadDemo();
         std::string why;
         if (!output::BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
-        QTcpServer tcp;
-        tcp.listen(QHostAddress::LocalHost, 0);
-        const int port = tcp.serverPort();
-        tcp.close();
+        // (a port free for UDP too, not shared: while it runs, the review holds the viewers' UDP port on the page's number)
+        int port = 0;
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QTcpServer tcp;
+            tcp.listen(QHostAddress::LocalHost, 0);
+            const quint16 p = tcp.serverPort();
+            const auto udpFree = [p](const QHostAddress& at) {
+                QUdpSocket udp;
+                return udp.bind(at, p, QAbstractSocket::DontShareAddress);
+            };
+            if (udpFree(QHostAddress::AnyIPv4) && udpFree(QHostAddress::LocalHost)) port = p;
+        }
+        QVERIFY(port);
         // Playback › Video Output › Remote Review…, viewers in a browser: the address and codecs are a browser's, the SRT
         // settings put away.
         win_->findChild<QAction*>("remoteReview")->trigger();

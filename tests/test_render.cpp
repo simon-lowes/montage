@@ -25008,6 +25008,51 @@ colorspaces:
         }
     }
 
+    // The 27 November Windows run: a review's viewers share one UDP port, the page's own number, and the review holds
+    // it from when it opens, not first when a viewer comes. Another socket asking for that number while the review is
+    // open is refused, the review lets it go when it closes, and a review whose port another program already holds for
+    // UDP does not open (its viewers could never join).
+    void browserReviewHoldsItsUdpPort() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        const auto grey = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = 0.5f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        const auto udpTaken = [](const QHostAddress& at, int port) {
+            QUdpSocket other;
+            return !other.bind(at, quint16(port), QAbstractSocket::DontShareAddress);
+        };
+        int port = 0;
+        {
+            ReviewRig rig;
+            rig.picture = grey;
+            QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+            port = rig.port();
+            QVERIFY(udpTaken(QHostAddress::LocalHost, port));
+            QVERIFY(udpTaken(QHostAddress::AnyIPv4, port));
+            rig.stop();
+            QVERIFY(!udpTaken(QHostAddress::LocalHost, port));
+        }
+        ReviewRig rig;
+        rig.picture = grey;
+        QUdpSocket holder;
+        QVERIFY(holder.bind(QHostAddress::LocalHost, quint16(rig.port()), QAbstractSocket::DontShareAddress));
+        QVERIFY(!rig.start(320, 180, "rec709", &why));
+        QVERIFY2(why.find("UDP port " + std::to_string(rig.port())) != std::string::npos, why.c_str());
+        // (with the port let go, a review on it opens)
+        holder.close();
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+    }
+
     // Live review in a browser through the network's hard places: a viewer on a slow link moved down the ladder and
     // back while another keeps the full picture.
     void browserReviewSimulcast() {
