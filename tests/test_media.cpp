@@ -48254,10 +48254,14 @@ private slots:
         copy.parentDescription = "The part used, cut by Montage";
         const QJsonObject def = QJsonDocument::fromJson(QByteArray::fromStdString(credentialManifestJson("/x/cut.mxf", {}, copy, "parent", people))).object();
         QCOMPARE(def.value("format").toString(), QString("application/mxf"));
-        const QJsonObject first = def.value("assertions").toArray()[0].toObject().value("data").toObject().value("actions").toArray()[0].toObject();
-        QCOMPARE(first.value("action").toString(), QString("c2pa.transcoded"));
+        // (its actions begin by opening the parent, as a manifest's must begin with created or opened)
+        const QJsonArray actions = def.value("assertions").toArray()[0].toObject().value("data").toObject().value("actions").toArray();
+        QCOMPARE(actions.size(), 2);
+        const QJsonObject first = actions[0].toObject(), then = actions[1].toObject();
+        QCOMPARE(first.value("action").toString(), QString("c2pa.opened"));
         QCOMPARE(first.value("parameters").toObject().value("ingredientIds").toArray()[0].toString(), QString("parent"));
-        QCOMPARE(first.value("description").toString(), QString("The part used, cut by Montage"));
+        QCOMPARE(then.value("action").toString(), QString("c2pa.transcoded"));
+        QCOMPARE(then.value("description").toString(), QString("The part used, cut by Montage"));
         QCOMPARE(def.value("redactions").toArray().size(), 2);
         // Said in the Media bin's tooltip.
         CredentialSummary said;
