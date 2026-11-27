@@ -1107,17 +1107,29 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             }
             // Each triangle turned so its corners run round its normals (outward) at the first frame: a mirrored
             // transform turns them all, and a font whose outlines run the other way (CFF's, macOS's) some of them.
-            // (a triangle with no area keeps the mirroring's turn)
+            // Which ones is decided in the title's own space, from its own corners and normals, and the mirroring: the
+            // scene's corners there come through the camera's map, whose last digits differ from one compiler's
+            // arithmetic to another's (fused multiply-adds), and a sliver's turn, near nothing, with them. The own
+            // corners are the font's floats, so their sides and cross product are exact in doubles, the same
+            // everywhere. A triangle with next to no area there, or whose normals lie nearly in its plane, keeps the
+            // mirroring's turn.
             for (size_t i = 0; i + 2 < m.indices.size(); i += 3) {
-                const double* a = &P[i * 3];
-                const double* b = &P[(i + 1) * 3];
-                const double* c = &P[(i + 2) * 3];
-                const double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+                double q[3][3], nsum[3] = {0, 0, 0};
+                for (size_t k = 0; k < 3; ++k) {
+                    const size_t vi = tr.indices[i + k];
+                    for (size_t ax = 0; ax < 3; ++ax) {
+                        q[k][ax] = double(tr.positions[vi * 3 + ax]);
+                        nsum[ax] += vi * 3 + ax < tr.normals.size() ? double(tr.normals[vi * 3 + ax]) : 0.0;
+                    }
+                }
+                const double e1[3] = {q[1][0] - q[0][0], q[1][1] - q[0][1], q[1][2] - q[0][2]};
+                const double e2[3] = {q[2][0] - q[0][0], q[2][1] - q[0][1], q[2][2] - q[0][2]};
                 const double g[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
-                double d = 0;
-                for (size_t k = 0; k < 3; ++k)
-                    for (int ax = 0; ax < 3; ++ax) d += g[ax] * f0.N[(i + k) * 3 + size_t(ax)];
-                if (d < 0 || (d == 0 && f0.mirrored)) std::swap(m.indices[i + 1], m.indices[i + 2]);
+                const double area = std::hypot(g[0], g[1], g[2]);
+                const double d = g[0] * nsum[0] + g[1] * nsum[1] + g[2] * nsum[2];
+                const bool decided = area > 1e-6 * std::hypot(e1[0], e1[1], e1[2]) * std::hypot(e2[0], e2[1], e2[2]) && std::fabs(d) > 1e-3 * area;
+                const bool against = decided && d < 0;
+                if (against != f0.mirrored) std::swap(m.indices[i + 1], m.indices[i + 2]);
             }
             m.color = {float(sum[0] / double(nv)), float(sum[1] / double(nv)), float(sum[2] / double(nv)), float(std::clamp(first.opacity, 0.0, 1.0))};
             if (!(pp > 0)) continue;

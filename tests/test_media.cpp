@@ -44657,9 +44657,14 @@ private slots:
         }
 
         // ---- Mirrored (flipped across), through half the lens and the 50 % scale: its corners where the picture shows
-        // them and its faces still toward the camera, its triangles turned round.
-        {
+        // them and its faces still toward the camera, its triangles turned round. In DejaVu Sans and in a font whose
+        // outlines run the other way round (CFF's) where one is installed: a font that lacks DejaVu Sans (macOS's) draws
+        // the title in another, with curves, so slivers among its faces.
+        for (const char* font : {"DejaVu Sans", "Inter", "Loma"}) {
+            if (std::string(font) != "DejaVu Sans" && !QFontDatabase::hasFamily(QString::fromLatin1(font))) continue;
+            const bool cff = std::string(font) != "DejaVu Sans";
             Clip mirrored = moved;
+            mirrored.generator.strings["font"] = font;
             mirrored.generator.params["rot_y"] = Param(20.0);
             mirrored.motion.params["flip_h"] = Param(1.0);
             Title3DMesh alone;
@@ -44668,16 +44673,17 @@ private slots:
             QVERIFY(placed(half, mirrored, mm));
             double faces = 0, sides = 0;
             QVERIFY(offAtEveryFrame(half, mm, mirrored, faces, sides));
-            qInfo("mirrored: its faces' corners %.2g px off, its sides' %.2g", faces, sides);
+            qInfo("mirrored, %s: its faces' corners %.2g px off, its sides' %.2g", font, faces, sides);
             QVERIFY(faces < 1e-3 && sides < 1e-3);
             int turned = 0;
             const QString wrong = turnedByNormals(mm, alone, true, turned);
-            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
-            QVERIFY2(turned > int(mm.indices.size() / 6), qPrintable(QString::number(turned)));
+            QVERIFY2(wrong.isEmpty(), qPrintable(QString("%1: %2").arg(font, wrong)));
+            QVERIFY2(turned > int(mm.indices.size() / 6), qPrintable(QString("%1: %2").arg(font).arg(turned)));
             const auto [toward, away] = facesToward(mm, alone, solvedCameraAt(half, 0), 0);
-            QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1 toward, %2 away").arg(toward).arg(away)));
-            // (its normals follow: each front face's normal toward the camera too)
-            int normalsToward = 0;
+            QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1: %2 toward, %3 away").arg(font).arg(toward).arg(away)));
+            // (its normals follow: every front face's corner's normal toward the camera too, slivers' as well, as a
+            // normal is the face's own and not its corners' turn; the turn above leaves slivers out)
+            int faceCorners = 0, normalsToward = 0;
             for (size_t i = 0; i < mm.indices.size(); ++i)
                 if (alone.onFace.at(i / 3)) {
                     const std::array<double, 3> N = at(mm.pointSamples.empty() ? mm.normals : mm.normalSamples[0].second, i);
@@ -44685,9 +44691,15 @@ private slots:
                     const double n[3] = {N[0] * M[0] + N[1] * M[4] + N[2] * M[8], N[0] * M[1] + N[1] * M[5] + N[2] * M[9], N[0] * M[2] + N[1] * M[6] + N[2] * M[10]};
                     const std::array<double, 3> X = sceneAt(mm, 0, i);
                     const ModelCamera cam = solvedCameraAt(half, 0);
+                    ++faceCorners;
                     normalsToward += n[0] * (cam.C[0] - X[0]) + n[1] * (cam.C[1] - X[1]) + n[2] * (cam.C[2] - X[2]) > 0;
                 }
-            QCOMPARE(normalsToward, toward * 3);
+            qInfo("mirrored, %s: %d of its %d triangles turned, %d front faces toward the camera by their turn and %d slivers, "
+                  "%d of %d front corners' normals toward it",
+                  font, turned, int(mm.indices.size() / 3), toward, faceCorners / 3 - toward, normalsToward, faceCorners);
+            QVERIFY(faceCorners >= toward * 3);
+            QCOMPARE(normalsToward, faceCorners);
+            if (cff) break;
         }
 
         // ---- A title turning a quarter over its ten frames, through the title's own lens: its transform's time
