@@ -46784,6 +46784,36 @@ private slots:
             for (int i = 0; i < 20000; ++i) at.push_back({1000.0f + float(i) * 0.001f, 0, 0});
             f.neighbourDistance = 0.0004f, f.neighbours = 1;
             QCOMPARE(countOf(splatKeep(cloudOf(at), f)), size_t(0));
+            // (nightly 27 Nov) Nor do splats more than 2^30 cells from the lowest share one: one at the origin and
+            // 120,000 in a line at x 700,000, as far apart as floats there can be (1/16), all go at a distance of 0.001.
+            at.clear();
+            at.push_back({0, 0, 0});
+            for (int i = 0; i < 120000; ++i) at.push_back({700000.0f + float(i) * 0.0625f, 0, 0});
+            f.neighbourDistance = 0.001f, f.neighbours = 1;
+            QCOMPARE(countOf(splatKeep(cloudOf(at), f)), size_t(0));
+            // Far out, where a float's steps are wider than the distance, splats of the same value on that axis are
+            // still near each other and others are not: what is kept is again what measuring every pair says, for
+            // crowds at 1e20 and -1e30 sharing a value, a line at 700,000 and a crowd at the origin.
+            at.clear();
+            for (int i = 0; i < 300; ++i) at.push_back({1e20f, float(rnd() * 0.002), float(rnd() * 0.002)});
+            for (int i = 0; i < 300; ++i) at.push_back({float(rnd() * 0.004), -1e30f, 5e15f + float(int(rnd() * 3)) * 1e9f});
+            for (int i = 0; i < 300; ++i) at.push_back({700000.0f + float(int(rnd() * 400)) * 0.0625f, float(rnd() * 0.002), 0});
+            for (int i = 0; i < 300; ++i) at.push_back({float(rnd() * 0.004), float(rnd() * 0.004), float(rnd() * 0.004)});
+            const SplatCloud far = cloudOf(at);
+            for (const float dist : {0.001f, 0.003f})
+                for (const int need : {1, 4}) {
+                    std::vector<uint8_t> measured(at.size(), 0);
+                    for (size_t i = 0; i < at.size(); ++i) {
+                        int found = 0;
+                        for (size_t j = 0; j < at.size(); ++j) {
+                            const double dx = double(at[j][0]) - at[i][0], dy = double(at[j][1]) - at[i][1], dz = double(at[j][2]) - at[i][2];
+                            if (j != i && dx * dx + dy * dy + dz * dz <= double(dist) * double(dist)) ++found;
+                        }
+                        measured[i] = found >= need;
+                    }
+                    f.neighbourDistance = dist, f.neighbours = need;
+                    QVERIFY2(splatKeep(far, f) == measured, qPrintable(QString("far: distance %1, %2 neighbours").arg(dist).arg(need)));
+                }
         }
         {
             SplatFilter f;

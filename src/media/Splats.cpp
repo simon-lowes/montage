@@ -987,26 +987,38 @@ namespace {
 void dropLonely(const SplatCloud& c, float dist, int need, std::vector<uint8_t>& keep, size_t& dropped) {
     const size_t n = c.count;
     if (n == 0 || !(dist > 0) || need <= 0) return;
-    const double d2 = double(dist) * double(dist), side = double(dist) / 1.733;
-    const double margin = side * 1e-6;  // (more than a cell's index can be off by, rounded)
+    // (Cells a little smaller than dist/√3, so that two centres in one cell are within dist even with each cell's
+    // index off by the most rounding can make it.)
+    const double d2 = double(dist) * double(dist), side = double(dist) / 1.74;
+    const double margin = side * 1e-3;  // (more than a cell's index can be off by, rounded)
     auto finite = [&](size_t i) {
         const float* p = &c.positions[i * 3];
         return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
     };
-    double lo[3] = {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
-    for (size_t i = 0; i < n; ++i)
-        if (finite(i))
-            for (int a = 0; a < 3; ++a) lo[a] = std::min(lo[a], double(c.positions[i * 3 + a]));
-    // Cells counted from the lowest centre; those past the last on an axis share it, and are measured splat by splat.
-    // A centre that is not a number (or infinite) is within no distance of anything, and is in no cell.
-    constexpr int32_t kLast = int32_t(1) << 30;
-    using Cell = std::array<int32_t, 3>;
-    std::vector<Cell> cells(n, Cell{-1, -1, -1});
+    // Cells counted from 0 on each axis, up to 2^40 of them either way. A centre farther out than that is so far that
+    // the next value a float can hold there is more than 2^16 cells away, so along that axis it has a cell of its own
+    // value (from kExact on), and only centres of that very value are near it that way. So no cell is shared by
+    // centres that are not near each other, however the cloud lies. A centre that is not a number (or infinite) is
+    // within no distance of anything, and is in no cell.
+    constexpr double kFar = double(int64_t(1) << 40);
+    constexpr int64_t kExact = int64_t(1) << 42, kNone = std::numeric_limits<int64_t>::min();
+    using Cell = std::array<int64_t, 3>;
+    std::vector<Cell> cells(n, Cell{kNone, kNone, kNone});
     std::vector<uint32_t> order;
     order.reserve(n);
     for (size_t i = 0; i < n; ++i) {
         if (!finite(i)) continue;
-        for (int a = 0; a < 3; ++a) cells[i][a] = int32_t(std::min(std::floor((double(c.positions[i * 3 + a]) - lo[a]) / side), double(kLast)));
+        for (int a = 0; a < 3; ++a) {
+            const float v = c.positions[i * 3 + a];
+            const double q = std::floor(double(v) / side);
+            if (std::abs(q) < kFar) {
+                cells[i][a] = int64_t(q);
+            } else {
+                uint32_t bits;
+                std::memcpy(&bits, &v, sizeof bits);
+                cells[i][a] = kExact + int64_t(bits);
+            }
+        }
         order.push_back(uint32_t(i));
     }
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return cells[a] < cells[b] || (cells[a] == cells[b] && a < b); });
@@ -1023,8 +1035,9 @@ void dropLonely(const SplatCloud& c, float dist, int need, std::vector<uint8_t>&
     while (buckets < runs.size() * 2) buckets <<= 1;
     std::vector<uint32_t> table(buckets, UINT32_MAX);
     auto slotOf = [&](const Cell& at) {
-        const uint64_t h = (uint64_t(uint32_t(at[0])) * 0x9e3779b97f4a7c15ull) ^ (uint64_t(uint32_t(at[1])) * 0xc2b2ae3d27d4eb4full) ^ (uint64_t(uint32_t(at[2])) * 0x165667b19e3779f9ull);
-        return size_t(h ^ (h >> 29)) & (buckets - 1);
+        uint64_t h = (uint64_t(at[0]) * 0x9e3779b97f4a7c15ull) ^ (uint64_t(at[1]) * 0xc2b2ae3d27d4eb4full) ^ (uint64_t(at[2]) * 0x165667b19e3779f9ull);
+        h ^= h >> 29, h *= 0xbf58476d1ce4e5b9ull;
+        return size_t(h ^ (h >> 32)) & (buckets - 1);
     };
     for (size_t r = 0; r < runs.size(); ++r) {
         size_t s = slotOf(runs[r].at);
@@ -1057,37 +1070,34 @@ void dropLonely(const SplatCloud& c, float dist, int need, std::vector<uint8_t>&
         for (int task = (r0 + 15) / 16; task < (r1 + 15) / 16; ++task)
             for (size_t i = size_t(task) * kChunk; i < std::min(n, (size_t(task) + 1) * kChunk); ++i) {
                 if (!keep[i]) continue;
-                if (cells[i][0] < 0) {
+                if (cells[i][0] == kNone) {
                     lonely[i] = 1;
                     continue;
                 }
                 const float* p = &c.positions[i * 3];
-                double rel[3];
-                for (int a = 0; a < 3; ++a) rel[a] = double(p[a]) - lo[a];
                 const Cell& own = cells[i];
                 int found = 0;
                 for (const auto& o : kAround) {
-                    const Cell at{own[0] + o[0], own[1] + o[1], own[2] + o[2]};  // (kLast + 2 still fits)
-                    if (at[0] < 0 || at[1] < 0 || at[2] < 0 || at[0] > kLast || at[1] > kLast || at[2] > kLast) continue;
+                    // (Along an axis where the centre has a cell of its own value, only that cell can be near.)
+                    if ((o[0] && own[0] >= kExact) || (o[1] && own[1] >= kExact) || (o[2] && own[2] >= kExact)) continue;
+                    const Cell at{own[0] + o[0], own[1] + o[1], own[2] + o[2]};
                     const Run* run = runAt(at);
                     if (!run) continue;
-                    const bool shared = at[0] == kLast || at[1] == kLast || at[2] == kLast;
-                    bool whole = false;
-                    if (!shared && o == std::array<int, 3>{0, 0, 0}) {
+                    if (o == std::array<int, 3>{0, 0, 0}) {
                         found += int(std::min<uint32_t>(uint32_t(need), run->count - 1));
                         continue;
                     }
-                    if (!shared) {
-                        double nearest = 0, farthest = 0;
-                        for (int a = 0; a < 3; ++a) {
-                            const double from = double(at[a]) * side - margin, to = double(at[a] + 1) * side + margin;
-                            const double near = rel[a] < from ? from - rel[a] : rel[a] > to ? rel[a] - to : 0;
-                            const double far = std::max(std::abs(rel[a] - from), std::abs(rel[a] - to));
-                            nearest += near * near, farthest += far * far;
-                        }
-                        if (nearest > d2 * (1 + 1e-9)) continue;
-                        whole = farthest <= d2 * (1 - 1e-9);
+                    double nearest = 0, farthest = 0;
+                    for (int a = 0; a < 3; ++a) {
+                        if (at[a] >= kExact) continue;  // (the same value)
+                        const double from = double(at[a]) * side - margin, to = double(at[a] + 1) * side + margin;
+                        const double v = double(p[a]);
+                        const double near = v < from ? from - v : v > to ? v - to : 0;
+                        const double far = std::max(std::abs(v - from), std::abs(v - to));
+                        nearest += near * near, farthest += far * far;
                     }
+                    if (nearest > d2 * (1 + 1e-9)) continue;
+                    const bool whole = farthest <= d2 * (1 - 1e-9);
                     if (whole) {
                         found += int(std::min<uint32_t>(uint32_t(need), run->count));
                     } else {
