@@ -28054,10 +28054,12 @@ colorspaces:
             relay.madeUpRealm = made.realm;
             relay.madeUpNonce = made.nonce;
             relay.madeUpChallenge = made.code;
-            // Three Refreshes kept by the relay (about three seconds), each answered first by a made-up challenge.
+            // Three Refreshes kept by the relay (about three seconds), each answered first by a made-up challenge. (Both
+            // counts waited for: the relay counts a Refresh before it looks whether to make a challenge up for it, so
+            // with the Refreshes alone the last could find the challenges already turned off.)
             QElapsedTimer waited;
             waited.start();
-            while (waited.elapsed() < 12000 && relay.refreshes < refreshesBefore + 3) QThread::msleep(20);
+            while (waited.elapsed() < 12000 && (relay.refreshes < refreshesBefore + 3 || relay.challengesMadeUp < madeBefore + 3)) QThread::msleep(20);
             relay.madeUpChallenge = 0;
             QVERIFY2(relay.refreshes >= refreshesBefore + 3, qPrintable(row + "; " + relay.told()));
             QVERIFY2(relay.challengesMadeUp >= madeBefore + 3, qPrintable(row));
