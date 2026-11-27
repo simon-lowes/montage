@@ -3901,7 +3901,9 @@ private slots:
     void recordingLandsWherePlayedAfterADropout() {
         // The device held up for 120 ms (a busy computer) catches up at once, block after block, faster than sound is
         // made ahead for it: the output runs dry and the timeline stands still while the device goes on. A click played
-        // after that is recorded where it was played, not later by what ran dry.
+        // after that is recorded where it was played, not later by what ran dry. (The playback makes nothing more
+        // until the device has taken more than the most that can be made ahead of it, so it runs dry however the
+        // computer's other work lets each thread run: nightly 27 Nov, where under a parallel run it did not.)
         audiodev::setLoopbackOptions({256, 512, 0});
         audiodev::Engine e;
         audiodev::DeviceSettings s;
@@ -3917,7 +3919,15 @@ private slots:
         std::atomic<bool> held{false};
         const int out = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) {
             const int64_t p = clicker.render(o, ch, n);
-            if (p >= 1200 && !held.exchange(true)) audiodev::loopbackStall(120);  // (a quarter of the way to the click)
+            if (p >= 1200 && !held.exchange(true)) {  // (a quarter of the way to the click)
+                const int64_t from = audiodev::loopbackCounts().frames;
+                audiodev::loopbackStall(120);
+                // (the most made ahead is 100 ms, and a block being mixed)
+                QElapsedTimer w;
+                w.start();
+                while (audiodev::loopbackCounts().frames < from + 4800 + 2048 && w.elapsed() < 5000)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             return p;
         });
         auto unhookOut = qScopeGuard([&] { e.removeOutput(out); });
