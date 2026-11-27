@@ -532,9 +532,14 @@ struct LivePackager::State {
         std::string title;
         double at = -1;
         int64_t picture = -1;
+        std::string key;
     };
     std::vector<ChapterAsked> chaptersAsked;
-    std::vector<std::pair<double, std::string>> chapterList;
+    struct Chapter {
+        double at = 0;
+        std::string title, key;
+    };
+    std::vector<Chapter> chapterList;
     double encodedEnd = 0;  // (the pictures encoded so far, seconds)
 
     ~State() {
@@ -1236,9 +1241,9 @@ struct LivePackager::State {
         const int64_t edge = std::llround(encodedEnd * av_q2d(fps));
         for (size_t i = 0; i < chapterList.size(); ++i) {
             Caption c;
-            c.start = std::llround(chapterList[i].first * av_q2d(fps));
-            c.end = i + 1 < chapterList.size() ? std::llround(chapterList[i + 1].first * av_q2d(fps)) : std::max(edge, c.start + 1);
-            c.text = chapterList[i].second;
+            c.start = std::llround(chapterList[i].at * av_q2d(fps));
+            c.end = i + 1 < chapterList.size() ? std::llround(chapterList[i + 1].at * av_q2d(fps)) : std::max(edge, c.start + 1);
+            c.text = chapterList[i].title;
             if (c.end > c.start) cues.push_back(std::move(c));
         }
         return writeAtomically(folder + "/chapters.vtt", captionsToVtt(cues, Rational{fps.num, fps.den})) || fail("Cannot write " + folder + "/chapters.vtt");
@@ -1531,9 +1536,13 @@ struct LivePackager::State {
                 // (one at a time already packaged, as a marker placed on the recording behind it, keeps its time:
                 // the list is written whole each time)
                 const int64_t frame = c.at >= 0 ? std::max<int64_t>(0, std::llround(c.at * rate) - firstPicture) : frameOf(c.at, c.picture, &late);
-                chapterList.push_back({seconds(frame), c.title});
+                // (one given before by its key: moved and titled anew)
+                auto was = c.key.empty() ? chapterList.end()
+                                         : std::find_if(chapterList.begin(), chapterList.end(), [&](const Chapter& k) { return k.key == c.key; });
+                if (was != chapterList.end()) was->at = seconds(frame), was->title = c.title;
+                else chapterList.push_back({seconds(frame), c.title, c.key});
             }
-            std::stable_sort(chapterList.begin(), chapterList.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            std::stable_sort(chapterList.begin(), chapterList.end(), [](const Chapter& a, const Chapter& b) { return a.at < b.at; });
             if (chapterList.size() > 1000) chapterList.erase(chapterList.begin(), chapterList.begin() + ptrdiff_t(chapterList.size() - 1000));
             writeChapters();
             std::lock_guard lock(m);
@@ -1977,10 +1986,10 @@ void LivePackager::cueFromFeed(const std::vector<uint8_t>& section, double feedZ
     s_->asked.push_back({lc, -1, true});
 }
 
-void LivePackager::chapter(const std::string& title, double at) {
+void LivePackager::chapter(const std::string& title, double at, const std::string& key) {
     std::lock_guard lock(s_->m);
     if (!s_->st.running || s_->stopping || s_->chaptersAsked.size() >= 256) return;
-    s_->chaptersAsked.push_back({title, at, -1});
+    s_->chaptersAsked.push_back({title, at, -1, key});
 }
 
 void LivePackager::finish() {
@@ -2155,6 +2164,9 @@ struct LiveOrigin::State {
     QEventLoop* loop = nullptr;
     int port = 0;
     std::atomic<int64_t> heldBytes{0};  // (bytes handed to connections that their clients have not taken yet)
+    std::atomic<int> keptNow{0};
+    std::atomic<int64_t> letGo{0};      // (connections let go by the 512 kept)
+    int sendBuffer = 0;
 
     // A connection's one request (each answered, then closed). Kept until its socket is gone.
     struct Request {
@@ -2490,6 +2502,7 @@ struct LiveOrigin::State {
                 if (stuck) {
                     drop(*stuck);
                     --kept;
+                    ++letGo;
                 }
             }
             if (!socket->setSocketDescriptor(fd) || open >= 256 || kept >= 512) {
@@ -2497,10 +2510,11 @@ struct LiveOrigin::State {
                 socket->deleteLater();
                 return;
             }
+            if (sendBuffer > 0) socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, sendBuffer);
 #ifdef Q_OS_WIN
             // (Windows otherwise takes many megabytes into a connection's send buffer whether or not its client reads
             // them, so a client that reads nothing still seemed to take what it was sent)
-            socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, 1 << 20);
+            else socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, 1 << 20);
 #endif
             auto r = std::make_unique<Request>();
             r->socket = socket;
@@ -2541,9 +2555,11 @@ struct LiveOrigin::State {
             for (Request* r : waiting) attempt(*r);
             for (Request* r : slow) drop(*r);
             int64_t held = 0;
+            int keptCount = 0;
             for (auto& r : requests)
-                if (!r->gone && r->socket) held += r->socket->bytesToWrite();
+                if (!r->gone && r->socket) held += r->socket->bytesToWrite(), ++keptCount;
             heldBytes.store(held);
+            keptNow.store(keptCount);
         });
         tick.start(10);
         {
@@ -2596,6 +2612,12 @@ bool LiveOrigin::start(const std::string& folder, int port, std::function<bool(c
 int LiveOrigin::port() const { return s_->port; }
 
 int64_t LiveOrigin::bytesWaiting() const { return s_->heldBytes.load(); }
+
+int LiveOrigin::connectionsKept() const { return s_->keptNow.load(); }
+
+int64_t LiveOrigin::connectionsLetGo() const { return s_->letGo.load(); }
+
+void LiveOrigin::setSendBuffer(int bytes) { s_->sendBuffer = std::max(0, bytes); }
 
 void LiveOrigin::stop() {
     if (!s_->thread.joinable()) return;

@@ -36014,6 +36014,89 @@ colorspaces:
         }
     }
 
+    // Phase 18: 600 clients that each ask for a file and read none of its answer. The origin keeps 512 connections;
+    // each one past that makes room by letting go the one whose client has taken nothing for longest, so the first 88
+    // are closed and the last 512 kept, and those are then sent their whole answers. (Each connection's system buffer
+    // is made small, so the answers wait in the origin as they would for players past a slow link.)
+    void liveOriginKeeps512() {
+#ifndef _WIN32
+        // (1,200 sockets in this process: the client's and the origin's of each)
+        rlimit files{};
+        if (getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur != RLIM_INFINITY && files.rlim_cur < 4096) {
+            files.rlim_cur = files.rlim_max == RLIM_INFINITY ? 4096 : std::min<rlim_t>(4096, files.rlim_max);
+            setrlimit(RLIMIT_NOFILE, &files);
+        }
+#endif
+        QTemporaryDir dir;
+        const int size = 96 << 10;
+        {
+            QFile f(dir.filePath("seg_3.m4s"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray(size, 'x'));
+        }
+        LiveOrigin origin;
+        origin.setSendBuffer(8 << 10);
+        std::string err;
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, [](const std::string&) { return false; }, &err), err.c_str());
+        constexpr int kClients = 600, kKept = 512;
+        std::vector<std::unique_ptr<QTcpSocket>> clients;
+        std::vector<QByteArray> got(kClients);
+        QElapsedTimer began;
+        began.start();
+        for (int i = 0; i < kClients; ++i) {
+            auto s = std::make_unique<QTcpSocket>();
+            s->setReadBufferSize(1);  // (a byte of the answer taken, to know it was sent, and nothing more)
+            s->connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            QVERIFY2(s->waitForConnected(5000), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
+            s->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 4096);
+            s->write("GET /seg_3.m4s HTTP/1.1\r\nHost: x\r\n\r\n");
+            QVERIFY(s->waitForBytesWritten(5000) || s->bytesToWrite() == 0);
+            QVERIFY2(s->waitForReadyRead(5000), qPrintable(QString("client %1 was not answered").arg(i)));
+            // (the origin's thread sees what its system took of the answer before the next client comes)
+            QThread::msleep(4);
+            clients.push_back(std::move(s));
+        }
+        // (all within the 20 s an unread answer is kept for)
+        QVERIFY2(began.elapsed() < 15000, qPrintable(QString::number(began.elapsed())));
+        QElapsedTimer t;
+        t.start();
+        while (t.elapsed() < 3000 && (origin.connectionsKept() != kKept || origin.connectionsLetGo() != kClients - kKept)) QTest::qWait(20);
+        QCOMPARE(origin.connectionsKept(), kKept);
+        QCOMPARE(origin.connectionsLetGo(), int64_t(kClients - kKept));
+        QVERIFY2(origin.bytesWaiting() >= int64_t(kKept) * 4096, qPrintable(QString::number(origin.bytesWaiting())));
+        // Every client now reads: the first 88 were let go, the last 512 are sent their whole answers.
+        for (int i = 0; i < kClients; ++i) {
+            QTcpSocket* s = clients[size_t(i)].get();
+            got[size_t(i)] = s->readAll();
+            QObject::connect(s, &QTcpSocket::readyRead, s, [s, &got, i] { got[size_t(i)] += s->readAll(); });
+            s->setReadBufferSize(0);
+        }
+        auto finished = [&] {
+            for (const auto& s : clients)
+                if (s->state() == QAbstractSocket::ConnectedState || s->bytesAvailable() > 0) return false;
+            return true;
+        };
+        t.restart();
+        while (t.elapsed() < 15000 && !finished()) QTest::qWait(20);
+        int closed = 0, whole = 0;
+        for (int i = 0; i < kClients; ++i) {
+            QByteArray& in = got[size_t(i)];
+            in += clients[size_t(i)]->readAll();
+            const qsizetype head = in.indexOf("\r\n\r\n");
+            const bool all = in.startsWith("HTTP/1.1 200") && head > 0 && in.size() - (head + 4) == size;
+            if (i < kClients - kKept) {
+                QVERIFY2(!all, qPrintable(QString("client %1 was sent its whole answer").arg(i)));
+                ++closed;
+            } else {
+                QVERIFY2(all, qPrintable(QString("client %1: %2 bytes").arg(i).arg(in.size())));
+                ++whole;
+            }
+        }
+        qInfo("%d closed and %d answered whole, in %lld ms", closed, whole, (long long)began.elapsed());
+        QCOMPARE(closed, kClients - kKept);
+        QCOMPARE(whole, kKept);
+    }
+
     // Nightly 15 Nov: low latency HLS as a player is promised it. The preload hint after a segment's last part
     // names the next segment's first; every part but a segment's last is 85% of its playlist's PART-TARGET at least
     // (with sound, a part asked shorter than 13 coded frames is made that long); a blocking reload for what is too

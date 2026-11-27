@@ -3604,7 +3604,7 @@ private slots:
                       {"live", QJsonObject{{"folder", folder}, {"captions", "sometimes"}}}})
                     .value("isError")
                     .toBool());
-        QJsonObject r = call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Marks 01"}, {"seconds", 7},
+        QJsonObject r = call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Marks 01"}, {"seconds", 10},
                               {"codec", "prores_proxy"}, {"watch", false},
                               {"live", QJsonObject{{"folder", folder}, {"languages", true}, {"captions", "none"}, {"low_latency", true}}}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
@@ -3682,6 +3682,21 @@ private slots:
         }));
         QTest::qWait(300);
         QCOMPARE(liveNow().value("chapters").toInt(), 3);
+        // Phase 18: the marker moved to 2 s and renamed while recording moves and renames its chapter (the list is
+        // written whole again), and makes no other.
+        QVERIFY(state()->apply("Move marker", [growing](Project&, Sequence& s) {
+            for (auto* tracks : {&s.videoTracks, &s.audioTracks})
+                for (Track& t : *tracks)
+                    for (Clip& c : t.clips)
+                        if (c.mediaId == growing)
+                            for (Marker& m : c.markers)
+                                if (m.name == "From the clip") m.t = FrameTime(std::llround(2 * s.fps.toDouble())), m.name = "Moved on";
+            return edit::Result{};
+        }));
+        markedAt.restart();
+        while (markedAt.elapsed() < 2500 && !(listed = readFile(folder + "/chapters.vtt")).contains("Moved on")) QTest::qWait(50);
+        QVERIFY2(listed.contains("00:00:02.000 --> ") && listed.contains("Moved on") && !listed.contains("From the clip"), qPrintable(listed));
+        QCOMPARE(liveNow().value("chapters").toInt(), 3);
         QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 30000);
         QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live package ended"), 20000);
         QVERIFY2(dlg->statusText().contains("2 ad cue") && dlg->statusText().contains("2 sound stream"), qPrintable(dlg->statusText()));
@@ -3695,7 +3710,7 @@ private slots:
         const QString list = readFile(folder + "/" + video);
         QVERIFY2(list.contains("ID=\"cue-1\"") && list.contains("ID=\"cue-2\"") && list.contains("PLANNED-DURATION=1.500"), qPrintable(list));
         const QString chapters = readFile(folder + "/chapters.vtt");
-        QVERIFY2(chapters.contains("Second half") && chapters.contains("Chapter 2") && chapters.contains("From the clip"), qPrintable(chapters));
+        QVERIFY2(chapters.contains("Second half") && chapters.contains("Chapter 2") && chapters.contains("Moved on") && !chapters.contains("From the clip"), qPrintable(chapters));
     }
 
     // ST 2110 streams recorded by an agent (montage_capture), their SDPs given as text: in the Captures bin with the
