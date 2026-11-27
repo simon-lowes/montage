@@ -4190,6 +4190,7 @@ private slots:
             if (!chosen) QThread::msleep(100);
         }
         QVERIFY2(chosen, "the device back was not taken up");
+        qInfo("the device was taken up again %lld ms after it came back", (long long)back.elapsed());
         QVERIFY2(back.elapsed() <= 3000 + 500, qPrintable(QString::number(back.elapsed())));
         QVERIFY(e.isOpen());
     }

@@ -821,6 +821,19 @@ struct Engine::Impl {
     std::condition_variable retryCv;
     std::atomic<bool> standInNow{false};
     std::atomic<bool> clientLeft{false};  // an output or input let go since the retry thread last looked
+    // When the retry is next due (standInTried + retryEvery, as steady_clock's count), for the retry thread to wake
+    // then rather than at its next look; and `poked`, set under retryM when a client lets go, to try at once (a
+    // retry that came due while a client played through the stand-in waited for it to go).
+    std::atomic<int64_t> retryDue{0};
+    bool poked = false;
+    void noteRetryDue() { retryDue = (standInTried + retryEvery).time_since_epoch().count(); }
+    void pokeRetry() {
+        {
+            std::lock_guard<std::mutex> l(retryM);
+            poked = true;
+        }
+        retryCv.notify_all();
+    }
     void retryLoop();
     void setStandIn(bool on) {
         standIn = on;
@@ -1188,7 +1201,7 @@ bool Engine::Impl::openWith(const DeviceSettings& s, std::string* why) {
 // client plays or records through is left as it is: closing it would break the sound off.)
 void Engine::Impl::retryChosenLocked() {
     if (!standIn || !stream) return;
-    if (clientLeft.exchange(false)) retryEvery = std::chrono::seconds(3);
+    if (clientLeft.exchange(false)) retryEvery = std::chrono::seconds(3), noteRetryDue();
     if (std::chrono::steady_clock::now() - standInTried < retryEvery) return;
     {
         std::lock_guard<std::mutex> l(m);
@@ -1198,19 +1211,29 @@ void Engine::Impl::retryChosenLocked() {
     const std::chrono::seconds every = retryEvery;
     openLocked(nullptr);
     if (standIn) retryEvery = std::min(every * 2, std::chrono::seconds(30));
+    noteRetryDue();
 }
 
 void Engine::Impl::retryLoop() {
     std::unique_lock<std::mutex> l(retryM);
+    bool busy = false;  // (openM was held when it last looked)
     while (!quit.load()) {
         if (!standInNow.load()) {
             retryCv.wait(l, [this] { return quit.load() || standInNow.load(); });
             continue;
         }
-        if (retryCv.wait_for(l, std::chrono::milliseconds(250), [this] { return quit.load(); })) break;
+        // (a look every 250 ms, and at the moment the retry is due, and at once when a client lets go: no poll's
+        // interval is added to the retry's; with the engine busy opening, a look again soon)
+        const auto now = std::chrono::steady_clock::now();
+        const auto due = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(retryDue.load()));
+        auto until = now + (busy ? std::chrono::milliseconds(20) : std::chrono::milliseconds(250));
+        if (due > now && due < until) until = due;
+        if (retryCv.wait_until(l, until, [this] { return quit.load() || poked; }) && quit.load()) break;
+        poked = false;
         l.unlock();
         {
             std::unique_lock<std::recursive_mutex> lock(openM, std::try_to_lock);
+            busy = !lock.owns_lock();
             if (lock.owns_lock()) {
                 reapLocked();
                 retryChosenLocked();
@@ -1240,6 +1263,7 @@ bool Engine::Impl::openLocked(std::string* why) {
         if (openWith(alt, &altErr)) {
             standInTried = std::chrono::steady_clock::now();
             retryEvery = std::chrono::seconds(3);
+            noteRetryDue();
             setStandIn(true);
             error = err;
             return true;
@@ -1398,6 +1422,7 @@ void Engine::removeOutput(int id) {
     if (gone) {
         d_->clientLeft = true;
         d_->settle();
+        d_->pokeRetry();
     }
 }
 
@@ -1474,6 +1499,7 @@ void Engine::removeInput(int id) {
     if (gone) {
         d_->clientLeft = true;
         d_->settle();
+        d_->pokeRetry();
     }
 }
 
