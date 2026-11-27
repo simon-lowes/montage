@@ -10,6 +10,7 @@
 #ifndef _WIN32
 #include <pthread.h>
 #include <sched.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #endif
 
@@ -36974,9 +36975,10 @@ colorspaces:
         }
 #endif
         QTemporaryDir dir;
-        // (under the 256 KB an answer is held whole in the origin, and past what the systems take: Windows takes one of
-        // the origin's 64 KB pieces whole, whatever the connection's buffer)
-        const int size = 192 << 10;
+        // (just under the 256 KB an answer is held whole in the origin, and so as far past what the systems take as
+        // can be: Windows takes one of the origin's 64 KB pieces whole, whatever the connection's buffer, and macOS
+        // took a whole 192 KB answer)
+        const int size = 250000;
         {
             QFile f(dir.filePath("seg_3.m4s"));
             QVERIFY(f.open(QIODevice::WriteOnly));
@@ -36999,11 +37001,14 @@ colorspaces:
             auto s = std::make_unique<QTcpSocket>();
             s->setReadBufferSize(1);  // (a byte of the answer taken, to know it was sent, and nothing more)
             // (bound first, so its system buffer is small from the start: the window it offers is settled as it
-            // connects, and macOS and Windows do not shrink it afterwards)
+            // connects, and Windows does not shrink it afterwards. And again once connected: macOS made it 326,640
+            // bytes as it connected (CI, 74c58b5), more than the answer, whatever was asked. Asked small from the start
+            // its window is offered unscaled, under 64 KB, and asked small again it offers no more than that)
             QVERIFY2(s->bind(QHostAddress::LocalHost, 0), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
             s->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 4096);
             s->connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
             QVERIFY2(s->waitForConnected(5000), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
+            s->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 4096);
             s->write("GET /seg_3.m4s HTTP/1.1\r\nHost: x\r\n\r\n");
             QVERIFY(s->waitForBytesWritten(5000) || s->bytesToWrite() == 0);
             QVERIFY2(s->waitForReadyRead(5000), qPrintable(QString("client %1 was not answered").arg(i)));
@@ -37024,12 +37029,17 @@ colorspaces:
             int closed = 0;
             for (const auto& s : clients) closed += s->state() != QAbstractSocket::ConnectedState;
             // (and where an answer went: the last client's receive buffer as its system has it, and the bytes waiting
-            // for it there, which are its system's buffer and the one byte read)
+            // for it in its system's buffer)
             QTcpSocket& last = *clients.back();
+            long queued = -1;
+#ifndef _WIN32
+            int n = 0;
+            if (ioctl(int(last.socketDescriptor()), FIONREAD, &n) == 0) queued = n;
+#endif
             return QString("%1 kept, %2 let go, %3 bytes waiting in the origin, %4 of the clients closed; at most %5 kept and %6 bytes "
-                           "waiting while they came; the last client's receive buffer %7, %8 bytes come to it")
+                           "waiting while they came; the last client's receive buffer %7, %8 bytes waiting for it in its system")
                 .arg(origin.connectionsKept()).arg(origin.connectionsLetGo()).arg(origin.bytesWaiting()).arg(closed).arg(mostKept)
-                .arg(mostWaiting).arg(last.socketOption(QAbstractSocket::ReceiveBufferSizeSocketOption).toInt()).arg(last.bytesAvailable());
+                .arg(mostWaiting).arg(last.socketOption(QAbstractSocket::ReceiveBufferSizeSocketOption).toInt()).arg(queued);
         };
         QVERIFY2(origin.connectionsKept() == kKept, qPrintable(said()));
         QVERIFY2(origin.connectionsLetGo() == int64_t(kClients - kKept), qPrintable(said()));
