@@ -248,6 +248,7 @@ bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, 
         std::vector<std::string> rows;
         int row = 0;
         int rowCount = 15;
+        int columnCount = 42;  // (the most a 16:9 service shows, until the window is defined)
         int anchorPoint = 7;
     };
     bool paintedOn = false;  // text written into a window on screen (roll-up, paint-on)
@@ -262,7 +263,11 @@ bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, 
         Window& w = windows[size_t(current)];
         paintedOn = paintedOn || w.visible;
         if (w.rows.size() <= size_t(w.row)) w.rows.resize(size_t(w.row) + 1);
-        putUtf8(w.rows[size_t(w.row)], c);
+        std::string& row = w.rows[size_t(w.row)];
+        // (a character past the window's last column is not shown: a row kept to its columns keeps each change to
+        // what is on screen small, where a feed that never ends a row would make decoding it quadratic)
+        if (std::count_if(row.begin(), row.end(), [](char b) { return (uint8_t(b) & 0xC0) != 0x80; }) >= w.columnCount) return;
+        putUtf8(row, c);
     };
     auto forMask = [&](uint8_t mask, auto&& f) {
         for (int k = 0; k < 8; ++k)
@@ -344,6 +349,7 @@ bool captionsFrom708(const std::vector<std::pair<double, CcTriplet>>& triplets, 
                             w.visible = (b[j] & 0x20) != 0;
                             w.anchorPoint = std::min(8, b[j + 3] >> 4);
                             w.rowCount = (b[j + 3] & 0x0F) + 1;
+                            w.columnCount = (b[j + 4] & 0x3F) + 1;
                             j += 6;
                         }
                 }

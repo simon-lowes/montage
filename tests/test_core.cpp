@@ -4007,6 +4007,41 @@ private slots:
         }
     }
 
+    void cc708RowKeptToItsColumns() {
+        // Nightly 27 Nov: a 708 service that never ends its row (60,000 characters into a window of 32 columns, as a
+        // broken or hostile live feed might send). The row stops at the window's last column, as a viewer would see
+        // it, so each change to what is on screen stays small and the feed is read in one pass, not in a time that
+        // grows with the square of the row.
+        const Rational fps{30, 1};
+        std::vector<std::pair<double, CcTriplet>> triplets;
+        int sequence = 0;
+        auto packet = [&](double at, const std::vector<uint8_t>& svc) {
+            std::vector<uint8_t> pk{0, uint8_t((1 << 5) | svc.size())};
+            pk.insert(pk.end(), svc.begin(), svc.end());
+            if (pk.size() % 2) pk.push_back(0);
+            pk[0] = uint8_t(((sequence++ & 3) << 6) | (pk.size() / 2));
+            for (size_t i = 0; i < pk.size(); i += 2) triplets.push_back({at, {uint8_t(i ? 0xFE : 0xFF), pk[i], pk[i + 1]}});
+        };
+        // (a two-row window of 32 columns, shown at once; then 30 characters a packet, a packet a frame)
+        packet(0, {0x98, 0x38, 0x80 | 90, 50, (7 << 4) | 1, 31, 0x09});
+        std::string sent;
+        for (int f = 1; sent.size() < 60000; ++f) {
+            std::vector<uint8_t> svc;
+            for (int k = 0; k < 30; ++k) svc.push_back(uint8_t('a' + (sent.size() + svc.size()) % 26));
+            sent.append(svc.begin(), svc.end());
+            packet(f / 30.0, svc);
+        }
+        std::vector<Caption> out;
+        std::string error;
+        QElapsedTimer t;
+        t.start();
+        QVERIFY2(captionsFrom708(triplets, fps, out, &error, nullptr, 1, true), error.c_str());
+        qInfo("%zu characters read in %lld ms", sent.size(), (long long)t.elapsed());
+        QVERIFY(!out.empty());
+        QCOMPARE(out.back().text, sent.substr(0, 32));
+        for (const Caption& c : out) QVERIFY2(c.text.size() <= 32, c.text.c_str());
+    }
+
     void teletextSubtitlePages() {
         const Rational pal{25, 1};
         // A caption at frame 5: the page header (magazine 8 sent as 0, page 88, erase and subtitle flags), its row, and the
