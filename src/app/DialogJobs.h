@@ -133,6 +133,7 @@ public:
         double progress = 0;
         bool running = false, paused = false;
         QString note;  // an offered result: what moved
+        QJsonObject input;  // what it was given
     };
     std::vector<TaskInfo> tasks() const;
     void setPaused(const QString& id, bool paused);  // (it waits at its next report of progress)

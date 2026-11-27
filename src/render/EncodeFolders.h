@@ -4,9 +4,12 @@
 // A file is ready once its size and modification time have stayed the same for `settleMs` (a copy over a network, a
 // recorder or a download still writing it is waited for), and it is not hidden or a partial download (".part",
 // ".crdownload", ".download", ".tmp"). What was encoded is kept in a ledger in the output folder
-// (".montage-encoded.json": each file's name, size and time and what it became), so after a restart nothing finished
-// is encoded again, while a new file of the same name (another size or time) is. The app runs the encodes as
-// background jobs (app/EncodeFoldersDialog.h); `montage-cli encode-folder` runs them one after the other.
+// (".montage-encoded.json": each file's path, the preset, its size and time and what it became), so after a restart
+// nothing finished is encoded again, while a new file of the same name (another size or time) is. Folders that share
+// an output folder share its ledger, each keeping its own files apart from the others' (one input with two presets,
+// or two inputs with files of one name); a ledger written before kept bare names, which are read as before. The app
+// runs the encodes as background jobs (app/EncodeFoldersDialog.h); `montage-cli encode-folder` runs them one after
+// the other.
 #pragma once
 
 #include <QString>
@@ -39,11 +42,13 @@ public:
     bool markDone(const QString& file, const QString& output);
     // An encode that failed or was stopped: the file is looked at again once it changes.
     void letGo(const QString& file);
-    // Where the file's encode goes: its name with the preset's extension, numbered when another file has it.
-    QString outputFor(const QString& file) const;
+    // Where the file's encode goes: its name with the preset's extension, numbered when another file has it, or
+    // another encode is writing it now (`busy`: those encodes' outputs).
+    QString outputFor(const QString& file, const std::vector<QString>& busy = {}) const;
     // The ledger read again (another process wrote it).
     void reload();
-    int encodedCount() const { return int(ledger_.size()); }
+    // How many of this folder's files (with its preset) the ledger has.
+    int encodedCount() const;
     // How many files the last look found still growing (not yet ready).
     int waiting() const { return waiting_; }
 
@@ -54,15 +59,19 @@ private:
     struct Done {
         qint64 size = 0, modified = 0;
         QString output;
+        QString input, preset;  // the file's path and the preset ("" for a ledger's entry of before, by bare name)
     };
     EncodeFolder folder_;
     qint64 settleMs_;
     int waiting_ = 0;
     std::map<QString, Seen> seen_;
-    std::map<QString, Done> ledger_;
+    std::map<QString, Done> ledger_;  // by key(): this folder's and every other's that shares the output folder
     std::map<QString, Seen> taken_;   // as it was when taken
     std::map<QString, Seen> failed_;  // as it was when it failed: tried again once it changes
     QString ledgerPath() const;
+    QString key(const QString& file) const;  // a file's entry: its path and the preset
+    // The file's entry: its own, else one by its bare name from a ledger of before that has it as it is now.
+    const Done* entryFor(const QString& file) const;
     bool isOutput(const QString& path) const;  // an encode written here (when the output folder is the input one)
 };
 

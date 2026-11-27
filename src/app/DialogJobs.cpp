@@ -789,7 +789,7 @@ TaskOutcome DialogJobs::watch(const QString& id, QWidget* parent) {
 std::vector<DialogJobs::TaskInfo> DialogJobs::tasks() const {
     std::vector<TaskInfo> out;
     for (const auto& t : tasks_)
-        out.push_back({t->id, t->kind, t->title, t->shared->done.load(), t->started, t->shared->paused.load(), {}});
+        out.push_back({t->id, t->kind, t->title, t->shared->done.load(), t->started, t->shared->paused.load(), {}, t->input});
     return out;
 }
 

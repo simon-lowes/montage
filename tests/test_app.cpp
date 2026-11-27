@@ -20381,6 +20381,85 @@ const auto seq = [this] { return state()->sequence(); };
         jobs->reloadFolders();
     }
 
+    // Nightly 27 Nov: one input folder watched with two presets, and two input folders encoded into one output
+    // folder. Each folder's encodes are its own: both presets encode the file, a file of the same name from the other
+    // folder goes beside the first rather than over it, and nothing is encoded twice. A ledger written before, by bare
+    // name, is still read.
+    void encodeFoldersSharingAnInputOrAnOutput() {
+        const QString root = dir_.path() + "/encode-shared";
+        const QString in = root + "/in", other = root + "/other", out = root + "/out";
+        QVERIFY(QDir().mkpath(in) && QDir().mkpath(other) && QDir().mkpath(out));
+        QFile source(QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        const QByteArray wav = source.readAll();
+        auto write = [](const QString& path, const QByteArray& bytes) {
+            QFile f(path);
+            return f.open(QIODevice::WriteOnly) && f.write(bytes) == bytes.size();
+        };
+        QVERIFY(write(in + "/take.wav", wav) && write(other + "/take.wav", wav.left(wav.size() / 2)));
+        const qint64 later = QDateTime::currentMSecsSinceEpoch() + 60000;
+        // The scans alone: two presets on one input, and another input with a file of the same name, all into one
+        // output folder.
+        {
+            EncodeFolderScan wavs({in, "Audio - WAV 24-bit", out}, 0), aacs({in, "Audio - AAC (M4A)", out}, 0), others({other, "Audio - WAV 24-bit", out}, 0);
+            for (EncodeFolderScan* s : {&wavs, &aacs, &others}) QCOMPARE(s->ready(later), std::vector<QString>{"take.wav"});
+            QCOMPARE(wavs.outputFor("take.wav"), out + "/take.wav");
+            QCOMPARE(aacs.outputFor("take.wav"), out + "/take.m4a");
+            // (while the first is still being written, the other folder's goes beside it)
+            QCOMPARE(others.outputFor("take.wav", {out + "/take.wav"}), out + "/take 2.wav");
+            QVERIFY(write(out + "/take.wav", "first") && wavs.markDone("take.wav", out + "/take.wav"));
+            QVERIFY(write(out + "/take.m4a", "second") && aacs.markDone("take.wav", out + "/take.m4a"));
+            others.reload();
+            QCOMPARE(others.outputFor("take.wav"), out + "/take 2.wav");
+            QVERIFY(write(out + "/take 2.wav", "third") && others.markDone("take.wav", out + "/take 2.wav"));
+            for (EncodeFolderScan* s : {&wavs, &aacs, &others}) {
+                s->reload();
+                QVERIFY(s->encoded("take.wav"));
+                QCOMPARE(s->encodedCount(), 1);
+                QVERIFY(s->ready(later + 1000).empty());
+            }
+            // Each folder's encode, asked for again, is its own output: written over only by itself.
+            QCOMPARE(wavs.outputFor("take.wav"), out + "/take.wav");
+            QCOMPARE(others.outputFor("take.wav"), out + "/take 2.wav");
+        }
+        // A ledger of before, by bare name, still says the file is encoded; it is kept when another file is added.
+        {
+            const QString oldOut = root + "/old-out";
+            QVERIFY(QDir().mkpath(oldOut));
+            const QFileInfo fi(in + "/take.wav");
+            const QJsonObject files{{"take.wav", QJsonObject{{"size", double(fi.size())}, {"modified", double(fi.lastModified().toMSecsSinceEpoch())},
+                                                             {"output", oldOut + "/take.wav"}}}};
+            QVERIFY(write(oldOut + "/.montage-encoded.json", QJsonDocument(QJsonObject{{"files", files}}).toJson()));
+            QVERIFY(write(in + "/next.wav", wav.left(wav.size() / 3)));
+            EncodeFolderScan old({in, "Audio - WAV 24-bit", oldOut}, 0);
+            QVERIFY(old.encoded("take.wav"));
+            QCOMPARE(old.ready(later), std::vector<QString>{"next.wav"});
+            QVERIFY(old.markDone("next.wav", oldOut + "/next.wav"));
+            EncodeFolderScan again({in, "Audio - WAV 24-bit", oldOut}, 0);
+            QVERIFY(again.encoded("take.wav") && again.encoded("next.wav"));
+            QCOMPARE(again.encodedCount(), 2);
+            QFile::remove(in + "/next.wav");
+        }
+        // Through the app: both presets' encodes of one file run (the second is not taken for the first), each to its
+        // own file.
+        for (const QString& f : QDir(out).entryList(QDir::Files | QDir::Hidden | QDir::NoDotAndDotDot)) QVERIFY(QFile::remove(out + "/" + f));
+        const std::vector<EncodeFolder> saved = savedEncodeFolders();
+        saveEncodeFolders({{in, "Audio - WAV 24-bit", out}, {in, "Audio - AAC (M4A)", out}});
+        auto* jobs = EncodeFolderJobs::of(win_.get(), state());
+        jobs->setSettleMs(300);
+        const int startedBefore = jobs->started();
+        QElapsedTimer clock;
+        clock.start();
+        while (!(QFileInfo::exists(out + "/take.wav") && QFileInfo::exists(out + "/take.m4a") && jobs->pending() == 0) && clock.elapsed() < 60000) QTest::qWait(100);
+        QCOMPARE(jobs->started() - startedBefore, 2);
+        for (const char* made : {"take.wav", "take.m4a"}) {
+            MediaItem m;
+            QVERIFY2(probeMedia((out + "/" + made).toStdString(), m) && m.hasAudio && std::fabs(m.duration - 11.0) < 0.3, made);
+        }
+        saveEncodeFolders(saved);
+        jobs->reloadFolders();
+    }
+
     void encodeFolderFromTheCommandLine() {
         // montage-cli encode-folder: three files put in the folder are each encoded once, a fourth still growing is
         // passed over until it stops, and with --once it ends when nothing is left; run again, it encodes nothing.
