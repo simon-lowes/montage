@@ -28648,12 +28648,16 @@ colorspaces:
         // its pictures 90 to 150 ms before the page draws them while its sound is stamped within 15 ms, and Montage
         // cannot see that from the wire.
         std::vector<std::pair<double, double>> pairs;  // (the beep after its flash in the recording, by the sender's reports or NaN)
+        // (each flash's line again in a failure's message: a run that has printed too much shows no more of its qInfo)
+        std::string flashesSaid;
         for (const double f : flashes) {
             double nearest = 1e9;
             for (const double b : beeps) nearest = std::fabs(b - f) < std::fabs(nearest) ? b - f : nearest;
             if (std::fabs(nearest) > 0.5) continue;
             senderHad = false;
-            qInfo("WHIP: flash at %.3f s, its beep %+.0f ms; %s", f, nearest * 1000, wire(f, f + nearest).c_str());
+            const std::string line = QString::asprintf("flash at %.3f s, its beep %+.0f ms; %s", f, nearest * 1000, wire(f, f + nearest).c_str()).toStdString();
+            qInfo("WHIP: %s", line.c_str());
+            flashesSaid += "\n  " + line;
             pairs.emplace_back(nearest, senderHad ? senderLast : std::nan(""));
         }
         const int paired = int(pairs.size());
@@ -28666,8 +28670,9 @@ colorspaces:
             worst = std::max(worst, std::fabs(off));
         }
         if (bySender) qInfo("WHIP: judged by the sender's own reports, which put each beep %+.0f ms after its flash on average", senderSum / senderPaired * 1000);
-        QVERIFY2(std::fabs(sum / paired) <= 0.040, (std::to_string(sum / paired) + (senderPaired ? "; by the sender's own reports " + std::to_string(senderSum / senderPaired) : std::string())).c_str());
-        QVERIFY2(worst <= 0.040 + 1 / fps, std::to_string(worst).c_str());
+        const std::string judged = bySender ? " (judged by the sender's own reports)" : "";
+        QVERIFY2(std::fabs(sum / paired) <= 0.040, (std::to_string(sum / paired) + (senderPaired ? "; by the sender's own reports " + std::to_string(senderSum / senderPaired) : std::string()) + judged + flashesSaid).c_str());
+        QVERIFY2(worst <= 0.040 + 1 / fps, (std::to_string(worst) + judged + flashesSaid).c_str());
     }
 
     // Phase 18: RTP and RTCP written by hand into the WHIP endpoint, over HTTP and over HTTPS with the test's own
@@ -36627,8 +36632,10 @@ colorspaces:
 
     // Phase 18: 600 clients that each ask for a file and read none of its answer. The origin keeps 512 connections;
     // each one past that makes room by letting go the one whose client has taken nothing for longest, so the first 88
-    // are closed and the last 512 kept, and those are then sent their whole answers. (Each connection's system buffer
-    // is made small, so the answers wait in the origin as they would for players past a slow link.)
+    // are closed and the last 512 kept, and those are then sent their whole answers. (Each connection's system buffers
+    // are made small, the client's before it connects, so the answers wait in the origin as they would for players
+    // past a slow link: macOS and Windows otherwise take a whole 96 KB answer into the system, and a connection whose
+    // answer the system took is finished and closed by the origin, so nothing is kept to count.)
     void liveOriginKeeps512() {
 #ifndef _WIN32
         // (1,200 sockets in this process: the client's and the origin's of each)
@@ -36639,7 +36646,9 @@ colorspaces:
         }
 #endif
         QTemporaryDir dir;
-        const int size = 96 << 10;
+        // (under the 256 KB an answer is held whole in the origin, and past what the systems take: Windows takes one of
+        // the origin's 64 KB pieces whole, whatever the connection's buffer)
+        const int size = 192 << 10;
         {
             QFile f(dir.filePath("seg_3.m4s"));
             QVERIFY(f.open(QIODevice::WriteOnly));
@@ -36657,9 +36666,12 @@ colorspaces:
         for (int i = 0; i < kClients; ++i) {
             auto s = std::make_unique<QTcpSocket>();
             s->setReadBufferSize(1);  // (a byte of the answer taken, to know it was sent, and nothing more)
+            // (bound first, so its system buffer is small from the start: the window it offers is settled as it
+            // connects, and macOS and Windows do not shrink it afterwards)
+            QVERIFY2(s->bind(QHostAddress::LocalHost, 0), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
+            s->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 4096);
             s->connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
             QVERIFY2(s->waitForConnected(5000), qPrintable(QString("client %1: %2").arg(i).arg(s->errorString())));
-            s->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 4096);
             s->write("GET /seg_3.m4s HTTP/1.1\r\nHost: x\r\n\r\n");
             QVERIFY(s->waitForBytesWritten(5000) || s->bytesToWrite() == 0);
             QVERIFY2(s->waitForReadyRead(5000), qPrintable(QString("client %1 was not answered").arg(i)));
@@ -36672,9 +36684,17 @@ colorspaces:
         QElapsedTimer t;
         t.start();
         while (t.elapsed() < 3000 && (origin.connectionsKept() != kKept || origin.connectionsLetGo() != kClients - kKept)) QTest::qWait(20);
-        QCOMPARE(origin.connectionsKept(), kKept);
-        QCOMPARE(origin.connectionsLetGo(), int64_t(kClients - kKept));
-        QVERIFY2(origin.bytesWaiting() >= int64_t(kKept) * 4096, qPrintable(QString::number(origin.bytesWaiting())));
+        // (said whole when it fails: what the origin keeps and let go, what it holds, and how many clients the origin
+        // closed, as where the systems took the answers whole it keeps none)
+        const auto said = [&] {
+            int closed = 0;
+            for (const auto& s : clients) closed += s->state() != QAbstractSocket::ConnectedState;
+            return QString("%1 kept, %2 let go, %3 bytes waiting in the origin, %4 of the clients closed")
+                .arg(origin.connectionsKept()).arg(origin.connectionsLetGo()).arg(origin.bytesWaiting()).arg(closed);
+        };
+        QVERIFY2(origin.connectionsKept() == kKept, qPrintable(said()));
+        QVERIFY2(origin.connectionsLetGo() == int64_t(kClients - kKept), qPrintable(said()));
+        QVERIFY2(origin.bytesWaiting() >= int64_t(kKept) * 4096, qPrintable(said()));
         // Every client now reads: the first 88 were let go, the last 512 are sent their whole answers.
         for (int i = 0; i < kClients; ++i) {
             QTcpSocket* s = clients[size_t(i)].get();
