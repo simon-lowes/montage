@@ -12744,6 +12744,90 @@ private slots:
         QVERIFY(std::fabs(held.at(20) - 150) < 1e-6);
     }
 
+    // Nightly 27 Nov: FCPXML's split edits and long caption files. A clip whose sound runs on past its picture (an L
+    // cut, audioDuration) and one whose sound starts before it (a J cut, audioStart) import with their sound where it
+    // is heard; written out and read back, the sound stays there, and a trim of the sound is kept rather than the
+    // file's split values written back. Twenty thousand captions, given out of order, are read in order and trimmed
+    // to the next one's start, in a few seconds at most.
+    void fcpxmlSplitEditsAndManyCaptions() {
+        auto t = [](int frames) { return QStringLiteral("%1/25s").arg(frames); };
+        QString captions;
+        const int count = 20000;
+        for (int i = count - 1; i >= 0; --i)
+            captions += QStringLiteral("<caption lane=\"1\" offset=\"%1\" duration=\"%2\" role=\"iTT?captionFormat=ITT.en\"><text>Line %3</text></caption>\n")
+                            .arg(t(i * 4), t(6))
+                            .arg(i);
+        const QString xml =
+            QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<fcpxml version=\"1.11\"><resources>"
+                           "<format id=\"r1\" name=\"FFVideoFormat1080p25\" frameDuration=\"1/25s\" width=\"1920\" height=\"1080\"/>"
+                           "<asset id=\"r2\" name=\"talk\" start=\"0s\" duration=\"120s\" hasVideo=\"1\" hasAudio=\"1\" format=\"r1\" audioSources=\"1\" "
+                           "audioChannels=\"2\" audioRate=\"48000\"><media-rep kind=\"original-media\" src=\"file:///nonexistent/talk.mov\"/></asset>"
+                           "</resources><library><event name=\"Tests\"><project name=\"Split\">"
+                           "<sequence format=\"r1\" duration=\"%1\" tcStart=\"0s\" tcFormat=\"NDF\" audioLayout=\"stereo\" audioRate=\"48k\"><spine>"
+                           "<asset-clip ref=\"r2\" offset=\"0s\" name=\"Leaves\" start=\"0s\" duration=\"10s\" audioDuration=\"12s\"/>"
+                           "<gap name=\"Gap\" offset=\"10s\" start=\"0s\" duration=\"5s\"/>"
+                           "<asset-clip ref=\"r2\" offset=\"15s\" name=\"Arrives\" start=\"20s\" duration=\"10s\" audioStart=\"18s\" audioDuration=\"12s\"/>"
+                           "<gap name=\"Gap\" offset=\"25s\" start=\"0s\" duration=\"%2\">%3</gap>"
+                           "</spine></sequence></project></event></library></fcpxml>")
+                .arg(t(625 + count * 4 + 25), t(count * 4 + 25), captions);
+        Project p = makeDefaultProject();
+        QElapsedTimer took;
+        took.start();
+        ImportResult r = importXmlTimeline(p, xml.toStdString());
+        const qint64 ms = took.elapsed();
+        QVERIFY2(r.ok, r.error.c_str());
+        Sequence* s = p.findSequence(r.sequence);
+        QVERIFY(s);
+        QVERIFY2(ms < 10000, qPrintable(QStringLiteral("%1 ms to read the file").arg(ms)));
+        // The captions: all of them, in order, each ending where the next starts.
+        QCOMPARE(s->captionTracks.size(), size_t(1));
+        const std::vector<Caption>& caps = s->captionTracks[0].captions;
+        QCOMPARE(int(caps.size()), count);
+        for (int i = 0; i < count; ++i) {
+            QCOMPARE(caps[size_t(i)].start, FrameTime(625 + i * 4));
+            QCOMPARE(caps[size_t(i)].end, FrameTime(625 + i * 4 + (i + 1 < count ? 4 : 6)));
+        }
+        QCOMPARE(caps.front().text, std::string("Line 0"));
+        // The sound where it is heard: the L cut's for two seconds after its picture, the J cut's from two before.
+        auto clipNamed = [](const Track& track, const std::string& name) -> const Clip* {
+            for (const Clip& c : track.clips)
+                if (c.name == name) return &c;
+            return nullptr;
+        };
+        auto check = [&](const Sequence& seq, FrameTime leavesSound) {
+            const Clip* lv = clipNamed(seq.videoTracks.at(0), "Leaves");
+            const Clip* av = clipNamed(seq.videoTracks.at(0), "Arrives");
+            // (read back, the sound may be a clip connected below the storyline's: on any audio track)
+            const Clip *la = nullptr, *aa = nullptr;
+            for (const Track& track : seq.audioTracks) {
+                if (!la) la = clipNamed(track, "Leaves");
+                if (!aa) aa = clipNamed(track, "Arrives");
+            }
+            if (!lv || !av || !la || !aa) return QStringLiteral("a clip is missing");
+            if (lv->start != 0 || lv->duration != 250) return QStringLiteral("the L cut's picture at %1 for %2").arg(lv->start).arg(lv->duration);
+            if (la->start != 0 || la->duration != leavesSound || std::fabs(la->sourceIn) > 1e-6)
+                return QStringLiteral("the L cut's sound at %1 for %2").arg(la->start).arg(la->duration);
+            if (av->start != 375 || av->duration != 250 || std::fabs(av->sourceIn - 500) > 1e-6)
+                return QStringLiteral("the J cut's picture at %1 for %2").arg(av->start).arg(av->duration);
+            if (aa->start != 325 || aa->duration != 300 || std::fabs(aa->sourceIn - 450) > 1e-6)
+                return QStringLiteral("the J cut's sound at %1 for %2 from %3").arg(aa->start).arg(aa->duration).arg(aa->sourceIn);
+            return QString();
+        };
+        QString why = check(*s, 300);
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // The L cut's sound trimmed by a second, then written out and read back: the trim kept, and no split values
+        // written back.
+        for (Clip& c : s->audioTracks.at(0).clips)
+            if (c.name == "Leaves") c.duration = 275;
+        const std::string out = exportFcpXml(p, *s);
+        QVERIFY(out.find("audioStart") == std::string::npos && out.find("audioDuration") == std::string::npos);
+        Project back = makeDefaultProject();
+        ImportResult again = importXmlTimeline(back, out);
+        QVERIFY2(again.ok, again.error.c_str());
+        why = check(*back.findSequence(again.sequence), 275);
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+    }
+
     void fcpxml115CarriedThrough() {
         // A 1.15 file with natural motion blur, a semantic mask and the flags attribute reads with motion blur on, and
         // writes back the mask and the flags equal in canonical XML; the report names the filter Montage did not use, by
