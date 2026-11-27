@@ -25836,7 +25836,9 @@ print("added " + ui["name"])
             return state()->edit("HDR", [space](Project& p, Sequence& s) {
                 s.colorSpace = space;
                 s.hdrPeakNits = 1000;
-                Clip c = makeGeneratorClip(p, "color", 10);
+                // Long enough to be still playing when the wait below ends: ten frames last under half a second, and
+                // a machine under load renders only the newest frame asked for, so it saw one or two before the end.
+                Clip c = makeGeneratorClip(p, "color", 1200);
                 for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 1.0;
                 return edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
             });
@@ -25866,7 +25868,9 @@ print("added " + ui["name"])
         hdrSpy.clear();
         program->seek(0);
         program->play();
-        QTRY_VERIFY(hdrSpy.size() >= 3);
+        QTRY_VERIFY2(hdrSpy.size() >= 3, qPrintable(QString("%1 HDR frames, at frame %2, %3").arg(hdrSpy.size()).arg(program->position())
+                                                         .arg(program->isPlaying() ? "playing" : "stopped")));
+        QVERIFY(program->isPlaying());
         program->pause();
         for (const QList<QVariant>& args : hdrSpy) QVERIFY(args.at(0).value<HdrPicturePtr>() != nullptr);
         // An SDR sequence has none (the viewer shows its SDR picture).
