@@ -44483,6 +44483,40 @@ private slots:
             return true;
         };
 
+        // Whether each exported triangle's corners are its own three (as the title alone has them), the last two
+        // swapped exactly where that keeps them running round their normals: where the title's own triangle runs
+        // against its corners' normals (a font whose outlines run the other way leaves some: CFF's, macOS's), or, seen
+        // mirrored, where it runs with them. Slivers with next to no area may go either way. Empty when so; `turned`
+        // counts the swapped.
+        auto turnedByNormals = [&](const SolvedSceneMesh& mesh, const Title3DMesh& alone, bool mirrored, int& turned) -> QString {
+            turned = 0;
+            if (mesh.indices.size() != alone.triangles.indices.size()) return QStringLiteral("triangles differ");
+            const std::vector<float>& ap = alone.triangles.positions;
+            const std::vector<float>& an = alone.triangles.normals;
+            for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+                const bool swapped = mesh.indices[t + 1] == uint32_t(t + 2);
+                if (mesh.indices[t] != uint32_t(t) || mesh.indices[t + 1] != uint32_t(swapped ? t + 2 : t + 1) ||
+                    mesh.indices[t + 2] != uint32_t(swapped ? t + 1 : t + 2))
+                    return QStringLiteral("triangle %1: %2 %3 %4").arg(t / 3).arg(mesh.indices[t]).arg(mesh.indices[t + 1]).arg(mesh.indices[t + 2]);
+                turned += swapped;
+                const std::array<double, 3> a = at(ap, alone.triangles.indices[t]), b = at(ap, alone.triangles.indices[t + 1]),
+                                            c = at(ap, alone.triangles.indices[t + 2]);
+                const double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+                const double g[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                const double area = std::hypot(g[0], g[1], g[2]);
+                if (area <= 1e-4 * std::hypot(e1[0], e1[1], e1[2]) * std::hypot(e2[0], e2[1], e2[2])) continue;
+                double d = 0;
+                for (size_t k = 0; k < 3; ++k) {
+                    const std::array<double, 3> N = at(an, alone.triangles.indices[t + k]);
+                    d += g[0] * N[0] + g[1] * N[1] + g[2] * N[2];
+                }
+                if (std::abs(d) <= 1e-6 * area) continue;
+                if (swapped != (mirrored ? d > 0 : d < 0))
+                    return QStringLiteral("triangle %1 %2 against normals that turn it %3").arg(t / 3).arg(swapped ? "swapped" : "kept").arg(d);
+            }
+            return {};
+        };
+
         // ---- Through a solved camera with the title's own lens: every corner where its own camera shows it, at every
         // frame of the moving camera, the title's place its transform's time samples alone.
         const CameraSolve solve = solveWith(lens);
@@ -44494,9 +44528,14 @@ private slots:
         QCOMPARE(m.name, std::string("Hello"));
         QCOMPARE(m.motion.size(), size_t(10));
         QVERIFY(m.pointSamples.empty() && m.normalSamples.empty());
+        {
+            int turned = 0;
+            const QString wrong = turnedByNormals(m, own, false, turned);
+            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+            qInfo("a 3D title in a solved scene: %d of its %d triangles turned to run round their normals", turned, int(m.indices.size() / 3));
+        }
         double worst = 0, lo = 1e300, hi = 0;
         for (size_t i = 0; i < m.indices.size(); ++i) {
-            QCOMPARE(m.indices[i], uint32_t(i));
             // (in proportion: distances to the first corner)
             const std::array<double, 3> a = ownAt(0), b = ownAt(i), A = sceneAt(m, 0, 0), B = sceneAt(m, 0, i);
             const double d0 = std::hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]), d1 = std::hypot(B[0] - A[0], B[1] - A[1], B[2] - A[2]);
@@ -44543,6 +44582,10 @@ private slots:
             QVERIFY(placed(solve, other, om));
             const auto [toward, away] = facesToward(om, alone, solvedCameraAt(solve, 0), 0);
             QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1: %2 toward, %3 away").arg(cff).arg(toward).arg(away)));
+            int turned = 0;
+            const QString wrong = turnedByNormals(om, alone, false, turned);
+            QVERIFY2(wrong.isEmpty(), qPrintable(QString("%1: %2").arg(cff, wrong)));
+            qInfo("%s: %d of its %d triangles turned to run round their normals", cff, turned, int(om.indices.size() / 3));
             s.videoTracks[1].clips = {title};
             break;
         }
@@ -44627,7 +44670,10 @@ private slots:
             QVERIFY(offAtEveryFrame(half, mm, mirrored, faces, sides));
             qInfo("mirrored: its faces' corners %.2g px off, its sides' %.2g", faces, sides);
             QVERIFY(faces < 1e-3 && sides < 1e-3);
-            QCOMPARE(mm.indices[1], uint32_t(2));
+            int turned = 0;
+            const QString wrong = turnedByNormals(mm, alone, true, turned);
+            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+            QVERIFY2(turned > int(mm.indices.size() / 6), qPrintable(QString::number(turned)));
             const auto [toward, away] = facesToward(mm, alone, solvedCameraAt(half, 0), 0);
             QVERIFY2(toward > 10 && away == 0, qPrintable(QString("%1 toward, %2 away").arg(toward).arg(away)));
             // (its normals follow: each front face's normal toward the camera too)
