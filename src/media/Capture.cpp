@@ -1871,10 +1871,15 @@ void Recorder::run() {
                 av_frame_free(&pic);
                 return false;
             }
+            // (counted as recorded at once: when the last slots before a set length came empty, no picture after them
+            // is written to count them)
             std::lock_guard lock(s->m);
             ++s->st.repeated;
+            s->st.frames = nextFrame;
+            s->st.seconds = double(nextFrame) / av_q2d(fps);
         }
-        nextFrame = std::max(nextFrame, at);
+        // (no further than a set length: its sound ends there too)
+        nextFrame = std::max(nextFrame, frameLimit > 0 ? std::min(at, frameLimit) : at);
         if (frameLimit > 0 && nextFrame >= frameLimit) {
             av_frame_free(&pic);
             timedOut = true;

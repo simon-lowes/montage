@@ -3124,6 +3124,78 @@ private slots:
 #endif
     }
 
+    // The 27 November macOS run: a recording of a set length whose last slots come empty (the feed's pictures lost,
+    // or its sender behind) is filled with the last picture repeated, and the status counts those pictures too. Before,
+    // it counted a picture only when one that came was written, so the repeats that ended the recording went uncounted.
+    // Its sound ends with the pictures, at the set length, not at the slot of the picture that came after the gap.
+    void captureCountsPicturesRepeatedAtTheEnd() {
+        namespace st = st2110;
+        int ports[2];
+        {
+            st::Receiver probe[2];
+            for (int i = 0; i < 2; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        // (the video packets of ten pictures in a row lost, from when 44 have been recorded)
+        std::atomic<bool> losing{false};
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]};
+        o.ttl = 1;
+        o.drop = [&losing](int stream, int, uint64_t) { return stream == 0 && losing.load(); };
+        const int W = 320, H = 180, spf = 1920;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        st::Raster grey(W, H, st::Sampling::Ycc422, 10);
+        for (int y = 0; y < H; ++y) {
+            uint16_t* d = grey.row(y);
+            for (int x = 0; x < W; ++x) d[2 * x] = 512, d[2 * x + 1] = 500;
+        }
+        std::string url;
+        for (const auto& [name, text] : {std::pair{"video", tx.sdpVideo()}, {"audio", tx.sdpAudio()}}) {
+            const std::string file = path(QStringLiteral("st2110-repeated-%1.sdp").arg(QLatin1String(name)).toStdString().c_str());
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(text.c_str());
+            url += (url.empty() ? "" : ";") + file;
+        }
+        CaptureSettings cs;
+        cs.video.device = "st2110";
+        cs.video.url = url;
+        cs.path = path("capture-st2110-repeated.mov");
+        cs.seconds = 2;
+        Recorder rec;
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            int lostFrom = -1;
+            for (int t = 0; !stop && t < 25 * 30; ++t) {
+                if (lostFrom < 0 && rec.status().frames >= 44) lostFrom = t;
+                losing = lostFrom >= 0 && t < lostFrom + 10;
+                std::vector<float> sound(size_t(spf) * 2, 0.0f);
+                if (!tx.send(grey, sound.data(), spf, nullptr, {}, &stop)) break;
+            }
+        });
+        auto stopSending = qScopeGuard([&] {
+            stop = true;
+            sending.join();
+            tx.close();
+        });
+        QVERIFY2(rec.start(cs, &err), err.c_str());
+        QVERIFY(rec.wait(20));
+        const CaptureStatus status = rec.status();
+        QVERIFY2(status.error.empty(), status.error.c_str());
+        QVERIFY2(status.repeated >= 3, std::to_string(status.repeated).c_str());
+        QCOMPARE(status.frames, int64_t(50));
+        QVERIFY(std::fabs(status.seconds - 2.0) < 1e-9);
+        MediaItem m;
+        QVERIFY(probeMedia(cs.path, m, &err));
+        QVERIFY2(std::fabs(m.duration - 2.0) < 0.05, std::to_string(m.duration).c_str());
+    }
+
     // ST 2110-22 (JPEG XS, a packet of each slice its own) recorded with its -41 fast metadata stream: the items each
     // frame came with kept beside the recording at the frame it became, the picture there the one they were sent with.
     // (Uncompressed -20 video when built without SVT-JPEG-XS.)
