@@ -48243,7 +48243,7 @@ private slots:
         st.path = path("beside/plate.%04d.exr");
         QCOMPARE(exportSignedPath(st), st.path);
         QVERIFY(exportCarriesCredentials(st));
-        // A copy's manifest: transcoded from its parent, the parent's assertions naming people redacted.
+        // A copy's manifest: its parent opened and transcoded, the parent's assertions naming people redacted.
         const std::string store = R"({"active_manifest":"urn:c2pa:cam","manifests":{"urn:c2pa:cam":{"assertions":[
             {"label":"c2pa.actions.v2"},{"label":"stds.schema-org.CreativeWork"},{"label":"cawg.identity"}]}}})";
         const std::vector<std::string> people = personAssertions(store);

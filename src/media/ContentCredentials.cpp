@@ -157,14 +157,19 @@ std::string credentialManifestJson(const std::string& path, const Provenance& pr
     const QJsonObject montage{{"name", "Montage"}, {"version", MONTAGE_VERSION}};
     // Made by Montage from other media (some of it made by AI, when it is), or a signed file opened in Montage; then each
     // model's part.
+    // (a manifest's actions begin with c2pa.created or c2pa.opened, which c2pa-rs's validation requires: a copy opens its
+    // parent, then says what was done to it)
     QJsonArray actions;
-    if (!parent.empty() && !options.parent.empty())
-        actions.append(QJsonObject{{"action", QString::fromStdString(options.parentAction)},
+    if (!parent.empty() && !options.parent.empty()) {
+        actions.append(QJsonObject{{"action", "c2pa.opened"},
                                    {"softwareAgent", montage},
                                    {"parameters", QJsonObject{{"ingredientIds", QJsonArray{QString::fromStdString(parent)}}}},
+                                   {"description", "A signed file opened in Montage to make a copy of it"}});
+        actions.append(QJsonObject{{"action", QString::fromStdString(options.parentAction)},
+                                   {"softwareAgent", montage},
                                    {"description", QString::fromStdString(options.parentDescription.empty() ? std::string("Made in Montage from a signed file")
                                                                                                             : options.parentDescription)}});
-    else if (!parent.empty())
+    } else if (!parent.empty())
         actions.append(QJsonObject{{"action", "c2pa.opened"},
                                    {"softwareAgent", montage},
                                    {"parameters", QJsonObject{{"ingredientIds", QJsonArray{QString::fromStdString(parent)}}}},
@@ -432,8 +437,10 @@ void summarize(C2paReader* reader, CredentialSummary& out) {
                 if (it.key() == store.value("active_manifest").toString()) out.actions.push_back(text(action.value("action")));
             }
         }
-    // A copy of a signed file: its parent carries credentials, and was not this file itself signed again.
-    if (out.actions.empty() || out.actions.front() != "c2pa.opened")
+    // A copy of a signed file: its parent carries credentials, and was not this file itself signed again (which opens
+    // its parent and changes nothing of it; a copy opens it and transcodes it).
+    if (out.actions.empty() || out.actions.front() != "c2pa.opened" ||
+        std::find(out.actions.begin(), out.actions.end(), "c2pa.transcoded") != out.actions.end())
         for (const QJsonValue& v : active.value("ingredients").toArray()) {
             const QJsonObject ing = v.toObject();
             if (ing.value("relationship").toString() == "parentOf" && ing.contains("active_manifest")) out.through = text(ing.value("title"));
