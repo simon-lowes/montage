@@ -20188,6 +20188,35 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY2(again.exitCode() == 0 && second.contains("0 encoded, 0 failed"), second.constData());
     }
 
+    void aafHandoverFromTheCommandLine() {
+        // montage-cli aaf: a track's volume automation written as the track's own lane, or with --bake-automation
+        // played into its clip's gain, leaving no track lane.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 50, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false).ok);
+        s.audioTracks[0].volumeAuto.addKey(0, 0.0);
+        s.audioTracks[0].volumeAuto.addKey(40, -10.0);
+        const QString project = dir_.path() + "/cli-aaf.montage";
+        QVERIFY(saveProject(p, project.toStdString()));
+        auto run = [&](const QString& out, bool bake) {
+            QStringList args{QStringLiteral("aaf"), project, QStringLiteral("-o"), out, QStringLiteral("--no-picture")};
+            if (bake) args << QStringLiteral("--bake-automation");
+            QProcess cli;
+            cli.start(QStringLiteral(MONTAGE_CLI), args);
+            if (!cli.waitForFinished(120000) || cli.exitCode() != 0) return QByteArray("failed: ") + cli.readAllStandardError();
+            return cli.readAllStandardOutput();
+        };
+        const QByteArray lanes = run(dir_.path() + "/cli-lanes.aaf", false);
+        QVERIFY2(lanes.contains("Wrote") && lanes.contains("1 track volume or pan lanes"), lanes.constData());
+        const QByteArray baked = run(dir_.path() + "/cli-baked.aaf", true);
+        QVERIFY2(baked.contains("Wrote") && !baked.contains("track volume or pan lanes"), baked.constData());
+        QVERIFY(QFileInfo::exists(dir_.path() + "/cli-baked.aaf"));
+    }
+
     void keyframeCopyPaste() {
         // Red's opacity fade and a blur's radius, copied and pasted onto Blue at the playhead.
         loadDemo();
