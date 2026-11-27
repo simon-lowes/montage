@@ -55,6 +55,7 @@ class RedactFacesDialog;
 class LearnEffectDialog;
 
 class EditorState;
+struct GrainProfile;
 class CompareDialog;
 class MergeDialog;
 class CleanFeedWindow;
@@ -361,6 +362,12 @@ public:
     bool rebuildLutAsGrade(const QString& residualPath, Id lutEffect = 0);
     // Measures the grain of the clip under the playhead and saves it as a Grain Match preset; the preset's file.
     QString measureGrainAsPreset();
+    // Measure Grain's profile kept by name instead (Save Grain Profile…): in the project, one undo step, and with
+    // `where` 1 the user's library too, as montage_grain's save_as keeps it. No name or `where` -1: asked for.
+    bool saveGrainProfile(QString name = {}, int where = -1);
+    // Playback › Grain as Decoded: the Program monitor shows the sequence cleaned of its grain with it put back from AV1
+    // grain parameters (`filmGrain`: "measure", or a profile's text), as a decoder puts it back; off when an edit is made.
+    bool showGrainAsDecoded(bool on, const std::string& filmGrain = "measure");
     // Avid Log Exchange (core/Ale.h): an ALE's log fields and CDLs onto the matching media (and, with `cdlToClips`,
     // the CDLs onto their clips), as one undo step, returning how many media items matched (-1 if it cannot be read);
     // the selected media (else all) as an ALE.
@@ -549,6 +556,8 @@ protected:
     void childEvent(QChildEvent* e) override;
 
 private:
+    // The grain of the clip a command acts on, measured (false, said, if there is none or it was cancelled).
+    bool measureCommandClipGrain(GrainProfile& profile, std::string& clipName);
     enum class Monitor { Source, Program };
 
     void buildPanels();

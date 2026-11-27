@@ -6069,6 +6069,172 @@ private slots:
         state()->newProject();
     }
 
+    // A new project holding a grainy plate at 320x180: a flat colour with fresh grain on every frame, kept by ProRes
+    // 422 HQ at `shot`, placed at the start of the sequence.
+    bool placeGrainyPlate(const QString& shot) {
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+        Clip c = makeGeneratorClip(gen, "color", 20);
+        c.generator.params["color.r"] = Param(0.45);
+        c.generator.params["color.g"] = Param(0.5);
+        c.generator.params["color.b"] = Param(0.4);
+        Effect grain = makeEffect(gen, "film_grain");
+        grain.params["amount"] = Param(0.3);
+        grain.params["color"] = Param(1.0);
+        c.effects.push_back(grain);
+        if (!edit::overwrite(gen, gs, {TrackKind::Video, 0}, c).ok) return false;
+        ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
+        st.path = shot.toStdString();
+        st.audioCodec = "none";
+        std::string err;
+        if (!exportSequence(gen, gs, st, nullptr, nullptr, &err)) return qWarning("%s", err.c_str()), false;
+        state()->newProject();
+        const auto ids = state()->importFiles({shot});
+        if (ids.size() != 1) return false;
+        return state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        });
+    }
+
+    void saveGrainProfileFromTheMenu() {
+        // Save Grain Profile… keeps the measured grain by name in the project (one undo step) and the user's library,
+        // the same profile montage_grain's save_as keeps, and an export carrying it by either name is the same file.
+        const QByteArray library = (dir_.path() + "/saved-grain-library.json").toUtf8();
+        qputenv("MONTAGE_GRAIN_LIBRARY", library);
+        auto putBack = qScopeGuard([] { qunsetenv("MONTAGE_GRAIN_LIBRARY"); });
+        QVERIFY(win_->findChild<QAction*>("saveGrainProfile"));
+        QVERIFY(placeGrainyPlate(dir_.path() + "/grainy-profile-plate.mov"));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->setSelection({clip});
+        state()->setPlayhead(5);
+        // A name that is a setting's own word is refused, and nothing kept.
+        QVERIFY(!win_->saveGrainProfile("measure", 1));
+        QVERIFY(state()->project().grainProfiles.empty());
+        // Kept in the project and the library, undone in one step (the library keeps its copy).
+        QVERIFY2(win_->saveGrainProfile("From the menu", 1), qPrintable(win_->statusBar()->currentMessage()));
+        QCOMPARE(state()->project().grainProfiles.size(), size_t(1));
+        const std::string fromMenu = state()->project().grainProfiles.at("From the menu");
+        QCOMPARE(userGrainProfiles().at("From the menu"), fromMenu);
+        state()->undo();
+        QVERIFY(state()->project().grainProfiles.empty());
+        state()->redo();
+        QCOMPARE(state()->project().grainProfiles.at("From the menu"), fromMenu);
+        // In the project only: the library is left alone.
+        QVERIFY(win_->saveGrainProfile("Project only", 0));
+        QVERIFY(state()->project().grainProfiles.count("Project only") && !userGrainProfiles().count("Project only"));
+
+        // Over MCP, the same clip measured and saved: the same profile.
+        const QString file = dir_.filePath("grain-profile.montage");
+        QVERIFY(state()->save(file));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_grain"},
+                                                     {"arguments", QJsonObject{{"project", file}, {"action", "measure"}, {"clip", double(clip)},
+                                                                               {"save_as", "Over MCP"}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project overMcp;
+        QVERIFY(loadProject(file.toStdString(), overMcp));
+        QCOMPARE(overMcp.grainProfiles.at("Over MCP"), fromMenu);
+        QCOMPARE(userGrainProfiles().at("Over MCP"), fromMenu);
+
+        // An AV1 export carrying the grain by either name: the same file.
+        if (avcodec_find_encoder_by_name("libsvtav1")) {
+            const ExportPreset* av1 = nullptr;
+            for (const ExportPreset& pr : exportPresets())
+                if (!av1 && pr.settings.videoCodec == "libsvtav1") av1 = &pr;
+            QVERIFY(av1);
+            QByteArray made[2];
+            for (int k = 0; k < 2; ++k) {
+                const Project& p = k == 0 ? state()->project() : overMcp;
+                ExportSettings st = av1->settings;
+                st.path = dir_.filePath(QString("grain-profile-%1.mp4").arg(k)).toStdString();
+                st.audioCodec = "none";
+                st.in = 0, st.out = 6;
+                st.filmGrain = k == 0 ? "From the menu" : "Over MCP";
+                std::string err;
+                QVERIFY2(resolveFilmGrainSetting(p, st.filmGrain, &err), err.c_str());
+                QCOMPARE(st.filmGrain, fromMenu);
+                QVERIFY2(exportSequence(p, *p.findSequence(p.activeSequence), st, nullptr, nullptr, &err), err.c_str());
+                QFile f(QString::fromStdString(st.path));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                made[k] = f.readAll();
+                f.close();
+                QFile::remove(QString::fromStdString(st.path));
+            }
+            QVERIFY(!made[0].isEmpty());
+            QVERIFY(made[0] == made[1]);
+        }
+        QFile::remove(QString::fromUtf8(library));
+        state()->newProject();
+    }
+
+    void grainAsDecodedOnTheProgramMonitor() {
+        // Playback › Grain as Decoded: the Program monitor shows the plate cleaned of its grain with its AV1 grain
+        // parameters put back as a decoder does (render/Av1GrainExport.h's GrainAsDecoded, which test_render checks
+        // against dav1d), a new grain every frame; an edit turns it off.
+        QVERIFY(win_->findChild<QAction*>("grainAsDecoded"));
+        const QString shot = dir_.path() + "/grainy-decoded-plate.mov";
+        QVERIFY(placeGrainyPlate(shot));
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        auto* controller = win_->findChild<PlaybackController*>();
+        state()->setSelection({});
+        state()->setPlayhead(5);
+        QTRY_VERIFY(!program->viewer()->image().isNull());
+        const QImage plain = program->viewer()->image();
+        // What it should show: the cleaned frame with frame 5's grain on it.
+        GrainAsDecoded want;
+        std::string err;
+        {
+            const WorkingSpaceScope scope(&sequenceColorSpace(*state()->sequence()));
+            QVERIFY2(want.prepare(state()->project(), *state()->sequence(), "measure", nullptr, &err), err.c_str());
+        }
+        QCOMPARE(want.shots().size(), size_t(1));
+        QVERIFY(want.at(5).apply && want.at(6).apply && want.at(5).seed != want.at(6).seed);
+        RenderOptions o;
+        o.offlineProxies = true;
+        o.captions = true;
+        Image img = renderProgramFrame(want.cleanProject(), want.cleanSequence(), 5, o);
+        const Image clean = img;
+        want.apply(5, img);
+        QImage expect(img.width, img.height, QImage::Format_RGBA8888);
+        toRgba8(img, expect.bits(), size_t(expect.bytesPerLine()));
+        QImage cleanView(clean.width, clean.height, QImage::Format_RGBA8888);
+        toRgba8(clean, cleanView.bits(), size_t(cleanView.bytesPerLine()));
+        auto apart = [](const QImage& a, const QImage& b) {
+            if (a.size() != b.size()) return 1e9;
+            const QImage x = a.convertToFormat(QImage::Format_RGBA8888), y = b.convertToFormat(QImage::Format_RGBA8888);
+            double sum = 0;
+            for (int r = 0; r < x.height(); ++r)
+                for (int c = 0; c < x.width() * 4; ++c) sum += std::abs(int(x.constScanLine(r)[c]) - int(y.constScanLine(r)[c]));
+            return sum / (double(x.width()) * x.height() * 3);
+        };
+        QVERIFY(win_->showGrainAsDecoded(true));
+        QVERIFY(controller->grainAsDecoded());
+        QVERIFY(win_->findChild<QAction*>("grainAsDecoded")->isChecked());
+        QTRY_VERIFY_WITH_TIMEOUT(apart(program->viewer()->image(), expect) < 0.01, 20000);
+        // The grain is there: the picture is not the cleaned one, nor the plate's own.
+        const double fromClean = apart(expect, cleanView), fromPlain = apart(expect, plain);
+        qInfo("grain as decoded: %.2f codes from the cleaned picture, %.2f from the plate's own", fromClean, fromPlain);
+        QVERIFY2(fromClean > 0.5, QByteArray::number(fromClean));
+        QVERIFY2(fromPlain > 0.5, QByteArray::number(fromPlain));
+        // An edit turns it off, and the monitor shows the sequence again.
+        QVERIFY(state()->edit("Move", [&](Project&, Sequence& s) {
+            s.videoTracks[0].clips[0].name = "Renamed";
+            return true;
+        }));
+        QVERIFY(!controller->grainAsDecoded());
+        QVERIFY(!win_->findChild<QAction*>("grainAsDecoded")->isChecked());
+        QTRY_VERIFY_WITH_TIMEOUT(apart(program->viewer()->image(), plain) < 0.01, 20000);
+        state()->newProject();
+    }
+
     void clipMarkersFromTheMenu() {
         loadDemo();
         auto* add = win_->findChild<QAction*>("addClipMarker");

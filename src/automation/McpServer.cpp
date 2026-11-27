@@ -13867,7 +13867,7 @@ void McpServer::Impl::addTools() {
             "color_space":{"type":"string","description":"Deliver in this display space (rec709, srgb, rec2100pq, rec2100hlg...) instead of the sequence's; an HDR sequence delivered in SDR is tone mapped"},
             "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"An HDR sequence delivered in SDR: \"\" Montage's roll-off, or ITU-R BT.2446 Method A or C (a sequence graded scene-referred goes through its output transform instead)"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
-            "film_grain":{"type":"string","description":"AV1 exports: carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned, or the name it was saved under (the project's, else the user's library's): that grain for every shot; \"off\" (the default): none"},
+            "film_grain":{"type":"string","description":"AV1 exports, and streaming packages whose rungs are all AV1 (each rung's parameters fitted again at its size): carry grain as parameters. \"measure\": each shot's grain measured (as montage_grain measures it), taken out of the picture before it is encoded and written as AV1 film grain parameters, a set for each shot with a new seed every frame, which the decoder puts back; a profile montage_grain's measure returned, or the name it was saved under (the project's, else the user's library's): that grain for every shot; \"off\" (the default): none"},
             "regions":{"type":"array","description":"Regions coded finer (H.264, HEVC and VP9): parts of the picture given more of the bits, each frame's passed to the encoder as regions of interest. Each is {kind: \"box\" (x, y, w, h: fractions of the frame, from its top left), \"mask\" (the masks of clip `clip`, or of every clip with masks; `effect` for one effect's mask, as tracked) or \"faces\" (each face found), strength: 0 to 1, default 0.5 (at 1, a fifth of the encoder's quantiser range finer)}; where they overlap the stronger wins. VP9 with regions codes in its real-time mode, as libvpx takes them only there. In a streaming package, boxes and masks go to its H.264 and HEVC rungs, each at its own size",
                 "items":{"type":"object","properties":{"kind":{"type":"string","enum":["box","mask","faces"]},"strength":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"w":{"type":"number"},"h":{"type":"number"},"clip":{"type":"integer"},"effect":{"type":"integer"}}}},
             "region_report":{"type":"boolean","default":false,"description":"With regions: the export made again without them and both measured against a lossless render: luma PSNR inside and outside the regions, VMAF of the whole picture, and both sizes"},
@@ -14311,6 +14311,10 @@ void McpServer::Impl::addTools() {
                 ss.audioBitrate = so.value("audio_bitrate").toInteger(128000);
                 if (ss.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
                 ss.startDate = str(so, "start_date").toStdString();
+                // (grain carried as parameters on AV1 rungs; boxes and masks coded finer on H.264 and HEVC rungs)
+                ss.filmGrain = st.filmGrain;
+                ss.regions = st.regions;
+                if (regionReport) throw ArgError{"\"region_report\" is for a file, not a streaming package"};
                 const std::string codec = str(so, "codec", "libx264").toStdString();
                 for (const QJsonValue& v : so.value("ladder").toArray()) {
                     const QJsonObject r = v.toObject();
@@ -14352,6 +14356,18 @@ void McpServer::Impl::addTools() {
                     }
                     o["per_shot"] = rungs;
                     o["ladder_report"] = QString::fromStdString(res.ladderReport);
+                }
+                if (!res.grain.empty()) {
+                    // (each rung's grain: the frames given it and the bytes its parameters added)
+                    QJsonArray rungs;
+                    for (const StreamingResult::RungGrain& g : res.grain) {
+                        rungs.append(QJsonObject{{"rendition", QString::fromStdString(g.rendition)}, {"frames_with_grain", double(g.framesWithGrain)},
+                                                 {"bytes_added", double(g.bytesAdded)}});
+                        text += QStringLiteral("\n%1: grain carried as parameters on %2 frames (%3 bytes)")
+                                    .arg(QString::fromStdString(g.rendition)).arg(g.framesWithGrain).arg(g.bytesAdded);
+                    }
+                    o["grain"] = rungs;
+                    for (const std::string& n : res.grainNotes) text += QStringLiteral("\n") + QString::fromStdString(n);
                 }
                 for (const std::string& w : res.warnings) text += QStringLiteral("\n") + QString::fromStdString(w);
                 return ok(text, o);

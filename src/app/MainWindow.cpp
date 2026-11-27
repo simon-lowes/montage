@@ -134,6 +134,7 @@ extern "C" {
 #include "render/LutExport.h"
 #include "render/Crosstalk.h"
 #include "render/GrainMatch.h"
+#include "render/Av1GrainExport.h"
 #include "render/LutToGrade.h"
 #include "media/LtcTimecode.h"
 #include "media/TextReader.h"
@@ -1800,6 +1801,7 @@ void MainWindow::buildMenus() {
         rebuildLutAsGrade(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("lutToGrade"));
     add(clipM, QT_TR_NOOP("Measure &Grain"), QKeySequence(), [this] { measureGrainAsPreset(); })->setObjectName(QStringLiteral("measureGrain"));
+    add(clipM, QT_TR_NOOP("Save Grain Profile…"), QKeySequence(), [this] { saveGrainProfile(); })->setObjectName(QStringLiteral("saveGrainProfile"));
     add(clipM, QT_TR_NOOP("Import CDL…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import CDL"), QString(), tr("ASC CDL (*.cdl *.cc *.ccc);;All files (*)"));
         if (!path.isEmpty()) importCdl(path);
@@ -2836,6 +2838,22 @@ void MainWindow::buildMenus() {
                                      5000);
         });
         play->addSeparator();
+    }
+    {
+        // Grain as Decoded: what an AV1 export carrying the grain as parameters shows once decoded (turned off by an
+        // edit, as it shows the sequence as it was).
+        QAction* grain = add(play, QT_TR_NOOP("Grain as Decoded"), QKeySequence(), [this](bool on) { showGrainAsDecoded(on); });
+        grain->setObjectName(QStringLiteral("grainAsDecoded"));
+        grain->setCheckable(true);
+        grain->setToolTip(tr("The Program monitor shows each shot cleaned of its grain with the grain put back from AV1 film grain "
+                             "parameters, as a player's decoder puts it back (paused frames at full resolution)"));
+        for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched})
+            connect(state_, sig, this, [this] {
+                if (program_->grainAsDecoded()) {
+                    showGrainAsDecoded(false);
+                    state_->message(tr("Grain as Decoded is off: the sequence changed"), 5000);
+                }
+            });
     }
     trimView_ = add(play, QT_TR_NOOP("Two-Up Trim View"), QKeySequence(), [](bool on) { appSettings().setValue("playback/twoUpTrim", on); });
     trimView_->setObjectName(QStringLiteral("twoUpTrim"));
@@ -6447,25 +6465,119 @@ bool MainWindow::rebuildLutAsGrade(const QString& residualPath, Id lutEffect) {
     return true;
 }
 
-QString MainWindow::measureGrainAsPreset() {
+bool MainWindow::measureCommandClipGrain(GrainProfile& profile, std::string& clipName) {
     const Clip* c = clipForCommand();
     const Sequence* seq = state_->sequence();
     if (!c || !seq || c->isGenerator()) {
         state_->message(tr("Select a clip of footage under the playhead to measure its grain"), 5000);
-        return {};
+        return false;
     }
     const Project project = state_->project();
     const Sequence copy = *seq;
     const Clip clip = *c;
+    clipName = clip.name;
+    return runWithProgress(this, state_, tr("Measuring the grain of %1…").arg(QString::fromStdString(clip.name)),
+                           [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
+                               const WorkingSpaceScope scope(&sequenceColorSpace(copy));
+                               return measureClipGrain(project, copy, clip, {}, profile, error, progress, cancel);
+                           });
+}
+
+bool MainWindow::saveGrainProfile(QString name, int where) {
+    if (!clipForCommand() || clipForCommand()->isGenerator()) {
+        state_->message(tr("Select a clip of footage under the playhead to measure its grain"), 5000);
+        return false;
+    }
+    if (name.isEmpty() || where < 0) {
+        // Asked for: the name, and where it is kept.
+        QDialog dlg(this);
+        dlg.setWindowTitle(tr("Save Grain Profile"));
+        auto* form = new QFormLayout(&dlg);
+        auto* nameEdit = new QLineEdit(tr("Grain of %1").arg(QString::fromStdString(clipForCommand()->name)), &dlg);
+        nameEdit->setObjectName(QStringLiteral("grainProfileName"));
+        auto* whereBox = new QComboBox(&dlg);
+        whereBox->setObjectName(QStringLiteral("grainProfileWhere"));
+        whereBox->addItem(tr("This project"), 0);
+        whereBox->addItem(tr("This project and my library"), 1);
+        whereBox->setCurrentIndex(1);
+        form->addRow(tr("Name:"), nameEdit);
+        form->addRow(tr("Keep in:"), whereBox);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dlg);
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        form->addRow(buttons);
+        if (dlg.exec() != QDialog::Accepted) return false;
+        name = nameEdit->text().trimmed();
+        where = whereBox->currentData().toInt();
+    }
+    const std::string key = name.toStdString();
+    if (std::string why; !checkGrainProfileName(key, &why)) {
+        state_->message(QString::fromStdString(why), 5000);
+        return false;
+    }
     GrainProfile profile;
-    if (!runWithProgress(this, state_, tr("Measuring the grain of %1…").arg(QString::fromStdString(clip.name)),
-                         [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
-                             const WorkingSpaceScope scope(&sequenceColorSpace(copy));
-                             return measureClipGrain(project, copy, clip, {}, profile, error, progress, cancel);
-                         }))
-        return {};
+    std::string clipName;
+    if (!measureCommandClipGrain(profile, clipName)) return false;
+    // Kept as montage_grain's save_as keeps it: in the library too when asked, and in the project (one undo step).
+    if (where == 1)
+        if (std::string why; !saveUserGrainProfile(key, profile, &why)) {
+            state_->message(tr("Could not save the profile: %1").arg(QString::fromStdString(why)));
+            return false;
+        }
+    const std::string text = grainProfileText(profile);
+    if (!state_->apply(tr("Save Grain Profile"), [&](Project& p, Sequence&) {
+            p.grainProfiles[key] = text;
+            return edit::Result{};
+        }))
+        return false;
+    state_->message(where == 1 ? tr("Saved the grain of %1 as the profile %2, in this project and your library")
+                                     .arg(QString::fromStdString(clipName), name)
+                               : tr("Saved the grain of %1 as the profile %2 in this project").arg(QString::fromStdString(clipName), name),
+                    10000);
+    return true;
+}
+
+bool MainWindow::showGrainAsDecoded(bool on, const std::string& filmGrain) {
+    QAction* action = findChild<QAction*>(QStringLiteral("grainAsDecoded"));
+    auto checked = [&](bool v) {
+        if (!action) return;
+        const QSignalBlocker quiet(action);
+        action->setChecked(v);
+    };
+    if (!on) {
+        program_->setGrainAsDecoded(nullptr);
+        checked(false);
+        return true;
+    }
+    const Sequence* seq = state_->sequence();
+    if (!seq || seq->duration() <= 0) {
+        checked(false);
+        state_->message(tr("Grain as Decoded needs a sequence with something in it"), 5000);
+        return false;
+    }
+    const Project project = state_->project();
+    const Sequence copy = *seq;
+    auto grain = std::make_shared<GrainAsDecoded>();
+    if (!runWithProgress(this, state_, tr("Measuring each shot's grain…"), [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
+            const WorkingSpaceScope scope(&sequenceColorSpace(copy));
+            return grain->prepare(project, copy, filmGrain, cancel, error, progress);
+        })) {
+        checked(false);
+        return false;
+    }
+    const auto withGrain = std::count_if(grain->shots().begin(), grain->shots().end(), [](const Av1GrainShot& sh) { return sh.grain.apply; });
+    program_->setGrainAsDecoded(grain);
+    checked(true);
+    state_->message(tr("Grain as Decoded: %1 of %2 shots carry grain as parameters").arg(withGrain).arg(grain->shots().size()), 8000);
+    return true;
+}
+
+QString MainWindow::measureGrainAsPreset() {
+    GrainProfile profile;
+    std::string clipName;
+    if (!measureCommandClipGrain(profile, clipName)) return {};
     EffectPreset preset;
-    preset.name = tr("Grain of %1").arg(QString::fromStdString(clip.name)).toStdString();
+    preset.name = tr("Grain of %1").arg(QString::fromStdString(clipName)).toStdString();
     preset.video = true;
     Effect e = makeEffect("grain_match", 0);
     e.strings["profile"] = grainProfileText(profile);
@@ -6479,7 +6591,7 @@ QString MainWindow::measureGrainAsPreset() {
     }
     effects_->reload();
     state_->message(tr("Measured the grain of %1 (about %2 px, colours alike by %3): saved as the preset %4 in the Effects panel's Presets")
-                        .arg(QString::fromStdString(clip.name), QString::number(grainSize(profile), 'f', 1),
+                        .arg(QString::fromStdString(clipName), QString::number(grainSize(profile), 'f', 1),
                              QString::number((profile.correlation[0] + profile.correlation[1] + profile.correlation[2]) / 3, 'f', 2),
                              QString::fromStdString(preset.name)),
                     10000);

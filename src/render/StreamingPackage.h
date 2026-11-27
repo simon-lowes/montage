@@ -14,7 +14,9 @@
 #include <vector>
 
 #include "core/Model.h"
+#include "render/Av1FilmGrain.h"
 #include "render/Exporter.h"
+#include "render/GrainMatch.h"
 
 namespace montage {
 
@@ -68,6 +70,16 @@ struct StreamingSettings {
     // A shot's frames are kept in memory while it is tried, up to this many bytes: a longer shot is taken in parts,
     // each from a segment's start. 0: 1 GiB.
     int64_t shotMemory = 0;
+    // Carry Grain as Parameters (render/Av1GrainExport.h), for a ladder of AV1 rungs: "measure" (each shot's grain
+    // measured) or a grain profile's text (a saved profile's name made its text first, resolveFilmGrainSetting); "" or
+    // "off": none. The render is made once with each shot's grain taken out, every rung is encoded from it, and each
+    // rung's frame headers carry the shots' grain fitted again for the rung's size, with a new seed every frame. Set per
+    // shot, the trials and what is delivered are scored against the cleaned render (the picture a decoder shows with its
+    // grain left off), and a shot's cap allows for the parameters' bits.
+    std::string filmGrain;
+    // Regions coded finer (render/CodingRegions.h) in the H.264 and HEVC rungs, each at its own size: boxes and clips'
+    // masks (faces are found in an export's own render, not here). AV1 rungs take none.
+    std::vector<CodingRegion> regions;
 };
 
 // One quality setting tried on a shot: the encoder's CRF, the bits it took and the VMAF it scored (its frames' mean).
@@ -101,6 +113,8 @@ struct StreamingShot {
     double vmaf = 0, ownVmaf = 0, trialVmaf = 0;
     std::string stopped;
     int trials = 0;
+    int64_t grainBits = 0;  // of `bits`, what grain parameters added to its frame headers
+    int capEncodes = 0;     // encodes of it made again, coarser, because one came out past its cap
 };
 struct StreamingRungShots {
     std::string rendition;
@@ -125,6 +139,16 @@ struct StreamingResult {
     double crfFloor = 0;
     int renderDecodes = 0;
     int64_t shotEncodes = 0;
+    // With grain carried as parameters: each shot's grain (as measured or given, and why none where there is none), and
+    // for each rung the parameters each shot was given at its size, the frames given grain and the bytes they added.
+    struct RungGrain {
+        std::string rendition;
+        std::vector<Av1FilmGrain> shots;  // (each shot's, its seed its first frame's)
+        int64_t framesWithGrain = 0, bytesAdded = 0;
+    };
+    std::vector<GrainProfile> grainProfiles;
+    std::vector<std::string> grainNotes;
+    std::vector<RungGrain> grain;
     std::vector<std::string> warnings;
 };
 

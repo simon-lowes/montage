@@ -25,10 +25,13 @@
 #include "render/StreamingPackage.h"
 #include "core/Preferences.h"
 
+#include "render/ExportScaler.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 }
 
 namespace montage {
@@ -170,6 +173,31 @@ std::vector<Av1GrainShot> av1GrainShots(const Project& p, const Sequence& seq, F
         if (cancel && cancel->load()) break;
     }
     return shots;
+}
+
+void grainCleanedSequence(const Project& p, const Sequence& seq, FrameTime in, const std::vector<Av1GrainShot>& shots, Project& clean,
+                          Sequence& cleanSeq) {
+    clean = p;
+    cleanSeq = seq;
+    std::map<Id, std::string> profileOf;  // (each clip's, as text)
+    const bool given = shots.empty() ? false : shots.front().source == "given";
+    for (const Av1GrainShot& sh : shots) {
+        if (sh.source.empty()) continue;
+        if (const Clip* c = mediaClipAt(p, seq, in + (sh.first + sh.end) / 2)) profileOf[c->id] = grainProfileText(sh.profile);
+    }
+    for (Track& t : cleanSeq.videoTracks)
+        for (Clip& c : t.clips) {
+            if (c.isGenerator() || !c.enabled) continue;
+            auto it = profileOf.find(c.id);
+            if (it == profileOf.end() && !given) continue;
+            const std::string text = it != profileOf.end() ? it->second : grainProfileText(shots.front().profile);
+            Effect e = makeEffect(clean, "grain_match");
+            e.params["source"] = 0.0;  // (the measured profile)
+            e.params["mode"] = 1.0;    // (Replace Grain: the plate's own taken out)
+            e.params["amount"] = 0.0;  // (and none put back: the decoder does that)
+            e.strings["profile"] = text;
+            c.effects.push_back(e);
+        }
 }
 
 void fitAv1GrainShots(std::vector<Av1GrainShot>& shots, const ColorSpace& working, const ColorSpace& delivery, const Av1GrainTarget& target) {
@@ -358,29 +386,9 @@ bool exportCarryingGrain(const Project& p, const Sequence& seq, const ExportSett
     // Each shot's grain, then the sequence with it taken out (Replace Grain on each clip measured, putting none back).
     std::vector<Av1GrainShot> shots = av1GrainShots(p, seq, in, out, s.filmGrain, cancel, [&](double f) { report01(0.1 * f); });
     if (cancel && cancel->load()) return fail("Export cancelled");
-    Project clean = p;
-    Sequence cleanSeq = seq;
-    {
-        std::map<Id, std::string> profileOf;  // (each clip's, as text)
-        const bool given = shots.empty() ? false : shots.front().source == "given";
-        for (const Av1GrainShot& sh : shots) {
-            if (sh.source.empty()) continue;
-            if (const Clip* c = mediaClipAt(p, seq, in + (sh.first + sh.end) / 2)) profileOf[c->id] = grainProfileText(sh.profile);
-        }
-        for (Track& t : cleanSeq.videoTracks)
-            for (Clip& c : t.clips) {
-                if (c.isGenerator() || !c.enabled) continue;
-                auto it = profileOf.find(c.id);
-                if (it == profileOf.end() && !given) continue;
-                const std::string text = it != profileOf.end() ? it->second : grainProfileText(shots.front().profile);
-                Effect e = makeEffect(clean, "grain_match");
-                e.params["source"] = 0.0;  // (the measured profile)
-                e.params["mode"] = 1.0;    // (Replace Grain: the plate's own taken out)
-                e.params["amount"] = 0.0;  // (and none put back: the decoder does that)
-                e.strings["profile"] = text;
-                c.effects.push_back(e);
-            }
-    }
+    Project clean;
+    Sequence cleanSeq;
+    grainCleanedSequence(p, seq, in, shots, clean, cleanSeq);
     // (unsigned and unchecked: the file is signed and checked once its parameters are in it)
     ExportSettings plain = s;
     plain.filmGrain.clear();
@@ -455,6 +463,105 @@ bool exportCarryingGrain(const Project& p, const Sequence& seq, const ExportSett
         report->shots = std::move(shots);
     }
     return true;
+}
+
+bool GrainAsDecoded::prepare(const Project& p, const Sequence& seq, const std::string& filmGrain, const std::atomic<bool>* cancel,
+                             std::string* error, const std::function<void(double)>& progress) {
+    shots_.clear();
+    if (filmGrain.empty() || filmGrain == "off") {
+        if (error) *error = "No grain to carry";
+        return false;
+    }
+    if (std::string why; !checkFilmGrainSetting(filmGrain, &why)) {
+        if (error) *error = why;
+        return false;
+    }
+    const FrameTime len = seq.duration();
+    if (len <= 0 || seq.width <= 0 || seq.height <= 0) {
+        if (error) *error = "The sequence is empty";
+        return false;
+    }
+    shots_ = av1GrainShots(p, seq, 0, len, filmGrain, cancel, progress);
+    if (cancel && cancel->load()) {
+        if (error) *error = "Cancelled";
+        return false;
+    }
+    grainCleanedSequence(p, seq, 0, shots_, clean_, cleanSeq_);
+    // (as an AV1 export of the sequence codes it: 8-bit 4:2:0, limited range, at its size, in its space)
+    const ColorSpace& delivery = sequenceColorSpace(seq);
+    width_ = seq.width, height_ = seq.height;
+    bt2020_ = delivery.primaries == Primaries::Bt2020;
+    Av1GrainTarget target;
+    target.width = width_;
+    if (bt2020_) target.kr = 0.2627, target.kb = 0.0593;
+    fitAv1GrainShots(shots_, workingColorSpace(seq), delivery, target);
+    return true;
+}
+
+Av1FilmGrain GrainAsDecoded::at(FrameTime f) const {
+    Av1FilmGrain g;
+    auto it = std::upper_bound(shots_.begin(), shots_.end(), f, [](FrameTime t, const Av1GrainShot& sh) { return t < sh.end; });
+    if (f < 0 || it == shots_.end() || f < it->first || !it->grain.apply) return g;
+    g = it->grain;
+    g.seed = av1GrainSeed(f);
+    return g;
+}
+
+void GrainAsDecoded::apply(FrameTime f, Av1GrainPicture& pic) const {
+    const Av1FilmGrain g = at(f);
+    if (g.apply) av1ApplyFilmGrain(g, pic);
+}
+
+void GrainAsDecoded::apply(FrameTime f, Image& img) const {
+    const Av1FilmGrain g = at(f);
+    if (!g.apply || img.width != width_ || img.height != height_ || img.width < 2 || img.height < 2) return;
+    const int w = img.width, h = img.height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+    const AVColorSpace cs = bt2020_ ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
+    // To Y'CbCr as the export makes it.
+    std::vector<uint16_t> rgba;
+    toRgba16(img, rgba);
+    SwsContext* to = exportPictureScaler(nullptr, w, h, w, h, AV_PIX_FMT_YUV420P, AVCHROMA_LOC_LEFT, cs, AVCOL_RANGE_MPEG);
+    if (!to) return;
+    std::vector<uint8_t> y(size_t(w) * size_t(h)), u(size_t(cw) * size_t(ch)), v(size_t(cw) * size_t(ch));
+    {
+        const uint8_t* src[4] = {reinterpret_cast<const uint8_t*>(rgba.data()), nullptr, nullptr, nullptr};
+        const int srcStride[4] = {w * 8, 0, 0, 0};
+        uint8_t* dst[4] = {y.data(), u.data(), v.data(), nullptr};
+        const int dstStride[4] = {w, cw, cw, 0};
+        sws_scale(to, src, srcStride, 0, h, dst, dstStride);
+    }
+    sws_freeContext(to);
+    // The grain put back, on 16-bit words as the synthesis takes them.
+    std::vector<uint16_t> py(y.begin(), y.end()), pu(u.begin(), u.end()), pv(v.begin(), v.end());
+    Av1GrainPicture pic;
+    pic.plane[0] = py.data(), pic.plane[1] = pu.data(), pic.plane[2] = pv.data();
+    pic.stride[0] = w, pic.stride[1] = cw, pic.stride[2] = cw;
+    pic.width = w, pic.height = h;
+    pic.bitDepth = 8;
+    av1ApplyFilmGrain(g, pic);
+    for (size_t i = 0; i < y.size(); ++i) y[i] = uint8_t(std::min<int>(255, py[i]));
+    for (size_t i = 0; i < u.size(); ++i) u[i] = uint8_t(std::min<int>(255, pu[i])), v[i] = uint8_t(std::min<int>(255, pv[i]));
+    // And back to RGB, the alpha kept.
+    SwsContext* back = sws_getContext(w, h, AV_PIX_FMT_YUV420P, w, h, AV_PIX_FMT_RGBA64LE, SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT,
+                                      nullptr, nullptr, nullptr);
+    if (!back) return;
+    const int* coef = sws_getCoefficients(bt2020_ ? SWS_CS_BT2020 : SWS_CS_ITU709);
+    sws_setColorspaceDetails(back, coef, 0, coef, 1, 0, 1 << 16, 1 << 16);
+    std::vector<uint16_t> out(size_t(w) * size_t(h) * 4);
+    {
+        const uint8_t* src[4] = {y.data(), u.data(), v.data(), nullptr};
+        const int srcStride[4] = {w, cw, cw, 0};
+        uint8_t* dst[4] = {reinterpret_cast<uint8_t*>(out.data()), nullptr, nullptr, nullptr};
+        const int dstStride[4] = {w * 8, 0, 0, 0};
+        sws_scale(back, src, srcStride, 0, h, dst, dstStride);
+    }
+    sws_freeContext(back);
+    for (int yy = 0; yy < h; ++yy) {
+        float* row = img.row(yy);
+        const uint16_t* o = out.data() + size_t(yy) * size_t(w) * 4;
+        for (int x = 0; x < w; ++x)
+            for (int c = 0; c < 3; ++c) row[4 * x + c] = float(o[4 * x + c]) * (1.0f / 65535.0f) * std::clamp(row[4 * x + 3], 0.0f, 1.0f);  // (premultiplied again)
+    }
 }
 
 }  // namespace montage

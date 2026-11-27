@@ -24,6 +24,8 @@
 #include "core/EditOps.h"
 #include "media/Analysis.h"
 #include "render/Ac3.h"
+#include "render/Av1GrainExport.h"
+#include "render/Av1Headers.h"
 #include "render/ColorSpace.h"
 #include "render/EncodeCompare.h"
 #include "render/Scte35.h"
@@ -165,6 +167,34 @@ int64_t mdatPayload(const uint8_t* d, size_t n) {
 
 // Bits a second at the peak, as HLS defines it (the busiest run of whole segments lasting half to one and a half times
 // the target duration, so a short segment at a split cannot inflate it), from each segment's bytes and seconds.
+// The level an H.264 or HEVC encoder's headers (Annex B, as x264 and x265 give them) state: H.264's level_idc from its
+// SPS, HEVC's general_level_idc from its VPS. 0 if there is none.
+int headerLevel(const std::vector<uint8_t>& h, bool hevc) {
+    for (size_t i = 0; i + 3 < h.size(); ++i) {
+        if (!(h[i] == 0 && h[i + 1] == 0 && h[i + 2] == 1)) continue;
+        const size_t at = i + 3;
+        const int type = hevc ? (h[at] >> 1) & 0x3f : h[at] & 0x1f;
+        if (type != (hevc ? 32 : 7)) continue;
+        // (its bytes without emulation prevention, as far as the level)
+        std::vector<uint8_t> rbsp;
+        int zeros = 0;
+        for (size_t j = at; j < h.size() && rbsp.size() < 32; ++j) {
+            if (zeros >= 2 && h[j] == 3) {
+                zeros = 0;
+                continue;
+            }
+            if (zeros >= 2 && h[j] <= 2) break;  // (the next start code)
+            zeros = h[j] == 0 ? zeros + 1 : 0;
+            rbsp.push_back(h[j]);
+        }
+        // (H.264: the NAL header, profile_idc, the constraint flags, level_idc; HEVC: the NAL header's two bytes, four
+        // of the VPS's own, then profile_tier_level's eleven before general_level_idc)
+        const size_t pos = hevc ? 17 : 3;
+        return pos < rbsp.size() ? rbsp[pos] : 0;
+    }
+    return 0;
+}
+
 int64_t peakRate(const std::vector<std::pair<double, double>>& segs) {
     double longest = 0;
     for (const auto& s : segs) longest = std::max(longest, s.second);
@@ -594,11 +624,18 @@ struct VideoOut {
     // rendition's parameters for its decoders, what it delivers scored on every frame, each shot as delivered, and,
     // filling the rung's rate, each shot's trial points until every shot has them.
     std::vector<uint8_t> header;
+    int level = 0;  // (set per shot: the level the rendition's headers state, H.264's and HEVC's, which every shot's encoder keeps)
     std::unique_ptr<AVCodecParameters, void (*)(AVCodecParameters*)> par{nullptr, [](AVCodecParameters* q) { avcodec_parameters_free(&q); }};
     std::unique_ptr<VmafMeter> meter;
     std::unique_ptr<VmafMeter> ownMeter;  // (the same at the rung's own size, where that is not the display's)
     std::vector<StreamingShot> shots;
     std::vector<std::vector<ShotTrialPoint>> points;
+    // With grain carried as parameters: the shots' grain at this rung's size, what writes it into the frame headers,
+    // the frames written so far, and the most a frame's parameters take written in full (bits).
+    std::vector<Av1GrainShot> grainShots;
+    std::unique_ptr<Av1GrainWriter> grainWriter;
+    int64_t grainShown = 0;
+    int64_t grainFrameBits = 0;
     ~VideoOut() {
         avcodec_free_context(&enc);
         sws_freeContext(sws);
@@ -914,6 +951,22 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
     }
     // (with TS segments and no DASH, the CMAF fragments are only measured)
     const bool cmafFiles = !ts || s.dash;
+    // Grain carried as parameters: AV1's alone, so every rung is AV1 (the render they share is cleaned of it).
+    const bool grain = !s.filmGrain.empty() && s.filmGrain != "off";
+    if (grain) {
+        std::string why;
+        if (!checkFilmGrainSetting(s.filmGrain, &why)) return fail(why);
+        if (std::any_of(rungs.begin(), rungs.end(), [](const StreamingRung& r) { return r.codec != "libsvtav1"; }))
+            return fail("Grain is carried as parameters in AV1 alone: every rung of the ladder must then be AV1");
+    }
+    if (!s.regions.empty()) {
+        std::string why;
+        if (!checkCodingRegions(s.regions, &why)) return fail(why);
+        if (std::any_of(s.regions.begin(), s.regions.end(), [](const CodingRegion& r) { return r.kind == "faces"; }))
+            res.warnings.push_back("Faces are coded finer in an export, not yet in a streaming package's rungs");
+        if (std::none_of(rungs.begin(), rungs.end(), [](const StreamingRung& r) { return encoderTakesRegions(r.codec); }))
+            res.warnings.push_back("No rung's encoder takes regions coded finer (H.264 and HEVC do)");
+    }
     if (hdr && std::any_of(rungs.begin(), rungs.end(), [](const StreamingRung& r) { return r.codec == "libx264"; }))
         res.warnings.push_back("HDR in H.264 (10-bit) plays on few devices and browsers: HEVC or AV1 rungs play far more widely");
 
@@ -986,9 +1039,24 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
     const bool sound = !s.audioCodec.empty() && s.audioCodec != "none";
     // (set per shot, the trial encodes take far longer than the render)
     const double renderShare = (sound ? 0.45 : 0.5) * (s.perShot ? 0.3 : 1), soundShare = sound ? 0.05 : 0.0;
+    // With grain carried as parameters: each shot's grain measured (or given), and the render made with it taken out.
+    std::vector<Av1GrainShot> grainShots;
+    Project cleanProject;
+    Sequence cleanSeq;
+    if (grain) {
+        grainShots = av1GrainShots(p, seq, in, out, s.filmGrain, cancel, [&](double f) { report(0.1 * f * renderShare); });
+        if (cancelled()) return fail("Cancelled");
+        grainCleanedSequence(p, seq, in, grainShots, cleanProject, cleanSeq);
+        for (const Av1GrainShot& sh : grainShots) {
+            res.grainProfiles.push_back(sh.profile);
+            res.grainNotes.push_back(sh.note);
+        }
+    }
     {
         std::string why;
-        if (!exportSequence(p, seq, m, [&](double f, FrameTime) { report(f * renderShare); }, cancel, &why)) return fail(why.empty() ? "Cancelled" : why);
+        const double from = grain ? 0.1 * renderShare : 0, share = grain ? 0.9 * renderShare : renderShare;
+        if (!exportSequence(grain ? cleanProject : p, grain ? cleanSeq : seq, m, [&](double f, FrameTime) { report(from + f * share); }, cancel, &why))
+            return fail(why.empty() ? "Cancelled" : why);
     }
     if (cancelled()) return fail("Cancelled");
 
@@ -1142,7 +1210,9 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
     // A rung's encoder, at the rung's bit rate, or (`crf` at or above 0, set per shot) at that constant quality. SVT-AV1
     // will not start a keyframe on request in bit-rate mode, so an AV1 rung is given a new encoder for each segment
     // instead (the same settings, so the same sequence header).
-    auto openEncoder = [&](VideoOut& v, double crf, std::string* why) -> bool {
+    // Set per shot, `spanBits` and `spanFrames` are what the encoder may spend over the frames it codes (a shot's, or
+    // for AV1 a segment's of it): its buffer model is set so it cannot spend more.
+    auto openEncoder = [&](VideoOut& v, double crf, std::string* why, int64_t spanBits = 0, FrameTime spanFrames = 0) -> bool {
         const StreamingRung& r = v.rung;
         const AVCodec* codec = avcodec_find_encoder_by_name(r.codec.c_str());
         avcodec_free_context(&v.enc);
@@ -1164,6 +1234,26 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             // (x264's and x265's VBV, SVT-AV1's maximum rate).
             e->bit_rate = 0;
             e->rc_max_rate = r.bitrate * 3 / 2;
+            if (spanBits > 0 && spanFrames > 0) {
+                // The span's cap given to the encoder itself: a buffer of a sixth of the cap (at most half a second at
+                // the rung's rate), half full at the start, so what the span spends is at most half the buffer and its
+                // rate over the span; that rate set so the two make 95 % of the cap (x264's and x265's VBV, SVT-AV1's
+                // maximum rate).
+                const double seconds = double(spanFrames) * frameSeconds;
+                const int64_t buffer = std::max<int64_t>(8000, std::min<int64_t>(r.bitrate / 2, spanBits / 6));
+                const double rate = (0.95 * double(spanBits) - 0.5 * double(buffer)) / seconds;
+                e->rc_max_rate = std::clamp<int64_t>(int64_t(rate), 8000, r.bitrate * 3 / 2);
+                e->rc_buffer_size = int(std::min<int64_t>(INT32_MAX, buffer));
+                e->rc_initial_buffer_occupancy = int(buffer / 2);
+                if (r.codec == "libsvtav1") {
+                    // (SVT-AV1's capped CRF has no buffer's fullness: its rate over a window as long as the segment)
+                    e->rc_max_rate = std::clamp<int64_t>(int64_t(0.95 * double(spanBits) / seconds), 8000, r.bitrate * 3 / 2);
+                    e->rc_buffer_size = int(std::min<double>(INT32_MAX, double(e->rc_max_rate) * seconds));
+                    e->rc_initial_buffer_occupancy = 0;
+                }
+                // (x264 and x265 choose their level by the buffer model too: kept at the rendition's, so the headers stay its)
+                if (r.codec == "libx264" && v.level > 0) e->level = v.level;
+            }
             char buf[32];
             std::snprintf(buf, sizeof buf, r.codec == "libsvtav1" ? "%.0f" : "%.2f", crf);
             av_dict_set(&opts, "crf", buf, 0);
@@ -1172,7 +1262,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             // (SVT-AV1 4 refuses a peak rate outside its constant-quality mode, so an AV1 rung's peak is left to its VBR)
             if (r.codec != "libsvtav1") e->rc_max_rate = r.bitrate * 3 / 2;
         }
-        e->rc_buffer_size = int(std::min<int64_t>(INT32_MAX, r.bitrate * 2));
+        if (!(perShot && spanBits > 0 && spanFrames > 0)) e->rc_buffer_size = int(std::min<int64_t>(INT32_MAX, r.bitrate * 2));
         e->gop_size = int(longest * 2 + 1);  // (keyframes only where forced)
         e->keyint_min = 1;
         e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -1196,6 +1286,11 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             std::string params = "log-level=error:scenecut=0:open-gop=0";
             // (set per shot, each shot's encoder writes the same headers: without the SEI naming its options, CRF among them)
             if (perShot) params += ":info=0";
+            if (perShot && spanBits > 0 && v.level > 0) {
+                char lv[32];
+                std::snprintf(lv, sizeof lv, ":level-idc=%.1f", v.level / 30.0);
+                params += lv;
+            }
             if (pq) {
                 params += ":hdr10=1";  // (parameter sets in the sample entry only, as hvc1 says)
                 if (mastering && mastering->size >= sizeof(AVMasteringDisplayMetadata)) {
@@ -1229,6 +1324,25 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
     const bool renderChromaLeft = rp->chroma_location != AVCHROMA_LOC_CENTER;
     auto rungScaler = [&](int width, int height, AVPixelFormat format) -> SwsContext* {
         return bicubicScaler(rp->width, rp->height, rp->format, renderChromaLeft, width, height, format);
+    };
+
+    // Regions coded finer on a rung's picture at sequence frame `index` from the range's start (none where its encoder
+    // takes none).
+    auto attachRegions = [&](const VideoOut& v, AVFrame* f, FrameTime index) -> bool {
+        if (s.regions.empty()) return true;
+        av_frame_remove_side_data(f, AV_FRAME_DATA_REGIONS_OF_INTEREST);
+        if (!encoderTakesRegions(v.rung.codec)) return true;
+        const std::vector<CodedRegion> given = codedRegionsAt(p, seq, s.regions, in + index, v.width, v.height);
+        if (given.empty()) return true;
+        AVFrameSideData* sd = av_frame_new_side_data(f, AV_FRAME_DATA_REGIONS_OF_INTEREST, given.size() * sizeof(AVRegionOfInterest));
+        if (!sd) return fail("Out of memory");
+        auto* r = reinterpret_cast<AVRegionOfInterest*>(sd->data);
+        for (size_t i = 0; i < given.size(); ++i) {
+            r[i].self_size = sizeof(AVRegionOfInterest);
+            r[i].top = given[i].top, r[i].bottom = given[i].bottom, r[i].left = given[i].left, r[i].right = given[i].right;
+            r[i].qoffset = av_make_q(int(std::lround(given[i].qoffset * 10000)), 10000);
+        }
+        return true;
     };
 
     std::vector<std::unique_ptr<VideoOut>> video;
@@ -1266,7 +1380,44 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
 #endif
         v->track = std::make_unique<CmafTrack>();
         std::string why;
-        if (!v->track->open(dir, par.get(), e->time_base, &why, cmafFiles)) return fail(why);
+        // (with grain carried: the shots' grain fitted again at this rung's size, and the sample entry's sequence header
+        // marked as carrying it; the rendition's decoders, set per shot, take the encoder's own)
+        std::unique_ptr<AVCodecParameters, void (*)(AVCodecParameters*)> withGrain(nullptr, [](AVCodecParameters* q) { avcodec_parameters_free(&q); });
+        if (grain) {
+            Av1GrainTarget target;
+            const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(e->pix_fmt);
+            target.width = e->width;
+            target.bitDepth = d ? d->comp[0].depth : 8;
+            target.subX = d ? d->log2_chroma_w != 0 : true, target.subY = d ? d->log2_chroma_h != 0 : true;
+            target.fullRange = e->color_range == AVCOL_RANGE_JPEG;
+            if (e->colorspace == AVCOL_SPC_BT2020_NCL || e->colorspace == AVCOL_SPC_BT2020_CL) target.kr = 0.2627, target.kb = 0.0593;
+            v->grainShots = grainShots;
+            fitAv1GrainShots(v->grainShots, workingColorSpace(seq), space ? *space : sequenceColorSpace(seq), target);
+            Av1Sequence like;  // (4:2:0 colour: what the parameters' syntax depends on)
+            like.subX = target.subX, like.subY = target.subY;
+            StreamingResult::RungGrain rg;
+            rg.rendition = v->name;
+            for (const Av1GrainShot& sh : v->grainShots) {
+                std::vector<bool> bits;
+                av1WriteFilmGrain(sh.grain, like, false, true, -1, bits);
+                v->grainFrameBits = std::max<int64_t>(v->grainFrameBits, int64_t(bits.size()) + 8);
+                rg.shots.push_back(sh.grain);
+            }
+            res.grain.push_back(std::move(rg));
+            v->grainWriter = std::make_unique<Av1GrainWriter>();
+            withGrain.reset(avcodec_parameters_alloc());
+            if (!withGrain || avcodec_parameters_copy(withGrain.get(), par.get()) < 0) return fail("Out of memory");
+            std::vector<uint8_t> config(withGrain->extradata, withGrain->extradata + std::max(0, withGrain->extradata_size));
+            if (!v->grainWriter->configure(config, &why)) return fail("Cannot read the AV1's configuration: " + why);
+            if (!config.empty()) {
+                av_freep(&withGrain->extradata);
+                withGrain->extradata = static_cast<uint8_t*>(av_mallocz(config.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+                if (!withGrain->extradata) return fail("Out of memory");
+                std::copy(config.begin(), config.end(), withGrain->extradata);
+                withGrain->extradata_size = int(config.size());
+            }
+        }
+        if (!v->track->open(dir, withGrain ? withGrain.get() : par.get(), e->time_base, &why, cmafFiles)) return fail(why);
         if (ts) {
             v->ts = std::make_unique<TsTrack>();
             v->ts->dir = dir;
@@ -1276,6 +1427,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         v->range = range;
         if (s.perShot) {
             v->header.assign(e->extradata, e->extradata + e->extradata_size);
+            if (r.codec == "libx264" || r.codec == "libx265") v->level = headerLevel(v->header, r.codec == "libx265");
             v->par = std::move(par);
             avcodec_free_context(&v->enc);
             // (what it delivers, scored on every frame at the display size)
@@ -1304,6 +1456,30 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             return fail("The " + v.rung.codec + " encoder did not start on a keyframe");
         }
         std::string why;
+        if (v.grainWriter) {
+            // (each temporal unit shows one frame: its grain that of the shot the frame is in, its seed the frame's own)
+            auto grainAt = [&](int64_t frame) {
+                Av1FilmGrain g;
+                auto it = std::upper_bound(v.grainShots.begin(), v.grainShots.end(), FrameTime(frame),
+                                           [](FrameTime f, const Av1GrainShot& sh) { return f < sh.end; });
+                if (frame < 0 || it == v.grainShots.end() || !it->grain.apply) return g;
+                g = it->grain;
+                g.seed = av1GrainSeed(frame);
+                return g;
+            };
+            std::vector<uint8_t> rewritten;
+            if (!v.grainWriter->rewrite(pkt->data, size_t(pkt->size), v.grainShown, grainAt, rewritten, &why))
+                return fail("Cannot write the grain into " + v.name + "'s frame " + std::to_string(v.grainShown) + ": " + why);
+            ++v.grainShown;
+            std::unique_ptr<AVPacket, void (*)(AVPacket*)> np(av_packet_alloc(), [](AVPacket* q) { av_packet_free(&q); });
+            if (!np || av_new_packet(np.get(), int(rewritten.size())) < 0) return fail("Out of memory");
+            std::copy(rewritten.begin(), rewritten.end(), np->data);
+            av_packet_copy_props(np.get(), pkt);
+            np->duration = pkt->duration;
+            if (v.ts && !v.ts->write(np.get(), v.tb, &why)) return fail(why);
+            if (!v.track->write(np.get(), v.tb, &why)) return fail(why);
+            return true;
+        }
         if (v.ts && !v.ts->write(pkt, v.tb, &why)) return fail(why);
         if (!v.track->write(pkt, v.tb, &why)) return fail(why);
         return true;
@@ -1345,6 +1521,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                 v->frame->color_primaries = v->enc->color_primaries, v->frame->color_trc = v->enc->color_trc;
                 v->frame->colorspace = v->enc->colorspace, v->frame->color_range = v->enc->color_range;
                 v->frame->chroma_location = AVCHROMA_LOC_LEFT;
+                if (!attachRegions(*v, v->frame, index)) return false;
                 if (int rc = avcodec_send_frame(v->enc, v->frame); rc < 0) return fail("Encoding failed: " + averr(rc));
                 if (!take(*v)) return false;
             }
@@ -1398,14 +1575,17 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             }
             return out;
         };
+        // (with grain carried, less what its parameters may take at the most, a frame's written in full)
         auto capOf = [&](const VideoOut& v, size_t shot) {
-            return int64_t(std::floor(double(v.rung.bitrate) * double(shotEnd(shot) - shots[shot]) * frameSeconds));
+            return int64_t(std::floor(double(v.rung.bitrate) * double(shotEnd(shot) - shots[shot]) * frameSeconds)) -
+                   v.grainFrameBits * (shotEnd(shot) - shots[shot]);
         };
 
         // A shot's encoder at a CRF: its headers are the rendition's.
-        auto openShotEncoder = [&](VideoOut& t, const VideoOut& v, double crf) -> bool {
+        // (given the cap of the span it is to encode: `spanBits` over `spanFrames`)
+        auto openShotEncoder = [&](VideoOut& t, const VideoOut& v, double crf, int64_t spanBits, FrameTime spanFrames) -> bool {
             std::string why;
-            if (!openEncoder(t, crf, &why)) return fail(why);
+            if (!openEncoder(t, crf, &why, spanBits, spanFrames)) return fail(why);
             if (v.header != std::vector<uint8_t>(t.enc->extradata, t.enc->extradata + t.enc->extradata_size))
                 return fail("The " + v.rung.codec + " encoder changed its headers between shots");
             return true;
@@ -1429,13 +1609,22 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             };
             std::vector<std::unique_ptr<Try>> tries;
             std::string why;
+            // The cap of the span an encoder is opened for: the whole shot for x264 and x265, a segment's share of it
+            // for AV1 (an encoder of its own at each segment's start).
+            const int64_t shotCap = capOf(v, shot);
+            auto spanFrom = [&](FrameTime f) -> FrameTime {
+                if (!isAv1(v)) return n - f;
+                const auto next = std::upper_bound(segs.begin(), segs.end(), first + f);
+                return std::min<FrameTime>(n, next != segs.end() ? *next - first : n) - f;
+            };
+            auto spanCap = [&](FrameTime f) { return int64_t(double(shotCap) * double(spanFrom(f)) / double(std::max<FrameTime>(1, n))); };
             for (const double crf : crfs) {
                 auto t = std::make_unique<Try>();
-                t->enc.rung = v.rung, t->enc.width = v.width, t->enc.height = v.height;
+                t->enc.rung = v.rung, t->enc.width = v.width, t->enc.height = v.height, t->enc.level = v.level;
                 t->enc.pkt = av_packet_alloc();
                 t->trial.crf = crf;
                 if (!t->enc.pkt) return fail("Out of memory");
-                if (!openShotEncoder(t->enc, v, crf)) return false;
+                if (!openShotEncoder(t->enc, v, crf, spanCap(0), spanFrom(0))) return false;
                 if (score && (!t->dec.open(v.par.get(), displayW, displayH, &why) ||
                               !t->meter.open(vmafModel, std::max(1, cores / int(crfs.size())), &why, trialEvery)))
                     return fail(why);
@@ -1465,7 +1654,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                 if (start && f > 0 && isAv1(v))
                     for (auto& t : tries) {
                         avcodec_send_frame(t->enc.enc, nullptr);
-                        if (!drain(*t) || !openShotEncoder(t->enc, v, t->trial.crf)) return false;
+                        if (!drain(*t) || !openShotEncoder(t->enc, v, t->trial.crf, spanCap(f), spanFrom(f))) return false;
                     }
                 const AVFrame* src = fr.src[size_t(f)];
                 if (av_frame_make_writable(v.frame) < 0) return fail("Out of memory");
@@ -1476,6 +1665,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                 v.frame->color_primaries = e->color_primaries, v.frame->color_trc = e->color_trc;
                 v.frame->colorspace = e->colorspace, v.frame->color_range = e->color_range;
                 v.frame->chroma_location = AVCHROMA_LOC_LEFT;
+                if (!attachRegions(v, v.frame, index)) return false;
                 for (auto& t : tries) {
                     if (int rc = avcodec_send_frame(t->enc.enc, v.frame); rc < 0) return fail("Encoding failed: " + averr(rc));
                     if (!drain(*t)) return false;
@@ -1525,14 +1715,17 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                 if (!back.feed(q, each, &why)) return fail(why);
             if (!back.feed(nullptr, each, &why)) return fail(why);
             if (back.decoded != n) return fail(v.name + " came back with " + std::to_string(back.decoded) + " frames of a shot of " + std::to_string(n));
+            const int64_t grainBefore = v.grainWriter ? v.grainWriter->bytesAdded : 0;
             for (AVPacket* q : t.packets)
                 if (!intoSegments(v, q)) return false;
             StreamingShot sh;
             sh.first = first, sh.end = first + n;
             sh.crf = t.crf;
             sh.trialVmaf = trialVmaf;
-            sh.bitrate = int64_t(std::floor(double(t.bits) / (double(n) * frameSeconds)));
-            sh.bits = t.bits;
+            // (with the bits grain parameters added to its frames' headers)
+            sh.grainBits = v.grainWriter ? 8 * (v.grainWriter->bytesAdded - grainBefore) : 0;
+            sh.bits = t.bits + sh.grainBits;
+            sh.bitrate = int64_t(std::floor(double(sh.bits) / (double(n) * frameSeconds)));
             sh.stopped = stopped;
             sh.trials = trials;
             v.shots.push_back(std::move(sh));
@@ -1592,12 +1785,15 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         // Why a shot's setting is short of what was asked: "floor" at the lowest CRF allowed, "cap" where the next
         // better setting tried is past the shot's cap (or even the coarsest is), "" where neither held it back.
         auto stoppedAt = [&](const VideoOut& v, const std::vector<ShotTrialPoint>& pts, const ShotTrialPoint& got, int64_t cap) -> std::string {
+            // (the encoder holding a shot to its cap, a setting it held comes out near the cap, not past it: within 30 %)
+            auto held = [&](const ShotTrialPoint& q) { return q.bits > cap || double(q.bits) >= 0.7 * double(cap); };
             if (got.bits > cap) return "cap";
             if (s.vmafTarget > 0 && got.vmaf >= s.vmafTarget) return "";
+            if (held(got)) return "cap";
             const ShotTrialPoint* better = nullptr;
             for (const ShotTrialPoint& q : pts)
                 if (q.crf < got.crf - 0.1 && (!better || q.crf > better->crf)) better = &q;
-            if (better && better->bits > cap) return "cap";
+            if (better && held(*better)) return "cap";
             if (got.crf <= floorOf(v) + 0.1) return "floor";
             return "";
         };
@@ -1683,7 +1879,8 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                     if (!more(firstCrfs(v))) return false;
                     done((double(r) + 0.6) / double(video.size()));
                     // (a shot whose every setting is past its cap is encoded again, coarser, until one is within it)
-                    for (int again = 0; again < 4; ++again) {
+                    int overCap = 0;
+                    for (int again = 0; again < 4; ++again, ++overCap) {
                         const double c = coarserFor(v, pts, cap);
                         if (c <= 0 || std::any_of(pts.begin(), pts.end(), [&](const ShotTrialPoint& q) { return std::fabs(q.crf - c) < 0.2; })) break;
                         if (!more({c})) return false;
@@ -1703,6 +1900,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                     if (pts[pick].bits > cap)
                         res.warnings.push_back(v.name + ": the shot at frame " + std::to_string(shots[shot]) + " is past its cap at the coarsest setting");
                     if (!deliver(v, shot, fr, tried[pick], pts[pick].vmaf, stoppedAt(v, pts, pts[pick], cap), int(pts.size()))) return false;
+                    v.shots.back().capEncodes = overCap;
                     done(double(r + 1) / double(video.size()));
                 }
                 return true;
@@ -1727,8 +1925,8 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                         const ShotTrialPoint chosen = pts[picks[r][shot]];
                         std::vector<ShotTrial> made;
                         if (!tryShot(v, shot, fr, {chosen.crf}, false, made)) return false;
-                        int trials = int(pts.size()) + 1;
-                        for (int again = 0; again < 4 && made.back().bits > cap && chosen.bits <= cap; ++again, ++trials) {
+                        int trials = int(pts.size()) + 1, overCap = 0;
+                        for (int again = 0; again < 4 && made.back().bits > cap && chosen.bits <= cap; ++again, ++trials, ++overCap) {
                             pts.push_back({made.back().crf, made.back().bits, 0});
                             const double c = coarserFor(v, {pts.back()}, cap);
                             if (c <= 0) break;
@@ -1739,6 +1937,7 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                         if (got.bits > cap)
                             res.warnings.push_back(v.name + ": the shot at frame " + std::to_string(shots[shot]) + " is past its cap at the coarsest setting");
                         if (!deliver(v, shot, fr, made.back(), chosen.vmaf, stoppedAt(v, v.points[shot], got, cap), trials)) return false;
+                        v.shots.back().capEncodes = overCap;
                         done(double(r + 1) / double(video.size()));
                     }
                     return true;
@@ -1778,6 +1977,9 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         }
     }
     for (auto& v : video) {
+        if (v->grainWriter)
+            for (StreamingResult::RungGrain& rg : res.grain)
+                if (rg.rendition == v->name) rg.framesWithGrain = v->grainWriter->framesWithGrain, rg.bytesAdded = v->grainWriter->bytesAdded;
         std::string why;
         if (!v->track->finish(&why) || (v->ts && !v->ts->cut(&why))) return fail(why);
         if (v->ts && v->ts->segments.size() != segs.size()) return fail(v->name + " came out with a different number of TS segments");
@@ -1795,13 +1997,22 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                       res.displayWidth, res.displayHeight, res.scaler.c_str(), QFileInfo(QString::fromStdString(vmafModel)).fileName().toStdString().c_str(),
                       res.trialVmafEvery, res.crfFloor, s.vmafTarget);
         std::string csv = buf;
-        csv += "rendition,shot,first_frame,end_frame,crf,kbps,vmaf,vmaf_own_size,trial_vmaf,stopped_at,trials\n";
+        // (with grain carried as parameters: scored against the cleaned render, and what the parameters take of each
+        // shot's rate)
+        if (grain) csv += "# film_grain,carried as parameters; VMAF against the render with the grain taken out\n";
+        csv += grain ? "rendition,shot,first_frame,end_frame,crf,kbps,vmaf,vmaf_own_size,trial_vmaf,stopped_at,trials,grain_kbps\n"
+                     : "rendition,shot,first_frame,end_frame,crf,kbps,vmaf,vmaf_own_size,trial_vmaf,stopped_at,trials\n";
         for (const StreamingRungShots& rs : res.perShot)
             for (size_t i = 0; i < rs.shots.size(); ++i) {
                 const StreamingShot& sh = rs.shots[i];
-                std::snprintf(buf, sizeof buf, "%s,%zu,%lld,%lld,%.2f,%.1f,%.3f,%.3f,%.3f,%s,%d\n", rs.rendition.c_str(), i + 1, (long long)sh.first,
+                std::snprintf(buf, sizeof buf, "%s,%zu,%lld,%lld,%.2f,%.1f,%.3f,%.3f,%.3f,%s,%d", rs.rendition.c_str(), i + 1, (long long)sh.first,
                               (long long)sh.end, sh.crf, double(sh.bitrate) / 1000, sh.vmaf, sh.ownVmaf, sh.trialVmaf, sh.stopped.c_str(), sh.trials);
                 csv += buf;
+                if (grain) {
+                    std::snprintf(buf, sizeof buf, ",%.2f", double(sh.grainBits) / (double(sh.end - sh.first) * frameSeconds) / 1000);
+                    csv += buf;
+                }
+                csv += "\n";
             }
         if (!writeFile(folder + "/ladder.csv", csv)) return fail("Cannot write " + folder + "/ladder.csv");
         res.ladderReport = finalFolder + "/ladder.csv";

@@ -55,6 +55,10 @@ bool resolveFilmGrainSetting(const Project& p, std::string& setting, std::string
 // (`filmGrain` "measure"), or the profile `filmGrain` holds. Their `grain` is not yet set.
 std::vector<Av1GrainShot> av1GrainShots(const Project& p, const Sequence& seq, FrameTime in, FrameTime out, const std::string& filmGrain,
                                         const std::atomic<bool>* cancel = nullptr, const std::function<void(double)>& progress = {});
+// The sequence with each shot's grain taken out (Replace Grain on each clip that was measured, or on every clip of
+// media for a given profile, putting none back: the decoder does that), in `cleanSeq`, with `clean` the copy of `p` its effects were made in.
+void grainCleanedSequence(const Project& p, const Sequence& seq, FrameTime in, const std::vector<Av1GrainShot>& shots, Project& clean,
+                          Sequence& cleanSeq);
 // Each shot's grain fitted to AV1's parameters, for a coded picture `target` in `delivery` (the profiles being in
 // `working`).
 void fitAv1GrainShots(std::vector<Av1GrainShot>& shots, const ColorSpace& working, const ColorSpace& delivery, const Av1GrainTarget& target);
@@ -72,5 +76,34 @@ bool exportCarryingGrain(const Project& p, const Sequence& seq, const ExportSett
 // shown (counted from the first; apply false: none), its other streams and the rest of its AV1 copied as they are.
 bool carryAv1Grain(const std::string& path, const std::function<Av1FilmGrain(int64_t frame)>& grain, std::string* error = nullptr,
                    Av1GrainReport* report = nullptr);
+
+// Grain as Decoded (the Program monitor's): the picture an AV1 export of the whole sequence carrying its grain as
+// parameters (`filmGrain`: "measure" or a profile's text) shows once a decoder has put the grain back, without the
+// coding. Each shot's grain is measured, the sequence cleaned as the export cleans it, and each shot's parameters
+// fitted as that export's are for its coded pictures: 8-bit 4:2:0, limited range, the sequence's size and delivery
+// space. A frame of the cleaned sequence then has the grain of frame `f` (the export's, its seed too) put back by
+// the synthesis a decoder runs, on its Y'CbCr as coded.
+class GrainAsDecoded {
+public:
+    bool prepare(const Project& p, const Sequence& seq, const std::string& filmGrain, const std::atomic<bool>* cancel = nullptr,
+                 std::string* error = nullptr, const std::function<void(double)>& progress = {});
+    const Project& cleanProject() const { return clean_; }
+    const Sequence& cleanSequence() const { return cleanSeq_; }
+    const std::vector<Av1GrainShot>& shots() const { return shots_; }
+    // Frame f's parameters (apply false where its shot has no grain).
+    Av1FilmGrain at(FrameTime f) const;
+    // On a picture's planes as decoded.
+    void apply(FrameTime f, Av1GrainPicture& pic) const;
+    // On a frame of the cleaned sequence as rendered (in the sequence's delivery space, at its size: else left as
+    // it is), through 8-bit Y'CbCr 4:2:0 as the export codes it and back.
+    void apply(FrameTime f, Image& picture) const;
+
+private:
+    Project clean_;
+    Sequence cleanSeq_;
+    std::vector<Av1GrainShot> shots_;
+    int width_ = 0, height_ = 0;
+    bool bt2020_ = false;
+};
 
 }  // namespace montage
