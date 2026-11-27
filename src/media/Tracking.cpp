@@ -711,7 +711,20 @@ std::vector<TrackQuad> trackQuad(const std::string& path, double from, double to
 std::string cameraMotionToString(const CameraMotion& m) {
     std::ostringstream o;
     o.precision(9);
-    o << "v1 " << m.fps << ' ' << m.start << ' ' << m.steps.size();
+    // (the rate and start as nine digits where that reads back as the same number, as they always were written, else
+    // in full, so 30000/1001 and an in point between round times read back exactly)
+    auto exact = [](double v) {
+        std::ostringstream t;
+        t.precision(9);
+        t << v;
+        double back = 0;
+        if (std::istringstream(t.str()) >> back && back == v) return t.str();
+        t.str({});
+        t.precision(17);
+        t << v;
+        return t.str();
+    };
+    o << "v1 " << exact(m.fps) << ' ' << exact(m.start) << ' ' << m.steps.size();
     for (const Similarity& s : m.steps) o << ' ' << s.tx << ' ' << s.ty << ' ' << s.angle << ' ' << s.scale;
     return o.str();
 }
@@ -743,9 +756,11 @@ CameraMotion analyzeCameraMotion(const std::string& path, double from, double to
     m.start = from;
     const int frames = std::max(1, int(std::floor((to - from) * src.fps + 1e-6)));
     // (taken on from an earlier run's last frame where it measured the same stretch: its frames are read by the same
-    // times, so the steps come out as one run's would)
+    // times, so the steps come out as one run's would. The same to nine digits, as earlier builds kept the rate and
+    // start, is the same stretch.)
+    auto same = [](double a, double b) { return std::fabs(a - b) <= 1e-8 * std::max(1.0, std::fabs(b)); };
     int first = 1;
-    if (resume && resume->start == from && resume->fps == src.fps && !resume->steps.empty() && int(resume->steps.size()) <= frames) {
+    if (resume && same(resume->start, from) && same(resume->fps, src.fps) && !resume->steps.empty() && int(resume->steps.size()) <= frames) {
         m.steps = resume->steps;
         first = int(m.steps.size());
     }
@@ -756,6 +771,7 @@ CameraMotion analyzeCameraMotion(const std::string& path, double from, double to
     }
     const double W = src.w;
     if (m.steps.empty()) m.steps.push_back({});
+    int nextKeep = (first / 50 + 1) * 50;
     for (int i = first; i < frames; ++i) {
         if (cancel && cancel->load()) {
             m.steps.clear();
@@ -786,7 +802,12 @@ CameraMotion analyzeCameraMotion(const std::string& path, double from, double to
         }
         m.steps.push_back(step);
         gCameraMotionFrames.fetch_add(1);
-        if (keep && i % 50 == 0) keep(m);
+        // Kept every 50 frames at first, then each time an eighth more is measured: each keep writes all measured so
+        // far, so a long clip writes a few times its measure in all, not a copy every 50 frames.
+        if (keep && i >= nextKeep) {
+            keep(m);
+            nextKeep = i + std::max(50, i / 8);
+        }
         if (progress) progress(double(i) / frames);
     }
     return m;

@@ -34844,7 +34844,7 @@ private slots:
 
     // A textured still moved by known jitter every frame: a shaky "camera".
     // Returns the jitter (sequence pixels) per frame.
-    std::vector<Point2> writeShakyVideo(const std::string& file, int frames) {
+    std::vector<Point2> writeShakyVideo(const std::string& file, int frames, Rational fps = {25, 1}) {
         QImage tex(480, 270, QImage::Format_RGB32);
         tex.fill(QColor(90, 90, 90));
         {
@@ -34860,7 +34860,7 @@ private slots:
         Sequence& s = *p.active();
         s.width = 320;
         s.height = 180;
-        s.fps = {25, 1};
+        s.fps = fps;
         MediaItem m = probeOrFail(p, png.toStdString());
         p.media.push_back(m);
         Clip c = makeClip(p, m, TrackKind::Video, s);
@@ -35414,7 +35414,7 @@ private slots:
         QVERIFY2(half > repaired && half < skewed, qPrintable(QString("%1 %2 %3").arg(skewed).arg(half).arg(repaired)));
     }
 
-    // The camera's motion measured up to a point is kept (every 50 frames) and taken up from there: a run stopped at
+    // The camera's motion measured up to a point is kept (every 50 frames at first) and taken up from there: a run stopped at
     // two thirds and taken up from what it kept measures only the frames after it, and comes out as one whole run's.
     void cameraMotionTakenUp() {
         const std::string video = path("shaky-long.mp4");
@@ -35447,6 +35447,33 @@ private slots:
         const CameraMotion other = analyzeCameraMotion(video, 0.2, frames / 25.0, {}, nullptr, &err, &fromText);
         QCOMPARE(cameraMotionFramesMeasured() - before, long(other.steps.size() - 1));
         QVERIFY(other.start == 0.2);
+        // (nightly 27 Nov) Footage at 30000/1001 from an in point between round times is taken up the same way, from
+        // what it kept as text now and from the text as earlier builds wrote it (the rate and start to nine digits).
+        const std::string ntsc = path("shaky-ntsc.mp4");
+        writeShakyVideo(ntsc, frames, {30000, 1001});
+        const double in = 7.0 / 30, out = in + 100 * 1001 / 30000.0;
+        const CameraMotion ntscWhole = analyzeCameraMotion(ntsc, in, out, {}, nullptr, &err);
+        QCOMPARE(int(ntscWhole.steps.size()), 100);
+        cancel = false, keptTimes = 0;
+        QVERIFY(analyzeCameraMotion(ntsc, in, out, [&](double f) { cancel = cancel || f >= 0.6; }, &cancel, &err, nullptr,
+                                    [&](const CameraMotion& so) { kept = so, ++keptTimes; })
+                    .steps.empty());
+        QCOMPARE(keptTimes, 1);
+        const std::string keptText = cameraMotionToString(kept);
+        QStringList earlier = QString::fromStdString(keptText).split(' ');
+        earlier[1] = QString::number(kept.fps, 'g', 9), earlier[2] = QString::number(kept.start, 'g', 9);
+        QVERIFY(earlier.join(' ').toStdString() != keptText);
+        for (const std::string& text : {keptText, earlier.join(' ').toStdString()}) {
+            QVERIFY(cameraMotionFromString(text, fromText));
+            before = cameraMotionFramesMeasured();
+            const CameraMotion again = analyzeCameraMotion(ntsc, in, out, {}, nullptr, &err, &fromText);
+            QCOMPARE(cameraMotionFramesMeasured() - before, long(100 - 51));
+            QCOMPARE(cameraMotionToString(again), cameraMotionToString(ntscWhole));
+        }
+        // A round rate and start are written as they always were.
+        CameraMotion round;
+        round.fps = 25, round.start = 0.2;
+        QCOMPARE(cameraMotionToString(round), std::string("v1 25 0.2 0"));
     }
 
     void trackingAndStabilization() {
