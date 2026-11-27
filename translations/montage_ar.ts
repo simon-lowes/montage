@@ -6688,6 +6688,10 @@
         <source>Samples (0: Auto)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Lit as Drawn Alone (in the 3D layers&apos; scene)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -13220,10 +13224,6 @@ The certificate must be issued by a certificate authority (not signed by itself)
         <translation type="unfinished">هذا من لا يُوقّع ليس مكتبة</translation>
     </message>
     <message>
-        <source>Content Credentials cannot go in %1 exports: a single MP4, MOV, WAV, MP3, JPEG, PNG or TIFF file can hold them</source>
-        <translation type="unfinished">لا يمكن أن تدخل وثائق الإعتمادات %1 في الصادرات: يمكن أن يحتفظ بها ملف واحد من MP4 أو MOV أو WAV أو MP3 أو JPEG أو PNG أو TIFF</translation>
-    </message>
-    <message>
         <source>A signed record in the file of who made it, with what, and each AI model that generated or changed it, with the credentials its sources carried; checked at contentcredentials.org/verify. Like Premiere&apos;s Content Credentials.</source>
         <translation type="unfinished">سجل موقع في ملف من صنعه، مع ماذا، وكل نموذج من نماذج الذكاء الذاتي التي أنتجته أو غيرته، مع وثائق التفويض التي حملتها مصادره؛ تم التحقق منه في وثائق المحتوى.org/تدقيق. مثل وثائق تفويض مضمون رئيس الوزراء.</translation>
     </message>
@@ -13487,10 +13487,6 @@ Do you want to replace it?</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>JPEG XS&apos;s rate: each picture the same number of bytes, its width times its height times this, over 8</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>JPEG XS:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -13652,6 +13648,22 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>, no more than %1 kbit/s with its decoder model stated</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XS&apos;s rate: each picture the same number of bytes, its width times its height times this, over 8; or lossless, each picture as many bytes as it takes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Leave out the names of people in the sources&apos; credentials</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The sources&apos; assertions that name their authors or signers are redacted from the new credentials</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Content Credentials cannot go in %1 exports</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -24829,6 +24841,70 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
         <source>Pre&amp;ferences…</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Scale the handles by each shot&apos;s speed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A shot at 400 % with 8 handles pulls 32 source frames either side</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip values below 0</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip values over 1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source> (%n frame(s) copied without coding again)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>, %n clip(s) baked</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>, %n clip(s) nothing shows left out</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Project Manager</source>
+        <translation type="unfinished">مدير مشروع</translation>
+    </message>
+    <message numerus="yes">
+        <source>%n clip(s) nothing shows were left out of the new project.</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -29734,6 +29810,198 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     <message>
         <source>Copy Project</source>
         <translation type="unfinished">نسخ المشروع</translation>
+    </message>
+    <message>
+        <source>Save…</source>
+        <translation type="unfinished">احفظ…</translation>
+    </message>
+    <message>
+        <source>Save Preset</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Preset name:</source>
+        <translation type="unfinished">الاسم السابق:</translation>
+    </message>
+    <message>
+        <source>Save Consolidate Preset</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The project could not be changed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In the project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In my library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Compare…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>What this preset sets differently from the presets of the same name it overrides</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Compare Preset</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Preset:</source>
+        <translation type="unfinished">المجموعة المسبقة:</translation>
+    </message>
+    <message>
+        <source>For finishing: the parts used, in their own formats</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>For finishing: the parts used, as image sequences</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cut without coding again where the format allows; other formats are transcoded to ProRes 422 HQ</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Seconds</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frames</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Timecode</source>
+        <translation type="unfinished">رمز الوقت</translation>
+    </message>
+    <message>
+        <source>None</source>
+        <translation type="unfinished">لا يوجد</translation>
+    </message>
+    <message>
+        <source>The whole file</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> frames</source>
+        <translation type="unfinished"> إطارات</translation>
+    </message>
+    <message>
+        <source>DNxHR HQ (.mov)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>H.265 (.mp4)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>FFV1, lossless (.mkv)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each file&apos;s own, where it is one of these</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>OpenEXR (half float)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>DPX (10-bit)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>TIFF (16-bit)</source>
+        <translation type="unfinished">TIFF (16 بت)</translation>
+    </message>
+    <message>
+        <source>Image sequences:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each file&apos;s own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The working space</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour space:</source>
+        <translation type="unfinished">مساحة الألوان:</translation>
+    </message>
+    <message>
+        <source>Each source&apos;s own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A pattern of {sequence}, {shot}, {clip}, {reel}, {tape}, {scene}, {take} and, for image sequences, {frame}</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Names:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How many of each source&apos;s folders are kept above it in the new Media folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Source folders kept:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Leave out clips nothing shows (disabled, or hidden under clips above)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Bake in grades, effects and speed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sound: only the parts used, as WAV</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>project</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>library</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>facility</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 (%2)</source>
+        <translation type="unfinished">%1 (%2)</translation>
+    </message>
+    <message>
+        <source>There is no preset called %1.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The %1 preset %2 sets nothing differently from the levels above it.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The %1 preset %2 sets:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1: %2 (the %3 gives %4)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>nothing</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -35607,6 +35875,34 @@ so the jump in the picture morphs across instead of cutting</source>
     <message>
         <source>This display does not show HDR</source>
         <translation type="unfinished">هذا العرض لا يظهر تقرير التنمية البشرية</translation>
+    </message>
+    <message>
+        <source>HLG</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PQ (converted from HLG)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PQ</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR</source>
+        <translation type="unfinished">تقرير التنمية البشرية</translation>
+    </message>
+    <message>
+        <source>SDR</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>SDR: this display does not take HDR</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>SDR: %1</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
