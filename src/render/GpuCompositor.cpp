@@ -361,6 +361,9 @@ private:
     bool readPicture(QRhiTexture* from, QRhiResourceUpdateBatch*& u, Image& picture);
     void callBack(const std::function<void()>& fn);  // (on the GPU's thread: fn run by the thread waiting in serve())
     void endFrame(bool drawn);
+    // The work recorded so far submitted and waited for, mid-frame (on FFmpeg's Vulkan device, holding its queues'
+    // lock, as FFmpeg's decoders submit to the same queues).
+    void finishWork();
     bool recover();  // (the device lost: everything made again, on FFmpeg's device again when shared, else on a new one)
 
     std::thread thread_;
@@ -1645,7 +1648,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                     QRhiResourceUpdateBatch* rb = rhi_->nextResourceUpdateBatch();
                     rb->readBackTexture({made}, &read);
                     cb_->resourceUpdate(rb);
-                    rhi_->finish();
+                    finishWork();
                     const size_t n = size_t(made->pixelSize().width()) * size_t(made->pixelSize().height());
                     flags.clear();
                     if (size_t(read.data.size()) >= n * 16) {
@@ -2044,7 +2047,7 @@ QRhiTexture* Device::splatLayer(const SplatLayer& s, QRhiResourceUpdateBatch*& u
     for (size_t k = 0; k < batches; ++k) {
         // (each batch's uploads go into the buffers the one before read: that one's work is waited for first, as a
         // backend may copy an upload into a buffer when it is recorded, Metal's among them)
-        if (k > 0) rhi_->finish();
+        if (k > 0) finishWork();
         const size_t part = s.points ? batches - 1 - k : k;
         const size_t from = starts[part], nb = starts[part + 1] - from;
         size_t E = 0;
@@ -2184,7 +2187,7 @@ bool Device::readPicture(QRhiTexture* from, QRhiResourceUpdateBatch*& u, Image& 
     u->readBackTexture({from}, &read);
     cb_->resourceUpdate(u);
     u = rhi_->nextResourceUpdateBatch();
-    rhi_->finish();
+    finishWork();
     const size_t n = size_t(size.width()) * size_t(size.height());
     picture.width = size.width(), picture.height = size.height();
     picture.px.resize(n * 4);
@@ -2231,6 +2234,12 @@ bool Device::external(const TextureStep* step, const std::vector<QRhiTexture*>& 
     ++textureSteps;
     if (logFallbacks()) std::fprintf(stderr, "montage gpu: %s drawn from and into the compositor's textures\n", step->name.c_str());
     return true;
+}
+
+void Device::finishWork() {
+    std::unique_lock<std::recursive_mutex> queues;
+    if (shared_ && backend_ == QRhi::Vulkan) queues = std::unique_lock(vulkanQueueMutex());
+    rhi_->finish();
 }
 
 void Device::endFrame(bool drawn) {
