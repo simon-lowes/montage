@@ -25,7 +25,16 @@
 
 #include "render/St2110.h"
 
+namespace montage {
+struct JxsHeader;
+}
+
 namespace montage::st2110 {
+
+// Whether a JPEG XS codestream's header is what an ST 2110-22 stream of format `v` carries in a picture (or a field)
+// `height` rows high: its width and depth, and three components. An SDP names no alpha, so a codestream of four is
+// not taken: a recording that keeps the codestreams as they came is never three components and then four.
+bool jxsCodestreamMatches(const JxsHeader& h, const VideoFormat& v, int height);
 
 // One stream an SDP describes: what it carries and where it arrives (with ST 2022-7, on two paths).
 struct SdpStream {

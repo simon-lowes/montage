@@ -21195,6 +21195,33 @@ colorspaces:
         QCOMPARE(recorded, montage::jpegXsAvailable() && broadcastMxfAvailable());
     }
 
+    // Nightly 27 Nov: an ST 2110-22 stream's codestream with a fourth component (alpha) is not what its SDP describes,
+    // which names no alpha, so it is not taken; one of three components of the SDP's size and depth is. Runs without
+    // the library: the codestreams' headers are made by hand.
+    void st2110JpegXsWithAlphaRefused() {
+        namespace st = montage::st2110;
+        auto header = [](int components) {
+            std::vector<uint8_t> cs = {0xFF, 0x10, 0xFF, 0x12, 0x00, 0x1A};
+            cs.resize(cs.size() + 24, 0);
+            cs[6 + 8] = 0x02, cs[6 + 9] = 0x80, cs[6 + 10] = 0x01, cs[6 + 11] = 0x68;  // (640 x 360)
+            cs[6 + 15] = 1, cs[6 + 16] = uint8_t(components), cs[6 + 22] = 4;
+            cs.insert(cs.end(), {0xFF, 0x13, 0x00, uint8_t(2 + 2 * components), 0x0A, 0x11, 0x0A, 0x21, 0x0A, 0x21});
+            if (components == 4) cs.insert(cs.end(), {0x0A, 0x11});
+            cs.insert(cs.end(), {0xFF, 0x11});
+            return cs;
+        };
+        st::VideoFormat v;
+        v.codec = "jxsv", v.width = 640, v.height = 360, v.fps = {25, 1}, v.depth = 10, v.bpp = 3;
+        montage::JxsHeader three, four;
+        const std::vector<uint8_t> a = header(3), b = header(4);
+        QVERIFY(montage::readJxsHeader(a.data(), a.size(), three) && three.components == 3 && three.width == 640 && three.depth == 10);
+        QVERIFY(montage::readJxsHeader(b.data(), b.size(), four) && four.components == 4 && four.width == 640 && four.depth == 10);
+        QVERIFY(st::jxsCodestreamMatches(three, v, 360));
+        QVERIFY(!st::jxsCodestreamMatches(four, v, 360));
+        // (nor one of another height, as a field is where a frame belongs)
+        QVERIFY(!st::jxsCodestreamMatches(three, v, 180));
+    }
+
     // Interlaced JPEG XS over ST 2110-22 (RFC 9134's picture segments): each field a codestream of its own, sent under
     // the frame's timestamp and F count with I saying which field, each field's last packet marked; rebuilt as two
     // codestreams, the first field's and then the second's, and a progressive frame after them as a frame. A field is
