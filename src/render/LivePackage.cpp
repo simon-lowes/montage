@@ -498,6 +498,13 @@ struct LivePackager::State {
     std::deque<std::pair<double, CcTriplet>> cc;
     bool ccSeen = false;
     std::vector<std::unique_ptr<Rendition>> captions;
+    // Each AdaptationSet's id in the MPD, given the first time its rendition is listed and kept: players match sets
+    // by id from one update of the manifest to the next, so a sound stream that turns up late must not move them.
+    std::map<std::string, int> dashSetIds;
+    int setIdFor(const std::string& rendition) {
+        auto [it, added] = dashSetIds.try_emplace(rendition, int(dashSetIds.size()) + 1);
+        return it->second;
+    }
     std::set<std::string> ccIds;  // (the services and channels seen, by CcCaptionStream::id)
     bool announceDue = false;     // a rendition joined: the multivariant playlist and the MPD again once it has a part
 
@@ -997,9 +1004,8 @@ struct LivePackager::State {
             if (parts) t += " availabilityTimeOffset=\"" + fmt("%.3f", segSeconds - partSeconds) + "\" availabilityTimeComplete=\"false\"";
             return t + "/>\n";
         };
-        int id = 1;
         if (!video.empty()) {
-            x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\" startWithSAP=\"1\" "
+            x += "<AdaptationSet id=\"" + std::to_string(setIdFor("(the pictures)")) + "\" contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\" startWithSAP=\"1\" "
                  "frameRate=\"" + std::to_string(fps.num) + "/" + std::to_string(fps.den) + "\">\n";
             // (ad cues: SCTE 35 messages in emsg boxes, before the chunk they come in)
             x += std::string("<InbandEventStream schemeIdUri=\"") + kScte35Scheme + "\" value=\"1\"/>\n";
@@ -1009,7 +1015,7 @@ struct LivePackager::State {
             x += "</AdaptationSet>\n";
         }
         for (const auto& a : audio) {
-            x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"audio\" mimeType=\"audio/mp4\" lang=\"" + xmlEscape(a->language) +
+            x += "<AdaptationSet id=\"" + std::to_string(setIdFor(a->name)) + "\" contentType=\"audio\" mimeType=\"audio/mp4\" lang=\"" + xmlEscape(a->language) +
                  "\" segmentAlignment=\"true\">\n<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"" + (a->track == 0 ? "main" : "alternate") +
                  "\"/>\n<Label>" + xmlEscape(a->label) + "</Label>\n";
             x += "<Representation id=\"" + a->name + "\" bandwidth=\"" + std::to_string(a->enc ? a->enc->bit_rate : set.audioBitrate * 4) + "\" codecs=\"" + a->codecs +
@@ -1022,7 +1028,7 @@ struct LivePackager::State {
         }
         for (const auto& c : captions) {
             // (IMSC 1 text in fragmented MP4, a TTML document a segment, made at each segment's end)
-            x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"text\" mimeType=\"application/mp4\" lang=\"" + xmlEscape(c->language) +
+            x += "<AdaptationSet id=\"" + std::to_string(setIdFor(c->name)) + "\" contentType=\"text\" mimeType=\"application/mp4\" lang=\"" + xmlEscape(c->language) +
                  "\" segmentAlignment=\"true\">\n<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"caption\"/>\n<Label>" + xmlEscape(c->label) +
                  "</Label>\n<Representation id=\"" + c->name + "\" bandwidth=\"2000\" codecs=\"stpp.ttml.im1t\">\n<SegmentTemplate timescale=\"1000\" duration=\"" +
                  std::to_string(std::llround(segSeconds * 1000)) + "\" startNumber=\"1\" initialization=\"" + c->name + "/init.mp4\" media=\"" +

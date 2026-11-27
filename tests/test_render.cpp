@@ -37766,10 +37766,19 @@ colorspaces:
         cancel.eventId = 77, cancel.eventCancel = true;
         const std::vector<uint8_t> cancelBytes = scte35::encode(cancel);
         int64_t writes0 = -1, parts0 = 0, writes1 = 0, parts1 = 0;
+        QString earlyMpd;
         for (int64_t f = 0; f < feed.frames; ++f) {
             if (f == 75) packager.cueFromFeed(scte35::encode(out), 0, 3.0);
             if (f == 90) packager.cueFromFeed(cancelBytes, 0, 3.6);
             feed.push(packager, f);
+            // (the manifest before the late sound stream is announced: its sets' ids, kept for the end)
+            if (f == 40) {
+                QElapsedTimer settle;
+                settle.start();
+                while (packager.status().behind > 0 && settle.elapsed() < 10000) QThread::msleep(2);
+                QFile early(QString::fromStdString(ls.folder) + "/manifest.mpd");
+                if (early.open(QIODevice::ReadOnly)) earlyMpd = QString::fromUtf8(early.readAll());
+            }
             // (kept up with: nothing dropped)
             QElapsedTimer t;
             t.start();
@@ -37838,6 +37847,28 @@ colorspaces:
         QVERIFY2(late.startsWith("a2_"), qPrintable(late));
         QCOMPARE(int(master.count("TYPE=AUDIO")), 2);
         QVERIFY(master.contains("NAME=\"Commentaire\"") && mpd.contains(late));
+        // Each AdaptationSet keeps its id from one manifest to the next, the late sound stream's set taking a new one,
+        // as players match sets by id (one moved would put a viewer on another language).
+        auto setIds = [](const QString& text) {
+            std::map<QString, QString> ids;  // (a Representation's id: its set's)
+            QString set;
+            const QRegularExpression tag("<(AdaptationSet|Representation) id=\"([^\"]+)\"");
+            for (auto it = tag.globalMatch(text); it.hasNext();) {
+                const QRegularExpressionMatch m = it.next();
+                if (m.captured(1) == "AdaptationSet") set = m.captured(2);
+                else ids[m.captured(2)] = set;
+            }
+            return ids;
+        };
+        const std::map<QString, QString> before = setIds(earlyMpd), after = setIds(mpd);
+        QVERIFY2(before.size() >= 3 && !before.count(late), qPrintable(earlyMpd));
+        for (const auto& [rep, set] : before) {
+            QVERIFY2(after.count(rep), qPrintable(rep));
+            QVERIFY2(after.at(rep) == set, qPrintable(QString("%1: set %2, then %3").arg(rep, set, after.at(rep))));
+        }
+        QSet<QString> beforeSets;
+        for (const auto& [rep, set] : before) beforeSets.insert(set);
+        QVERIFY2(after.count(late) && !beforeSets.contains(after.at(late)), qPrintable(mpd));
         const QString lateList = readFile(folder + "/" + late + "/playlist.m3u8");
         QVERIFY2(lateList.contains("#EXT-X-MEDIA-SEQUENCE:3\n") && !lateList.contains("seg00002.m4s") && lateList.contains("seg00003.m4s"), qPrintable(lateList));
         QVERIFY(!QFile::exists(folder + "/" + late + "/seg00002.m4s"));
