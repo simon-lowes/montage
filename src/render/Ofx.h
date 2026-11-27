@@ -229,6 +229,18 @@ struct GlPicture {
 // in this process; or in a plug-in host whose pictures come back as handles to the GPU's memory, copied into the
 // compositor's texture: render/OfxRemote.h's renderInto); `why` says why not.
 bool rendersTextures(const Effect& e, std::string* why = nullptr, bool transition = false);
+// While one lives on this thread (a frame's render: the GPU compositor's try, and the CPU's render that follows when
+// that fails), a render in a plug-in host that failed (its host hung or crashed, or the plug-in refused) is not asked
+// of a host again for the same effect, plug-in, time and progress: it fails at once, with the same reason. So a hung
+// host holds the frame for one timeout and uses one restart, not two. Nested ones share the outermost's.
+class HostFailuresScope {
+public:
+    HostFailuresScope();
+    ~HostFailuresScope();
+    HostFailuresScope(const HostFailuresScope&) = delete;
+    HostFailuresScope& operator=(const HostFailuresScope&) = delete;
+};
+
 // applyEffect from `from` into `to` (two textures of one size, in a context sharing with the plug-ins'; what was drawn
 // into `from` finished first). Called from the thread that renders the frame, with its scopes, not the compositor's
 // own. A plug-in that after all does not render them with OpenGL has `from` read back and its picture written into

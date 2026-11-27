@@ -3722,6 +3722,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
 
 QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
     ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
+    ofx::HostFailuresScope failures;  // (a plug-in that failed on the GPU's try is not rendered again on the CPU)
     QImage q;
     if (o.gpu && o.depth == 0 && gpuProgramFrame(p, seq, t, o, nullptr, &q)) return q;
     RenderOptions cpu = o;
@@ -3734,6 +3735,7 @@ QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime 
 
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
     ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
+    ofx::HostFailuresScope failures;  // (a plug-in that failed on the GPU's try is not rendered again on the CPU)
     if (o.gpu && o.depth == 0) {
         Image img;
         if (gpuProgramFrame(p, seq, t, o, &img, nullptr)) return img;

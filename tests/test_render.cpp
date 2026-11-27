@@ -32002,6 +32002,22 @@ colorspaces:
                 QVERIFY(!came && !err.empty());
             }
             plugins::clearHostFailures();
+            // (a stop is delivered to a host's threads in their own time, and its thread asking for the frame spins
+            // for the answer before it sleeps: in a slow guest it took the answer and rendered before the stop
+            // landed. So every thread is seen stopped before the frame is given.)
+            auto allStopped = [](pid_t pid) {
+                const QDir tasks(QStringLiteral("/proc/%1/task").arg(pid));
+                const QStringList ids = tasks.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+                if (ids.isEmpty()) return false;
+                for (const QString& id : ids) {
+                    QFile stat(tasks.filePath(id + "/stat"));
+                    if (!stat.open(QIODevice::ReadOnly)) return false;
+                    const QByteArray line = stat.readAll();
+                    const int close = line.lastIndexOf(')');  // (the state follows the name, which may hold spaces)
+                    if (close < 0 || close + 2 >= line.size() || (line[close + 2] != 'T' && line[close + 2] != 't')) return false;
+                }
+                return true;
+            };
             // Nightly 25 Nov: a host that hangs while its picture was to come as a handle (stopped where it asks for the
             // frame before, and waited for as long as this test's export timeout): no handle is asked for from then on,
             // but the frame is not rendered again in a new host, which would wait out a second timeout; it fails, and
@@ -32013,22 +32029,6 @@ colorspaces:
                 quick.exportTimeoutMs = 2000;
                 plugins::setHosting(quick);
                 pid_t stopped = 0;
-                // (a stop is delivered to a host's threads in their own time, and its thread asking for the frame spins
-                // for the answer before it sleeps: in a slow guest it took the answer and rendered before the stop
-                // landed. So every thread is seen stopped before the frame is given.)
-                auto allStopped = [](pid_t pid) {
-                    const QDir tasks(QStringLiteral("/proc/%1/task").arg(pid));
-                    const QStringList ids = tasks.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-                    if (ids.isEmpty()) return false;
-                    for (const QString& id : ids) {
-                        QFile stat(tasks.filePath(id + "/stat"));
-                        if (!stat.open(QIODevice::ReadOnly)) return false;
-                        const QByteArray line = stat.readAll();
-                        const int close = line.lastIndexOf(')');  // (the state follows the name, which may hold spaces)
-                        if (close < 0 || close + 2 >= line.size() || (line[close + 2] != 'T' && line[close + 2] != 't')) return false;
-                    }
-                    return true;
-                };
                 const ofx::FrameFetch stopping = [&](double, Image& out) {
                     if (!stopped)
                         for (const plugins::HostInfo& running : plugins::runningHosts())
@@ -32057,6 +32057,49 @@ colorspaces:
                 } else {
                     QVERIFY(!expected);
                 }
+                plugins::setHosting(was);
+                plugins::clearHostFailures();
+            }
+            // Nightly 27 Nov: within one frame's HostFailuresScope (the GPU compositor's try and the CPU's render after
+            // it), a render whose host hung is not asked of a new host again: the second fails at once, as the first did.
+            {
+                const plugins::HostingSettings was = plugins::hosting();
+                plugins::HostingSettings quick = was;
+                quick.exportTimeoutMs = 2000;
+                plugins::setHosting(quick);
+                pid_t stopped = 0;
+                const ofx::FrameFetch stopping = [&](double, Image& out) {
+                    if (!stopped)
+                        for (const plugins::HostInfo& running : plugins::runningHosts())
+                            if (running.key.find("temporal") != std::string::npos && running.pid > 0 && ::kill(pid_t(running.pid), SIGSTOP) == 0) {
+                                stopped = pid_t(running.pid);
+                                for (int i = 0; i < 2000 && !allStopped(stopped); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
+                    out = numbered(10);
+                    return true;
+                };
+                {
+                    ofx::HostFailuresScope frame;
+                    std::string first, second;
+                    there = numbered(11);
+                    QVERIFY(!ofx::applyEffect(slow, 11, there, 1.0, stopping, &first));
+                    if (stopped > 0) ::kill(stopped, SIGKILL);
+                    QVERIFY(stopped > 0);
+                    QVERIFY2(QString::fromStdString(first).contains("did not answer"), first.c_str());
+                    stopped = -1;  // (a second host would not be stopped: it would answer)
+                    QElapsedTimer took;
+                    took.start();
+                    there = numbered(11);
+                    QVERIFY(!ofx::applyEffect(slow, 11, there, 1.0, stopping, &second));
+                    QVERIFY2(took.elapsed() < 500, qPrintable(QString::number(took.elapsed())));
+                    QCOMPARE(second, first);
+                    // (another frame is asked as ever)
+                    there = numbered(12);
+                    QVERIFY2(ofx::applyEffect(slow, 12, there, 1.0, [&](double, Image& out) { return out = numbered(11), true; }, &second), second.c_str());
+                }
+                // Out of the scope, the same frame is asked again.
+                there = numbered(11);
+                QVERIFY2(ofx::applyEffect(slow, 11, there, 1.0, [&](double, Image& out) { return out = numbered(10), true; }, &err), err.c_str());
                 plugins::setHosting(was);
                 plugins::clearHostFailures();
             }
