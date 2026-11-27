@@ -1513,8 +1513,11 @@ void main() {
             const int ox = int(p[2].y), oy = int(p[2].z), w = int(p[2].w), h = int(p[3].x), halfW = int(p[3].y);
             vec4 c = vec4(0.0);
             float a = 0.0;
-            for (int yy = 2 * y; yy < min(h, 2 * y + 2); ++yy)
-                for (int x2 = 2 * xx; x2 < min(w, 2 * xx + 2); ++x2) {
+            // (over the two by two below, by constant bounds: Direct3D's HLSL would unroll it, and cannot by these)
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int yy = 2 * y + dy, x2 = 2 * xx + dx;
+                    if (yy >= h || x2 >= w) continue;
                     const ivec2 at = ivec2(ox + x2, oy + yy);
                     const float ai = fromS ? texelFetch(extra, at + ivec2(halfW, 0), 0).x : texelFetch(srcTex, at + ivec2(halfW, 0), 0).x;
                     if (ai <= 0.0) continue;

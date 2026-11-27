@@ -422,6 +422,11 @@ vec4 matteStep(ivec2 xy, int mode) {
     return vec4(v, v, v, 1.0);
 }
 
+// Channel i of `v`, and the unit vector along it (a channel chosen at run time is changed through these: Direct3D's
+// HLSL cannot write a vector's component by an index it does not know).
+float channelOf(vec3 v, int i) { return i == 0 ? v.x : i == 1 ? v.y : v.z; }
+vec3 unitAlong(int i) { return vec3(i == 0 ? 1.0 : 0.0, i == 1 ? 1.0 : 0.0, i == 2 ? 1.0 : 0.0); }
+
 // The keyers (modes 18 to 20), on the pixel's straight colour `c` and alpha `a`: what they make, premultiplied.
 vec4 keyer(int mode, vec3 c, float a, ivec2 xy) {
     if (mode == 18) {
@@ -434,8 +439,8 @@ vec4 keyer(int mode, vec3 c, float a, ivec2 xy) {
         vec3 o = c;
         if (p[2].y > 0.0) {
             const int dom = int(p[2].z);
-            const float others = 0.5 * (o[(dom + 1) % 3] + o[(dom + 2) % 3]);
-            if (o[dom] > others) o[dom] -= (o[dom] - others) * p[2].y;
+            const float others = 0.5 * (channelOf(o, (dom + 1) % 3) + channelOf(o, (dom + 2) % 3)), own = channelOf(o, dom);
+            if (own > others) o -= unitAlong(dom) * ((own - others) * p[2].y);
         }
         const float na = a * matte;
         return p[2].w > 0.5 ? vec4(vec3(na), 1.0) : vec4(o * na, na);
@@ -464,8 +469,8 @@ vec4 keyer(int mode, vec3 c, float a, ivec2 xy) {
     if (view == 2) return vec4(vec3(na < 0.02 ? 0.0 : na > 0.98 ? 1.0 : 0.5), 1.0);
     vec3 o = c;
     const float before = luma(o);
-    const float limit = p[1].y * max(o[o1], o[o2]) + (1.0 - p[1].y) * min(o[o1], o[o2]);
-    if (o[dom] > limit) o[dom] -= (o[dom] - limit) * p[2].z;
+    const float limit = p[1].y * max(channelOf(o, o1), channelOf(o, o2)) + (1.0 - p[1].y) * min(channelOf(o, o1), channelOf(o, o2));
+    if (channelOf(o, dom) > limit) o -= unitAlong(dom) * ((channelOf(o, dom) - limit) * p[2].z);
     o += vec3((before - luma(o)) * p[2].w);
     if (p[3].x > 0.0) {
         const float edge = 4.0 * m * (1.0 - m) * p[3].x, l = luma(o);
